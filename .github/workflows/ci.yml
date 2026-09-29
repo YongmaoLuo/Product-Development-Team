@@ -515,35 +515,55 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - shard: unit
-            paths: tests/unit
-          - shard: root
-            # Everything the original single job ran, minus the three
-            # directories the other shards own. ``tests/integration`` and
-            # ``tests/e2e`` are deliberately NOT ignored: the ``-m``
-            # filter already drops the marked tests inside them (102
-            # across the whole run), and the unmarked ones there were
-            # part of the old selection — ignoring the directories
-            # silently dropped 209 tests.
-            #
-            # Verified: 3254 (unit) + 1622 (root) + 194 (misc) = 5070 —
-            # exactly what `pytest tests/ -m "not e2e and not
-            # integration"` selected before the split.
-            paths: >-
-              tests/
-              --ignore=tests/unit
-              --ignore=tests/contract
-              --ignore=tests/concurrency
-              --ignore=tests/performance
-              --ignore=tests/security
-              --ignore=tests/meta_tests
-          - shard: misc
-            paths: >-
-              tests/contract
-              tests/security
-              tests/meta_tests
-              tests/concurrency
-              tests/performance
+          # ----------------------------------------------------------------
+          # Sizing rule (2026-09-29). A shard only finishes if it is small
+          # enough; that is now measured, not guessed. Every shard that has
+          # ever completed on the runner ran ~25 test files / ~200 tests /
+          # under 2.5 minutes, and every one that was reaped at 45m00s ran
+          # 766 tests or more:
+          #
+          #   ctrl-1-25   25 files   40s      success
+          #   alt-26-50   25 files   2m22s    completed (real test errors)
+          #   misc        194 tests  1m40s    success
+          #   u-75        766 tests            reaped at 45m00s
+          #   root        1622 tests           reaped at 45m00s
+          #   unit        3482 tests           reaped at 45m00s
+          #
+          # So `unit` (283 files) is cut into 12 and `root` (175 files)
+          # into 7, both landing at ~24 files per shard — inside the band
+          # that finishes, with headroom. Round-robin over the collected
+          # file list (``NR % n == index``) keeps every file in exactly one
+          # shard, so the union of the shards is the union the single job
+          # used to run and the combined coverage is unchanged.
+          #
+          # `lane` (not `paths`) is the matrix key so each of the 20
+          # entries stays one line; the step maps lane to its path set and
+          # then slices it. The `root` path set keeps its original
+          # reasoning: ``tests/integration`` and ``tests/e2e`` are
+          # deliberately NOT ignored — the ``-m`` filter already drops the
+          # marked tests inside them, and ignoring the directories
+          # silently dropped 209 tests.
+          - { lane: unit, shard: unit-00, index: "0",  count: "12" }
+          - { lane: unit, shard: unit-01, index: "1",  count: "12" }
+          - { lane: unit, shard: unit-02, index: "2",  count: "12" }
+          - { lane: unit, shard: unit-03, index: "3",  count: "12" }
+          - { lane: unit, shard: unit-04, index: "4",  count: "12" }
+          - { lane: unit, shard: unit-05, index: "5",  count: "12" }
+          - { lane: unit, shard: unit-06, index: "6",  count: "12" }
+          - { lane: unit, shard: unit-07, index: "7",  count: "12" }
+          - { lane: unit, shard: unit-08, index: "8",  count: "12" }
+          - { lane: unit, shard: unit-09, index: "9",  count: "12" }
+          - { lane: unit, shard: unit-10, index: "10", count: "12" }
+          - { lane: unit, shard: unit-11, index: "11", count: "12" }
+          - { lane: root, shard: root-0, index: "0", count: "7" }
+          - { lane: root, shard: root-1, index: "1", count: "7" }
+          - { lane: root, shard: root-2, index: "2", count: "7" }
+          - { lane: root, shard: root-3, index: "3", count: "7" }
+          - { lane: root, shard: root-4, index: "4", count: "7" }
+          - { lane: root, shard: root-5, index: "5", count: "7" }
+          - { lane: root, shard: root-6, index: "6", count: "7" }
+          - lane: misc
+            shard: misc
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -649,6 +669,59 @@ jobs:
           CI_STACK_DUMP_PATH: pytest-stack-dump-${{ matrix.shard }}.txt
         run: |
           set -o pipefail
+          # --- which files this shard owns ---------------------------------
+          # The matrix carries a lane plus a (index, count) pair rather
+          # than a path list, so a shard is defined by a slice of the
+          # collected file set rather than by a directory. Directories do
+          # not split usefully here: 249 of the 283 files under
+          # tests/unit sit at its top level.
+          case "${{ matrix.lane }}" in
+            unit) LANE_PATHS="tests/unit" ;;
+            root) LANE_PATHS="tests/ --ignore=tests/unit --ignore=tests/contract --ignore=tests/concurrency --ignore=tests/performance --ignore=tests/security --ignore=tests/meta_tests" ;;
+            misc) LANE_PATHS="tests/contract tests/security tests/meta_tests tests/concurrency tests/performance" ;;
+            *) echo "::error::unknown lane '${{ matrix.lane }}'"; exit 2 ;;
+          esac
+          if [ -n "${{ matrix.index }}" ]; then
+            # Round-robin over the collected files. Every file lands in
+            # exactly one shard (``NR % count == index`` partitions the
+            # list), so the shards' union is the lane's whole file set and
+            # the combined coverage is what the single job produced.
+            #
+            # ``-o addopts=`` because pytest.ini sets ``-v``, which turns
+            # ``--collect-only`` into a tree with no ``path::name`` lines
+            # to slice. The file is taken by STRIPPING from ``::`` and the
+            # line must actually BE a node id (``\.py::``): pytest's
+            # warnings summary also emits ``tests/...`` lines, and without
+            # the ``::`` they pass through as targets and pytest answers
+            # "file or directory not found". Both of those bit this repo
+            # on the staircase lane (runs 35851035325 and 35851915784).
+            #
+            # No ``-m`` here, deliberately. The marker belongs to the
+            # pytest invocation below, and it is the ONLY place it is
+            # written: ``test_default_lane_excludes_the_marker`` reads the
+            # one authoritative expression per lane, and a second literal
+            # copy would make that gate ambiguous about which one governs.
+            # Omitting it costs nothing — the file set collected here is a
+            # superset (a file whose tests are all marked e2e still lists),
+            # and the marker on the real invocation drops exactly those
+            # tests, so the set of tests actually executed is unchanged.
+            echo "shard ${{ matrix.shard }}: resolving file $(( ${{ matrix.index }} + 1 )) of ${{ matrix.count }} from ${LANE_PATHS}"
+            TARGETS=$(./.venv/bin/python3 -m pytest ${LANE_PATHS} \
+                        --collect-only -q -o addopts= -p no:cacheprovider -p no:warnings 2>/dev/null \
+                      | grep -E '^tests/[^:]*\.py::' | sed 's/::.*//' | sort -u \
+                      | awk -v i="${{ matrix.index }}" -v n="${{ matrix.count }}" 'NR % n == i' \
+                      | tr '\n' ' ')
+            FILE_COUNT=$(echo "$TARGETS" | wc -w | tr -d ' ')
+            echo "shard ${{ matrix.shard }}: ${FILE_COUNT} file(s)"
+            # A shard with no files is not a shard — it is a silent hole in
+            # the suite, and it would report success. Say so loudly.
+            if [ "$FILE_COUNT" -eq 0 ]; then
+              echo "::error::shard ${{ matrix.shard }} resolved to zero files; the slice or the lane's path set is wrong"
+              exit 2
+            fi
+          else
+            TARGETS="$LANE_PATHS"
+          fi
           # NO ``ulimit`` guardrails here (2026-09-23, reverted).
           #
           # An earlier revision of this step set ``ulimit -t 900`` /
@@ -690,7 +763,7 @@ jobs:
           # symptom.
           set +e
           COVERAGE_FILE=.coverage.${{ matrix.shard }} \
-          setsid ./.venv/bin/python3 -m pytest ${{ matrix.paths }} \
+          setsid ./.venv/bin/python3 -m pytest $TARGETS \
             -m "not e2e and not integration and not perf" \
             --cov=. \
             --cov-report= \
