@@ -593,6 +593,17 @@ backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_ci_lanes_mat
 backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_ci_lanes_match_marker_contracts.py backend/tests/performance/test_backend_startup_perf.py -q
 ```
 
+### Finding ENTRY-033
+档位: should-fix
+问题: **文件锁 broker 的服务线程在 Linux 上停不下来，泄漏到用例之外。** `FileLockBroker.stop()` 靠关闭监听套接字来结束服务线程，但那个线程正阻塞在 `server.accept()` 上。在 Linux 上，一个已经阻塞在 `accept()` 里的线程会通过未决的系统调用继续持有文件描述符，所以 `close()` 并不唤醒它 —— `_serve()` 唯一的退出信号（`accept()` 抛 `OSError`）永远不会到达，线程活过 `stop()` 的 `join(timeout=5.0)`，也活过 conftest 泄漏守卫的 `join(timeout=10)`。macOS 会唤醒它（阻塞中的 `accept` 以 ECONNABORTED 失败），所以这个缺陷在开发机上完全不可见，只在 Linux runner 上现形。
+影响: 每一次 agent 运行结束都留下一条 daemon 线程和一个监听套接字。在 CI 上它以泄漏守卫的形式报错，并指名肇事线程：run 36576222631 的 `alt-26-50` 分片有 6 个用例 ERROR（`test_agent_dispatch.py` 3 个、`test_agent_execution_log.py` 3 个），断言为 `1 application worker thread(s) outlived their test` / `assert not [<_RecordingThread(pdt-lock-broker, started daemon ...)>]`。单个分片里这是可数的几条；`unit` 分片要跑几千个用例，累积的线程与套接字是那条 lane 被 45 分钟回收的一个可信来源 —— 这一条尚未单独确证，先按已证实的缺陷记账。
+攻击路径: 前置条件 — 无（这是测试隔离与 CI 有效性的缺陷，不是运行时漏洞；列出它是为了让本轮改动可归因）；触发步骤 — 在 Linux 上跑任何一个会启动 broker 的用例，然后等它结束；可观测后果 — conftest 的泄漏断言以 `pdt-lock-broker` 点名该线程、用例 ERROR，而每个这样的用例还留下一条永不退出的线程与一个占用的 fd。
+修复: `backend/file_lock_broker.py` 让服务循环轮询停止标志，而不是指望 `close()` 去唤醒 `accept()`：`start()` 在 `listen()` 之后调用 `server.settimeout(_ACCEPT_POLL_SECONDS)`，`_serve()` 增加 `except socket.timeout: continue`。轮询间隔 0.2s —— 它就是关停延迟，短到无感，又长到不构成忙等（线程除这一小段时间外都在睡眠）。`accept()` 返回的套接字无论监听套接字是否带超时都仍是阻塞模式（Python 3.7 起），所以每连接的 `_handle` 线程不受影响。**不能改用 `shutdown()`**：未连接的监听套接字上调用它会以 `ENOTCONN` 失败（在本机复现过），那条路走不通，这也是为什么选择轮询而不是"先 shutdown 再 close"。新增 `test_stop_ends_the_serving_thread_even_when_close_cannot_wake_it` 钉住这条契约：它用一层只截掉 `close()` 的代理把 Linux 的行为模拟出来（`socket.close` 在 C 类型上是只读属性，只能靠委托拦截），因此这条用例在 macOS 上也能区分修复前后 —— 旧写法会把 `join` 的 5 秒预算耗尽仍然失败，新写法让线程立即退出。已验证该用例对旧写法失败、对新写法通过。
+验证方式:
+```bash
+backend/.venv/bin/python3 -m pytest backend/tests/unit/test_file_lock_broker.py backend/tests/static_gates/test_diff_is_attributable_to_audit_findings.py -q
+```
+
 ---
 
 ## Appendix A — modified tests
