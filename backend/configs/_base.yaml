@@ -1,0 +1,157 @@
+# Base Configuration
+# Contains common prompts and settings shared by all domain configurations
+# This file is automatically merged with domain-specific configs
+#
+# Fields starting with underscore (_) are internal components used to build prompts.
+# Domain configs can reference these components and add their own domain-specific content.
+
+# =============================================================================
+# INTERNAL COMPONENTS (used to build prompts, not exposed directly)
+# =============================================================================
+
+# Common Task ID Rules (used in planner and refiner prompts)
+_task_id_rules: |
+  IMPORTANT: Task IDs must follow a hierarchical format using strings:
+  - First-level tasks use simple numeric IDs: "1", "2", "3", ...
+  - If a task needs to be broken into subtasks, use "-" to connect the original ID with the subtask ID:
+    - Task "1" broken into 3 subtasks -> "1-1", "1-2", "1-3"
+    - Task "1-1" broken into 2 subtasks -> "1-1-1", "1-1-2"
+  - Task IDs must always be unique strings
+
+# Common JSON output format for planner
+# (model_type rule: see _planner_json_format below near model_map for full
+#  description of complex vs medium selection.)
+
+# Common file output format for executor
+_executor_file_format: |
+  Provide a list of files to be created or modified, with their FULL content.
+  IMPORTANT: All file paths must be RELATIVE to the project directory. Do NOT use absolute paths.
+  Format:
+  FILE: path/to/file
+  ```
+  content
+  ```
+  FILE: path/to/another_file
+  ```
+  content
+  ```
+
+# Common refiner failure handling rules
+_refiner_failure_rules: |
+  CRITICAL: If the last task FAILED, you MUST:
+  1. Analyze the error output and the implementation attempt to understand the root cause.
+  2. Break down the failed task into smaller, more manageable, and more specific subtasks that address the root cause of the failure.
+  3. Generate hierarchical IDs for the new subtasks. For example, if task "2" failed, create subtasks like "2-1", "2-2", "2-3".
+  4. Replace the failed task with the new subtasks in the task list.
+
+  CRITICAL PRESERVATION RULES (READ THESE FIRST):
+  - DO NOT remove tasks unrelated to the current failure. Only the failed task and its hierarchical descendants may be removed/replaced.
+  - If a task's title and description do not relate to the failed task's domain, PRESERVE it verbatim (same id, title, description, status, project_dir, test_commands).
+  - Tasks with IDs not derived from the failed task ID (e.g. task "17" or task "18" when task "15" failed) MUST be preserved unless they are explicitly a descendant of the failed task.
+  - User-added tasks (introduced after the initial plan was generated) represent explicit user requirements and MUST be preserved.
+  - When in doubt: PRESERVE rather than delete. Cleaning up "redundant" tasks is a destructive operation that loses user intent; defer that judgment to a human reviewer.
+
+# Common refiner JSON format
+_refiner_json_format: |
+  Output the COMPLETE updated list of tasks in the following JSON format:
+  {
+    "tasks": [
+      {
+        "id": "1",
+        "title": "Short title",
+        "description": "Detailed description",
+        "test_command": "Command to verify",
+        "model_type": "complex | medium",
+        "status": "pending/completed/failed/in_progress",
+        "updated_time": "ISO8601 timestamp or null"
+      }
+    ]
+  }
+  IMPORTANT: You MUST preserve these metadata fields from existing tasks:
+  1. "status" - Do not change the status of completed tasks
+  2. "updated_time" - Always preserve this field if it exists
+  3. "model_type" - Preserve if set; for new/replacement tasks choose by complexity
+  When returning the updated task list, include these fields for all existing tasks.
+
+# Common task JSON format for execution tasks (planner + repair generator)
+_planner_json_format: |
+  Output the result in the following JSON format:
+  {
+    "tasks": [
+      {
+        "id": "1",
+        "title": "Short title",
+        "description": "Detailed description of what to do",
+        "test_command": "The shell command to run to verify this subtask",
+        "model_type": "complex | medium"
+      }
+    ]
+  }
+
+  model_type choice rules:
+  - **complex** (complex tasks) - multi-file coordination, state machines, concurrency/resource management, protocol parsing, debugging complex bugs, MCP operations (e.g. puppeteer end-to-end verification, browser automation), cross-service integration, framework design
+  - **medium** (medium tasks) - templated CRUD, single-file modifications, pure queries, clear bug fixes (diagnosis already clear), routine import/format corrections
+
+  Experience: implementation tasks in the execution phase are usually medium; end-to-end puppeteer verification tasks in the verification phase must be complex (operating MCP is a high-difficulty action).
+
+# =============================================================================
+# DEFAULT SETTINGS (can be overridden by domain configs)
+# =============================================================================
+
+# Default behavior settings
+max_retries: 2
+background_task_timeout: 180
+
+# Default file patterns (catch-all)
+file_patterns:
+  - "*"
+
+# =============================================================================
+# PROVIDER DEFINITIONS — MOVED OUT OF THE REPOSITORY (2026-09-24)
+# =============================================================================
+# This file used to declare a ``providers:`` block mapping a locally-invented
+# provider id (``vendor-a-pro``, ``vendor-b-pro``, ...) onto the row name that
+# provider has in the operator's CC Switch database.
+#
+# That is gone, and nothing reads it. Two reasons:
+#
+#   1. **The id was redundant.** Scene routing already selects providers by
+#      REGEX OVER THEIR NAMES (see ``provider_routing.yaml``), so the name is
+#      the identity. A second, locally-invented key alongside it meant every
+#      provider had to be declared twice and the two could drift while both
+#      looked authoritative.
+#
+#   2. **It does not belong in a shipped file.** Which providers exist is a
+#      property of one operator's machine, not of this project. Compiling a
+#      provider set into the file every user downloads publishes one person's
+#      setup as though it were everyone's, and silently routes anyone who
+#      never edited it.
+#
+# WHERE PROVIDER CONFIGURATION LIVES NOW — ``<repo>/.config/``:
+#
+#   * ``provider_routing.yaml`` — maps workflow scenes onto the ``high`` /
+#     ``medium`` / ``low`` tiers, each tier a list of regexes matched against
+#     provider names. This is the whole configuration.
+#   * With no CC Switch installed, there is nothing to configure: leave
+#     ``.config/`` empty and the backend runs on your own Claude Code setup
+#     (``~/.claude/settings.json`` and the ``ANTHROPIC_*`` variables) without
+#     managing it.
+#
+# Templates for both files ship in ``<repo>/example/`` — copy one into
+# ``.config/`` and rename it to the real filename to activate it. See
+# README.md for the directory tree.
+# =============================================================================
+
+# =============================================================================
+# MODEL MAP — REMOVED (2026-09-13)
+# =============================================================================
+# The tiered model_map (complex/medium → provider → model) has been
+# removed. Model management is delegated ENTIRELY to CC Switch: each
+# provider row in the CC Switch database carries its own complete
+# ANTHROPIC_* env block (base URL, credentials, and model names), which
+# the backend forwards verbatim to the sub-agent subprocess.
+#
+# Which providers a given workflow phase may use is now decided by
+# provider_routing.yaml (scene → tier → regex over CC Switch display
+# names). See backend/provider_routing.py.
+# =============================================================================

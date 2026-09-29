@@ -1,0 +1,78 @@
+{
+  "plan_id": "test-diagnosis-output",
+  "generated_at": "2026-06-15T00:00:00Z",
+  "source": "pytest",
+  "total_failures": 10,
+  "failures": [
+    {
+      "test_id": "backend/tests/fixtures/diagnosis_target.py::test_bucket_assertion_alpha",
+      "line_no": 11,
+      "bucket": "assertion",
+      "error_type": "AssertionError",
+      "message": "Simulated assertion failure for test_bucket_assertion_alpha"
+    },
+    {
+      "test_id": "backend/tests/fixtures/diagnosis_target.py::test_bucket_assertion_beta",
+      "line_no": 16,
+      "bucket": "assertion",
+      "error_type": "AssertionError",
+      "message": "Simulated assertion failure for test_bucket_assertion_beta"
+    },
+    {
+      "test_id": "backend/tests/fixtures/diagnosis_target.py::test_bucket_import_gamma",
+      "line_no": 21,
+      "bucket": "import",
+      "error_type": "ImportError",
+      "message": "Simulated import failure for test_bucket_import_gamma"
+    },
+    {
+      "test_id": "backend/tests/fixtures/diagnosis_target.py::test_bucket_import_delta",
+      "line_no": 26,
+      "bucket": "import",
+      "error_type": "ModuleNotFoundError",
+      "message": "Simulated import failure for test_bucket_import_delta"
+    },
+    {
+      "test_id": "backend/tests/fixtures/diagnosis_target.py::test_bucket_timeout_epsilon",
+      "line_no": 31,
+      "bucket": "timeout",
+      "error_type": "asyncio.TimeoutError",
+      "message": "Simulated timeout failure for test_bucket_timeout_epsilon"
+    },
+    {
+      "test_id": "backend/tests/fixtures/diagnosis_target.py::test_bucket_timeout_zeta",
+      "line_no": 36,
+      "bucket": "timeout",
+      "error_type": "pytest_timeout",
+      "message": "Simulated timeout failure for test_bucket_timeout_zeta"
+    },
+    {
+      "test_id": "backend/tests/fixtures/diagnosis_target.py::test_bucket_syntax_eta",
+      "line_no": 41,
+      "bucket": "syntax",
+      "error_type": "SyntaxError",
+      "message": "Simulated syntax failure for test_bucket_syntax_eta"
+    },
+    {
+      "test_id": "backend/tests/fixtures/diagnosis_target.py::test_bucket_missing_fixture_theta",
+      "line_no": 46,
+      "bucket": "missing_fixture",
+      "error_type": "MissingFixture",
+      "message": "Simulated missing_fixture failure for test_bucket_missing_fixture_theta"
+    },
+    {
+      "test_id": "backend/tests/fixtures/diagnosis_target.py::test_bucket_runtime_iota",
+      "line_no": 51,
+      "bucket": "runtime",
+      "error_type": "RuntimeError",
+      "message": "Simulated runtime failure for test_bucket_runtime_iota"
+    },
+    {
+      "test_id": "backend/tests/fixtures/diagnosis_target.py::test_bucket_runtime_kappa",
+      "line_no": 56,
+      "bucket": "runtime",
+      "error_type": "ValueError",
+      "message": "Simulated runtime failure for test_bucket_runtime_kappa"
+    }
+  ]
+}

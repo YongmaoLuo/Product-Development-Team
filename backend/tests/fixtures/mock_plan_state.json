@@ -1,0 +1,13 @@
+{
+  "plan_id": "test-plan",
+  "current_phase": "completed",
+  "completed_phases": [],
+  "review_rounds": {"prd": 0, "arch": 0, "test": 0},
+  "flags": {},
+  "verification": {
+    "status": "pending",
+    "round": 0,
+    "max_rounds": 3,
+    "stop_reason": null
+  }
+}

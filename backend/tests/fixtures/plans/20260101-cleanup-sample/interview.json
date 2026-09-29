@@ -1,0 +1,40 @@
+{
+  "plan_id": "20260101-cleanup-sample",
+  "created_at": "2026-08-05T00:00:00.000000Z",
+  "status": "complete",
+  "dimensions": {
+    "background": "E2E fixture for the three-defense cleanup gate. Provides a minimal interview scaffold so the EXEC_PORT=8001 server accepts the lifecycle endpoint and the e2e teardown walk has allowlisted baseline artifacts to assert against.",
+    "goals": [
+      "Provide a planted interview.json that satisfies the /api/execution/{plan_id}/start pre-condition",
+      "Carry no JSON sidecars that would trip Defense 1 (source grep) or Defense 1b (filesystem teardown)",
+      "Provide a minimal tasks.json + verification_plan.json + verification_report.json trio so the fixture plan is schema-complete and does not regress the allowlist"
+    ],
+    "scope": {
+      "in": [
+        "interview.json: minimal 5-dimension content",
+        "tasks.json: empty list (no real tasks; the e2e fixture does not exercise task execution)",
+        "verification_plan.json: 1 verification point with overall PASSED",
+        "verification_report.json: 1 verification result row"
+      ],
+      "out": [
+        "No real execution",
+        "No LLM-backed verification",
+        "No state.db sidecar on disk (the spawned server writes its own)"
+      ]
+    },
+    "constraints": {
+      "tech_stack": "JSON only — no executable scripts"
+    },
+    "acceptance": "After lifecycle + teardown: plans/20260101-cleanup-sample/ contains exactly {interview.json, tasks.json, verification_plan.json, verification_report.json}, and the surrounding plans/ tree has zero forbidden JSON sidecars."
+  },
+  "chat_history": [
+    {
+      "role": "user",
+      "content": "Plant a minimal cleanup-sample plan fixture so the e2e test can drive /api/execution/{plan_id}/start and verify the three-defense layers."
+    },
+    {
+      "role": "interviewer",
+      "content": "Five dimensions covered. Mark complete."
+    }
+  ]
+}

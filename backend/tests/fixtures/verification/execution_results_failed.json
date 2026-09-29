@@ -1,0 +1,37 @@
+{
+  "verification_points": [
+    {
+      "id": "VP-001",
+      "title": "用户登录功能测试",
+      "related_prd_criteria": "用户可以使用正确用户名密码登录",
+      "verification_method": "automated_test",
+      "priority": "high",
+      "expected_result": "登录功能正常工作，失败率<1%",
+      "test_command": "pytest tests/test_login.py -v"
+    },
+    {
+      "id": "VP-002", 
+      "title": "错误处理验证",
+      "related_prd_criteria": "错误处理清晰，用户能理解失败原因",
+      "verification_method": "code_review",
+      "priority": "high",
+      "expected_result": "代码包含完整的错误处理逻辑",
+      "test_command": ""
+    }
+  ],
+  "execution_results": [
+    {
+      "id": "VP-001",
+      "status": "FAILED",
+      "actual_result": "测试失败：未找到错误处理逻辑",
+      "evidence": "测试输出显示缺少异常处理代码，登录失败时系统崩溃而非返回错误消息"
+    },
+    {
+      "id": "VP-002",
+      "status": "FAILED", 
+      "actual_result": "代码审查失败",
+      "evidence": "登录函数缺少try-except块，无错误日志记录"
+    }
+  ],
+  "executed_at": "2024-01-01T12:00:00"
+}

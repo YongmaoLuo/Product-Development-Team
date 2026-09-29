@@ -1,0 +1,73 @@
+name: JSON cleanup defense gate
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "backend/server.py"
+      - "backend/verification_executor.py"
+      - "backend/state_machine/**"
+      - "backend/tests/test_server_json_cleanup.py"
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/server.py"
+      - "backend/verification_executor.py"
+      - "backend/state_machine/**"
+      - "backend/tests/test_server_json_cleanup.py"
+
+permissions:
+  contents: read
+
+env:
+  EXEC_PORT: 8001
+
+jobs:
+  json-cleanup:
+    name: JSON cleanup three-layer defense
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Create project virtual environment
+        run: python -m venv backend/.venv
+
+      - name: Install backend dependencies
+        run: |
+          backend/.venv/bin/python3 -m pip install --upgrade pip
+          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout
+
+      - name: Verify execution port is available
+        run: |
+          if lsof -iTCP:"${EXEC_PORT}" -sTCP:LISTEN -t >/dev/null 2>&1; then
+            echo "Port ${EXEC_PORT} is already in use"
+            exit 1
+          fi
+          echo "Port ${EXEC_PORT} is available"
+
+      - name: Run JSON cleanup tests
+        run: |
+          backend/.venv/bin/python3 -m pytest \
+            backend/tests/test_server_json_cleanup.py \
+            --strict-markers \
+            --durations=20 \
+            --junitxml=json-cleanup-junit.xml
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-cleanup-test-report-${{ github.run_id }}
+          path: json-cleanup-junit.xml
+          if-no-files-found: warn
+          retention-days: 14

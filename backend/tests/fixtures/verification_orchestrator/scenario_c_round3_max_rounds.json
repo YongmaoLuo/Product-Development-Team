@@ -1,0 +1,25 @@
+{
+  "overall_status": "FAILED",
+  "verification_results": [
+    {
+      "id": "VP-001",
+      "status": "FAILED",
+      "actual_result": "Test failed: assertion error in login flow",
+      "evidence": "pytest output: AssertionError: expected 200, got 401"
+    },
+    {
+      "id": "VP-002",
+      "status": "FAILED",
+      "actual_result": "UI validation failed",
+      "evidence": "puppeteer timeout"
+    }
+  ],
+  "requirement_deviations": [
+    {
+      "verification_point_id": "VP-001",
+      "type": "missing",
+      "description": "Login flow not implemented correctly",
+      "severity": "high"
+    }
+  ]
+}

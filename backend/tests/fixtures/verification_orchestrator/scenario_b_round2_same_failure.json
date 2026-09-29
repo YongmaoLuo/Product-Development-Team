@@ -1,0 +1,12 @@
+{
+  "overall_status": "FAILED",
+  "verification_results": [
+    {
+      "id": "VP-001",
+      "status": "FAILED",
+      "actual_result": "Test failed: assertion error in login flow",
+      "evidence": "pytest output: AssertionError: expected 200, got 401"
+    }
+  ],
+  "requirement_deviations": []
+}

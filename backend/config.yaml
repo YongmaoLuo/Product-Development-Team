@@ -1,0 +1,61 @@
+# the backend configuration.
+#
+# This file declares paths and ancillary process definitions that the
+# FastAPI server reads at startup. The fields here are intentionally
+# kept thin — most provider / model configuration still lives in
+# backend/configs/_base.yaml (the domain-specific config layer).
+#
+# Resolution rules
+# ----------------
+# * ``provider_order_file`` is a *relative* path resolved against the
+#   project root (``Path(__file__).parent.parent`` from backend/server.py).
+#
+#   There is deliberately **no default value that points anywhere
+#   useful**. The provider-order contract is written by an external
+#   optimizer process that is not part of this repository, so a checkout
+#   that has not configured one has no order file — and
+#   ``backend/provider_order.load_fallback_order()`` is expected to say
+#   so rather than silently invent a provider chain.
+#
+#   Set the path either here or, preferably, with the
+#   ``PROVIDER_ORDER_FILE`` environment variable. When set, the env value
+#   is used verbatim — it may be an absolute path or a path relative to
+#   CWD.
+#
+# * ``subsidiary_processes`` lists long-running subprocesses that the
+#   server brings up during the FastAPI lifespan, in order. It is empty
+#   by default: this repository ships the mechanism, not any particular
+#   fleet. Operators add their own entries.
+#
+#   Two properties of the mechanism are load-bearing and worth keeping
+#   in mind when adding entries:
+#     - a failed start aborts uvicorn startup (strong-consistency
+#       guarantee), unless the entry is marked ``optional: true``;
+#     - entries start in list order, so a producer must precede anything
+#       that consumes what it writes.
+
+# Path to the JSON contract file read by
+# backend/provider_order.load_fallback_order().
+#
+# Resolved as: <project_root>/<provider_order_file>
+# Override at runtime with: PROVIDER_ORDER_FILE=/abs/path/to/file.json
+#
+# Left unset on purpose — see the header. Uncomment and point it at your
+# optimizer's output to enable the fallback provider order.
+# provider_order_file: provider-order.json
+
+# Long-running subsidiary processes supervised by the FastAPI lifespan.
+#
+# Each entry maps a logical name to a launch spec:
+#
+#   subsidiary_processes:
+#     - name: my-service
+#       cmd: ["/abs/or/relative/python", "path/to/main.py"]
+#       cwd: ".."                     # relative to backend/
+#       ready_file: state/ready.json  # optional; supervisor waits for it
+#       optional: true                # optional; default false
+#       restart_on_crash: true
+#       poll_interval_sec: 3
+#
+# Empty here by design.
+subsidiary_processes: []

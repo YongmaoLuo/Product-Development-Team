@@ -1,0 +1,13 @@
+{
+  "plan_id": "test-plan",
+  "round": 0,
+  "overall_status": "PASSED",
+  "verification_points": [],
+  "requirement_deviations": [],
+  "summary": {
+    "passed": 0,
+    "failed": 0,
+    "skipped": 0,
+    "total": 0
+  }
+}

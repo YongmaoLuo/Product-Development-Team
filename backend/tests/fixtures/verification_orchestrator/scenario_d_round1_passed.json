@@ -1,0 +1,18 @@
+{
+  "overall_status": "PASSED",
+  "verification_results": [
+    {
+      "id": "VP-001",
+      "status": "PASSED",
+      "actual_result": "Test passed",
+      "evidence": "pytest output: 3 passed"
+    },
+    {
+      "id": "VP-002",
+      "status": "PASSED",
+      "actual_result": "Code review passed",
+      "evidence": "No issues found"
+    }
+  ],
+  "requirement_deviations": []
+}

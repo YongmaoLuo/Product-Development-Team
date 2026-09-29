@@ -1,0 +1,24 @@
+# Documentation-site dependencies — deliberately NOT in backend/requirements.txt.
+#
+# The server does not need any of this. Keeping it separate means a
+# deployment that only runs the backend never installs a static-site
+# generator, and a docs-only change never invalidates the backend's
+# dependency layer in CI.
+#
+# Install (into the project venv, or any venv):
+#     backend/.venv/bin/python3 -m pip install -r docs/requirements.txt
+#
+# Build:
+#     backend/.venv/bin/python3 -m mkdocs build --strict
+#
+# ``--strict`` is what makes this a gate rather than a convenience: a
+# nav entry pointing at a missing file, or a link to a page that does not
+# exist, exits non-zero. .github/workflows/pages.yml runs it on every
+# pull request for exactly that reason.
+
+mkdocs>=1.6.0
+mkdocs-material>=9.5.0
+# Bilingual site: builds the default locale at `/` and every other locale
+# under `/<locale>/`, and renders the language selector in the header.
+# Structure is `suffix` — `page.md` (English) + `page.zh.md` (Chinese).
+mkdocs-static-i18n>=1.2.0

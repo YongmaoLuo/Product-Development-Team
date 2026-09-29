@@ -1,0 +1,26 @@
+{
+  "requirement": "backward-compatibility test fixture (old tasks.json format)",
+  "stop_reason": null,
+  "reason_detail": null,
+  "tasks": [
+    {
+      "id": "1",
+      "title": "legacy task A",
+      "description": "Old-format task with no files_to_modify, no provider, no model_type, no breakdown_count.",
+      "test_command": "echo legacy-A"
+    },
+    {
+      "id": "2",
+      "title": "legacy task B",
+      "description": "Second legacy task. Should serialise with task 1 because both declare the unknown-modifications sentinel.",
+      "test_command": "echo legacy-B"
+    },
+    {
+      "id": "3",
+      "title": "modern task with explicit files",
+      "description": "Modern-format task that declares files_to_modify disjoint from the sentinel. Should run concurrently with legacy tasks.",
+      "test_command": "echo modern-3",
+      "files_to_modify": ["src/modern.py"]
+    }
+  ]
+}

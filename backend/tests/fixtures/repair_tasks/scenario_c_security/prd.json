@@ -1,0 +1,28 @@
+{
+  "title": "用户认证系统",
+  "overview": "实现一个安全的用户认证系统，防止暴力破解和未授权访问。",
+  "constraints": "使用Python + FastAPI，JWT token认证，bcrypt密码加密",
+  "acceptance": "1. 登录失败5次后锁定账户30分钟\n2. 密码使用bcrypt加密\n3. 支持IP黑名单功能\n4. 记录所有登录失败日志",
+  "decision_points": [
+    {
+      "index": 0,
+      "title": "账户锁定策略",
+      "context": "系统需要防止暴力破解攻击",
+      "problem": "如何在防止攻击的同时不影响正常用户",
+      "evidence": "账户锁定是防止暴力破解的有效手段",
+      "action": "登录失败5次后锁定账户30分钟",
+      "impact": "用户认证流程",
+      "alternatives": ["使用验证码", "渐进式延迟"]
+    },
+    {
+      "index": 1,
+      "title": "密码安全策略",
+      "context": "用户密码需要安全存储",
+      "problem": "如何防止密码泄露",
+      "evidence": "bcrypt是当前最安全的密码哈希算法之一",
+      "action": "使用bcrypt加密密码，cost factor=12",
+      "impact": "用户密码存储",
+      "alternatives": ["使用PBKDF2", "使用SHA256"]
+    }
+  ]
+}

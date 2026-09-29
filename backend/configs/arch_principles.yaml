@@ -1,0 +1,84 @@
+# Architecture Design Principles Library
+# ======================================
+#
+# Pre-defined design principles that every ``arch-design.md`` must
+# declare in its ``## Design Principles`` section. The
+# ``DesignPrincipleValidator`` (see ``backend/arch_design_principles.py``)
+# uses this yaml to check the architecture document for principle coverage
+# and consistency.
+#
+# Schema
+# ------
+# ``principles`` is a list; each entry has:
+#   * ``name``        — the canonical principle identifier in the
+#                       human-readable form shown in the validator
+#                       output (``PrincipleCheck["principle"]``).
+#                       Each name uses single spaces (no underscores)
+#                       — matching the task spec example
+#                       (``"stateless services"``).
+#   * ``description`` — one-line human-readable description (English).
+#   * ``keywords``    — list of substrings (case-insensitive) that the
+#                       keyword fallback matcher checks against the
+#                       ``## Design Principles`` section text.
+#   * ``required_keywords`` — list of substrings that MUST all be
+#                       present (after the section is parsed) for a
+#                       principle to be marked ``is_consistent=True``
+#                       by the keyword fallback. Optional; if empty
+#                       the principle is satisfied by any keyword hit.
+#
+# The yaml is intentionally the ONLY source of truth for the
+# principle library: ``DesignPrincipleValidator`` loads it via
+# ``yaml.safe_load`` and falls back to a hard-coded 5-principle set
+# when this file is missing or malformed, so the agent never crashes
+# on a config error.
+
+principles:
+  - name: "solid single responsibility"
+    description: "SOLID — every module has exactly one reason to change."
+    keywords:
+      - "single responsibility"
+      - "SRP"
+      - "单一职责"
+    required_keywords:
+      - "single responsibility"
+
+  - name: "twelve factor config"
+    description: "12-Factor — config lives in the environment, never in code."
+    keywords:
+      - "twelve-factor"
+      - "12-factor"
+      - "env var"
+      - "环境变量"
+      - "configuration via env"
+    required_keywords:
+      - "env var"
+
+  - name: "layered architecture"
+    description: "Layered architecture — strict dependency ordering between layers."
+    keywords:
+      - "layered"
+      - "分层"
+      - "layer"
+    required_keywords:
+      - "layer"
+
+  - name: "stateless services"
+    description: "Stateless services — no mutable local state inside a service process."
+    keywords:
+      - "stateless"
+      - "无状态"
+      - "no local state"
+    required_keywords:
+      - "stateless"
+
+  - name: "explicit error boundaries"
+    description: "Explicit error boundaries — every cross-layer call returns a typed Result/Either."
+    keywords:
+      - "explicit error"
+      - "error boundary"
+      - "Result"
+      - "Either"
+      - "显式错误"
+      - "explicit return"
+    required_keywords:
+      - "error"

@@ -1,0 +1,109 @@
+# .pre-commit-config.yaml — local pre-commit hooks for the project.
+#
+# Why a local hook (and not a hosted hook)?
+# -----------------------------------------
+# The grep-guard gate is a regex sweep of the backend production
+# source tree. It is purely local — no network, no API calls, no
+# third-party services. A hosted pre-commit hook (e.g. from
+# pre-commit.com's default hooks repo) would only add network
+# latency for zero gain.
+#
+# The hook delegates to ``scripts/grep_guard.sh`` so the SAME shell
+# wrapper is the entry point for:
+#
+#   * developer local pre-commit (this file);
+#   * GitHub Actions CI (``.github/workflows/ci.yml``);
+#   * ad-hoc ``bash scripts/grep_guard.sh`` invocations from any cwd.
+#
+# One source of truth for venv resolution, ``sys.path`` insertion,
+# and the exit-code contract.
+#
+# Why ``language: system``?
+# -------------------------
+# The hook shell-script already resolves the project venv Python
+# internally (see ``scripts/grep_guard.sh``).  A
+# ``language: python`` hook would force pre-commit to build yet
+# another isolated Python venv, which is redundant — we already
+# have the project venv.
+#
+# Stages
+# ------
+# pre-commit: runs on every ``git commit``. Files passed to the hook
+# are filtered so the gate only scans the touched files (cheap,
+# fast feedback loop) while still respecting the project's
+# "default production scope" on a clean run.
+#
+# Failing-fast behaviour
+# ----------------------
+# A grep-guard violation aborts the commit (exit 1). Developers see
+# the same one-line-per-violation output the CI gate produces.
+#
+# First-time setup
+# ----------------
+# Install pre-commit (``brew install pre-commit`` on macOS, or
+# ``pip install pre-commit``), then in the project root::
+#
+#     pre-commit install
+#
+# This registers ``pre-commit`` as the ``pre-commit`` git hook for
+# the local clone. Subsequent ``git commit`` invocations run the
+# hook automatically.
+
+# Minimum pre-commit version — required for ``stages: [pre-commit]``
+# and the modern ``pass_filenames`` semantics used below.
+minimum_pre_commit_version: "3.0.0"
+
+repos:
+  # -----------------------------------------------------------------
+  # Local grep-guard gate — uses the shared ``scripts/grep_guard.sh``
+  # wrapper. Re-uses the project's venv Python via the wrapper so
+  # there is exactly one place that owns the venv resolution logic.
+  # -----------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: grep-guard
+        name: grep-guard (forbidden filename regex sweep)
+        # ``language: system`` means pre-commit invokes the hook as
+        # an executable directly — no managed Python venv created
+        # by pre-commit itself (the wrapper handles venv resolution).
+        language: system
+        # ``stages: [pre-commit]`` makes this run on every commit.
+        stages: [pre-commit]
+        # The hook must receive the list of staged files on stdin
+        # (one path per line). ``pass_filenames: false`` means we
+        # ignore that list and let the wrapper apply the default
+        # production scope — this matches CI exactly. (If we set
+        # ``pass_filenames: true`` the hook would have to filter
+        # against the production scope manually, duplicating the
+        # scanner's path-enumeration logic.)
+        pass_filenames: false
+        # Always run the gate on every commit. The script itself
+        # exits in < 1s on a clean tree (well within pre-commit's
+        # default 5s hook timeout) so this is not a UX hit.
+        always_run: true
+        entry: bash scripts/grep_guard.sh
+
+      # ---------------------------------------------------------------
+      # Commit-message hygiene — no AI attribution trailer.
+      #
+      # ``stages: [commit-msg]`` is a different stage from the hook
+      # above: it runs *after* git has assembled the message, and
+      # pre-commit passes the path to ``.git/COMMIT_EDITMSG`` as the
+      # hook's first argument. That file is what this hook inspects, so
+      # the positional path is the input — there is no filename list to
+      # filter, and ``pass_filenames`` is left at its default.
+      #
+      # ``language: system`` for the same reason as grep-guard: the
+      # script is a stdlib-only Python file run with the interpreter on
+      # PATH, so a managed venv would be pure overhead.
+      #
+      # Rationale and the exact rule live in ``scripts/check_commit_msg.py``.
+      # It is intentionally narrow: it checks the attribution *trailer*,
+      # not the prose, so a message may still discuss Claude Code,
+      # providers, or models.
+      # ---------------------------------------------------------------
+      - id: commit-msg-no-ai-attribution
+        name: commit-msg (no AI attribution trailer)
+        language: system
+        stages: [commit-msg]
+        entry: python3 scripts/check_commit_msg.py

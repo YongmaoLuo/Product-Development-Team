@@ -1,0 +1,25 @@
+{
+  "requirement": "test missing dependency A→Z rejection",
+  "stop_reason": null,
+  "reason_detail": null,
+  "tasks": [
+    {
+      "id": "A",
+      "title": "Task A referencing missing Z",
+      "description": "depends on task Z which does not exist in the task list",
+      "test_command": "echo A",
+      "test_commands": [],
+      "status": "pending",
+      "updated_time": null,
+      "failure_reason": null,
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": [
+        "Z"
+      ],
+      "files_to_modify": [
+        "__NO_FILE_CHANGES__"
+      ]
+    }
+  ]
+}

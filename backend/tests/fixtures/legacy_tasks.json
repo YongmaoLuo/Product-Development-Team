@@ -1,0 +1,46 @@
+{
+  "requirement": "legacy plan with tasks that pre-date files_to_modify support",
+  "stop_reason": null,
+  "reason_detail": null,
+  "tasks": [
+    {
+      "id": "1",
+      "title": "Set up repository scaffolding",
+      "description": "Initialize the project layout and base modules.",
+      "test_command": "echo scaffold",
+      "test_commands": [],
+      "status": "pending",
+      "updated_time": null,
+      "failure_reason": null,
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": []
+    },
+    {
+      "id": "2",
+      "title": "Implement core data model",
+      "description": "Add the canonical entities and their relations.",
+      "test_command": "echo model",
+      "test_commands": [],
+      "status": "pending",
+      "updated_time": null,
+      "failure_reason": null,
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": ["1"]
+    },
+    {
+      "id": "3",
+      "title": "Wire up CLI entry point",
+      "description": "Expose the public command-line interface.",
+      "test_command": "echo cli",
+      "test_commands": [],
+      "status": "completed",
+      "updated_time": "2026-01-01T00:00:00",
+      "failure_reason": null,
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": ["2"]
+    }
+  ]
+}

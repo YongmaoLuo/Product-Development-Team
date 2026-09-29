@@ -1,0 +1,100 @@
+name: Docs
+
+# Builds the MkDocs site and publishes it to GitHub Pages.
+#
+# Two jobs, and the split is the point:
+#
+#   * ``build`` runs on every pull request that touches the docs, with
+#     ``--strict``. That is the gate — a nav entry pointing at a missing
+#     page, or a link to a page that does not exist, exits non-zero and
+#     the PR cannot merge. A docs tree whose links rot is worse than no
+#     docs tree, and link rot is invisible in review.
+#   * ``deploy`` runs only on ``main``, and only after ``build`` passed.
+#     A pull request therefore validates without ever publishing.
+#
+# Why a separate workflow rather than another job in ``ci.yml``: the
+# deploy needs ``pages: write`` and ``id-token: write``, while ``ci.yml``
+# runs the whole test suite under ``contents: read``. Granting write
+# scope to the job that executes untrusted pull-request code is exactly
+# the trade this split avoids.
+#
+# The Markdown under ``docs/`` is plain and renders on github.com as
+# well, so nothing here is load-bearing for reading the docs in the
+# repository.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: docs/requirements.txt
+
+      # Docs-only dependencies, deliberately kept out of
+      # backend/requirements.txt so the server never installs a static
+      # site generator and a docs change never invalidates the backend's
+      # dependency layer.
+      - name: Install docs dependencies
+        run: python -m pip install -r docs/requirements.txt
+
+      # --strict turns a broken internal link or a nav entry naming a
+      # file that does not exist into a non-zero exit. Without it mkdocs
+      # warns and exits 0, which would make this job decorative.
+      - name: Build site (strict)
+        run: python -m mkdocs build --strict
+
+      - name: Configure Pages
+        if: github.ref == 'refs/heads/main'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: deploy
+    needs: build
+    # Merge gate is CI; publishing happens only from main.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

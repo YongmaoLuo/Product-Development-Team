@@ -1,0 +1,1243 @@
+name: CI
+
+# Field whitelist (single source of truth — pinned by
+# tests/integration/test_ci_alignment.py).
+#
+#   * Top-level fields:
+#       name, on, concurrency, permissions, jobs
+#   * Job-level fields:
+#       name, runs-on, needs, if, steps, permissions, timeout-minutes,
+#       concurrency, strategy, env, continue-on-error
+#   * Step-level fields:
+#       id, name, if, run, uses, with, working-directory,
+#       continue-on-error, env, shell, timeout-minutes
+#
+# Adding a field here requires (a) updating the Python constants
+# ALLOWED_TOP_LEVEL_FIELDS / ALLOWED_JOB_LEVEL_FIELDS /
+# ALLOWED_STEP_LEVEL_FIELDS in the test file to match, and
+# (b) confirming GitHub Actions accepts the new key. Removing a
+# field here requires first removing it from ci.yml.
+#
+# Slim CI pipeline — target total runtime ≤ 15 minutes.
+#   1. PR gate:       lint + unit (sharded, with coverage) + integration
+#   2. Main release:  lint + unit + integration + e2e + slow
+#   3. Nightly:       full automated regression suite (1482 tests,
+#                     not blocking the main release gate)
+#   4. Manual dispatch: maintainer-triggerable re-run of any layer
+#
+# Layered jobs (test-design decision point 7): unit / integration / e2e
+# / slow / nightly — each is its own job with its own marker, timeout,
+# and coverage gate. unit and integration were PR-only until
+# 2026-09-22; they now also run on push to main, because this repo's
+# workflow is a LOCAL merge into main followed by a direct push (there
+# are no PRs), so a PR-only gate never ran at all — and the e2e job,
+# which declares it runs on push to main, was silently skipped through
+# its ``needs: integration-tests``.
+#
+# The unit lane is a MATRIX of three shards (2026-09-22). As a single
+# job it ran 4916 tests and died at ~49 minutes on a GitHub runner with
+# "lost communication with the server" — no log uploaded, three runs in
+# a row. Shards report independently, so a slow or dying one names
+# itself; each writes its own ``.coverage.<shard>`` data file and the
+# ``coverage-gate`` job combines them to enforce the 80 % floor on the
+# union (a per-shard percentage would be meaningless).
+#
+# The nightly runs in two places, split by what each can actually
+# execute (2026-09-25):
+#
+#   * here, on the ``schedule`` trigger — the cloud-runnable set: unit +
+#     integration + contract checks, minus the ``real_model`` tests
+#     (they need the claude CLI and a live provider, so the ``CI=true``
+#     contract in tests/conftest.py skips them);
+#   * on the operator's machine, as an externally-scheduled job — ONLY the
+#     ``real_model`` marker, i.e. exactly what the cloud cannot run.
+#
+# The two sets are disjoint; neither duplicates the other. All pytest
+# invocations go through backend/.venv (CLAUDE.md: never use system
+# Python to run pytest — it has stale urllib3 + missing packages).
+#
+# The previous pipeline ran a "Run full backend suite (regression)"
+# step on every push to main that re-ran all 1482 unit + integration
+# tests in addition to the E2E suite. That step was responsible for
+# 45+ minute CI runs and pushed the main release gate well past
+# the 15-minute budget. It now lives only in the nightly regression
+# layer, which runs once a day and does not block the merge-to-main
+# gate. Style (bandit + provider-ID + legacy-URL-map scans) was
+# previously PR-only and is now enforced on push to main as well so the
+# contract is checked right before a release.
+#
+# Boundary semantics:
+#   - lint fail                          -> unit + integration skipped
+#   - unit fail (any shard)              -> coverage-gate + integration skipped
+#   - coverage-gate fail (<80%)          -> integration skipped
+#   - integration fail                   -> PR is blocked
+#   - e2e failure                        -> blocks main release
+#   - slow failure                       -> blocks main release
+#   - nightly-regression failure         -> blocks release
+#   - Coverage report (unit)             -> uploaded as artifact on every PR
+#   - New code line coverage             -> gate ≥ 80% (--cov-fail-under=80,
+#                                           via coverage-gate on the combined
+#                                           shard data)
+#   - secrets/permissions                -> least-privilege defaults (contents:read)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # Cloud nightly — the half of the nightly that CAN run on a hosted
+  # runner: everything except the ``real_model`` tests (those call a real
+  # model through the ``claude`` CLI and are skipped here by the
+  # ``CI=true`` contract in ``backend/tests/conftest.py``).
+  #
+  # Division of labour with whatever local nightly an operator runs on
+  # their own machine (scheduled outside this repository):
+  #
+  #   * cloud  → the cloud-runnable set (unit + integration + contract,
+  #              minus e2e/slow/perf/real_model)
+  #   * local  → ONLY the ``real_model`` marker, i.e. exactly what the
+  #              cloud cannot run
+  #
+  # The two sets are disjoint, so neither run duplicates the other. This
+  # trigger was absent between 2026-09-22 (when the local nightly moved
+  # to an external scheduler) and 2026-09-25; the local job had in the
+  # meantime been reduced to the model-calling tests only, which left the
+  # cloud set unscheduled — hence the split above rather than a single
+  # owner.
+  schedule:
+    # 00:00 CST — two hours before the local nightly, so a cloud failure
+    # is already visible when the local run reports.
+    - cron: "0 16 * * *"
+  # Manual trigger — required for the e2e / slow layers (per test-design
+  # decision point 7: e2e/slow must NOT run on every PR, only on main or
+  # explicit manual dispatch). Lets maintainers force-run the slow suite
+  # when investigating flaky markers without waiting for the next push.
+  workflow_dispatch:
+    inputs:
+      layer:
+        description: "Which test layer to run (unit|integration|e2e|slow|nightly)"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - unit
+          - integration
+          - e2e
+          - slow
+          - nightly
+      # Bisection harness for the "a shard wedges the runner" failure
+      # (2026-09-23). A JSON array of matrix entries; each one becomes a
+      # `unit-staircase` job. Empty means "don't run that job at all".
+      #
+      # It lives on workflow_dispatch rather than on the push path for one
+      # reason: the search must cost a dispatch, not a push. `unit` and
+      # `root` hang such that the step and job timeouts never fire and
+      # GitHub cancels at ~45 minutes with no log uploaded, so a push-based
+      # search pays 45 minutes per data point. A dispatch is ~10 minutes
+      # and can carry several shard sizes at once.
+      #
+      #   gh workflow run ci.yml -f staircase='[
+      #     {"shard":"u-1","paths":"tests/unit","limit_files":1},
+      #     {"shard":"u-20","paths":"tests/unit","limit_files":20}
+      #   ]'
+      #
+      # `limit_files` is optional: run only the first N files (sorted) that
+      # pytest collects for `paths` — an alphabetical prefix, so nesting
+      # one staircase inside a bigger one is a true superset.
+      staircase:
+        description: "JSON array of {shard, paths, limit_files?} for wedge bisection (empty = off)"
+        required: false
+        default: ""
+      # Explicit opt-in for the dangerous REAL plan migration suite.
+      # The mock-plan E2E runs on every push to main (see e2e-main
+      # below). The real-plan migration writes to the production
+      # ``plans/`` directory and MUST NEVER run on a routine push or
+      # PR; only an explicit ``run_real_plan_migration == 'true'``
+      # maintenance dispatch unlocks it. The boolean default is
+      # ``false`` so a bare ``Run workflow`` click cannot trigger
+      # the real-plan migration by accident.
+      run_real_plan_migration:
+        description: "Run the REAL plan migration suite (writes to plans/) - DANGEROUS"
+        required: true
+        type: boolean
+        default: false
+
+# Cancel previous in-flight runs for the same PR / branch to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege permissions. Jobs explicitly request additional scopes
+# (e.g. pull-requests: write for status comments) only when needed.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # STAGE 1 — LINT (PR gate)
+  # Static security scan (bandit) + provider-ID scans. If this stage fails,
+  # neither unit nor integration will run (needs: chain below).
+  # ---------------------------------------------------------------------------
+
+  lint:
+    name: Lint (bandit static scan)
+    runs-on: ubuntu-latest
+    # Style gate runs on every PR AND every push to main so that
+    # the style contract is enforced right before a release, not
+    # only at PR time. The bandit + provider-ID + legacy-URL-map
+    # scans are static and finish in well under a minute.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Install bandit
+        run: pip install bandit
+
+      # -ll = medium+ severity. JSON output feeds into the next step.
+      # Non-zero exit on findings -> PR is blocked.
+      - name: Run bandit scan
+        working-directory: backend
+        run: bandit -r . -ll -f json -o bandit-report.json || true
+
+      # Enforce bandit gate via grep (avoid embedding Python f-strings
+      # in the YAML block scalar — they collide with YAML colon parsing
+      # on some parsers). The scan step writes bandit-report.json; if
+      # it contains any HIGH/MEDIUM hits we exit non-zero.
+      - name: Enforce bandit gate (block PR on findings)
+        working-directory: backend
+        run: |
+          if [ ! -f bandit-report.json ]; then
+            echo "bandit-report.json not found — bandit step did not run?"
+            exit 1
+          fi
+          # Count lines with issue_severity HIGH or MEDIUM in the
+          # bandit JSON output. Each finding has its own line so a
+          # simple grep -c suffices.
+          high_count=$(grep -c '"issue_severity": "HIGH"' bandit-report.json || true)
+          med_count=$(grep -c '"issue_severity": "MEDIUM"' bandit-report.json || true)
+          echo "Bandit findings: HIGH=$high_count MEDIUM=$med_count"
+          total=$(( high_count + med_count ))
+          if [ "$total" -gt 0 ]; then
+            echo "Bandit gate FAILED: $total medium/high issues"
+            grep -E '"(test_id|issue_severity|filename|line_number|issue_text)"' bandit-report.json | head -30
+            exit 1
+          fi
+          echo "Bandit gate passed (no medium/high issues)"
+
+      # The provider-ID scanners are the second half of the static gate:
+      # they enforce the "single source of truth" contract (no hardcoded
+      # provider URLs/keys/registry dicts/legacy bare IDs, and no legacy
+      # CC Switch JSON indirection references). Failures here block the PR.
+      - name: Run hardcoded provider ID scan
+        run: python scripts/scanners/scan_hardcoded_provider_ids.py
+
+      - name: Run legacy provider URL map reference scan
+        run: python scripts/scanners/scan_provider_url_map_refs.py
+
+  # ---------------------------------------------------------------------------
+  # STAGE 1b — GREP GUARD (fast static gate)
+  # Runs the project's regex-sweep scanner over the production
+  # tree (server.py + verification_executor.py + state_machine/) for
+  # the five forbidden JSON state-file construction patterns pinned
+  # by backend/tests/grep_guard.py. Because this gate is purely a
+  # regex sweep it finishes in seconds, so we run it BEFORE unit to
+  # fail fast on known bug shapes without wasting CI minutes on
+  # pytest collection.
+  # ---------------------------------------------------------------------------
+
+  grep-guard:
+    name: Grep guard (forbidden filename regex sweep)
+    runs-on: ubuntu-latest
+    # Static sweep, runs on PR AND push to main - cheap enough to
+    # always run, and gating on PR means a developer never has to
+    # wait for the unit gate to discover that they reintroduced a
+    # forbidden filename pattern.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      # Bootstrap the project venv so we can call ``run_grep_guard``
+      # via the project's own interpreter - same venv-python rule
+      # that unit / integration / e2e / nightly already follow.
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install --upgrade pip
+          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+
+      # Run the scanner via the shared ``scripts/grep_guard.sh`` wrapper.
+      # The wrapper owns:
+      #   * venv-python resolution (CLAUDE.md: never use system Python
+      #     for pytest-family commands — system Python has stale
+      #     urllib3 + missing packages);
+      #   * ``sys.path`` insertion for the standalone ``grep_guard``
+      #     module (which lives outside any package);
+      #   * the exit-code contract (0 = clean, 1 = violations, 2 =
+      #     setup error) consumed by ``bash`` below.
+      # The wrapper is the SAME entry point developers invoke locally
+      # and that ``.pre-commit-config.yaml`` hooks call, so CI never
+      # diverges from local enforcement.
+      - name: Run grep-guard scan
+        working-directory: backend
+        run: bash ../scripts/grep_guard.sh
+
+  # ---------------------------------------------------------------------------
+  # Commit-message hygiene
+  # ---------------------------------------------------------------------------
+  # Rejects the two shapes that make an authorship claim about an AI system:
+  # a ``Co-Authored-By:`` trailer naming one, or a "Generated with <tool>"
+  # line. The rule and its rationale live in scripts/check_commit_msg.py —
+  # this job exists so that ``git commit --no-verify``, or a clone with no
+  # hooks installed, still cannot land such a trailer on main.
+  #
+  # No venv and no dependency install: the checker is stdlib-only, so the
+  # job costs a deep checkout and a few milliseconds.
+  # ---------------------------------------------------------------------------
+  commit-hygiene:
+    name: Commit messages carry no AI attribution trailer
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The range below walks history, so a shallow clone would not
+          # contain the commits being checked.
+          fetch-depth: 0
+
+      - name: Check every commit in the range
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+
+          # Resolve the range, and say so loudly when we cannot. A range
+          # git refuses to parse lists no commits at all, which would make
+          # this job green while checking nothing — the failure mode that
+          # matters more than a missed commit.
+          if git rev-parse --quiet --verify "${BASE}^{commit}" >/dev/null 2>&1; then
+            RANGE="${BASE}..HEAD"
+          elif git rev-parse --quiet --verify "HEAD~1" >/dev/null 2>&1; then
+            echo "::warning::base ${BASE} is not resolvable; checking HEAD~1..HEAD only"
+            RANGE="HEAD~1..HEAD"
+          else
+            echo "::warning::no base and no parent commit; checking the tip only"
+            RANGE="HEAD"
+          fi
+
+          echo "checking commits in ${RANGE}"
+          # ``rc`` rather than ``status``: the latter is a read-only
+          # special variable in zsh, so a local reproduction of this
+          # block under zsh dies on the assignment instead of checking
+          # anything. CI runs bash, but the block should survive being
+          # pasted into either shell.
+          rc=0
+          while read -r sha; do
+            [[ -z "$sha" ]] && continue
+            if ! git log -1 --format=%B "$sha" | python3 scripts/check_commit_msg.py --stdin; then
+              echo "  ^ commit ${sha}" >&2
+              rc=1
+            fi
+          done < <(git log --format=%H "${RANGE}")
+
+          exit "${rc}"
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2 — UNIT (PR gate)
+  # Depends on lint AND grep-guard: if either upstream gate fails,
+  # unit is skipped (the ``needs:`` chain enforces this). Runs
+  # pytest under the project's venv (backend/.venv/bin/python3) per
+  # CLAUDE.md — never the system Python (the old Xcode 3.9 base had
+  # dependency skew that breaks pytest; the venv was rebuilt on
+  # Homebrew 3.11 on 2026-08-28, and CI pins 3.11 to match it).
+  # ---------------------------------------------------------------------------
+
+  unit-tests:
+    name: Unit tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # 2026-09-22 — sharded. Before this the lane was ONE job running
+    # `pytest tests/ -m "not e2e and not integration"` — 4916 tests, and
+    # on a GitHub runner that job died at ~49 minutes with "The hosted
+    # runner lost communication with the server", which uploads no log
+    # at all (runs 35725371222, 35739754628, 35743882365 — and the same
+    # 49-minute signature on the 2026-09-16 PR run 35077046987).
+    #
+    # The same suite is 7m18s locally and 8m29s in a 4-CPU Linux
+    # container, so the wall clock on CI is ~6x the container's and the
+    # cause is still unidentified. Splitting the lane is both the fix
+    # (a fraction of the work per job, so each one is comfortably inside
+    # any per-job ceiling) and the diagnostic (each shard reports
+    # independently, so a slow or dying shard names itself instead of
+    # taking the whole lane's evidence down with it).
+    #
+    # Sizes measured with `--collect-only`: tests/unit 3254,
+    # root-level tests/*.py 1468, the rest 194.
+    timeout-minutes: 40
+    # 2026-09-22 — push-to-main included, same predicate as lint and
+    # grep-guard. It used to be ``github.event_name == 'pull_request'``
+    # only, which made this an empty gate in practice: this repo's
+    # workflow is a LOCAL merge into main followed by a direct push
+    # (there is no PR), so on a push the job was skipped and main was
+    # never unit-tested. The 35725018566 run on 2026-09-22 is the
+    # evidence — ``conclusion: success`` with unit, integration and e2e
+    # all ``skipped``; the only real checks were lint + grep-guard +
+    # slow.
+    #
+    # The e2e job below carries ``needs: integration-tests`` and an
+    # ``if`` that explicitly ALLOWS a push to main, so the PR-only
+    # condition here also silently defeated e2e on main — contradicting
+    # that job's own comment ("Default CI behaviour (push to main):
+    # runs the MOCK-PLAN E2E only").
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    # Chain the layered gates: lint (style) + grep-guard (fast
+    # static scan) BOTH must pass before unit runs. A grep-guard
+    # failure on a forbidden filename pattern fails fast (seconds)
+    # and blocks the slower unit + integration layers from wasting
+    # CI minutes on a known-bad tree.
+    needs: grep-guard
+    # ``fail-fast: false`` is deliberate: one shard dying must not
+    # cancel the others, because the surviving shards are exactly the
+    # evidence needed to locate the problem.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: unit
+            paths: tests/unit
+          - shard: root
+            # Everything the original single job ran, minus the three
+            # directories the other shards own. ``tests/integration`` and
+            # ``tests/e2e`` are deliberately NOT ignored: the ``-m``
+            # filter already drops the marked tests inside them (102
+            # across the whole run), and the unmarked ones there were
+            # part of the old selection — ignoring the directories
+            # silently dropped 209 tests.
+            #
+            # Verified: 3254 (unit) + 1622 (root) + 194 (misc) = 5070 —
+            # exactly what `pytest tests/ -m "not e2e and not
+            # integration"` selected before the split.
+            paths: >-
+              tests/
+              --ignore=tests/unit
+              --ignore=tests/contract
+              --ignore=tests/concurrency
+              --ignore=tests/performance
+              --ignore=tests/security
+              --ignore=tests/meta_tests
+          - shard: misc
+            paths: >-
+              tests/contract
+              tests/security
+              tests/meta_tests
+              tests/concurrency
+              tests/performance
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest pytest-cov pytest-timeout coverage
+
+      # Create the project venv so that subsequent steps can invoke it via
+      # `backend/.venv/bin/python3`. The bootstrap step only succeeds if the
+      # venv does not already exist (idempotent via the `|| true` fallback).
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install --upgrade pip
+          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install pytest pytest-cov pytest-timeout coverage
+
+      # Run this shard via the venv Python.
+      # This pins the CLAUDE.md rule: never use system Python to run pytest.
+      #
+      # Coverage: each shard writes its OWN ``.coverage.<shard>`` data file
+      # (via COVERAGE_FILE) instead of judging a percentage on its own —
+      # a shard that runs a third of the suite would report a third of the
+      # coverage. ``coverage-gate`` below downloads all three, combines
+      # them, and enforces --cov-fail-under=80 on the union.
+      #
+      # STEP-level timeout, not just the job-level one (2026-09-23).
+      # A job that is CANCELLED — by the job timeout, or by whatever
+      # killed the runner at ~49 minutes — uploads NO log at all
+      # (``actions/jobs/<id>/logs`` returns BlobNotFound), which is why
+      # the 45-minute unit runs produced no evidence three times running.
+      # A STEP that times out fails the step normally and the job then
+      # continues into the ``if: always()`` upload below, so the pytest
+      # output survives. That upload IS the diagnostic: its tail names
+      # the last test that started.
+      - name: Run unit tests — ${{ matrix.shard }} shard
+        timeout-minutes: 20
+        working-directory: backend
+        # Unbuffered stdout so the last progress line survives even if the
+        # step is killed: pytest writes to a pipe here (GitHub captures
+        # it), and a block-buffered stream would lose the tail exactly
+        # when it matters most — the test that stalled.
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -o pipefail
+          # NO ``ulimit`` guardrails here (2026-09-23, reverted).
+          #
+          # An earlier revision of this step set ``ulimit -t 900`` /
+          # ``-u 512`` / ``-v 8388608`` to turn "starve the runner,
+          # upload nothing" into a named failure. It did not work, and
+          # it introduced hazards of its own:
+          #
+          #   * ``-u`` is RLIMIT_NPROC, which is counted **per user**,
+          #     not per process tree. The runner user already owns every
+          #     process on the box, so this caps the runner's own ability
+          #     to fork rather than the test's. Reproduced locally: after
+          #     ``ulimit -u 512`` the shell could not fork at all
+          #     ("Resource temporarily unavailable") and the step died
+          #     before pytest started.
+          #   * ``-v`` sets RLIMIT_AS, which is not the same thing as
+          #     memory and is invalid on some platforms (macOS rejects
+          #     ``ulimit -v`` outright).
+          #
+          # The wedge they were meant to catch is a *process-tree* leak,
+          # and the fix for that belongs in the code that leaks —
+          # ``backend/bounded_subprocess.py`` now kills the process group
+          # on every timeout. Guardrails that guess at the symptom from
+          # the outside only convert one opaque failure into another.
+          #
+          # NOT a pipe into ``tee``. ``tee`` returns on EOF, so a
+          # descendant that inherited the write end of that pipe and
+          # outlived pytest keeps ``tee`` alive forever — the step never
+          # completes, no post-step and no artifact ever runs, and GitHub
+          # reaps the job at ~45 minutes having recorded nothing. That is
+          # the exact shape of this shard's wedge, and it is why the
+          # wedge was undiagnosable: the failure destroyed its own
+          # evidence. Redirecting to a file removes the thing a survivor
+          # could hold.
+          #
+          # ``setsid`` puts pytest in its own process group. That makes
+          # the step's timeout effective again (nothing downstream is
+          # blocked), and it lets ``ci_process_guard`` reap and *name*
+          # whatever outlives a test — the culprit rather than the
+          # symptom.
+          set +e
+          COVERAGE_FILE=.coverage.${{ matrix.shard }} \
+          setsid ./.venv/bin/python3 -m pytest ${{ matrix.paths }} \
+            -m "not e2e and not integration" \
+            --cov=. \
+            --cov-report= \
+            --tb=short \
+            -p ci_process_guard \
+            --timeout=60 > pytest-${{ matrix.shard }}.log 2>&1 < /dev/null &
+          PYTEST_PID=$!
+          tail -n +1 -f --pid=$PYTEST_PID pytest-${{ matrix.shard }}.log &
+          TAIL_PID=$!
+          wait $PYTEST_PID
+          RC=$?
+          kill $TAIL_PID 2>/dev/null || true
+          exit $RC
+
+      # The diagnostic half of the step timeout above: this runs even when
+      # the test step timed out, and it is the ONLY way to see where a
+      # shard got stuck (job-level cancellation uploads nothing at all).
+      - name: Upload pytest output — ${{ matrix.shard }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-log-${{ matrix.shard }}
+          path: backend/pytest-${{ matrix.shard }}.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload coverage data — ${{ matrix.shard }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-data-${{ matrix.shard }}
+          path: backend/.coverage.${{ matrix.shard }}
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # STAGE 1b — STAIRCASE (workflow_dispatch only): locate the CI wedge
+  # ---------------------------------------------------------------------------
+  #
+  # `unit` and `root` wedge the runner. The job does not finish, the STEP
+  # timeout (20m) does not fire, the JOB timeout (40m) does not fire, and
+  # GitHub cancels the run at ~45 minutes having uploaded nothing —
+  # post-steps stay `pending`, which says the runner agent itself stopped
+  # being scheduled rather than "the tests are slow". Four runs, same
+  # signature (35725371222, 35804605555, 35813699508, 35815833805,
+  # 35845978402). Locally the same selection finishes in 95s (`unit`) and
+  # 310s (`root`) with the same flags, the same `--cov`, the same
+  # environment and a 1.2 GB peak; a 2-CPU Linux container reproduces that.
+  #
+  # Every timeout-based diagnostic is therefore dead on the runner, and the
+  # only remaining locator is a shard small enough to finish. This job makes
+  # that search cost a DISPATCH instead of a PUSH: a push-based bisection
+  # pays ~45 minutes per data point, a dispatch is ~10 minutes and carries
+  # several shard sizes at once (`fail-fast: false`).
+  #
+  # Putting a small shard and a large one in the same dispatch separates
+  # the two hypotheses in one run:
+  #   * only the large one wedges  -> it accumulates with volume
+  #   * a small one wedges         -> it is that shard's content
+  #
+  # Not on the push path at all, and coverage-gate does not run on
+  # workflow_dispatch, so nothing here can affect the merge gate.
+  unit-staircase:
+    name: Staircase (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.staircase != ''
+    timeout-minutes: 40
+    strategy:
+      # The whole point is to see which shard dies without losing the
+      # others' verdicts.
+      fail-fast: false
+      matrix:
+        # `|| '[]'` guards the push/PR path: there `inputs.staircase` is
+        # null, and `fromJSON('')` would fail the run rather than yield an
+        # empty matrix.
+        include: ${{ fromJSON(inputs.staircase || '[]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install --upgrade pip
+          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install pytest pytest-timeout
+
+      # No `--cov` here: coverage-gate does not run on a dispatch, and the
+      # question is wall-clock behaviour, not coverage.
+      - name: Run staircase shard — ${{ matrix.shard }}
+        timeout-minutes: 30
+        working-directory: backend
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -o pipefail
+          TARGETS="${{ matrix.paths }}"
+          LIMIT="${{ matrix.limit_files }}"
+          if [ -n "$LIMIT" ]; then
+            # Alphabetical prefix of the collected files, so nesting one
+            # staircase shard inside a bigger one is a true superset and
+            # the two runs are comparable.
+            #
+            # Two details are load-bearing:
+            #
+            # * ``-o addopts=`` — pytest.ini sets ``-v``, which turns
+            #   ``--collect-only`` into a nested ``<Package>/<Module>``
+            #   tree with no ``path::name`` lines to select from.
+            # * The file part is taken by STRIPPING from ``::``, never by
+            #   matching a trailing ``.py``. A node id's parameters can
+            #   themselves contain a ``.py``: the very first staircase
+            #   run (35851035325) hit
+            #   ``...test_llm_calls_inherit_unified_timeout.py::test_no_
+            #   magic_number_timeout_on_llm_calls[agent.py]`` — a
+            #   parametrisation over module filenames — and a greedy
+            #   ``^tests/[^ ]*\.py`` matched into the parameter, emitting
+            #   seven ``...calls[agent.py`` fragments that pytest
+            #   rejected with ``ERROR: not found`` and exit 4, so u-200
+            #   ran no tests at all (reproduced locally).
+            #
+            # * The line must actually BE a node id. pytest's warnings
+            #   summary emits lines that also start with ``tests/`` —
+            #   ``tests/unit/test_agent_no_self_split.py:103:
+            #   DeprecationWarning: ...`` — and they contain no ``::``,
+            #   so ``sed 's/::.*//'`` passes them through untouched as
+            #   targets. Run 35851915784 died on exactly that: u-60 and
+            #   u-70 were handed ``...test_agent_no_self_split.py:1``
+            #   (and ``:103`` / ``:232``, the line numbers the file cites
+            #   in its own docstrings), pytest answered "file or directory
+            #   not found", and both shards collected 0 items while
+            #   reporting `failure`. Requiring ``.py::`` is what
+            #   distinguishes a node id from a warning line.
+            #
+            # ``awk 'NR<=n'`` rather than ``head -n``: ``head`` closes
+            # the pipe as soon as it has enough lines, ``sort`` (still
+            # writing) takes SIGPIPE, and ``set -o pipefail`` then fails
+            # the step — which is how the run before that one died, with
+            # "sort: write failed: 'standard output': Broken pipe".
+            echo "staircase: first ${LIMIT} collected file(s) of ${TARGETS}"
+            TARGETS=$(./.venv/bin/python3 -m pytest ${{ matrix.paths }} \
+                        --collect-only -q -o addopts= -p no:cacheprovider -p no:warnings 2>/dev/null \
+                      | grep -E '^tests/[^:]*\.py::' | sed 's/::.*//' | sort -u \
+                      | awk -v n="$LIMIT" 'NR <= n' | tr '\n' ' ')
+            echo "staircase: resolved -> ${TARGETS}"
+          fi
+          # The `ci_progress_marker` plugin that used to run here was
+          # deleted: it assumed a cancelled job still leaves readable
+          # check-run annotations, and that is false. GitHub caps
+          # annotations per step (a completed shard surfaced 4, none of
+          # them per-test breadcrumbs) and exposes none at all while the
+          # job is still in progress (an in-flight wedge read back 0),
+          # which is precisely when the breadcrumbs would matter.
+          #
+          # The wedge also gets much harder to hit as a side effect of
+          # the no-pipe shape below; `ci_process_guard` is what replaces
+          # the marker, and unlike the marker it works by *ending* the
+          # run rather than by trying to narrate it from inside.
+          #
+          # ``--timeout`` is a matrix key so the two candidate causes can
+          # be told apart in one dispatch: if a shard completes with a
+          # larger timeout, the wall clock is the variable; if it wedges
+          # at any timeout, it is not.
+          #
+          # Same no-pipe / ``setsid`` shape as the unit shards above, and
+          # for the same reason: a leaked descendant holding ``tee``'s
+          # pipe is what turns a finished pytest run into a 45-minute
+          # wedge. ``ci_process_guard`` reports the leaking test by name
+          # and reaps the survivors.
+          set +e
+          setsid ./.venv/bin/python3 -m pytest $TARGETS \
+            -m "not e2e and not integration" \
+            --tb=short \
+            -p ci_process_guard \
+            --timeout=${{ matrix.timeout || 60 }} \
+            > pytest-staircase-${{ matrix.shard }}.log 2>&1 < /dev/null &
+          PYTEST_PID=$!
+          tail -n +1 -f --pid=$PYTEST_PID \
+            pytest-staircase-${{ matrix.shard }}.log &
+          TAIL_PID=$!
+          wait $PYTEST_PID
+          RC=$?
+          kill $TAIL_PID 2>/dev/null || true
+          exit $RC
+
+      - name: Upload pytest output — ${{ matrix.shard }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-log-staircase-${{ matrix.shard }}
+          path: backend/pytest-staircase-${{ matrix.shard }}.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2b — COVERAGE GATE (PR gate)
+  # The 80% floor used to be enforced by the single unit job. It cannot be
+  # enforced per shard (a shard sees a fraction of the suite, so its
+  # percentage is meaningless), so each shard uploads its raw coverage data
+  # and this job combines them and applies the gate to the union — the same
+  # measurement the unsharded job used to produce.
+  # ---------------------------------------------------------------------------
+
+  coverage-gate:
+    name: Coverage gate (≥80%)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: unit-tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install --upgrade pip
+          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install coverage
+
+      - name: Download coverage data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-data-*
+          path: backend
+          merge-multiple: true
+
+      - name: Enforce the combined coverage gate
+        working-directory: backend
+        run: |
+          ./.venv/bin/python3 -m coverage combine
+          ./.venv/bin/python3 -m coverage report --fail-under=80
+
+      - name: Upload combined coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-pr-${{ github.event.pull_request.number }}
+          path: |
+            backend/.coverage
+            backend/coverage.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # STAGE 3 — INTEGRATION (PR gate)
+  # Depends on unit: if unit fails, integration is skipped. This enforces
+  # the "失败时不得继续下一级" boundary.
+  # Runs pytest under the project's venv (backend/.venv/bin/python3).
+  # ---------------------------------------------------------------------------
+
+  integration-tests:
+    name: Integration tests (PR gate)
+    runs-on: ubuntu-latest
+    # 2026-09-22 — push-to-main included; see the note on ``unit-tests``.
+    # Kept in lockstep with ``unit-tests`` on purpose: the e2e job needs
+    # this one, so a divergence here silently removes e2e from main.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    # Chain the layered gates: unit, the combined coverage floor, and
+    # grep-guard must all pass before integration runs. If any upstream
+    # gate fails (style violation, grep-guard regex hit, unit test
+    # failure, or coverage below 80 %) the integration suite is skipped
+    # so a developer sees the earliest-detected failure instead of
+    # waiting for a slower suite to also fail on the same root cause.
+    needs: [unit-tests, coverage-gate]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest pytest-asyncio pytest-timeout
+
+      # Create the project venv so the integration pytest invocation
+      # uses the same interpreter as the unit stage.
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install --upgrade pip
+          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout
+
+      # Stub integration uses mock LLM/coding-tool to avoid real network calls.
+      # Runs only the integration stub tests (NOT e2e).
+      - name: Run integration tests (venv Python)
+        working-directory: backend
+        run: ./.venv/bin/python3 -m pytest tests/integration/ -m "integration and not e2e" --tb=short --timeout=120 --junitxml=integration-junit.xml
+
+      - name: Upload integration test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-report-pr-${{ github.event.pull_request.number }}
+          path: backend/integration-junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # MAIN RELEASE — runs after merge to main (push event)
+  # Slim: lint (which already runs on push via the
+  # ``if`` above) + dry-run E2E only. The 1482-test regression
+  # suite lives in the nightly cron and is NOT a release blocker.
+  # ---------------------------------------------------------------------------
+
+  e2e-on-demand:
+    name: E2E pipeline (mock plan, main release)
+    runs-on: ubuntu-latest
+    # Per test-design decision point 7: e2e/slow only on main or manual
+    # dispatch — never on PR. Manual dispatch lets maintainers force-run
+    # the e2e layer when investigating flakes.
+    #
+    # Default CI behaviour (push to main): runs the MOCK-PLAN E2E
+    # only. The dangerous REAL-plan migration lives in its own
+    # `real-plan-migration` job below, gated behind
+    # `inputs.run_real_plan_migration == 'true'` so a routine push
+    # or PR cannot trigger a real migration.
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    # Chain after the layered gates: the mock-plan E2E is the
+    # cheapest of the e2e jobs so it runs by default; a real-plan
+    # migration lives behind `real-plan-migration` (gated by the
+    # `run_real_plan_migration` workflow_dispatch input below).
+    needs: integration-tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest pytest-asyncio pytest-timeout requests
+
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install --upgrade pip
+          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout requests
+
+      # E2E exercises the full pipeline: agent → executor → LLM (stub) →
+      # verifier → report. These are the slow tests; they only run on
+      # main, not on every PR. The full pytest suite (1482 tests) used
+      # to also run here as a "regression" step, but it pushed the
+      # total CI time past 45 minutes — far above the 15-minute
+      # budget for a merge-to-main gate. The dry-run E2E tests are
+      # representative enough of the executor + verifier + report
+      # pipeline that we keep just this step on push; the full
+      # 1482-test suite moves to the nightly-regression job (which
+      # already runs once a day on a cron and is not blocking).
+      - name: Run E2E tests
+        working-directory: backend
+        run: ./.venv/bin/python3 -m pytest tests/ -m "e2e" --tb=short --timeout=600 -v
+
+      - name: Upload E2E logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs-main-${{ github.sha }}
+          path: |
+            backend/logs/
+            backend/.pytest_cache/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # STAGE 4b — SLOW (main release / manual dispatch)
+  # Per test-design decision point 7: tests marked ``@pytest.mark.slow``
+  # (long-running stress, soak, or full pipeline sweeps) are split out
+  # from the regular suite so they do not block PR throughput. They run
+  # only on push to main or on manual ``workflow_dispatch``. The
+  # dedicated job keeps the slow layer's timeout / artifact retention
+  # independent from the (faster) e2e job.
+  # ---------------------------------------------------------------------------
+
+  existing-test:
+    name: Slow tests (main release)
+    runs-on: ubuntu-latest
+    # Per test-design decision point 7: slow only on main or manual
+    # dispatch — never on PR. Manual dispatch lets maintainers force-run
+    # the slow layer when investigating flakes.
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest pytest-asyncio pytest-timeout requests
+
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install --upgrade pip
+          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout requests
+
+      # Slow layer exercises stress / soak / full-pipeline sweeps gated
+      # by ``@pytest.mark.slow``. 30-minute per-test timeout covers
+      # overnight-style scenarios; the global pytest-timeout ceiling
+      # is 1800s. Failures block main release.
+      - name: Run slow tests
+        working-directory: backend
+        run: ./.venv/bin/python3 -m pytest tests/ -m "slow" --tb=short --timeout=1800 -v --junitxml=slow-junit.xml
+
+      - name: Upload slow logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slow-logs-main-${{ github.sha }}
+          path: |
+            backend/slow-junit.xml
+            backend/logs/
+            backend/.pytest_cache/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # NIGHTLY REGRESSION — daily cron, blocks release on failure
+  # ---------------------------------------------------------------------------
+
+  nightly-regression:
+    name: Nightly regression (daily full suite)
+    runs-on: ubuntu-latest
+    # Runs on the daily cron schedule, plus ad-hoc workflow_dispatch
+    # (with ``layer=nightly``) for manual verification of the runner
+    # pool after infrastructure-level failures. ``workflow_dispatch``
+    # bypasses the schedule-pool deprioritization that has been
+    # causing the cron-triggered job to lose its runner VM at the
+    # "Run nightly regression suite" step on a consistent 46-minute
+    # pattern (see the 5 consecutive failures logged under runs
+    # five consecutive failures). If the manual run also fails, the issue is in
+    # the test code or the workflow; if it passes, the issue is
+    # specifically the schedule pool.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Hard-cap the job so it fails fast with a clear timeout error
+    # (instead of the ambiguous "hosted runner lost communication"
+    # at the ~46-minute runner-image hang documented in
+    # actions/runner-images#13770). 40 minutes is the unit+integration
+    # suite's engineering budget plus CI headroom for the ~3x slowdown
+    # observed on the 2-CPU ubuntu-latest runner; slow + perf + e2e
+    # markers are excluded below to keep the actual run well under this
+    # cap.
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest pytest-asyncio pytest-timeout pytest-xdist requests
+
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install --upgrade pip
+          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout pytest-xdist requests
+
+      # Mitigate actions/runner-images#13770: the Ubuntu 24.04 runner image
+      # ships with a ``read_ahead_kb`` value that consumes too much page cache
+      # on I/O-heavy jobs (pytest collection, in particular, imports every
+      # test module which reads many files). Symptom: the runner dies silently
+      # right after ``Run nightly regression suite`` starts, with 0 bytes of
+      # pytest output and ``hosted runner lost communication with the server``
+      # ~46 minutes later. GitHub shipped a partial fix in image 20260513 that
+      # covers ``/dev/sd*`` (SCSI), but ``/dev/nvme*n*`` (NVMe namespaces,
+      # used on Azure v5/v6 VM series — which the standard runner-image
+      # targets) is NOT yet covered (see PR #13938 and follow-up in the
+      # issue thread). Until the upstream fix lands, we explicitly pin
+      # ``read_ahead_kb=128`` on every block device before pytest loads.
+      - name: Mitigate runner-images#13770 (read_ahead_kb)
+        run: |
+          sudo bash -c '
+            shopt -s nullglob
+            for dev in /sys/block/sd* /sys/block/nvme*n*; do
+              if [ -e "$dev/queue/read_ahead_kb" ]; then
+                echo "  $(basename $dev): $(cat $dev/queue/read_ahead_kb) -> 128"
+                echo 128 > "$dev/queue/read_ahead_kb"
+              fi
+            done
+            exit 0
+          '
+
+      # Daily regression runs the full automated suite (unit + integration +
+      # contract checks). E2E tests that require a local CC Switch DB are
+      # left to the main-branch E2E job; the dry-run e2e markers are not
+      # included here so the scheduled run stays deterministic in vanilla
+      # CI runners. Failures fail the workflow and block release.
+      #
+      # ``-n 2`` runs pytest across 2 workers (the default ubuntu-latest
+      # runner has 2 CPU cores). Locally this cuts runtime from ~5m15s
+      # to ~2m20s for 1766 tests (2.3x). On CI the slowdown observed
+      # against the 2-core runner image is offset by the parallelism —
+      # total runtime is well under the 40-minute job cap.
+      - name: Run nightly regression suite
+        id: nightly_regression
+        working-directory: backend
+        run: |
+          ./.venv/bin/python3 -m pytest tests/ \
+            -m "not e2e and not slow and not perf" \
+            --tb=short \
+            --timeout=120 \
+            -n 2 \
+            -q \
+            --junitxml=nightly-regression-junit.xml
+
+      - name: Upload nightly regression report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-regression-report-${{ github.run_id }}
+          path: backend/nightly-regression-junit.xml
+          if-no-files-found: warn
+          retention-days: 90
+
+      # Surface the result in the run summary so it's visible without
+      # opening artifacts. This step only renders on success because the
+      # job fails the workflow on regression failures.
+      - name: Annotate run summary
+        if: success()
+        run: |
+          {
+            echo "## Nightly regression"
+            echo
+            echo "✅ All nightly regression checks passed"
+            echo
+            echo "Trigger: schedule (daily 02:00 UTC)"
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # REAL PLAN MIGRATION — explicit opt-in only
+  #
+  # This job runs the REAL plan migration suite (writes to the
+  # production ``plans/`` directory and may invoke mocks with side
+  # effects). It is gated behind the explicit ``workflow_dispatch``
+  # input ``run_real_plan_migration == 'true'`` so it CANNOT run on
+  # a routine push to main, a PR, or the nightly cron.
+  #
+  # The boolean default for the input is ``false`` (declared in
+  # the ``workflow_dispatch.inputs`` block above). A bare "Run
+  # workflow" click without explicitly checking the box therefore
+  # leaves this job skipped, which is the desired safe default.
+  #
+  # When ``run_real_plan_migration == 'true'`` is supplied, the
+  # job still chains after the layered gates (grep-guard, unit,
+  # integration, e2e-main) so a failed gate blocks the dangerous
+  # job from running on an already-broken main.
+  # ---------------------------------------------------------------------------
+
+  real-plan-migration:
+    name: Real plan migration suite (DANGEROUS, opt-in only)
+    runs-on: ubuntu-latest
+    # Explicit, verbatim string comparison so any non-'true' value
+    # (including the boolean default 'false', an unset input, an
+    # older boolean-shaped string, or a JSON-friendly 'True')
+    # cleanly skips this job. This is the canonical "manual
+    # maintenance" dispatch gate that the task brief pins.
+    if: github.event.inputs.run_real_plan_migration == 'true'
+    # Even when explicitly invoked, the real-plan migration must
+    # not run on a tree that already failed the layered gates. The
+    # needs-chain enforces: grep-guard (static) + lint + unit +
+    # integration + e2e-main (mock plan E2E) all green before the
+    # real-plan migration is allowed to start.
+    needs: e2e-on-demand
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest pytest-asyncio pytest-timeout requests
+
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install --upgrade pip
+          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout requests
+
+      # The actual REAL-plan migration invocation. This writes to
+      # the production ``plans/`` directory and may invoke mocks
+      # with side effects — that's why the entire job is gated
+      # behind the explicit dispatch input above. The pytest call
+      # still uses the project's venv Python (CLAUDE.md rule)
+      # rather than the system Python on the runner.
+      - name: Run REAL plan migration
+        working-directory: backend
+        run: |
+          ./.venv/bin/python3 -m pytest tests/integration/real_plan_migration \
+            -m "real_plan_migration" \
+            --tb=long \
+            --timeout=1800 \
+            -v \
+            --junitxml=real-plan-migration-junit.xml || true
+
+      - name: Upload real-plan-migration report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-plan-migration-report-${{ github.run_id }}
+          path: backend/real-plan-migration-junit.xml
+          if-no-files-found: warn
+          retention-days: 365
+
+      # Surface the result in the run summary so the explicit
+      # opt-in intent is visible without opening artifacts. The
+      # WARNING emoji + "DANGEROUS" label is intentional — anyone
+      # reading the run summary should immediately see that this
+      # was a manual-dispatch real-plan migration, not a routine
+      # push-triggered run.
+      - name: Annotate run summary
+        if: always()
+        run: |
+          {
+            echo "## ⚠️ Real plan migration (manual dispatch, DANGEROUS)"
+            echo
+            echo "Trigger: workflow_dispatch with inputs.run_real_plan_migration=true"
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "This run explicitly opted in to a REAL plan migration via the"
+            echo "\`run_real_plan_migration\` workflow_dispatch input. The job"
+            echo "was permitted to write to the production \`plans/\` directory."
+          } >> "$GITHUB_STEP_SUMMARY"
