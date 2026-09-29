@@ -40,6 +40,21 @@ from provider_order import cache_clear, load_fallback_order  # noqa: E402
 pytestmark = pytest.mark.perf
 
 
+#: How long a single ``_measure_startup`` call may poll for a first 200.
+#: This bounds *waiting*, not the measurement: the call returns the
+#: instant the endpoint answers, so widening it cannot flatter a slow
+#: server — it only keeps a cold start on a 2-core shared runner from
+#: being reported as "the server never came up". The previous 15 s was
+#: tight enough that the baseline half of the comparison (a second full
+#: server booted from ``git archive HEAD``) could exceed it and skip.
+_STARTUP_DEADLINE_SECONDS = 30.0
+
+#: Per-attempt socket timeout inside that poll. Separate from the deadline
+#: above on purpose: a timeout here means "not ready yet, try again", and
+#: conflating the two is what made one late response fatal.
+_POLL_TIMEOUT_SECONDS = 1.0
+
+
 def _venv_python(project_root: Path) -> Path:
     """Return the project's venv interpreter, falling back to sys.executable."""
     venv = project_root / "backend" / ".venv" / "bin" / "python"
@@ -118,18 +133,9 @@ def _measure_startup(project_root: Path, endpoint: str, order_file: Path | None 
         if port is None:
             raise RuntimeError("Could not determine server port from startup logs")
 
-        url = f"http://127.0.0.1:{port}{endpoint}"
-        deadline = start + 15.0
-        while time.monotonic() < deadline:
-            try:
-                with urllib.request.urlopen(url, timeout=1.0) as resp:
-                    if resp.status == 200:
-                        return time.monotonic() - start
-            except urllib.error.URLError:
-                pass
-            time.sleep(0.01)
-
-        raise RuntimeError(f"Server endpoint {endpoint} did not return 200")
+        return _poll_until_ready(
+            f"http://127.0.0.1:{port}{endpoint}", endpoint, start
+        )
     finally:
         proc.terminate()
         try:
@@ -137,6 +143,44 @@ def _measure_startup(project_root: Path, endpoint: str, order_file: Path | None 
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5.0)
+
+
+def _poll_until_ready(url: str, endpoint: str, start: float) -> float:
+    """Poll ``url`` until it answers 200; returns seconds since ``start``.
+
+    Split out of ``_measure_startup`` so the retry contract can be tested
+    without booting two servers, because that contract was wrong and the
+    mistake was invisible in every lane that ran.
+
+    ``URLError`` alone is not the whole set. The socket timeout is only
+    wrapped into ``URLError`` on the *request* half:
+    ``AbstractHTTPHandler.do_open`` calls ``h.getresponse()`` outside that
+    ``try``, so a server that has bound its port but has not finished its
+    lifespan startup raises a bare ``TimeoutError`` straight out of
+    ``urlopen``. Catching only ``URLError`` turned "the runner is slow"
+    into an ERROR with no retry — which is how this failed on the slow
+    lane (run 36549676307, 2026-09-29: ``TimeoutError: timed out`` at the
+    ``urlopen`` line, 1 failed / 35 passed). The port was up, the app was
+    not ready, and the exception escaped the loop that exists to wait for
+    exactly that.
+
+    ``TimeoutError`` is an ``OSError``, as is ``URLError``; both land
+    here and the loop tries again until the deadline, which is the
+    behaviour the poll was written for.
+    """
+    deadline = start + _STARTUP_DEADLINE_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                url, timeout=_POLL_TIMEOUT_SECONDS
+            ) as resp:
+                if resp.status == 200:
+                    return time.monotonic() - start
+        except (urllib.error.URLError, TimeoutError):
+            pass
+        time.sleep(0.01)
+
+    raise RuntimeError(f"Server endpoint {endpoint} did not return 200")
 
 
 def _median(values: list[float]) -> float:
@@ -258,3 +302,81 @@ def test_load_fallback_order_opens_provider_order_once(tmp_path: Path, monkeypat
     assert len(open_calls) == 1, (
         f"expected provider-order.json opened exactly once, got {len(open_calls)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The poll contract — sensitivity and counterweight
+#
+# These two are why ``_poll_until_ready`` is a function of its own. The bug
+# they cover (:mod:`urllib` raising ``TimeoutError`` unwrapped) was invisible
+# in every lane that ran: locally the server comes up fast enough that the
+# 1 s socket timeout never fires, and ``perf`` had no lane of its own until
+# 2026-09-29, so nothing exercised the path at all.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    """Minimal stand-in for the context manager ``urlopen`` returns."""
+
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_a_read_timeout_is_retried_rather_than_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shape that killed the slow lane: port bound, app not ready yet.
+
+    ``AbstractHTTPHandler.do_open`` calls ``h.getresponse()`` outside the
+    ``try`` that wraps errors into ``URLError``, so a read timeout arrives
+    as a bare ``TimeoutError``. Without it in the ``except`` clause the
+    call raises instead of waiting, and the perf test errors on precisely
+    the transient it exists to absorb.
+    """
+    attempts: list[str] = []
+
+    def _opener(url, timeout=None):
+        attempts.append(url)
+        if len(attempts) < 3:
+            raise TimeoutError("timed out")
+        return _FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _opener)
+    elapsed = _poll_until_ready(
+        "http://127.0.0.1:1/health", "/health", time.monotonic()
+    )
+    assert len(attempts) == 3, (
+        "the poll must keep trying after a read timeout — it gave up after "
+        f"{len(attempts)} attempt(s), which is the 2026-09-29 failure"
+    )
+    assert elapsed >= 0.0
+
+
+def test_a_server_that_never_answers_raises_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counterweight: retrying must not turn into waiting forever.
+
+    The baseline half of the comparison depends on this. A
+    ``RuntimeError`` from the baseline measurement is caught and turned
+    into a skip ("cannot measure regression against a broken baseline"),
+    so a runner that cannot boot ``HEAD`` degrades instead of reporting a
+    false regression in the current tree.
+    """
+    monkeypatch.setattr(
+        sys.modules[__name__], "_STARTUP_DEADLINE_SECONDS", 0.05
+    )
+
+    def _opener(url, timeout=None):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _opener)
+    with pytest.raises(RuntimeError):
+        _poll_until_ready(
+            "http://127.0.0.1:1/health", "/health", time.monotonic()
+        )

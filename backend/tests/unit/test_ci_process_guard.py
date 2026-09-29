@@ -8,6 +8,7 @@ a clean run, which is the failure mode it exists to remove.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -154,3 +155,93 @@ class TestTheFallbackProbe:
         monkeypatch.setattr(subprocess, "run", _boom)
 
         assert guard._pids_in_group(os.getpgrp()) == {}
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGUSR1"), reason="SIGUSR1 is POSIX-only"
+)
+class TestTheStackDump:
+    """The dump is the only artefact that survives an uninterruptible hang.
+
+    ``pytest-timeout``'s thread method raises into the main thread through
+    ``PyThreadState_SetAsyncExc``, which is delivered at a bytecode
+    boundary — so a test parked in ``waitpid`` never sees it, the run
+    never ends, and the log stops at the last test that STARTED. That is
+    the shape every 45-minute reap of the ``unit`` shard has had.
+
+    These tests pin the two things that make the dump usable, both of
+    which were wrong in the first implementation and caught by running it
+    against a deliberately wedged process (see the module docstring):
+    the sink must be a real file rather than stderr, and the signal must
+    go to the leader rather than the group.
+    """
+
+    @pytest.fixture
+    def armed_dump(self, tmp_path, monkeypatch):
+        """Arm the dump against a scratch file and disarm on teardown.
+
+        A registered signal handler is process-global, so the fixture
+        hands the process back the way it found it.
+        """
+        path = tmp_path / "stack-dump.txt"
+        monkeypatch.setenv("CI_STACK_DUMP_PATH", str(path))
+        assert guard._arm_stack_dump(), "the handler must arm on POSIX"
+        yield path
+        guard._disarm_stack_dump()
+
+    def test_sigusr1_names_the_blocked_frame(self, armed_dump):
+        """The dump must name *this* test — that is its whole job."""
+        os.kill(os.getpid(), signal.SIGUSR1)
+        text = armed_dump.read_text(encoding="utf-8")
+        assert "test_sigusr1_names_the_blocked_frame" in text, (
+            "the SIGUSR1 stack dump does not name the running test; a "
+            "wedge would still be unattributable. Got:\n" + text[:2000]
+        )
+        assert "Current thread" in text, (
+            "the dump must include the current thread's stack, not only "
+            "the background ones:\n" + text[:2000]
+        )
+
+    def test_it_writes_to_the_configured_file_not_stderr(
+        self, armed_dump, capfd
+    ):
+        """Why a file and not stderr — the first implementation's bug.
+
+        pytest's default ``fd``-level capture replaces fd 2 for the
+        duration of a test, so a dump written to stderr lands in a buffer
+        that is discarded when the process is killed. That is precisely
+        the case the dump exists for, so the sink has to be a file the
+        guard owns.
+        """
+        os.kill(os.getpid(), signal.SIGUSR1)
+        captured = capfd.readouterr()
+        assert armed_dump.read_text(encoding="utf-8").strip(), (
+            "nothing was written to the configured dump file"
+        )
+        assert "Current thread" not in (captured.out + captured.err), (
+            "the dump went to stderr, where pytest's per-test capture "
+            "will discard it the moment the shard is killed"
+        )
+
+    def test_disarm_leaves_no_handler_and_no_open_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CI_STACK_DUMP_PATH", str(tmp_path / "d.txt"))
+        assert guard._arm_stack_dump()
+        guard._disarm_stack_dump()
+        assert guard._STACK_DUMP_FILE is None, (
+            "disarming must release the file object, not just the handler"
+        )
+        assert guard._STATE["stack_dump_path"] == ""
+        # Arming after disarming must work again — this is what makes the
+        # call idempotent rather than one-shot.
+        assert guard._arm_stack_dump(), "re-arming after a disarm failed"
+        guard._disarm_stack_dump()
+
+    def test_an_unopenable_path_is_not_armed_and_does_not_raise(
+        self, tmp_path, monkeypatch
+    ):
+        """A bolt-on diagnostic must never be why a session fails."""
+        monkeypatch.setenv(
+            "CI_STACK_DUMP_PATH", str(tmp_path / "no-such-dir" / "d.txt")
+        )
+        assert guard._arm_stack_dump() is False
+        assert guard._STATE["stack_dump_path"] == ""
