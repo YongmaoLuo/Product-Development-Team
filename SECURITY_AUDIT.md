@@ -547,6 +547,18 @@ grep -n 'show-toplevel' .git/hooks/commit-msg      # 运行时解析，非安装
 backend/.venv/bin/python3 -m pytest backend/tests/unit/test_agent_no_self_split.py backend/tests/unit/test_agent_load.py backend/tests/static_gates/ backend/tests/meta_tests/ -q
 ```
 
+### Finding ENTRY-029
+档位: should-fix
+问题: **所有"防隐私"静态门禁扫的都是当前树，没有一条扫提交历史。** 三条规则（本机家目录路径、操作者归属、带日期的本机测量）各自由 `backend/tests/static_gates/` 下的一条门禁执行，而它们都经 `source_scan.iter_first_party_sources()` 遍历磁盘上的文件 —— 看到的只有最终状态。于是"先加后删"是一个隐形形状：某个提交写入私有标识，下一个提交把它删掉，交付树干净、全部门禁绿，而携带该标识的那一份快照仍然留在历史里。历史不是本地残留：公开仓库的任意提交都可由 `git fetch origin <sha>` 匿名取出，`refs/pull/<N>/head` 在 squash merge 之后仍然保留 PR 的原始提交 —— squash 决定的是默认分支上留下什么，不是仓库里还留着什么。净 diff 与最终树都不是"已经公开了什么"的度量。
+影响: 树干净会被读成"没有泄露"，而这个结论对历史不成立。私有项目名、真实计划号与本机测量数据可以在全部树形门禁为绿的同时已经公开，且推送之前与之后都没有机制提示。修复代价极不对称：树上的问题改一行即可，历史里的问题只能删除仓库重建或联系托管方，二者都远大于在推送前发现。
+攻击路径: 前置条件 — 一次把本地未打算公开的祖先提交一并推上去的 push（本地存在未被推送的历史，而被推的是一个带祖先链的 ref）；触发步骤 — 对一个公开仓库执行 `git fetch origin <任意历史 SHA>`，或读取 `refs/pull/<N>/head`，两步都不需要认证；可观测后果 — 该快照里的私有标识对匿名读者可见，而当前树与全部树形门禁仍报告干净。
+修复: 新增按提交区间扫描的机制，规则不重写，直接复用树门禁导出的纯函数。新增 `backend/tests/static_gates/commit_range_scan.py`（`git ls-tree` 枚举树、`git cat-file --batch` 单进程流式取内容、逐提交套用 `find_home_paths` / `find_attribution` / `find_local_measurements`，空区间与读不全一律报错而不是当作干净）与 `scripts/scan_commit_range.sh`（CI 与 pre-push 共用的单一入口，退出码 0/1/2 与 `scripts/grep_guard.sh` 一致；gitleaks 存在则对同一区间扫描，不存在则显式警告并跳过该步）。把 `backend/tests/static_gates/source_scan.py` 的过滤拆成两半：`is_first_party_source` 保持"相对扫描根"的原语义不变（磁盘遍历与传绝对根的 `scripts/` 门禁都依赖它），新增 `is_under_scan_root` 与 `is_first_party_path` 供持有仓库根相对路径的调用方使用 —— 把根归属判断塞进前者会让后两个调用方静默扫不到文件，而"非空"断言仍然为绿。CI 侧 `.github/workflows/ci.yml` 增加 `commit-range-privacy` job（`fetch-depth: 0`、`--ci --max-commits 5`、gitleaks 固定版本并以已发布的 SHA256 校验）。`scripts/install_git_hooks.sh` 增加 `pre-push` hook —— 生成器必须按 hook 类型传参（git 只在 stdin 给 ref 行），且 `--check` 必须连参数一起比对，否则参数失效的陈旧 hook 会被判为最新。**没有改任何运行时行为。**
+验证方式:
+```bash
+backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_commit_range_scan.py backend/tests/static_gates/ backend/tests/meta_tests/ -q
+bash scripts/scan_commit_range.sh --range HEAD
+```
+
 ---
 
 ## Appendix A — modified tests

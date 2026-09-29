@@ -372,6 +372,90 @@ jobs:
           exit "${rc}"
 
   # ---------------------------------------------------------------------------
+  # STAGE 1c — COMMIT RANGE (the history gate)
+  #
+  # The privacy gates in ``backend/tests/static_gates/`` read the current
+  # tree. That answers "is the repository clean now", not "did we publish
+  # something we should not have". A commit that adds an operator's private
+  # project name and a later commit that removes it leaves a *clean tree*
+  # and a dirty history — every tree gate passes — while the dirty commit
+  # stays fetchable by its SHA, and through ``refs/pull/<N>/head`` even
+  # after a squash merge.
+  #
+  # So this job scans every commit in the pushed range: not the diff, not
+  # the tree. The rules are the *same pure functions* the tree gates use
+  # (imported by ``commit_range_scan.py``, never restated), so the two
+  # scans cannot disagree about what a violation is.
+  #
+  # ``--max-commits 5`` is a scan budget as much as a hygiene rule: this
+  # job's cost is linear in the number of commits, and a pull request with
+  # sixty commits wants squashing before review regardless.
+  #
+  # This job is *detective* — it runs after the push. The ``pre-push`` hook
+  # (scripts/install_git_hooks.sh) runs the same script and is the only
+  # preventive half; it is also the cheap half, because rewriting an
+  # unmerged commit costs nothing.
+  # ---------------------------------------------------------------------------
+  commit-range-privacy:
+    name: Commits carry no private info (every commit in the range)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The scan walks history, so a shallow clone would not contain
+          # the commits being checked — and an empty walk must not be
+          # allowed to read as a clean one.
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Create the venv the scanner resolves
+        run: |
+          set -euo pipefail
+          python3 -m venv backend/.venv
+          # pytest only. The scanner imports the gate *modules*, and those
+          # import pytest for their own test functions; the rules it calls
+          # (find_home_paths / find_attribution / find_local_measurements)
+          # are pure and need nothing else.
+          backend/.venv/bin/python3 -m pip install -q pytest
+
+      - name: Install gitleaks (pinned by version and checksum)
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          # Published digest for gitleaks_8.30.1_linux_x64.tar.gz. Pinning
+          # the digest as well as the version keeps the scanner from
+          # changing under us — a gate whose detector updates itself is a
+          # coin flip. Extracted into /tmp and put on PATH via
+          # $GITHUB_PATH rather than installed into /usr/local/bin, so the
+          # step needs no sudo.
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSL -o /tmp/gitleaks.tar.gz "$url"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          echo "/tmp" >> "$GITHUB_PATH"
+
+      - name: Scan every commit in the range
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          # The workflow computes the base; the script owns the resolution
+          # (including the loud fallback when the base does not resolve),
+          # so the same code path runs here and in the pre-push hook.
+          PDT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          gitleaks version
+          bash scripts/scan_commit_range.sh --ci --max-commits 5
+
+  # ---------------------------------------------------------------------------
   # STAGE 2 — UNIT (PR gate)
   # Depends on lint AND grep-guard: if either upstream gate fails,
   # unit is skipped (the ``needs:`` chain enforces this). Runs
