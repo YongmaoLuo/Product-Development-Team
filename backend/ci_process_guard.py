@@ -41,6 +41,7 @@ Enabled explicitly (``-p ci_process_guard``), never auto-loaded.
 
 from __future__ import annotations
 
+import faulthandler
 import os
 import signal
 import time
@@ -58,7 +59,13 @@ _STATE: dict = {
     "nodeid": "",
     "seen": set(),
     "dedicated": False,
+    "stack_dump_path": "",
 }
+
+#: Held for the lifetime of the session because ``faulthandler.register``
+#: requires its ``file`` argument to stay referenced — dropping it lets
+#: CPython close the descriptor and the handler then writes nowhere.
+_STACK_DUMP_FILE = None
 
 #: A test slower than this gets its group diffed on the way out. Cheap
 #: enough to run on every test on Linux (a /proc walk), but there is no
@@ -148,6 +155,91 @@ def _reap(pids) -> list:
     return stubborn
 
 
+def _arm_stack_dump() -> bool:
+    """Dump every thread's stack when the CI watchdog sends SIGUSR1.
+
+    A shard that overruns its budget is usually parked in a *blocking*
+    call, and ``pytest-timeout``'s thread method cannot interrupt those:
+    it raises into the main thread through ``PyThreadState_SetAsyncExc``,
+    which is only delivered at a bytecode boundary, so a test sitting in
+    ``waitpid``/``select``/``recv`` never sees it. That is why a wedged
+    shard's log ends at the last test that *started* and says nothing
+    about where inside it the process stopped.
+
+    ``faulthandler`` does not need the interpreter to reach a boundary —
+    it walks the C stacks from the signal handler — so a stack dump is
+    the one artefact that survives a genuinely stuck process.
+
+    **It has to be an explicit file, not stderr.** pytest's default
+    ``fd``-level capture replaces fd 2 with a per-test temp file while a
+    test runs, so a dump written to stderr lands in a buffer that is
+    discarded when the process is killed — the exact case this exists
+    for. Measured: with stderr as the sink, a wedged run produced no dump
+    at all; with the file below, the stack came through intact. (The
+    file object must stay referenced for as long as the handler is
+    registered, which is why it is held in a module global.)
+
+    Returns whether the handler is armed, so ``pytest_configure`` can say
+    so in the log rather than leaving the reader to guess.
+    """
+    global _STACK_DUMP_FILE
+    if not hasattr(signal, "SIGUSR1"):  # Windows
+        return False
+    # Idempotent: arming twice must not leak the first file object, which
+    # would leave a descriptor open for the life of the session.
+    _disarm_stack_dump()
+    path = os.environ.get("CI_STACK_DUMP_PATH", "pytest-stack-dump.txt")
+    handle = None
+    try:
+        handle = open(path, "a", encoding="utf-8")
+        # ``chain=False``: override any existing handler rather than
+        # refusing to install. ``faulthandler.register`` raises when a
+        # handler is already present and chaining was requested, and a
+        # bolt-on guard must never be the reason a session fails to
+        # start — so a failure here is "not armed", never an exception.
+        faulthandler.register(
+            signal.SIGUSR1,
+            file=handle,
+            all_threads=True,
+            chain=False,
+        )
+    except (ValueError, RuntimeError, OSError):
+        # Close before giving up: a handle opened and then abandoned would
+        # leak for the life of the session on a path that already failed.
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        return False
+    _STACK_DUMP_FILE = handle
+    _STATE["stack_dump_path"] = path
+    return True
+
+
+def _disarm_stack_dump() -> None:
+    """Undo :func:`_arm_stack_dump` — unregister, then close the file.
+
+    A signal handler and its open descriptor are process-global state, not
+    a per-test resource, so a test that arms the dump has to hand the
+    process back the way it found it. Without this the handler survives
+    into every later test in the session.
+    """
+    global _STACK_DUMP_FILE
+    if hasattr(signal, "SIGUSR1"):
+        try:
+            faulthandler.unregister(signal.SIGUSR1)
+        except (ValueError, RuntimeError, OSError):
+            pass
+    if _STACK_DUMP_FILE is not None:
+        try:
+            _STACK_DUMP_FILE.close()
+        except OSError:
+            pass
+    _STACK_DUMP_FILE = None
+    _STATE["stack_dump_path"] = ""
+
+
 def pytest_configure(config):
     try:
         pgid = os.getpgrp()
@@ -158,13 +250,16 @@ def pytest_configure(config):
     _STATE["pgid"] = pgid
     _STATE["dedicated"] = dedicated
     _STATE["before"] = _pids_in_group(pgid)
+    _arm_stack_dump()
 
     _report(
         "ci-process-guard",
         f"watching process group {pgid} "
         f"(dedicated={dedicated}, "
         f"{len(_STATE['before'])} process(es) already present, "
-        f"reap={'yes' if dedicated else 'no — report only'})",
+        f"reap={'yes' if dedicated else 'no — report only'}, "
+        f"stack-dump-on-SIGUSR1="
+        f"{_STATE['stack_dump_path'] or 'unavailable'})",
         level="notice",
     )
 

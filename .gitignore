@@ -15,6 +15,11 @@ coverage.json
 htmlcov/
 coverage.xml
 *-junit.xml
+# CI-shard artifacts: the per-shard log is covered by *.log below, these
+# two are written straight into backend/ by the shard step, so a developer
+# reproducing a CI run locally would otherwise find them untracked.
+pytest-stack-dump*.txt
+pytest-deadline-*.flag
 
 # Node
 node_modules/
