@@ -570,6 +570,51 @@ jobs:
           backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
           backend/.venv/bin/python3 -m pip install pytest pytest-cov pytest-timeout coverage
 
+      # --- Mitigate actions/runner-images#13770 (2026-09-29) ---------------
+      #
+      # The Ubuntu 24.04 runner image ships a ``read_ahead_kb`` high enough
+      # to thrash the page cache on I/O-heavy jobs. Collection imports every
+      # test module and ``--cov=.`` instruments all of them, so this shard is
+      # about as I/O-heavy as a job gets.
+      #
+      # The symptom is NOT "the tests are slow", it is "the runner stops
+      # reporting". On run 36549676307 this shard's pytest step sat
+      # ``in_progress`` past BOTH its own ``timeout-minutes: 20`` (due
+      # 11:49:27) and the watchdog's 15-minute budget (due 11:44:27), while
+      # ``misc`` — a different, smaller VM on the same run — passed in 99s;
+      # GitHub then reaped the job at exactly 45m00s having uploaded nothing.
+      #
+      # That is why no in-workflow budget can be the fix: every ceiling in
+      # this file is enforced by a process *on the runner*, so a runner that
+      # has stopped reporting can neither enforce one nor upload a log. The
+      # only defence is not to trigger the bug, which is what this step is.
+      # The nightly job has carried this mitigation since the runner bug was
+      # first seen; the shards that actually die did not.
+      #
+      # Unlike the nightly's copy, this one reports what it touched and warns
+      # when the globs match nothing. A mitigation that silently no-ops is
+      # indistinguishable from one that was deleted, and the device names on
+      # the runner image have changed before.
+      - name: Mitigate runner-images#13770 (read_ahead_kb)
+        run: |
+          sudo bash -c '
+            shopt -s nullglob
+            touched=0
+            for dev in /sys/block/sd* /sys/block/nvme*n*; do
+              if [ -e "$dev/queue/read_ahead_kb" ]; then
+                echo "  $(basename $dev): $(cat $dev/queue/read_ahead_kb) -> 128"
+                echo 128 > "$dev/queue/read_ahead_kb"
+                touched=$((touched + 1))
+              fi
+            done
+            if [ "$touched" -eq 0 ]; then
+              echo "::warning::read_ahead_kb matched no block device — the globs are stale for this runner image, so runner-images#13770 is NOT mitigated and the shard may stop reporting"
+            else
+              echo "read_ahead_kb lowered on $touched block device(s)"
+            fi
+            exit 0
+          '
+
       # Run this shard via the venv Python.
       # This pins the CLAUDE.md rule: never use system Python to run pytest.
       #
@@ -844,6 +889,29 @@ jobs:
           backend/.venv/bin/python3 -m pip install --upgrade pip
           backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
           backend/.venv/bin/python3 -m pip install pytest pytest-timeout
+
+      # Same mitigation as the unit shards, for the same reason — this lane
+      # bisects the wedge, so it must not be able to hit it. See the long
+      # explanation above the unit shards' copy.
+      - name: Mitigate runner-images#13770 (read_ahead_kb)
+        run: |
+          sudo bash -c '
+            shopt -s nullglob
+            touched=0
+            for dev in /sys/block/sd* /sys/block/nvme*n*; do
+              if [ -e "$dev/queue/read_ahead_kb" ]; then
+                echo "  $(basename $dev): $(cat $dev/queue/read_ahead_kb) -> 128"
+                echo 128 > "$dev/queue/read_ahead_kb"
+                touched=$((touched + 1))
+              fi
+            done
+            if [ "$touched" -eq 0 ]; then
+              echo "::warning::read_ahead_kb matched no block device — the globs are stale for this runner image, so runner-images#13770 is NOT mitigated"
+            else
+              echo "read_ahead_kb lowered on $touched block device(s)"
+            fi
+            exit 0
+          '
 
       # No `--cov` here: coverage-gate does not run on a dispatch, and the
       # question is wall-clock behaviour, not coverage.
