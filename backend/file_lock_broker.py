@@ -115,6 +115,15 @@ _TURN_POLL_SECONDS = 0.25
 #: not make us overrun the caller's timeout.
 _OS_LOCK_PROBE_SECONDS = 1.0
 
+#: How long the serving thread blocks in ``accept()`` before looping to
+#: re-read its stop flag. This is the ONLY thing that ends the thread on
+#: Linux, where closing the listening socket does not wake a thread
+#: already blocked in ``accept()`` — see the ``settimeout`` call in
+#: :meth:`FileLockBroker.start` for the full failure this prevents. It
+#: sets the shutdown latency, so it is short; it is not a busy-wait,
+#: because the thread spends all but this fraction of its life asleep.
+_ACCEPT_POLL_SECONDS = 0.2
+
 
 def _default_emit(event: str, data: Dict[str, Any]) -> None:  # pragma: no cover
     """No-op sink used when the caller supplies no logger."""
@@ -204,6 +213,23 @@ class FileLockBroker:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(self._sock_path))
         server.listen(64)
+        # The serving thread blocks in ``accept()``, and ``stop()`` needs a
+        # way to make it return. Closing the socket is NOT that way: on
+        # Linux a thread already blocked in ``accept()`` keeps the file
+        # description alive through the pending syscall, so ``close()``
+        # does not wake it and ``_serve`` never sees an ``OSError``. The
+        # thread then outlives its test — the conftest leak guard reports
+        # ``pdt-lock-broker`` as still alive after a 10s join, which is
+        # exactly what CI reported on the ``unit`` lane.
+        #
+        # macOS does wake it (the blocked ``accept`` fails ECONNABORTED), so
+        # this is invisible on a developer machine and reproducible only on
+        # the Linux runner. Hence the poll: a short accept timeout turns
+        # "is it time to stop?" into something the loop can answer without
+        # depending on a platform-specific socket teardown. ``accept()``
+        # returns its socket in blocking mode regardless of this setting
+        # (Python 3.7+), so the per-connection handlers are unaffected.
+        server.settimeout(_ACCEPT_POLL_SECONDS)
         # The per-user temp dir is shared with every other process the same
         # user runs; 0600 keeps a stray process from connecting and
         # acquiring locks on this checkout's behalf.
@@ -274,6 +300,10 @@ class FileLockBroker:
         while not self._stop.is_set():
             try:
                 conn, _ = server.accept()
+            except socket.timeout:
+                # The poll interval, not an error: loop round so the
+                # ``_stop`` check above is re-evaluated.
+                continue
             except OSError:
                 # Socket closed by stop(), or the OS reclaimed it.
                 return
