@@ -368,3 +368,77 @@ def test_the_watchdog_does_not_hold_the_step_open(job_name: str) -> None:
             f"else killed pytest' — an OOM kill is also exit 137, and 143 "
             f"alone is ambiguous."
         )
+
+
+# ---------------------------------------------------------------------------
+# The I/O-heavy lanes must work around the known runner bug
+# ---------------------------------------------------------------------------
+
+#: Mitigation for actions/runner-images#13770: the Ubuntu 24.04 image ships
+#: a ``read_ahead_kb`` that thrashes the page cache on I/O-heavy jobs.
+_RUNNER_BUG_MITIGATION = "read_ahead_kb"
+
+
+@pytest.mark.parametrize("job_name", _SETSID_LANES)
+def test_a_heavy_lane_mitigates_the_known_runner_bug(job_name: str) -> None:
+    """The lanes that die must carry the workaround the nightly already has.
+
+    Diagnosed from run 36549676307. This shard's pytest step sat
+    ``in_progress`` past **both** its own ``timeout-minutes: 20`` and the
+    watchdog's 15-minute budget, while ``misc`` — a different, smaller VM on
+    the same run — passed in 99s. Two independent ceilings failing together
+    is not a slow test; it is a runner that has stopped reporting.
+
+    That also means no in-workflow budget can be the remedy: every ceiling in
+    the file is enforced by a process *on the runner*, so a runner that can
+    no longer report can neither enforce one nor upload the log. Not
+    triggering the bug is the only defence, and the mitigation for exactly
+    this bug has been sitting on the nightly job since it was first seen —
+    just not on the shards that hit it.
+
+    Two properties, both of which the nightly's copy lacks:
+
+    * it runs **before** the pytest step, or it mitigates nothing, and
+    * it reports what it touched and warns when the globs match no device. A
+      mitigation that silently no-ops is indistinguishable from one that was
+      deleted, and the device names on the runner image have changed before.
+
+    Scope, stated honestly: this reads the workflow. It can confirm the
+    mitigation is present, correctly ordered and self-reporting; it cannot
+    confirm the kernel accepted the write.
+    """
+    workflow = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+    steps = workflow["jobs"][job_name]["steps"]
+
+    mitigating = [
+        i
+        for i, step in enumerate(steps)
+        if _RUNNER_BUG_MITIGATION in (step.get("run") or "")
+    ]
+    assert mitigating, (
+        f"{job_name!r} has no `{_RUNNER_BUG_MITIGATION}` step. This lane runs "
+        f"pytest with --cov over thousands of test modules; without the "
+        f"runner-images#13770 workaround its VM can stop reporting, and then "
+        f"no timeout, watchdog or upload in this file can fire — which is "
+        f"exactly the 45-minute reap with no evidence."
+    )
+
+    detaching = [
+        i
+        for i, step in enumerate(steps)
+        if "setsid" in (step.get("run") or "")
+    ]
+    assert detaching, f"{job_name!r} no longer starts pytest under setsid"
+    assert min(mitigating) < min(detaching), (
+        f"in {job_name!r} the `{_RUNNER_BUG_MITIGATION}` step comes after the "
+        f"pytest step, so the shard has already done its I/O by the time the "
+        f"mitigation applies"
+    )
+
+    body = steps[min(mitigating)]["run"]
+    assert "::warning::" in body, (
+        f"the {job_name!r} mitigation cannot say that it did nothing. The "
+        f"globs are matched against runner-image device names, so a stale "
+        f"glob list turns the whole step into a silent no-op — and silence "
+        f"reads as 'mitigated'."
+    )
