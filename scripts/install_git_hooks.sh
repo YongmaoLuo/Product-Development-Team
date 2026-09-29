@@ -68,6 +68,7 @@ MARKER="# installed by scripts/install_git_hooks.sh"
 HOOKS=(
     "commit-msg	scripts/check_commit_msg.py	rejects AI attribution trailers"
     "pre-commit	scripts/grep_guard.sh	forbidden-filename sweep"
+    "pre-push	scripts/scan_commit_range.sh	scans the commits being pushed for private info"
 )
 
 missing=0
@@ -80,14 +81,20 @@ for entry in "${HOOKS[@]}"; do
         continue
     fi
 
-    # The body differs by hook kind: a commit-msg hook must pass the
-    # message file through ("$1"), everything else takes no arguments.
+    # How to run it: ``.py`` through the interpreter, everything else as a
+    # shell script.
     case "$script" in
         *.py) invoke="python3 \"\$REPO_ROOT/$script\"" ;;
         *)    invoke="bash \"\$REPO_ROOT/$script\"" ;;
     esac
+
+    # The body differs by hook kind: a commit-msg hook must pass the
+    # message file through ("$1"); pre-push must be told to read the ref
+    # lines from stdin, because git gives those on stdin and not in argv;
+    # everything else takes no arguments.
     case "$name" in
         commit-msg) passthrough='"$1"' ;;
+        pre-push)   passthrough='--stdin-pre-push' ;;
         *)          passthrough="" ;;
     esac
 
@@ -96,9 +103,20 @@ for entry in "${HOOKS[@]}"; do
         # hook body stores ``$REPO_ROOT`` unexpanded, so grepping for the
         # absolute path would report every correctly-installed hook as
         # stale. (It did, on the first run of this script.)
+        #
+        # Also compare the passthrough token. Without that, changing what
+        # a hook is invoked with leaves every installed copy stale while
+        # ``--check`` reports it current -- which is exactly what happened
+        # when pre-push gained ``--stdin-pre-push``: the hook ran, took the
+        # no-argument path, and rejected an ordinary ``git push``.
+        # ``-e`` because a passthrough token may begin with ``-``
+        # (``--stdin-pre-push``), and grep would otherwise read it as an
+        # option and match nothing -- reporting a freshly written hook as
+        # stale.
         if [[ ! -f "$target" ]] \
             || ! grep -qF "$MARKER" "$target" 2>/dev/null \
-            || ! grep -qF "$script" "$target" 2>/dev/null; then
+            || ! grep -qF "$script" "$target" 2>/dev/null \
+            || { [[ -n "$passthrough" ]] && ! grep -qFe "$passthrough" "$target" 2>/dev/null; }; then
             echo "stale $name — run: bash scripts/install_git_hooks.sh" >&2
             missing=1
         fi
