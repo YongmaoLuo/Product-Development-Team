@@ -69,6 +69,22 @@ from typing import List, Tuple
 
 import pytest
 
+# Every test here spawns ``pytest`` as a subprocess against the real task
+# pipeline — that is the ``integration`` marker's definition ("spawns local
+# subprocesses / drives the real server, but needs NO model"), and it is
+# what this file was missing.
+#
+# Unmarked, it was collected by the *unit* shards, whose marker expression
+# is ``not e2e and not integration`` and whose per-test ceiling is
+# ``--timeout=60``. Three nested interpreter starts plus a full backend
+# import do not fit in 60 seconds on a 2-core hosted runner, so
+# ``test_first_5_tests_all_pass`` was killed mid-``subprocess.run`` on every
+# CI run — and because that shard collects ``tests/`` in name order, it died
+# at ~9% and never reached ``static_gates`` at all. The integration lane
+# runs ``-m "integration and not e2e"`` with ``--timeout=120``, which is
+# where this file belongs.
+pytestmark = pytest.mark.integration
+
 
 # ---------------------------------------------------------------------------
 # Paths + constants

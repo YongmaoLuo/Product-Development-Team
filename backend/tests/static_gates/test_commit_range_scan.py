@@ -174,26 +174,51 @@ def test_a_clean_range_reports_clean(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_commit_scan_and_tree_scan_agree_on_scope(
+def test_the_tree_scan_does_not_depend_on_the_working_directory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The walker must find the same files whatever the cwd is.
+
+    CI runs the suite with ``working-directory: backend``. While
+    ``SCAN_ROOTS`` were resolved against the process working directory, no
+    ``backend/`` root existed there — the walker fell back to whatever
+    relative root happened to exist (``backend/scripts/``) and returned a
+    handful of unrelated files. That is enough for every "the scan is not
+    empty" assertion in the sibling gates to stay green, so the failure
+    mode was *silence*: the tree those gates exist to scan was never read,
+    and nothing said so.
+
+    A count floor cannot catch that (a handful is not zero), which is why
+    this pins the answer itself: the same set from three different
+    working directories, one of them outside the repository entirely.
+    """
+    root = {
+        source_scan.repo_relative(p).as_posix()
+        for p in source_scan.iter_first_party_sources()
+    }
+    assert root, "no first-party sources found from the repository root"
+
+    for cwd in (source_scan.REPO_ROOT / "backend", _REPO_ROOT, Path("/")):
+        monkeypatch.chdir(cwd)
+        elsewhere = {
+            source_scan.repo_relative(p).as_posix()
+            for p in source_scan.iter_first_party_sources()
+        }
+        assert elsewhere == root, (
+            f"the walker returned {len(elsewhere)} files with cwd={cwd} and "
+            f"{len(root)} from the repository root. The scan surface must not "
+            f"depend on where pytest was launched — CI launches it from "
+            f"backend/, where a relative root like 'backend' does not resolve."
+        )
+
+
+def test_commit_scan_and_tree_scan_agree_on_scope() -> None:
     """For HEAD, the commit scan sees exactly the disk walker's HEAD files.
 
-    ``monkeypatch.chdir`` first: ``iter_first_party_sources`` resolves its
-    ``SCAN_ROOTS`` against the process working directory, and the suite runs
-    from either the repository root or ``backend/`` depending on the caller.
-    The commit scan is not cwd-sensitive at all (``git ls-tree`` hands back
-    repository-root-relative paths), so without the chdir this test would
-    compare a cwd-independent walk against a cwd-dependent one and fail for
-    a reason that has nothing to do with scope agreement.
-
-    That cwd-sensitivity is a real, separate defect, not something this
-    chdir papers over as *fixed*: under `working-directory: backend` no
-    ``backend/`` root resolves, and the walker falls back to returning only
-    the files under ``backend/scripts/`` — enough for a non-empty assertion
-    to pass while the tree it is supposed to scan is never read. It is
-    reported rather than repaired here, because the repair changes the
-    meaning of every gate that shares this walker.
+    Neither side depends on the working directory: ``git ls-tree`` hands
+    back repository-root-relative paths, and ``iter_first_party_sources``
+    resolves its ``SCAN_ROOTS`` against ``source_scan.REPO_ROOT`` and
+    yields absolute paths. ``repo_relative`` puts both in the same form.
 
     Both sides are restricted to what **HEAD's tree** contains, rather than
     to ``git ls-files``. The index is not the commit: a file that is staged
@@ -207,8 +232,6 @@ def test_commit_scan_and_tree_scan_agree_on_scope(
     HEAD must be scanned here, and the commit scan must not reach anything
     the tree gates never check.
     """
-    monkeypatch.chdir(_REPO_ROOT)
-
     head_names = set(
         subprocess.run(
             ["git", "-C", str(_REPO_ROOT), "ls-tree", "-r", "--name-only", "HEAD"],
@@ -218,10 +241,10 @@ def test_commit_scan_and_tree_scan_agree_on_scope(
         ).stdout.splitlines()
     )
 
-    # ``iter_first_party_sources`` yields paths relative to the scan roots
-    # (its ``SCAN_ROOTS`` are relative), so with the cwd anchored at the
-    # repository root these are repository-root-relative.
-    on_disk = {p.as_posix() for p in source_scan.iter_first_party_sources()}
+    on_disk = {
+        source_scan.repo_relative(p).as_posix()
+        for p in source_scan.iter_first_party_sources()
+    }
     in_head = {rel for rel, _ in commit_range_scan.iter_commit_sources(
         _REPO_ROOT, "HEAD"
     )}

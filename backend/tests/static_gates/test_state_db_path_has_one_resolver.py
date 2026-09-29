@@ -122,7 +122,9 @@ def _string_constants(path: Path) -> list[tuple[int, str]]:
 def test_only_the_resolver_module_names_the_database_file() -> None:
     offenders: list[str] = []
     for path in _production_sources():
-        if path == _RESOLVER_MODULE:
+        # ``repo_relative``: the walker yields absolute paths, and this
+        # comparison is written against a repository-root-relative constant.
+        if source_scan.repo_relative(path) == _RESOLVER_MODULE:
             continue
         try:
             constants = _string_constants(path)
@@ -149,7 +151,9 @@ def test_only_the_resolver_module_names_the_database_file() -> None:
 def test_only_the_resolver_module_reads_the_env_override() -> None:
     offenders: list[str] = []
     for path in _production_sources():
-        if path == _RESOLVER_MODULE:
+        # ``repo_relative``: the walker yields absolute paths, and this
+        # comparison is written against a repository-root-relative constant.
+        if source_scan.repo_relative(path) == _RESOLVER_MODULE:
             continue
         try:
             text = path.read_text(encoding="utf-8")
