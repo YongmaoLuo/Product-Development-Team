@@ -154,11 +154,12 @@ def test_no_non_placeholder_home_path() -> None:
         except OSError:
             continue
         for _, lineno, segment in find_home_paths(path, text):
-            rel = path
-            try:
-                rel = path.relative_to(source_scan.SCAN_ROOTS[0].parent)
-            except ValueError:
-                pass
+            # ``repo_relative`` renders the offender the way a reader
+            # thinks about it (``backend/server.py``) regardless of how the
+            # walker reached it; the walker yields absolute paths, so
+            # formatting ``path`` directly would print the runner's whole
+            # checkout prefix into the failure message.
+            rel = source_scan.repo_relative(path)
             offenders.append(f"{rel}:{lineno}: /Users/{segment}/...")
 
     assert not offenders, (
