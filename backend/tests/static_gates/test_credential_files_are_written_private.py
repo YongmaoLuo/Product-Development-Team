@@ -62,6 +62,13 @@ def find_flat_tmp_settings_paths(path: Path, text: str) -> list[tuple[Path, int,
 #: Modules that write a settings file into the temp root. Every one of
 #: them must route through :mod:`utils.secret_files` for the directory
 #: mode, the file mode and the redaction helper.
+#: Repository-root-relative names of the modules that may write a settings
+#: file. Kept as relative names because that is how they read in a failure
+#: message and how a reviewer thinks about them; resolved against
+#: ``source_scan.REPO_ROOT`` at the point of use. Written as bare
+#: ``Path(...)`` they were resolved against the *working directory*, so
+#: under CI's ``working-directory: backend`` every one of them reported
+#: "module is gone" while sitting right there on disk.
 _SETTINGS_WRITERS = (
     Path("backend/coding_tool.py"),
     Path("backend/subagent_config.py"),
@@ -72,15 +79,18 @@ _SETTINGS_WRITERS = (
 def test_scan_is_non_empty() -> None:
     """A gate that scans nothing passes vacuously.
 
-    ``SCAN_ROOTS`` is relative, so running pytest from anywhere other
-    than the repository root yields an empty walk. This fails loudly
-    instead of reporting a clean scan.
+    The walker now resolves its roots against ``source_scan.REPO_ROOT``,
+    so the answer no longer moves with the working directory (it used to,
+    and this docstring used to say so). What can still empty the scan is a
+    filter that has drifted: an excluded-directory name that swallows the
+    tree, an extension list that matches nothing. An empty walk is
+    silent without this assertion, which is why it stays.
     """
     files = list(source_scan.iter_first_party_sources())
     assert files, (
         "iter_first_party_sources() returned no files — the gate would "
-        "pass on an empty result. Run pytest from the repository root, or "
-        "check that SCAN_ROOTS / EXCLUDED_DIRS still resolve."
+        "pass on an empty result. Check that SCAN_ROOTS / EXCLUDED_DIRS / "
+        "SOURCE_EXTENSIONS still describe the real first-party tree."
     )
     production = _production_sources()
     assert production, (
@@ -155,10 +165,11 @@ def test_settings_writers_route_through_secret_files() -> None:
     """
     missing: list[str] = []
     for rel in _SETTINGS_WRITERS:
-        if not rel.exists():  # pragma: no cover - module moved or renamed
+        path = source_scan.REPO_ROOT / rel
+        if not path.exists():  # pragma: no cover - module moved or renamed
             missing.append(f"{rel} (module is gone — update _SETTINGS_WRITERS)")
             continue
-        text = rel.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
         for needed in ("utils.secret_files", "private_dir"):
             if needed not in text:
                 missing.append(f"{rel} does not reference {needed!r}")
