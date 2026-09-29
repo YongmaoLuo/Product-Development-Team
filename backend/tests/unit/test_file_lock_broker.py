@@ -312,6 +312,77 @@ def sock_path_exists(path: str) -> bool:
     return Path(path).exists()
 
 
+def test_stop_ends_the_serving_thread_even_when_close_cannot_wake_it(
+    tmp_path, plan_dir, monkeypatch
+):
+    """``stop()`` must not depend on ``close()`` to end the accept loop.
+
+    The defect this pins was found on the CI runner, not here. On Linux a
+    thread already blocked in ``accept()`` keeps the file description
+    alive through the pending syscall, so closing the listening socket
+    does NOT wake it: ``_serve`` never sees the ``OSError`` it waits for,
+    the thread outlives ``stop()``'s join, and the conftest leak guard
+    fails the test with ``pdt-lock-broker ... outlived their test``.
+    macOS *does* wake it (the blocked accept fails ECONNABORTED), so the
+    bug is invisible on a developer machine and reproducible only on the
+    runner.
+
+    So the platform is simulated rather than relied on: ``close()`` is
+    neutralised, which is exactly the Linux behaviour. A broker that
+    ends its thread by polling a stop flag still shuts down; one that
+    waits for ``close()`` to deliver an error hangs here.
+    """
+
+    class _CloseInertSocket:
+        """Everything the broker does to its server socket, minus close.
+
+        ``socket.close`` is read-only on the C type, so the attribute has
+        to be intercepted by delegation rather than patched in place.
+        Only ``stop()`` ever sees this — ``_serve`` captured the real
+        socket when its thread started, which is the point: the loop is
+        still blocked in ``accept()`` on a socket nothing can close out
+        from under it.
+        """
+
+        def __init__(self, sock):
+            self._sock = sock
+
+        def __getattr__(self, name):
+            return getattr(self._sock, name)
+
+        def close(self):
+            pass
+
+    project = tmp_path / "project"
+    project.mkdir(parents=True)
+    broker = FileLockBroker(project, locks_dir_for_plan(plan_dir))
+    sock = broker.start()
+    # Captured up front: ``stop()`` clears ``_thread`` on its way out, so
+    # the assertion below has to hold a reference of its own.
+    server_thread = broker._thread
+    assert server_thread is not None and server_thread.is_alive()
+    real_server = broker._server
+
+    monkeypatch.setattr(broker, "_server", _CloseInertSocket(real_server))
+    started = time.monotonic()
+    broker.stop()
+    elapsed = time.monotonic() - started
+
+    # Whatever the platform, the socket and its file must not leak into
+    # the next broker this process starts.
+    real_server.close()
+    Path(sock).unlink(missing_ok=True)
+
+    assert not server_thread.is_alive(), (
+        "the serving thread is still blocked in accept() after stop(); it "
+        "must be ended by the stop flag, not by the socket teardown"
+    )
+    assert elapsed < 5.0, (
+        f"stop() took {elapsed:.1f}s — it burned the whole join timeout "
+        f"waiting for a thread that was never going to wake"
+    )
+
+
 def test_an_unopenable_lock_file_is_unavailable_not_busy(tmp_path, plan_dir):
     """An I/O failure must not be reported as contention.
 
