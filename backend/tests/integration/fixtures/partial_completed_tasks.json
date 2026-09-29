@@ -1,0 +1,106 @@
+{
+  "requirement": "test cross-process recovery: terminal tasks filtered on reload",
+  "stop_reason": null,
+  "reason_detail": null,
+  "tasks": [
+    {
+      "id": "A",
+      "title": "Already completed task A",
+      "description": "completed in a prior run — must be skipped on reload to avoid re-executing finished work",
+      "test_command": "echo A",
+      "test_commands": [],
+      "status": "completed",
+      "updated_time": "2026-06-01T10:00:00.000000",
+      "failure_reason": null,
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": [],
+      "files_to_modify": [
+        "__NO_FILE_CHANGES__"
+      ]
+    },
+    {
+      "id": "B",
+      "title": "Pending task B",
+      "description": "no deps, pending — will be dispatched on reload",
+      "test_command": "echo B",
+      "test_commands": [],
+      "status": "pending",
+      "updated_time": null,
+      "failure_reason": null,
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": [],
+      "files_to_modify": [
+        "__NO_FILE_CHANGES__"
+      ]
+    },
+    {
+      "id": "C",
+      "title": "Failed task C",
+      "description": "failed terminally in a prior run — must be skipped on reload (failed is a terminal status)",
+      "test_command": "echo C",
+      "test_commands": [],
+      "status": "failed",
+      "updated_time": "2026-06-01T10:05:00.000000",
+      "failure_reason": "synthetic failure_reason for testing the terminal-failed filter",
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": [],
+      "files_to_modify": [
+        "__NO_FILE_CHANGES__"
+      ]
+    },
+    {
+      "id": "D",
+      "title": "Pending task D (downstream of failed C)",
+      "description": "depends on B and C. Per the 'downstream keeps its own lifecycle' rule, D must remain in the active set even though C is failed.",
+      "test_command": "echo D",
+      "test_commands": [],
+      "status": "pending",
+      "updated_time": null,
+      "failure_reason": null,
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": [
+        "B",
+        "C"
+      ],
+      "files_to_modify": [
+        "__NO_FILE_CHANGES__"
+      ]
+    },
+    {
+      "id": "E",
+      "title": "Task E in breakdown-in-progress",
+      "description": "parent task whose children were just inserted into tasks.json. Must remain in the DAG so the children can be scheduled (breakdown_in_progress is intentionally NOT in _TERMINAL_TASK_STATUSES).",
+      "test_command": "echo E",
+      "test_commands": [],
+      "status": "breakdown_in_progress",
+      "updated_time": "2026-06-01T10:10:00.000000",
+      "failure_reason": null,
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": [],
+      "files_to_modify": [
+        "__NO_FILE_CHANGES__"
+      ]
+    },
+    {
+      "id": "F",
+      "title": "Pending task F",
+      "description": "no deps, pending — will be dispatched on reload",
+      "test_command": "echo F",
+      "test_commands": [],
+      "status": "pending",
+      "updated_time": null,
+      "failure_reason": null,
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": [],
+      "files_to_modify": [
+        "__NO_FILE_CHANGES__"
+      ]
+    }
+  ]
+}

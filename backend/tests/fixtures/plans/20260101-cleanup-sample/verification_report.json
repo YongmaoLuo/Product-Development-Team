@@ -1,0 +1,12 @@
+{
+  "overall_status": "PASSED",
+  "summary": "Cleanup-sample e2e fixture's verification point VP-001 passed: after EXEC_PORT=8001 lifecycle + teardown, the plans/20260101-cleanup-sample/ tree contains only the allowlisted baseline artifacts (interview.json, tasks.json, verification_plan.json, verification_report.json) — zero forbidden JSON sidecars, schema whitelist stable.",
+  "verification_results": [
+    {
+      "id": "VP-001",
+      "status": "PASSED",
+      "actual_result": "Three-defense layers all green for cleanup-sample plan; the test_e2e_three_layer_defense wrapper asserts Defense 1 (source grep), Defense 1b (filesystem teardown), and Defense 2 (SQLite schema whitelist) on a freshly spawned EXEC_PORT=8001 instance",
+      "evidence": "fixture file paths: backend/tests/fixtures/plans/20260101-cleanup-sample/{interview.json, tasks.json, verification_plan.json, verification_report.json}; spawn server.py via subprocess.Popen on EXEC_PORT=8001 with PDT_STATE_DB_PATH redirected to tmp_path; plant interview.json + tasks.json; drive /api/execution/{plan_id}/start; teardown proc.terminate() then shutil.rmtree(temp_dir); assert zero forbidden JSON sidecars in plans/ tree"
+    }
+  ]
+}

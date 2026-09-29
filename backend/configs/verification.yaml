@@ -1,0 +1,50 @@
+# Verification Configuration
+# =========================
+#
+# Per-method timeout and parallelism configuration for the
+# VerificationAgent.
+#
+# 2026-09-13: the per-VP ``timeout_seconds``
+# interface was DELETED. The enforcement layers are exactly two:
+#   - 1-hour outer cap: flat ``HARD_WALL_CLOCK_CAP_SECONDS=3600`` in
+#     VerificationSubAgent (no per-VP scaling, no multiplier, no grace)
+#   - 15-min inner idle: ``coding_tool._total_timer`` (fires when
+#     subprocess stdout is silent for 15 min — emits HardTimeoutError)
+#
+# The values below are surface metadata for ``vp_start`` events and
+# always equal 3600. They are NOT read as per-VP overrides anymore.
+# Do NOT set them below 3600.
+#
+# Loaded by:
+#   - backend/verification_config.py (TimeoutPolicy.from_yaml)
+#   - backend/config_registry.py (registered as 'verification')
+
+execution:
+  # Surface metadata only (vp_start event observability), NOT
+  # enforcement. A missing key falls back to the global default.
+  per_method_timeout_seconds:
+    ui_validation: 3600      # 1-hour cap
+    code_review: 3600        # 1-hour cap
+    api_test: 3600           # 1-hour cap
+    # 2026-09-18: Phase 2 的两种全量关卡。``automated_test`` 已于同日退役
+    # —— 留着它会让 vp_start 事件报一个不存在的 method。注意这里的值只是
+    # "扁平一小时"契约的同一份值；整仓命令真正的时长约束是 VP 自己的
+    # ``ci_timeout_seconds``，不是这一层。
+    e2e: 3600                # 1-hour cap
+    full_ci: 3600            # 1-hour cap
+
+  # Maximum number of verification points evaluated in parallel.
+  #
+  # Two bounds nest here, and only one of them is this knob:
+  #   * per group — this cap throttles one method-group's own fan-out;
+  #   * plan-wide — ``plan_semaphore``, created once per round and shared
+  #     by every group, is the real fleet ceiling.
+  # Without the second one the per-group caps multiply (cap × groups) and
+  # quietly exceed the number an operator thinks they configured. See
+  # ``verification_agent._execute_group``.
+  #
+  # (2026-09-28: this comment used to say verification "currently runs
+  # points sequentially" and that the knob was for a future concurrent
+  # implementation. That had been false for a while — groups and the VPs
+  # inside them both run under ``asyncio.gather`` today.)
+  parallelism_cap: 4

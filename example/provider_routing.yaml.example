@@ -1,0 +1,94 @@
+# Provider Routing Configuration (2026-09-13, ordering revised 2026-09-14)
+# =============================================================================
+# Scene → tier → regex patterns over CC Switch provider DISPLAY names. The backend
+# manages PROVIDERS only — model selection is delegated entirely to CC
+# Switch (each provider row carries its own ANTHROPIC_* env block,
+# forwarded verbatim to the sub-agent subprocess).
+#
+# Matching semantics:
+#   * Patterns are Python regexes matched with re.search() against the
+#     CC Switch display name (the same name shown in the CC Switch UI and
+#     written into provider-order.json). Anchor explicitly when needed:
+#     "^Vendor B Pro$" is exact, "Vendor A" is a substring match.
+#
+#   * ORDERING — a tier's pattern list is a MEMBERSHIP filter; the order
+#     the patterns are written in carries NO ranking meaning. The
+#     resolved chain follows CC Switch's current provider order (read
+#     from provider-order.json, which the optimizer keeps in sync with
+#     CC Switch). Names the optimizer does not rank follow, in DB row
+#     order. So if CC Switch currently puts Vendor C first, the `high` chain
+#     leads with Vendor C even though "^Vendor D" is written first below.
+#     Practical consequence: to change the pick order, reorder providers
+#     in CC Switch (or pin a priority via the optimizer) — editing this
+#     list cannot do it.
+#
+#   * The dispatch loop can only pick providers from the resolved chain,
+#     so fallback NEVER crosses tiers.
+#
+# Hot reload: this file is re-read automatically whenever its mtime/size
+# changes — edits take effect on the next dispatch without restarting the
+# the backend. ``PDT_PROVIDER_ROUTING_FILE`` overrides the config path.
+#
+# Degradation: a missing tier, an invalid regex, or zero matches yields
+# an EMPTY chain for that scene (WARNING in the log); the caller then
+# falls back to the documented parent-process behaviour. A scene missing
+# from ``scenes`` routes to ``default_tier``.
+# =============================================================================
+
+version: 1
+
+# Scenes not listed below route here ("至少都用 medium" — nothing routes
+# to low implicitly).
+default_tier: medium
+
+tiers:
+  # Put the CC Switch DISPLAY NAMES of your providers into the three tiers.
+  # Patterns are Python regexes matched with re.search() against the name
+  # CC Switch shows, so "^Example Strong" is a prefix match and
+  # "^Example Strong$" is exact.
+  #
+  # Replace the examples below with your own provider names.
+  high:
+    - "^Example Strong"
+  medium:
+    - "^Example Balanced"
+  low:
+    - "^Example Cheap"
+
+scenes:
+  # --- Document / planning phases: strongest tier ---
+  interview: high
+  prd: high
+  prd_refine: high
+  arch: high
+  arch_refine: high
+  test_design: high
+  test_refine: high
+  tasks_generation: high
+  planning: high
+  # Refiner (post-failure replanning) must be stronger than execution.
+  refiner: high
+  breakdown: high
+  # Verification failure → repair-task generation: strong tier.
+  repair_generation: high
+  # 验收命令的**语义**审计（2026-09-15）。
+  #
+  # 静态护栏只能认出"形态"（有没有界定范围、点名的测试是否存在）；像
+  # VP-020 那种自定义脚本"exit 0 但采样 0 个 fixture"、VP-017 那种
+  # "grep 一个不存在的目录再 `|| echo CLEAN`"，只能靠读懂命令的语义来判。
+  # 这个判断的要求高，所以走 high 档。
+  verification_command_audit: high
+  # --- Execution: medium (cost control) ---
+  execution: medium
+  repair_execution: medium
+  verification: medium
+  # 服务新鲜度预检的进程重启发现（2026-09-16）。走 medium 档：
+  # 这是 discovery + kill/relaunch，不需要 high 档推理；且每轮只跑一次。
+  service_restart: medium
+  # 每轮开始前的验证计划增量评估（2026-09-16）：判断 VP 要不要增减。
+  # 是覆盖度判断（依据是否成立、有没有重复覆盖），不是高难语义推理，
+  # 口径同"至少都用 medium"。
+  verification_plan_delta: medium
+  # --- Low-stakes auxiliary calls ---
+  audit_second_pass: low
+  summarizer: low

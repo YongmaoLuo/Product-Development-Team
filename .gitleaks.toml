@@ -1,0 +1,11 @@
+[extend]
+useDefault = true
+
+# `backend/.env.ci` is a committed, non-secret template. Its
+# `ANTHROPIC_API_KEY` value deliberately keeps the `sk-ant-` prefix,
+# because `backend/env_config.validate_config()` rejects anything else —
+# that prefix check is worth keeping honest. The value is a placeholder
+# and must not fail the scan forever.
+[[allowlists]]
+description = "committed placeholder in the non-secret CI env template"
+paths = ['''backend/\.env\.ci''']

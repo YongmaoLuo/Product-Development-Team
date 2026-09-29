@@ -1,0 +1,78 @@
+{
+  "source_file": "backend/tests/unit/test_coding_tool.py",
+  "generated_by": "task 8-1-1 (refactor-provider-config plan)",
+  "pytest_command": "backend/.venv/bin/python3 -m pytest backend/tests/unit/test_coding_tool.py --tb=line -q",
+  "total_failed": 10,
+  "failures": [
+    {
+      "node_id": "backend/tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_run_claude_uses_vendor-b_when_available",
+      "line": 780,
+      "error_type": "AssertionError",
+      "error_message": "assert 'vendor-b' not in env; bare provider id leaked into ANTHROPIC_BASE_URL",
+      "bucket": "D"
+    },
+    {
+      "node_id": "backend/tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_run_claude_inherits_parent_when_vendor-b_unavailable",
+      "line": 815,
+      "error_type": "AssertionError",
+      "error_message": "assert env['ANTHROPIC_BASE_URL'] == parent_url; fallback dispatch still referenced bare 'vendor-b'",
+      "bucket": "D"
+    },
+    {
+      "node_id": "backend/tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_run_claude_explicit_api_key_takes_precedence_over_vendor-b",
+      "line": 846,
+      "error_type": "AssertionError",
+      "error_message": "assert explicit_key in env; provider override path dropped explicit key for bare 'vendor-b'",
+      "bucket": "D"
+    },
+    {
+      "node_id": "backend/tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_run_claude_vendor-b_logs_provider_selection",
+      "line": 880,
+      "error_type": "AssertionError",
+      "error_message": "assert 'vendor-b-pro' in log_message; logger emitted bare 'vendor-b' provider identifier",
+      "bucket": "D"
+    },
+    {
+      "node_id": "backend/tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_query_fallback_to_parent_when_vendor-b_api_error",
+      "line": 917,
+      "error_type": "AssertionError",
+      "error_message": "assert fallback_called; query() did not fall back to parent config after bare 'vendor-b' ApiError",
+      "bucket": "E"
+    },
+    {
+      "node_id": "backend/tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_query_json_fallback_to_parent_when_vendor-b_api_error",
+      "line": 976,
+      "error_type": "AssertionError",
+      "error_message": "assert fallback_called; query_json() did not fall back to parent config after bare 'vendor-b' ApiError",
+      "bucket": "E"
+    },
+    {
+      "node_id": "backend/tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_query_no_fallback_when_not_vendor-b",
+      "line": 1022,
+      "error_type": "AssertionError",
+      "error_message": "assert not fallback_called; non-vendor-b provider incorrectly triggered fallback due to bare id mismatch",
+      "bucket": "E"
+    },
+    {
+      "node_id": "backend/tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_query_no_infinite_fallback_loop",
+      "line": 1053,
+      "error_type": "AssertionError",
+      "error_message": "assert call_count <= 2; infinite fallback loop caused by bare 'vendor-b' re-dispatch",
+      "bucket": "E"
+    },
+    {
+      "node_id": "backend/tests/unit/test_coding_tool.py::test_no_bare_vendor-b_in_coding_tool",
+      "line": 1637,
+      "error_type": "AssertionError",
+      "error_message": "assert 'vendor-b' not in source; coding_tool.py contains bare provider identifier",
+      "bucket": "C"
+    },
+    {
+      "node_id": "backend/tests/unit/test_coding_tool.py::test_coding_tool_vendor-b_glm_path",
+      "line": 1657,
+      "error_type": "KeyError",
+      "error_message": "'vendor-b'; legacy alias failed to resolve to canonical 'vendor-b-pro' registry entry",
+      "bucket": "C"
+    }
+  ]
+}

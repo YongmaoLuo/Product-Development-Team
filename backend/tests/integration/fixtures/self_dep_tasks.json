@@ -1,0 +1,25 @@
+{
+  "requirement": "test self-dependency A→A rejection",
+  "stop_reason": null,
+  "reason_detail": null,
+  "tasks": [
+    {
+      "id": "A",
+      "title": "Task A depending on itself",
+      "description": "self-loop — depends_on includes its own id",
+      "test_command": "echo A",
+      "test_commands": [],
+      "status": "pending",
+      "updated_time": null,
+      "failure_reason": null,
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": [
+        "A"
+      ],
+      "files_to_modify": [
+        "__NO_FILE_CHANGES__"
+      ]
+    }
+  ]
+}

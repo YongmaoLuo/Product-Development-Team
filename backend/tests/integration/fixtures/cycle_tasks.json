@@ -1,0 +1,43 @@
+{
+  "requirement": "test cycle A→B→A rejection",
+  "stop_reason": null,
+  "reason_detail": null,
+  "tasks": [
+    {
+      "id": "A",
+      "title": "Cycle node A",
+      "description": "cycle head — depends on B",
+      "test_command": "echo A",
+      "test_commands": [],
+      "status": "pending",
+      "updated_time": null,
+      "failure_reason": null,
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": [
+        "B"
+      ],
+      "files_to_modify": [
+        "__NO_FILE_CHANGES__"
+      ]
+    },
+    {
+      "id": "B",
+      "title": "Cycle node B",
+      "description": "cycle tail — depends on A",
+      "test_command": "echo B",
+      "test_commands": [],
+      "status": "pending",
+      "updated_time": null,
+      "failure_reason": null,
+      "project_dir": null,
+      "model_type": "medium",
+      "depends_on": [
+        "A"
+      ],
+      "files_to_modify": [
+        "__NO_FILE_CHANGES__"
+      ]
+    }
+  ]
+}

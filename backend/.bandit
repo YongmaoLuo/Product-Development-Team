@@ -1,0 +1,22 @@
+[bandit]
+# Exclude third-party / build artifacts from scanning.
+# Patterns are matched against each file's path; both relative-to-cwd and
+# **/-glob forms are listed so the same file works regardless of where
+# bandit is invoked from.
+exclude = backend/.venv,backend/.benchmarks,**/.venv/**,**/__pycache__/**,**/.pytest_cache/**,**/.mypy_cache/**
+
+# Skipped test IDs — these patterns are intentional in this codebase:
+# B104 - bind to 0.0.0.0: intentional for the FastAPI dev server (server.py).
+# B108 - hardcoded /tmp: used in test fixtures and CLI tools as a stable,
+#        cross-platform temp path (NOT for storing secrets).
+# B113 - requests without timeout: tests use mocked responses and adapters.
+# B202 - tarfile.extractall: only invoked on `git archive` output in a perf
+#        test baseline (source is trusted).
+# B310 - urllib.urlopen: only called on validated internal URLs (cc-switch,
+#        localhost health-checks) with explicit timeout.
+# B602 - subprocess shell=True: test runner executes task-defined shell
+#        commands (pytest, etc.) where shell semantics are required.
+# B608 - SQL query construction: column list is built from a hardcoded tuple
+#        of identifiers and values are passed via `?` placeholders.
+# B324 - hashlib.md5: used to derive short URL identifiers (NOT for crypto).
+skips = B104,B108,B113,B202,B310,B602,B608,B324

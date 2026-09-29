@@ -1,0 +1,13 @@
+{
+  "verification_points": [
+    {
+      "id": "VP-001",
+      "title": "基础功能验证",
+      "related_prd_criteria": "系统基本功能可用",
+      "verification_method": "automated_test",
+      "priority": "high",
+      "expected_result": "核心功能正常运行",
+      "test_command": "echo 'Basic functionality check'"
+    }
+  ]
+}

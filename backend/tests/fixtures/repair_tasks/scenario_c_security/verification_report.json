@@ -1,0 +1,26 @@
+{
+  "overall_status": "FAILED",
+  "summary": "安全测试失败：缺少账户锁定机制",
+  "verification_results": [
+    {
+      "id": "VP-001",
+      "status": "FAILED",
+      "actual_result": "登录失败5次后账户未锁定，仍可继续登录",
+      "evidence": "pytest_fail: Account not locked after 5 failed logins\n\nExpected: Account locked for 30 minutes\nActual: Account still active after 5 failed attempts\n\nError: AssertionError: Account lock not implemented"
+    },
+    {
+      "id": "VP-002",
+      "status": "FAILED",
+      "actual_result": "没有实现登录失败日志记录",
+      "evidence": "pytest_fail: Login failure logs not found\n\nExpected: Security log entry with timestamp and IP\nActual: No log entries found in security log\n\nError: AssertionError: Security logging not implemented"
+    }
+  ],
+  "requirement_deviations": [
+    {
+      "verification_point_id": "VP-001",
+      "type": "security",
+      "description": "缺少PRD要求的账户锁定安全机制",
+      "severity": "high"
+    }
+  ]
+}

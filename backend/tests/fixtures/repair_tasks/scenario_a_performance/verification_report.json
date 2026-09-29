@@ -1,0 +1,26 @@
+{
+  "overall_status": "FAILED",
+  "summary": "性能测试失败：并发登录响应时间超过PRD要求的2秒",
+  "verification_results": [
+    {
+      "id": "VP-001",
+      "status": "FAILED",
+      "actual_result": "并发登录测试失败：100并发用户下，平均响应时间为5.3秒，超过PRD要求的2秒",
+      "evidence": "pytest_timeout: Login function took 5300ms for 100 concurrent users\n\nError: AssertionError: Expected response time < 2000ms, but got 5300ms"
+    },
+    {
+      "id": "VP-002",
+      "status": "FAILED",
+      "actual_result": "登录失败率过高：测试中失败率达到2.5%，超过PRD要求的<1%",
+      "evidence": "pytest_fail: 1000 login attempts, 25 failures (2.5% failure rate)\n\nError: AssertionError: Expected failure rate < 1%, but got 2.5%"
+    }
+  ],
+  "requirement_deviations": [
+    {
+      "verification_point_id": "VP-001",
+      "type": "performance",
+      "description": "并发登录响应时间超过PRD性能要求",
+      "severity": "high"
+    }
+  ]
+}

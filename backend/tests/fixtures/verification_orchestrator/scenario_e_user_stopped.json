@@ -1,0 +1,12 @@
+{
+  "overall_status": "FAILED",
+  "verification_results": [
+    {
+      "id": "VP-001",
+      "status": "FAILED",
+      "actual_result": "Test failed",
+      "evidence": "error"
+    }
+  ],
+  "requirement_deviations": []
+}

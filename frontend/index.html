@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Spec-Driven Dev System</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%234f46e5'/%3E%3Ctext x='8' y='12' font-size='10' text-anchor='middle' fill='white' font-family='sans-serif'%3ES%3C/text%3E%3C/svg%3E">
+    <link rel="stylesheet" href="style.css?v=15">
+</head>
+<body>
+    <div id="app-layout">
+        <!-- Sidebar: always-visible plan list -->
+        <aside id="sidebar">
+            <div class="sidebar-header">
+                <div class="sidebar-brand" id="btn-sidebar-home">
+                    <div class="sidebar-logo">S</div>
+                    <div class="sidebar-brand-text">
+                        <h1>Spec-Driven Dev</h1>
+                        <p>需求驱动开发系统</p>
+                    </div>
+                </div>
+                <div class="sidebar-actions">
+                    <button id="btn-new-plan" class="btn-icon" title="新建计划">+</button>
+                </div>
+            </div>
+            <div id="sidebar-plans"></div>
+        </aside>
+
+        <main id="app">
+            <!-- Dynamic step indicator -->
+            <nav class="steps" id="steps-nav">
+                <!-- Steps rendered dynamically by JS -->
+            </nav>
+
+            <!-- Plans list view -->
+            <section id="plans-view" class="view">
+                <div class="view-header">
+                    <h2>项目计划</h2>
+                </div>
+                <div id="plans-list" class="plans-list"></div>
+            </section>
+
+            <!-- Interview view -->
+            <section id="interview-view" class="view hidden">
+                <h2>需求收集</h2>
+                <div id="interview-chat" class="chat-container"></div>
+                <div class="input-area">
+                    <textarea id="interview-input" placeholder="输入你的需求或回答..." rows="3"></textarea>
+                    <button id="btn-send-interview" class="btn btn-primary">发送</button>
+                </div>
+                <div id="interview-complete-bar" class="action-bar hidden" style="margin-top:16px">
+                    <button id="btn-to-home-from-interview" class="btn">返回计划列表</button>
+                    <button id="btn-generate-prd" class="btn btn-primary">生成 PRD</button>
+                </div>
+            </section>
+
+            <!-- PRD view -->
+            <section id="prd-view" class="view hidden">
+                <h2>PRD 文档</h2>
+                <div id="prd-content" class="prd-content"></div>
+                <div class="action-bar">
+                    <button id="btn-back-interview" class="btn">返回修改需求</button>
+                    <button id="btn-regen-prd" class="btn btn-outline">重新生成</button>
+                    <button id="btn-to-review" class="btn btn-primary">进入审阅</button>
+                </div>
+            </section>
+
+            <!-- PRD Review view -->
+            <section id="review-view" class="view hidden">
+                <h2>PRD 审阅</h2>
+                <div id="review-progress" class="review-progress"></div>
+                <div id="review-items" class="review-items"></div>
+                <div class="action-bar">
+                    <button id="btn-back-prd" class="btn">返回 PRD</button>
+                    <button id="btn-regen-prd-in-review" class="btn btn-outline">重新生成</button>
+                    <button id="btn-accept-all-prd" class="btn btn-outline">一键接受</button>
+                    <button id="btn-to-arch-option" class="btn btn-primary">继续</button>
+                </div>
+            </section>
+
+            <!-- PRD Refinement pending view -->
+            <section id="prd-refine-view" class="view hidden">
+                <div class="refine-pending">
+                    <div class="spinner" style="margin: 0 auto 20px;"></div>
+                    <h2>PRD 正在修订中</h2>
+                    <p>有 <span id="prd-rejected-count">0</span> 个决策点被拒绝，AI 正在根据反馈重新生成...</p>
+                    <button id="btn-prd-refine-done" class="btn btn-primary" style="margin-top: 20px;">查看修订后的 PRD</button>
+                </div>
+            </section>
+
+            <!-- Architecture option view -->
+            <section id="arch-option-view" class="view hidden">
+                <div class="option-view">
+                    <h2>架构设计</h2>
+                    <p class="option-desc">PRD 已审阅通过。是否需要生成架构设计文档？<br><span class="option-hint">对于复杂系统，架构设计可以帮助明确技术选型和模块划分。</span></p>
+                    <div class="option-actions">
+                        <button id="btn-skip-arch" class="btn">跳过，直接生成任务</button>
+                        <button id="btn-enable-arch" class="btn btn-primary">生成架构设计</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Architecture design view -->
+            <section id="arch-view" class="view hidden">
+                <h2>架构设计文档</h2>
+                <div id="arch-content" class="prd-content"></div>
+                <div class="action-bar">
+                    <button id="btn-back-prd-from-arch" class="btn">返回 PRD</button>
+                    <button id="btn-regen-arch" class="btn btn-outline">重新生成</button>
+                    <button id="btn-to-arch-review" class="btn btn-primary">进入架构审阅</button>
+                </div>
+            </section>
+
+            <!-- Architecture review view -->
+            <section id="arch-review-view" class="view hidden">
+                <h2>架构审阅</h2>
+                <div id="arch-review-progress" class="review-progress"></div>
+                <div id="arch-review-items" class="review-items"></div>
+                <div class="action-bar">
+                    <button id="btn-back-arch" class="btn">返回架构文档</button>
+                    <button id="btn-regen-arch-in-review" class="btn btn-outline">重新生成</button>
+                    <button id="btn-accept-all-arch" class="btn btn-outline">一键接受</button>
+                    <button id="btn-to-test-option" class="btn btn-primary">继续</button>
+                </div>
+            </section>
+
+            <!-- Architecture refinement pending view -->
+            <section id="arch-refine-view" class="view hidden">
+                <div class="refine-pending">
+                    <div class="spinner" style="margin: 0 auto 20px;"></div>
+                    <h2>架构设计正在修订中</h2>
+                    <p>有 <span id="arch-rejected-count">0</span> 个决策点被拒绝，AI 正在根据反馈重新生成...</p>
+                    <button id="btn-arch-refine-done" class="btn btn-primary" style="margin-top: 20px;">查看修订后的架构</button>
+                </div>
+            </section>
+
+            <!-- Test design option view -->
+            <section id="test-option-view" class="view hidden">
+                <div class="option-view">
+                    <h2>测试设计</h2>
+                    <p class="option-desc">架构设计已审阅通过。是否需要生成测试设计文档？<br><span class="option-hint">测试设计文档定义测试策略、覆盖目标和验收标准。</span></p>
+                    <div class="option-actions">
+                        <button id="btn-skip-test" class="btn">跳过，直接生成任务</button>
+                        <button id="btn-enable-test" class="btn btn-primary">生成测试设计</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Test design view -->
+            <section id="test-view" class="view hidden">
+                <h2>测试设计文档</h2>
+                <div id="test-content" class="prd-content"></div>
+                <div class="action-bar">
+                    <button id="btn-back-arch-from-test" class="btn">返回架构</button>
+                    <button id="btn-regen-test" class="btn btn-outline">重新生成</button>
+                    <button id="btn-to-test-review" class="btn btn-primary">进入测试审阅</button>
+                </div>
+            </section>
+
+            <!-- Test design review view -->
+            <section id="test-review-view" class="view hidden">
+                <h2>测试设计审阅</h2>
+                <div id="test-review-progress" class="review-progress"></div>
+                <div id="test-review-items" class="review-items"></div>
+                <div class="action-bar">
+                    <button id="btn-back-test" class="btn">返回测试文档</button>
+                    <button id="btn-regen-test-in-review" class="btn btn-outline">重新生成</button>
+                    <button id="btn-accept-all-test" class="btn btn-outline">一键接受</button>
+                    <button id="btn-to-tasks-from-test" class="btn btn-primary">生成任务</button>
+                </div>
+            </section>
+
+            <!-- Test refinement pending view -->
+            <section id="test-refine-view" class="view hidden">
+                <div class="refine-pending">
+                    <div class="spinner" style="margin: 0 auto 20px;"></div>
+                    <h2>测试设计正在修订中</h2>
+                    <p>有 <span id="test-rejected-count">0</span> 个决策点被拒绝，AI 正在根据反馈重新生成...</p>
+                    <button id="btn-test-refine-done" class="btn btn-primary" style="margin-top: 20px;">查看修订后的测试设计</button>
+                </div>
+            </section>
+
+            <!-- Tasks view -->
+            <section id="tasks-view" class="view hidden">
+                <h2>任务列表</h2>
+                <div id="tasks-list" class="tasks-list"></div>
+
+                <!-- Execution panel -->
+                <div id="execution-panel" class="execution-panel hidden">
+                    <div class="execution-header">
+                        <h3>执行任务</h3>
+                        <span id="execution-status-badge" class="exec-badge">未开始</span>
+                    </div>
+                    <div id="execution-setup" class="execution-setup">
+                        <input id="project-dir-input" class="exec-input" placeholder="目标项目目录（如 ~/projects/my-app）" />
+                        <button id="btn-confirm-execute" class="btn btn-primary">开始执行</button>
+                    </div>
+                    <div id="execution-controls" class="hidden" style="margin-top:8px">
+                        <button id="btn-stop-execution" class="btn btn-danger">停止执行</button>
+                        <button id="btn-restart-execution" class="btn btn-outline">重新执行</button>
+                    </div>
+                    <pre id="execution-logs" class="execution-logs hidden"></pre>
+                </div>
+
+                <!-- Verification panel -->
+                <div id="verification-panel" class="verification-panel hidden">
+                    <div class="verification-header">
+                        <div class="verification-title-row">
+                            <h3>Verification</h3>
+                            <span id="verification-status-badge" class="verification-badge pending">未开始</span>
+                        </div>
+                        <span id="verification-round" class="verification-round">Round 0/3</span>
+                    </div>
+
+                    <!-- Verification progress area (shown when running) -->
+                    <div id="verification-progress-area" class="verification-area hidden">
+                        <div class="verification-subtitle">验证进度</div>
+                        <div id="verification-counts-detail"></div>
+                        <div id="verification-points-list"></div>
+                    </div>
+
+                    <!-- Verification result area (shown when passed/failed/loop_stopped) -->
+                    <div id="verification-result-area" class="verification-area hidden">
+                        <div class="verification-subtitle">验证结果</div>
+                        <div id="verification-overall-result" class="verification-overall"></div>
+                        <div id="verification-stats" class="verification-stats"></div>
+                        <div id="verification-deviations" class="verification-deviations"></div>
+                    </div>
+
+                    <!-- Repair tasks area (shown when failed) -->
+                    <div id="verification-repair-area" class="verification-area hidden">
+                        <div class="verification-subtitle">修复任务</div>
+                        <div id="verification-repair-tasks"></div>
+                        <div class="verification-repair-actions">
+                            <button id="btn-execute-all-repairs" class="btn btn-primary">全部执行</button>
+                            <button id="btn-custom-execute-repairs" class="btn btn-outline">自定义执行</button>
+                        </div>
+                    </div>
+
+                    <!-- Action buttons area -->
+                    <div id="verification-actions" class="verification-actions">
+                        <button id="btn-start-verification" class="btn btn-primary">启动验证</button>
+                        <button id="btn-stop-verification" class="btn btn-danger hidden">停止验证</button>
+                    </div>
+                </div>
+
+                <!-- Usage panel: per-plan token/cost accounting (2026-09-21) -->
+                <div id="usage-panel" class="usage-panel hidden">
+                    <div class="usage-header">
+                        <h3>用量统计</h3>
+                        <div class="usage-header-right">
+                            <span id="usage-cross-check-badge" class="usage-badge">未开始</span>
+                            <button id="btn-refresh-usage" class="btn btn-outline">刷新</button>
+                        </div>
+                    </div>
+                    <div id="usage-empty" class="usage-empty">
+                        暂无用量记录（执行后自动统计）
+                    </div>
+                    <div id="usage-body" class="usage-body hidden">
+                        <div id="usage-meta" class="usage-meta"></div>
+                        <div id="usage-totals" class="usage-totals"></div>
+                        <div id="usage-breakdowns" class="usage-breakdowns"></div>
+                        <div id="usage-notes" class="usage-notes"></div>
+                        <div id="usage-updated" class="usage-updated"></div>
+                    </div>
+                </div>
+
+                <div class="action-bar">
+                    <button id="btn-back-tasks" class="btn">返回</button>
+                    <button id="btn-start-execution" class="btn btn-success">开始执行</button>
+                    <button id="btn-to-home" class="btn btn-primary">返回计划列表</button>
+                </div>
+            </section>
+
+            <!-- Loading overlay -->
+            <div id="loading" class="loading hidden">
+                <div class="spinner"></div>
+                <p id="loading-text">处理中...</p>
+            </div>
+        </main>
+    </div>
+
+    <script src="app.js?v=18"></script>
+</body>
+</html>

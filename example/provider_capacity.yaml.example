@@ -1,0 +1,81 @@
+# Provider Capacity Configuration
+# =============================================================================
+# How many sub-agents may run concurrently against each provider.
+#
+# Copy this file to your config directory and edit it for your own setup:
+#
+#     mkdir -p .config && cp example/provider_capacity.yaml.example \
+#         .config/provider_capacity.yaml
+#
+# The real file is gitignored (``.config/``), and so is the provider set it
+# describes. That is deliberate: a cap describes *your* provider rows — how
+# many parallel agents your plan with that vendor tolerates — so a table of
+# concrete names in source would compile one deployment's providers into
+# every install. This file is read at dispatch time, so it never needs to
+# reach the repository.
+#
+# ``PDT_PROVIDER_CAPACITY_FILE`` overrides the path.
+#
+# -----------------------------------------------------------------------------
+# MATCHING
+# -----------------------------------------------------------------------------
+# ``pattern`` is a Python regex, searched CASE-INSENSITIVELY against the
+# provider name. Rules are tried in order and the FIRST match wins, so put
+# narrow patterns above broad ones.
+#
+# A rule is tested against the name as the dispatch layer spelled it and
+# against two normalized renderings of it: lower-cased with spaces and
+# underscores folded to hyphens, and that form with the hyphens turned
+# back into spaces. So "^Vendor A", "^vendor-a" and "^vendor a" all reach
+# a provider spelled "Vendor A Pro" or "vendor-a-pro". You can still
+# distinguish the spellings on purpose with an anchored pattern such as
+# "^vendor-a$".
+#
+# Reach for an anchored pattern when a prefix would over-match:
+#   "^Vendor A$"   exact
+#   "^Vendor A"    prefix — also catches "Vendor A Pro"
+#   "Vendor"       anywhere in the name
+#
+# -----------------------------------------------------------------------------
+# WHAT THE NUMBER MEANS
+# -----------------------------------------------------------------------------
+# The cap is the *maximum* in-flight count at 100 % of the provider's
+# 5-hour quota. It scales down with the remaining quota: at 40 % remaining
+# a cap of 10 yields 4. So a number here is a ceiling, not a reservation.
+#
+# Separate rows are separate quota pools. If your provider list holds two
+# rows backed by two different credentials, a pattern covering both gives
+# each its own cap — they do not share the budget.
+#
+# You do not need an entry for a provider that fails to answer. A provider
+# that cannot be reached or has no usable credentials never takes a slot,
+# so a cap set for it costs nothing; the fleet's real concurrency is the
+# sum of the caps that are actually callable, not the number written here.
+#
+# -----------------------------------------------------------------------------
+# DEFAULTS
+# -----------------------------------------------------------------------------
+# ``default_max_concurrency`` applies to every provider no rule matches.
+# Leaving it out uses 5. Setting it deliberately low is a reasonable way to
+# keep an unlisted provider from consuming the whole machine.
+# =============================================================================
+
+version: 1
+
+# Cap for providers that match none of the rules below.
+default_max_concurrency: 5
+
+providers:
+  # Replace these with your own provider names. Between them they show the
+  # two shapes worth distinguishing: a family that shares one budget, and a
+  # single row that gets its own.
+  - pattern: "^Example Strong"
+    max_concurrency: 10
+
+  - pattern: "^Example Balanced"
+    max_concurrency: 5
+
+  # A provider that runs close to its quota limit, or one whose plan
+  # tolerates little parallelism, gets a smaller number.
+  - pattern: "^Example Metered"
+    max_concurrency: 2

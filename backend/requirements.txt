@@ -1,0 +1,57 @@
+# Dependencies
+
+GitPython>=3.1.0
+PyYAML>=6.0
+fastapi>=0.115.0
+uvicorn>=0.34.0
+python-dotenv>=1.0.0
+APScheduler>=3.10.0
+# httpx is required by starlette.testclient / fastapi.testclient.
+# The integration / API test suites import ``TestClient`` for
+# in-process endpoint tests, so a clean CI install must include it.
+httpx>=0.27.0
+# Test-only dependencies imported across the unit / integration /
+# E2E suites. Clean CI installs need these to collect tests.
+freezegun>=1.0
+requests-mock>=1.10
+# ~100 ``async def test_*`` coroutines across the suite (verification
+# API, auth boundary, session errors, lock hooks …) are driven by
+# pytest-asyncio in STRICT mode (see pytest.ini). Without the plugin a
+# clean CI install errors every one with "async def functions are not
+# natively supported" — the dev venv masked this because it had the
+# plugin ad hoc (2026-09-16 CI red root cause).
+pytest-asyncio>=1.0
+jsonschema>=4.0
+# ``tests/e2e/test_teardown_cleanup.py`` uses ``psutil`` to verify
+# that subsidiary processes have been torn down (no zombies left
+# after the suite ends). The test calls
+# ``pytest.importorskip("psutil")`` so a missing dep produces a
+# clean skip rather than a hard fail, but installing it lets the
+# teardown contract actually be exercised.
+psutil>=5.9
+# OS-level file locking used by the agent to coordinate access to project
+# files across tasks and processes.
+filelock>=3.13.0
+
+# Feishu IM push (backend/notifications/feishu_notifier.py). Required for
+# the in-process event-driven card push that replaces the legacy polling
+# bridge (commit 917ba667). Without this dep feishu_notifier self-disables
+# at server startup and silently degrades to "no push".
+lark-oapi>=1.7.0
+
+# ---------------------------------------------------------------------
+# Test tooling. These are what the suite is *run* with, as opposed to
+# the libraries it imports. They were missing until 2026-09-24: the dev
+# venv happened to have them installed ad hoc, so a clean checkout
+# failed at the first `pytest --timeout=...` with
+# "unrecognized arguments", and pytest.ini's `timeout` /
+# `timeout_method` settings were silently ignored rather than applied.
+# A public repo cannot rely on the maintainer's machine being special.
+pytest>=8.0
+# pytest.ini sets `timeout = 300` / `timeout_method = thread`, and CI
+# passes --timeout= on the command line. Without the plugin neither is
+# honoured — the suite would hang forever instead of failing.
+pytest-timeout>=2.3
+# CI's unit shards pass --cov=.; without the plugin pytest exits with
+# "unrecognized arguments: --cov".
+pytest-cov>=5.0

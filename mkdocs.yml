@@ -1,0 +1,144 @@
+# MkDocs configuration — the developer documentation site.
+#
+# Build locally (install first — see docs/requirements.txt):
+#     backend/.venv/bin/python3 -m pip install -r docs/requirements.txt
+#     backend/.venv/bin/python3 -m mkdocs serve      # http://127.0.0.1:8000
+#     backend/.venv/bin/python3 -m mkdocs build --strict
+#
+# `--strict` is the gate: it turns a broken internal link, a nav entry
+# pointing at a file that does not exist, or a typo'd anchor into a
+# non-zero exit. CI runs exactly that, so a docs change cannot merge
+# broken. See .github/workflows/pages.yml.
+#
+# The Markdown under docs/ is plain — it renders on github.com exactly as
+# it does here. That is deliberate: a reader who lands on the repository
+# should not have to wait for a build to read the same page.
+
+site_name: Product Development Team
+site_description: >-
+  A spec-driven agent harness that runs the work of a product development
+  team — from a one-line requirement to verified delivery — as an auditable
+  pipeline instead of a chat session.
+site_url: https://yongmaoluo.github.io/Product-Development-Team/
+
+repo_url: https://github.com/YongmaoLuo/Product-Development-Team
+repo_name: YongmaoLuo/Product-Development-Team
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: en
+  features:
+    # NOTE: `navigation.instant` is deliberately absent. The i18n plugin's
+    # language switcher builds a *contextual* link (the same page in the
+    # other locale), and that is incompatible with instant navigation —
+    # mkdocs-static-i18n emits a warning, and with `strict: true` a warning
+    # fails the build. A working language switch is worth more than
+    # client-side page transitions.
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  palette:
+    # Follow the reader's OS preference, with a manual toggle.
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Workflow: workflow.md
+  - Architecture:
+      - Execution: architecture/execution.md
+      - Verification: architecture/verification.md
+  - Operations:
+      - Running it: operations/running.md
+      - Configuration: operations/configuration.md
+  - Development:
+      - Tests: development/testing.md
+      - Contributing: development/contributing.md
+      - Design notes: development/design-notes.md
+  - Security: security.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+  # Bilingual site: the default locale is built at `/`, every other locale
+  # under `/<locale>/`, with a language selector in the header.
+  #
+  # Structure is `suffix` — `index.md` is English, `index.zh.md` is its
+  # Chinese translation. Nav always references the *unsuffixed* file; the
+  # plugin fans it out per locale.
+  #
+  # `reconfigure_material` re-applies the theme's own UI strings per
+  # locale (search box, "edit this page", …) and is what makes the
+  # selector appear at all. `reconfigure_search` keeps each locale's
+  # search index separate, so a Chinese query does not return English
+  # pages.
+  - i18n:
+      docs_structure: suffix
+      fallback_to_default: true
+      reconfigure_material: true
+      reconfigure_search: true
+      languages:
+        - locale: en
+          default: true
+          name: English
+          build: true
+        - locale: zh
+          name: 中文
+          build: true
+          # Nav labels are declared once in `nav:` above (in English, so
+          # the default locale and every link stay stable) and translated
+          # here. Keyed by the exact English label.
+          nav_translations:
+            Home: 首页
+            Getting started: 快速开始
+            Workflow: 工作流
+            Architecture: 架构
+            Execution: 执行
+            Verification: 验证
+            Operations: 运维
+            Running it: 运行它
+            Configuration: 配置
+            Development: 开发
+            Tests: 测试
+            Contributing: 贡献
+            Design notes: 设计说明
+            Security: 安全
+
+# Fail the build on a broken internal reference rather than shipping a
+# dead link. A docs site whose links rot is worse than no docs site.
+strict: true
+validation:
+  links:
+    absolute_links: relative_to_docs
+    unrecognized_links: warn
