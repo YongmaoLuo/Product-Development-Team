@@ -175,3 +175,196 @@ def test_the_driver_list_is_not_empty() -> None:
         "no nested-pytest drivers declared — the check above would pass "
         "vacuously"
     )
+
+
+# ---------------------------------------------------------------------------
+# A lane that detaches pytest must bound it itself
+# ---------------------------------------------------------------------------
+
+#: Lanes that start pytest under ``setsid``. Every one of them needs its own
+#: deadline, because the one it declares does not reach this process tree.
+_SETSID_LANES = ("unit-tests", "unit-staircase")
+
+_WATCHDOG_RE = re.compile(r"WATCHDOG_SECONDS=(\d+)")
+
+
+def _setsid_steps(job_name: str) -> list[dict]:
+    workflow = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+    job = workflow["jobs"].get(job_name)
+    assert job is not None, f"ci.yml has no job named {job_name!r}"
+    return [
+        step
+        for step in job.get("steps", [])
+        if "setsid" in (step.get("run") or "")
+    ]
+
+
+@pytest.mark.parametrize("job_name", _SETSID_LANES)
+def test_a_lane_that_detaches_pytest_bounds_it_itself(job_name: str) -> None:
+    """``timeout-minutes`` is not a ceiling once pytest runs under ``setsid``.
+
+    That is the whole reason the watchdog exists, and it is not a theory:
+    on run 36544551232 the unit shard's pytest step sat ``in_progress``
+    for 44 minutes with ``timeout-minutes: 20`` declared, the post-steps
+    stayed ``pending``, and GitHub reaped the job at exactly 45m00s
+    having uploaded nothing. Six consecutive runs share that signature,
+    and the missing log is the part that mattered — a shard that dies
+    without a log names no culprit.
+
+    ``setsid`` is what breaks the declared ceiling: pytest ends up in a
+    process group the runner never created, and the runner's timeout
+    machinery does not reach it. A plain ``sleep``+``kill`` does, because
+    it is an ordinary child of the step's own shell.
+
+    So the invariant this pins is two-sided:
+
+      * a lane that detaches pytest must declare a watchdog at all, and
+      * the watchdog must fire BEFORE the step's ceiling, or it can never
+        win the race it exists to win.
+
+    Scope, stated honestly: this reads the workflow. It cannot verify that
+    a budget is *long enough* for the shard, only that one exists and is
+    the smaller of the two numbers that would otherwise fight.
+    """
+    steps = _setsid_steps(job_name)
+    assert steps, (
+        f"{job_name!r} no longer starts pytest under setsid — if that was "
+        f"deliberate, drop it from _SETSID_LANES; if not, the lane lost the "
+        f"process-group isolation its comments describe."
+    )
+
+    workflow = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+    job_ceiling_min = workflow["jobs"][job_name].get("timeout-minutes")
+
+    for step in steps:
+        run = step["run"]
+        match = _WATCHDOG_RE.search(run)
+        assert match, (
+            f"the {job_name!r} step {step.get('name')!r} runs pytest under "
+            f"`setsid` with no `WATCHDOG_SECONDS=<n>` self-imposed deadline. "
+            f"`timeout-minutes` does not reach a setsid'd child (see the "
+            f"docstring), so without this the step can hang until GitHub "
+            f"reaps the job — uploading no log, which is the failure mode "
+            f"this whole shape exists to end."
+        )
+        budget_s = int(match.group(1))
+
+        step_ceiling_min = step.get("timeout-minutes")
+        assert step_ceiling_min is not None, (
+            f"the {job_name!r} step {step.get('name')!r} has a watchdog but "
+            f"no `timeout-minutes`; the watchdog's whole job is to beat it"
+        )
+        assert budget_s < step_ceiling_min * 60, (
+            f"the {job_name!r} watchdog fires at {budget_s}s but the step "
+            f"ceiling is {step_ceiling_min}m ({step_ceiling_min * 60}s). The "
+            f"watchdog must be the smaller of the two, or the step dies "
+            f"first and the `if: always()` upload never runs — which is the "
+            f"exact defect it was added to fix."
+        )
+        if isinstance(job_ceiling_min, int):
+            assert budget_s < job_ceiling_min * 60, (
+                f"the {job_name!r} watchdog fires at {budget_s}s but the "
+                f"JOB ceiling is {job_ceiling_min}m "
+                f"({job_ceiling_min * 60}s), leaving no room for the upload "
+                f"steps that run after it fails."
+            )
+
+
+@pytest.mark.parametrize("job_name", _SETSID_LANES)
+def test_the_watchdog_photographs_the_shard_before_it_kills(job_name: str) -> None:
+    """The deadline is only half the instrument; the dump is the other half.
+
+    Killing a wedged shard makes it *finish*, which makes its log upload —
+    but a log ends at the last test that STARTED, and the interesting
+    question is always one level deeper. ``pytest-timeout``'s thread
+    method cannot answer it: it raises into the main thread through
+    ``PyThreadState_SetAsyncExc``, delivered only at a bytecode boundary,
+    so a test parked in ``waitpid``/``select`` never sees it and produces
+    no traceback at all.
+
+    ``ci_process_guard`` arms ``faulthandler`` on SIGUSR1 for exactly
+    that, so the watchdog must ask before it kills. Two details are
+    load-bearing and both were found by running the thing:
+
+    * **The sink is a file, not stderr.** pytest's default ``fd``-level
+      capture replaces fd 2 while a test runs, so a dump written to
+      stderr is discarded at the moment the shard is killed.
+    * **SIGUSR1 goes to the leader, not the group.** An unhandled SIGUSR1
+      terminates its target, so a group-wide one would kill whatever the
+      shard is blocked *on* — unblocking the very test being photographed.
+
+    Scope, stated honestly: this reads the workflow and checks the
+    conventions agree with the plugin. It cannot prove a dump will be
+    produced on a given hang, only that every part is wired to the same
+    channel.
+    """
+    workflow = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+    job = workflow["jobs"][job_name]
+
+    for step in _setsid_steps(job_name):
+        run = step["run"]
+        assert 'kill -USR1 "$PYTEST_PID"' in run, (
+            f"the {job_name!r} watchdog kills the shard without first "
+            f"asking for a stack dump. Add the SIGUSR1 before the TERM, or "
+            f"the next wedge buys another 45 minutes and another log that "
+            f"says only which test started."
+        )
+        assert 'kill -USR1 -"$PYTEST_PID"' not in run, (
+            f"the {job_name!r} watchdog sends SIGUSR1 to the whole process "
+            f"GROUP. An unhandled SIGUSR1 terminates its target, so this "
+            f"kills the child the shard is blocked on and unblocks the test "
+            f"being photographed. Send it to $PYTEST_PID alone."
+        )
+        env = step.get("env") or {}
+        assert "CI_STACK_DUMP_PATH" in env, (
+            f"the {job_name!r} step does not tell the plugin where to write "
+            f"the dump, so the artifact below cannot name it."
+        )
+
+    # ...and the file the plugin writes is the file the upload collects.
+    uploads = [
+        step
+        for step in job.get("steps", [])
+        if "pytest-stack-dump" in str(step.get("with", {}).get("path", ""))
+    ]
+    assert uploads, (
+        f"no upload step in {job_name!r} collects the stack dump, so a dump "
+        f"would be written into the workspace and thrown away with the "
+        f"runner — the same 'no evidence' outcome the watchdog exists to end."
+    )
+
+
+@pytest.mark.parametrize("job_name", _SETSID_LANES)
+def test_the_watchdog_does_not_hold_the_step_open(job_name: str) -> None:
+    """A background helper may not keep the runner's output pipe open.
+
+    ``kill $WATCHDOG_PID`` kills the subshell, not its ``sleep``: the child
+    is reparented and keeps running — for up to the whole budget — after the
+    step's shell has exited. Left holding the write end of the step's
+    stdout, it makes the runner wait for an EOF that arrives fifteen minutes
+    after the step ended. That is the same mechanism as the ``tee`` wedge
+    this job's own comments describe, and the redirect is what stops the
+    watchdog from re-creating it.
+
+    Pinned rather than commented because the failure is invisible in every
+    run where the budget does *not* fire: the stray process only matters on
+    the path that already went wrong, which is exactly the path nobody
+    exercises before shipping.
+    """
+    for step in _setsid_steps(job_name):
+        run = step["run"]
+        assert re.search(
+            r"\)\s*>\s*/dev/null\s+2>&1\s*&\s*\n\s*WATCHDOG_PID=", run
+        ), (
+            f"the {job_name!r} watchdog is started without redirecting its "
+            f"own stdout/stderr. Its `sleep` outlives the kill, so it would "
+            f"go on holding the step's output pipe and delay the runner by "
+            f"the length of the budget. Redirect the subshell before "
+            f"backgrounding it."
+        )
+        assert "DEADLINE_FLAG=" in run, (
+            f"the {job_name!r} watchdog sets no deadline marker, so the "
+            f"failure message cannot tell 'the budget fired' from 'something "
+            f"else killed pytest' — an OOM kill is also exit 137, and 143 "
+            f"alone is ambiguous."
+        )

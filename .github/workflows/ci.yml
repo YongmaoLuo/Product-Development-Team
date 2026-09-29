@@ -597,6 +597,11 @@ jobs:
         # when it matters most — the test that stalled.
         env:
           PYTHONUNBUFFERED: "1"
+          # Where ci_process_guard writes the SIGUSR1 stack dump. Handled by
+          # pytest itself, in the workspace, because a dump sent to stderr is
+          # swallowed by pytest's per-test fd capture and lost when the shard
+          # is killed — see _arm_stack_dump's docstring.
+          CI_STACK_DUMP_PATH: pytest-stack-dump-${{ matrix.shard }}.txt
         run: |
           set -o pipefail
           # NO ``ulimit`` guardrails here (2026-09-23, reverted).
@@ -646,13 +651,106 @@ jobs:
             --cov-report= \
             --tb=short \
             -p ci_process_guard \
+            --durations=25 \
             --timeout=60 > pytest-${{ matrix.shard }}.log 2>&1 < /dev/null &
           PYTEST_PID=$!
           tail -n +1 -f --pid=$PYTEST_PID pytest-${{ matrix.shard }}.log &
           TAIL_PID=$!
+
+          # --- a deadline that actually fires (2026-09-29) ---------------
+          #
+          # The step declares ``timeout-minutes: 20``, and on run
+          # 36544551232 that ceiling did nothing: the pytest step sat
+          # ``in_progress`` for 44 minutes, the post-steps stayed
+          # ``pending``, and GitHub reaped the job at exactly 45m00s
+          # having uploaded no log and no artifact. Six consecutive runs
+          # of the ``unit`` shard have the same signature.
+          #
+          # Whatever enforces ``timeout-minutes`` is not reaching this
+          # process tree. pytest is started under ``setsid``, i.e. in a
+          # process group the runner did not create and evidently does
+          # not reap — so a ceiling defined in terms of that group is not
+          # a ceiling at all.
+          #
+          # A plain ``sleep`` + ``kill`` does not depend on any of that.
+          # It is an ordinary child of this shell, so it fires as long as
+          # the runner is alive at all — and the runner IS alive, because
+          # it is busy running the shard. Two properties make it work
+          # where the declared timeout did not:
+          #
+          #   * it signals the process GROUP (``-$PYTEST_PID``; ``setsid``
+          #     makes pytest a group leader, so its PGID equals its PID),
+          #     not just the leader, so nothing that inherited the group
+          #     is left holding the step open;
+          #   * it lets ``wait`` return, which is what lets this step END
+          #     — and a step that ends is a step whose ``if: always()``
+          #     upload below actually runs. That upload is the whole point:
+          #     the shard's own log is the only thing that can name the
+          #     test it died on.
+          #
+          # The budget is deliberately below the step's ``timeout-minutes``
+          # so ours wins, and below the 40-minute job ceiling so the upload
+          # still has room. Reaching it is a FAILURE (exit code 143 from
+          # the SIGTERM), not a quiet truncation — a shard that cannot
+          # finish inside its budget is a fact the gate must state.
+          WATCHDOG_SECONDS=900
+          DEADLINE_FLAG=pytest-deadline-${{ matrix.shard }}.flag
+          rm -f "$DEADLINE_FLAG"
+          (
+            sleep "$WATCHDOG_SECONDS"
+            # Marker for the main shell: only the budget firing sets this, so
+            # the failure message below cannot misattribute a death that came
+            # from somewhere else (an OOM kill is also exit 137).
+            : > "$DEADLINE_FLAG"
+            {
+              echo
+              echo "===== shard deadline reached after ${WATCHDOG_SECONDS}s ====="
+              echo "pytest was still running. Everything above is its output up"
+              echo "to the kill; the last test that STARTED is the place to"
+              echo "look, and '--durations' in this log has the slow ones."
+            } >> pytest-${{ matrix.shard }}.log
+            # Ask for a stack dump BEFORE the kill, and give it time to land.
+            # A shard that overruns its budget is usually parked in a
+            # blocking call, which ``pytest-timeout``'s thread method cannot
+            # interrupt — so its own traceback never appears and the log can
+            # only say which test STARTED. ``ci_process_guard`` arms
+            # ``faulthandler`` on SIGUSR1, which walks the C stacks from the
+            # handler, so the dump is the answer to "where is it stuck".
+            #
+            # Leader only — note the missing ``-``, unlike the two kills
+            # below. A group-wide SIGUSR1 would also reach whatever the shard
+            # is blocked ON, and an unhandled SIGUSR1 terminates its target:
+            # that would unblock the very test we are trying to photograph.
+            kill -USR1 "$PYTEST_PID" 2>/dev/null
+            sleep 10
+            kill -TERM -"$PYTEST_PID" 2>/dev/null
+            sleep 20
+            kill -KILL -"$PYTEST_PID" 2>/dev/null
+          # The subshell's own stdout/stderr go to /dev/null, and that is not
+          # tidiness — it closes a wedge this very job has hit before.
+          #
+          # Killing the subshell does NOT kill its `sleep`: the child is
+          # reparented and keeps running (up to the full budget) after the
+          # step's shell has exited. If it still held the write end of the
+          # step's output pipe, the runner would wait for an EOF that does
+          # not come for another 15 minutes — the same mechanism as the `tee`
+          # wedge documented on this step. A background process must not hold
+          # anything the runner is reading. The log append inside the
+          # subshell is unaffected (it writes to a file), and the failure
+          # annotation is emitted by the main shell below instead.
+          ) >/dev/null 2>&1 &
+          WATCHDOG_PID=$!
+
           wait $PYTEST_PID
           RC=$?
-          kill $TAIL_PID 2>/dev/null || true
+          kill "$WATCHDOG_PID" "$TAIL_PID" 2>/dev/null || true
+          # Say plainly that the budget fired, rather than letting a bare
+          # exit 143 be read as a crash. The flag file is the only thing
+          # that sets this — an OOM kill is exit 137 and would otherwise be
+          # blamed on the deadline.
+          if [ -f "$DEADLINE_FLAG" ]; then
+            echo "::error::the ${{ matrix.shard }} shard was killed at its ${WATCHDOG_SECONDS}s budget (rc=$RC). The uploaded log ends at the last test that started; the stack dump names the frame it was stuck in."
+          fi
           exit $RC
 
       # The diagnostic half of the step timeout above: this runs even when
@@ -663,7 +761,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pytest-log-${{ matrix.shard }}
-          path: backend/pytest-${{ matrix.shard }}.log
+          # The stack dump goes out with the log: when the watchdog fires,
+          # the log can only say which test STARTED, and the dump is what
+          # says where it was stuck. A separate artifact rather than an
+          # append, so a missing dump cannot truncate the log that did
+          # arrive. `if-no-files-found: warn` keeps the ordinary green run
+          # (no deadline, no dump) from reporting a missing-file problem.
+          path: |
+            backend/pytest-${{ matrix.shard }}.log
+            backend/pytest-stack-dump-${{ matrix.shard }}.txt
           if-no-files-found: warn
           retention-days: 14
 
@@ -746,6 +852,11 @@ jobs:
         working-directory: backend
         env:
           PYTHONUNBUFFERED: "1"
+          # Where ci_process_guard writes the SIGUSR1 stack dump. Handled by
+          # pytest itself, in the workspace, because a dump sent to stderr is
+          # swallowed by pytest's per-test fd capture and lost when the shard
+          # is killed — see _arm_stack_dump's docstring.
+          CI_STACK_DUMP_PATH: pytest-stack-dump-${{ matrix.shard }}.txt
         run: |
           set -o pipefail
           TARGETS="${{ matrix.paths }}"
@@ -825,15 +936,72 @@ jobs:
             -m "not e2e and not integration and not perf" \
             --tb=short \
             -p ci_process_guard \
+            --durations=25 \
             --timeout=${{ matrix.timeout || 60 }} \
             > pytest-staircase-${{ matrix.shard }}.log 2>&1 < /dev/null &
           PYTEST_PID=$!
           tail -n +1 -f --pid=$PYTEST_PID \
             pytest-staircase-${{ matrix.shard }}.log &
           TAIL_PID=$!
+
+          # Same self-imposed deadline as the unit shards above, and for the
+          # same reason: this job exists to BISECT the wedge, so a shard that
+          # dies without a log destroys the very datum the dispatch was spent
+          # to buy. 25 minutes against the step's 30 — ours must win.
+          WATCHDOG_SECONDS=1500
+          DEADLINE_FLAG=pytest-deadline-${{ matrix.shard }}.flag
+          rm -f "$DEADLINE_FLAG"
+          (
+            sleep "$WATCHDOG_SECONDS"
+            # Marker for the main shell; see the unit shard's copy.
+            : > "$DEADLINE_FLAG"
+            {
+              echo
+              echo "===== shard deadline reached after ${WATCHDOG_SECONDS}s ====="
+              echo "the last test that STARTED is the place to look"
+            } >> pytest-staircase-${{ matrix.shard }}.log
+            # Ask for a stack dump BEFORE the kill, and give it time to land.
+            # A shard that overruns its budget is usually parked in a
+            # blocking call, which ``pytest-timeout``'s thread method cannot
+            # interrupt — so its own traceback never appears and the log can
+            # only say which test STARTED. ``ci_process_guard`` arms
+            # ``faulthandler`` on SIGUSR1, which walks the C stacks from the
+            # handler, so the dump is the answer to "where is it stuck".
+            #
+            # Leader only — note the missing ``-``, unlike the two kills
+            # below. A group-wide SIGUSR1 would also reach whatever the shard
+            # is blocked ON, and an unhandled SIGUSR1 terminates its target:
+            # that would unblock the very test we are trying to photograph.
+            kill -USR1 "$PYTEST_PID" 2>/dev/null
+            sleep 10
+            kill -TERM -"$PYTEST_PID" 2>/dev/null
+            sleep 20
+            kill -KILL -"$PYTEST_PID" 2>/dev/null
+          # The subshell's own stdout/stderr go to /dev/null, and that is not
+          # tidiness — it closes a wedge this very job has hit before.
+          #
+          # Killing the subshell does NOT kill its `sleep`: the child is
+          # reparented and keeps running (up to the full budget) after the
+          # step's shell has exited. If it still held the write end of the
+          # step's output pipe, the runner would wait for an EOF that does
+          # not come for another 15 minutes — the same mechanism as the `tee`
+          # wedge documented on this step. A background process must not hold
+          # anything the runner is reading. The log append inside the
+          # subshell is unaffected (it writes to a file), and the failure
+          # annotation is emitted by the main shell below instead.
+          ) >/dev/null 2>&1 &
+          WATCHDOG_PID=$!
+
           wait $PYTEST_PID
           RC=$?
-          kill $TAIL_PID 2>/dev/null || true
+          kill "$WATCHDOG_PID" "$TAIL_PID" 2>/dev/null || true
+          # Say plainly that the budget fired, rather than letting a bare
+          # exit 143 be read as a crash. The flag file is the only thing
+          # that sets this — an OOM kill is exit 137 and would otherwise be
+          # blamed on the deadline.
+          if [ -f "$DEADLINE_FLAG" ]; then
+            echo "::error::the ${{ matrix.shard }} shard was killed at its ${WATCHDOG_SECONDS}s budget (rc=$RC). The uploaded log ends at the last test that started; the stack dump names the frame it was stuck in."
+          fi
           exit $RC
 
       - name: Upload pytest output — ${{ matrix.shard }}
@@ -841,7 +1009,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pytest-log-staircase-${{ matrix.shard }}
-          path: backend/pytest-staircase-${{ matrix.shard }}.log
+          # See the note on the unit shard's upload: the dump is what says
+          # where a reaped shard was stuck.
+          path: |
+            backend/pytest-staircase-${{ matrix.shard }}.log
+            backend/pytest-stack-dump-${{ matrix.shard }}.txt
           if-no-files-found: warn
           retention-days: 14
 
