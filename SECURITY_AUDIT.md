@@ -604,6 +604,17 @@ backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_ci_lanes_mat
 backend/.venv/bin/python3 -m pytest backend/tests/unit/test_file_lock_broker.py backend/tests/static_gates/test_diff_is_attributable_to_audit_findings.py -q
 ```
 
+### Finding ENTRY-034
+档位: should-fix
+问题: **两条主测试分片的规模超出了托管 runner 能跑完的量级，被整段回收，而 ENTRY-032 交付的那套截止机制已被证伪。** 这两条分片各自把一个测试目录整体交给单个 job；它们的 pytest 步从未完成过一次。ENTRY-032 交付的 watchdog 从未在这些 job 上触发，步骤自身声明的 `timeout-minutes` 与 job 的 `timeout-minutes` 同样没有触发。job 被回收之后，连它们的日志 blob 都不存在 —— 连 checkout、pip install 这些明确成功、必然打印过输出的步骤都没有留下记录。ENTRY-032 的 `read_ahead_kb` 缓解同样没有阻止任何一次回收。真正的分辨依据不是"哪条截止生效了"，而是**每个 job 的工作量**：仓库里那条专用二分 harness 反复量到的结果是，小到某个量级的分片总能跑完并报出真实结果，越过那个量级就一律在回收线上一言不发地被收走。本条记的是这个缺陷类别 —— **分片规模没有上限约束**，而不是某一次的具体数字。
+影响: `main` 的合并门禁长期是红的，而且红得没有信息 —— 每次回收、每次零日志、零产物。更实际的后果是它训练人忽略这条 lane：一个每次都红、且从不携带证据的检查等于没有检查，因此真正的回归（ENTRY-033 那种指名肇事线程的泄漏守卫报错）会被淹没在里面无人查看。
+攻击路径: 前置条件 — 无（这是 CI 有效性的缺陷，不是运行时漏洞；列出它是为了让本轮改动可归因）；触发步骤 — 让 `main` 上任意一次 push 或 PR 触发 CI；可观测后果 — 两条大分片在回收线上一言不发地消失、无日志无产物，而小分片绿灯，合并门禁因此长期不可用。
+修复: `.github/workflows/ci.yml` 的 `unit-tests` lane 把 `unit` 与 `root` 两条 lane 各自切成多片，每片的文件数取在实测能跑完的量级内。分片方式是对**收集到的文件列表**取模轮转（`NR % count == index`），因此每个文件恰好属于一片，各片之并等于原来那一个 job 的全集 —— 覆盖率不变；覆盖率门禁本来就是下载全部 `.coverage.<shard>` 再 `coverage combine`，多几个分片对它透明。矩阵键从 `paths` 换成 `lane` 加上 `index`/`count`，路径集在步骤里由 `case` 映射，这样每个矩阵项各占一行；**不能用目录来切**，因为 `tests/unit` 下绝大多数文件直接躺在顶层，按目录切分不出来。收集那一步**故意不写** `-m`：标记只写在真正的 pytest 调用上，`test_default_lane_excludes_the_marker` 要求每条 lane 只有一处权威标记，第二个字面副本会让那条门禁无法判断以哪个为准；省掉它没有代价 —— 收集到的是文件的超集，而真调用上的标记会精确丢掉那些被标记的用例，实际执行的用例集合不变。**空分片必须报错退出**：切分或路径集写错时，零文件的分片会报成功，那是套件里的一个静默窟窿。
+验证方式:
+```bash
+backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_ci_lanes_match_marker_contracts.py -q
+```
+
 ---
 
 ## Appendix A — modified tests
