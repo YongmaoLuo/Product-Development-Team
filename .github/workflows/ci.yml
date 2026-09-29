@@ -641,7 +641,7 @@ jobs:
           set +e
           COVERAGE_FILE=.coverage.${{ matrix.shard }} \
           setsid ./.venv/bin/python3 -m pytest ${{ matrix.paths }} \
-            -m "not e2e and not integration" \
+            -m "not e2e and not integration and not perf" \
             --cov=. \
             --cov-report= \
             --tb=short \
@@ -822,7 +822,7 @@ jobs:
           # and reaps the survivors.
           set +e
           setsid ./.venv/bin/python3 -m pytest $TARGETS \
-            -m "not e2e and not integration" \
+            -m "not e2e and not integration and not perf" \
             --tb=short \
             -p ci_process_guard \
             --timeout=${{ matrix.timeout || 60 }} \
@@ -1086,7 +1086,7 @@ jobs:
       # is 1800s. Failures block main release.
       - name: Run slow tests
         working-directory: backend
-        run: ./.venv/bin/python3 -m pytest tests/ -m "slow" --tb=short --timeout=1800 -v --junitxml=slow-junit.xml
+        run: ./.venv/bin/python3 -m pytest tests/ -m "slow or perf" --tb=short --timeout=1800 -v --junitxml=slow-junit.xml
 
       - name: Upload slow logs
         if: always()

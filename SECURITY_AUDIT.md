@@ -559,6 +559,29 @@ backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_commit_range
 bash scripts/scan_commit_range.sh --range HEAD
 ```
 
+### Finding ENTRY-030
+档位: should-fix
+问题: **树形隐私门禁的扫描面取决于进程的工作目录。** `source_scan.SCAN_ROOTS` 是相对名（`backend` / `frontend` / `scripts` / `example`），而遍历器把它们相对**cwd** 解析。CI 的单元分片用 `working-directory: backend` 运行套件，那里不存在 `backend/` 根，于是遍历器退回到**恰好存在**的 `backend/scripts/`，只返回少量互不相关的文件。后果是双向的：`test_scan_is_non_empty` 那类"非空"断言仍然通过（少量并非零），而它本该扫描的 `backend/` 一个文件都没被读取；同时，按 cwd 相对字面量定位模块的门禁会报"模块已不存在"。同类 cwd 依赖还出现在 `test_credential_files_are_written_private` 的 `_SETTINGS_WRITERS` 上。
+影响: 一个"看起来在防、实际没扫"的门禁比没有门禁更糟 —— 它为一次发布提供一份虚假的清洁证明。本仓全部树形隐私门禁（家目录路径、操作者归属、本机测量、凭据写入点）都建立在这个遍历器上，所以在那种调用下它们**同时**失效，而 CI 报出来的却是别的失败，这个缺陷因此一直没有名字。
+攻击路径: 前置条件 — 以仓库根以外的工作目录运行套件（CI 正是如此）；触发步骤 — 让一个树形门禁在其扫描面内找不到任何目标文件，然后看它结束时报什么；可观测后果 — 门禁以"通过"结束，而它本应检查的源码从未被打开。
+修复: `backend/tests/static_gates/source_scan.py` 新增 `REPO_ROOT`（由 `__file__` 解析，四个父目录，与同目录各门禁的既有算法一致）、`resolve_root`（相对根解析到 `REPO_ROOT` 而非 cwd；绝对根原样保留，`test_scripts_have_no_dangerous_defaults` 传的正是绝对根）与 `repo_relative`（供展示、以及同仓库根相对路径比较之用）。`iter_first_party_sources` 改为产出**绝对**路径，使只做 `read_text()` 的调用方也不再依赖 cwd；按 `path.parts` / `path.name` 分类的调用方本就与基准无关，不受影响。`repo_relative` **不先解析符号链接** —— `backend/tests/` 下若干文件是指向 `unit/` 的链接，git 记录的是链接名，解析会把它们换成任何提交里都不存在的路径。`test_state_db_path_has_one_resolver` 的两处 resolver 豁免比较、`test_no_local_home_path_in_first_party` 的展示、`test_credential_files_are_written_private` 的 `_SETTINGS_WRITERS` 分别改用 `repo_relative` / `REPO_ROOT` 解析。`test_commit_range_scan` 新增回归门禁：从仓库根、`backend/` 与 `/` 三个 cwd 遍历必须得到同一个文件集 —— 计数下限抓不到这个缺陷（少量不是零），集合相等才能。**没有改任何运行时行为。**
+验证方式:
+```bash
+backend/.venv/bin/python3 -m pytest backend/tests/static_gates/ -q
+cd backend && ./.venv/bin/python3 -m pytest tests/static_gates -q
+```
+
+### Finding ENTRY-031
+档位: should-fix
+问题: **CI 默认分片的 marker 表达式与文档声明的契约不一致，两条测试因此进了它们不该在的 lane。** 第一，`perf` marker 的说明写着这类基准只在 slow lane 运行（原文称 addopts 的 `-m "not slow"` 会排除它们），但 `backend/pytest.ini` 的 addopts 只有 `-m "not slow"` —— 它不排除 `perf`，于是启动延迟基准留在了默认分片里，而它断言的是一个以毫秒计的启动差异。第二，`backend/tests/integration/test_agent_execute_task_first5.py` 的每个用例都自行 spawn `pytest` 子进程去驱动真实任务管线 —— 那正是 `integration` marker 的定义 —— 却没有打这个 marker，于是被 `-m "not e2e and not integration"` 的单元分片收走，在其 60s 上限下被杀在 `subprocess.run` 里。
+影响: CI 自第一次完整运行起就是红的，而两次红都与当时的改动无关：一条基准超时、一条嵌套运行超时。红色 CI 的代价是它不再传递信息 —— 真正的回归会混在恒定的噪声里；更具体的是分片在到达 `static_gates` 之前就死掉，所以 ENTRY-030 的缺陷（树形隐私门禁在 CI 里形同虚设）从未被执行过，也就无人发现。
+攻击路径: 前置条件 — 无（这是 CI 有效性问题，不是运行时漏洞；列出它是为了让本轮改动可归因）；触发步骤 — 检查默认分片是否收集了被文档声明属于其他 lane 的用例；可观测后果 — 分片在到达静态门禁之前被环境相关的超时终止，lint 之外的检查事实上不运行，而它们"存在"这一点让人以为已经跑过。
+修复: `unit-tests` 与 `unit-staircase` 的表达式改为 `not e2e and not integration and not perf`；slow lane 改为 `slow or perf`（它的 `--timeout=1800` 是这类基准唯一能承受的预算）；`backend/pytest.ini` 中 `perf` 的说明改写为陈述真实机制，包括那句错误声明本身。`test_agent_execute_task_first5.py` 补上模块级 `pytestmark = pytest.mark.integration`，使 integration lane（`-m "integration and not e2e"`，`--timeout=120`）收它、单元分片不再收它。新增门禁 `backend/tests/static_gates/test_ci_lanes_match_marker_contracts.py`：它读 `ci.yml` 里各 job 的 `-m` 表达式与源码里的 marker 声明，钉住上面三项契约（默认 lane 必须排除 `perf`、slow lane 必须收 `perf`、自行 spawn 子进程的用例必须声明 `integration`），并在表达式缺失或数量不为一时直接报错而不是空过。**没有改任何断言**，改的是这些用例在哪个预算下被执行。
+验证方式:
+```bash
+backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_ci_lanes_match_marker_contracts.py -q
+```
+
 ---
 
 ## Appendix A — modified tests

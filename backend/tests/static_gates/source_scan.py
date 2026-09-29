@@ -83,10 +83,62 @@ SOURCE_EXTENSIONS: frozenset[str] = frozenset({
 })
 
 
+#: Repository root, derived from this file's location rather than from the
+#: process working directory. ``backend/tests/static_gates/source_scan.py``
+#: is four parents deep from the root, the same way every gate in this
+#: directory already computes it.
+REPO_ROOT: Path = Path(__file__).resolve().parents[3]
+
 #: Directory names of :data:`SCAN_ROOTS`. Callers that hold a
 #: *repository-root-relative* path — a commit tree, a diff — need this
-#: explicitly; the on-disk walker gets it for free by starting at the roots.
+#: explicitly; the on-disk walker expresses it by resolving its roots.
 SCAN_ROOT_NAMES: frozenset[str] = frozenset(p.name for p in SCAN_ROOTS)
+
+
+def resolve_root(root: Path) -> Path:
+    """Absolute form of a scan root.
+
+    A relative root is resolved against :data:`REPO_ROOT`, **not** against
+    the process working directory. That distinction is the whole point of
+    this function: ``SCAN_ROOTS`` are relative names like ``backend``, and
+    resolving them against cwd made the scan depend on how pytest was
+    launched. CI runs the suite with ``working-directory: backend``, where
+    no ``backend/`` root exists — the walker then fell back to whatever
+    relative root happened to exist there (``backend/scripts/``) and
+    returned a handful of unrelated files, which is enough for a
+    non-empty assertion to pass while the tree the gates exist to scan is
+    never read.
+
+    Absolute roots are returned unchanged, so a caller that resolves its
+    own root (``test_scripts_have_no_dangerous_defaults`` passes
+    ``<project>/scripts``) keeps working.
+    """
+    return root if root.is_absolute() else REPO_ROOT / root
+
+
+def repo_relative(path: Path) -> Path:
+    """*path* relative to :data:`REPO_ROOT`, or *path* unchanged if outside.
+
+    For display, and for comparing against paths that are already
+    repository-root-relative (a ``git ls-tree`` listing).
+
+    Symlinks are **not** resolved on the first attempt, and that ordering
+    matters: several files under ``backend/tests/`` are symlinks into
+    ``unit/``, and git records the *link* name. Resolving would turn
+    ``backend/tests/test_grep_guard.py`` into
+    ``backend/tests/unit/test_grep_guard.py`` — a path no commit contains,
+    which then compares unequal to the tree listing for no useful reason.
+    The resolved form is only tried as a fallback, for a path that reaches
+    the repository through a different prefix.
+    """
+    try:
+        return path.relative_to(REPO_ROOT)
+    except ValueError:
+        pass
+    try:
+        return path.resolve().relative_to(REPO_ROOT)
+    except (ValueError, OSError):
+        return path
 
 
 def is_first_party_source(
@@ -153,23 +205,30 @@ def iter_first_party_sources(
     ``excluded`` directory name as a path part is skipped. Files
     whose suffix is not in ``extensions`` are skipped; this is the
     single point that decides which file types count as "source".
+
+    Yields **absolute** paths, and each root is resolved against
+    :data:`REPO_ROOT` rather than against cwd (see :func:`resolve_root`).
+    Both halves matter for the same reason: the result must not depend on
+    where the process was started. Absolute paths also keep the callers
+    that merely ``read_text()`` working from any working directory, and
+    the callers that classify a path by its parts
+    (``"tests" not in path.parts``) are unaffected — they never depended
+    on the path being relative. A caller that needs the
+    repository-root-relative form passes it through
+    :func:`repo_relative`.
     """
     seen: set[Path] = set()
     for root in roots:
-        if not root.exists():
+        resolved = resolve_root(root)
+        if not resolved.exists():
             continue
-        for path in sorted(root.rglob("*")):
+        for path in sorted(resolved.rglob("*")):
             if not path.is_file():
                 continue
             try:
-                rel = path.relative_to(root)
+                rel = path.relative_to(resolved)
             except ValueError:  # pragma: no cover - safety net only
                 rel = path
-            # ``rel``, not ``root / rel``: the predicate is root-agnostic,
-            # and a root may be absolute (``test_scripts_have_no_dangerous_
-            # defaults`` passes an absolute ``scripts/`` root), so
-            # re-attaching it would produce a path whose first part is
-            # ``/`` and confuse any caller that does look at the first part.
             if not is_first_party_source(rel, excluded, extensions):
                 continue
             if path in seen:
