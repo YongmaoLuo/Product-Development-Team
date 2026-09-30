@@ -4056,7 +4056,8 @@ class AutonomousAgent:
             True if task completed successfully, False if it failed.
         """
         # Per-task SubagentConfig tmpfile regeneration (decisions 2/3 + 4).
-        # Each task in the run() loop gets a fresh ``/tmp/subagent_settings_<uuid>.json``
+        # Each task in the run() loop gets a fresh
+        # ``subagent_settings_<uuid>.json`` under its own private dir
         # so the Claude subprocess launched for THIS task is wired with
         # its own ``--settings`` tmpfile (env block + hooks payload) and
         # ``CLAUDE_SETTINGS_PATH`` env var for hook correlation. Without
@@ -7135,9 +7136,10 @@ def autonomous_coding(
     )
     # Expose SubagentConfig on the agent so ``_execute_task_with_retry``
     # can regenerate the settings tmpfile per task (decisions 2/3 + 4).
-    # Each task gets its own ``/tmp/subagent_settings_<uuid>.json`` so
-    # the Claude subprocess launched for that task is wired with a
-    # unique ``--settings`` path; see ``_execute_task_with_retry``.
+    # Each task gets its own private dir and its own
+    # ``subagent_settings_<uuid>.json`` so the Claude subprocess launched
+    # for that task is wired with a unique ``--settings`` path; see
+    # ``_execute_task_with_retry``.
     agent.subagent_cfg = subagent_cfg
 
     if requirement and not recover:

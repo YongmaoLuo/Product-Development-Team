@@ -327,7 +327,8 @@ class SubagentConfig:
             OSError: if the temp root is unwritable (propagated from open()).
         """
         file_uuid = uuid.uuid4().hex
-        # A private 0700 directory under the system temp root, with a
+        # A private 0700 directory under the private root (``~/.pdt-scratch``
+        # unless ``PDT_SECRET_TEMP_ROOT`` says otherwise), with a
         # 0600 file inside it. Both layers matter: the payload carries
         # the routed provider's ``ANTHROPIC_API_KEY`` /
         # ``ANTHROPIC_AUTH_TOKEN``, and the previous flat

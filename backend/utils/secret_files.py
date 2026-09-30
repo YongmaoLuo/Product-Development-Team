@@ -23,10 +23,14 @@ and the set only grows.
 Three properties fix it. They are independent layers — any one alone
 leaves a gap:
 
-* :func:`private_dir` — ``mkdtemp`` gives a ``0700`` directory. On Linux
-  this is the *only* directory-level protection (``tempfile.gettempdir()``
-  is ``/tmp``); on macOS it is a second layer over the already-private
-  per-user temp dir (``/var/folders/…``, also ``0700``).
+* :func:`private_dir` — ``mkdtemp`` gives a ``0700`` directory under a
+  per-user root (``~/.pdt-scratch``). Two reasons that root is not the
+  system temp directory. On Linux ``gettempdir()`` *is* ``/tmp``
+  (``1777``), so only the directory ``mkdtemp`` creates is private. And
+  the temp root is a different string on every platform (``/tmp`` on
+  Linux, ``/var/folders/…/T`` on macOS, and a ``TMPDIR`` that the guard's
+  own subprocess may not even inherit), so "go look in your temp
+  directory" is not a path an operator can act on.
 * :func:`write_private_json` — ``mkdtemp`` sets the *directory* mode, not
   the file's. A file created inside it is still ``0644`` under the
   default umask, so the file mode has to be set explicitly (and forced
@@ -49,6 +53,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -83,7 +88,7 @@ PRIVATE_FILE_MODE = 0o600
 FLAT_TEMP_SETTINGS_RE = re.compile(r"^nightly_ci_settings_[0-9a-f]{32}\.json$")
 
 #: Root :func:`private_dir` mints its directories under, overriding the
-#: system temp root when set.
+#: per-user default when set.
 #:
 #: A dispatch is a short-lived thing, but the directories it leaves are
 #: not: the boot-time sweep rewrites the *credentials* in a payload and
@@ -94,48 +99,125 @@ FLAT_TEMP_SETTINGS_RE = re.compile(r"^nightly_ci_settings_[0-9a-f]{32}\.json$")
 #:
 #: This override is how a harness keeps that scratch inside something it
 #: owns and removes. Same shape as ``PDT_PLANS_DIR`` /
-#: ``PDT_STATE_DB_PATH`` / ``PDT_LOCK_ROOT``: the default stays the
-#: machine-side temp root for production, and the suite points it at its
-#: own session directory.
+#: ``PDT_STATE_DB_PATH`` / ``PDT_LOCK_ROOT``: the default is a per-user
+#: directory the operator owns, and the suite points it at its own
+#: session directory.
 PRIVATE_ROOT_ENV_VAR = "PDT_SECRET_TEMP_ROOT"
+
+#: Where the private directories go when :data:`PRIVATE_ROOT_ENV_VAR` is
+#: unset — a dotted name under the user's home, not a temp directory.
+#:
+#: Home, because it is the one location with the same meaning on every
+#: platform: ``/tmp`` is ``/tmp`` on Linux and a symlink to
+#: ``/private/tmp`` on macOS, and ``TMPDIR`` is a per-process value on
+#: both — so "go look in your temp directory" is not an instruction an
+#: operator can paste anywhere.
+#:
+#: The cost is that nothing collects it. The OS swept the temp root on a
+#: timer (macOS ``tmp_cleaner``, Linux ``systemd-tmpfiles``); nothing
+#: sweeps a home directory. :data:`PRIVATE_ROOT_ENV_VAR` is the way out
+#: of that cost for a harness that dispatches constantly: point the root
+#: at a session directory and remove it with the session.
+DEFAULT_PRIVATE_ROOT_NAME = ".pdt-scratch"
+
+
+def default_private_root() -> Optional[Path]:
+    """``~/.pdt-scratch``, or ``None`` when the home dir is unknown.
+
+    Public because the boot-time sweep has to look in the same place.
+    Naming the path in two modules is how they drift apart, and a sweep
+    pointed at the wrong root is a sweep that finds nothing — which reads
+    exactly like "this machine is clean".
+    """
+    try:
+        return Path.home() / DEFAULT_PRIVATE_ROOT_NAME
+    except (RuntimeError, OSError):
+        # No resolvable home: a service account with no passwd entry, or a
+        # container started without HOME. The caller falls back to the
+        # system temp root — worse, because nothing collects it, but the
+        # 0700/0600 layers still hold.
+        return None
 
 
 def _private_root() -> Optional[Path]:
-    """The override root, or ``None`` to use the system temp root.
+    """The override if one is set, else the per-user default.
 
     Read on each call rather than cached at import, so a harness that
     sets the variable in a fixture still takes effect for code imported
-    earlier. ``None`` (rather than returning ``gettempdir()``) is what
-    keeps the unset case calling ``mkdtemp`` with no ``dir`` argument,
-    i.e. exactly the behaviour this module had before the override
-    existed.
+    earlier. ``None`` means "no root at all" and the caller lets
+    ``mkdtemp`` choose the system temp root itself.
     """
     override = os.environ.get(PRIVATE_ROOT_ENV_VAR, "").strip()
-    return Path(override) if override else None
+    return Path(override) if override else default_private_root()
+
+
+def current_private_root() -> Optional[Path]:
+    """The root :func:`private_dir` will use right now, or ``None``.
+
+    Public view of :func:`_private_root` for the boot-time sweep. It
+    exists so the writer and the sweeper cannot name the root
+    differently — a sweep pointed at a root nothing writes to reports a
+    clean machine, which is the one failure mode a cleanup tool must not
+    have.
+    """
+    return _private_root()
 
 
 def private_dir(prefix: str = DIR_PREFIX) -> Path:
-    """Create a fresh ``0700`` directory under the temp root.
+    """Create a fresh ``0700`` directory under the private root.
 
     Deliberately **not** inside the workspace: these files belong to a
     single dispatch, and dropping them into the project directory would
     pollute the delivered tree (the attributable-diff gate would flag
     them too).
 
-    ``mkdtemp`` is used rather than ``gettempdir()`` directly because on
-    Linux ``gettempdir()`` is ``/tmp`` itself (``1777``) — only the
-    directory ``mkdtemp`` creates is private.
+    ``mkdtemp`` is used rather than the root itself because the root may
+    be a shared directory (``/tmp`` on Linux is ``1777``) — only the
+    directory ``mkdtemp`` creates is private, whatever the root's mode.
 
-    The root is the system temp root unless :data:`PRIVATE_ROOT_ENV_VAR`
-    names another one (see the constant for why a harness wants that).
+    The root is ``~/.pdt-scratch`` unless :data:`PRIVATE_ROOT_ENV_VAR`
+    names another one (see that constant for why a harness wants that).
     An override that does not exist yet is created ``0700`` rather than
     left to ``mkdtemp``, which would fail on a missing ``dir``.
+
+    The root's mode is then **forced**, not merely requested.
+    ``mkdir(exist_ok=True)`` returns silently when the directory is
+    already there and leaves its mode exactly as it found it, so a root
+    left at ``0755`` by anything else stays world-readable forever and
+    the one line that says "private" quietly stops being true. The leaf
+    ``mkdtemp`` creates is ``0700`` regardless, so this is defence in
+    depth rather than the load-bearing layer — but a directory whose
+    whole reason for existing is to be private should not depend on
+    nobody having touched it first.
     """
     root = _private_root()
     if root is None:
         return Path(tempfile.mkdtemp(prefix=prefix))
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _force_private_dir_mode(root)
     return Path(tempfile.mkdtemp(prefix=prefix, dir=str(root)))
+
+
+def _force_private_dir_mode(root: Path) -> bool:
+    """``chmod`` ``root`` to ``0700`` if it is not already. True if changed.
+
+    Best-effort: a filesystem that refuses the chmod (a mounted share, a
+    read-only home) must not stop a dispatch, and the ``0700`` leaf
+    ``mkdtemp`` goes on to create is what actually holds. So a failure is
+    swallowed here rather than raised — but it is *visible*, because
+    silently continuing is what made this worth fixing.
+    """
+    try:
+        current = stat.S_IMODE(root.stat().st_mode)
+    except OSError:
+        return False
+    if current == 0o700:
+        return False
+    try:
+        root.chmod(0o700)
+    except OSError:
+        return False
+    return True
 
 
 def write_private_json(path: Path, payload: Any) -> None:
