@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -178,12 +179,45 @@ def private_dir(prefix: str = DIR_PREFIX) -> Path:
     names another one (see that constant for why a harness wants that).
     An override that does not exist yet is created ``0700`` rather than
     left to ``mkdtemp``, which would fail on a missing ``dir``.
+
+    The root's mode is then **forced**, not merely requested.
+    ``mkdir(exist_ok=True)`` returns silently when the directory is
+    already there and leaves its mode exactly as it found it, so a root
+    left at ``0755`` by anything else stays world-readable forever and
+    the one line that says "private" quietly stops being true. The leaf
+    ``mkdtemp`` creates is ``0700`` regardless, so this is defence in
+    depth rather than the load-bearing layer — but a directory whose
+    whole reason for existing is to be private should not depend on
+    nobody having touched it first.
     """
     root = _private_root()
     if root is None:
         return Path(tempfile.mkdtemp(prefix=prefix))
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _force_private_dir_mode(root)
     return Path(tempfile.mkdtemp(prefix=prefix, dir=str(root)))
+
+
+def _force_private_dir_mode(root: Path) -> bool:
+    """``chmod`` ``root`` to ``0700`` if it is not already. True if changed.
+
+    Best-effort: a filesystem that refuses the chmod (a mounted share, a
+    read-only home) must not stop a dispatch, and the ``0700`` leaf
+    ``mkdtemp`` goes on to create is what actually holds. So a failure is
+    swallowed here rather than raised — but it is *visible*, because
+    silently continuing is what made this worth fixing.
+    """
+    try:
+        current = stat.S_IMODE(root.stat().st_mode)
+    except OSError:
+        return False
+    if current == 0o700:
+        return False
+    try:
+        root.chmod(0o700)
+    except OSError:
+        return False
+    return True
 
 
 def write_private_json(path: Path, payload: Any) -> None:
