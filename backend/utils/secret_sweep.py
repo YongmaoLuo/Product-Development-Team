@@ -59,6 +59,7 @@ from utils.secret_files import (
     FLAT_TEMP_SETTINGS_RE,
     REDACTED,
     SENSITIVE_ENV_KEYS,
+    current_private_root,
     is_flat_temp_settings,
     is_managed,
     redact,
@@ -105,14 +106,21 @@ DISABLE_ENV = "PDT_DISABLE_TEMP_SWEEP"
 
 
 def default_roots() -> List[Path]:
-    """Temp roots to scan, deduplicated by real path.
+    """Roots to scan, deduplicated by real path.
 
-    ``tempfile.gettempdir()`` is the root the private-directory writers
-    use, but it is not ``/tmp`` on macOS — and a writer that hardcoded
-    ``/tmp`` put its payload there instead. Both are scanned so a machine
-    that saw either version gets cleaned by one call.
+    The private root the writers actually use comes from
+    :func:`current_private_root` rather than from a path named here, so
+    this function cannot drift away from where the payloads land. The
+    temp roots are kept as well: a writer that hardcoded ``/tmp``, and a
+    machine that predates the per-user default, both leave residue the
+    private root does not cover.
     """
-    candidates = [Path(os.environ.get("TMPDIR") or "/tmp"), Path("/tmp")]
+    candidates: List[Path] = []
+    private = current_private_root()
+    if private is not None:
+        candidates.append(private)
+    candidates.append(Path(os.environ.get("TMPDIR") or "/tmp"))
+    candidates.append(Path("/tmp"))
     try:
         import tempfile
 
@@ -362,12 +370,16 @@ _AGED_PRUNABLE_DIR_PREFIXES = (DIR_PREFIX,)
 #: Age past which a ``pdt-subagent-*`` directory is removed whatever it
 #: holds.
 #:
-#: Wide on purpose. The directory holds the redacted payload kept for
-#: post-mortem reading, and post-mortem value decays in days — but the
-#: gate only has to be wide enough that it can never plausibly describe a
-#: live dispatch, and a generous margin costs nothing except disk the
-#: machine was not going to look at again. Three months is that margin.
-DEFAULT_RESIDUE_MAX_AGE_SEC = 90 * 24 * 60 * 60.0
+#: The gate has one hard requirement and one soft preference, and they
+#: point the same way. It must be wide enough that it can never plausibly
+#: describe a live dispatch — the child that wrote into one lives for
+#: minutes, so any gate measured in weeks clears that by a wide margin.
+#: Within that constraint, the preference is a *short* post-mortem window:
+#: the payload inside is already redacted, so what a reader of a month-old
+#: copy gets is the hook-config layout and a timestamp, and that decays in
+#: weeks. A longer gate only buys disk the machine was never going to look
+#: at again.
+DEFAULT_RESIDUE_MAX_AGE_SEC = 30 * 24 * 60 * 60.0
 
 
 def prune_empty_dirs(roots: Iterable[Path], min_age_sec: float,
