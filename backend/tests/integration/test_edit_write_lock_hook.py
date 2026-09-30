@@ -93,8 +93,17 @@ def _run_hook(workspace, target, *, broker_on, task_id="t1", extra_env=None):
 # ---------------------------------------------------------------------------
 # containment (pre-existing contract — must not regress)
 # ---------------------------------------------------------------------------
-def test_edit_outside_the_project_is_still_refused(workspace, tmp_path):
-    outside = tmp_path / "elsewhere" / "notes.md"
+def test_edit_outside_the_project_is_still_refused(workspace):
+    # NOT under ``tmp_path``, deliberately. The guard allows all temp scratch
+    # space, and where pytest puts ``tmp_path`` is a property of the machine,
+    # not of this code: on Linux ``TMPDIR`` is unset, so the basetemp IS
+    # ``/tmp`` and a tmp_path target is *legitimately allowed* there — this
+    # case asserted nothing and failed on CI while passing on macOS, whose
+    # ``TMPDIR`` is the ``/var/folders`` sandbox the guard does not allow.
+    # ``$HOME`` is outside every allowed root on both platforms, which is the
+    # same idiom the sibling suite already uses
+    # (tests/test_edit_write_containment_guard.py).
+    outside = Path.home() / "work" / "other-repo" / "notes.md"
     code, stderr = _run_hook(workspace, outside, broker_on=True)
 
     assert code == 2
@@ -199,6 +208,41 @@ def test_plan_state_files_are_not_brokered(workspace, broker):
 
     assert code == 0, stderr
     assert "another task" not in stderr
+
+
+def test_plan_state_files_are_allowed_outside_scratch(workspace):
+    """``plans/`` is allowed on its own account, not because it is scratch.
+
+    The test above puts ``plans/`` under ``tmp_path``, so on Linux the
+    target satisfies the guard's temp-scratch allowance as well: two
+    independent reasons to allow, and deleting the plans clause from the
+    allow-list leaves the test green there while turning macOS red. A
+    plans dir that is not in any temp dir makes that clause the ONLY
+    reason the edit is allowed, on every platform.
+
+    ``$HOME`` for the same reason as the refusal case above — it is
+    outside every allowed root regardless of where the machine keeps its
+    temporary files.
+    """
+    import shutil
+
+    plans = Path.home() / ".pdt-plans-allow"
+    if plans.exists():
+        shutil.rmtree(plans)
+    plans.mkdir()
+    try:
+        # ``extra_env`` because the fixture points PDT_PLANS_DIR at the
+        # tmp_path plans dir — this case is about a plans dir that is NOT
+        # in a temp dir, so the guard has to be told this one is it.
+        code, stderr = _run_hook(
+            workspace,
+            plans / "tasks.json",
+            broker_on=False,
+            extra_env={"PDT_PLANS_DIR": str(plans)},
+        )
+        assert code == 0, f"plans/ must be allowed outside scratch: {stderr!r}"
+    finally:
+        shutil.rmtree(plans, ignore_errors=True)
 
 
 def test_the_cli_path_the_tool_publishes_really_exists():
