@@ -734,6 +734,17 @@ def exec_instance_setup(tmp_path, monkeypatch):
     env = {
         "EXEC_PORT": "8001",
         "PDT_STATE_DB_PATH": str(tmp_state_db),
+        # The monkeypatch above redirects PLANS_DIR in THIS process. The
+        # spawned uvicorn is a separate process with its own PLANS_DIR
+        # pointing at the real repository one, so without this it never
+        # finds the plan planted above, the start request 404s, and the
+        # schema migration that would create the database never runs --
+        # leaving the schema assertions to report an empty sqlite_master
+        # that looks like a regression and is not one. ``server.py``
+        # reads this override at import (see the ``_PLANS_DIR_OVERRIDE``
+        # block), which is why it has to be in the child's environment
+        # rather than patched in afterwards.
+        "PDT_PLANS_DIR": str(plans_root),
         "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
         # 2026-09-14: prompts.py does ``from backend.framework.prompts
         # import ...``, which requires the REPO ROOT on sys.path.
