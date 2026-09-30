@@ -677,3 +677,57 @@ def test_current_provider_agrees_with_the_by_name_reader(tmp_path, monkeypatch):
     assert current.base_url == by_name.base_url
     assert current.api_key == by_name.api_key
     assert current.models == by_name.models
+
+
+def test_opening_a_database_is_validated_by_reading_the_schema(monkeypatch, tmp_path):
+    """The validation query must be one that actually reads the file.
+
+    ``test_invalid_database_file_raises`` above is the behavioural
+    contract, but it cannot be the only pin: whether ``SELECT 1`` happens
+    to touch the database header is an incidental property of the sqlite
+    build, and it differs between platforms. On the Python this repository
+    developed on, ``SELECT 1`` raised ``DatabaseError`` on a text file, so
+    the old probe appeared to work; on the CI runner's it did not — the
+    text file sailed through validation and a caller's own query raised a
+    raw ``sqlite3.DatabaseError`` from the middle of a lookup. A test that
+    passes on one platform and fails on another is not pinning anything.
+
+    So this asserts the mechanism instead: a statement that names no table
+    cannot be the validation, because SQLite can answer it without ever
+    reading the file. ``sqlite_master`` is the one table it must parse
+    before it can answer anything.
+
+    The recording is done with a proxy rather than by patching
+    ``sqlite3.Connection.execute``: that attribute lives on an immutable C
+    type and cannot be set.
+    """
+    bad = tmp_path / "not-a-db.db"
+    bad.write_text("this is not sqlite")
+    executed: list[str] = []
+
+    class _RecordingConnection:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args, **kwargs):
+            executed.append(sql)
+            return self._real.execute(sql, *args, **kwargs)
+
+        def close(self):
+            self._real.close()
+
+    real_connect = sqlite3.connect
+
+    def _recording_connect(*args, **kwargs):
+        return _RecordingConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(pcc.sqlite3, "connect", _recording_connect)
+
+    with pytest.raises(CCSwitchError):
+        pcc._connect_db(bad)
+
+    assert executed, "the opener ran no statement at all, so it validated nothing"
+    assert any("sqlite_master" in sql for sql in executed), (
+        f"the validation query never reads the schema ({executed!r}); a "
+        f"statement that names no table cannot detect a non-database file"
+    )

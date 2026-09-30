@@ -198,7 +198,7 @@ def _connect_db(db_path: Optional[Union[str, Path]] = None) -> sqlite3.Connectio
     *validates* the file — SQLite will happily open a text file or a
     zero-byte one as an empty database, and several zero-byte
     ``cc-switch.db`` files exist on a real machine (see
-    :func:`candidate_db_paths`). Without the ``SELECT 1`` probe those
+    :func:`candidate_db_paths`). Without the schema probe those
     would surface later as ``no such table: providers`` from the middle
     of a dispatch instead of as "this database is not usable".
 
@@ -216,7 +216,14 @@ def _connect_db(db_path: Optional[Union[str, Path]] = None) -> sqlite3.Connectio
     try:
         uri = f"file:{path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-        conn.execute("SELECT 1")
+        # Read the schema, not ``SELECT 1``. A constant select is
+        # answered by the engine without ever touching the file, so it
+        # cannot tell a database from a text file — a non-sqlite file
+        # passed this probe and then raised a raw ``sqlite3.DatabaseError``
+        # from the middle of a lookup instead. ``sqlite_master`` is the
+        # one table SQLite must parse before it can answer anything, so
+        # this is the statement that actually validates the header.
+        conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
         return conn
     except sqlite3.Error as exc:
         raise CCSwitchDBNotFoundError(
