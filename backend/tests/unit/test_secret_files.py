@@ -35,7 +35,9 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+from utils import secret_files  # noqa: E402
 from utils.secret_files import (  # noqa: E402
+    DEFAULT_PRIVATE_ROOT_NAME,
     DIR_PREFIX,
     PRIVATE_ROOT_ENV_VAR,
     REDACTED,
@@ -69,7 +71,7 @@ def _payload(**env_over):
 # ---------------------------------------------------------------------------
 
 
-def test_private_dir_is_0700_under_the_temp_root_and_not_in_the_workspace():
+def test_private_dir_is_0700_and_outside_the_workspace():
     d = private_dir()
     try:
         assert _mode(d) == 0o700, (
@@ -99,17 +101,27 @@ def test_private_dir_returns_a_fresh_directory_each_call():
         b.rmdir()
 
 
-def test_private_dir_defaults_to_the_system_temp_root(monkeypatch):
-    """The unset case must stay exactly what it was before the override.
+def test_private_dir_defaults_to_a_per_user_root_under_home(monkeypatch):
+    """The unset case mints under ``~/.pdt-scratch``, not a temp dir.
 
-    A test suite points the root somewhere it owns; production does not,
-    and a default that quietly moved would put dispatches' credential
-    payloads wherever the new value happened to point.
+    Two properties the old default did not have on every platform, both
+    of which have to survive any future "simplify this back to
+    ``gettempdir()``" edit:
+
+    * the root is the same string on every machine, so "go look in your
+      private scratch directory" is an instruction an operator can act
+      on — ``/tmp`` is a symlink to ``/private/tmp`` on macOS and
+      ``TMPDIR`` is a third thing again, per-process, on both;
+    * nothing else collects it. The temp root had a 3-day OS sweep
+      (macOS ``tmp_cleaner``, Linux ``systemd-tmpfiles``); a home
+      directory has none, so ``secret_sweep.default_roots`` resolving
+      through ``current_private_root`` is what keeps the payload from
+      accumulating for ever.
     """
     monkeypatch.delenv(PRIVATE_ROOT_ENV_VAR, raising=False)
     d = private_dir()
     try:
-        expected = Path(tempfile.gettempdir()).resolve()
+        expected = (Path.home() / DEFAULT_PRIVATE_ROOT_NAME).resolve()
         assert d.parent.resolve() == expected, (
             f"with no override the directory must be minted directly in "
             f"{expected}, not {d.parent}"
@@ -411,3 +423,64 @@ def test_subagent_config_writes_into_a_private_dir(tmp_path: Path):
     finally:
         import shutil
         shutil.rmtree(path.parent, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# The private root's own mode
+# ---------------------------------------------------------------------------
+
+
+def test_private_dir_repairs_a_private_root_left_world_readable(
+    tmp_path: Path, monkeypatch
+):
+    """A root that already exists at ``0755`` is forced back to ``0700``.
+
+    ``mkdir(exist_ok=True)`` is a no-op on a directory that is already
+    there — it does not even look at ``mode``. So a ``~/.pdt-scratch``
+    left world-readable by anything else would stay that way for ever,
+    and the one line in this module that says the location is *private*
+    would be quietly untrue.
+
+    The ``0700`` leaf ``mkdtemp`` creates is what actually holds the
+    payload, so this is defence in depth rather than the load-bearing
+    layer. It is pinned anyway: "the root is private" should not depend
+    on nobody having touched it first, and no other gate in this repo
+    looks at this directory's mode.
+    """
+    root = tmp_path / "pdt-scratch"
+    root.mkdir(mode=0o755)
+    assert _mode(root) == 0o755, "fixture must start world-readable"
+
+    monkeypatch.setenv(PRIVATE_ROOT_ENV_VAR, str(root))
+    d = private_dir()
+    try:
+        assert _mode(root) == 0o700, (
+            f"the private root stayed {_mode(root):o} — private_dir must "
+            f"chmod a root it did not create"
+        )
+        assert _mode(d) == 0o700
+    finally:
+        d.rmdir()
+
+
+def test_private_dir_leaves_an_already_private_root_alone(
+    tmp_path: Path, monkeypatch
+):
+    """The common path must not churn the root's ctime every dispatch.
+
+    ``chmod`` is a syscall on a directory that is visited once per
+    dispatch; doing it unconditionally would touch metadata that nothing
+    else in this module touches, for no gain.
+    """
+    root = tmp_path / "pdt-scratch"
+    root.mkdir(mode=0o700)
+    monkeypatch.setenv(PRIVATE_ROOT_ENV_VAR, str(root))
+
+    assert secret_files._force_private_dir_mode(root) is False
+    assert _mode(root) == 0o700
+
+    d = private_dir()
+    try:
+        assert _mode(root) == 0o700
+    finally:
+        d.rmdir()

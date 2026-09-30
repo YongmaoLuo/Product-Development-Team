@@ -442,3 +442,57 @@ def test_a_heavy_lane_mitigates_the_known_runner_bug(job_name: str) -> None:
         f"glob list turns the whole step into a silent no-op — and silence "
         f"reads as 'mitigated'."
     )
+
+
+# ---------------------------------------------------------------------------
+# The bisect harness must be the same shape as what it bisects
+# ---------------------------------------------------------------------------
+
+#: pytest flags that change *how* a shard runs rather than what it selects.
+#: ``--cov`` is the one that matters: it instruments every module under
+#: ``backend/`` at collection time, which is the I/O-heavy step.
+_SHAPE_FLAGS = ("--cov=.", "-p ci_process_guard", "--tb=short")
+
+
+@pytest.mark.parametrize("flag", _SHAPE_FLAGS)
+def test_the_bisect_lane_runs_the_shape_it_bisects(flag: str) -> None:
+    """``unit-staircase`` must invoke pytest like ``unit-tests`` does.
+
+    The staircase exists to bisect a shard that wedges. It ran **without**
+    ``--cov=.`` — on the stated grounds that ``coverage-gate`` does not run
+    on a dispatch — and that made it a reproduction of something other than
+    the thing under investigation. Four bisect rounds came back entirely
+    green, controls included, on a wedge that had failed five consecutive
+    push runs:
+
+    ==========================  ===============  ===================
+    lane                        shape             result
+    ==========================  ===============  ===================
+    ``Staircase (u00-full)``    no ``--cov=.``    20s, 273 passed
+    ``Unit tests (unit-00)``    ``--cov=.``       reaped at 45m00s
+    ==========================  ===============  ===================
+
+    Same 24 files, same 273 tests. The harness cannot find a bug that only
+    the heavier shape has, and it reports "all green" — the single most
+    expensive answer a bisect tool can give.
+
+    The coverage *gate* is genuinely irrelevant here and stays off; only
+    the flag that shapes collection is pinned. The two lanes differ in
+    their watchdog budget and step ceiling on purpose (the staircase's is
+    longer, because a bisect round is expected to be the thing that
+    wedges), and those are covered by the test above.
+    """
+    workflow = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+    missing = [
+        job
+        for job in _SETSID_LANES
+        if not any(
+            flag in (step.get("run") or "")
+            for step in workflow["jobs"][job].get("steps", [])
+            if "setsid" in (step.get("run") or "")
+        )
+    ]
+    assert not missing, (
+        f"{', '.join(missing)} no longer passes {flag!r} to pytest, so the "
+        f"bisect harness runs a different shape than the shard it bisects"
+    )
