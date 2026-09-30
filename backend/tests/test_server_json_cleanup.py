@@ -730,6 +730,7 @@ def exec_instance_setup(tmp_path, monkeypatch):
     # project-level state.db).  The env var propagates into the
     # spawned uvicorn subprocess via ``env=...`` below.
     tmp_state_db = tmp_path / "state.db"
+    server_log = open(tmp_path / "uvicorn.log", "w+b")  # noqa: SIM115
     env = {
         "EXEC_PORT": "8001",
         "PDT_STATE_DB_PATH": str(tmp_state_db),
@@ -759,8 +760,15 @@ def exec_instance_setup(tmp_path, monkeypatch):
         ],
         cwd=str(_BACKEND_ROOT),
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        # NOT DEVNULL. The server is the only thing that knows why it
+        # failed to bring the database up, and every consumer of this
+        # fixture reads the database afterwards -- so with the output
+        # discarded, "the server never wrote state.db" is
+        # indistinguishable from "the server wrote a state.db with no
+        # tables in it", and the second reading is the one the schema
+        # assertions go on to report as an empty ``sqlite_master``.
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
     )
     try:
         # Wait for the server to come up.  30 s budget.
@@ -777,10 +785,34 @@ def exec_instance_setup(tmp_path, monkeypatch):
             except (urllib.error.URLError, ConnectionResetError, OSError):
                 pass
             time.sleep(0.25)
+        def _server_log_tail() -> str:
+            try:
+                server_log.flush()
+                server_log.seek(0)
+                return server_log.read().decode("utf-8", "replace")[-2000:]
+            except OSError:
+                return "<server log unavailable>"
+
         if not ready:
             pytest.skip(
                 "EXEC_PORT=8001 server did not become healthy within 30s; "
-                "teardown guard cannot exercise the live lifecycle."
+                "teardown guard cannot exercise the live lifecycle. "
+                f"Server output:\n{_server_log_tail()}"
+            )
+        # A healthy 8001 is not evidence that THIS server is the one
+        # answering. The port is fixed, so anything else that ever bound
+        # it -- a previous test's server that has not been reaped yet, or
+        # a listener this runner image starts by default -- answers the
+        # health probe instantly while writing to a DIFFERENT state.db.
+        # That is the failure this whole fixture has been silently
+        # producing: a healthy check, a foreign server, and an empty
+        # ``sqlite_master`` three tests later with nothing in between
+        # saying so.
+        if proc.poll() is not None:
+            pytest.skip(
+                f"the spawned server exited (rc={proc.returncode}) before "
+                f"the health probe succeeded, so another process is "
+                f"serving :8001. Server output:\n{_server_log_tail()}"
             )
 
         # Drive /api/execution/{plan_id}/start.  We accept either
@@ -812,6 +844,20 @@ def exec_instance_setup(tmp_path, monkeypatch):
             # to be exercised, not to succeed.
             _ = exc.code
 
+        # The schema assertions below read this file. Checking it HERE
+        # means the fixture fails with "the server never wrote the
+        # database" rather than letting three downstream tests each
+        # report an empty ``sqlite_master``, which reads like a schema
+        # regression and is not one.
+        if not tmp_state_db.exists() or tmp_state_db.stat().st_size == 0:
+            pytest.fail(
+                f"the spawned server never created {tmp_state_db}. The "
+                f"schema assertions in this file will otherwise report an "
+                f"empty sqlite_master, which looks like a schema "
+                f"regression and is not one. Server output:\n"
+                f"{_server_log_tail()}"
+            )
+
         yield plans_root
     finally:
         # Stop the spawned server.  Best-effort: if terminate fails
@@ -824,6 +870,10 @@ def exec_instance_setup(tmp_path, monkeypatch):
                 proc.kill()
                 proc.wait(timeout=5)
         except Exception:
+            pass
+        try:
+            server_log.close()
+        except OSError:
             pass
 
 
@@ -1870,6 +1920,7 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
 
     # Spawn the real uvicorn process on EXEC_PORT=8001.
     tmp_state_db = tmp_path / "state.db"
+    server_log = open(tmp_path / "uvicorn.log", "w+b")  # noqa: SIM115
     env = {
         "EXEC_PORT": str(_E2E_PORT),
         "PDT_STATE_DB_PATH": str(tmp_state_db),
@@ -1892,8 +1943,15 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
         ],
         cwd=str(_BACKEND_ROOT),
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        # NOT DEVNULL. The server is the only thing that knows why it
+        # failed to bring the database up, and every consumer of this
+        # fixture reads the database afterwards -- so with the output
+        # discarded, "the server never wrote state.db" is
+        # indistinguishable from "the server wrote a state.db with no
+        # tables in it", and the second reading is the one the schema
+        # assertions go on to report as an empty ``sqlite_master``.
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
     )
 
     server_started = False

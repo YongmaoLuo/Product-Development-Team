@@ -381,13 +381,22 @@ class TestCodingToolSettingsInjection:
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
             "ANTHROPIC_DEFAULT_SUMMARIZE_MODEL",
         }
+        # Only the three fields the tool writes unconditionally. The
+        # per-tier model keys are NOT required, and requiring them is
+        # what made this test machine-dependent: the tool forwards the
+        # operator's ANTHROPIC_DEFAULT_*_MODEL values when they are
+        # exported and omits them when they are not, so on a developer
+        # machine that has them set the file carries all six and on a
+        # clean runner it carries three. Model management is delegated
+        # to CC Switch by design (see SubagentConfig.to_settings_dict),
+        # so a tier key appearing is a function of the environment, not
+        # of this code. When they ARE written they are still pinned --
+        # by the allowlist check below, which is the property that
+        # actually matters: nothing the tool does not own leaks in.
         sdk_required = {
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_DEFAULT_SONNET_MODEL",
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL",
         }
         missing = sorted(sdk_required - env_keys)
         assert not missing, (
