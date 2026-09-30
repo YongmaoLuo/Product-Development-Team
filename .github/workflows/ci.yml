@@ -564,6 +564,31 @@ jobs:
           - { lane: root, shard: root-6, index: "6", count: "7" }
           - lane: misc
             shard: misc
+          # --- wedge bisect (temporary, 2026-09-30) --------------------
+          #
+          # unit-00 and root-4 have wedged on the runner in 9 consecutive
+          # runs while every other shard finishes in 50-100s. These are
+          # the same two shards cut into quarters, run in THIS lane so
+          # they inherit its exact shape.
+          #
+          # The slicing here MUST match the lane's own. The lane selects
+          # with awk 'NR % n == i' and awk's NR is 1-based, so shard 0 of
+          # 12 is the files at 0-based indices 11, 23, 35 ... — deriving
+          # the same slice in Python as `i % n == 0` yields a set with
+          # ZERO files in common, which is what made two earlier bisect
+          # rounds report "all green" for a shard they never ran.
+          #
+          # Delete these eight lines once the wedge is located. They
+          # deliberately overlap unit-00/root-4, so the combined coverage
+          # double-counts those files while they are present.
+          - { lane: bisect, shard: u00-q1, paths: "tests/unit/notifications/test_card_intermediate_phases.py tests/unit/notifications/test_unified_phase_section.py tests/unit/test_agent_desc_consistency.py tests/unit/test_agent_refine_timing.py tests/unit/test_binary_freshness.py tests/unit/test_coding_tool.py" }
+          - { lane: bisect, shard: u00-q2, paths: "tests/unit/test_config.py tests/unit/test_empty_response_retry.py tests/unit/test_framework_text.py tests/unit/test_is_dependency_ready.py tests/unit/test_notifier_satisfies_request_guard.py tests/unit/test_plan_status.py" }
+          - { lane: bisect, shard: u00-q3, paths: "tests/unit/test_provider_routing.py tests/unit/test_repair_generation_failure_handling.py tests/unit/test_round_passed_with_pending.py tests/unit/test_service_manager.py tests/unit/test_stranded_card_sweep.py tests/unit/test_task_manager_hydrate_orphans.py" }
+          - { lane: bisect, shard: u00-q4, paths: "tests/unit/test_tasks_generator_self_review_fixes.py tests/unit/test_verification_agent.py tests/unit/test_verification_dag_provider_names.py tests/unit/test_verification_plan_wide_concurrency.py tests/unit/test_verification_terminal_state_machine.py" }
+          - { lane: bisect, shard: r04-q1, paths: "tests/api/test_execution_state_persistence.py tests/crash_recovery/test_kill_after_commit_persists_change.py tests/e2e/test_full_plan_lifecycle_on_8001.py tests/e2e/test_security_fixes_do_not_break_plan_lifecycle.py tests/integration/resume_test/test_api_client.py tests/integration/test_agent_lock_hooks.py tests/integration/test_closed_loop_three_layer_fix.py" }
+          - { lane: bisect, shard: r04-q2, paths: "tests/integration/test_grep_guard_target_coverage.py tests/integration/test_subagent_instantiation.py tests/static_gates/test_commit_messages_are_not_ai_attributed.py tests/static_gates/test_frontend_message_views_escape_html.py tests/static_gates/test_no_operator_attribution_in_source.py tests/static_gates/test_sqlite_schema_tables_exactly_four_plus_version.py tests/test_atomic_io.py" }
+          - { lane: bisect, shard: r04-q3, paths: "tests/test_base_yaml_no_order.py tests/test_coding_tool.py tests/test_e2e_mock_plan_full_workflow.py tests/test_fixed_timeout_contract.py tests/test_integration_state_machine_migration.py tests/test_no_legacy_read_path_in_server.py tests/test_plan_state_persistence.py" }
+          - { lane: bisect, shard: r04-q4, paths: "tests/test_provider_order.py tests/test_runtime_provider_assertions.py tests/test_server_recovery.py tests/test_state_machine_completed_transition.py tests/test_usage_registry.py tests/test_verification_executor_filename.py tests/test_verification_state_machine.py" }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -675,13 +700,28 @@ jobs:
           # collected file set rather than by a directory. Directories do
           # not split usefully here: 249 of the 283 files under
           # tests/unit sit at its top level.
+          BISECT=0
           case "${{ matrix.lane }}" in
             unit) LANE_PATHS="tests/unit" ;;
             root) LANE_PATHS="tests/ --ignore=tests/unit --ignore=tests/contract --ignore=tests/concurrency --ignore=tests/performance --ignore=tests/security --ignore=tests/meta_tests" ;;
             misc) LANE_PATHS="tests/contract tests/security tests/meta_tests tests/concurrency tests/performance" ;;
+            # A bisect shard carries its own file list and skips the
+            # round-robin. The slice has to be re-runnable in THIS lane
+            # because every property that separates a real shard from a
+            # staircase shard is a property of this job.
+            bisect)
+              BISECT=1
+              TARGETS="${{ matrix.paths }}"
+              if [ -z "$TARGETS" ]; then
+                echo "::error::bisect shard ${{ matrix.shard }} has no paths"
+                exit 2
+              fi
+              FILE_COUNT=$(echo "$TARGETS" | wc -w | tr -d ' ')
+              echo "bisect shard ${{ matrix.shard }}: explicit list of ${FILE_COUNT} file(s)"
+              ;;
             *) echo "::error::unknown lane '${{ matrix.lane }}'"; exit 2 ;;
           esac
-          if [ -n "${{ matrix.index }}" ]; then
+          if [ "$BISECT" -eq 0 ] && [ -n "${{ matrix.index }}" ]; then
             # Round-robin over the collected files. Every file lands in
             # exactly one shard (``NR % count == index`` partitions the
             # list), so the shards' union is the lane's whole file set and
@@ -719,7 +759,7 @@ jobs:
               echo "::error::shard ${{ matrix.shard }} resolved to zero files; the slice or the lane's path set is wrong"
               exit 2
             fi
-          else
+          elif [ "$BISECT" -eq 0 ]; then
             TARGETS="$LANE_PATHS"
           fi
           # NO ``ulimit`` guardrails here (2026-09-23, reverted).
