@@ -36,6 +36,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from utils.secret_files import (  # noqa: E402
+    DEFAULT_PRIVATE_ROOT_NAME,
     DIR_PREFIX,
     PRIVATE_ROOT_ENV_VAR,
     REDACTED,
@@ -69,7 +70,7 @@ def _payload(**env_over):
 # ---------------------------------------------------------------------------
 
 
-def test_private_dir_is_0700_under_the_temp_root_and_not_in_the_workspace():
+def test_private_dir_is_0700_and_outside_the_workspace():
     d = private_dir()
     try:
         assert _mode(d) == 0o700, (
@@ -99,17 +100,27 @@ def test_private_dir_returns_a_fresh_directory_each_call():
         b.rmdir()
 
 
-def test_private_dir_defaults_to_the_system_temp_root(monkeypatch):
-    """The unset case must stay exactly what it was before the override.
+def test_private_dir_defaults_to_a_per_user_root_under_home(monkeypatch):
+    """The unset case mints under ``~/.pdt-scratch``, not a temp dir.
 
-    A test suite points the root somewhere it owns; production does not,
-    and a default that quietly moved would put dispatches' credential
-    payloads wherever the new value happened to point.
+    Two properties the old default did not have on every platform, both
+    of which have to survive any future "simplify this back to
+    ``gettempdir()``" edit:
+
+    * the root is the same string on every machine, so "go look in your
+      private scratch directory" is an instruction an operator can act
+      on — ``/tmp`` is a symlink to ``/private/tmp`` on macOS and
+      ``TMPDIR`` is a third thing again, per-process, on both;
+    * nothing else collects it. The temp root had a 3-day OS sweep
+      (macOS ``tmp_cleaner``, Linux ``systemd-tmpfiles``); a home
+      directory has none, so ``secret_sweep.default_roots`` resolving
+      through ``current_private_root`` is what keeps the payload from
+      accumulating for ever.
     """
     monkeypatch.delenv(PRIVATE_ROOT_ENV_VAR, raising=False)
     d = private_dir()
     try:
-        expected = Path(tempfile.gettempdir()).resolve()
+        expected = (Path.home() / DEFAULT_PRIVATE_ROOT_NAME).resolve()
         assert d.parent.resolve() == expected, (
             f"with no override the directory must be minted directly in "
             f"{expected}, not {d.parent}"

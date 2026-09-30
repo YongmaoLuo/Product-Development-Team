@@ -511,6 +511,43 @@ def test_a_lock_directory_holding_a_lock_file_is_left_alone(
     assert (held / "deadbeef.lock").exists()
 
 
+def test_the_retention_gate_is_thirty_days_and_the_boundary_keeps(
+    tmp_path: Path,
+) -> None:
+    """The number is pinned, and both sides of it are exercised.
+
+    Two failure modes with the same invisible symptom — the directories
+    just never go away. A gate that quietly widened, and a gate that
+    nobody re-checks because no test mentions it, are indistinguishable
+    from the outside. The other tests in this section all pass the
+    constant in symbolically, so none of them would notice a change to
+    it; this one states the value.
+
+    The sides are probed a minute either side rather than exactly on the
+    boundary: the rule compares against a ``time.time()`` it reads
+    itself, so a directory whose mtime is exactly one gate old has
+    already crossed by the time the comparison runs, and a test that
+    claimed otherwise would be asserting a coincidence rather than the
+    rule.
+    """
+    gate = sweeper.DEFAULT_RESIDUE_MAX_AGE_SEC
+    assert gate == 30 * 24 * 3600, (
+        f"the retention gate is {gate / (24 * 3600):.1f} days; this test "
+        f"pins 30, so a change to the number is a deliberate one"
+    )
+
+    inside = _managed_settings(tmp_path, dir_name="pdt-subagent-in")
+    past_it = _managed_settings(tmp_path, dir_name="pdt-subagent-out")
+    _age(inside.parent, gate - 60)
+    _age(past_it.parent, gate + 60)
+
+    removed = sweeper.prune_aged_residue([tmp_path], max_age_sec=gate, apply=True)
+
+    assert removed == [past_it.parent]
+    assert inside.exists(), "a directory a minute inside the gate must be kept"
+    assert not past_it.parent.exists()
+
+
 # ---------------------------------------------------------------------------
 # Aged-residue pruning — the rule the empty-directory prune cannot express
 # ---------------------------------------------------------------------------
@@ -790,6 +827,48 @@ def test_two_roots_are_taken_and_deduplicated(tmp_path: Path) -> None:
     assert len(sweeper.find_candidates([a])) == 1
     assert len(sweeper.find_candidates([a, a])) == 1
     assert len(sweeper.find_candidates([a, b])) == 1
+
+
+# ---------------------------------------------------------------------------
+# Where the sweep looks
+# ---------------------------------------------------------------------------
+
+
+def test_default_roots_covers_the_private_root_the_writers_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep must look where the writers actually write.
+
+    A sweep pointed at a root nothing writes to returns an empty finding
+    list, which reads exactly like "this machine is clean" — the one
+    outcome a cleanup tool must never be able to produce by accident.
+    So the root is read through the same resolver the writer uses rather
+    than named here, and this test pins that both the override and the
+    per-user default land in the list.
+    """
+    from utils import secret_files, secret_sweep
+
+    private = tmp_path / "private"
+    private.mkdir()
+    monkeypatch.setenv(secret_files.PRIVATE_ROOT_ENV_VAR, str(private))
+    roots = {p.resolve() for p in secret_sweep.default_roots()}
+    assert private.resolve() in roots, (
+        "the sweep would not scan the root the writers use; a payload "
+        "left by a crash would be reported as no residue at all"
+    )
+
+    monkeypatch.delenv(secret_files.PRIVATE_ROOT_ENV_VAR, raising=False)
+    default = tmp_path / "default-root"
+    default.mkdir()
+    # Patch the resolver rather than creating ~/.pdt-scratch: a test must
+    # not leave a directory in the developer's home to assert where the
+    # code would look.
+    monkeypatch.setattr(secret_files, "default_private_root", lambda: default)
+    roots = {p.resolve() for p in secret_sweep.default_roots()}
+    assert default.resolve() in roots, (
+        "with no override the sweep must still cover the per-user default, "
+        "or every dispatch's residue is unreachable on a fresh machine"
+    )
 
 
 # ---------------------------------------------------------------------------

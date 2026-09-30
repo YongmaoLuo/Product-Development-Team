@@ -999,13 +999,16 @@ async def _lifespan(app):
                 )
             # The other half of keeping the population bounded: every
             # dispatch mints a directory, and a dispatch that failed
-            # before writing (or whose payload was redacted and kept)
-            # leaves one behind that nothing else collects. Removing the
-            # empty ones here is what stops the count growing forever.
+            # before writing leaves an empty one behind while a dispatch
+            # that succeeded leaves a non-empty one (the payload is
+            # redacted and kept for post-mortem). Neither is reachable by
+            # the other rule, so ``prune_residue`` runs both — the
+            # settle-window empty prune and the 30-day age prune.
             if _sweep_pruned:
                 logger.warning(
-                    "[secret_sweep] startup sweep removed %d empty "
-                    "sweep-owned director%s",
+                    "[secret_sweep] startup sweep removed %d sweep-owned "
+                    "director%s (empty past the settle window, or aged past "
+                    "the retention gate)",
                     len(_sweep_pruned),
                     "y" if len(_sweep_pruned) == 1 else "ies",
                 )
