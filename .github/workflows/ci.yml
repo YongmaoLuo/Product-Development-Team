@@ -986,8 +986,30 @@ jobs:
             exit 0
           '
 
-      # No `--cov` here: coverage-gate does not run on a dispatch, and the
-      # question is wall-clock behaviour, not coverage.
+      # `--cov=.` here is NOT about the coverage gate — coverage-gate does
+      # not run on a dispatch and never will. It is here because a bisect
+      # harness that runs a lighter shape than the shard it bisects cannot
+      # find a bug that only the heavier shape has.
+      #
+      # This flag is **not** the explanation for the wedge, and the comment
+      # used to claim it was. Measured on the shard that wedges, `--cov=.`
+      # costs 0.1s (18.53s -> 18.64s locally): coverage's overhead tracks
+      # the lines actually executed, and one shard touches a small slice of
+      # ``backend/``. With the flag added, this lane ran the wedge's own 24
+      # files and still finished in 21s.
+      #
+      # What IS established, and what this comment is for: **the staircase
+      # does not reproduce the wedge**, matching flags or not. Four bisect
+      # rounds came back green including both controls, and so did an
+      # isolation round where the two wedging shards ran as the only jobs in
+      # the run. So the trigger is not another shard competing with them,
+      # not the file set at <=12 files (halves and quarters all pass), not
+      # test count, and not peak memory (flat at ~98MB). Do not re-run those
+      # rounds; the open question is what a 2-CPU Linux runner does that a
+      # developer machine does not.
+      #
+      # ``test_the_bisect_lane_runs_the_shape_it_bisects`` pins the
+      # alignment so the harness cannot silently drift lighter again.
       - name: Run staircase shard — ${{ matrix.shard }}
         timeout-minutes: 30
         working-directory: backend
@@ -1075,6 +1097,8 @@ jobs:
           set +e
           setsid ./.venv/bin/python3 -m pytest $TARGETS \
             -m "not e2e and not integration and not perf" \
+            --cov=. \
+            --cov-report= \
             --tb=short \
             -p ci_process_guard \
             --durations=25 \
