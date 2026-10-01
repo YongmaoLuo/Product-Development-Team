@@ -174,6 +174,154 @@ permissions:
   contents: read
 
 jobs:
+  # ===========================================================================
+  # WHO HOLDS THE PIPE — name the process that outlives the step.
+  # ===========================================================================
+  #
+  # The mechanism is proven synthetically on Linux with a real pipe (see the
+  # PR body): a leaked child that inherits the step's stdout holds the
+  # runner's output pipe open. The step's shell exits rc=0; the runner is
+  # left waiting for an EOF that never comes. From outside that is
+  # indistinguishable from a hung step — and it explains the one observation
+  # nothing else did: **the step's own `timeout-minutes` never fired**,
+  # because the step *process* was long gone and the runner was blocked on
+  # the pipe rather than on a process.
+  #
+  # That leaves one question this job answers directly: after pytest exits,
+  # is there a FOREIGN process still holding the step's stdout, and which
+  # one? A watcher polls `/proc/*/fd/1` every 10s, excluding itself, the
+  # step shell and their ancestors, and writes what it finds to a file.
+  # Its own output is redirected away first — otherwise the watcher would be
+  # the thing holding the pipe it is measuring.
+  #
+  # Two historically wedged shards, plus one that has never wedged as a
+  # control for "this round's runner was healthy".
+  #
+  # Not a gate. Read once, then delete.
+  wedge-pipe-holder:
+    name: Pipe holder ${{ matrix.group }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { group: "unit0", targets: "tests/unit/notifications/test_card_intermediate_phases.py tests/unit/notifications/test_unified_phase_section.py tests/unit/test_agent_desc_consistency.py tests/unit/test_agent_refine_timing.py tests/unit/test_binary_freshness.py tests/unit/test_coding_tool.py tests/unit/test_config.py tests/unit/test_empty_response_retry.py tests/unit/test_framework_text.py tests/unit/test_is_dependency_ready.py tests/unit/test_notifier_satisfies_request_guard.py tests/unit/test_plan_status.py tests/unit/test_provider_routing.py tests/unit/test_repair_generation_failure_handling.py tests/unit/test_round_passed_with_pending.py tests/unit/test_service_manager.py tests/unit/test_stranded_card_sweep.py tests/unit/test_task_manager_hydrate_orphans.py tests/unit/test_tasks_generator_self_review_fixes.py tests/unit/test_verification_agent.py tests/unit/test_verification_dag_provider_names.py tests/unit/test_verification_plan_wide_concurrency.py tests/unit/test_verification_terminal_state_machine.py" }
+          - { group: "root4", targets: "tests/api/test_execution_state_persistence.py tests/crash_recovery/test_kill_after_commit_persists_change.py tests/e2e/test_full_plan_lifecycle_on_8001.py tests/e2e/test_security_fixes_do_not_break_plan_lifecycle.py tests/integration/resume_test/test_api_client.py tests/integration/test_agent_lock_hooks.py tests/integration/test_closed_loop_three_layer_fix.py tests/integration/test_grep_guard_target_coverage.py tests/integration/test_subagent_instantiation.py tests/static_gates/test_commit_messages_are_not_ai_attributed.py tests/static_gates/test_frontend_message_views_escape_html.py tests/static_gates/test_no_operator_attribution_in_source.py tests/static_gates/test_sqlite_schema_tables_exactly_four_plus_version.py tests/test_atomic_io.py tests/test_base_yaml_no_order.py tests/test_coding_tool.py tests/test_e2e_mock_plan_full_workflow.py tests/test_fixed_timeout_contract.py tests/test_integration_state_machine_migration.py tests/test_no_legacy_read_path_in_server.py tests/test_plan_state_persistence.py tests/test_provider_order.py tests/test_runtime_provider_assertions.py tests/test_server_recovery.py tests/test_state_machine_completed_transition.py tests/test_usage_registry.py tests/test_verification_executor_filename.py tests/test_verification_state_machine.py" }
+          - { group: "unit3-ctl", targets: "tests/unit/archive_scan/test_dirname_date_takes_precedence_over_metadata.py tests/unit/notifications/test_card_vp_split_visibility.py tests/unit/repositories/test_artifact_content_hash_recomputed_on_update.py tests/unit/test_agent_dynamic_concurrency.py tests/unit/test_api_test_vocabulary_equivalence.py tests/unit/test_cards_failed_task_attempt_count.py tests/unit/test_coding_tool_query_json_retry.py tests/unit/test_config_placeholders_are_neutral.py tests/unit/test_execution_progress_single_connection.py tests/unit/test_grep_guard.py tests/unit/test_llm_calls_inherit_unified_timeout.py tests/unit/test_partial_completion_path.py tests/unit/test_preflight_review.py tests/unit/test_recovery_closes_its_connections.py tests/unit/test_repair_prompt_feedback.py tests/unit/test_scheduling_skeleton.py tests/unit/test_skill_md_alignment.py tests/unit/test_subagent_isolation.py tests/unit/test_task_persist_failure_reason.py tests/unit/test_tasks_generator_user_requirement.py tests/unit/test_verification_api_test_wiring.py tests/unit/test_verification_executor_filename.py tests/unit/test_verification_repair_tasks_card.py tests/unit/test_vp_split.py" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install -q --upgrade pip
+          backend/.venv/bin/python3 -m pip install -q -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install -q pytest pytest-cov pytest-timeout coverage
+
+      - name: Mitigate runner-images#13770 (read_ahead_kb)
+        run: |
+          sudo bash -c '
+            shopt -s nullglob
+            for dev in /sys/block/sd* /sys/block/nvme*n*; do
+              if [ -e "$dev/queue/read_ahead_kb" ]; then
+                echo 128 > "$dev/queue/read_ahead_kb"
+              fi
+            done
+            exit 0
+          '
+
+      - name: Who holds the pipe — ${{ matrix.group }}
+        working-directory: backend
+        timeout-minutes: 12
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          G="${{ matrix.group }}"
+          REPORT="holder-$G.txt"
+          # `$$` not `/proc/self`: inside a command substitution `self` is
+          # the substitution shell, whose fd 1 is the capture pipe — reading
+          # that would report a pipe nothing else can ever hold.
+          PIPE_TARGET=$(readlink /proc/$$/fd/1)
+          echo "step stdout -> $PIPE_TARGET" > "$REPORT"
+          echo "our pid=$$ pgid=$(ps -o pgid= -p $$ | tr -d ' ')" >> "$REPORT"
+
+          cat > ./watch.sh <<'WATCH_EOF'
+          # 谁还攥着 runner 的管道？只算**外人**——不算观察者自己、
+          # 不算步骤 shell、不算它们的祖先。
+          REPORT=$1; PIPE=$2; GROUP=$3
+          # 步骤 shell 与本观察者的 pid，以及它们的祖先，一律不算泄漏。
+          (
+            p=$$
+            while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ]; do
+              echo "$p"
+              p=$(awk '{print $4}' /proc/$p/stat 2>/dev/null)
+            done
+          ) > /tmp/ours-$GROUP.txt
+
+          self=$$
+          for i in $(seq 1 120); do
+            holders=""
+            for fd in /proc/[0-9]*/fd/1; do
+              pid=${fd#/proc/}; pid=${pid%%/*}
+              [ "$pid" = "$self" ] && continue
+              grep -qx "$pid" /tmp/ours-$GROUP.txt && continue
+              [ "$(readlink "$fd" 2>/dev/null)" = "$PIPE" ] || continue
+              holders="$holders $pid"
+            done
+            alive=$(pgrep -f "python3 -m pytest" >/dev/null && echo yes || echo no)
+            if [ -n "$holders" ]; then
+              {
+                echo "t=${i}0s pytest_alive=$alive PIPE_HELD_BY:$holders"
+                for p in $holders; do
+                  echo "    pid=$p ppid_state=$(awk '{print $4}' /proc/$p/stat 2>/dev/null) cmd=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-160)"
+                done
+              } >> "$REPORT"
+            elif [ "$alive" = no ]; then
+              echo "t=${i}0s pytest gone, no foreign pipe holder" >> "$REPORT"
+              break
+            fi
+            sleep 10
+          done
+          echo "watch-done" >> "$REPORT"
+          WATCH_EOF
+
+          # 观察者自己的输出重定向走文件——否则它自己就成了"攥管道的人"。
+          setsid nohup bash ./watch.sh "$REPORT" "$PIPE_TARGET" "$G" \
+            > /dev/null 2>&1 < /dev/null &
+
+          set +e
+          COVERAGE_FILE=.coverage.$G \\
+          timeout --foreground --signal=USR1 --kill-after=20s 600 \
+            ./.venv/bin/python3 -m pytest ${{ matrix.targets }} \
+              -m "not e2e and not integration and not perf" \
+              --cov=. --cov-report= --tb=short \
+              -p ci_process_guard -p faulthandler -o faulthandler_timeout=60 \
+              --durations=25 --timeout=60 > "pytest-$G.log" 2>&1 < /dev/null
+          RC=$?
+          echo "pytest rc=$RC at $(date +%H:%M:%S)" >> "$REPORT"
+          # 给观察者一点时间把最后一条写完。
+          sleep 15
+          echo "=== $REPORT ==="
+          cat "$REPORT"
+          exit $RC
+
+      - name: Upload — ${{ matrix.group }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: holder-${{ matrix.group }}
+          path: |
+            backend/holder-${{ matrix.group }}.txt
+            backend/pytest-${{ matrix.group }}.log
+          if-no-files-found: warn
+          retention-days: 14
+
   # ---------------------------------------------------------------------------
   # STAGE 1 — LINT (PR gate)
   # Static security scan (bandit) + provider-ID scans. If this stage fails,
