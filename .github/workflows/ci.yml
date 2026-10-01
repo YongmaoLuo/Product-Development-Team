@@ -564,6 +564,28 @@ jobs:
           - { lane: root, shard: root-6, index: "6", count: "7" }
           - lane: misc
             shard: misc
+          # --- wedge bisect, round 3: one file per shard (temporary) ---
+          #
+          # Round 2 grouped the 13 suspects 6-7 at a time and ALL FOUR
+          # groups wedged, while unit-01..11 (23-28 files each, same lane)
+          # passed in under 95s. Volume is therefore not the variable and
+          # a group result cannot name a file. One shard per file is the
+          # only remaining split.
+          #
+          # Delete these thirteen lines once the wedge is located.
+          - { lane: bisect, shard: s00, paths: "tests/unit/notifications/test_card_intermediate_phases.py" }
+          - { lane: bisect, shard: s01, paths: "tests/unit/notifications/test_unified_phase_section.py" }
+          - { lane: bisect, shard: s02, paths: "tests/unit/test_agent_desc_consistency.py" }
+          - { lane: bisect, shard: s03, paths: "tests/unit/test_agent_refine_timing.py" }
+          - { lane: bisect, shard: s04, paths: "tests/unit/test_binary_freshness.py" }
+          - { lane: bisect, shard: s05, paths: "tests/unit/test_coding_tool.py" }
+          - { lane: bisect, shard: s06, paths: "tests/test_base_yaml_no_order.py" }
+          - { lane: bisect, shard: s07, paths: "tests/test_coding_tool.py" }
+          - { lane: bisect, shard: s08, paths: "tests/test_e2e_mock_plan_full_workflow.py" }
+          - { lane: bisect, shard: s09, paths: "tests/test_fixed_timeout_contract.py" }
+          - { lane: bisect, shard: s10, paths: "tests/test_integration_state_machine_migration.py" }
+          - { lane: bisect, shard: s11, paths: "tests/test_no_legacy_read_path_in_server.py" }
+          - { lane: bisect, shard: s12, paths: "tests/test_plan_state_persistence.py" }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -675,13 +697,24 @@ jobs:
           # collected file set rather than by a directory. Directories do
           # not split usefully here: 249 of the 283 files under
           # tests/unit sit at its top level.
+          BISECT=0
           case "${{ matrix.lane }}" in
             unit) LANE_PATHS="tests/unit" ;;
             root) LANE_PATHS="tests/ --ignore=tests/unit --ignore=tests/contract --ignore=tests/concurrency --ignore=tests/performance --ignore=tests/security --ignore=tests/meta_tests" ;;
             misc) LANE_PATHS="tests/contract tests/security tests/meta_tests tests/concurrency tests/performance" ;;
+            bisect)
+              BISECT=1
+              TARGETS="${{ matrix.paths }}"
+              if [ -z "$TARGETS" ]; then
+                echo "::error::bisect shard ${{ matrix.shard }} has no paths"
+                exit 2
+              fi
+              FILE_COUNT=$(echo "$TARGETS" | wc -w | tr -d ' ')
+              echo "bisect shard ${{ matrix.shard }}: explicit list of ${FILE_COUNT} file(s)"
+              ;;
             *) echo "::error::unknown lane '${{ matrix.lane }}'"; exit 2 ;;
           esac
-          if [ -n "${{ matrix.index }}" ]; then
+          if [ "$BISECT" -eq 0 ] && [ -n "${{ matrix.index }}" ]; then
             # Round-robin over the collected files. Every file lands in
             # exactly one shard (``NR % count == index`` partitions the
             # list), so the shards' union is the lane's whole file set and
@@ -719,7 +752,7 @@ jobs:
               echo "::error::shard ${{ matrix.shard }} resolved to zero files; the slice or the lane's path set is wrong"
               exit 2
             fi
-          else
+          elif [ "$BISECT" -eq 0 ]; then
             TARGETS="$LANE_PATHS"
           fi
           # NO ``ulimit`` guardrails here (2026-09-23, reverted).
@@ -769,6 +802,8 @@ jobs:
             --cov-report= \
             --tb=short \
             -p ci_process_guard \
+            -p faulthandler \
+            -o faulthandler_timeout=60 \
             --durations=25 \
             --timeout=60 > pytest-${{ matrix.shard }}.log 2>&1 < /dev/null &
           PYTEST_PID=$!
