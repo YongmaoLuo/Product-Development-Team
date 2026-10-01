@@ -531,23 +531,25 @@ jobs:
 
 
   # ===========================================================================
-  # KILLPG(1) — what does the call return, when a hung job cannot say?
+  # KILLPG(1) VIA COMMIT STATUS — the one channel a dead step cannot block
   # ===========================================================================
   #
-  # The bisect put it beyond doubt: `id-only`, `mock-pid` and `getpgid-once`
-  # pass; `killpg-once` and `killpg-1000` are cancelled at the job ceiling.
-  # One `os.killpg(1, signal.SIGKILL)` is enough. The census says the caller is
-  # uid 1001 and that group 1 holds only root's init, so the call *ought* to
-  # come back EPERM — but a refused syscall cannot hang a step.
+  # Everything so far has failed for the same reason: the answer lives in the
+  # step's log, and the step is what dies. A double-forked probe plus a
+  # watchdog still produced nothing — the watchdog never printed its first
+  # line, so the step was gone within five seconds of the call.
   #
-  # The wedged job cannot report what happened, so this asks from outside the
-  # process that makes the call. A detached probe writes its result to a file
-  # and a watchdog re-posts that file to the step log every few seconds, so
-  # the answer lands even if the step itself is the thing that dies. The
-  # probe is double-forked into its own session: nothing it does can reach
-  # the step's process group, which is the whole point.
-  wedge-killpg-report:
-    name: what does killpg(1) return
+  # So stop asking the step. The probe posts its own findings to the commit
+  # status API, which is read over plain HTTPS and has nothing to do with the
+  # runner's logging or process supervision. If killing group 1 takes down
+  # the VM's init — and the symptom says it does — the network is still up
+  # and the POST still lands, even though the step that made the call can
+  # never report anything again.
+  #
+  # Uses the automatic GITHUB_TOKEN, which is per-run and never printed.
+  # This is a throwaway diagnostic branch; it does not go near main.
+  wedge-killpg-status:
+    name: killpg(1) verdict via commit status
     runs-on: ubuntu-latest
     timeout-minutes: 6
     steps:
@@ -556,59 +558,88 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Probe from a detached session
+      - name: Probe and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          STATE_URL: ${{ github.server_url }}/${{ github.repository }}/statuses/${{ github.sha }}
         run: |
           set +e
           cat > /tmp/probe.py <<'PROBE'
-          import errno, os, signal, socket, time
+          import errno, json, os, signal, time, urllib.request
           from datetime import datetime, timezone
 
-          def stamp(msg):
-              print(f"{datetime.now(timezone.utc).isoformat()} {msg}", flush=True)
+          TOKEN = os.environ["GH_TOKEN"]
+          URL = os.environ["STATE_URL"]
+          REPO = os.environ["REPO"]
+          lines = []
 
-          def bail(msg):
-              stamp("FATAL " + msg)
-              os._exit(9)
+          def note(msg):
+              line = f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} {msg}"
+              lines.append(line)
+              print(line, flush=True)
+
+          def publish(state, desc):
+              body = json.dumps({
+                  "state": state, "context": "killpg1-probe",
+                  "description": desc[:140],
+              }).encode()
+              req = urllib.request.Request(
+                  URL, data=body, method="POST",
+                  headers={
+                      "Authorization": f"Bearer {TOKEN}",
+                      "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json",
+                  })
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      note(f"published {state} -> HTTP {r.status}")
+              except Exception as e:
+                  note(f"publish failed: {type(e).__name__}: {e}")
 
           try:
-              stamp(f"probe pid={os.getpid()} pgid={os.getpgrp()} uid={os.getuid()}")
               from unittest.mock import MagicMock
+              note(f"uid={os.getuid()} our_pgid={os.getpgrp()} pid={os.getpid()}")
               m = MagicMock()
               g = os.getpgid(m.pid)
-              stamp(f"getpgid(mock.pid)={g}")
-              stamp("about to call killpg(1, SIGKILL) — one call")
+              note(f"getpgid(mock.pid)={g}")
+              try:
+                  with open("/proc/1/stat") as fh:
+                      before = fh.read()
+              except OSError:
+                  before = "?"
+              note("PID 1 before: " + before[:80])
+              publish("pending", "probe reached the killpg call")
+
               t0 = time.time()
               try:
                   os.killpg(g, signal.SIGKILL)
-                  stamp(f"killpg RETURNED DELIVERED in {time.time()-t0:.3f}s")
+                  verdict = f"DELIVERED in {time.time()-t0:.3f}s"
               except OSError as e:
-                  stamp(f"killpg RETURNED errno={e.errno} "
-                        f"({errno.errorcode.get(e.errno)}) in {time.time()-t0:.3f}s")
-              stamp("still alive after the call; probe concludes")
+                  verdict = (f"REFUSED errno={e.errno} "
+                               f"({errno.errorcode.get(e.errno)}) "
+                               f"in {time.time()-t0:.3f}s")
+              note("killpg -> " + verdict)
+              note(f"probe STILL ALIVE after the call, pid={os.getpid()}")
+              try:
+                  with open("/proc/1/stat") as fh:
+                      after = fh.read()
+              except OSError as e:
+                  after = f"unreadable: {e}"
+              note("PID 1 after : " + after[:80])
+              note("PID 1 unchanged = " + str(before == after))
+              publish("success", verdict + " | probe alive | pid1 same=" + str(before == after))
           except BaseException as e:
-              bail(f"{type(e).__name__}: {e}")
+              note(f"FATAL {type(e).__name__}: {e}")
+              publish("failure", f"probe crashed: {type(e).__name__}: {e}"[:140])
           PROBE
-          echo "probe written"
-
-          # double-fork into its own session so the probe shares nothing with
-          # the step: not its process group, not its session, not its pipes.
+          echo "probe written; running it in the foreground of a detached session"
           setsid nohup setsid python3 -u /tmp/probe.py > /tmp/probe.out 2>&1 < /dev/null &
-          disown || true
-
-          # The watchdog: re-print whatever the probe has written, repeatedly.
-          # If the step survives even a little, the answer is in the log.
-          for i in $(seq 1 40); do
-            echo "--- t=$((i*5))s ---"
-            cat /tmp/probe.out 2>/dev/null || echo "(probe produced nothing yet)"
-            if grep -q "probe concludes" /tmp/probe.out 2>/dev/null; then
-              echo "=== probe finished cleanly ==="
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "=== watchdog gave up; last state: ==="
-          cat /tmp/probe.out 2>/dev/null
-          echo "=== step survived to the end ==="
+          sleep 45
+          echo "--- whatever the probe managed to write ---"
+          cat /tmp/probe.out 2>/dev/null || echo "(nothing)"
+          echo "--- step survived ---"
 
   # ---------------------------------------------------------------------------
   # STAGE 1 — LINT (PR gate)
