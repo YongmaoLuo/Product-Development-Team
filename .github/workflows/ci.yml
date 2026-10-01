@@ -723,152 +723,87 @@ jobs:
             TARGETS="$LANE_PATHS"
           fi
           # NO ``ulimit`` guardrails here (2026-09-23, reverted).
+          # --- one foreground `timeout`, no hand-rolled process plumbing --
           #
-          # An earlier revision of this step set ``ulimit -t 900`` /
-          # ``-u 512`` / ``-v 8388608`` to turn "starve the runner,
-          # upload nothing" into a named failure. It did not work, and
-          # it introduced hazards of its own:
+          # This used to be `setsid pytest &` + `tail -f --pid` + a
+          # background watchdog + `wait`, and every one of those four
+          # pieces is a way for the STEP to fail to end. It did: the
+          # shard sat `in_progress` until the job-level 40-minute ceiling
+          # cancelled it, and a cancelled job uploads nothing — the log,
+          # the stack dump, the coverage data, all gone. Nine runs of
+          # `unit-00` and `root-4` ended that way, which is why the wedge
+          # took ten hours to locate: the failure destroyed the only
+          # evidence that could have named it.
           #
-          #   * ``-u`` is RLIMIT_NPROC, which is counted **per user**,
-          #     not per process tree. The runner user already owns every
-          #     process on the box, so this caps the runner's own ability
-          #     to fork rather than the test's. Reproduced locally: after
-          #     ``ulimit -u 512`` the shell could not fork at all
-          #     ("Resource temporarily unavailable") and the step died
-          #     before pytest started.
-          #   * ``-v`` sets RLIMIT_AS, which is not the same thing as
-          #     memory and is invalid on some platforms (macOS rejects
-          #     ``ulimit -v`` outright).
+          # The wedge itself is a pipe that never reaches EOF, and this
+          # shape is chosen so there is no such pipe to hold.
           #
-          # The wedge they were meant to catch is a *process-tree* leak,
-          # and the fix for that belongs in the code that leaks —
-          # ``backend/bounded_subprocess.py`` now kills the process group
-          # on every timeout. Guardrails that guess at the symptom from
-          # the outside only convert one opaque failure into another.
+          # `timeout` is an ordinary foreground child of this shell, so
+          # the shell always returns and the step always ends. Three
+          # properties follow, and they are the whole fix:
           #
-          # NOT a pipe into ``tee``. ``tee`` returns on EOF, so a
-          # descendant that inherited the write end of that pipe and
-          # outlived pytest keeps ``tee`` alive forever — the step never
-          # completes, no post-step and no artifact ever runs, and GitHub
-          # reaps the job at ~45 minutes having recorded nothing. That is
-          # the exact shape of this shard's wedge, and it is why the
-          # wedge was undiagnosable: the failure destroyed its own
-          # evidence. Redirecting to a file removes the thing a survivor
-          # could hold.
+          #   * nothing downstream can block — there is no `wait`, no
+          #     `tail`, and no background subshell holding the step's
+          #     output pipe. pytest's stdout goes to a FILE, which
+          #     descendants inherit as a file, so a leaked child has
+          #     nothing to hold open.
+          #   * the step's own `timeout-minutes: 20` works again, because
+          #     the runner's process tree is once more the one it knows
+          #     how to time out. Our 900s budget fires well before it, so
+          #     it stays a backstop rather than the primary.
+          #   * the budget still produces a diagnosis. `--signal=USR1`
+          #     makes `timeout` signal pytest when the budget fires;
+          #     `ci_process_guard` has `faulthandler` registered on
+          #     SIGUSR1, so pytest walks every thread's C stack into
+          #     `$CI_STACK_DUMP_PATH` and survives to be killed 30s later
+          #     by `--kill-after`. `--foreground` is what makes the
+          #     signal reach pytest ALONE: without it `timeout` signals
+          #     the whole group, and a leaked descendant has no SIGUSR1
+          #     handler, so it dies on the spot — taking the EOF pytest
+          #     is blocked on with it, and the shard can finish before
+          #     the dump is written. The thing being photographed must
+          #     outlive the photograph.
           #
-          # ``setsid`` puts pytest in its own process group. That makes
-          # the step's timeout effective again (nothing downstream is
-          # blocked), and it lets ``ci_process_guard`` reap and *name*
-          # whatever outlives a test — the culprit rather than the
-          # symptom.
+          # The budget is below the step's `timeout-minutes` so ours wins,
+          # and below the job ceiling so the `if: always()` upload below
+          # still has room to run.
+          WATCHDOG_SECONDS=900
           set +e
           COVERAGE_FILE=.coverage.${{ matrix.shard }} \
-          setsid ./.venv/bin/python3 -m pytest $TARGETS \
-            -m "not e2e and not integration and not perf" \
-            --cov=. \
-            --cov-report= \
-            --tb=short \
-            -p ci_process_guard \
-            --durations=25 \
-            --timeout=60 > pytest-${{ matrix.shard }}.log 2>&1 < /dev/null &
-          PYTEST_PID=$!
-          tail -n +1 -f --pid=$PYTEST_PID pytest-${{ matrix.shard }}.log &
-          TAIL_PID=$!
+          timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
+            ./.venv/bin/python3 -m pytest $TARGETS \
+              -m "not e2e and not integration and not perf" \
+              --cov=. \
+              --cov-report= \
+              --tb=short \
+              -p ci_process_guard \
+              -p faulthandler \
+              -o faulthandler_timeout=60 \
+              --durations=25 \
+              --timeout=60 > pytest-${{ matrix.shard }}.log 2>&1 < /dev/null
+          RC=$?
 
-          # --- a deadline that actually fires (2026-09-29) ---------------
-          #
-          # The step declares ``timeout-minutes: 20``, and on run
-          # 36544551232 that ceiling did nothing: the pytest step sat
-          # ``in_progress`` for 44 minutes, the post-steps stayed
-          # ``pending``, and GitHub reaped the job at exactly 45m00s
-          # having uploaded no log and no artifact. Six consecutive runs
-          # of the ``unit`` shard have the same signature.
-          #
-          # Whatever enforces ``timeout-minutes`` is not reaching this
-          # process tree. pytest is started under ``setsid``, i.e. in a
-          # process group the runner did not create and evidently does
-          # not reap — so a ceiling defined in terms of that group is not
-          # a ceiling at all.
-          #
-          # A plain ``sleep`` + ``kill`` does not depend on any of that.
-          # It is an ordinary child of this shell, so it fires as long as
-          # the runner is alive at all — and the runner IS alive, because
-          # it is busy running the shard. Two properties make it work
-          # where the declared timeout did not:
-          #
-          #   * it signals the process GROUP (``-$PYTEST_PID``; ``setsid``
-          #     makes pytest a group leader, so its PGID equals its PID),
-          #     not just the leader, so nothing that inherited the group
-          #     is left holding the step open;
-          #   * it lets ``wait`` return, which is what lets this step END
-          #     — and a step that ends is a step whose ``if: always()``
-          #     upload below actually runs. That upload is the whole point:
-          #     the shard's own log is the only thing that can name the
-          #     test it died on.
-          #
-          # The budget is deliberately below the step's ``timeout-minutes``
-          # so ours wins, and below the 40-minute job ceiling so the upload
-          # still has room. Reaching it is a FAILURE (exit code 143 from
-          # the SIGTERM), not a quiet truncation — a shard that cannot
-          # finish inside its budget is a fact the gate must state.
-          WATCHDOG_SECONDS=900
-          DEADLINE_FLAG=pytest-deadline-${{ matrix.shard }}.flag
-          rm -f "$DEADLINE_FLAG"
-          (
-            sleep "$WATCHDOG_SECONDS"
-            # Marker for the main shell: only the budget firing sets this, so
-            # the failure message below cannot misattribute a death that came
-            # from somewhere else (an OOM kill is also exit 137).
-            : > "$DEADLINE_FLAG"
+          # 124 is `timeout`'s "the budget fired" code. Say so plainly
+          # rather than letting a bare number be read as a crash: an OOM
+          # kill is 137 and a test failure is 1, so the three are
+          # distinguishable and the log should not leave it to guesswork.
+          if [ "$RC" -eq 124 ]; then
             {
               echo
-              echo "===== shard deadline reached after ${WATCHDOG_SECONDS}s ====="
-              echo "pytest was still running. Everything above is its output up"
-              echo "to the kill; the last test that STARTED is the place to"
-              echo "look, and '--durations' in this log has the slow ones."
+              echo "===== shard budget of ${WATCHDOG_SECONDS}s reached; killed ====="
+              echo "The output above ends at the last test that STARTED."
+              echo "The stack dump (if any) names the frame it was stuck in."
             } >> pytest-${{ matrix.shard }}.log
-            # Ask for a stack dump BEFORE the kill, and give it time to land.
-            # A shard that overruns its budget is usually parked in a
-            # blocking call, which ``pytest-timeout``'s thread method cannot
-            # interrupt — so its own traceback never appears and the log can
-            # only say which test STARTED. ``ci_process_guard`` arms
-            # ``faulthandler`` on SIGUSR1, which walks the C stacks from the
-            # handler, so the dump is the answer to "where is it stuck".
-            #
-            # Leader only — note the missing ``-``, unlike the two kills
-            # below. A group-wide SIGUSR1 would also reach whatever the shard
-            # is blocked ON, and an unhandled SIGUSR1 terminates its target:
-            # that would unblock the very test we are trying to photograph.
-            kill -USR1 "$PYTEST_PID" 2>/dev/null
-            sleep 10
-            kill -TERM -"$PYTEST_PID" 2>/dev/null
-            sleep 20
-            kill -KILL -"$PYTEST_PID" 2>/dev/null
-          # The subshell's own stdout/stderr go to /dev/null, and that is not
-          # tidiness — it closes a wedge this very job has hit before.
-          #
-          # Killing the subshell does NOT kill its `sleep`: the child is
-          # reparented and keeps running (up to the full budget) after the
-          # step's shell has exited. If it still held the write end of the
-          # step's output pipe, the runner would wait for an EOF that does
-          # not come for another 15 minutes — the same mechanism as the `tee`
-          # wedge documented on this step. A background process must not hold
-          # anything the runner is reading. The log append inside the
-          # subshell is unaffected (it writes to a file), and the failure
-          # annotation is emitted by the main shell below instead.
-          ) >/dev/null 2>&1 &
-          WATCHDOG_PID=$!
-
-          wait $PYTEST_PID
-          RC=$?
-          kill "$WATCHDOG_PID" "$TAIL_PID" 2>/dev/null || true
-          # Say plainly that the budget fired, rather than letting a bare
-          # exit 143 be read as a crash. The flag file is the only thing
-          # that sets this — an OOM kill is exit 137 and would otherwise be
-          # blamed on the deadline.
-          if [ -f "$DEADLINE_FLAG" ]; then
-            echo "::error::the ${{ matrix.shard }} shard was killed at its ${WATCHDOG_SECONDS}s budget (rc=$RC). The uploaded log ends at the last test that started; the stack dump names the frame it was stuck in."
+            echo "::error::the ${{ matrix.shard }} shard was killed at its ${WATCHDOG_SECONDS}s budget. pytest-${{ matrix.shard }}.log ends at the last test that started; the stack dump names the frame."
           fi
+
+          # Put the tail in the step log as well as the artifact. On a
+          # green run the artifact is never opened; on a red one, the last
+          # 40 lines are usually the whole answer and they should not
+          # require a download to see.
+          echo "----- tail of pytest-${{ matrix.shard }}.log -----"
+          tail -n 40 pytest-${{ matrix.shard }}.log
+          echo "----- end -----"
           exit $RC
 
       # The diagnostic half of the step timeout above: this runs even when
@@ -1078,95 +1013,39 @@ jobs:
           # them per-test breadcrumbs) and exposes none at all while the
           # job is still in progress (an in-flight wedge read back 0),
           # which is precisely when the breadcrumbs would matter.
-          #
-          # The wedge also gets much harder to hit as a side effect of
-          # the no-pipe shape below; `ci_process_guard` is what replaces
-          # the marker, and unlike the marker it works by *ending* the
-          # run rather than by trying to narrate it from inside.
-          #
-          # ``--timeout`` is a matrix key so the two candidate causes can
-          # be told apart in one dispatch: if a shard completes with a
-          # larger timeout, the wall clock is the variable; if it wedges
-          # at any timeout, it is not.
-          #
-          # Same no-pipe / ``setsid`` shape as the unit shards above, and
-          # for the same reason: a leaked descendant holding ``tee``'s
-          # pipe is what turns a finished pytest run into a 45-minute
-          # wedge. ``ci_process_guard`` reports the leaking test by name
-          # and reaps the survivors.
-          set +e
-          setsid ./.venv/bin/python3 -m pytest $TARGETS \
-            -m "not e2e and not integration and not perf" \
-            --cov=. \
-            --cov-report= \
-            --tb=short \
-            -p ci_process_guard \
-            --durations=25 \
-            --timeout=${{ matrix.timeout || 60 }} \
-            > pytest-staircase-${{ matrix.shard }}.log 2>&1 < /dev/null &
-          PYTEST_PID=$!
-          tail -n +1 -f --pid=$PYTEST_PID \
-            pytest-staircase-${{ matrix.shard }}.log &
-          TAIL_PID=$!
-
-          # Same self-imposed deadline as the unit shards above, and for the
-          # same reason: this job exists to BISECT the wedge, so a shard that
-          # dies without a log destroys the very datum the dispatch was spent
-          # to buy. 25 minutes against the step's 30 — ours must win.
+          # Same single foreground `timeout` as the unit shards, for the
+          # same reason: the wedge is a pipe that never reaches EOF, and
+          # the hand-rolled `setsid` + `tail -f --pid` + `wait` plumbing
+          # had four separate ways to fail to end the step. `ci_process_guard`
+          # still reports the leaking test by name and reaps the survivors.
           WATCHDOG_SECONDS=1500
-          DEADLINE_FLAG=pytest-deadline-${{ matrix.shard }}.flag
-          rm -f "$DEADLINE_FLAG"
-          (
-            sleep "$WATCHDOG_SECONDS"
-            # Marker for the main shell; see the unit shard's copy.
-            : > "$DEADLINE_FLAG"
+          set +e
+          COVERAGE_FILE=.coverage.staircase-${{ matrix.shard }} \
+          timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
+            ./.venv/bin/python3 -m pytest $TARGETS \
+              -m "not e2e and not integration and not perf" \
+              --cov=. \
+              --cov-report= \
+              --tb=short \
+              -p ci_process_guard \
+              -p faulthandler \
+              -o faulthandler_timeout=60 \
+              --durations=25 \
+              --timeout=60 > pytest-${{ matrix.shard }}.log 2>&1 < /dev/null
+          RC=$?
+
+          if [ "$RC" -eq 124 ]; then
             {
               echo
-              echo "===== shard deadline reached after ${WATCHDOG_SECONDS}s ====="
-              echo "the last test that STARTED is the place to look"
-            } >> pytest-staircase-${{ matrix.shard }}.log
-            # Ask for a stack dump BEFORE the kill, and give it time to land.
-            # A shard that overruns its budget is usually parked in a
-            # blocking call, which ``pytest-timeout``'s thread method cannot
-            # interrupt — so its own traceback never appears and the log can
-            # only say which test STARTED. ``ci_process_guard`` arms
-            # ``faulthandler`` on SIGUSR1, which walks the C stacks from the
-            # handler, so the dump is the answer to "where is it stuck".
-            #
-            # Leader only — note the missing ``-``, unlike the two kills
-            # below. A group-wide SIGUSR1 would also reach whatever the shard
-            # is blocked ON, and an unhandled SIGUSR1 terminates its target:
-            # that would unblock the very test we are trying to photograph.
-            kill -USR1 "$PYTEST_PID" 2>/dev/null
-            sleep 10
-            kill -TERM -"$PYTEST_PID" 2>/dev/null
-            sleep 20
-            kill -KILL -"$PYTEST_PID" 2>/dev/null
-          # The subshell's own stdout/stderr go to /dev/null, and that is not
-          # tidiness — it closes a wedge this very job has hit before.
-          #
-          # Killing the subshell does NOT kill its `sleep`: the child is
-          # reparented and keeps running (up to the full budget) after the
-          # step's shell has exited. If it still held the write end of the
-          # step's output pipe, the runner would wait for an EOF that does
-          # not come for another 15 minutes — the same mechanism as the `tee`
-          # wedge documented on this step. A background process must not hold
-          # anything the runner is reading. The log append inside the
-          # subshell is unaffected (it writes to a file), and the failure
-          # annotation is emitted by the main shell below instead.
-          ) >/dev/null 2>&1 &
-          WATCHDOG_PID=$!
-
-          wait $PYTEST_PID
-          RC=$?
-          kill "$WATCHDOG_PID" "$TAIL_PID" 2>/dev/null || true
-          # Say plainly that the budget fired, rather than letting a bare
-          # exit 143 be read as a crash. The flag file is the only thing
-          # that sets this — an OOM kill is exit 137 and would otherwise be
-          # blamed on the deadline.
-          if [ -f "$DEADLINE_FLAG" ]; then
+              echo "===== shard budget of ${WATCHDOG_SECONDS}s reached; killed ====="
+              echo "The output above ends at the last test that STARTED."
+            } >> pytest-${{ matrix.shard }}.log
             echo "::error::the ${{ matrix.shard }} shard was killed at its ${WATCHDOG_SECONDS}s budget (rc=$RC). The uploaded log ends at the last test that started; the stack dump names the frame it was stuck in."
           fi
+
+          echo "----- tail of pytest-${{ matrix.shard }}.log -----"
+          tail -n 40 pytest-${{ matrix.shard }}.log
+          echo "----- end -----"
           exit $RC
 
       - name: Upload pytest output — ${{ matrix.shard }}
