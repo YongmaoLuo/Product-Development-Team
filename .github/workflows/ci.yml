@@ -213,6 +213,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The half of #14 that was thrown away, restored ON ITS OWN.
+      #
+      # The old shape is not the variable — the payload is. #14 changed four
+      # things in one commit: the step's shape, `utils/process.py`, the
+      # coverage upload, and a `timeout=` on this file's one real
+      # subprocess. The "it no longer reproduces" result came from running
+      # the old shape against the ALREADY-FIXED process.py, so it proved
+      # nothing about the historical combination.
+      #
+      # Restore only `process.py` and leave the test file alone. The
+      # `timeout=60` on the real `subprocess.run` stays, so the one other
+      # way this file can hang is nailed shut: if it wedges again, the cause
+      # is the kill.
+      - name: Restore the discarded half of #14 (process.py only)
+        run: git show 7000128:backend/utils/process.py > backend/utils/process.py
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -352,6 +368,49 @@ jobs:
             backend/oldshape-stack-dump-${{ matrix.group }}.txt
           if-no-files-found: warn
           retention-days: 14
+
+
+  # ===========================================================================
+  # PGID PROBE — is the runner itself in process group 1?
+  # ===========================================================================
+  #
+  # The competing explanation for the wedge: three provider-fallback tests
+  # call `kill_process_group` on a `MagicMock`, and `MagicMock.__index__()`
+  # returns 1, so `os.getpgid` resolves to the group of PID 1 and the helper
+  # sends that group a SIGKILL. If the runner's own agent lives in group 1,
+  # a test-suite assertion can take down the agent — which would explain
+  # everything the pipe theory cannot: the step's own `timeout-minutes`
+  # (enforced BY that agent) never firing, while the server-side job timeout
+  # still reaps the job.
+  #
+  # `setsid` is why pytest survives: it gets its own group, so it is not in
+  # group 1. shell, tail and watchdog are not setsid'd, so they are.
+  #
+  # Thirty seconds, read-only, no checkout.
+  pgid-probe:
+    name: Who lives in pgid 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Process group census
+        run: |
+          echo "step shell: pid=$$ pgid=$(ps -o pgid= -p $$ | tr -d ' ') sid=$(ps -o sid= -p $$ | tr -d ' ')"
+          echo
+          echo "--- PID 1 ---"
+          ps -o pid,ppid,pgid,sid,user,args -p 1
+          echo
+          echo "--- runner agent processes ---"
+          ps -eo pid,ppid,pgid,sid,user,args | grep -iE 'Runner\.|actions-runner|externals' | grep -v grep || echo "(none matched)"
+          echo
+          echo "--- every member of pgid 1 ---"
+          ps -eo pid,ppid,pgid,sid,user,args | awk 'NR==1 || $3==1'
+          echo
+          echo "--- the step shell's own ancestry, with pgid ---"
+          p=$$; while [ -n "$p" ] && [ "$p" != 0 ]; do
+            ps -o pid=,ppid=,pgid=,sid=,args= -p "$p" 2>/dev/null | cut -c1-140
+            p=$(awk '{print $4}' /proc/$p/stat 2>/dev/null)
+          done
+
 
   # ---------------------------------------------------------------------------
   # STAGE 1 — LINT (PR gate)
