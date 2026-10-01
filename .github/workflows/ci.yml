@@ -841,6 +841,17 @@ jobs:
         with:
           name: coverage-data-${{ matrix.shard }}
           path: backend/.coverage.${{ matrix.shard }}
+          # `COVERAGE_FILE` is conventionally dot-prefixed, and
+          # upload-artifact v4.4+ skips hidden files unless told otherwise.
+          # The file is on disk and 237 KB; the glob simply never matched
+          # it, so every shard logged "No files were found" and the
+          # coverage gate — which had never once run to completion, because
+          # two shards always wedged first — reported "No data to combine"
+          # with nothing pointing at a cause. The sibling `pytest-*.log`
+          # upload in the step above is not hidden, which is exactly why
+          # that one always worked and made this look like coverage
+          # itself was broken.
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
 
@@ -1128,6 +1139,10 @@ jobs:
           path: |
             backend/.coverage
             backend/coverage.xml
+          # upload-artifact v4.4+ skips dot-prefixed path components
+          # unless told otherwise, and reports 'No files were found' —
+          # which reads as "the run produced nothing".
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
 
@@ -1262,6 +1277,10 @@ jobs:
           path: |
             backend/logs/
             backend/.pytest_cache/
+          # upload-artifact v4.4+ skips dot-prefixed path components
+          # unless told otherwise, and reports 'No files were found' —
+          # which reads as "the run produced nothing".
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 30
 
@@ -1322,6 +1341,10 @@ jobs:
             backend/slow-junit.xml
             backend/logs/
             backend/.pytest_cache/
+          # upload-artifact v4.4+ skips dot-prefixed path components
+          # unless told otherwise, and reports 'No files were found' —
+          # which reads as "the run produced nothing".
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 30
 

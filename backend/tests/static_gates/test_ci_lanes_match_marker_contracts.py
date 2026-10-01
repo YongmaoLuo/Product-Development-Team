@@ -436,6 +436,72 @@ def test_the_watchdog_does_not_hold_the_step_open(job_name: str) -> None:
         )
 
 
+def test_an_upload_of_a_hidden_file_opts_in_to_hidden_files() -> None:
+    """A dot-prefixed artifact path is silently skipped by upload-artifact.
+
+    ``actions/upload-artifact`` v4.4 added ``include-hidden-files`` and
+    defaulted it to **false**: a path segment beginning with ``.`` never
+    matches, and the step reports ``No files were found`` — which reads as
+    "the run produced nothing" rather than "the glob excluded it".
+
+    That is not hypothetical here. ``COVERAGE_FILE`` is conventionally
+    dot-prefixed, so ``backend/.coverage.<shard>`` was excluded from every
+    shard's coverage upload while the file sat on disk at 237 KB. No shard
+    ever produced a ``coverage-data-*`` artifact, and the coverage gate —
+    which had never once run to completion, because two shards always
+    wedged the lane first — could only report ``No data to combine``,
+    naming neither a shard nor a cause. The sibling ``pytest-*.log`` upload
+    one step earlier is not hidden, which is precisely why it always
+    worked and made this look like coverage itself was broken.
+
+    Pinned over every upload step rather than the one that was broken: the
+    trap is a property of the file name, so the next step that uploads a
+    dotfile hits it too.
+    """
+    workflow = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+
+    offenders: list[str] = []
+    checked = 0
+    for job_name, job in workflow["jobs"].items():
+        for step in job.get("steps", []):
+            if "upload-artifact" not in str(step.get("uses", "")):
+                continue
+            with_ = step.get("with") or {}
+            path = str(with_.get("path", ""))
+            # Split on whitespace (several paths may be listed) and then
+            # on `/`, because the hidden segment is a *component*:
+            # `backend/.coverage.unit-00` hides behind a directory. Only
+            # literal components count — a `*` or `**` component matches
+            # hidden entries only if the pattern says so.
+            segments = [
+                seg
+                for token in path.replace("\n", " ").split()
+                for seg in token.split("/")
+                if seg.startswith(".") and seg not in (".", "..")
+            ]
+            if not segments:
+                continue
+            checked += 1
+            if with_.get("include-hidden-files") is not True:
+                offenders.append(
+                    f"{job_name} / {step.get('name')!r}: path {path!r} names "
+                    f"hidden segment(s) {segments} but does not set "
+                    f"`include-hidden-files: true`"
+                )
+
+    assert checked, (
+        "no upload step in ci.yml names a hidden file, so this gate would "
+        "pass vacuously — the coverage upload it was written for is the "
+        "one that has to keep existing"
+    )
+    assert not offenders, (
+        "these uploads name a dot-prefixed path without opting into hidden "
+        "files, so upload-artifact will skip them and report 'No files were "
+        "found':\n  " + "\n  ".join(offenders)
+    )
+
+
+
 # ---------------------------------------------------------------------------
 # The I/O-heavy lanes must work around the known runner bug
 # ---------------------------------------------------------------------------
