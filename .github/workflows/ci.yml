@@ -174,6 +174,128 @@ permissions:
   contents: read
 
 jobs:
+  # ===========================================================================
+  # WEDGE BISECT — which TEST in test_coding_tool.py triggers the stall?
+  # ===========================================================================
+  #
+  # The correlation is exact across 25 job instances: every job whose file
+  # set contains `tests/unit/test_coding_tool.py` stalls, and every job
+  # whose file set does not passes. The bisect lane put that ONE FILE in a
+  # shard by itself (s05) and it stalled — 52 tests, 0.44s locally.
+  #
+  # So the unit of the next cut is the TEST, not the file. Fifty-two is
+  # small enough to halve six times, and a matrix does all eight jobs in
+  # parallel, so a round costs minutes rather than the 45 a wedged shard
+  # costs.
+  #
+  # **The method is elimination, and that is deliberate.** A group that
+  # stalls takes its own log with it — the job's own conclusion is all we
+  # ever get, and `cancelled` is indistinguishable from `failure` at a
+  # glance. But the OTHER seven groups finishing green is the signal: the
+  # one that did not finish is the suspect. So the round does not need the
+  # culprit's evidence to be useful.
+  #
+  # Two controls make a round readable rather than merely suggestive:
+  #
+  #   g8-control-known-good     a file that has passed in every run so far.
+  #                             If IT stalls, the runner was unhealthy this
+  #                             round and every other result is void.
+  #   g9-whole-file-control     the whole file, which is the known wedge. If
+  #                             it does NOT stall, the trigger needs the
+  #                             accumulated state of a full run rather than
+  #                             any single test, and per-test bisection is
+  #                             the wrong instrument — which is itself worth
+  #                             knowing before spending five rounds on it.
+  #
+  # Each job uses the #14 shape (a plain foreground `timeout`), so a
+  # healthy group always ends and always uploads.
+  #
+  # Not a gate. Read once, then delete.
+  wedge-bisect:
+    name: Bisect ${{ matrix.group }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { group: g0, targets: "tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_interactive_default_no_model_override tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_interactive_default_inherits_parent_env tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_interactive_with_explicit_model tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_interactive_with_explicit_api_key tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_interactive_with_both_model_and_api_key tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_interactive_reads_assistant_text_blocks tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_interactive_reads_result_event" }
+          - { group: g1, targets: "tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_interactive_session_id_captured_from_init tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_interactive_api_error_raises tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_interactive_writes_plain_prompt tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_interactive_graceful_shutdown_called tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_query_uses_interactive tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_query_json_extracts_json_from_response tests/unit/test_coding_tool.py::TestClaudeCodingToolSubprocessInvocation::test_query_json_pure_json_response" }
+          - { group: g2, targets: "tests/unit/test_coding_tool.py::TestClaudeCodingToolEnvLoading::test_load_api_key_from_env_variable tests/unit/test_coding_tool.py::TestClaudeCodingToolEnvLoading::test_load_api_key_from_dotenv tests/unit/test_coding_tool.py::TestClaudeCodingToolEnvLoading::test_load_api_key_prefers_env_over_dotenv tests/unit/test_coding_tool.py::TestClaudeCodingToolEnvLoading::test_load_api_key_returns_none_when_missing tests/unit/test_coding_tool.py::TestClaudeCodingToolInit::test_init_defaults_none tests/unit/test_coding_tool.py::TestClaudeCodingToolInit::test_init_with_explicit_values tests/unit/test_coding_tool.py::TestClaudeCodingToolInit::test_init_does_not_auto_set_default_model" }
+          - { group: g3, targets: "tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_load_provider_from_db tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_db_fallback_when_missing tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_load_provider_from_db_returns_empty_when_db_missing tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_load_provider_from_db_returns_empty_for_unknown_provider tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_load_provider_from_db_returns_empty_on_invalid_json tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_provider_name_is_used_verbatim tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_named_lookup_never_answers_from_the_ambient_env" }
+          - { group: g4, targets: "tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_unnamed_lookup_reads_the_ambient_env tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_unnamed_lookup_rejects_the_proxy_managed_sentinel tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_check_provider_availability_unknown_provider_returns_false tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_check_provider_availability_reads_the_named_row tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_check_provider_availability_requires_both_url_and_key tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_interactive_uses_the_routed_provider tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_interactive_inherits_parent_when_no_provider_available" }
+          - { group: g5, targets: "tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_interactive_routed_provider_wins_over_explicit_api_key tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_interactive_explicit_api_key_used_when_no_provider_routed tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_interactive_logs_provider_selection tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_query_fallback_to_parent_when_provider_api_error tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_query_json_fallback_to_parent_when_provider_api_error tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_query_no_fallback_when_nothing_was_selected tests/unit/test_coding_tool.py::TestClaudeCodingToolProviderSelection::test_query_no_infinite_fallback_loop" }
+          - { group: g6, targets: "tests/unit/test_coding_tool.py::test_interactive_dispatch_has_no_hardcoded_provider_branches tests/unit/test_coding_tool.py::test_no_bare_vendor_b_in_coding_tool tests/unit/test_coding_tool.py::test_query_returns_str_from_interactive_tuple tests/unit/test_coding_tool.py::test_query_interactive_session_id_is_none tests/unit/test_coding_tool.py::test_query_interactive_no_print_flag" }
+          - { group: g7, targets: "tests/unit/test_coding_tool.py::test_run_claude_method_removed tests/unit/test_coding_tool.py::test_query_with_retry_method_removed tests/unit/test_coding_tool.py::test_query_timeout_fallback_uses_new_session tests/unit/test_coding_tool.py::test_query_api_error_fallback_uses_new_session tests/unit/test_coding_tool.py::test_query_internal_m1_api_error_falls_back_instead_of_name_error" }
+          - { group: g8-control-known-good, targets: "tests/unit/test_agent_refine_timing.py" }
+          - { group: g9-whole-file-control, targets: "tests/unit/test_coding_tool.py" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install -q --upgrade pip
+          backend/.venv/bin/python3 -m pip install -q -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install -q pytest pytest-cov pytest-timeout coverage
+
+      - name: Mitigate runner-images#13770 (read_ahead_kb)
+        run: |
+          sudo bash -c '
+            shopt -s nullglob
+            for dev in /sys/block/sd* /sys/block/nvme*n*; do
+              if [ -e "$dev/queue/read_ahead_kb" ]; then
+                echo 128 > "$dev/queue/read_ahead_kb"
+              fi
+            done
+            exit 0
+          '
+
+      - name: Run group — ${{ matrix.group }}
+        working-directory: backend
+        timeout-minutes: 10
+        env:
+          PYTHONUNBUFFERED: "1"
+          CI_STACK_DUMP_PATH: bisect-stack-dump-${{ matrix.group }}.txt
+        run: |
+          G="${{ matrix.group }}"
+          LOG="bisect-$G.log"
+          echo "group=$G"
+          echo "targets=${{ matrix.targets }}" | head -c 2000
+          set +e
+          timeout --foreground --signal=USR1 --kill-after=20s 240 \
+            ./.venv/bin/python3 -m pytest ${{ matrix.targets }} \
+              -m "not e2e and not integration and not perf" \
+              --cov=. --cov-report= --tb=short \
+              -p ci_process_guard -p faulthandler -o faulthandler_timeout=60 \
+              --durations=25 --timeout=60 > "$LOG" 2>&1 < /dev/null
+          RC=$?
+          echo "=== group $G rc=$RC ==="
+          # Whatever survived the run, named. A healthy group reporting its
+          # own leftovers is half of what tells a stall from a slow test.
+          echo "--- processes still in this group after the run ---"
+          ps -eo pid,ppid,pgid,stat,args | grep -E "[p]ytest|[s]cripts/scanners" || echo "(none)"
+          tail -n 25 "$LOG"
+          exit $RC
+
+      - name: Upload — ${{ matrix.group }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bisect-${{ matrix.group }}
+          path: |
+            backend/bisect-${{ matrix.group }}.log
+            backend/bisect-stack-dump-${{ matrix.group }}.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+
   # ---------------------------------------------------------------------------
   # STAGE 1 — LINT (PR gate)
   # Static security scan (bandit) + provider-ID scans. If this stage fails,
