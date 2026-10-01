@@ -174,6 +174,185 @@ permissions:
   contents: read
 
 jobs:
+  # ===========================================================================
+  # OLD SHAPE + WHO HOLDS THE PIPE — the run that finally cannot lose evidence
+  # ===========================================================================
+  #
+  # #18 established the mechanism: a leaked child that inherits the step's
+  # stdout holds the runner's output pipe open. The step's shell exits rc=0
+  # and the runner is left waiting for an EOF that never comes — which is why
+  # the step's own `timeout-minutes` never fired. The step *process* was long
+  # gone; the runner was blocked on a pipe, not on a process.
+  #
+  # #18 also established the negative: under the #14 shape, nothing holds the
+  # pipe after pytest exits. So the leak belongs to the OLD shape, and main
+  # no longer has it. This job puts it back.
+  #
+  # What makes this round different from every previous attempt: the old
+  # shape's `wait` cannot reach the upload when it hangs, so the old shape is
+  # run under an outer `timeout` that guarantees the step ENDS. The outer
+  # timeout changes nothing about what the old shape does; it only means the
+  # `if: always()` upload runs. A watcher polls `/proc/*/fd/1` throughout and
+  # records every foreign holder together with its ancestry, tagged
+  # `[VIA-PYTEST]` when it hangs off pytest — that tag is the answer.
+  #
+  # Two historically wedged shards, plus one that has never wedged.
+  #
+  # Not a gate. Read once, then delete.
+  wedge-oldshape-leak:
+    name: Old shape ${{ matrix.group }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { group: "unit0", targets: "tests/unit/notifications/test_card_intermediate_phases.py tests/unit/notifications/test_unified_phase_section.py tests/unit/test_agent_desc_consistency.py tests/unit/test_agent_refine_timing.py tests/unit/test_binary_freshness.py tests/unit/test_coding_tool.py tests/unit/test_config.py tests/unit/test_empty_response_retry.py tests/unit/test_framework_text.py tests/unit/test_is_dependency_ready.py tests/unit/test_notifier_satisfies_request_guard.py tests/unit/test_plan_status.py tests/unit/test_provider_routing.py tests/unit/test_repair_generation_failure_handling.py tests/unit/test_round_passed_with_pending.py tests/unit/test_service_manager.py tests/unit/test_stranded_card_sweep.py tests/unit/test_task_manager_hydrate_orphans.py tests/unit/test_tasks_generator_self_review_fixes.py tests/unit/test_verification_agent.py tests/unit/test_verification_dag_provider_names.py tests/unit/test_verification_plan_wide_concurrency.py tests/unit/test_verification_terminal_state_machine.py" }
+          - { group: "root4", targets: "tests/api/test_execution_state_persistence.py tests/crash_recovery/test_kill_after_commit_persists_change.py tests/e2e/test_full_plan_lifecycle_on_8001.py tests/e2e/test_security_fixes_do_not_break_plan_lifecycle.py tests/integration/resume_test/test_api_client.py tests/integration/test_agent_lock_hooks.py tests/integration/test_closed_loop_three_layer_fix.py tests/integration/test_grep_guard_target_coverage.py tests/integration/test_subagent_instantiation.py tests/static_gates/test_commit_messages_are_not_ai_attributed.py tests/static_gates/test_frontend_message_views_escape_html.py tests/static_gates/test_no_operator_attribution_in_source.py tests/static_gates/test_sqlite_schema_tables_exactly_four_plus_version.py tests/test_atomic_io.py tests/test_base_yaml_no_order.py tests/test_coding_tool.py tests/test_e2e_mock_plan_full_workflow.py tests/test_fixed_timeout_contract.py tests/test_integration_state_machine_migration.py tests/test_no_legacy_read_path_in_server.py tests/test_plan_state_persistence.py tests/test_provider_order.py tests/test_runtime_provider_assertions.py tests/test_server_recovery.py tests/test_state_machine_completed_transition.py tests/test_usage_registry.py tests/test_verification_executor_filename.py tests/test_verification_state_machine.py" }
+          - { group: "unit3-ctl", targets: "tests/unit/archive_scan/test_dirname_date_takes_precedence_over_metadata.py tests/unit/notifications/test_card_vp_split_visibility.py tests/unit/repositories/test_artifact_content_hash_recomputed_on_update.py tests/unit/test_agent_dynamic_concurrency.py tests/unit/test_api_test_vocabulary_equivalence.py tests/unit/test_cards_failed_task_attempt_count.py tests/unit/test_coding_tool_query_json_retry.py tests/unit/test_config_placeholders_are_neutral.py tests/unit/test_execution_progress_single_connection.py tests/unit/test_grep_guard.py tests/unit/test_llm_calls_inherit_unified_timeout.py tests/unit/test_partial_completion_path.py tests/unit/test_preflight_review.py tests/unit/test_recovery_closes_its_connections.py tests/unit/test_repair_prompt_feedback.py tests/unit/test_scheduling_skeleton.py tests/unit/test_skill_md_alignment.py tests/unit/test_subagent_isolation.py tests/unit/test_task_persist_failure_reason.py tests/unit/test_tasks_generator_user_requirement.py tests/unit/test_verification_api_test_wiring.py tests/unit/test_verification_executor_filename.py tests/unit/test_verification_repair_tasks_card.py tests/unit/test_vp_split.py" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install -q --upgrade pip
+          backend/.venv/bin/python3 -m pip install -q -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install -q pytest pytest-cov pytest-timeout coverage
+
+      - name: Mitigate runner-images#13770 (read_ahead_kb)
+        run: |
+          sudo bash -c '
+            shopt -s nullglob
+            for dev in /sys/block/sd* /sys/block/nvme*n*; do
+              if [ -e "$dev/queue/read_ahead_kb" ]; then
+                echo 128 > "$dev/queue/read_ahead_kb"
+              fi
+            done
+            exit 0
+          '
+
+      - name: Old shape + who holds the pipe — ${{ matrix.group }}
+        working-directory: backend
+        timeout-minutes: 14
+        env:
+          PYTHONUNBUFFERED: "1"
+          CI_STACK_DUMP_PATH: oldshape-stack-dump-${{ matrix.group }}.txt
+        run: |
+          G="${{ matrix.group }}"
+          REPORT="leak-$G.txt"
+          PIPE=$(readlink /proc/$$/fd/1)
+          STEP_PID=$$
+          {
+            echo "step pid=$STEP_PID  stdout=$PIPE  group=$G"
+            echo "记录规则：除了 watcher 自己、步骤 shell 及其祖先之外，"
+            echo "还有谁攥着 runner 的管道；[VIA-PYTEST] 表示它挂在 pytest 下面。"
+          } > "$REPORT"
+
+          cat > ./leakwatch.sh <<'WATCH_EOF'
+          REPORT=$1; PIPE=$2; STEP=$3
+          self=$$
+          for i in $(seq 1 60); do
+            for fd in /proc/[0-9]*/fd/1; do
+              pid=${fd#/proc/}; pid=${pid%%/*}
+              [ "$pid" = "$self" ] && continue
+              [ "$pid" = "$STEP" ] && continue
+              [ "$(readlink "$fd" 2>/dev/null)" = "$PIPE" ] || continue
+              chain=""; p=$pid; via="direct"
+              while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ]; do
+                chain="$chain $p"
+                case "$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)" in
+                  *pytest*) via="VIA-PYTEST" ;;
+                esac
+                [ "$p" = "$STEP" ] && break
+                p=$(awk '{print $4}' /proc/$p/stat 2>/dev/null)
+              done
+              cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | cut -c1-140)
+              echo "t=$((i*5))s holder=$pid [$via] chain=$chain cmd=$cmd" >> "$REPORT"
+            done
+            sleep 5
+          done
+          echo "watch-done" >> "$REPORT"
+          WATCH_EOF
+
+          # 老形态的 shell 本体，写成独立脚本，才能被外层 timeout 看管。
+          cat > ./oldshape.sh <<'OLD_EOF'
+          G=$1; REPORT=$2
+          set +e
+          COVERAGE_FILE=.coverage.$G \
+          setsid ./.venv/bin/python3 -m pytest $3 \
+            -m "not e2e and not integration and not perf" \
+            --cov=. \
+            --cov-report= \
+            --tb=short \
+            -p ci_process_guard \
+            --durations=25 \
+            --timeout=60 > "oldshape-$G.log" 2>&1 < /dev/null &
+          PYTEST_PID=$!
+          {
+            echo "launched pytest pid=$PYTEST_PID"
+            echo "  ppid=$(ps -o ppid= -p $PYTEST_PID 2>/dev/null | tr -d ' ')"
+            echo "  pgid=$(ps -o pgid= -p $PYTEST_PID 2>/dev/null | tr -d ' ')"
+          } >> "$REPORT"
+
+          tail -n +1 -f --pid=$PYTEST_PID "oldshape-$G.log" &
+          TAIL_PID=$!
+          echo "launched tail pid=$TAIL_PID" >> "$REPORT"
+
+          (
+            sleep 100
+            kill -USR1 "$PYTEST_PID" 2>/dev/null
+            sleep 10
+            kill -TERM -"$PYTEST_PID" 2>/dev/null
+            sleep 20
+            kill -KILL -"$PYTEST_PID" 2>/dev/null
+          ) >/dev/null 2>&1 &
+          WATCHDOG_PID=$!
+          echo "launched watchdog pid=$WATCHDOG_PID" >> "$REPORT"
+
+          echo "BLOCK-ON-WAIT" >> "$REPORT"
+          wait $PYTEST_PID
+          RC=$?
+          echo "WAIT-RETURNED rc=$RC" >> "$REPORT"
+          kill "$WATCHDOG_PID" "$TAIL_PID" 2>/dev/null || true
+          echo "helpers-killed" >> "$REPORT"
+          exit $RC
+          OLD_EOF
+
+          setsid nohup bash ./leakwatch.sh "$REPORT" "$PIPE" "$STEP_PID" \
+            > /dev/null 2>&1 < /dev/null &
+
+          set +e
+          # 外层 timeout 是仪器：它不改变老形态的行为，只保证这一步**一定结束**，
+          # 于是 `if: always()` 的上传会跑，报告才拿得到。老形态的 `wait`
+          # 卡住时，没有这层就又是一次零证据。
+          timeout --foreground --signal=USR1 --kill-after=30s 300 \
+            bash ./oldshape.sh "$G" "$REPORT" "${{ matrix.targets }}"
+          RC=$?
+          echo "old-shape finished rc=$RC (124 = 外层上限到点)" >> "$REPORT"
+          sleep 12
+
+          echo "=== $REPORT ==="
+          cat "$REPORT"
+          exit $RC
+
+      - name: Upload — ${{ matrix.group }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leak-${{ matrix.group }}
+          path: |
+            backend/leak-${{ matrix.group }}.txt
+            backend/oldshape-${{ matrix.group }}.log
+            backend/oldshape-stack-dump-${{ matrix.group }}.txt
+          if-no-files-found: warn
+          retention-days: 14
+
   # ---------------------------------------------------------------------------
   # STAGE 1 — LINT (PR gate)
   # Static security scan (bandit) + provider-ID scans. If this stage fails,
