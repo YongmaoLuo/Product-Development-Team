@@ -564,6 +564,26 @@ jobs:
           - { lane: root, shard: root-6, index: "6", count: "7" }
           - lane: misc
             shard: misc
+          # --- wedge bisect, round 2 (temporary, 2026-09-30) ---------
+          #
+          # Round 1 (run 36725081213) cut unit-00 and root-4 into
+          # quarters with the lane's own awk convention. Six quarters
+          # passed; u00-q1 and r04-q3 wedged, exactly as unit-00 and
+          # root-4 do. All 13 files in those two slices appear in NO
+          # passing slice, so the suspect set is these 13.
+          #
+          # Four overlapping groups, deliberately: a/b are the first and
+          # second half (does it need both?), cu/cr are the tests/unit
+          # and tests/ sides (does it need both?). If exactly one group
+          # of each pair wedges, the trigger is a cross-group pair; if
+          # none, it is a single file inside one of them.
+          #
+          # Delete these four lines once the wedge is located. They
+          # overlap unit-00/root-4, so combined coverage double-counts.
+          - { lane: bisect, shard: w13-a, paths: "tests/unit/notifications/test_card_intermediate_phases.py tests/unit/notifications/test_unified_phase_section.py tests/unit/test_agent_desc_consistency.py tests/unit/test_agent_refine_timing.py tests/unit/test_binary_freshness.py tests/unit/test_coding_tool.py" }
+          - { lane: bisect, shard: w13-b, paths: "tests/test_base_yaml_no_order.py tests/test_coding_tool.py tests/test_e2e_mock_plan_full_workflow.py tests/test_fixed_timeout_contract.py tests/test_integration_state_machine_migration.py tests/test_no_legacy_read_path_in_server.py tests/test_plan_state_persistence.py" }
+          - { lane: bisect, shard: w13-cu, paths: "tests/unit/notifications/test_card_intermediate_phases.py tests/unit/notifications/test_unified_phase_section.py tests/unit/test_agent_desc_consistency.py tests/unit/test_agent_refine_timing.py tests/unit/test_binary_freshness.py tests/unit/test_coding_tool.py" }
+          - { lane: bisect, shard: w13-cr, paths: "tests/test_base_yaml_no_order.py tests/test_coding_tool.py tests/test_e2e_mock_plan_full_workflow.py tests/test_fixed_timeout_contract.py tests/test_integration_state_machine_migration.py tests/test_no_legacy_read_path_in_server.py tests/test_plan_state_persistence.py" }
           # --- wedge bisect (temporary, 2026-09-30) --------------------
           #
           # unit-00 and root-4 have wedged on the runner in 9 consecutive
@@ -581,14 +601,14 @@ jobs:
           # Delete these eight lines once the wedge is located. They
           # deliberately overlap unit-00/root-4, so the combined coverage
           # double-counts those files while they are present.
-          - { lane: bisect, shard: u00-q1, paths: "tests/unit/notifications/test_card_intermediate_phases.py tests/unit/notifications/test_unified_phase_section.py tests/unit/test_agent_desc_consistency.py tests/unit/test_agent_refine_timing.py tests/unit/test_binary_freshness.py tests/unit/test_coding_tool.py" }
-          - { lane: bisect, shard: u00-q2, paths: "tests/unit/test_config.py tests/unit/test_empty_response_retry.py tests/unit/test_framework_text.py tests/unit/test_is_dependency_ready.py tests/unit/test_notifier_satisfies_request_guard.py tests/unit/test_plan_status.py" }
-          - { lane: bisect, shard: u00-q3, paths: "tests/unit/test_provider_routing.py tests/unit/test_repair_generation_failure_handling.py tests/unit/test_round_passed_with_pending.py tests/unit/test_service_manager.py tests/unit/test_stranded_card_sweep.py tests/unit/test_task_manager_hydrate_orphans.py" }
-          - { lane: bisect, shard: u00-q4, paths: "tests/unit/test_tasks_generator_self_review_fixes.py tests/unit/test_verification_agent.py tests/unit/test_verification_dag_provider_names.py tests/unit/test_verification_plan_wide_concurrency.py tests/unit/test_verification_terminal_state_machine.py" }
-          - { lane: bisect, shard: r04-q1, paths: "tests/api/test_execution_state_persistence.py tests/crash_recovery/test_kill_after_commit_persists_change.py tests/e2e/test_full_plan_lifecycle_on_8001.py tests/e2e/test_security_fixes_do_not_break_plan_lifecycle.py tests/integration/resume_test/test_api_client.py tests/integration/test_agent_lock_hooks.py tests/integration/test_closed_loop_three_layer_fix.py" }
-          - { lane: bisect, shard: r04-q2, paths: "tests/integration/test_grep_guard_target_coverage.py tests/integration/test_subagent_instantiation.py tests/static_gates/test_commit_messages_are_not_ai_attributed.py tests/static_gates/test_frontend_message_views_escape_html.py tests/static_gates/test_no_operator_attribution_in_source.py tests/static_gates/test_sqlite_schema_tables_exactly_four_plus_version.py tests/test_atomic_io.py" }
-          - { lane: bisect, shard: r04-q3, paths: "tests/test_base_yaml_no_order.py tests/test_coding_tool.py tests/test_e2e_mock_plan_full_workflow.py tests/test_fixed_timeout_contract.py tests/test_integration_state_machine_migration.py tests/test_no_legacy_read_path_in_server.py tests/test_plan_state_persistence.py" }
-          - { lane: bisect, shard: r04-q4, paths: "tests/test_provider_order.py tests/test_runtime_provider_assertions.py tests/test_server_recovery.py tests/test_state_machine_completed_transition.py tests/test_usage_registry.py tests/test_verification_executor_filename.py tests/test_verification_state_machine.py" }
+
+
+
+
+
+
+
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -809,6 +829,8 @@ jobs:
             --cov-report= \
             --tb=short \
             -p ci_process_guard \
+            -p faulthandler \
+            -o faulthandler_timeout=60 \
             --durations=25 \
             --timeout=60 > pytest-${{ matrix.shard }}.log 2>&1 < /dev/null &
           PYTEST_PID=$!
