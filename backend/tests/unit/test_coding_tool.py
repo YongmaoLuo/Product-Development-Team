@@ -1172,6 +1172,14 @@ def test_no_bare_vendor_b_in_coding_tool():
         cwd=str(project_root),
         capture_output=True,
         text=True,
+        # The only subprocess in this file that no ``@patch`` covers, so
+        # the 28 ``Popen`` mocks do nothing for it. Without a timeout
+        # ``communicate()`` waits for an EOF that a wedged child never
+        # sends, and the whole shard goes with it — which is what a
+        # 45-minute CI reap with no log and no artifact looks like from
+        # the outside. The scan takes 0.05s; anything near the ceiling
+        # means it is stuck, not slow.
+        timeout=60,
     )
     assert result.returncode == 0, (
         f"scan_hardcoded_provider_ids found violations in coding_tool.py:\n"
