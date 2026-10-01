@@ -531,71 +531,84 @@ jobs:
 
 
   # ===========================================================================
-  # KILLPG(1) BISECT — which call in that five-line script hangs the job?
+  # KILLPG(1) — what does the call return, when a hung job cannot say?
   # ===========================================================================
   #
-  # A job whose entire body is `os.killpg(1, SIGKILL)` in a loop hangs. If
-  # the signal were refused with EPERM — which the census implies, since the
-  # runner stack is not in group 1 and runs as `runner` — a thousand failing
-  # syscalls would finish in milliseconds and the job would pass. It does not.
-  # So something about the call is not a no-op, and the only way to find out
-  # which part is to make the pieces separate jobs: whichever one hangs is
-  # the culprit, and the others hand back their logs.
+  # The bisect put it beyond doubt: `id-only`, `mock-pid` and `getpgid-once`
+  # pass; `killpg-once` and `killpg-1000` are cancelled at the job ceiling.
+  # One `os.killpg(1, signal.SIGKILL)` is enough. The census says the caller is
+  # uid 1001 and that group 1 holds only root's init, so the call *ought* to
+  # come back EPERM — but a refused syscall cannot hang a step.
   #
-  # This is also the smallest reproduction of the wedge found so far: no
-  # repo code, no test suite, no step shape — one syscall.
-  wedge-killpg:
-    name: killpg bisect ${{ matrix.probe }}
+  # The wedged job cannot report what happened, so this asks from outside the
+  # process that makes the call. A detached probe writes its result to a file
+  # and a watchdog re-posts that file to the step log every few seconds, so
+  # the answer lands even if the step itself is the thing that dies. The
+  # probe is double-forked into its own session: nothing it does can reach
+  # the step's process group, which is the whole point.
+  wedge-killpg-report:
+    name: what does killpg(1) return
     runs-on: ubuntu-latest
-    timeout-minutes: 4
-    strategy:
-      fail-fast: false
-      matrix:
-        probe:
-          - id-only
-          - mock-pid
-          - getpgid-once
-          - killpg-once
-          - killpg-1000
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: ${{ matrix.probe }}
+
+      - name: Probe from a detached session
         run: |
           set +e
-          echo "uid=$(id -u) user=$(whoami) our_pgid=$(ps -o pgid= -p $$ | tr -d ' ')"
-          echo "pgid-1 members:"
-          ps -eo pid,ppid,pgid,user,args | awk 'NR==1 || $3==1'
-          python3 -u -c '
-          import errno, os, signal, sys
-          from unittest.mock import MagicMock
-          P = "${{ matrix.probe }}"
-          print("probe =", P, flush=True)
-          if P == "id-only":
-              print("done", flush=True); raise SystemExit(0)
-          m = MagicMock()
-          print("mock.pid       =", repr(m.pid), flush=True)
-          print("mock.__index__ =", m.pid.__index__(), flush=True)
-          if P == "mock-pid":
-              print("done", flush=True); raise SystemExit(0)
-          g = os.getpgid(m.pid)
-          print("getpgid(mock)  =", g, flush=True)
-          if P == "getpgid-once":
-              print("done", flush=True); raise SystemExit(0)
-          n = 1 if P == "killpg-once" else 1000
-          for i in range(n):
+          cat > /tmp/probe.py <<'PROBE'
+          import errno, os, signal, socket, time
+          from datetime import datetime, timezone
+
+          def stamp(msg):
+              print(f"{datetime.now(timezone.utc).isoformat()} {msg}", flush=True)
+
+          def bail(msg):
+              stamp("FATAL " + msg)
+              os._exit(9)
+
+          try:
+              stamp(f"probe pid={os.getpid()} pgid={os.getpgrp()} uid={os.getuid()}")
+              from unittest.mock import MagicMock
+              m = MagicMock()
+              g = os.getpgid(m.pid)
+              stamp(f"getpgid(mock.pid)={g}")
+              stamp("about to call killpg(1, SIGKILL) — one call")
+              t0 = time.time()
               try:
                   os.killpg(g, signal.SIGKILL)
-                  r = "DELIVERED"
+                  stamp(f"killpg RETURNED DELIVERED in {time.time()-t0:.3f}s")
               except OSError as e:
-                  r = errno.errorcode.get(e.errno, e.errno)
-              if i < 3 or i == n - 1:
-                  print(f"  killpg {i+1}/{n} -> {r}", flush=True)
-          print("done", flush=True)
-          '
-          echo "step finished rc=$?"
+                  stamp(f"killpg RETURNED errno={e.errno} "
+                        f"({errno.errorcode.get(e.errno)}) in {time.time()-t0:.3f}s")
+              stamp("still alive after the call; probe concludes")
+          except BaseException as e:
+              bail(f"{type(e).__name__}: {e}")
+          PROBE
+          echo "probe written"
+
+          # double-fork into its own session so the probe shares nothing with
+          # the step: not its process group, not its session, not its pipes.
+          setsid nohup setsid python3 -u /tmp/probe.py > /tmp/probe.out 2>&1 < /dev/null &
+          disown || true
+
+          # The watchdog: re-print whatever the probe has written, repeatedly.
+          # If the step survives even a little, the answer is in the log.
+          for i in $(seq 1 40); do
+            echo "--- t=$((i*5))s ---"
+            cat /tmp/probe.out 2>/dev/null || echo "(probe produced nothing yet)"
+            if grep -q "probe concludes" /tmp/probe.out 2>/dev/null; then
+              echo "=== probe finished cleanly ==="
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "=== watchdog gave up; last state: ==="
+          cat /tmp/probe.out 2>/dev/null
+          echo "=== step survived to the end ==="
 
   # ---------------------------------------------------------------------------
   # STAGE 1 — LINT (PR gate)
