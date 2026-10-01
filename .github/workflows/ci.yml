@@ -418,6 +418,118 @@ jobs:
           done
 
 
+  # ===========================================================================
+  # PROCESS.PY VARIANTS — which of the two guards is load-bearing?
+  # ===========================================================================
+  #
+  # Pinned to one variable: restoring the pre-#14 `utils/process.py` brings the
+  # wedge back on both historically wedged shards, while a shard WITHOUT
+  # `test_coding_tool.py` still passes in the same run on the same runner.
+  #
+  # That file differs from the fixed one in exactly two guards, so cut along
+  # that seam instead of guessing:
+  #
+  #   old            neither guard                    (positive control)
+  #   old_owngroup   own-group guard only             (mock still resolves to
+  #                                                     group 1 and is still
+  #                                                     signalled)
+  #   old_childpid   `_child_pid` only                (mock short-circuits
+  #                                                     the helper before any
+  #                                                     signal is sent)
+  #   new            both guards
+  #
+  # All four run the OLD step shape on unit-0's file set, under an outer
+  # timeout that guarantees the step ends so a wedge still uploads its log.
+  # If `old` passes, the round is void.
+  wedge-processpy:
+    name: process.py ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [old, old_owngroup, old_childpid, new]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install -q --upgrade pip
+          backend/.venv/bin/python3 -m pip install -q -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install -q pytest pytest-cov pytest-timeout coverage
+
+      - name: Mitigate runner-images#13770 (read_ahead_kb)
+        run: |
+          sudo bash -c '
+            shopt -s nullglob
+            for dev in /sys/block/sd* /sys/block/nvme*n*; do
+              if [ -e "$dev/queue/read_ahead_kb" ]; then
+                echo 128 > "$dev/queue/read_ahead_kb"
+              fi
+            done
+            exit 0
+          '
+
+      - name: Install the variant
+        run: |
+          V='${{ matrix.variant }}'
+          cp "scripts/diagnostics/processpy-variants/$V.py" backend/utils/process.py
+          find backend -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+          echo "installed variant $V"
+          echo -n "  has _child_pid : "; grep -c "_child_pid" backend/utils/process.py || true
+          echo -n "  has own_pgid   : "; grep -c "own_pgid" backend/utils/process.py || true
+
+      - name: Run unit-0 under the old shape
+        working-directory: backend
+        timeout-minutes: 12
+        env:
+          PYTHONUNBUFFERED: "1"
+          CI_STACK_DUMP_PATH: pv-stack-dump-${{ matrix.variant }}.txt
+        run: |
+          G='${{ matrix.variant }}'
+          TARGETS=$(./.venv/bin/python3 -m pytest tests/unit \
+                      --collect-only -q -o addopts= -p no:cacheprovider -p no:warnings 2>/dev/null \
+                    | grep -E '^tests/[^:]*\.py::' | sed 's/::.*//' | sort -u \
+                    | awk -v i=0 -v n=12 'NR % n == i' | tr '\n' ' ')
+          echo "variant=$G files=$(echo $TARGETS | wc -w)"
+          set +e
+          COVERAGE_FILE=.coverage.$G \
+          setsid ./.venv/bin/python3 -m pytest $TARGETS \
+            -m "not e2e and not integration and not perf" \
+            --cov=. --cov-report= --tb=short \
+            -p ci_process_guard --durations=25 --timeout=60 \
+            > "pv-$G.log" 2>&1 < /dev/null &
+          P=$!
+          tail -n +1 -f --pid=$P "pv-$G.log" &
+          T=$!
+          ( sleep 240; kill -USR1 $P 2>/dev/null; sleep 10
+            kill -TERM -$P 2>/dev/null; sleep 20; kill -KILL -$P 2>/dev/null
+          ) >/dev/null 2>&1 &
+          W=$!
+          wait $P; RC=$?
+          kill $W $T 2>/dev/null || true
+          echo "=== variant $G rc=$RC ==="
+          tail -n 15 "pv-$G.log"
+          exit $RC
+
+      - name: Upload — ${{ matrix.variant }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pv-${{ matrix.variant }}
+          path: |
+            backend/pv-${{ matrix.variant }}.log
+            backend/pv-stack-dump-${{ matrix.variant }}.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+
   # ---------------------------------------------------------------------------
   # STAGE 1 — LINT (PR gate)
   # Static security scan (bandit) + provider-ID scans. If this stage fails,
