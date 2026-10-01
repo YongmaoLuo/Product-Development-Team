@@ -797,6 +797,15 @@ jobs:
             echo "::error::the ${{ matrix.shard }} shard was killed at its ${WATCHDOG_SECONDS}s budget. pytest-${{ matrix.shard }}.log ends at the last test that started; the stack dump names the frame."
           fi
 
+          # What did this shard actually leave on disk? The coverage data
+          # is the input to the `coverage-gate` job, and when a shard
+          # produces none that job can only say "No data to combine" twenty
+          # seconds later, naming no shard. Saying it here names the shard.
+          # (`ls`, not a glob: a glob that matches nothing prints its own
+          # pattern and reads like a successful listing.)
+          echo "----- coverage data on disk after the run -----"
+          ls -la .coverage* 2>&1 || echo "(no .coverage* in $(pwd))"
+
           # Put the tail in the step log as well as the artifact. On a
           # green run the artifact is never opened; on a red one, the last
           # 40 lines are usually the whole answer and they should not
