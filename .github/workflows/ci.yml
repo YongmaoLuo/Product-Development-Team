@@ -238,6 +238,52 @@ jobs:
           backend/.venv/bin/python3 -m pip install -q -r backend/requirements.txt
           backend/.venv/bin/python3 -m pip install -q pytest pytest-cov pytest-timeout coverage
 
+      # The FIRST run of this probe job hung 5/5 — including E-fixed, the
+      # exact shape that runs in 21s in #14 — because this job was the one
+      # place in the file WITHOUT the read_ahead_kb mitigation. Same run,
+      # same commands: the 18 unit/root shards that carry the mitigation
+      # completed, these five did not. The mitigation is load-bearing, so
+      # the probe has to carry it too or it measures the runner, not the
+      # shape.
+      - name: Mitigate runner-images#13770 (read_ahead_kb)
+        run: |
+          sudo bash -c '
+            shopt -s nullglob
+            touched=0
+            for dev in /sys/block/sd* /sys/block/nvme*n*; do
+              if [ -e "$dev/queue/read_ahead_kb" ]; then
+                echo "  $(basename $dev): $(cat $dev/queue/read_ahead_kb) -> 128"
+                echo 128 > "$dev/queue/read_ahead_kb"
+                touched=$((touched + 1))
+              fi
+            done
+            if [ "$touched" -eq 0 ]; then
+              echo "::warning::read_ahead_kb matched no block device — the globs are stale for this runner image, so runner-images#13770 is NOT mitigated and the shard may stop reporting"
+            else
+              echo "read_ahead_kb lowered on $touched block device(s)"
+            fi
+            exit 0
+          '
+
+      # Run this shard via the venv Python.
+      # This pins the CLAUDE.md rule: never use system Python to run pytest.
+      #
+      # Coverage: each shard writes its OWN ``.coverage.<shard>`` data file
+      # (via COVERAGE_FILE) instead of judging a percentage on its own —
+      # a shard that runs a third of the suite would report a third of the
+      # coverage. ``coverage-gate`` below downloads all three, combines
+      # them, and enforces --cov-fail-under=80 on the union.
+      #
+      # STEP-level timeout, not just the job-level one (2026-09-23).
+      # A job that is CANCELLED — by the job timeout, or by whatever
+      # killed the runner at ~49 minutes — uploads NO log at all
+      # (``actions/jobs/<id>/logs`` returns BlobNotFound), which is why
+      # the 45-minute unit runs produced no evidence three times running.
+      # A STEP that times out fails the step normally and the job then
+      # continues into the ``if: always()`` upload below, so the pytest
+      # output survives. That upload IS the diagnostic: its tail names
+      # the last test that started.
+
       - name: Probe — ${{ matrix.variant }}
         working-directory: backend
         timeout-minutes: 12
