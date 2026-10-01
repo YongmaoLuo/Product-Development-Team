@@ -174,6 +174,197 @@ permissions:
   contents: read
 
 jobs:
+  # ===========================================================================
+  # WEDGE PROBE — which of the old step's four constructs stopped the step?
+  # ===========================================================================
+  #
+  # `unit-00` and `root-4` hung for 40 minutes on nine consecutive runs and
+  # were cancelled by the job ceiling, uploading nothing. The fix in #14
+  # replaced the step's hand-rolled process plumbing with a single
+  # foreground `timeout` — which proves the *class* of cause but not which
+  # of the four constructs was responsible, and the failure destroyed its
+  # own evidence, so it cannot be recovered after the fact.
+  #
+  # This job answers the narrower question in one round instead of four.
+  # Five variants of the old shape run as a matrix, each dropping exactly
+  # one construct:
+  #
+  #   A-full         setsid + tail -f --pid + watchdog + wait   (control)
+  #   B-no-setsid    tail + watchdog + wait
+  #   C-no-tail      setsid + watchdog + wait
+  #   D-no-watchdog  setsid + tail + wait
+  #   E-fixed        the foreground `timeout` that shipped in #14
+  #
+  # `wait` is not a candidate to drop — something has to wait for pytest —
+  # so it stays in every variant and the three removable constructs are
+  # what the matrix varies. All five run the SAME 23 files `unit-00` owns,
+  # sliced with the lane's own awk expression, so the only difference
+  # between them is the shape.
+  #
+  # The outer `timeout 180` is a MEASURING INSTRUMENT, not part of any
+  # variant: it does not change what the variant does, it only guarantees
+  # the step ENDS so the `if: always()` upload runs. Without it a wedging
+  # variant takes the evidence down with it — which is precisely why this
+  # took ten hours the first time. Every construct prints a marker into
+  # both the step log and the artifact, so a variant that hits the outer
+  # ceiling names the last construct it got through.
+  #
+  # Nothing here is a gate. It exists to be read once and then deleted.
+  wedge-probe:
+    name: Wedge probe (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - A-full
+          - B-no-setsid
+          - C-no-tail
+          - D-no-watchdog
+          - E-fixed
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install -q --upgrade pip
+          backend/.venv/bin/python3 -m pip install -q -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install -q pytest pytest-cov pytest-timeout coverage
+
+      - name: Probe — ${{ matrix.variant }}
+        working-directory: backend
+        timeout-minutes: 12
+        env:
+          PYTHONUNBUFFERED: "1"
+          CI_STACK_DUMP_PATH: probe-stack-dump-${{ matrix.variant }}.txt
+        run: |
+          V="${{ matrix.variant }}"
+          LOG="probe-$V.log"
+
+          # The variant body lives in a file so the outer `timeout` can
+          # supervise it as a single foreground child — the same trick the
+          # fix uses, applied here to the measurement rather than to any
+          # variant's behaviour.
+          cat > ./variant.sh <<'VARIANT_EOF'
+          V="$1"; LOG="$2"
+          mark() {
+            local line
+            line="MARK $(date +%s) $*"
+            echo "$line"
+            echo "$line" >> "$LOG"
+          }
+
+          # The same 23 files `unit-00` owns, with the lane's own awk.
+          TARGETS=$(./.venv/bin/python3 -m pytest tests/unit \
+                      --collect-only -q -o addopts= -p no:cacheprovider -p no:warnings 2>/dev/null \
+                    | grep -E '^tests/[^:]*\.py::' | sed 's/::.*//' | sort -u \
+                    | awk -v i=0 -v n=12 'NR % n == i' | tr '\n' ' ')
+          mark "variant=$V files=$(echo $TARGETS | wc -w)"
+
+          if [ "$V" = "E-fixed" ]; then
+            mark start-fixed
+            timeout --foreground --signal=USR1 --kill-after=20s 150 \
+              ./.venv/bin/python3 -m pytest $TARGETS \
+                -m "not e2e and not integration and not perf" \
+                --cov=. --cov-report= --tb=short \
+                -p ci_process_guard -p faulthandler -o faulthandler_timeout=60 \
+                --durations=25 --timeout=60 >> "$LOG" 2>&1 < /dev/null
+            RC=$?
+            mark "fixed-returned rc=$RC"
+            exit $RC
+          fi
+
+          mark "start-$V"
+          # --- construct 1: launch (setsid unless this variant drops it) ---
+          case "$V" in
+            B-no-setsid)
+              ./.venv/bin/python3 -m pytest $TARGETS \
+                -m "not e2e and not integration and not perf" \
+                --cov=. --cov-report= --tb=short \
+                -p ci_process_guard --durations=25 --timeout=60 \
+                >> "$LOG" 2>&1 < /dev/null &
+              ;;
+            *)
+              setsid ./.venv/bin/python3 -m pytest $TARGETS \
+                -m "not e2e and not integration and not perf" \
+                --cov=. --cov-report= --tb=short \
+                -p ci_process_guard --durations=25 --timeout=60 \
+                >> "$LOG" 2>&1 < /dev/null &
+              ;;
+          esac
+          PYTEST_PID=$!
+          mark "launched pytest pid=$PYTEST_PID pgid=$(ps -o pgid= -p $PYTEST_PID 2>/dev/null | tr -d ' ')"
+
+          # --- construct 2: tail -f --pid (unless dropped) ---
+          TAIL_PID=""
+          if [ "$V" != "C-no-tail" ]; then
+            tail -n +1 -f --pid=$PYTEST_PID "$LOG" &
+            TAIL_PID=$!
+            mark "launched tail pid=$TAIL_PID"
+          else
+            mark "tail-DROPPED"
+          fi
+
+          # --- construct 3: background watchdog (unless dropped) ---
+          WATCHDOG_PID=""
+          if [ "$V" != "D-no-watchdog" ]; then
+            (
+              sleep 100
+              mark "watchdog-firing"
+              kill -USR1 "$PYTEST_PID" 2>/dev/null
+              sleep 5
+              kill -TERM -"$PYTEST_PID" 2>/dev/null
+              sleep 5
+              kill -KILL -"$PYTEST_PID" 2>/dev/null
+            ) >/dev/null 2>&1 &
+            WATCHDOG_PID=$!
+            mark "launched watchdog pid=$WATCHDOG_PID budget=100s"
+          else
+            mark "watchdog-DROPPED"
+          fi
+
+          # --- construct 4: wait (present in every variant) ---
+          mark BLOCK-ON-WAIT
+          wait $PYTEST_PID
+          RC=$?
+          mark "WAIT-RETURNED rc=$RC"
+
+          [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null
+          [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null
+          mark helpers-killed
+          exit $RC
+          VARIANT_EOF
+
+          : > "$LOG"
+          # The instrument, not the experiment: 180s is four times the
+          # 21s the tests actually need, so a variant that reaches it has
+          # told us something.
+          timeout --foreground --signal=USR1 --kill-after=20s 180 \
+            bash ./variant.sh "$V" "$LOG"
+          RC=$?
+          echo "=== variant $V finished rc=$RC ==="
+          tail -n 30 "$LOG"
+          exit $RC
+
+      - name: Upload probe output — ${{ matrix.variant }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.variant }}
+          path: |
+            backend/probe-${{ matrix.variant }}.log
+            backend/probe-stack-dump-${{ matrix.variant }}.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+
   # ---------------------------------------------------------------------------
   # STAGE 1 — LINT (PR gate)
   # Static security scan (bandit) + provider-ID scans. If this stage fails,
