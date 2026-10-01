@@ -212,6 +212,12 @@ jobs:
           - { group: "unit3-ctl", targets: "tests/unit/archive_scan/test_dirname_date_takes_precedence_over_metadata.py tests/unit/notifications/test_card_vp_split_visibility.py tests/unit/repositories/test_artifact_content_hash_recomputed_on_update.py tests/unit/test_agent_dynamic_concurrency.py tests/unit/test_api_test_vocabulary_equivalence.py tests/unit/test_cards_failed_task_attempt_count.py tests/unit/test_coding_tool_query_json_retry.py tests/unit/test_config_placeholders_are_neutral.py tests/unit/test_execution_progress_single_connection.py tests/unit/test_grep_guard.py tests/unit/test_llm_calls_inherit_unified_timeout.py tests/unit/test_partial_completion_path.py tests/unit/test_preflight_review.py tests/unit/test_recovery_closes_its_connections.py tests/unit/test_repair_prompt_feedback.py tests/unit/test_scheduling_skeleton.py tests/unit/test_skill_md_alignment.py tests/unit/test_subagent_isolation.py tests/unit/test_task_persist_failure_reason.py tests/unit/test_tasks_generator_user_requirement.py tests/unit/test_verification_api_test_wiring.py tests/unit/test_verification_executor_filename.py tests/unit/test_verification_repair_tasks_card.py tests/unit/test_vp_split.py" }
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: the step below reaches into 7000128 to restore
+          # `process.py`. The default shallow clone does not have that
+          # object, and `git show` fails with exit 128 — which is exactly
+          # what the first run of this job did.
+          fetch-depth: 0
 
       # The half of #14 that was thrown away, restored ON ITS OWN.
       #
