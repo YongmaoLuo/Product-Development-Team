@@ -530,6 +530,68 @@ jobs:
           retention-days: 14
 
 
+  # ===========================================================================
+  # ERRNO — what does killpg(1, SIGKILL) actually return on a runner?
+  # ===========================================================================
+  #
+  # The wedge tracks one behaviour exactly: whether `kill_process_group`
+  # reaches `os.getpgid(mock.pid)` / `os.killpg(1, SIGKILL)` for a MagicMock.
+  # `old` and `old_owngroup` do and wedge; `new` does not and passes; the
+  # pgid census says the runner stack lives in its own group, not group 1,
+  # and runs as `runner`, so the inference is EPERM — an inference, not a
+  # measurement. This measures it, and then checks whether the step is
+  # still alive afterwards.
+  #
+  # If the signal is delivered rather than refused, the premise of the
+  # whole EPERM story is wrong and everything downstream needs re-reading.
+  wedge-errno:
+    name: errno of killpg(1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Measure
+        run: |
+          set +e
+          echo "uid=$(id -u) user=$(whoami)"
+          echo "our pgid=$(ps -o pgid= -p $$ | tr -d ' ')"
+          python3 - <<'PYEOF'
+          import errno, os, signal, sys, time
+          from unittest.mock import MagicMock, patch
+
+          m = MagicMock()
+          print("MagicMock.pid         =", repr(m.pid))
+          print("MagicMock.__index__() =", m.pid.__index__())
+          pgid = os.getpgid(m.pid)
+          print("os.getpgid(mock.pid) =", pgid)
+
+          outcomes = {}
+          t0 = time.time()
+          for i in range(1000):
+              try:
+                  os.killpg(pgid, signal.SIGKILL)
+                  key = "DELIVERED"
+              except OSError as exc:
+                  key = f"{errno.errorcode.get(exc.errno, exc.errno)}"
+              outcomes[key] = outcomes.get(key, 0) + 1
+          dt = time.time() - t0
+          print(f"1000x killpg({pgid}, SIGKILL) -> {outcomes}  ({dt:.2f}s)")
+
+          # The same thing through the real helper, the way the suite does.
+          sys.path.insert(0, "backend")
+          from utils.process import kill_process_group
+          before = os.getpid()
+          for _ in range(50):
+              kill_process_group(MagicMock())
+          print("survived 50 calls through kill_process_group; pid unchanged =",
+                os.getpid() == before)
+          print("OUR PID STILL ALIVE:", os.getpid() == before)
+          PYEOF
+          echo "=== shell still alive after the probe: yes (rc=$?) ==="
+
   # ---------------------------------------------------------------------------
   # STAGE 1 — LINT (PR gate)
   # Static security scan (bandit) + provider-ID scans. If this stage fails,
