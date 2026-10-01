@@ -21,6 +21,33 @@ from typing import Optional
 __all__ = ["kill_process_group"]
 
 
+def _child_pid(proc: object) -> Optional[int]:
+    """``proc``'s pid if it is a real one, else ``None``.
+
+    The ``isinstance`` is the whole point. ``os.getpgid`` does not want an
+    ``int``; it wants *anything* with ``__index__``, and CPython will
+    happily call it. ``MagicMock`` configures ``__index__`` to return
+    ``1``, so the old ``getattr(proc, "pid", None)`` guard let a mocked
+    process through and ``os.getpgid`` answered with the group of PID 1.
+    Every fallback path in ``coding_tool`` — six call sites, all reached
+    with a ``MagicMock`` in the unit suite — therefore sent ``SIGKILL``
+    to the init process group on its way out of a test.
+
+    ``bool`` is excluded explicitly because ``bool`` is an ``int`` and
+    ``True`` would resolve to PID 1 all over again.
+
+    A real ``subprocess.Popen`` is unaffected: its ``pid`` is an ``int``
+    from the OS, and the fastest way to prove that is the fact that
+    :func:`kill_process_group` still works, which
+    ``test_kill_process_group_terminates_proc`` pins against a real
+    child.
+    """
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return None
+    return pid if pid > 0 else None
+
+
 def kill_process_group(
     proc: Optional[object],
     *,
@@ -40,17 +67,42 @@ def kill_process_group(
     scheduler.  The caller already has a fallback path (timeout
     error, retry, etc.) so propagating these exceptions would only
     mask the real cause.
+
+    Two things it will not do, both of which it used to do silently:
+
+    * **Signal a group it was never given.** ``os.getpgid`` accepts any
+      object implementing ``__index__``, and ``MagicMock`` implements it
+      — returning ``1``. A ``MagicMock`` standing in for a subprocess
+      therefore resolved "the child's group" to the group of PID 1, and
+      this function ``SIGKILL``ed it. Every provider-fallback path in
+      ``coding_tool`` reaches here with a mocked process, so the suite
+      aimed a kill at init on the way past. :func:`_child_pid` requires
+      a genuine ``int``, which turns each of those into a no-op.
+    * **Signal its own group.** A child spawned *without*
+      ``start_new_session=True`` sits in the caller's group, and killing
+      that group kills the caller — under pytest, the whole session.
+      ``bounded_subprocess`` already refuses this; this helper did not.
     """
     if proc is None:
         return None
 
-    pid = getattr(proc, "pid", None)
+    pid = _child_pid(proc)
     if pid is None:
         return None
 
     try:
         pgid = os.getpgid(pid)
     except (ProcessLookupError, PermissionError, OSError):
+        pgid = None
+
+    # Never our own group: that is the caller, and everything it owns.
+    # Signalling it would take down the backend — or, under pytest, the
+    # whole session, which is a failure with no trace of its cause.
+    try:
+        own_pgid: Optional[int] = os.getpgrp()
+    except OSError:  # pragma: no cover - exotic platform
+        own_pgid = None
+    if own_pgid is not None and pgid == own_pgid:
         pgid = None
 
     if pgid is not None:
