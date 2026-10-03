@@ -1688,7 +1688,14 @@ jobs:
           echo "Full log: ${RUN_URL}"
           echo
 
-          failed="$(NEEDS_JSON="${NEEDS_JSON}" python3 - <<'PY'
+          # Prints the job count on success, the offending jobs on
+          # failure. It is one program because both answers come from the
+          # same parse — and printing the count from here rather than
+          # from bash is the point: `${#NEEDS_JSON}` is the length of the
+          # JSON *string* in bytes, so the summary used to announce "All
+          # 620 upstream jobs" for a nine-job gate. A number in a gate's
+          # own output has to be the number it means.
+          summary="$(NEEDS_JSON="${NEEDS_JSON}" python3 - <<'PY'
           import json, os, sys
 
           needs = json.loads(os.environ["NEEDS_JSON"])
@@ -1701,7 +1708,7 @@ jobs:
               if result.get("result") != "success"
           }
           if not bad:
-              print("")
+              print(f"{len(needs)}")
               sys.exit(0)
           print("These jobs did not succeed, so the merge gate is closed:")
           for name, result in bad.items():
@@ -1709,10 +1716,10 @@ jobs:
           sys.exit(1)
           PY
           )" || {
-            echo "$failed"
+            echo "$summary"
             echo
             echo "::error::Merge gate closed — see the list above."
             exit 1
           }
 
-          echo "All ${#NEEDS_JSON} upstream jobs succeeded — merge gate open."
+          echo "All ${summary} upstream jobs succeeded — merge gate open."
