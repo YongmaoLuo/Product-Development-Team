@@ -19,7 +19,10 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import signal
+import socket
 import sys
 from pathlib import Path
 
@@ -428,6 +431,9 @@ def test_start_service_launches_detached_and_waits(project, monkeypatch):
     class _FakeProc:
         pid = 999999
 
+        def poll(self):
+            return None   # still running, as a real spawn would be
+
     def _fake_popen(argv, **kwargs):
         spawned["argv"] = argv
         spawned["kwargs"] = kwargs
@@ -451,6 +457,9 @@ def test_start_service_launches_detached_and_waits(project, monkeypatch):
 def test_start_service_failure_carries_the_log_tail(project, monkeypatch):
     class _FakeProc:
         pid = 999998
+
+        def poll(self):
+            return None   # still running; the not-ready path is mocked
 
     monkeypatch.setattr(sm.subprocess, "Popen", lambda *a, **k: _FakeProc())
     monkeypatch.setattr(sm, "wait_until_ready", lambda decl, t=None: False)
@@ -565,6 +574,14 @@ def test_stop_service_reports_a_free_port_when_there_is_nothing_to_stop(
 
 
 def _free_port() -> int:
+    """A port the kernel says is currently unused.
+
+    Note what this does *not* promise: that the port will still be unused
+    when the caller gets around to binding it. The probe socket is closed
+    before this returns, so the port is unowned from here on, and in a
+    full unit run another test can take it in the gap. Callers that bind
+    must therefore handle EADDRINUSE — see :func:`_spawn_http_server`.
+    """
     import socket
 
     with socket.socket() as sock:
@@ -574,7 +591,18 @@ def _free_port() -> int:
 
 def _spawn_http_server(port: int, *, ignore_sigterm: bool = False) -> int:
     """Start a detached `python -m http.server` on ``port``; return its
-    pid so the test can always clean up."""
+    pid so the test can always clean up.
+
+    Retries on a bind failure. The port was chosen by :func:`_free_port`,
+    which closes its probe socket before returning — so between choosing
+    and binding, the port is unowned and any other test running
+    concurrently can take it. That window is why these three tests failed
+    intermittently in a full unit run while passing in isolation: the
+    failure has nothing to do with the service-manager code under test.
+
+    See :func:`_free_port` for why the window cannot be closed from that
+    side; it is closed here instead, where the bind actually happens.
+    """
     import shlex
     import subprocess
     import sys as _sys
@@ -594,10 +622,70 @@ def _spawn_http_server(port: int, *, ignore_sigterm: bool = False) -> int:
         ]
     else:
         argv = [_sys.executable, "-c", script]
-    proc = subprocess.Popen(
-        argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL, start_new_session=True,
-    )
+
+    deadline = _time.monotonic() + 10.0
+    while True:
+        proc = subprocess.Popen(
+            argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+        # Give the child a moment to either bind or die on EADDRINUSE.
+        _time.sleep(0.3)
+        if proc.poll() is not None:
+            # it exited — EADDRINUSE, most likely
+            pass
+        elif proc.pid in sm.probe_port(port).pids:
+            # Our child is the listener. This is the same check the
+            # production `start_service` does, and it was missing here:
+            # without it the helper handed back the pid of a dead child
+            # for a port something else was answering on, and every
+            # assertion downstream was reasoning from that.
+            break
+        else:
+            # Still running, but not the listener. Something else got
+            # there first, so treat it like a bind failure and retry.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            if _time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"port {port} is held by a process that is not the "
+                    f"server this helper started (pid {proc.pid}); gave up "
+                    f"after 10s of retries"
+                )
+            port = _free_port()
+            script = (
+                "import http.server,socketserver;"
+                f"socketserver.TCPServer(('127.0.0.1',{port}),"
+                "http.server.SimpleHTTPRequestHandler).serve_forever()"
+            )
+            if ignore_sigterm:
+                argv = [
+                    "/bin/bash", "-c",
+                    f"trap '' TERM; exec {shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
+                ]
+            else:
+                argv = [_sys.executable, "-c", script]
+            continue
+        if _time.monotonic() >= deadline:
+            raise AssertionError(
+                f"could not bind port {port} for the test server after "
+                f"retrying for 10s; something else is holding it"
+            )
+        port = _free_port()  # taken in the meantime; try another
+        script = (
+            "import http.server,socketserver;"
+            f"socketserver.TCPServer(('127.0.0.1',{port}),"
+            "http.server.SimpleHTTPRequestHandler).serve_forever()"
+        )
+        if ignore_sigterm:
+            argv = [
+                "/bin/bash", "-c",
+                f"trap '' TERM; exec {shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
+            ]
+        else:
+            argv = [_sys.executable, "-c", script]
     deadline = _time.monotonic() + 20
     while _time.monotonic() < deadline:
         if sm.probe_port(port).listening:
@@ -628,9 +716,7 @@ def test_stop_service_releases_a_real_port():
         runtime = sm.ServiceRuntime(
             name="stub", port=port, pid=pid, pgid=sm._process_group_of(pid),
         )
-
         result = sm.stop_service(runtime, grace_seconds=10.0)
-
         assert result["port_free"] is True
         assert not sm.probe_port(port).listening
         assert result["signalled"]
@@ -647,9 +733,7 @@ def test_stop_service_escalates_when_sigterm_is_ignored():
             name="stubborn", port=port, pid=pid,
             pgid=sm._process_group_of(pid),
         )
-
         result = sm.stop_service(runtime, grace_seconds=2.0)
-
         assert result["port_free"] is True
         assert result["killed"], "expected a SIGKILL escalation"
     finally:
@@ -1038,21 +1122,47 @@ def test_reap_end_to_end_frees_a_real_port(tmp_path: Path):
     import sys as _sys
     import time as _time
 
-    port = _free_port()
-    script = (
-        "import http.server,socketserver;"
-        f"socketserver.TCPServer(('127.0.0.1',{port}),"
-        "http.server.SimpleHTTPRequestHandler).serve_forever()"
+    # Go through the same relocation machinery production uses, rather
+    # than hand-rolling a port here.
+    #
+    # This test's subject is the start → ledger → reap cycle. Which port
+    # that happens on is not part of it, and the test used to pin one:
+    # `_free_port()` asked the kernel for a free port, released it, and
+    # then spliced it into a `start_cmd` and assumed it stayed ours. It
+    # did not, about one run in ten — a desktop application on this
+    # machine was caught holding it — and every later step then reasoned
+    # from a premise that had already stopped being true.
+    #
+    # `allocate_free_port` documents that same window and says the answer
+    # is to retry on a fresh port when readiness fails, which is exactly
+    # what `_relocate_service` does. Using it means the test stops
+    # re-implementing a race the production path already handles, and
+    # stops failing for a reason that says nothing about the contract.
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    port = holder.getsockname()[1]          # a port we deliberately hold
+    try:
+        script = (
+            "import http.server,socketserver;"
+            f"socketserver.TCPServer(('127.0.0.1',{port}),"
+            "http.server.SimpleHTTPRequestHandler).serve_forever()"
+        )
+        decl = _decl(
+            name="stub", port=port,
+            start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
+            ready_timeout_seconds=20,
+        )
+        # Held, so the declared port is unusable and the service must
+        # land elsewhere — the exact situation `_relocate_service` is for.
+        runtime = sm._relocate_service(decl, tmp_path, foreign_cmdline="the test's own holder socket")
+    finally:
+        holder.close()
+    port = runtime.port
+    assert runtime.ready, (
+        f"the relocated stub never started: {runtime.detail!r}"
     )
-    decl = _decl(
-        name="stub", port=port,
-        start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
-        ready_timeout_seconds=20,
-    )
-    runtime_map = sm.ServiceRuntimeMap(runtimes={
-        "stub": sm.start_service(decl, tmp_path),
-    })
-    assert runtime_map.runtimes["stub"].ready
+    runtime_map = sm.ServiceRuntimeMap(runtimes={"stub": runtime})
     sm.record_runtimes(tmp_path, tmp_path.name, runtime_map, project_dir=tmp_path)
     assert sm.ledger_path(tmp_path).exists()
 
@@ -1066,3 +1176,71 @@ def test_reap_end_to_end_frees_a_real_port(tmp_path: Path):
     finally:
         _force_cleanup(runtime_map.runtimes["stub"].pid)
         _time.sleep(0.2)
+
+
+# ---------------------------------------------------------------------------
+# T2 / T3 — the callers, against a listener the probe used to mistake
+# ---------------------------------------------------------------------------
+#
+# The probe's own test (T1, in test_service_freshness) pins the query.
+# These pin the consequence: a client that connected and whose peer has
+# closed must not make `stop_service` or `reap_services` report that a
+# killed process still holds the port. Both callers are correct to
+# refuse to signal a process they did not start — that is the 2026-09-07
+# boundary — so a false "someone is listening" from the probe turned a
+# completed stop into a reported failure.
+#
+# The socket is never closed before the assertion, so by the time the
+# probe runs it is guaranteed to be in CLOSE_WAIT. That makes these
+# deterministic, which is the point: a test that only fails one run in
+# twenty cannot tell you whether a fix worked.
+
+
+def test_stop_reports_the_port_free_despite_a_lingering_client(tmp_path):
+    """A connected client is not a listener (T2)."""
+    port = _free_port()
+    pid = _spawn_http_server(port)
+    client = socket.create_connection(("127.0.0.1", port), timeout=5)
+    client_port = client.getsockname()[1]
+    try:
+        runtime = sm.ServiceRuntime(
+            name="stub", port=port, pid=pid, pgid=sm._process_group_of(pid),
+        )
+        result = sm.stop_service(runtime, grace_seconds=10.0)
+        assert result["port_free"] is True, (
+            f"stop reported the port held: {result.get('detail')!r}. "
+            f"A client of ours was left in CLOSE_WAIT on remote port {port} "
+            f"(local {client_port}); that is not a listener."
+        )
+    finally:
+        client.close()
+        _force_cleanup(pid)
+
+
+def test_reap_clears_the_ledger_despite_a_lingering_client(tmp_path):
+    """Same shape, through the reap path (T3)."""
+    port = _free_port()
+    pid = _spawn_http_server(port)
+    client = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        runtime = sm.ServiceRuntime(
+            name="stub", port=port, pid=pid, pgid=sm._process_group_of(pid),
+            start_cmd="stub", cwd=str(tmp_path),
+            origin="spawned",
+        )
+        sm.record_runtimes(
+            tmp_path, tmp_path.name,
+            sm.ServiceRuntimeMap(runtimes={"stub": runtime}),
+            project_dir=tmp_path,
+        )
+        report = sm.reap_services(tmp_path, grace_seconds=10.0)
+
+        assert report.reaped == ["stub"], (
+            f"reap did not clear the ledger: {report.to_dict()}. Our own "
+            f"client was in CLOSE_WAIT on this port; the probe read it as "
+            f"a listener and the service looked foreign."
+        )
+        assert report.foreign_ports == []
+    finally:
+        client.close()
+        _force_cleanup(pid)

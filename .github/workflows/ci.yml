@@ -20,19 +20,24 @@ name: CI
 #
 # Slim CI pipeline — target total runtime ≤ 15 minutes.
 #   1. PR gate:       lint + unit (sharded, with coverage) + integration
-#   2. Main release:  lint + unit + integration + e2e + slow
+#                     + e2e + time-sensitive   ← all of it gates the merge
+#   2. Main release:  the same set, on the merged result
 #   3. Nightly:       full automated regression suite (1482 tests,
 #                     not blocking the main release gate)
 #   4. Manual dispatch: maintainer-triggerable re-run of any layer
 #
 # Layered jobs (test-design decision point 7): unit / integration / e2e
-# / slow / nightly — each is its own job with its own marker, timeout,
-# and coverage gate. unit and integration were PR-only until
-# 2026-09-22; they now also run on push to main, because this repo's
-# workflow is a LOCAL merge into main followed by a direct push (there
-# are no PRs), so a PR-only gate never ran at all — and the e2e job,
-# which declares it runs on push to main, was silently skipped through
-# its ``needs: integration-tests``.
+# / time-sensitive / nightly — each is its own job with its own marker,
+# timeout, and coverage gate. Every layer except nightly gates the merge,
+# so all of them run on `pull_request` as well as on a push to main; a
+# gate that only runs after the merge is a report, not a gate. They were
+# main-only until 2026-10-02 on the reading that e2e and the
+# time-sensitive set belonged to the release — measured, e2e is 17 tests
+# in 28 seconds and the time-sensitive lane is 30 in 32, so the cost was
+# a revert instead of a red PR. The time-sensitive lane is chained after
+# the unit shards (`needs: unit-tests`) because it is the one layer whose
+# assertions are about wall-clock time and therefore only mean something
+# on a runner that is not already busy.
 #
 # The unit lane is a MATRIX of three shards (2026-09-22). As a single
 # job it ran 4916 tests and died at ~49 minutes on a GitHub runner with
@@ -72,7 +77,7 @@ name: CI
 #   - coverage-gate fail (<80%)          -> integration skipped
 #   - integration fail                   -> PR is blocked
 #   - e2e failure                        -> blocks main release
-#   - slow failure                       -> blocks main release
+#   - time-sensitive failure            -> blocks main release
 #   - nightly-regression failure         -> blocks release
 #   - Coverage report (unit)             -> uploaded as artifact on every PR
 #   - New code line coverage             -> gate ≥ 80% (--cov-fail-under=80,
@@ -94,7 +99,7 @@ on:
   # their own machine (scheduled outside this repository):
   #
   #   * cloud  → the cloud-runnable set (unit + integration + contract,
-  #              minus e2e/slow/perf/real_model)
+  #              minus e2e/time-sensitive/perf/real_model)
   #   * local  → ONLY the ``real_model`` marker, i.e. exactly what the
   #              cloud cannot run
   #
@@ -108,14 +113,12 @@ on:
     # 00:00 CST — two hours before the local nightly, so a cloud failure
     # is already visible when the local run reports.
     - cron: "0 16 * * *"
-  # Manual trigger — required for the e2e / slow layers (per test-design
-  # decision point 7: e2e/slow must NOT run on every PR, only on main or
-  # explicit manual dispatch). Lets maintainers force-run the slow suite
-  # when investigating flaky markers without waiting for the next push.
+  # Manual trigger — lets a maintainer force any layer when investigating
+  # a flaky marker without waiting for the next push or the nightly cron.
   workflow_dispatch:
     inputs:
       layer:
-        description: "Which test layer to run (unit|integration|e2e|slow|nightly)"
+        description: "Which test layer to run (unit|integration|e2e|time-sensitive|nightly)"
         required: false
         default: "all"
         type: choice
@@ -124,7 +127,7 @@ on:
           - unit
           - integration
           - e2e
-          - slow
+          - time-sensitive
           - nightly
       # Bisection harness for the "a shard wedges the runner" failure
       # (2026-09-23). A JSON array of matrix entries; each one becomes a
@@ -735,8 +738,19 @@ jobs:
           # took ten hours to locate: the failure destroyed the only
           # evidence that could have named it.
           #
-          # The wedge itself is a pipe that never reaches EOF, and this
-          # shape is chosen so there is no such pipe to hold.
+          # The shape does not matter — the payload did. The shard that
+          # wedged was `tests/unit/test_coding_tool.py`, whose provider-
+          # fallback tests reach `kill_process_group` with a mocked
+          # process. See `backend/utils/process.py` for the full account;
+          # the one-line version is that a `MagicMock` resolved to a
+          # process group of 1, and `os.killpg(1, SIGKILL)` is
+          # `kill(-1, SIGKILL)` — a broadcast that took the runner's
+          # worker down with it.
+          #
+          # What the foreground `timeout` buys is not a diagnosis but a
+          # floor: whatever the step does, the step ends, so the
+          # `if: always()` upload always runs and the next failure has
+          # evidence instead of a hole.
           #
           # `timeout` is an ordinary foreground child of this shell, so
           # the shell always returns and the step always ends. Three
@@ -772,7 +786,7 @@ jobs:
           COVERAGE_FILE=.coverage.${{ matrix.shard }} \
           timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
             ./.venv/bin/python3 -m pytest $TARGETS \
-              -m "not e2e and not integration and not perf" \
+              -m "not e2e and not integration and not time_sensitive and not perf" \
               --cov=. \
               --cov-report= \
               --tb=short \
@@ -859,26 +873,32 @@ jobs:
   # STAGE 1b — STAIRCASE (workflow_dispatch only): locate the CI wedge
   # ---------------------------------------------------------------------------
   #
-  # `unit` and `root` wedge the runner. The job does not finish, the STEP
-  # timeout (20m) does not fire, the JOB timeout (40m) does not fire, and
-  # GitHub cancels the run at ~45 minutes having uploaded nothing —
-  # post-steps stay `pending`, which says the runner agent itself stopped
-  # being scheduled rather than "the tests are slow". Four runs, same
-  # signature (35725371222, 35804605555, 35813699508, 35815833805,
-  # 35845978402). Locally the same selection finishes in 95s (`unit`) and
-  # 310s (`root`) with the same flags, the same `--cov`, the same
-  # environment and a 1.2 GB peak; a 2-CPU Linux container reproduces that.
+  # `unit` and `root` used to wedge the runner, and this job is what
+  # found out why — so the write-up matters more than the mechanism.
+  # Short version: the step timeout never fired because the process that
+  # owns that timer was dead. The shard's payload reached
+  # `os.killpg(1, SIGKILL)`; on glibc that is `kill(-1, SIGKILL)`, a
+  # broadcast, and it took `Runner.Worker` with it. The step could not
+  # conclude, the job uploaded nothing, and GitHub's server-side timeout
+  # reaped it five minutes later. Darwin rejects that same call with
+  # `EPERM`, which is why the suite always passed locally and the bug
+  # survived until a CI runner died. Full account in
+  # `backend/utils/process.py`.
   #
-  # Every timeout-based diagnostic is therefore dead on the runner, and the
-  # only remaining locator is a shard small enough to finish. This job makes
-  # that search cost a DISPATCH instead of a PUSH: a push-based bisection
-  # pays ~45 minutes per data point, a dispatch is ~10 minutes and carries
-  # several shard sizes at once (`fail-fast: false`).
+  # The ladder below stays because a 95-second local pass is not proof
+  # that a shard is harmless; it only proved that *this* platform does
+  # not execute the call. Four runs shared the signature
+  # (35725371222, 35804605555, 35813699508, 35815833805, 35845978402).
+  # Locally the same selection finishes in 95s (`unit`) and 310s
+  # (`root`) with the same flags, the same `--cov`, the same
+  # environment and a 1.2 GB peak; a 2-CPU Linux container reproduces
+  # that.
   #
-  # Putting a small shard and a large one in the same dispatch separates
-  # the two hypotheses in one run:
-  #   * only the large one wedges  -> it accumulates with volume
-  #   * a small one wedges         -> it is that shard's content
+  # A push-based bisection costs ~45 minutes per data point, a dispatch
+  # is ~10 minutes and carries several shard sizes at once
+  # (`fail-fast: false`). Putting a small shard and a large one in the
+  # same dispatch separates "it accumulates with volume" from "it is
+  # that shard's content" in one run.
   #
   # Not on the push path at all, and coverage-gate does not run on
   # workflow_dispatch, so nothing here can affect the merge gate.
@@ -1033,17 +1053,19 @@ jobs:
           # them per-test breadcrumbs) and exposes none at all while the
           # job is still in progress (an in-flight wedge read back 0),
           # which is precisely when the breadcrumbs would matter.
-          # Same single foreground `timeout` as the unit shards, for the
-          # same reason: the wedge is a pipe that never reaches EOF, and
-          # the hand-rolled `setsid` + `tail -f --pid` + `wait` plumbing
-          # had four separate ways to fail to end the step. `ci_process_guard`
-          # still reports the leaking test by name and reaps the survivors.
+          # Same single foreground `timeout` as the unit shards, for
+          # the same reason: it guarantees the step ends so the upload
+          # runs, and the hand-rolled `setsid` + `tail -f --pid` +
+          # `wait` plumbing had four separate ways to fail to end it.
+          # `ci_process_guard` still reports a leaking test by name and
+          # reaps the survivors — though note that it was never what was
+          # killing the shard; see `backend/utils/process.py`.
           WATCHDOG_SECONDS=1500
           set +e
           COVERAGE_FILE=.coverage.staircase-${{ matrix.shard }} \
           timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
             ./.venv/bin/python3 -m pytest $TARGETS \
-              -m "not e2e and not integration and not perf" \
+              -m "not e2e and not integration and not time_sensitive and not perf" \
               --cov=. \
               --cov-report= \
               --tb=short \
@@ -1217,16 +1239,26 @@ jobs:
   e2e-on-demand:
     name: E2E pipeline (mock plan, main release)
     runs-on: ubuntu-latest
-    # Per test-design decision point 7: e2e/slow only on main or manual
-    # dispatch — never on PR. Manual dispatch lets maintainers force-run
-    # the e2e layer when investigating flakes.
+    # Per test-design decision point 7: e2e runs on PRs as well as on
+    # main, so a broken pipeline is caught before the merge rather than
+    # after it. It was main-only while this layer cost ~30 minutes; it
+    # now costs 28 seconds for 17 tests, and a merge that turns main red
+    # is a revert, not a fix. Manual dispatch still force-runs it for
+    # flake investigation.
+    #
+    # ``not time_sensitive`` keeps out the 26 e2e tests that assert on
+    # wall-clock time. They are in the same directory but a different
+    # lane: they need the runner to themselves, which is what
+    # `existing-test` gives them, and the PR gate here runs beside the
+    # unit shards. See the `time_sensitive` marker definition in
+    # `backend/pytest.ini`.
     #
     # Default CI behaviour (push to main): runs the MOCK-PLAN E2E
     # only. The dangerous REAL-plan migration lives in its own
     # `real-plan-migration` job below, gated behind
     # `inputs.run_real_plan_migration == 'true'` so a routine push
     # or PR cannot trigger a real migration.
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     # Chain after the layered gates: the mock-plan E2E is the
     # cheapest of the e2e jobs so it runs by default; a real-plan
     # migration lives behind `real-plan-migration` (gated by the
@@ -1256,7 +1288,7 @@ jobs:
           backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout requests
 
       # E2E exercises the full pipeline: agent → executor → LLM (stub) →
-      # verifier → report. These are the slow tests; they only run on
+      # verifier → report. These assert on wall-clock time; they only run on
       # main, not on every PR. The full pytest suite (1482 tests) used
       # to also run here as a "regression" step, but it pushed the
       # total CI time past 45 minutes — far above the 15-minute
@@ -1267,7 +1299,7 @@ jobs:
       # already runs once a day on a cron and is not blocking).
       - name: Run E2E tests
         working-directory: backend
-        run: ./.venv/bin/python3 -m pytest tests/ -m "e2e" --tb=short --timeout=600 -v
+        run: ./.venv/bin/python3 -m pytest tests/ -m "e2e and not time_sensitive" --tb=short --timeout=600 -v
 
       - name: Upload E2E logs
         if: always()
@@ -1286,21 +1318,32 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # STAGE 4b — SLOW (main release / manual dispatch)
-  # Per test-design decision point 7: tests marked ``@pytest.mark.slow``
+  # Per test-design decision point 7: tests marked ``@pytest.mark.time_sensitive``
   # (long-running stress, soak, or full pipeline sweeps) are split out
   # from the regular suite so they do not block PR throughput. They run
   # only on push to main or on manual ``workflow_dispatch``. The
-  # dedicated job keeps the slow layer's timeout / artifact retention
+  # dedicated job keeps that layer's timeout / artifact retention
   # independent from the (faster) e2e job.
   # ---------------------------------------------------------------------------
 
   existing-test:
-    name: Slow tests (main release)
+    name: Time-sensitive + perf (serial lane)
     runs-on: ubuntu-latest
-    # Per test-design decision point 7: slow only on main or manual
-    # dispatch — never on PR. Manual dispatch lets maintainers force-run
-    # the slow layer when investigating flakes.
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    # Runs on PRs as well as main. These tests are not slow — the whole
+    # set is about 30 seconds — but they are the only tests that must
+    # have the machine to themselves, because each one asserts on
+    # wall-clock time. "4 VPs in flight finish in 10s, not 40s" is only
+    # a claim about the code if the CPU was not being fought over while
+    # it was measured.
+    #
+    # That is what `needs: unit-tests` buys. On a runner, the shards of
+    # `unit-tests` run in parallel with anything not chained after
+    # them, so without this the assertions below would be measuring
+    # scheduler contention. Chaining costs wall-clock — this job cannot
+    # start until the shards finish — and buys a verdict that means
+    # something.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    needs: unit-tests
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -1325,20 +1368,20 @@ jobs:
           backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout requests
 
       # Slow layer exercises stress / soak / full-pipeline sweeps gated
-      # by ``@pytest.mark.slow``. 30-minute per-test timeout covers
+      # by ``@pytest.mark.time_sensitive``. 30-minute per-test timeout covers
       # overnight-style scenarios; the global pytest-timeout ceiling
       # is 1800s. Failures block main release.
-      - name: Run slow tests
+      - name: Run time-sensitive and perf tests
         working-directory: backend
-        run: ./.venv/bin/python3 -m pytest tests/ -m "slow or perf" --tb=short --timeout=1800 -v --junitxml=slow-junit.xml
+        run: ./.venv/bin/python3 -m pytest tests/ -m "time_sensitive or perf" --tb=short --timeout=1800 -v --junitxml=timesensitive-junit.xml
 
-      - name: Upload slow logs
+      - name: Upload time-sensitive logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: slow-logs-main-${{ github.sha }}
+          name: timesensitive-logs-${{ github.sha }}
           path: |
-            backend/slow-junit.xml
+            backend/timesensitive-junit.xml
             backend/logs/
             backend/.pytest_cache/
           # upload-artifact v4.4+ skips dot-prefixed path components
@@ -1371,9 +1414,12 @@ jobs:
     # at the ~46-minute runner-image hang documented in
     # actions/runner-images#13770). 40 minutes is the unit+integration
     # suite's engineering budget plus CI headroom for the ~3x slowdown
-    # observed on the 2-CPU ubuntu-latest runner; slow + perf + e2e
-    # markers are excluded below to keep the actual run well under this
-    # cap.
+    # observed on the 2-CPU ubuntu-latest runner; the ``e2e``,
+    # ``time_sensitive`` and ``perf`` markers are excluded below to keep
+    # the actual run well under this cap. The nightly therefore covers
+    # the middle of the matrix only — it re-runs what a merge already
+    # ran, on days when no merge happened, and is the only signal that
+    # the suite is still green without a PR to attribute it to.
     timeout-minutes: 40
     steps:
       - name: Checkout
@@ -1439,7 +1485,7 @@ jobs:
         working-directory: backend
         run: |
           ./.venv/bin/python3 -m pytest tests/ \
-            -m "not e2e and not slow and not perf" \
+            -m "not e2e and not time_sensitive and not perf" \
             --tb=short \
             --timeout=120 \
             -n 2 \

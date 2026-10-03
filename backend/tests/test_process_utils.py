@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
@@ -157,3 +158,174 @@ def test_a_real_child_is_still_killed_after_the_guards() -> None:
 
     with pytest.raises(ProcessLookupError):
         os.getpgid(pgid)
+
+
+# ---------------------------------------------------------------------------
+# The POSIX sentinels.
+#
+# Everything above this line guards the *type* of the pid. This guards the
+# *value of the resulting group*, and it is the guard that closes the CI
+# wedge: `killpg(1, sig)` is `kill(-1, sig)`, a broadcast. The mock that
+# caused it resolved to 1 by way of `__index__`, but a stub with
+# `pid = 1` is a plain `int` and would pass an isinstance check.
+#
+# These are written as "killpg was never reached" rather than "killpg was
+# reached and refused", because the difference matters: on Linux the
+# broadcast succeeds, so a test that asserted on the return value would
+# itself be killing the runner it runs on. Asserting at the call boundary
+# keeps the whole suite safe to run anywhere.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sentinel",
+    [
+        pytest.param(1, id="one-broadcasts-to-every-same-uid-process"),
+        pytest.param(0, id="zero-is-the-callers-own-group"),
+        pytest.param(-1, id="negative-one-reaches-init-as-a-plain-pid"),
+        pytest.param(-12345, id="arbitrary-negative-pid"),
+    ],
+)
+def test_a_sentinel_pgid_never_reaches_killpg(sentinel: int) -> None:
+    """``os.killpg`` must not be called for a reserved ``pgid``.
+
+    ``killpg(1, SIGKILL)`` is the exact statement that wedged the CI
+    shard: glibc has no special case, so it becomes ``kill(-1, sig)``
+    and SIGKILLs every process the caller may signal — the runner's
+    worker, its shell, and the job. Darwin's libc returns ``EPERM``
+    before the kernel is reached, which is why this shipped unnoticed:
+    the same line is a dud on a Mac and a grenade in CI.
+    """
+    proc = MagicMock()
+    proc.pid = 4242  # a real int, so `_child_pid` lets it through
+    with patch("utils.process.os.getpgid", return_value=sentinel):
+        with patch("utils.process.os.killpg") as mock_killpg:
+            kill_process_group(proc)
+
+    mock_killpg.assert_not_called(), (
+        f"killpg({sentinel}, ...) reached os.killpg; on Linux that is a "
+        f"broadcast or the caller's own group, not a child of ours"
+    )
+
+
+def test_a_bool_pgid_never_reaches_killpg() -> None:
+    """``True`` is ``1`` and ``False`` is ``0`` — both are sentinels.
+
+    ``bool`` subclasses ``int``, so without the explicit check a group
+    of ``True`` walks straight past ``isinstance(pgid, int)`` and lands
+    on the broadcast.
+    """
+    for sentinel in (True, False):
+        proc = MagicMock()
+        proc.pid = 4242
+        with patch("utils.process.os.getpgid", return_value=sentinel):
+            with patch("utils.process.os.killpg") as mock_killpg:
+                kill_process_group(proc)
+        mock_killpg.assert_not_called(), (
+            f"killpg({sentinel!r}, ...) reached os.killpg"
+        )
+
+
+def test_the_lowest_legitimate_pgid_is_still_signalled() -> None:
+    """Pin the boundary: ``2`` is the first signallable group.
+
+    Guards that reject too much are as broken as guards that reject too
+    little, and this is the one that catches an off-by-one in the
+    sentinel check — ``<= 1`` is correct, ``<= 2`` would be a bug.
+    """
+    proc = MagicMock()
+    proc.pid = 4242
+    with patch("utils.process.os.getpgid", return_value=2):
+        with patch("utils.process.os.getpgrp", return_value=999999):
+            with patch("utils.process.os.killpg") as mock_killpg:
+                kill_process_group(proc)
+
+    mock_killpg.assert_called_once_with(2, mock_killpg.call_args[0][1])
+
+
+# ---------------------------------------------------------------------------
+# The conftest tripwire itself.
+#
+# A guard nobody tests is a guard that quietly stops guarding — usually
+# because a refactor moved the call, not because anyone undid the fix.
+# These pin the tripwire while the suite is still green; the interesting
+# failure mode is the one where these go quiet.
+# ---------------------------------------------------------------------------
+
+
+def _tripwire_reports(request) -> list:
+    """The conftest tripwire's report list, reached the way pytest sees it.
+
+    ``import conftest`` does not work: pytest loads the file under a
+    dotted name derived from rootdir (``backend.tests.conftest``), and
+    the plugin manager registers it under a name of its own, so neither
+    ``import conftest`` nor ``get_plugin`` finds it. Looking for the
+    loaded module by suffix survives both.
+    """
+    for name, module in list(sys.modules.items()):
+        if name.endswith("conftest") and hasattr(module, "_KILLPG_REPORTS"):
+            return module._KILLPG_REPORTS
+    raise AssertionError(
+        "the conftest tripwire is not installed — no conftest module "
+        "exposes _KILLPG_REPORTS, so the fuse would never fire"
+    )
+
+
+def test_the_tripwire_ignores_a_legitimate_group(request) -> None:
+    """``pgid >= 2`` must never be reported, or the fuse is noise.
+
+    Uses signal 0 — the existence-check signal, which resolves the target
+    and the permission without delivering anything. ``unittest.mock``
+    cannot be used here: patching ``os.killpg`` replaces the very call
+    the audit hook observes, which is exactly the way to get a green run
+    from a broken fuse.
+    """
+    reports = _tripwire_reports(request)
+
+    before = len(reports)
+    with contextlib.suppress(OSError):
+        os.killpg(2, 0)
+    assert len(reports) == before, (
+        "the tripwire flagged pgid=2, which is an ordinary group"
+    )
+
+
+@pytest.mark.parametrize("sentinel", [1, 0], ids=["broadcast", "own-group"])
+def test_the_tripwire_catches_a_sentinel(request, sentinel: int) -> None:
+    """A sentinel reaching ``killpg`` must be recorded, with its stack.
+
+    Signal 0 again: the point is that the *attempt* is caught, and no
+    process on this machine should have to die to prove it. On macOS the
+    call is refused by libc anyway; on Linux CI it would succeed, which
+    is why the assertion is on the report and not on the return value.
+    """
+    reports = _tripwire_reports(request)
+
+    before = len(reports)
+    with contextlib.suppress(OSError):
+        os.killpg(sentinel, 0)
+    assert len(reports) == before + 1, (
+        f"pgid={sentinel} reached os.killpg and the tripwire did not "
+        f"record it — the fuse is not installed or not matching"
+    )
+    assert "os.killpg" in reports[-1]
+    # This call was made on purpose to prove the fuse works. Drop the
+    # record so the end-of-session check stays meaningful: it must fire
+    # on accidents, not on the tests that verify it.
+    del reports[before:]
+
+
+def test_the_tripwire_stays_quiet_across_the_whole_suite(request) -> None:
+    """Nothing in this file may attempt a sentinel kill.
+
+    The unit tests above drive ``os.killpg`` through a mock, which the
+    hook cannot see, so this is the check that a real one never happens
+    either. It runs last, so a violation surfaces after the rest of the
+    session has already been reported.
+    """
+    reports = _tripwire_reports(request)
+
+    assert reports == [], (
+        "a sentinel killpg was attempted somewhere in this module: "
+        + "\n".join(reports)
+    )

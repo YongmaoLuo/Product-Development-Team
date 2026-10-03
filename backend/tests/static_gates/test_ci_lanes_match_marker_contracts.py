@@ -7,10 +7,10 @@ each class of test runs, and the workflow's ``-m`` expressions are what
 actually decides it. Nothing tied the two together, and they had drifted in
 both directions at once:
 
-* ``perf`` was documented as slow-lane-only — the marker text claimed the
-  addopts' ``-m "not slow"`` excluded it, which they never did — so the
-  startup-latency benchmarks were collected by the default unit shard and
-  asserted a millisecond-scale difference on a shared runner.
+* ``perf`` was documented as serial-lane-only — the marker text claimed the
+  addopts excluded it, which they never did — so the startup-latency
+  benchmarks were collected by the default unit shard and asserted a
+  millisecond-scale difference on a shared runner.
 * ``test_agent_execute_task_first5.py`` spawns ``pytest`` as a subprocess
   for every test it contains, which is the ``integration`` marker's
   definition, but carried no marker — so the default shard collected it
@@ -27,7 +27,7 @@ What this pins
 1. **The default lanes exclude the markers they are documented not to
    run.** ``unit-tests`` and ``unit-staircase`` must exclude ``perf``
    alongside ``e2e`` and ``integration``.
-2. **The exclusions have a home.** The slow lane must collect ``perf``;
+2. **The exclusions have a home.** The serial lane must collect ``perf``;
    excluding a marker from every lane would be a different way of making
    the same tests never run.
 3. **A test that spawns subprocesses says so.** The nested-pytest file
@@ -59,7 +59,24 @@ _MARKER_RE = re.compile(r'-m\s+"([^"]+)"')
 
 #: The set of markers the default lanes must not collect, per the marker
 #: documentation in ``backend/pytest.ini``.
-_DEFAULT_LANE_EXCLUSIONS = ("e2e", "integration", "perf")
+#:
+#: ``time_sensitive`` is here for the same reason as the other three, and the
+#: reason it was missing is worth recording. Every time-sensitive test that
+#: exists today happens to live in ``tests/e2e/`` or
+#: ``tests/integration/``, so ``not e2e and not integration`` already keeps
+#: them off the default lanes — by accident, not by contract. The ``root``
+#: lane scans ``tests/`` minus an ignore list, so any new top-level
+#: directory is swept in, and a test carrying only
+#: ``@pytest.mark.time_sensitive`` would land in a 900-second-watched PR
+#: lane whose per-test budget is 120s. That lane's own budget is 1800s,
+#: and it is the only one that runs with the machine to itself — which is
+#: the entire point of the marker. Sharing CPU with a parallel shard makes
+#: the wall-clock bound it asserts unmeasurable.
+#:
+#: So the exclusion is stated where the gate can enforce it. Marking a
+#: test ``time_sensitive`` now makes this gate demand the exclusion, and
+#: the author discovers at PR time that the test needs the serial lane.
+_DEFAULT_LANE_EXCLUSIONS = ("e2e", "integration", "time_sensitive", "perf")
 
 
 def _run_blocks(job: dict) -> list[str]:
@@ -121,7 +138,7 @@ def test_default_lane_excludes_the_marker(job_name: str, marker: str) -> None:
     )
 
 
-def test_the_slow_lane_collects_perf() -> None:
+def test_the_serial_lane_collects_perf() -> None:
     """Excluding ``perf`` everywhere would mean it never runs at all.
 
     The complement of the assertion above, and the reason it is safe to add
@@ -129,14 +146,14 @@ def test_the_slow_lane_collects_perf() -> None:
     the only one in this workflow that fits a benchmark asserting on
     millisecond-scale timing.
 
-    The job is keyed ``existing-test`` while displaying as "Slow tests
-    (main release)" — the key names neither the lane nor the marker, which
+    The job is keyed ``existing-test`` while displaying as "Time-sensitive
+    + perf (main release)" — the key names neither the lane nor the marker, which
     is why this reads the key deliberately rather than guessing from the
     display name. ``_marker_expression`` fails loudly if the key disappears.
     """
     expression = _marker_expression("existing-test")
     assert "perf" in expression, (
-        f"the slow lane runs with `-m \"{expression}\"`, which does not "
+        f"the serial lane runs with `-m \"{expression}\"`, which does not "
         f"collect `perf`. The default lanes exclude it (see the test above), "
         f"so with neither collecting it the benchmarks would run nowhere."
     )
@@ -627,4 +644,85 @@ def test_the_bisect_lane_runs_the_shape_it_bisects(flag: str) -> None:
     assert not missing, (
         f"{', '.join(missing)} no longer passes {flag!r} to pytest, so the "
         f"bisect harness runs a different shape than the shard it bisects"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The layers that must run before a merge, not after one
+# ---------------------------------------------------------------------------
+
+#: Jobs that gate a merge, and therefore have to run on ``pull_request``.
+#:
+#: Both of these were main-only until 2026-10-02, on the reading that a
+#: merge is where the slow layers belong. Measured, that reading was
+#: wrong: e2e is 17 tests in 28 seconds and the time-sensitive lane is 30
+#: in 32. What they cost is not minutes, it is the fact that a main-only
+#: gate reports a broken pipeline *after* it is on main, where the fix is
+#: a revert.
+_MERGE_GATING_JOBS = ("e2e-on-demand", "existing-test")
+
+
+@pytest.mark.parametrize("job_name", _MERGE_GATING_JOBS)
+def test_a_merge_gating_layer_also_runs_on_pull_request(job_name: str) -> None:
+    """A layer that gates the merge must run on the PR, not on main.
+
+    Reading the ``if`` rather than trusting the job's placement: the
+    failure this catches is a job that sits in the main-release section
+    and looks like a gate, so nothing in the file announces that it will
+    not actually block anything.
+    """
+    workflow = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+    condition = str(workflow["jobs"][job_name].get("if", ""))
+    assert "pull_request" in condition, (
+        f"the {job_name} layer is gated on {condition!r}, which excludes "
+        f"pull_request. It is a merge gate: a failure in it must block the "
+        f"merge, and a failure discovered on main instead is a revert."
+    )
+
+
+def test_the_time_sensitive_lane_is_chained_after_the_shards() -> None:
+    """The time-sensitive lane must not run beside the unit shards.
+
+    Every test in it asserts on wall-clock time. GitHub gives a runner to
+    each job that has nothing else pending, so a job with no ``needs``
+    starts immediately and runs alongside the three unit shards — and the
+    parallelism contract it is there to check gets measured against
+    scheduler contention instead of against the code.
+
+    Chaining after ``unit-tests`` costs wall clock, and is the only thing
+    that makes the measurement mean anything.
+    """
+    workflow = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+    needs = workflow["jobs"]["existing-test"].get("needs")
+    if isinstance(needs, str):
+        needs = [needs]
+    assert "unit-tests" in (needs or []), (
+        f"existing-test has needs={needs!r}. Without unit-tests in the "
+        f"chain this job starts alongside the shards, and its wall-clock "
+        f"assertions measure contention rather than the code under test."
+    )
+
+
+def test_the_pr_e2e_lane_excludes_the_time_sensitive_tests() -> None:
+    """The e2e lane and the serial lane must not both collect the same test.
+
+    ``tests/e2e/`` holds 26 wall-clock tests alongside 17 that just walk
+    the pipeline. Both are marked ``e2e``, so ``-m "e2e"`` would collect
+    the wall-clock ones here too — on a job that runs beside the shards,
+    which is exactly the situation the serial lane exists to avoid. The
+    exclusion is what keeps the two lanes disjoint.
+    """
+    expression = _marker_expression("e2e-on-demand")
+    assert "e2e" in expression and "not time_sensitive" in expression, (
+        f"the e2e lane runs with `-m \"{expression}\"`. It needs to collect "
+        f"`e2e` and exclude `time_sensitive`: the 26 wall-clock tests that "
+        f"live in tests/e2e/ belong to the serial lane, which has the "
+        f"runner to itself."
+    )
+
+
+def test_the_merge_gating_list_is_not_empty() -> None:
+    assert _MERGE_GATING_JOBS, (
+        "no merge-gating jobs declared — the checks above would pass "
+        "vacuously"
     )

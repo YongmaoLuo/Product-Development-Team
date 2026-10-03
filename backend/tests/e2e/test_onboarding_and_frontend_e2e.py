@@ -73,7 +73,7 @@ import pytest
 
 pytestmark = [
     pytest.mark.e2e,
-    pytest.mark.slow,
+    pytest.mark.time_sensitive,
 ]
 
 
