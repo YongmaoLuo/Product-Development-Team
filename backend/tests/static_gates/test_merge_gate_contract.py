@@ -559,3 +559,116 @@ class TestStaticGatesRunBeforeTheLanes:
                 f"dedicated job and inside the shard matrix. Add the "
                 f"ignore; the dedicated job is the one the lanes depend on."
             )
+
+
+def _strip_yaml_comments(text: str) -> str:
+    """Drop whole-line ``#`` comments before asserting on a shape.
+
+    A substring check over a workflow file matches the prose as readily as
+    the code: this repository already paid for that lesson once, when a
+    watchdog gate looked for ``"setsid" in step["run"]`` and a newly
+    written *comment* mentioning ``setsid`` made it mistake a step that
+    no longer ran pytest for one that did. Two assertions below were
+    caught doing the same thing — one passed on the word "shuffle" in an
+    explanatory paragraph after the shuffle itself had been replaced by
+    ``sorted``.
+
+    Only full-line comments are removed. Block comments do not appear in
+    these workflows, and a naive ``#`` strip would also eat the ``#``
+    inside a string, which is a different class of mistake to introduce
+    while fixing this one.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+class TestTheShardsExecuteInAVaryingOrder:
+    """A suite that has only ever run one order has never been tested
+    for order dependence.
+
+    The failure this exists to keep finding is concrete and was found by
+    doing exactly this: fifteen test files write ``_verification_state``
+    as a bare ``dict[key] = ...``, and
+    ``test_round_start_liveness_state`` asserts a count taken across that
+    whole dictionary. Its own entry is terminal and does not count, so
+    the assertion reads as a property of that one test — and is actually
+    a property of everything that ran before it. It passed in its
+    natural position for as long as the suite had been run, and failed on
+    the first shuffled order tried.
+
+    What makes this worth a gate rather than a habit is that the
+    evidence is invisible from the green side. Every contract here passes
+    whatever order it runs in, so "the suite is green" is not evidence
+    about order, and nothing about a refactor suggests the shuffle
+    disappeared. A gate that only asserts on a diff is exactly the kind
+    that goes quiet.
+
+    Scope, stated honestly: this asserts the workflow shuffles and that
+    the seed is derived from the run. It cannot prove the resulting
+    orders differ — that would need running two runs, which is a
+    different kind of test. What it does make loud is the disappearance.
+    """
+
+    def test_the_shuffled_lane_job_exists(self, jobs):
+        assert "unit-tests" in jobs, (
+            "ci.yml has no `unit-tests` job, so there is no shard to "
+            "randomise; this file is looking at a workflow that has been "
+            "renamed or restructured"
+        )
+
+    def test_the_lanes_shuffle_before_running(self, workflow):
+        body = _strip_yaml_comments(
+            yaml.safe_dump(
+                workflow["jobs"]["unit-tests"], sort_keys=False, width=10_000
+            )
+        )
+        assert "EXEC_ORDER" in body, (
+            "the shard step does not build an EXEC_ORDER. The pytest "
+            "invocation must run the shuffled file list, not the "
+            "collection-ordered TARGETS it is derived from — the shuffle "
+            "computes a value and then ignores it otherwise."
+        )
+        # Assert the shuffle *runs on the pytest line*, not merely that
+        # the name appears somewhere: computing a shuffled list and
+        # passing the unsorted one is the exact shape of a gate that
+        # reports what it did not do.
+        pytest_line = next(
+            (ln for ln in body.splitlines() if "-m pytest" in ln), ""
+        )
+        assert "$EXEC_ORDER" in pytest_line, (
+            "the pytest invocation does not take $EXEC_ORDER — the order "
+            "is computed and then thrown away. Found: "
+            f"{pytest_line.strip()!r}"
+        )
+        assert ".shuffle(" in body, (
+            "no shuffle call in the shard step. Either it was reverted or "
+            "it was replaced with something deterministic (`sorted`), which "
+            "leaves the suite no more order-independent than before while "
+            "looking like it is."
+        )
+
+    def test_the_seed_comes_from_the_run(self, workflow):
+        body = _strip_yaml_comments(
+            yaml.safe_dump(
+                workflow["jobs"]["unit-tests"], sort_keys=False, width=10_000
+            )
+        )
+        assert "github.run_id" in body or "github.run_attempt" in body, (
+            "the order seed is not derived from the run, so every run "
+            "executes the same order and the suite is no more order-"
+            "independent than before — it just looks like it is."
+        )
+
+    def test_the_seed_is_printed(self, workflow):
+        body = _strip_yaml_comments(
+            yaml.safe_dump(
+                workflow["jobs"]["unit-tests"], sort_keys=False, width=10_000
+            )
+        )
+        assert "execution order seed" in body, (
+            "the seed is not echoed. Without it a shuffled failure cannot "
+            "be reproduced, and an unreproducible failure gets rerun until "
+            "it goes green — which is the exact habit this was built to "
+            "break."
+        )
