@@ -854,10 +854,46 @@ jobs:
           # and below the job ceiling so the `if: always()` upload below
           # still has room to run.
           WATCHDOG_SECONDS=900
+
+          # --- order independence ------------------------------------------
+          # Shuffle the order this shard *executes* its files in, seeded
+          # from the run so it differs every time but is reproducible from
+          # the log. The partition above stays deterministic: the point is
+          # not to move files between shards (they run on separate runners
+          # and cannot interfere), it is to vary what runs before what
+          # *inside* one process, because that is where order dependence
+          # actually lives.
+          #
+          # The reason to want it: every one of these contracts passes
+          # whatever order it runs in, so a passing suite has never been
+          # evidence of order independence. A real example — fifteen test
+          # files write ``server._verification_state`` as a bare
+          # ``dict[key] = ...``, and
+          # ``test_round_start_liveness_state`` asserts a count taken
+          # across that whole dictionary. It passed in its natural
+          # position for as long as the suite had been run, and failed on
+          # the first shuffled order tried.
+          # ``isolated_runtime_plan_state`` in ``tests/conftest.py`` is the
+          # fix for that one; this is what keeps finding the next one.
+          #
+          # ``random.Random(seed).shuffle`` rather than
+          # ``shuf --random-source``: the runner's ``shuf`` wants a byte
+          # stream and this seed is a short string, and a stream that runs
+          # dry is a second, quieter way for the order to stop varying.
+          ORDER_SEED="${{ github.run_id }}.${{ github.run_attempt }}.${{ matrix.shard }}"
+          EXEC_ORDER=$(./.venv/bin/python3 -c '
+          import random, sys
+          files = sys.argv[1].split()
+          random.Random(sys.argv[2]).shuffle(files)
+          print(" ".join(files))
+          ' $TARGETS "$ORDER_SEED")
+          echo "execution order seed: ${ORDER_SEED}"
+          echo "execution order: ${EXEC_ORDER}"
+
           set +e
           COVERAGE_FILE=.coverage.${{ matrix.shard }} \
           timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
-            ./.venv/bin/python3 -m pytest $TARGETS \
+            ./.venv/bin/python3 -m pytest $EXEC_ORDER \
               -m "not e2e and not integration and not time_sensitive and not perf" \
               --cov=. \
               --cov-report= \
