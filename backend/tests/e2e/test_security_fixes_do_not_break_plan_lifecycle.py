@@ -71,10 +71,11 @@ import pytest
 # ``e2e`` flags the file as a real-process integration test (the
 # ``conftest.py::hermetic_*`` fixtures already isolate state.db and
 # plans_dir, so a process boundary is the only thing left to opt into).
-# ``slow`` flags the multi-second runtime (subprocess boot + warm-up).
+# ``time_sensitive`` flags the multi-second runtime (subprocess boot + warm-up),
+# and the wall-clock bounds asserted alongside it.
 pytestmark = [
     pytest.mark.e2e,
-    pytest.mark.slow,
+    pytest.mark.time_sensitive,
 ]
 
 

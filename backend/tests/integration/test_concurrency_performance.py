@@ -30,11 +30,11 @@ file-lock and memory-conflict mechanisms exercised in tasks 4 and 5:
       (≤ 30s budget). A deadlock or starvation would push the run
       past the budget; this is the deadlock regression net.
 
-All four tests are marked ``@pytest.mark.slow`` and are **skipped by
+All four tests are marked ``@pytest.mark.time_sensitive`` and are **skipped by
 default** to keep the fast / default test loop hermetic. The skip is
 enforced at the project level: ``backend/pytest.ini`` ships with
-``-m "not slow"`` in ``addopts``, so a plain ``pytest`` run deselects
-all ``slow``-marked tests. Opt in with:
+``-m "not time_sensitive"`` in ``addopts``, so a plain ``pytest`` run deselects
+all ``time_sensitive``-marked tests. Opt in with:
 
     pytest tests/integration/test_concurrency_performance.py -m slow -v
     pytest tests/integration/test_concurrency_performance.py -m "not notslow" -v
@@ -93,7 +93,7 @@ from file_lock_manager import FileLockManager  # noqa: E402
 # decorators would be redundant.
 #
 # The "skipped by default" behaviour is enforced at the project level
-# via ``-m "not slow"`` in ``backend/pytest.ini``'s ``addopts`` (see
+# via ``-m "not time_sensitive"`` in ``backend/pytest.ini``'s ``addopts`` (see
 # the module docstring above). We do NOT register a local
 # ``pytest_collection_modifyitems`` / ``pytest_addoption`` here
 # because pytest only auto-discovers hooks from conftest.py and
@@ -102,7 +102,7 @@ from file_lock_manager import FileLockManager  # noqa: E402
 # both the simplest and the only working mechanism.
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.slow,
+    pytest.mark.time_sensitive,
 ]
 
 
@@ -759,8 +759,8 @@ def test_deadlock_free_stress(tmp_path: Path) -> None:
 #   ✓ test_deadlock_free_stress
 #       50 tasks / 5 files → all complete in ≤ 30s
 #
-# All four are decorated with ``@pytest.mark.slow`` via the module
-# ``pytestmark`` and skipped by default (``-m "not slow"`` in
+# All four are decorated with ``@pytest.mark.time_sensitive`` via the module
+# ``pytestmark`` and skipped by default (``-m "not time_sensitive"`` in
 # ``backend/pytest.ini``). Opt in with:
 #     pytest -m slow tests/integration/test_concurrency_performance.py -v
 # or override the default deselection with:
