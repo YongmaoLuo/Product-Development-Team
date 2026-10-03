@@ -1,22 +1,28 @@
 name: JSON cleanup defense gate
 
 on:
+  # No `paths:` filter, deliberately.
+  #
+  # This workflow's job is a required status check, and GitHub's rule for
+  # required checks is unforgiving: a workflow that is *skipped* by path
+  # filtering leaves the check in "Pending" forever, and a pending
+  # required check blocks every merge with no way to satisfy it. The
+  # filter was here to save ~40s of e2e on unrelated pull requests, and
+  # the price was that a pull request touching only `ci.yml` could never
+  # be merged at all.
+  #
+  # A required check and a path filter are mutually exclusive; only one
+  # of them can be had. The test is a required check.
+  #
+  # tests/static_gates/test_merge_gate_contract.py pins this: no workflow
+  # in this repository may path-filter a pull-request trigger, because
+  # none of them can be required while doing so.
   pull_request:
     branches:
       - main
-    paths:
-      - "backend/server.py"
-      - "backend/verification_executor.py"
-      - "backend/state_machine/**"
-      - "backend/tests/test_server_json_cleanup.py"
   push:
     branches:
       - main
-    paths:
-      - "backend/server.py"
-      - "backend/verification_executor.py"
-      - "backend/state_machine/**"
-      - "backend/tests/test_server_json_cleanup.py"
 
 permissions:
   contents: read
