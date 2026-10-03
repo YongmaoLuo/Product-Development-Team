@@ -98,7 +98,7 @@ from preflight_review import PreFlightReviewer
 from verification import VerificationOrchestrator
 from execution_logger import ExecutionLogger
 from utils.atomic_io import atomic_write_json
-from utils.process import kill_process_group
+from utils.process import _signallable_pgid, kill_process_group
 from sub_agent_registry import sub_agent_registry, SUB_AGENT_STALE_THRESHOLD_SEC
 from provider_order import load_fallback_order, ProviderOrderError
 from runtime_state import RuntimeState
@@ -2094,7 +2094,8 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         return
     try:
         pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
+        if _signallable_pgid(pgid) is not None:
+            os.killpg(pgid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
         pass
     try:
