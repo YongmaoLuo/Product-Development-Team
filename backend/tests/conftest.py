@@ -2081,3 +2081,63 @@ def mock_verification_report_factory():
 def plan_dir_writer():
     """Fixture wrapper around :func:`write_plan_dir`."""
     return write_plan_dir
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_plan_state():
+    """Every test starts with empty runtime plan state, and leaves it empty.
+
+    ``server`` keeps two process-global dictionaries that map a plan id to
+    whatever the server currently believes about that plan's run:
+
+        * ``_verification_state`` — round, status, stop reason
+        * ``_execution_state``     — the same shape for execution
+
+    Fifteen test files write into the first and thirteen into the second,
+    and the writes are bare ``dict[key] = ...`` — a ``monkeypatch`` in the
+    same function is usually patching something else, so it does not undo
+    these. Every one of them therefore leaks its entries into every later
+    test in the same process, which makes "what ran before me" part of the
+    input to any assertion that counts across the dictionary.
+
+    That is not hypothetical here, and it is not subtle once you see it.
+    ``test_round_start_liveness_state.py`` seeds one plan as ``loop_stopped``
+    — a terminal status — and then asserts ``get_active_tasks()`` reports
+    zero active verifications. Its own entry does not count. The count
+    spans the whole dictionary, so a single non-terminal entry left behind
+    by any earlier test flips that assertion from 0 to 1. The test passes
+    in its natural position and fails in a shuffled one; the suite has
+    been green for that reason rather than because the property holds.
+
+    Two fixtures in this file already isolate process globals the same way
+    — ``isolated_provider_state`` for the shared tracker and cooldown, and
+    ``_scrub_fixture_plan_ids_per_test`` for rows the e2e lane leaves in
+    the state database. This is the third instance of the same shape, and
+    it is the last one that can be added reactively: the remaining
+    exposure is whatever nobody has written a test for yet, which is what
+    running the suite in a shuffled order is for.
+
+    The snapshot is shallow. Keys are restored, values are shared — so a
+    test that mutates a nested dict *in place* still leaks that mutation.
+    Deep-copying was rejected on purpose: the values hold thread handles
+    and cancellation tokens, and copying those is a worse failure than the
+    one it would prevent. Restoring rather than clearing outright is also
+    deliberate, so a session-scoped fixture that seeds state on purpose
+    still has it after the first test runs.
+    """
+    import server
+
+    saved: dict[str, dict] = {}
+    for attr in ("_verification_state", "_execution_state"):
+        store = getattr(server, attr, None)
+        if isinstance(store, dict):
+            saved[attr] = dict(store)
+            store.clear()
+    try:
+        yield
+    finally:
+        for attr, snapshot in saved.items():
+            store = getattr(server, attr, None)
+            if isinstance(store, dict):
+                store.clear()
+                store.update(snapshot)

@@ -310,6 +310,67 @@ jobs:
         run: bash ../scripts/grep_guard.sh
 
   # ---------------------------------------------------------------------------
+  # STAGE 1 — STATIC GATES
+  #
+  # The 200-odd contracts in ``backend/tests/static_gates/`` are pytest
+  # files, so before this job they ran inside the ``root`` lane — sharded
+  # across ``root-0..root-6``, in parallel with the other nineteen. That
+  # made them a gate in name only: a static failure arrived at the same
+  # moment twenty runners were already committed to finishing, and the
+  # operator paid for all of them to learn something a 15-second job
+  # could have said first.
+  #
+  # Here they are their own job, and every test lane depends on it. One
+  # runner, no shard matrix, no coverage instrumentation (``.coveragerc``
+  # omits ``tests/*``, so moving them out of the sharded lanes does not
+  # change the 80% aggregate at all).
+  #
+  # What it costs: the lanes start ~40s later, once the slowest
+  # prerequisite reports. What it buys: a red gate costs one VM instead
+  # of twenty, and says so in about a minute instead of after the whole
+  # matrix. On a repository whose failures are mostly "someone changed
+  # one thing and it broke a contract", that is the right side of the
+  # trade.
+  # ---------------------------------------------------------------------------
+
+  static-gates:
+    name: Static gates (contracts)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      # The gates are pure pytest and import the backend modules they
+      # read, so they need the venv — the same rule every other lane
+      # follows (CLAUDE.md: never run pytest on the system interpreter).
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install --upgrade pip
+          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+
+      # No ``--cov``: these tests measure source shape, not behaviour,
+      # and their own lines are excluded from the coverage aggregate by
+      # ``.coveragerc`` anyway.
+      - name: Run the static gates
+        working-directory: backend
+        run: |
+          .venv/bin/python3 -m pytest tests/static_gates/ \
+            -p no:cacheprovider -q --timeout=300
+
+  # ---------------------------------------------------------------------------
   # Commit-message hygiene
   # ---------------------------------------------------------------------------
   # Rejects the two shapes that make an authorship claim about an AI system:
@@ -510,7 +571,13 @@ jobs:
     # failure on a forbidden filename pattern fails fast (seconds)
     # and blocks the slower unit + integration layers from wasting
     # CI minutes on a known-bad tree.
-    needs: grep-guard
+    # Every cheap gate is a prerequisite, not just grep-guard. A shard is
+    # a whole runner VM: starting twenty of them and then discovering
+    # that bandit failed wastes the entire matrix. The gates run in
+    # parallel and the slowest is ~45s, so the serial cost on a green
+    # pull request is a few seconds — cheap against twenty VMs burned
+    # on a red one.
+    needs: [lint, grep-guard, commit-hygiene, commit-range-privacy, static-gates]
     # ``fail-fast: false`` is deliberate: one shard dying must not
     # cancel the others, because the surviving shards are exactly the
     # evidence needed to locate the problem.
@@ -680,7 +747,12 @@ jobs:
           # tests/unit sit at its top level.
           case "${{ matrix.lane }}" in
             unit) LANE_PATHS="tests/unit" ;;
-            root) LANE_PATHS="tests/ --ignore=tests/unit --ignore=tests/contract --ignore=tests/concurrency --ignore=tests/performance --ignore=tests/security --ignore=tests/meta_tests" ;;
+            # ``--ignore=tests/static_gates`` because those are a gate,
+            # not a lane: they run in the single `static-gates` job that
+            # every test lane depends on. Leaving them in here meant a
+            # static-gate failure arrived at the same moment 19 shards
+            # were already in flight — the cost this job exists to remove.
+            root) LANE_PATHS="tests/ --ignore=tests/unit --ignore=tests/static_gates --ignore=tests/contract --ignore=tests/concurrency --ignore=tests/performance --ignore=tests/security --ignore=tests/meta_tests" ;;
             misc) LANE_PATHS="tests/contract tests/security tests/meta_tests tests/concurrency tests/performance" ;;
             *) echo "::error::unknown lane '${{ matrix.lane }}'"; exit 2 ;;
           esac
@@ -782,10 +854,76 @@ jobs:
           # and below the job ceiling so the `if: always()` upload below
           # still has room to run.
           WATCHDOG_SECONDS=900
+
+          # --- order independence ------------------------------------------
+          # Shuffle the order this shard *executes* its files in, seeded
+          # from the run so it differs every time but is reproducible from
+          # the log. The partition above stays deterministic: the point is
+          # not to move files between shards (they run on separate runners
+          # and cannot interfere), it is to vary what runs before what
+          # *inside* one process, because that is where order dependence
+          # actually lives.
+          #
+          # The reason to want it: every one of these contracts passes
+          # whatever order it runs in, so a passing suite has never been
+          # evidence of order independence. A real example — fifteen test
+          # files write ``server._verification_state`` as a bare
+          # ``dict[key] = ...``, and
+          # ``test_round_start_liveness_state`` asserts a count taken
+          # across that whole dictionary. It passed in its natural
+          # position for as long as the suite had been run, and failed on
+          # the first shuffled order tried.
+          # ``isolated_runtime_plan_state`` in ``tests/conftest.py`` is the
+          # fix for that one; this is what keeps finding the next one.
+          #
+          # ``random.Random(seed).shuffle`` rather than
+          # ``shuf --random-source``: the runner's ``shuf`` wants a byte
+          # stream and this seed is a short string, and a stream that runs
+          # dry is a second, quieter way for the order to stop varying.
+          ORDER_SEED="${{ github.run_id }}.${{ github.run_attempt }}.${{ matrix.shard }}"
+          # ``"$TARGETS"`` is QUOTED, and that is load-bearing. Unquoted,
+          # it word-splits into one argv entry per file, so
+          # ``sys.argv[1]`` is the *first file* rather than the list and
+          # ``sys.argv[2]`` is the second file rather than the seed. The
+          # result was a shuffle of one file: every shard ran 1 of its
+          # ~23, the combined coverage fell from 80% to 11%, and **every
+          # shard still reported success** — a green check standing for
+          # four percent of the work. The coverage gate is what caught
+          # it, and only because it measures the work rather than
+          # reporting on it.
+          #
+          # It is also invisible on a developer machine: zsh does not
+          # word-split unquoted parameter expansions, so the same snippet
+          # run locally permutes the whole list. The bug lived in the gap
+          # between the shell a developer types in and the bash a runner
+          # executes.
+          EXEC_ORDER=$(./.venv/bin/python3 -c '
+          import random, sys
+          files = sys.argv[1].split()
+          random.Random(sys.argv[2]).shuffle(files)
+          print(" ".join(files))
+          ' "$TARGETS" "$ORDER_SEED")
+
+          # And the counts are reconciled, here, against the count this
+          # shard resolved. The existing empty-shard guard reads
+          # ``FILE_COUNT`` — what was *resolved*, not what will be
+          # *executed* — so a shuffle that quietly drops files walks
+          # straight past it. That is precisely the shape of the failure
+          # above: a guard that was looking at the right number and the
+          # wrong moment.
+          EXEC_COUNT=$(printf '%s\n' "$EXEC_ORDER" | wc -w | tr -d ' ')
+          echo "execution order seed: ${ORDER_SEED}"
+          echo "execution order: ${EXEC_ORDER}"
+          echo "shard ${{ matrix.shard }}: ${EXEC_COUNT} file(s) to execute (of ${FILE_COUNT} resolved)"
+          if [ "$EXEC_COUNT" -ne "$FILE_COUNT" ]; then
+            echo "::error::shard ${{ matrix.shard }} resolved ${FILE_COUNT} file(s) but will execute ${EXEC_COUNT}; the shuffle dropped or duplicated files"
+            exit 2
+          fi
+
           set +e
           COVERAGE_FILE=.coverage.${{ matrix.shard }} \
           timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
-            ./.venv/bin/python3 -m pytest $TARGETS \
+            ./.venv/bin/python3 -m pytest $EXEC_ORDER \
               -m "not e2e and not integration and not time_sensitive and not perf" \
               --cov=. \
               --cov-report= \
@@ -1669,6 +1807,7 @@ jobs:
       - grep-guard
       - commit-hygiene
       - commit-range-privacy
+      - static-gates
       - unit-tests
       - coverage-gate
       - integration-tests

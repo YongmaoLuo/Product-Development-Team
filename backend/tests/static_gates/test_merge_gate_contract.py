@@ -416,3 +416,350 @@ class TestNoRequiredCheckCanBeSkippedAway:
             "wedge the merge gate and every other required check the same "
             "way"
         )
+
+
+class TestStaticGatesRunBeforeTheLanes:
+    """A gate that runs alongside the tests it gates is not a gate.
+
+    The static contracts are pytest files, so before the ``static-gates``
+    job existed they ran inside the ``root`` lane — sharded across
+    ``root-0..root-6``, in parallel with the other nineteen shards. A
+    contract failure then arrived at the same moment twenty runners had
+    already committed to finishing. The check was in the suite; it was
+    not ahead of anything.
+
+    The ordering is the whole value, and ordering is invisible to the
+    tests that live inside it: every one of these contracts passes
+    whether it runs first or last. So it has to be pinned from outside,
+    which is what this class is.
+
+    The invariant is deliberately about the *graph* and not about a
+    particular ``needs:`` line: a lane qualifies if it runs anything
+    under ``tests/``, and it must reach ``static-gates`` through the
+    dependency edges. That way adding a new lane is a gate failure
+    rather than an unmonitored way to spend twenty runner-minutes before
+    a contract gets its say.
+    """
+
+    GATE_JOB = "static-gates"
+
+    @pytest.fixture(scope="class")
+    def runs_tests(self, jobs: dict) -> set[str]:
+        """Jobs that both run tests and are part of the pull-request gate.
+
+        The PR scope is not a convenience — it is the only correct one.
+        ``nightly-regression`` runs on ``schedule``, where ``static-gates``
+        is itself skipped, so making the nightly depend on it would leave
+        the nightly permanently skipped. A contract about gate ordering
+        that wedges the job it is protecting is not a stricter gate.
+        """
+        found = set()
+        for name, body in jobs.items():
+            if not isinstance(body, dict):
+                continue
+            if "pull_request" not in str(body.get("if", "")):
+                continue
+            steps = body.get("steps") or []
+            text = "\n".join(
+                str(s.get("run", "")) for s in steps if isinstance(s, dict)
+            )
+            if re.search(r"pytest[^|;&\n]*tests/", text):
+                found.add(name)
+        return found
+
+    @staticmethod
+    def _needs_of(body) -> list[str]:
+        needs = body.get("needs")
+        if needs is None:
+            return []
+        return [needs] if isinstance(needs, str) else list(needs)
+
+    def _reaches_gate(self, jobs: dict, start: str) -> bool:
+        seen: set[str] = set()
+        frontier = [start]
+        while frontier:
+            current = frontier.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if current == self.GATE_JOB:
+                return True
+            body = jobs.get(current)
+            if isinstance(body, dict):
+                frontier.extend(self._needs_of(body))
+        return False
+
+    def test_the_gate_job_exists(self, jobs):
+        assert self.GATE_JOB in jobs, (
+            f"ci.yml has no `{self.GATE_JOB}` job. The static contracts "
+            f"go back to running inside the `root` lane, where a failure "
+            f"arrives with nineteen shards already in flight."
+        )
+
+    def test_every_lane_that_runs_tests_is_downstream_of_it(self, jobs, runs_tests):
+        ungated = sorted(
+            name for name in runs_tests if not self._reaches_gate(jobs, name)
+        )
+        assert not ungated, (
+            f"these jobs run tests but are not downstream of "
+            f"`{self.GATE_JOB}`: {ungated}. Their runners start before the "
+            f"contracts have said anything, so a red contract costs the "
+            f"full matrix instead of one job. Add `{self.GATE_JOB}` to "
+            f"their `needs` (directly, or via a job that has it)."
+        )
+
+    def test_the_lanes_that_spend_the_most_are_among_them(self, jobs, runs_tests):
+        """The shards are the whole point — a gate upstream of a 3-second
+        job buys nothing. This names the expensive ones explicitly so the
+        previous assertion cannot be satisfied by covering only cheap
+        jobs while the matrix stays ungated."""
+        for lane in ("unit-tests", "integration-tests", "e2e-on-demand"):
+            if lane in runs_tests:
+                assert self._reaches_gate(jobs, lane), (
+                    f"`{lane}` runs tests but is not downstream of "
+                    f"`{self.GATE_JOB}`"
+                )
+
+    def test_the_gate_itself_runs_on_pull_requests(self, jobs):
+        """The precondition for the whole ordering.
+
+        Every other assertion here asks "is the gate upstream of the
+        lanes". If the gate does not run on a pull request, that question
+        has no answer worth having: the lanes either start anyway or sit
+        skipped waiting for a check that will never report. Both outcomes
+        are the ``skipped`` trap this repository already fell into once.
+        """
+        body = jobs[self.GATE_JOB]
+        assert "pull_request" in str(body.get("if", "")), (
+            f"`{self.GATE_JOB}` does not run on pull requests. The lanes "
+            f"that depend on it would then start against a job that never "
+            f"reported — which is either a wedge or a bypass, depending on "
+            f"how the dependent lane's condition evaluates. Neither is what "
+            f"an ordering is for."
+        )
+
+    def test_the_gated_lanes_do_not_also_run_it_inline(self, workflow):
+        """No double-run.
+
+        ``tests/static_gates/`` lives under ``tests/``, so the ``root``
+        lane's ``tests/`` sweep picks it up unless it is explicitly
+        ignored. Running it in both places costs a redundant pass and,
+        worse, means a static failure can arrive twice from two different
+        directions — one of which is inside the matrix this job exists to
+        keep out of it.
+        """
+        text = WORKFLOW.read_text(encoding="utf-8")
+        for lane, marker in (("root", 'root) LANE_PATHS="'),):
+            start = text.find(marker)
+            assert start != -1, f"could not find the {lane} lane's path set"
+            line = text[start : text.find("\n", start)]
+            assert "--ignore=tests/static_gates" in line, (
+                f"the `{lane}` lane sweeps `tests/` without ignoring "
+                f"`tests/static_gates`, so the contracts run both in the "
+                f"dedicated job and inside the shard matrix. Add the "
+                f"ignore; the dedicated job is the one the lanes depend on."
+            )
+
+
+def _strip_yaml_comments(text: str) -> str:
+    """Drop whole-line ``#`` comments before asserting on a shape.
+
+    A substring check over a workflow file matches the prose as readily as
+    the code: this repository already paid for that lesson once, when a
+    watchdog gate looked for ``"setsid" in step["run"]`` and a newly
+    written *comment* mentioning ``setsid`` made it mistake a step that
+    no longer ran pytest for one that did. Two assertions below were
+    caught doing the same thing — one passed on the word "shuffle" in an
+    explanatory paragraph after the shuffle itself had been replaced by
+    ``sorted``.
+
+    Only full-line comments are removed. Block comments do not appear in
+    these workflows, and a naive ``#`` strip would also eat the ``#``
+    inside a string, which is a different class of mistake to introduce
+    while fixing this one.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def _job_source(name: str) -> str:
+    """One job's block, as raw text with full-line comments removed.
+
+    ``yaml.safe_dump`` is the wrong tool for anything shape-based here: a
+    ``run:`` block scalar comes back as a single line with ``\n`` escapes
+    in it, so line-oriented comment stripping silently does nothing and
+    every substring assertion ends up matching prose. The file has real
+    newlines; read the file.
+    """
+    text = WORKFLOW.read_text(encoding="utf-8")
+    marker = f"\n  {name}:\n"
+    if marker not in text:
+        pytest.fail(
+            f"ci.yml has no `{name}:` job. Either it was renamed or "
+            f"removed; every assertion in this class is about that job, "
+            f"and a class that silently stops matching it is a gate that "
+            f"reports nothing."
+        )
+    rest = text[text.index(marker) + 1 + len(marker) :]
+    nxt = re.search(r"\n  [A-Za-z0-9_-]+:\n", rest)
+    block = rest[: nxt.start()] if nxt else rest
+    return _strip_yaml_comments(block)
+
+
+class TestTheShardsExecuteInAVaryingOrder:
+    """A suite that has only ever run one order has never been tested
+    for order dependence.
+
+    The failure this exists to keep finding is concrete and was found by
+    doing exactly this: fifteen test files write ``_verification_state``
+    as a bare ``dict[key] = ...``, and
+    ``test_round_start_liveness_state`` asserts a count taken across that
+    whole dictionary. Its own entry is terminal and does not count, so
+    the assertion reads as a property of that one test — and is actually
+    a property of everything that ran before it. It passed in its
+    natural position for as long as the suite had been run, and failed on
+    the first shuffled order tried.
+
+    What makes this worth a gate rather than a habit is that the
+    evidence is invisible from the green side. Every contract here passes
+    whatever order it runs in, so "the suite is green" is not evidence
+    about order, and nothing about a refactor suggests the shuffle
+    disappeared. A gate that only asserts on a diff is exactly the kind
+    that goes quiet.
+
+    Scope, stated honestly: this asserts the workflow shuffles and that
+    the seed is derived from the run. It cannot prove the resulting
+    orders differ — that would need running two runs, which is a
+    different kind of test. What it does make loud is the disappearance.
+    """
+
+    def test_the_shuffled_lane_job_exists(self, jobs):
+        assert "unit-tests" in jobs, (
+            "ci.yml has no `unit-tests` job, so there is no shard to "
+            "randomise; this file is looking at a workflow that has been "
+            "renamed or restructured"
+        )
+
+    def test_the_lanes_shuffle_before_running(self):
+        body = _job_source("unit-tests")
+        assert "EXEC_ORDER" in body, (
+            "the shard step does not build an EXEC_ORDER. The pytest "
+            "invocation must run the shuffled file list, not the "
+            "collection-ordered TARGETS it is derived from — the shuffle "
+            "computes a value and then ignores it otherwise."
+        )
+        # Assert the shuffle *runs on the pytest line*, not merely that
+        # the name appears somewhere: computing a shuffled list and
+        # passing the unsorted one is the exact shape of a gate that
+        # reports what it did not do.
+        #
+        # The shard step contains two ``-m pytest`` calls and only the
+        # second one runs anything: the first is ``--collect-only``,
+        # there to resolve which files this shard owns. Matching the
+        # first would assert against the collector and pass no matter
+        # what the runner is given.
+        # Located relative to ``EXEC_ORDER=`` rather than by pattern: the
+        # collector's ``--collect-only`` sits on the *next* line of a
+        # backslash continuation, so no single line carries both the
+        # ``-m pytest`` and the marker that would distinguish it.
+        lines = body.splitlines()
+        after = next(
+            (i for i, ln in enumerate(lines) if "EXEC_ORDER=$(" in ln), -1
+        )
+        assert after != -1, "could not find the EXEC_ORDER assignment"
+        pytest_line = next(
+            (ln for ln in lines[after:] if "-m pytest" in ln), ""
+        )
+        assert "$EXEC_ORDER" in pytest_line, (
+            "the pytest invocation does not take $EXEC_ORDER — the order "
+            "is computed and then thrown away. Found: "
+            f"{pytest_line.strip()!r}"
+        )
+        assert ".shuffle(" in body, (
+            "no shuffle call in the shard step. Either it was reverted or "
+            "it was replaced with something deterministic (`sorted`), which "
+            "leaves the suite no more order-independent than before while "
+            "looking like it is."
+        )
+
+    def test_the_seed_comes_from_the_run(self):
+        body = _job_source("unit-tests")
+        assert "github.run_id" in body or "github.run_attempt" in body, (
+            "the order seed is not derived from the run, so every run "
+            "executes the same order and the suite is no more order-"
+            "independent than before — it just looks like it is."
+        )
+
+    def test_the_seed_is_printed(self):
+        body = _job_source("unit-tests")
+        assert "execution order seed" in body, (
+            "the seed is not echoed. Without it a shuffled failure cannot "
+            "be reproduced, and an unreproducible failure gets rerun until "
+            "it goes green — which is the exact habit this was built to "
+            "break."
+        )
+
+    def test_the_shuffled_count_is_reconciled_against_the_shard(self):
+        """The bug this pins cost a whole CI run, and nothing caught it.
+
+        The shuffle was written as ``python -c '...' $TARGETS "$SEED"`` with
+        ``$TARGETS`` unquoted. Under bash — which is what a GitHub Actions
+        step runs — that expands to one argv entry per file, so
+        ``sys.argv[1]`` was the *first file* and ``sys.argv[2]`` was the
+        *second file* rather than the seed. Every shard then executed one
+        of its ~23 files, the combined coverage fell from 80% to 11%, and
+        **every shard reported success**: seven green tests standing in
+        for a shard's whole job.
+
+        What let it through is the shape of the existing guard. The
+        empty-shard check reads ``FILE_COUNT``, which counts the targets
+        the shard *resolved* — not what it *executed*. A green
+        ``FILE_COUNT`` is compatible with executing nothing at all.
+
+        So the reconciliation has to be in the step, comparing the
+        shuffled count against the resolved one. This asserts that
+        comparison exists; it cannot assert it fired.
+        """
+        body = _job_source("unit-tests")
+        assert "EXEC_COUNT" in body, (
+            "the shard does not count what it is about to execute. The "
+            "existing empty-shard guard reads FILE_COUNT — what the shard "
+            "resolved — so a shuffle that silently drops files passes it. "
+            "The two counts must be compared in the step."
+        )
+        # The comparison is pinned literally, not by looking for `-ne`
+        # and `FILE_COUNT` somewhere in the block: both appear in the
+        # script for other reasons, so a test that only checked for them
+        # would pass on `[ 0 -ne 0 ]` — a comparison that compares
+        # nothing, which is what the mutation replaced it with.
+        assert '[ "$EXEC_COUNT" -ne "$FILE_COUNT" ]' in body, (
+            "the shard does not compare EXEC_COUNT against FILE_COUNT. "
+            "That is the comparison that would have stopped the run in "
+            "which every shard executed one file of twenty-three and "
+            "reported success."
+        )
+
+    def test_the_shuffled_targets_are_quoted(self):
+        """``"$TARGETS"``, not ``$TARGETS`` — the difference is 23 vs 1.
+
+        Worth pinning by shape because the failure is invisible locally:
+        zsh does not word-split unquoted parameter expansions, so a
+        developer running the same snippet on a Mac watches it behave
+        correctly while the bash step on the runner executes a single
+        file. That divergence is why the bug survived a local check.
+        """
+        body = _job_source("unit-tests")
+        line = next(
+            (ln for ln in body.splitlines() if "EXEC_ORDER=$(" in ln), ""
+        )
+        assert line, "could not find the EXEC_ORDER assignment in the shard step"
+        assert "' \"$TARGETS\" " in body, (
+            "the shuffle is not handed a quoted \"$TARGETS\". Unquoted, it "
+            "expands to one argv entry per file, so sys.argv[1] is the "
+            "first file and sys.argv[2] the second — the shuffle then "
+            "permutes one file and the shard runs a fraction of its work "
+            "while reporting success. Under zsh the same snippet looks "
+            "correct, which is why this has to be checked rather than "
+            "remembered."
+        )
