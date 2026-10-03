@@ -93,7 +93,7 @@ from coding_tool import ClaudeCodingTool  # noqa: E402
 # place so individual tests don't have to remember to decorate.
 pytestmark = [
     pytest.mark.e2e,
-    pytest.mark.slow,
+    pytest.mark.time_sensitive,
 ]
 
 

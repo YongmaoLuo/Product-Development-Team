@@ -128,9 +128,9 @@ _SEARCH_ROOTS = tuple(
     if root is not None
 )
 
-# E2E lane only. Deliberately NOT marked ``slow``: the migration is a
+# E2E lane only. Deliberately NOT marked ``time_sensitive``: the migration is a
 # single read + atomic write on a local file, well under 1s, and
-# ``backend/pytest.ini`` sets ``addopts = -m "not slow"`` — marking it
+# ``backend/pytest.ini`` sets ``addopts = -m "not time_sensitive"`` — marking it
 # slow would deselect it from the task's own test command.
 pytestmark = [pytest.mark.e2e]
 

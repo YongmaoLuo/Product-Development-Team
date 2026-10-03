@@ -29,7 +29,7 @@ runs have a frozen reference to diff against.
 Marker isolation
 ----------------
 All tests in this file carry ``@pytest.mark.integration`` so the default
-``pytest -m "not slow"`` run still picks them up (they're cheap — under
+``pytest -m "not time_sensitive"`` run still picks them up (they're cheap — under
 10s wall-clock with the default 200-request budget) while CI can split
 them into a dedicated lane with ``-m integration``.
 
