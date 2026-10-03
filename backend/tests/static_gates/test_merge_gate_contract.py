@@ -583,6 +583,30 @@ def _strip_yaml_comments(text: str) -> str:
     )
 
 
+def _job_source(name: str) -> str:
+    """One job's block, as raw text with full-line comments removed.
+
+    ``yaml.safe_dump`` is the wrong tool for anything shape-based here: a
+    ``run:`` block scalar comes back as a single line with ``\n`` escapes
+    in it, so line-oriented comment stripping silently does nothing and
+    every substring assertion ends up matching prose. The file has real
+    newlines; read the file.
+    """
+    text = WORKFLOW.read_text(encoding="utf-8")
+    marker = f"\n  {name}:\n"
+    if marker not in text:
+        pytest.fail(
+            f"ci.yml has no `{name}:` job. Either it was renamed or "
+            f"removed; every assertion in this class is about that job, "
+            f"and a class that silently stops matching it is a gate that "
+            f"reports nothing."
+        )
+    rest = text[text.index(marker) + 1 + len(marker) :]
+    nxt = re.search(r"\n  [A-Za-z0-9_-]+:\n", rest)
+    block = rest[: nxt.start()] if nxt else rest
+    return _strip_yaml_comments(block)
+
+
 class TestTheShardsExecuteInAVaryingOrder:
     """A suite that has only ever run one order has never been tested
     for order dependence.
@@ -617,12 +641,8 @@ class TestTheShardsExecuteInAVaryingOrder:
             "renamed or restructured"
         )
 
-    def test_the_lanes_shuffle_before_running(self, workflow):
-        body = _strip_yaml_comments(
-            yaml.safe_dump(
-                workflow["jobs"]["unit-tests"], sort_keys=False, width=10_000
-            )
-        )
+    def test_the_lanes_shuffle_before_running(self):
+        body = _job_source("unit-tests")
         assert "EXEC_ORDER" in body, (
             "the shard step does not build an EXEC_ORDER. The pytest "
             "invocation must run the shuffled file list, not the "
@@ -633,8 +653,23 @@ class TestTheShardsExecuteInAVaryingOrder:
         # the name appears somewhere: computing a shuffled list and
         # passing the unsorted one is the exact shape of a gate that
         # reports what it did not do.
+        #
+        # The shard step contains two ``-m pytest`` calls and only the
+        # second one runs anything: the first is ``--collect-only``,
+        # there to resolve which files this shard owns. Matching the
+        # first would assert against the collector and pass no matter
+        # what the runner is given.
+        # Located relative to ``EXEC_ORDER=`` rather than by pattern: the
+        # collector's ``--collect-only`` sits on the *next* line of a
+        # backslash continuation, so no single line carries both the
+        # ``-m pytest`` and the marker that would distinguish it.
+        lines = body.splitlines()
+        after = next(
+            (i for i, ln in enumerate(lines) if "EXEC_ORDER=$(" in ln), -1
+        )
+        assert after != -1, "could not find the EXEC_ORDER assignment"
         pytest_line = next(
-            (ln for ln in body.splitlines() if "-m pytest" in ln), ""
+            (ln for ln in lines[after:] if "-m pytest" in ln), ""
         )
         assert "$EXEC_ORDER" in pytest_line, (
             "the pytest invocation does not take $EXEC_ORDER — the order "
@@ -648,27 +683,83 @@ class TestTheShardsExecuteInAVaryingOrder:
             "looking like it is."
         )
 
-    def test_the_seed_comes_from_the_run(self, workflow):
-        body = _strip_yaml_comments(
-            yaml.safe_dump(
-                workflow["jobs"]["unit-tests"], sort_keys=False, width=10_000
-            )
-        )
+    def test_the_seed_comes_from_the_run(self):
+        body = _job_source("unit-tests")
         assert "github.run_id" in body or "github.run_attempt" in body, (
             "the order seed is not derived from the run, so every run "
             "executes the same order and the suite is no more order-"
             "independent than before — it just looks like it is."
         )
 
-    def test_the_seed_is_printed(self, workflow):
-        body = _strip_yaml_comments(
-            yaml.safe_dump(
-                workflow["jobs"]["unit-tests"], sort_keys=False, width=10_000
-            )
-        )
+    def test_the_seed_is_printed(self):
+        body = _job_source("unit-tests")
         assert "execution order seed" in body, (
             "the seed is not echoed. Without it a shuffled failure cannot "
             "be reproduced, and an unreproducible failure gets rerun until "
             "it goes green — which is the exact habit this was built to "
             "break."
+        )
+
+    def test_the_shuffled_count_is_reconciled_against_the_shard(self):
+        """The bug this pins cost a whole CI run, and nothing caught it.
+
+        The shuffle was written as ``python -c '...' $TARGETS "$SEED"`` with
+        ``$TARGETS`` unquoted. Under bash — which is what a GitHub Actions
+        step runs — that expands to one argv entry per file, so
+        ``sys.argv[1]`` was the *first file* and ``sys.argv[2]`` was the
+        *second file* rather than the seed. Every shard then executed one
+        of its ~23 files, the combined coverage fell from 80% to 11%, and
+        **every shard reported success**: seven green tests standing in
+        for a shard's whole job.
+
+        What let it through is the shape of the existing guard. The
+        empty-shard check reads ``FILE_COUNT``, which counts the targets
+        the shard *resolved* — not what it *executed*. A green
+        ``FILE_COUNT`` is compatible with executing nothing at all.
+
+        So the reconciliation has to be in the step, comparing the
+        shuffled count against the resolved one. This asserts that
+        comparison exists; it cannot assert it fired.
+        """
+        body = _job_source("unit-tests")
+        assert "EXEC_COUNT" in body, (
+            "the shard does not count what it is about to execute. The "
+            "existing empty-shard guard reads FILE_COUNT — what the shard "
+            "resolved — so a shuffle that silently drops files passes it. "
+            "The two counts must be compared in the step."
+        )
+        # The comparison is pinned literally, not by looking for `-ne`
+        # and `FILE_COUNT` somewhere in the block: both appear in the
+        # script for other reasons, so a test that only checked for them
+        # would pass on `[ 0 -ne 0 ]` — a comparison that compares
+        # nothing, which is what the mutation replaced it with.
+        assert '[ "$EXEC_COUNT" -ne "$FILE_COUNT" ]' in body, (
+            "the shard does not compare EXEC_COUNT against FILE_COUNT. "
+            "That is the comparison that would have stopped the run in "
+            "which every shard executed one file of twenty-three and "
+            "reported success."
+        )
+
+    def test_the_shuffled_targets_are_quoted(self):
+        """``"$TARGETS"``, not ``$TARGETS`` — the difference is 23 vs 1.
+
+        Worth pinning by shape because the failure is invisible locally:
+        zsh does not word-split unquoted parameter expansions, so a
+        developer running the same snippet on a Mac watches it behave
+        correctly while the bash step on the runner executes a single
+        file. That divergence is why the bug survived a local check.
+        """
+        body = _job_source("unit-tests")
+        line = next(
+            (ln for ln in body.splitlines() if "EXEC_ORDER=$(" in ln), ""
+        )
+        assert line, "could not find the EXEC_ORDER assignment in the shard step"
+        assert "' \"$TARGETS\" " in body, (
+            "the shuffle is not handed a quoted \"$TARGETS\". Unquoted, it "
+            "expands to one argv entry per file, so sys.argv[1] is the "
+            "first file and sys.argv[2] the second — the shuffle then "
+            "permutes one file and the shard runs a fraction of its work "
+            "while reporting success. Under zsh the same snippet looks "
+            "correct, which is why this has to be checked rather than "
+            "remembered."
         )
