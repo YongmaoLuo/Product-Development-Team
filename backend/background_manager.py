@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Optional, List
 
+from utils.process import _signallable_pgid
+
 
 @dataclass
 class ProcessState:
@@ -238,7 +240,8 @@ class BackgroundManager:
             # Kill the entire process group first
             try:
                 pgid = os.getpgid(process.pid)
-                os.killpg(pgid, signal.SIGTERM)
+                if _signallable_pgid(pgid) is not None:
+                    os.killpg(pgid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
             try:
