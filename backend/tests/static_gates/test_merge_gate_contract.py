@@ -416,3 +416,146 @@ class TestNoRequiredCheckCanBeSkippedAway:
             "wedge the merge gate and every other required check the same "
             "way"
         )
+
+
+class TestStaticGatesRunBeforeTheLanes:
+    """A gate that runs alongside the tests it gates is not a gate.
+
+    The static contracts are pytest files, so before the ``static-gates``
+    job existed they ran inside the ``root`` lane — sharded across
+    ``root-0..root-6``, in parallel with the other nineteen shards. A
+    contract failure then arrived at the same moment twenty runners had
+    already committed to finishing. The check was in the suite; it was
+    not ahead of anything.
+
+    The ordering is the whole value, and ordering is invisible to the
+    tests that live inside it: every one of these contracts passes
+    whether it runs first or last. So it has to be pinned from outside,
+    which is what this class is.
+
+    The invariant is deliberately about the *graph* and not about a
+    particular ``needs:`` line: a lane qualifies if it runs anything
+    under ``tests/``, and it must reach ``static-gates`` through the
+    dependency edges. That way adding a new lane is a gate failure
+    rather than an unmonitored way to spend twenty runner-minutes before
+    a contract gets its say.
+    """
+
+    GATE_JOB = "static-gates"
+
+    @pytest.fixture(scope="class")
+    def runs_tests(self, jobs: dict) -> set[str]:
+        """Jobs that both run tests and are part of the pull-request gate.
+
+        The PR scope is not a convenience — it is the only correct one.
+        ``nightly-regression`` runs on ``schedule``, where ``static-gates``
+        is itself skipped, so making the nightly depend on it would leave
+        the nightly permanently skipped. A contract about gate ordering
+        that wedges the job it is protecting is not a stricter gate.
+        """
+        found = set()
+        for name, body in jobs.items():
+            if not isinstance(body, dict):
+                continue
+            if "pull_request" not in str(body.get("if", "")):
+                continue
+            steps = body.get("steps") or []
+            text = "\n".join(
+                str(s.get("run", "")) for s in steps if isinstance(s, dict)
+            )
+            if re.search(r"pytest[^|;&\n]*tests/", text):
+                found.add(name)
+        return found
+
+    @staticmethod
+    def _needs_of(body) -> list[str]:
+        needs = body.get("needs")
+        if needs is None:
+            return []
+        return [needs] if isinstance(needs, str) else list(needs)
+
+    def _reaches_gate(self, jobs: dict, start: str) -> bool:
+        seen: set[str] = set()
+        frontier = [start]
+        while frontier:
+            current = frontier.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if current == self.GATE_JOB:
+                return True
+            body = jobs.get(current)
+            if isinstance(body, dict):
+                frontier.extend(self._needs_of(body))
+        return False
+
+    def test_the_gate_job_exists(self, jobs):
+        assert self.GATE_JOB in jobs, (
+            f"ci.yml has no `{self.GATE_JOB}` job. The static contracts "
+            f"go back to running inside the `root` lane, where a failure "
+            f"arrives with nineteen shards already in flight."
+        )
+
+    def test_every_lane_that_runs_tests_is_downstream_of_it(self, jobs, runs_tests):
+        ungated = sorted(
+            name for name in runs_tests if not self._reaches_gate(jobs, name)
+        )
+        assert not ungated, (
+            f"these jobs run tests but are not downstream of "
+            f"`{self.GATE_JOB}`: {ungated}. Their runners start before the "
+            f"contracts have said anything, so a red contract costs the "
+            f"full matrix instead of one job. Add `{self.GATE_JOB}` to "
+            f"their `needs` (directly, or via a job that has it)."
+        )
+
+    def test_the_lanes_that_spend_the_most_are_among_them(self, jobs, runs_tests):
+        """The shards are the whole point — a gate upstream of a 3-second
+        job buys nothing. This names the expensive ones explicitly so the
+        previous assertion cannot be satisfied by covering only cheap
+        jobs while the matrix stays ungated."""
+        for lane in ("unit-tests", "integration-tests", "e2e-on-demand"):
+            if lane in runs_tests:
+                assert self._reaches_gate(jobs, lane), (
+                    f"`{lane}` runs tests but is not downstream of "
+                    f"`{self.GATE_JOB}`"
+                )
+
+    def test_the_gate_itself_runs_on_pull_requests(self, jobs):
+        """The precondition for the whole ordering.
+
+        Every other assertion here asks "is the gate upstream of the
+        lanes". If the gate does not run on a pull request, that question
+        has no answer worth having: the lanes either start anyway or sit
+        skipped waiting for a check that will never report. Both outcomes
+        are the ``skipped`` trap this repository already fell into once.
+        """
+        body = jobs[self.GATE_JOB]
+        assert "pull_request" in str(body.get("if", "")), (
+            f"`{self.GATE_JOB}` does not run on pull requests. The lanes "
+            f"that depend on it would then start against a job that never "
+            f"reported — which is either a wedge or a bypass, depending on "
+            f"how the dependent lane's condition evaluates. Neither is what "
+            f"an ordering is for."
+        )
+
+    def test_the_gated_lanes_do_not_also_run_it_inline(self, workflow):
+        """No double-run.
+
+        ``tests/static_gates/`` lives under ``tests/``, so the ``root``
+        lane's ``tests/`` sweep picks it up unless it is explicitly
+        ignored. Running it in both places costs a redundant pass and,
+        worse, means a static failure can arrive twice from two different
+        directions — one of which is inside the matrix this job exists to
+        keep out of it.
+        """
+        text = WORKFLOW.read_text(encoding="utf-8")
+        for lane, marker in (("root", 'root) LANE_PATHS="'),):
+            start = text.find(marker)
+            assert start != -1, f"could not find the {lane} lane's path set"
+            line = text[start : text.find("\n", start)]
+            assert "--ignore=tests/static_gates" in line, (
+                f"the `{lane}` lane sweeps `tests/` without ignoring "
+                f"`tests/static_gates`, so the contracts run both in the "
+                f"dedicated job and inside the shard matrix. Add the "
+                f"ignore; the dedicated job is the one the lanes depend on."
+            )
