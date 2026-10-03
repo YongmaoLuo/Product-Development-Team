@@ -23,6 +23,59 @@ if str(BACKEND_DIR) not in sys.path:
 import ci_process_guard as guard  # noqa: E402
 
 
+def _can_enumerate_processes() -> bool:
+    """Whether this machine lets us see a process other than ourselves.
+
+    The guard reads the process table two ways: ``/proc`` on Linux, and a
+    ``ps -A`` subprocess everywhere else. Both can be unavailable, and the
+    second is unavailable more often than it looks — a sandboxed or
+    hardened macOS refuses ``ps`` with ``PermissionError`` rather than
+    running it, and ``ps`` can also exceed its timeout under load. The
+    guard handles that by returning an empty map, which is the right
+    behaviour for a best-effort reporter but makes "the guard saw
+    nothing" indistinguishable from "there was nothing to see".
+
+    So the tests that assert the guard *finds* a process have to know
+    whether finding is possible here at all. The probe has to spawn a
+    child to ask that: on a normal Linux runner the guard's own group
+    already holds processes, but a hermetic environment may hold only
+    this test, and asking "is anything in my group" would then answer
+    "no" for a reason that has nothing to do with the guard.
+
+    A test that spawns a child and then cannot see it is testing the
+    environment, not the guard — and failing there is how this file came
+    to fail intermittently on a developer machine while CI, which has
+    ``/proc``, was green throughout.
+    """
+    probe = subprocess.Popen(
+        ["sleep", "5"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if guard._pids_in_group(os.getpgrp()):
+                return True
+            time.sleep(0.05)
+        return False
+    except Exception:  # noqa: BLE001 - a probe, not a test
+        return False
+    finally:
+        probe.kill()
+        probe.wait()
+
+
+requires_process_visibility = pytest.mark.skipif(
+    not _can_enumerate_processes(),
+    reason=(
+        "this machine does not allow enumerating other processes "
+        "(no /proc and `ps` is unavailable), so the guard cannot see a "
+        "child here; it does see one on the Linux runners where it runs"
+    ),
+)
+
+
 @pytest.fixture
 def sleeper():
     """A child in *our* process group, as a leaked subprocess would be."""
@@ -61,6 +114,7 @@ def _wait_for_group(pgid, pid, present=True, timeout=5.0):
 
 
 class TestItSeesWhatItShould:
+    @requires_process_visibility
     def test_a_child_in_our_group_is_visible(self, sleeper):
         proc = sleeper()
         assert _wait_for_group(os.getpgrp(), proc.pid), (
@@ -85,6 +139,7 @@ class TestItSeesWhatItShould:
 
 
 class TestItReaps:
+    @requires_process_visibility
     def test_reap_kills_a_child_in_our_group(self, sleeper):
         proc = sleeper()
         assert _wait_for_group(os.getpgrp(), proc.pid)
@@ -131,6 +186,7 @@ class TestTheFallbackProbe:
             "pgid=,command=" in cmd for cmd in found.values()
         ), f"the guard reported its own `ps` probe as a leak: {found}"
 
+    @requires_process_visibility
     def test_the_fallback_still_sees_real_children(self, forced_ps_path, sleeper):
         proc = sleeper()
         assert _wait_for_group(os.getpgrp(), proc.pid), (

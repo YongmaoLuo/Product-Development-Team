@@ -63,11 +63,11 @@ from state_machine.repositories.verification_repository import (
 # Module-level markers — drive the test into the correct pytest
 # collection buckets. ``acceptance_1`` is the L5 anchor that
 # VP-001 selects via ``-m acceptance_1``; ``e2e`` flags the
-# full-lifecycle intent; ``slow`` flags multi-second runtime.
+# full-lifecycle intent; ``time_sensitive`` flags the multi-second runtime these share a lane with.
 pytestmark = [
     pytest.mark.acceptance_1,
     pytest.mark.e2e,
-    pytest.mark.slow,
+    pytest.mark.time_sensitive,
 ]
 
 

@@ -48,6 +48,7 @@ import json
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import List
 
@@ -335,16 +336,20 @@ def test_persist_concurrent_safe(project_dir, state_db):
     agent = _build_agent(project_dir)
 
     errors: List[Exception] = []
+    entered: List[str] = []
     barrier = threading.Barrier(10)
 
     def worker(task_id: str) -> None:
+        # Recorded before anything else, so the test can tell "this
+        # thread never ran" apart from "this thread ran and failed".
+        entered.append(task_id)
         try:
             # All threads start the critical section at the same
             # instant — the barrier makes the race window as wide
             # as possible (every thread is queued in
             # PlanTaskRepository.update_task's BEGIN IMMEDIATE at
             # the same moment).
-            barrier.wait(timeout=10)
+            barrier.wait(timeout=30)
             task = SubTask(
                 id=task_id,
                 title=f"Task {task_id}",
@@ -361,10 +366,67 @@ def test_persist_concurrent_safe(project_dir, state_db):
         threading.Thread(target=worker, args=(tid,))
         for tid in "ABCDEFGHIJ"
     ]
-    for t in threads:
+    # Started strictly one at a time, each one released only after it has
+    # proved it cleared the interpreter's startup path. The reason is not
+    # politeness — it is a real collision in CPython that killed this test
+    # on CI twice in a row:
+    #
+    #     File "threading.py", line 1040, in _bootstrap_inner
+    #         _sys.settrace(_trace_hook)
+    #     RuntimeError: Cannot install a trace function while another
+    #     trace function is being installed
+    #
+    # The unit shards run under `--cov=.`, and coverage installs a
+    # `threading.settrace` hook so that threads it did not create still
+    # report their lines. `_bootstrap_inner` therefore calls
+    # `sys.settrace` in *every* new thread — and `sys.settrace` refuses
+    # to be called while another call is in flight. Ten threads started
+    # in a tight loop put those calls on top of each other, one thread
+    # dies before its target body ever runs, and the barrier waits for a
+    # party that is already gone.
+    #
+    # What that looked like from the outside was nine identical
+    # `BrokenBarrierError`s and a 10-second stall — no mention of the
+    # thread that never arrived, which is the only fact that explains it.
+    #
+    # This does not weaken the test. The barrier is what synchronises the
+    # critical section; when the threads were *started* is irrelevant to
+    # it. Serialising the startups only removes the overlap between two
+    # `settrace` calls, which is an artifact of running under coverage
+    # rather than anything this test is asserting.
+    for t, tid in zip(threads, "ABCDEFGHIJ"):
         t.start()
+        # Wait for this thread to prove it is past the interpreter's
+        # thread-startup, before starting the next one. A fixed sleep
+        # would only make the collision less likely — under load the
+        # machine can stall for longer than any gap we pick, and then
+        # two `settrace` calls overlap anyway and a thread dies. Waiting
+        # for the thread to announce itself removes the window instead
+        # of shrinking it: at most one thread is ever inside
+        # `_bootstrap_inner`, so there is nothing to collide with.
+        #
+        # A mutex around `t.start()` would not do this. The `settrace`
+        # that races runs in the *new* thread, after `start()` has
+        # already returned; holding a lock in the main thread does not
+        # reach it. The only thing that serialises the two is knowing
+        # that thread A has cleared the startup path, and the thread
+        # announcing that is the first statement of its own body.
+        deadline = time.monotonic() + 30
+        while tid not in entered and time.monotonic() < deadline:
+            time.sleep(0.001)
     for t in threads:
-        t.join(timeout=30)
+        t.join(timeout=60)
+
+    # A thread that never entered its body died in `_bootstrap_inner`,
+    # before any of this file's code ran. Saying so beats the nine
+    # anonymous barrier errors it would otherwise produce.
+    missing = sorted(set("ABCDEFGHIJ") - set(entered))
+    assert not missing, (
+        f"{len(missing)} worker thread(s) {missing} never ran a single "
+        f"statement. They died during interpreter thread startup, before "
+        f"the test's code — on CI this is the `sys.settrace` collision "
+        f"described above, not a failure of the CAS logic under test."
+    )
 
     # No thread should have raised; a TaskProgressConflictError here
     # would mean the CAS budget is too small for the contention.

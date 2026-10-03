@@ -268,7 +268,7 @@ backend/.venv/bin/python3 -m pytest backend/tests -m unit -q
 scripts/run_tests.sh
 ```
 
-`-m unit` skips the `slow`, `integration`, `e2e` and `real_model` markers;
+`-m unit` skips the `time_sensitive`, `integration`, `e2e` and `real_model` markers;
 the missing models are satisfied by stubs the conftest installs.
 
 Two collection rules worth knowing: `pytest.ini` is directory-sensitive

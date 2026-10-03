@@ -111,7 +111,13 @@ def _stub_run(monkeypatch, lsof_out, ps_cmd_out, ps_lstart_out):
 
     def fake(argv, timeout=10):
         joined = " ".join(argv)
-        if argv[:2] == ["lsof", "-ti"]:
+        # Matched on the program name, not on the exact flag spelling.
+        # It used to be `argv[:2] == ["lsof", "-ti"]`, and when the query
+        # became listener-only that predicate stopped matching — the stub
+        # fell through to `return None`, and the probe tests went on
+        # passing against a probe that had been stubbed out. A stub that
+        # silently stops matching is worse than no stub.
+        if argv and argv[0] == "lsof":
             return lsof_out
         if joined.endswith("command="):
             return ps_cmd_out
@@ -336,3 +342,78 @@ def test_assess_healthy_when_listener_fresh(tmp_path: Path, monkeypatch) -> None
     report = assess_service_freshness(tmp_path, plan)
     assert report.action == "healthy"
     assert report.needs_restart == []
+
+
+# ---------------------------------------------------------------------------
+# T1 — the probe's own contract, against a real kernel
+# ---------------------------------------------------------------------------
+#
+# Everything above stubs `_run_probe_cmd`, so it cannot catch the probe
+# being wrong about lsof's semantics — it only pins what this code asks
+# for. This one runs the real query against a real socket.
+#
+# The scenario is the one that was silently breaking callers: a client
+# that connected, whose peer has since closed. The kernel leaves its
+# socket in CLOSE_WAIT with the *server's* port as the remote port, and
+# `lsof -ti :PORT` matches that. Before the listener-only query this
+# reported a listener for a port the kernel refuses a connection to.
+
+
+def test_probe_does_not_mistake_a_close_wait_client_for_a_listener():
+    """A lingering client must not read as a process listening.
+
+    This is the shape a container runtime produces in bulk: a few hundred
+    `CLOSED` sockets whose *remote* port is some number, none of which
+    are listening. Measured shadow rate on a developer machine, 4.8-8.0%
+    of ephemeral ports — high enough to make a per-port decision a coin
+    flip, and `stop_service` acted on it.
+    """
+    import socket as _socket
+
+    from service_freshness import probe_port
+
+    server = _socket.socket()
+    server.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    server_port = server.getsockname()[1]
+
+    client = _socket.create_connection(("127.0.0.1", server_port), timeout=5)
+    client_port = client.getsockname()[1]
+
+    # The listener closes first; the client is left in CLOSE_WAIT still
+    # holding `server_port` as its remote port.
+    server.close()
+
+    try:
+        # The kernel is the arbiter: nothing is listening on client_port.
+        with pytest.raises(OSError):
+            _socket.create_connection(("127.0.0.1", client_port), timeout=2).close()
+
+        probe = probe_port(client_port)
+        assert not probe.listening, (
+            f"probe_port({client_port}) claims a listener, but the kernel "
+            f"refuses a connection. The pid list was {probe.pids} — those "
+            f"are the client, in CLOSE_WAIT with a remote port that happens "
+            f"to equal {client_port}."
+        )
+        assert probe.pids == []
+    finally:
+        client.close()
+
+
+def test_probe_still_finds_a_real_listener():
+    """The same query must not have been narrowed into uselessness."""
+    import socket as _socket
+
+    from service_freshness import probe_port
+
+    server = _socket.socket()
+    server.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    try:
+        probe = probe_port(server.getsockname()[1])
+        assert probe.listening, "a real LISTEN socket was not found"
+    finally:
+        server.close()
