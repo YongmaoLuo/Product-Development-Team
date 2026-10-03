@@ -1619,3 +1619,107 @@ jobs:
             echo "\`run_real_plan_migration\` workflow_dispatch input. The job"
             echo "was permitted to write to the production \`plans/\` directory."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # STAGE 5 — MERGE GATE
+  #
+  # The single job branch protection requires. Everything above it can be
+  # red; this one is what turns "a red badge" into "you cannot merge".
+  #
+  # WHY THIS JOB HAS TO EXIST — the skipped-is-green trap
+  # ----------------------------------------------------
+  # GitHub evaluates a required status check as PASSING when its conclusion
+  # is `success` **or `skipped` or `neutral`**. So a job that depends on a
+  # failed job does not report a failure — it is skipped, the skip counts
+  # as success, and the pull request merges anyway:
+  #
+  #     unit-tests (a shard goes red)
+  #       └─ coverage-gate      → skipped → counts as SUCCESS  ← hole
+  #       └─ integration-tests  → skipped → counts as SUCCESS  ← hole
+  #     required_status_checks: satisfied. Merge proceeds with a red suite.
+  #
+  # Requiring the downstream jobs therefore does NOT transitively require
+  # the upstream ones, which is the intuitive reading and the wrong one.
+  # This is not hypothetical: it is what the previous required-check set
+  # did, configured in the belief that the `needs:` chain closed it.
+  #
+  # The fix is `if: always()` — the gate runs even when its dependencies
+  # were skipped — plus a body that inspects `needs.*.result` and fails on
+  # anything that is not `success`. A skipped dependency is NOT tolerated
+  # here either: for these nine jobs a skip on a pull request means
+  # something upstream went wrong or an `if:` was narrowed, and in both
+  # cases the honest answer is "this gate is not covered", not "fine".
+  #
+  # Deliberately NOT in `needs`: unit-staircase, nightly-regression,
+  # real-plan-migration. Those are dispatch/schedule-only by design, so
+  # requiring them would wedge every merge on a check that never reports
+  # on a pull request — a merge blocker that can never be satisfied.
+  # tests/static_gates/test_merge_gate_contract.py pins that split.
+  # ---------------------------------------------------------------------------
+
+  merge-gate:
+    name: Merge gate (all PR jobs green)
+    # `always()` is load-bearing and must not be dropped. Without it this
+    # job inherits the skip that it exists to detect, and a skip counts
+    # as a pass — the gate would invert from broken-but-green to
+    # green-while-broken in exactly the case it was added for.
+    if: always() && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    needs:
+      - lint
+      - grep-guard
+      - commit-hygiene
+      - commit-range-privacy
+      - unit-tests
+      - coverage-gate
+      - integration-tests
+      - e2e-on-demand
+      - existing-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless every upstream job succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          echo "Dependency results for this run:"
+          echo "${NEEDS_JSON}" | python3 -m json.tool
+          echo
+          echo "Full log: ${RUN_URL}"
+          echo
+
+          # Prints the job count on success, the offending jobs on
+          # failure. It is one program because both answers come from the
+          # same parse — and printing the count from here rather than
+          # from bash is the point: `${#NEEDS_JSON}` is the length of the
+          # JSON *string* in bytes, so the summary used to announce "All
+          # 620 upstream jobs" for a nine-job gate. A number in a gate's
+          # own output has to be the number it means.
+          summary="$(NEEDS_JSON="${NEEDS_JSON}" python3 - <<'PY'
+          import json, os, sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          # Anything other than `success` blocks. `skipped` is included
+          # on purpose: see the job comment — for these nine jobs a skip
+          # on a pull request is a broken gate, not a satisfied one.
+          bad = {
+              name: result.get("result")
+              for name, result in sorted(needs.items())
+              if result.get("result") != "success"
+          }
+          if not bad:
+              print(f"{len(needs)}")
+              sys.exit(0)
+          print("These jobs did not succeed, so the merge gate is closed:")
+          for name, result in bad.items():
+              print(f"  ✗ {name}: {result}")
+          sys.exit(1)
+          PY
+          )" || {
+            echo "$summary"
+            echo
+            echo "::error::Merge gate closed — see the list above."
+            exit 1
+          }
+
+          echo "All ${summary} upstream jobs succeeded — merge gate open."

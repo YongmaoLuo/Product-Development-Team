@@ -638,6 +638,19 @@ backend/.venv/bin/python3 -m pytest backend/tests/test_process_utils.py backend/
 ```
 ---
 
+### Finding ENTRY-037
+档位: should-fix
+问题: **合并门禁是一份「只报告不阻止」的清单：它列出的 9 个 required check 全部位于某个 job 的下游，于是 GitHub 把它们全部跳过，而被跳过的 required check 算通过。** GitHub 判定 required status check 通过的条件是 `success` / `skipped` / `neutral` 三者之一；而一个依赖失败 job 的下游报的是 `skipped`，不是 `failed`。因此「把下游设成 required 就等于覆盖了上游」这个推断是错的，`needs:` 链看上去闭合了这个洞，实际上没有。配置时的意图写得很明确（四个 check 是为了「unit 被传递性覆盖」），实际效果是：`unit-tests` 任一分片变红 → `coverage-gate` / `integration-tests` / `e2e-on-demand` / `existing-test` 全部 skipped → 全部算通过 → 合并照常进行。第二处独立缺陷在同一份清单的另一端：**`test_json_cleanup.yml` 的 `pull_request` 触发带 `paths:` 过滤**，而它的 job 是 required check。GitHub 的规则是：被路径过滤跳过的 workflow，其 check 永远停在 `Pending`，而 Pending 的 required check 会卡住每一次合并，且没有任何操作能让它变绿。两者叠加的实际后果是，一个只改 `.github/workflows/ci.yml` 的 PR **永远无法合并** —— 这不是「门禁被绕过」，是「门禁无法被满足」，而它看起来像 CI 还在忙。第三处：`.github/workflows/pages.yml` 里 `build (strict)` 一节写着「the PR cannot merge」，但它既不是 required check、又带 `paths:` 过滤，两个条件各自都足以让那句话不成立。
+影响: 三处都是「一个会照字面相信就出错的东西」，而它们的形状一致：报出来的东西看起来像保护，实际不保护。第一处让红色单元分片完全不阻止合并；第二处让合并按钮永久停在不可用，而诊断一个「CI 迟迟不变绿」的人会先怀疑 CI 卡住，不会想到是 required check 根本没报；第三处让文档严格构建的「PR 不能合」只是一句注释。
+攻击路径: 前置条件 — 无（这是 CI 配置缺陷，不是可被外部触发的漏洞；列出它是为了让本轮改动可归因）；触发步骤 — 第一处，任何让 `unit-tests` 变红的改动；第二处，任何只触及 `ci.yml` 或 `backend/tests/static_gates/` 的改动；第三处，任何只改 `docs/` 之外的文件的改动；可观测后果 — 合并在 unit 红的情况下照常发生，或在只改了无关文件的 PR 上永远无法发生。
+修复: 加一个终端 job `merge-gate`，形状是 GitHub 官方给的那个：`if: always()` + 读 `needs.*.result`，凡不是 `success` 一律 `exit 1`，并把 branch protection 的 required 清单加上它。`always()` 是承重的那一句 —— 没有它门禁自己会被 skip，而 skip 算通过，门禁会在最需要它的时候打开；`skipped` 在门禁内部也不放过，因为这 9 个 job 在 PR 上出现 skip 只可能是上游出事或 `if:` 被改窄。dispatch/schedule 专用的三个 job（`unit-staircase` / `nightly-regression` / `real-plan-migration`）不进 `needs`：它们在 PR 上不报点，required 一个永远不出现的 check 会把合并永久卡死。`test_json_cleanup.yml` 与 `pages.yml` 的 `pull_request` `paths:` 过滤一并去掉 —— required check 与路径过滤互斥，只能留一个，留 check。`pages.yml` 的 `build (strict)` 补进 required 清单，让它那句「the PR cannot merge」变成真的。新增门禁 `backend/tests/static_gates/test_merge_gate_contract.py`，它**执行**门禁的 `run:` body 而不是扫字符串（门禁是 `NEEDS_JSON` 的纯函数，无网络无文件系统，本机与 runner 一样可测），四个场景钉死：全绿放行 / 有 `failure` 拦 / 有 `skipped` 拦 / `cancelled` 也拦；另有一条钉住「新增的 PR job 必须进 `needs`」，清单是从 workflow 按 `if:` 含不含 `pull_request` **推出来**的，不是写死的。第一版这个门禁是扫字符串的，断言 `"exit 1" in source`，把真的 `sys.exit(1)` 改成 `sys.exit(0)` 之后**依然全绿** —— 因为 shell 兜底里还留着第二个 `exit 1` 字样；改执行之后 8 个变异（删 `always()` / 从 `needs` 删 job / 塞入 dispatch-only job / 放行 `skipped` / `sys.exit(1)→0` / shell `exit 1→0` / `if` 去掉 `pull_request` / job 改名）全部变红。门禁自己的汇总行也在第一次真跑时被查出 `${#NEEDS_JSON}` 报的是 JSON 字符串的**字符长度**：9 个 job 打印成「All 620 upstream jobs succeeded」，已改为由 python 从它自己那份 parse 出数。
+验证方式:
+```bash
+backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_merge_gate_contract.py -q
+```
+
+---
+
 ## Appendix A — modified tests
 
 The audit policy permits modifying existing tests that encoded
@@ -779,6 +792,8 @@ alone is not enough — see the test source for the exact contract).
 | `example/provider_capacity.yaml.example` | ENTRY-016 | Every `pattern:` carries the `^Example ` placeholder prefix. | Operator-template example edited to neutralise leaked provider names. |
 | `example/provider_routing.yaml.example` | ENTRY-016 | Every tier entry carries the `^Example ` placeholder prefix. | Same gate, separate files; same reason as capacity example. |
 | `.github/workflows/ci.yml` | ENTRY-007 | Non-empty `jobs:`, `pip install -r backend/requirements.txt`, venv pytest prefix. | ENTRY-007 to ENTRY-011 share one file; one row covers all five. |
+| `.github/workflows/test_json_cleanup.yml` | ENTRY-037 | `pull_request` trigger carries no `paths:` filter. | It is a required check; a path-filtered required check stays pending forever. |
+| `.github/workflows/pages.yml` | ENTRY-037 | `pull_request` trigger carries no `paths:` filter; `build (strict)` is required. | The header claims a rotten link blocks the PR; two separate conditions kept that false. |
 | `frontend/api.js` | ENTRY-001 | Shared `api()` wrapper injecting `X-PDT-Request: 1`. | Prose names the header not the file; row keeps `api.js` attributable. |
 | `frontend/app.js` | ENTRY-001 | Calls `api()` instead of bare `fetch`; partial migration tracked here. | ENTRY-003 names the migration; row records the touched file. |
 | `.gitignore` | ENTRY-016 | Confirms `.config/` is ignored and no tracked file lives under it. | Rule set here; row keeps the gate honest if the ignore drifts. |
