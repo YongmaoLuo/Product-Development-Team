@@ -7,12 +7,12 @@
 ## 各条 lane
 
 ```bash
-# 默认 CI lane。-m unit 会跳过 slow / integration / e2e / real_model 标记；
+# 默认 CI lane。-m unit 会跳过 time_sensitive / integration / e2e / real_model 标记；
 # 缺的模型由 backend/tests/conftest.py 装的桩满足。
 backend/.venv/bin/python3 -m pytest backend/tests -m unit -q
 
 # 集成：起服务并通过 HTTP 跟它说话。不需要真实模型，但需要一个空闲回环端口。
-backend/.venv/bin/python3 -m pytest backend/tests -m "not slow" -q
+backend/.venv/bin/python3 -m pytest backend/tests -m "not time_sensitive" -q
 
 # 端到端：走 dry-run 假后端跑完整计划生命周期。按测试设计的决定，只在 main 跑。
 backend/.venv/bin/python3 -m pytest backend/tests -m e2e -q

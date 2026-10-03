@@ -80,7 +80,7 @@ Why an e2e rather than another integration test
 -----------------------------------------------
 The integration suite in ``tests/integration/`` uses real on-disk
 files but only one piece of the pipeline. The e2e markers in
-``pytest.ini`` (``e2e``, ``slow``) signal the L5 acceptance lane:
+``pytest.ini`` (``e2e``, ``time_sensitive``) signal the L5 acceptance lane:
 this is the test that locks the **full chain** (factory → on-disk
 → migration → transition → on-disk re-readback) at the file-level
 boundary the orchestrator relies on, not at one isolated function.
@@ -139,9 +139,9 @@ DEFAULT_FLAGS = {"arch_enabled": False, "test_enabled": False}
 # Module-level markers — drive the test into the correct pytest
 # collection buckets. Tests are e2e (full chain through real on-disk
 # state + real migration + real state-machine transition); they are
-# intentionally NOT marked ``slow`` because the chain itself is in
+# intentionally NOT marked ``time_sensitive`` because the chain itself is in
 # memory and on tmp_path, well under 1s — so the default
-# ``addopts = -m "not slow"`` does not deselect them.
+# ``addopts = -m "not time_sensitive"`` does not deselect them.
 pytestmark = [
     pytest.mark.e2e,
 ]
