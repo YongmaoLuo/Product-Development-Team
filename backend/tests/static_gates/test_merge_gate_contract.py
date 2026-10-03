@@ -342,3 +342,77 @@ class TestTheBodyRefusesToBeFooled:
             f"the gate opened when a dependency reported {result!r}; only "
             f"`success` may open it"
         )
+
+
+class TestNoRequiredCheckCanBeSkippedAway:
+    """A required check that never reports is a permanent merge blocker.
+
+    GitHub's rule, from the troubleshooting guide: a workflow excluded by
+    path or branch filtering leaves its checks in ``Pending`` — and a
+    pending required check blocks every merge, with no action available
+    that makes it go away. The failure is not "the gate is bypassed"; it
+    is "the gate is unsatisfiable", which is worse, because it looks like
+    CI being busy.
+
+    That is not hypothetical here. ``test_json_cleanup.yml`` carried a
+    ``paths:`` filter listing four server-side paths, and a pull request
+    touching only ``ci.yml`` therefore could never be merged: the
+    ``JSON cleanup three-layer defense`` required check stayed pending
+    forever. The filter saved about forty seconds of e2e on unrelated
+    pull requests and cost the repository its ability to merge them.
+
+    A required check and a path filter are mutually exclusive — one of
+    them has to go — and which one goes is a policy decision that lives
+    in the repository's settings, not in this file. So the rule pinned
+    here is the conservative one: no workflow may path-filter a
+    pull-request trigger, because none of them can be required while
+    doing so. Dropping a check from ``required_status_checks`` remains
+    the escape hatch, and it is a visible one.
+    """
+
+    @pytest.fixture(scope="class")
+    def workflows_dir(self) -> Path:
+        return WORKFLOW.parent
+
+    def test_no_workflow_path_filters_a_pull_request(self, workflows_dir):
+        offenders = []
+        for path in sorted(workflows_dir.glob("*.yml")):
+            try:
+                document = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except yaml.YAMLError as exc:  # pragma: no cover - CI parses first
+                pytest.fail(f"{path.name} is not valid YAML: {exc}")
+            if not isinstance(document, dict):
+                continue
+
+            # PyYAML resolves the bare key `on:` to the boolean True,
+            # which is why every workflow reader has this quirk.
+            triggers = document.get("on", document.get(True))
+            if not isinstance(triggers, dict):
+                continue
+            pull_request = triggers.get("pull_request")
+            if isinstance(pull_request, dict) and pull_request.get("paths"):
+                offenders.append(
+                    f"{path.name} (pull_request.paths: "
+                    f"{pull_request['paths']})"
+                )
+            # The bare ``pull_request:`` form (no options) has no filter
+            # and is fine; only a mapping can carry one.
+
+        assert not offenders, (
+            "these workflows path-filter a pull-request trigger: "
+            + "; ".join(offenders)
+            + ". If any of their jobs is a required status check, a pull "
+            "request that touches none of the listed paths leaves the "
+            "check pending forever and blocks every merge with no way to "
+            "satisfy it. Remove the `paths:` filter, or take the job out "
+            "of required_status_checks — but do not leave both."
+        )
+
+    def test_the_main_workflow_itself_is_not_path_filtered(self, workflow):
+        triggers = workflow.get("on", workflow.get(True))
+        pull_request = (triggers or {}).get("pull_request")
+        assert not (isinstance(pull_request, dict) and pull_request.get("paths")), (
+            "ci.yml path-filters its own pull-request trigger, which would "
+            "wedge the merge gate and every other required check the same "
+            "way"
+        )
