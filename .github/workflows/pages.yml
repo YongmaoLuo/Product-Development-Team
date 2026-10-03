@@ -29,11 +29,16 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - ".github/workflows/pages.yml"
+  # No `paths:` here either, and for the same reason as
+  # test_json_cleanup.yml: `build` is a required status check, and GitHub
+  # leaves a path-filtered check in "Pending" forever — a pending
+  # required check blocks every merge with no way to satisfy it.
+  #
+  # The filter predated the check being required, and the header comment
+  # above already claimed the strict build "cannot merge" a pull request
+  # with rotten links. It could not, and could not, because nothing made
+  # it required. That claim is now true.
   pull_request:
-    paths:
-      - "docs/**"
-      - "mkdocs.yml"
-      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:
