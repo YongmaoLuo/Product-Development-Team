@@ -66,6 +66,8 @@ import signal
 import subprocess
 from typing import Any, Dict, Optional, Union
 
+from utils.process import _signallable_pgid
+
 __all__ = ["run_bounded", "terminate_process_tree"]
 
 
@@ -108,7 +110,9 @@ def terminate_process_tree(
     except OSError:  # pragma: no cover - exotic platform
         own_pgid = None
 
-    can_signal_group = pgid is not None and pgid != own_pgid
+    can_signal_group = (
+        _signallable_pgid(pgid) is not None and pgid != own_pgid
+    )
 
     if can_signal_group:
         try:

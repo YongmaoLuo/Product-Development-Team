@@ -327,21 +327,91 @@ def _run_probe_cmd(argv: List[str], timeout: int = 10) -> Optional[str]:
         return None
 
 
-def probe_port(port: int) -> PortProbe:
-    """Identify the process(es) listening on ``port`` (if any).
+def _port_is_listening(port: int, host: str = "127.0.0.1") -> Optional[bool]:
+    """Whether something accepts a TCP connection on *port*.
 
-    Uses ``lsof -ti :PORT`` for the PID list, then ``ps`` for cmdline
-    and start time. Any step failing degrades to a partial probe with
-    ``error`` set — callers treat an unprobed port as restart-worthy.
+    ``True`` / ``False``, or ``None`` when the question could not be
+    answered.
+
+    This is a **corroborating** probe, not the primary one. ``lsof`` stays
+    the primary: it is what names the process, and the freshness
+    comparison needs the pid and the start time anyway, so there is no
+    reason to make the connect the authority. What this adds is a second
+    opinion for the one case that matters and that ``lsof`` cannot
+    distinguish — ``lsof`` returning nothing means "nothing is listening"
+    *or* "lsof is missing" *or* "lsof timed out under load", and the
+    third is what made ``test_reap_end_to_end_frees_a_real_port`` pass
+    alone and fail inside the full suite. A refused connection is
+    evidence the first time is not, which is enough to resolve the
+    ambiguity in the safe direction.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=2.0):
+            return True
+    except ConnectionRefusedError:
+        # The kernel answered: nothing is accepting here.
+        return False
+    except OSError:
+        # Timeout, unreachable host, or a sandbox that refuses the
+        # connect outright. Not evidence either way.
+        return None
+
+
+def probe_port(port: int) -> PortProbe:
+    """Identify the process(es) **listening** on ``port`` (if any).
+
+    The PID list comes from a listener-only ``lsof`` query, then ``ps``
+    for cmdline and start time. Any step failing degrades to a partial
+    probe with ``error`` set — callers treat an unprobed port as
+    restart-worthy.
+
+    The query is listener-only on purpose, and the narrow form is load
+    bearing. The obvious spelling, ``lsof -ti :PORT``, asks a different
+    question than the one this function claims to answer: it matches any
+    socket whose local **or remote** port number is PORT, in any state
+    and either address family. A client that connected and whose peer
+    has since closed sits in ``CLOSE_WAIT`` holding exactly that remote
+    port, and a container runtime on the machine holds a few hundred
+    ``CLOSED`` sockets in the same shape — so the old query reported
+    "someone is listening" for ports the kernel would refuse a connect
+    to. Measured shadow rate on a developer machine: 4.8%–8.0%.
+
+    That is not a rare edge, it is a coin flip per port, and it made
+    ``stop_service`` and ``reap_services`` report that a killed process
+    still held its port. Both then correctly declined to signal a process
+    they had not started — the logic was right and the answer it was
+    given was not. Fixed by asking lsof the question it is being asked.
+
+    When ``lsof`` reports no listener, a connect is attempted to confirm
+    the port really is free rather than merely unlisted. See
+    :func:`_port_is_listening` for why that second opinion is worth a
+    subprocess's worth of ambiguity.
     """
     probe = PortProbe(port=port)
     if port in PROTECTED_PORTS:
         probe.error = f"port {port} is a protected backend-runtime port"
         return probe
 
-    pids_out = _run_probe_cmd(["lsof", "-ti", f":{port}"])
+    # Listener-only. Every selector here is load bearing:
+    #   -a            AND the selectors; without it lsof ORs -i and -p
+    #                 together and the filter means almost nothing
+    #   -iTCP:<port>  TCP only, so a UDP socket on the same number cannot
+    #                 make the port look occupied
+    #   -sTCP:LISTEN  the actual state filter — this is what excludes
+    #                 CLOSE_WAIT / CLOSED / ESTABLISHED, which is the
+    #                 whole bug
+    #   -t            pids only, so parsing stays a bare split()
+    pids_out = _run_probe_cmd([
+        "lsof", "-a", "-n", "-P", f"-iTCP:{port}", "-sTCP:LISTEN", "-t",
+    ])
     if pids_out is None:
         probe.error = "lsof probe failed (tool missing or errored)"
+        if _port_is_listening(port) is True:
+            # lsof is unavailable but the port answers, so something is
+            # holding it. The probe is partial, not clean — a caller that
+            # only reads `listening` must not conclude the port is free.
+            probe.listening = True
+            probe.error += "; port is listening but owner unknown"
         return probe
 
     pids: List[int] = []
@@ -351,6 +421,12 @@ def probe_port(port: int) -> PortProbe:
         except ValueError:
             continue
     if not pids:
+        if _port_is_listening(port) is True:
+            # lsof came back clean but the port accepts a connection.
+            # Under load lsof is the one that times out, and believing
+            # it here means declaring a live service stopped.
+            probe.listening = True
+            probe.error = "lsof reported no holder but the port accepts connections"
         return probe  # not listening — no error, just absent
 
     probe.listening = True

@@ -8,14 +8,14 @@ fails at *collection*, not at some later, more explicable point.
 ## The lanes
 
 ```bash
-# The default CI lane. -m unit skips the slow / integration / e2e /
+# The default CI lane. -m unit skips the time_sensitive / integration / e2e /
 # real_model markers; the missing models are satisfied by the stubs
 # backend/tests/conftest.py installs.
 backend/.venv/bin/python3 -m pytest backend/tests -m unit -q
 
 # Integration: spawns the server and talks to it over HTTP. Needs no live
 # model, but does need a free loopback port.
-backend/.venv/bin/python3 -m pytest backend/tests -m "not slow" -q
+backend/.venv/bin/python3 -m pytest backend/tests -m "not time_sensitive" -q
 
 # End-to-end: a full plan lifecycle through dry-run fake backends.
 # Main branch only, per the test-design decision.
