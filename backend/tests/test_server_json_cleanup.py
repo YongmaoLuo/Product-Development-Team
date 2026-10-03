@@ -109,6 +109,11 @@ import pytest
 # Backend root directory (the parent of ``server.py`` and ``state_machine/``).
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
+# The request guard's header name and value, read from the module rather
+# than spelled out, so a rename on the server side cannot leave this
+# fixture quietly sending a header nobody checks.
+import request_guard  # noqa: E402
+
 # Module-level guard: the state-machine refactor must be in place for
 # these gates to be meaningful.  When ``backend/state_machine/`` does
 # not exist (e.g. a parallel repo that has not yet received the
@@ -745,7 +750,18 @@ def exec_instance_setup(tmp_path, monkeypatch):
         # block), which is why it has to be in the child's environment
         # rather than patched in afterwards.
         "PDT_PLANS_DIR": str(plans_root),
-        "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+        # Extend the parent's PATH, do not replace it. It used to be a
+        # hard-coded macOS list, which meant the spawned server had no
+        # venv on its PATH: on CI the uvicorn that `which()` found a
+        # moment earlier lives in backend/.venv/bin, and the child could
+        # not resolve it. The server then died at startup, the health
+        # poll timed out, the fixture swallowed it, and the test carried
+        # on to assert against a database that had never been created —
+        # "sqlite_master 含 []", which is the exact symptom the comment
+        # above already documents for the stale-listener case. The local
+        # machine hid this: its uvicorn is outside the venv too, but it
+        # happened to start anyway.
+        "PATH": _child_path(),
         # 2026-09-14: prompts.py does ``from backend.framework.prompts
         # import ...``, which requires the REPO ROOT on sys.path.
         # ``uvicorn server:app`` with cwd=backend/ only puts backend/
@@ -843,7 +859,24 @@ def exec_instance_setup(tmp_path, monkeypatch):
         req = urllib.request.Request(  # noqa: S310
             f"http://127.0.0.1:8001/api/execution/{plan_id}/start",
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                # `server.request_guard` refuses any /api/* request that
+                # arrives without this header, and it refuses loopback
+                # hostnames that are not explicitly allowed. This fixture
+                # talks to a real server over real HTTP rather than
+                # through Starlette's TestClient, so it does not get the
+                # header `tests/conftest.py` injects into every
+                # TestClient — it has to send its own.
+                #
+                # Without it the call 403s, the request never reaches the
+                # code that runs `migrate()`, state.db is never created,
+                # and the schema layer reports an empty sqlite_master —
+                # which reads as a schema regression and is not one. That
+                # is the chain this test just spent a long time being
+                # misdiagnosed as.
+                request_guard.REQUEST_HEADER: request_guard.REQUEST_HEADER_VALUE,
+            },
             method="POST",
         )
         try:
@@ -1291,7 +1324,13 @@ def test_repository_api_contract(exec_instance_setup) -> None:
     req = urllib.request.Request(  # noqa: S310
         f"http://127.0.0.1:8001/api/execution/{plan_id}/start",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            # Same reason as the other two call sites: real HTTP, so no
+            # TestClient injection. Left off, this 403s before reaching
+            # any behaviour the assertions below are about.
+            request_guard.REQUEST_HEADER: request_guard.REQUEST_HEADER_VALUE,
+        },
         method="POST",
     )
     try:
@@ -1836,14 +1875,63 @@ _E2E_HEALTH_URL = f"http://127.0.0.1:{_E2E_PORT}/health"
 _E2E_START_URL_TEMPLATE = f"http://127.0.0.1:{_E2E_PORT}/api/execution/{{plan_id}}/start"
 
 
-def _find_uvicorn_path() -> str | None:
-    """Return the absolute path of the ``uvicorn`` executable, or
-    ``None`` if it is not on PATH.
+def _child_path() -> str:
+    """PATH for a spawned server: this process's, plus the venv if any.
 
-    The fixture relies on the same on-disk ``uvicorn`` binary as the
-    existing ``exec_instance_setup`` fixture so behavior is consistent
-    across the two real-server test gates.
+    The parent PATH is the base, not something to be replaced. It is what
+    `setup-python` populated and what makes the runner's own toolchain
+    reachable, and it is where a venv-installed ``uvicorn`` lands — so a
+    child given a shorter list cannot resolve the interpreter that
+    `_find_uvicorn_path()` just located a moment earlier.
+
+    The failure is silent in the worst way: the child dies at import, the
+    health poll times out, the fixture swallows that, and the test asserts
+    against a database nobody created. The comment at the other call
+    site records the same symptom arriving by a different route, which is
+    what made it look like a schema regression instead of a broken spawn.
+
+    ``sys.executable``'s directory is prepended for the venv case, where
+    the venv's ``bin`` may not be on PATH at all (a bare
+    ``python -m pytest`` invocation does not put it there).
     """
+    import os as _os
+    import sys as _sys
+
+    parts = [_os.path.dirname(_sys.executable)]
+    parts += [
+        p for p in _os.environ.get("PATH", "").split(_os.pathsep) if p
+    ]
+    return _os.pathsep.join(parts)
+
+
+def _find_uvicorn_path() -> str | None:
+    """Absolute path of the ``uvicorn`` to spawn, or ``None``.
+
+    Resolved from the running interpreter's own environment first, not
+    from ``PATH``. A hosted runner image ships uvicorn of its own, and
+    ``shutil.which`` was finding *that* one — a copy with none of this
+    project's dependencies. The spawn then died importing the backend,
+    the health poll timed out, the fixture treated a failed spawn as a
+    successful setup, and the test asserted against a database nobody had
+    created: ``sqlite_master`` empty, which reads exactly like a schema
+    regression.
+
+    The venv's own copy is the one that can import ``server``. When it
+    is genuinely absent, the correct outcome is a skip — "no live server
+    to test" — and this is now the only path that can produce one, so a
+    foreign uvicorn can no longer masquerade as ours.
+
+    Both fixtures resolve through here, so the two real-server gates
+    cannot drift apart again.
+    """
+    import os as _os
+    import sys as _sys
+
+    candidate = _os.path.join(
+        _os.path.dirname(_sys.executable), "uvicorn"
+    )
+    if _os.path.isfile(candidate) and _os.access(candidate, _os.X_OK):
+        return candidate
     return _shutil.which("uvicorn")
 
 
@@ -1935,7 +2023,51 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
     env = {
         "EXEC_PORT": str(_E2E_PORT),
         "PDT_STATE_DB_PATH": str(tmp_state_db),
-        "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+        # Two symptoms, one variable, and neither is where the other is.
+        #
+        # The 404: `server.py:166` reads PDT_PLANS_DIR once, at import,
+        # and caches it into the module global PLANS_DIR that `_plan_dir()`
+        # resolves against. A child process cannot inherit this test's
+        # `monkeypatch.setattr("server.PLANS_DIR", plans_root)` — that
+        # mutates the test process, and the server is a different one.
+        # So without this key the spawned server looks for tasks.json
+        # under <checkout>/plans and never finds the pair planted above.
+        #
+        # The missing state.db is NOT this request's doing, which is the
+        # part that misleads. `20260101-cleanup-sample` classifies as
+        # `archived` (its date is past any cutoff classify_plan is given),
+        # so `/start` returns 410 before it reaches open_db/migrate — the
+        # request path can never create this database. What creates it is
+        # the lifespan's `_recover_verification_states(PLANS_DIR)`
+        # (server.py:1070), which calls open_db + migrate once per
+        # subdirectory it finds under plans/ (verification_loop.py).
+        #
+        # That is why the missing key breaks both at once — the recovery
+        # loop iterates the same PLANS_DIR `_plan_dir()` uses — and why
+        # the failure is invisible on a developer machine. `/plans/` is
+        # gitignored (`.gitignore:85`), so a CI checkout has none, and
+        # PLANS_DIR.mkdir() at import leaves it empty: zero subdirectories
+        # means the loop body never runs means no database. A local
+        # checkout has a dozen real plan directories, so the same 404
+        # still produces a populated state.db. Verified both directions
+        # by running this test against a `git archive` of HEAD: identical
+        # failure to CI without the key, passes with it.
+        #
+        # `exec_instance_setup` below has carried this key since it was
+        # written; this fixture is a later copy that missed it.
+        "PDT_PLANS_DIR": str(plans_root),
+        # Extend the parent's PATH, do not replace it. It used to be a
+        # hard-coded macOS list, which meant the spawned server had no
+        # venv on its PATH: on CI the uvicorn that `which()` found a
+        # moment earlier lives in backend/.venv/bin, and the child could
+        # not resolve it. The server then died at startup, the health
+        # poll timed out, the fixture swallowed it, and the test carried
+        # on to assert against a database that had never been created —
+        # "sqlite_master 含 []", which is the exact symptom the comment
+        # above already documents for the stale-listener case. The local
+        # machine hid this: its uvicorn is outside the venv too, but it
+        # happened to start anyway.
+        "PATH": _child_path(),
         # See exec_instance_setup for why repo-root PYTHONPATH is
         # required — without it the spawn dies at import time
         # (``from backend.framework...``) and the e2e layer SKIPs.
@@ -1980,10 +2112,59 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
             except (urllib.error.URLError, ConnectionResetError, OSError):
                 pass
             time.sleep(0.25)
+        def _server_log_tail() -> str:
+            try:
+                server_log.flush()
+                server_log.seek(0)
+                return server_log.read().decode("utf-8", "replace")[-2000:]
+            except OSError:
+                return "<server log unavailable>"
+
         if not server_started:
             pytest.skip(
                 f"EXEC_PORT={_E2E_PORT} server did not become healthy "
-                "within 30s; e2e three-layer defense cannot run."
+                "within 30s; e2e three-layer defense cannot run. "
+                f"Server output:\n{_server_log_tail()}"
+            )
+
+        # A healthy :8001 is not evidence that THIS server is the one
+        # answering. The port is fixed, so anything else that ever bound
+        # it — a previous test's server that has not been reaped, or a
+        # listener the runner image starts — answers the probe instantly
+        # while writing to a DIFFERENT state.db. This fixture has no
+        # `PDT_STATE_DB_PATH` in the picture, so the consequence is a
+        # health check that passes, a foreign server, and an empty
+        # ``sqlite_master`` in the schema layer with nothing in between
+        # saying so.
+        #
+        # `exec_instance_setup` has had this guard since it was written;
+        # this fixture was a later copy that did not bring it along. That
+        # is why the failure looked like a schema regression: the schema
+        # assertion is the first thing to *report* it, and it is nowhere
+        # near the cause.
+        # A healthy :8001 is not evidence that THIS server is the one
+        # answering. The port is fixed, so anything else that ever bound
+        # it — a previous test's server not yet reaped, or a listener the
+        # runner image starts — answers the probe instantly while writing
+        # to a DIFFERENT state.db. `exec_instance_setup` has guarded
+        # against this since it was written; this fixture was a later
+        # copy that did not bring the guard along.
+        #
+        # A *live* server is the distinguishing evidence, and the process
+        # outlives the bind failure: when the port is taken it starts,
+        # writes its boot lines, and only then fails the bind, so
+        # `proc.poll()` has to be read after a beat rather than at the
+        # instant the probe succeeds.
+        for _ in range(20):                      # up to 5s at 0.25s
+            if proc.poll() is not None:
+                break
+            time.sleep(0.25)
+        if proc.poll() is not None:
+            pytest.skip(
+                f"the spawned server exited (rc={proc.returncode}) before "
+                f"the health probe succeeded, so another process is "
+                f"serving :{_E2E_PORT} and this test would read that "
+                f"server's database. Server output:\n{_server_log_tail()}"
             )
 
         # Drive the /api/execution/{plan_id}/start endpoint.  We
@@ -1997,16 +2178,81 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
         req = urllib.request.Request(  # noqa: S310
             _E2E_START_URL_TEMPLATE.format(plan_id=_E2E_FIXTURE_PLAN_ID),
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                # `server.request_guard` refuses any /api/* request that
+                # arrives without this header. This fixture talks to a
+                # real server over real HTTP rather than through
+                # Starlette's TestClient, so it does not get the header
+                # `tests/conftest.py` injects into every TestClient — it
+                # has to send its own.
+                #
+                # Without it the call 403s, the request never reaches the
+                # code that runs `migrate()`, state.db is never created,
+                # and the schema layer reports an empty sqlite_master —
+                # which reads as a schema regression and is not one.
+                request_guard.REQUEST_HEADER: request_guard.REQUEST_HEADER_VALUE,
+            },
             method="POST",
         )
+        status = None
+        start_body = ""
+        start_error = ""
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-                _ = resp.status
+                status = resp.status
+                start_body = resp.read().decode("utf-8", "replace")[:400]
         except urllib.error.HTTPError as exc:
             # 404/409/etc. are acceptable for the e2e test — we only
-            # need the endpoint exercised.
-            _ = exc.code
+            # need the endpoint exercised. The body is kept because when
+            # the schema layer later reports an empty sqlite_master, the
+            # question is always "what did this call actually say".
+            status = exc.code
+            start_body = exc.read().decode("utf-8", "replace")[:400]
+        except (urllib.error.URLError, OSError) as exc:
+            start_error = f"{type(exc).__name__}: {exc}"
+
+        # The database is NOT created by the call below, so the call's
+        # own response is not evidence about it. This plan classifies as
+        # `archived`, so /start returns 410 before it reaches
+        # open_db/migrate. What brings the schema up is the lifespan's
+        # recovery scan, which runs open_db + migrate per subdirectory
+        # under plans/ — see the PDT_PLANS_DIR note in the env block for
+        # the full chain and for why that scan has nothing to iterate on
+        # a CI checkout.
+        #
+        # So this asserts on the state the server left behind rather than
+        # on the endpoint's reply, and it fails rather than skips: an
+        # earlier version of this fixture checked for the database
+        # *before* driving the endpoint, so on a runner where the schema
+        # never got created it skipped with a message about a foreign
+        # process serving the port — which was not what was happening —
+        # and the third defense layer silently stopped being tested on
+        # every PR. A skip is only honest when the environment cannot run
+        # the test; here it can, so not running it is a failure and this
+        # one says what it found.
+        for _ in range(20):                      # up to 5s at 0.25s
+            if tmp_state_db.exists() and tmp_state_db.stat().st_size > 0:
+                break
+            time.sleep(0.25)
+
+        if not (tmp_state_db.exists() and tmp_state_db.stat().st_size > 0):
+            pytest.fail(
+                f"the spawned server answered /health on "
+                f":{_E2E_PORT} but never created {tmp_state_db}.\n"
+                f"  start endpoint: status={status} error={start_error or 'none'}\n"
+                f"  start body: {start_body}\n"
+                f"  state.db: exists={tmp_state_db.exists()} size="
+                f"{tmp_state_db.stat().st_size if tmp_state_db.exists() else 'n/a'}\n"
+                f"  tmp dir contents: "
+                f"{sorted(p.name for p in tmp_path.iterdir())}\n"
+                f"  PDT_STATE_DB_PATH in child env: {env.get('PDT_STATE_DB_PATH')}\n"
+                f"  server still running: {proc.poll() is None}\n"
+                f"  server output:\n{_server_log_tail()}\n"
+                f"The schema layer would report this as an empty "
+                f"sqlite_master, which reads like a schema regression. "
+                f"It is not: no migration ever ran."
+            )
 
         yield tmp_path
     finally:

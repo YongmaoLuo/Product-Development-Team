@@ -71,6 +71,94 @@ os.environ.setdefault("PDT_ALLOWED_HOSTS", "testserver")
 os.environ.setdefault("PDT_DEBUG_ROUTES", "1")
 
 
+# ---------------------------------------------------------------------------
+# Tripwire: no test may aim a broadcast at the machine it runs on.
+# ---------------------------------------------------------------------------
+#
+# ``os.killpg(1, sig)`` is ``kill(-1, sig)`` — a signal to every process
+# the caller may signal. On glibc that is exactly what happened here: a
+# ``MagicMock`` resolved to process group 1, the provider-fallback tests
+# in ``test_coding_tool`` broadcast a SIGKILL, and ``Runner.Worker`` died,
+# which is why a step timeout living inside that worker never fired and
+# the shard hung until GitHub reaped the job. See ``utils/process.py``.
+#
+# The guards in ``utils.process`` are the fix. This is the cheap fuse for
+# the day someone adds a *new* call site without routing it through them.
+#
+# Why an audit hook rather than a fixture: the call can happen at import
+# time or inside a thread the fixture never sees, and a hook catches all
+# of them. ``killpg`` is rare enough that the per-call cost is noise.
+#
+# Scope — read this before trusting a green run. The hook sees real
+# system calls only, so:
+#
+#   * it catches anything that genuinely reaches the kernel;
+#   * it is **blind** to ``os.killpg`` invoked through a test double.
+#     A suite that patches ``os.killpg`` replaces the very call the hook
+#     observes, so unit tests of the guards can never trip it — and that
+#     is exactly the traffic where a regression would hide.
+#
+# So this is a backstop against a *new call site firing for real*, not a
+# substitute for the per-guard tests in ``test_process_utils.py``. Both
+# are needed: the tests prove the guards work, this proves nothing grew
+# a fifth unguarded ``killpg`` between them.
+#
+# Reports rather than blocks, and does not raise at the call site: the
+# failure lands once at the end of the session with the full list and a
+# stack, instead of turning an unrelated test into a confusing error.
+# The signal only goes anywhere dangerous if a guard already failed to
+# prevent it, which is the case worth being loud about.
+_KILLPG_REPORTS: list = []
+
+
+def _install_killpg_tripwire() -> None:
+    """Record every real ``os.killpg`` that a guard failed to prevent.
+
+    A sentinel target (``<= 1``) reaching the kernel is a bug wherever it
+    appears, so the report is the deliverable and the signal itself is
+    left to do whatever it does — the point is to name the call site, and
+    on the platform where it matters the process is already in trouble by
+    the time this returns.
+    """
+
+    def _hook(event: str, args) -> None:
+        if event != "os.killpg":
+            return
+        pgid = args[0] if args else None
+        if isinstance(pgid, bool) or not isinstance(pgid, int) or pgid > 1:
+            return
+        import traceback
+
+        stack = "".join(traceback.format_stack()[-6:-1])
+        _KILLPG_REPORTS.append(f"os.killpg(pgid={pgid!r})\n{stack}")
+
+    sys.addaudithook(_hook)
+
+
+def _killpg_tripwire_report() -> None:
+    """Fail the session if any sentinel ``killpg`` was attempted.
+
+    Registered as a ``pytest_sessionfinish`` hook so the failure lands
+    once, with the full list, rather than per test.
+    """
+    if not _KILLPG_REPORTS:
+        return
+    report = "\n".join(f"  [{i + 1}] {r}" for i, r in enumerate(_KILLPG_REPORTS))
+    raise AssertionError(
+        f"{len(_KILLPG_REPORTS)} call(s) reached os.killpg with a POSIX "
+        f"sentinel target (pgid <= 1). On glibc that is a broadcast, not "
+        f"a group. Route them through utils.process.kill_process_group, "
+        f"or through _signallable_pgid if you need the raw check:\n{report}"
+    )
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:
+    _killpg_tripwire_report()
+
+
+_install_killpg_tripwire()
+
+
 def _install_request_guard_header() -> None:
     """Make every ``TestClient`` request carry the guard header.
 

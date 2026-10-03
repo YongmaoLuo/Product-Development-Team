@@ -2,19 +2,11 @@
 
 Why this exists
 ---------------
-The `unit` shard wedges on GitHub in a way that defeats every normal
-diagnostic: no step timeout, no job timeout, no post-steps, no artifact,
-no log. The reason there is *no evidence at all* is structural, and it is
-worth stating precisely because the shape recurs:
-
-    pytest ... 2>&1 | tee pytest-shard.log
-
-`tee` exits when it sees EOF on the pipe. A descendant process that
-inherited the write end of that pipe and is still alive keeps the pipe
-open, so **`tee` never exits, the step never completes**, the post-steps
-stay `pending`, and GitHub eventually reaps the job at ~45 minutes. The
-hang is not in pytest; pytest may well have exited. Nothing downstream of
-the pipe can run, which is why the wedge leaves no record.
+A test that leaves a child running is a real defect, and it is invisible
+by default: the process outlives the test that made it, nobody holds a
+handle, and the suite reports green. On a CI runner it is worse than
+invisible, because a lingering descendant can keep the step's output
+pipe open and the step never completes.
 
 So there are two defects and this module addresses the second one:
 
@@ -26,6 +18,45 @@ the process *group* — the same unit ``bounded_subprocess`` kills — diffs
 it around every test, and reports by name anything that appeared and
 survived, so a leak is attributed to the test that caused it rather than
 to the shard as a whole.
+
+Historical note — why the obvious explanation is not the one
+------------------------------------------------------------
+This docstring used to claim that the `unit` shard's GitHub wedge was a
+*pipe* problem: that a leaked child held stdout open, so ``tee`` never
+saw EOF and the step hung with the process long gone. That account was
+measured, plausible, and **wrong**, and it is recorded here so the next
+reader does not re-derive it.
+
+The real cause was ``os.killpg(1, SIGKILL)``. ``os.getpgid`` accepts any
+object implementing ``__index__``; a ``MagicMock`` standing in for a
+subprocess resolves to ``1``, so the provider-fallback tests in
+``test_coding_tool`` had the suite broadcasting a kill to every process
+the runner could signal. ``Runner.Worker`` died, which is why the step
+timeout — a timer living *inside* that worker — never fired, why the
+step never reached a conclusion, and why the job sat until GitHub's
+server-side timeout reaped it five minutes later. The single-variable
+matrix in the diagnostic run settled it: a probe that only *read*
+``getpgid(mock)`` passed, a probe that additionally *sent* the signal
+died.
+
+Two traps in that story, both worth remembering:
+
+  * A process-group census cannot refute this. The runner's agent lives
+    in some pgid; whether that is 1 or 2090 says nothing, because
+    ``killpg(1, sig)`` is ``kill(-1, sig)`` — a broadcast, not a
+    group-directed signal. "The target group doesn't contain the
+    victim" is not an answer.
+  * The bug is invisible on macOS and lethal on Linux. Darwin's libc
+    rejects ``pgid == 1`` with ``EPERM`` before the kernel is reached;
+    glibc has no such case. The same line is a dud on the laptop that
+    owns the code and a grenade in CI, so it survived a whole release
+    with a clean local test run. Absence of a local reproduction is not
+    evidence of safety — check the libc, not the symptom.
+
+The leak watcher below is still worth having — it is a genuine safety
+net for a genuine class of defect. It is just not what was killing the
+shard. The fix for that was in ``utils.process`` (guards on the pid and
+on the resulting group), not here.
 
 Scope and safety
 ----------------
