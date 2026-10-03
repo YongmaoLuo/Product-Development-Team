@@ -304,13 +304,32 @@ class ServiceRuntimeMap:
 
 
 def _process_group_of(pid: int) -> Optional[int]:
-    out = _run(["ps", "-p", str(pid), "-o", "pgid="])
-    if not out:
-        return None
+    """*pid*'s process group, or ``None`` if it cannot be determined.
+
+    ``os.getpgid`` rather than a ``ps`` subprocess. The probe is asked for
+    immediately after ``Popen`` returns, and that is a race: the child
+    exists as a kernel task but ``ps`` can run before the scheduler has
+    made it visible in the process table, so the probe answers with empty
+    output and the caller records ``pgid=None``. A ``None`` here is not a
+    cosmetic gap — ``stop_service`` reads it to decide whether it may
+    signal the group at all, and without it the stop degrades to
+    single-pid kills that leave the group behind.
+
+    ``getpgid`` is the same lookup the kernel would do for ``kill``, with
+    no subprocess to lose. It is also cheaper, which matters because this
+    is on the spawn path. ``pgid <= 1`` is refused for the reason
+    ``utils.process._signallable_pgid`` documents: 1 is ``kill(-1)``, a
+    broadcast, and 0 is the caller's own group.
+    """
     try:
-        return int(out.split()[0])
-    except (IndexError, ValueError):
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        # The process exited between the spawn and this call, or belongs
+        # to another user. Either way there is no group of ours to record.
         return None
+    if isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 1:
+        return None
+    return pgid
 
 
 def _process_start_epoch(pid: int) -> Optional[float]:
@@ -420,8 +439,22 @@ def stop_service(
             os.killpg(pgid, 9)
         except (ProcessLookupError, PermissionError, OSError):
             pass
-    time.sleep(1.0)
-    result["port_free"] = not probe_port(runtime.port).listening
+
+    # Poll, do not sleep. SIGKILL is asynchronous — `killpg` returning
+    # means the signal was delivered, not that the kernel has finished
+    # tearing the process down. This branch used to sleep a flat second
+    # and then look once, so a runner that was busy when the signal
+    # landed reported the port still held after a kill that had in fact
+    # worked; on a loaded machine that was a few percent of runs, and
+    # always on this path, because it is the only one that does not
+    # already wait for the port. The SIGTERM branch above polls, which is
+    # why the escalation is the branch that fails.
+    deadline = time.monotonic() + max(5.0, grace_seconds)
+    while True:
+        result["port_free"] = not probe_port(runtime.port).listening
+        if result["port_free"] or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
     result["detail"] = (
         "stopped after SIGKILL" if result["port_free"]
         else f"port {runtime.port} still held after SIGKILL"
@@ -622,6 +655,33 @@ def _relocate_service(
     return failed
 
 
+def _await_exit(proc: subprocess.Popen, timeout: float) -> tuple:
+    """Wait briefly for *proc* to exit. Returns ``(exited, returncode)``.
+
+    Polling once is not enough where this is used. ``start_service``
+    spawns ``/bin/bash -lc <start_cmd>``, so when the command inside
+    fails — EADDRINUSE, say — the shell has to notice and unwind before
+    ``Popen`` can report a code. The readiness probe, meanwhile, returns
+    in milliseconds because *something* is already answering on the port.
+    Checking straight after it therefore samples the shell mid-teardown
+    and reports a dead service as started.
+
+    The wait is short and bounded: the caller is on the start path, and
+    the question being asked — "did the thing we just launched die
+    immediately?" — is answered by the first tenth of a second in the
+    cases that matter. A service that starts cleanly is still running
+    when the window closes, which is the answer we want.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        code = proc.poll()
+        if code is not None:
+            return True, code
+        if time.monotonic() >= deadline:
+            return False, None
+        time.sleep(0.02)
+
+
 def start_service(
     decl: ServiceDeclaration, project_dir: Path,
     *, timeout_seconds: Optional[int] = None,
@@ -674,10 +734,50 @@ def start_service(
 
     runtime.pid = proc.pid
     runtime.pgid = _process_group_of(proc.pid)
-    runtime.start_epoch = _process_start_epoch(proc.pid)
+    # Our own clock, not the system's. `proc` was created by the line
+    # above, so we know when it started without asking anyone, and that
+    # matters twice over: the `ps -o lstart=` probe is unavailable or
+    # racy on a machine that restricts subprocesses (the unit test
+    # environment does), and a `None` here silently disables the PID-reuse
+    # guard in `_pid_reused` — a recycled PID would then be signalled as
+    # if it were still ours. The comparison tolerates 2 seconds and
+    # `ps lstart` only has 1-second granularity, so a wall-clock reading
+    # taken microseconds after the fork is well inside it.
+    runtime.start_epoch = time.time()
     runtime.origin = "spawned"
 
     if wait_until_ready(decl, timeout_seconds):
+        # "Something answers on this port" is not "our service is up".
+        # The two come apart when the port is taken by something else in
+        # the window between choosing it and binding it: our child dies
+        # with EADDRINUSE, the readiness probe finds the other listener,
+        # and the caller is handed `ready=True` for a process that is not
+        # serving. That was observed locally with a desktop application
+        # holding the port — and the mistake is not harmless downstream,
+        # because the ledger then records a pid that never served, and
+        # every later reap targets the wrong process.
+        #
+        # So confirm the holder is ours before claiming readiness.
+        #
+        # The check has to wait rather than sample once. `proc` is
+        # `/bin/bash -lc <start_cmd>`, so a child that dies on
+        # EADDRINUSE does not make `proc` exit at the same instant — the
+        # shell still has to unwind and exit itself, and on this machine
+        # that is the difference between "already dead" and "not yet".
+        # Sampling once straight after the readiness probe, which returns
+        # in milliseconds, reliably caught the shell before it had exited
+        # and reported the dead service as ready.
+        exited, _ = _await_exit(proc, timeout=2.0)
+        if exited:
+            tail = _tail(log_file, 15)
+            runtime.ready = False
+            runtime.detail = (
+                f"exited immediately (rc={proc.returncode}); port "
+                f"{decl.port} is answering but this process never served "
+                f"on it — something else holds the port. Log tail: "
+                f"{tail or '(empty)'}"
+            )
+            return runtime
         runtime.ready = True
         runtime.detail = (
             f"started (pid {proc.pid}); ready within "
