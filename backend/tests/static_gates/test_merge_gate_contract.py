@@ -282,6 +282,15 @@ class TestTheBodyRefusesToBeFooled:
             f"the gate closed on an all-green run (rc={proc.returncode}).\n"
             f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
         )
+        assert "All 3 upstream jobs succeeded" in proc.stdout, (
+            "the gate's own summary must state how many jobs it checked.\n"
+            f"stdout:\n{proc.stdout}\n"
+            "It used to print `${#NEEDS_JSON}` — the byte length of the "
+            "JSON string — and announce 620 jobs for a nine-job gate. A "
+            "number a reader takes literally is not a cosmetic problem; "
+            "it is the same class of defect this gate exists to prevent, "
+            "one level down."
+        )
 
     def test_it_closes_when_a_job_failed(self, gate_step, gate_script):
         """The case the whole job exists for.
