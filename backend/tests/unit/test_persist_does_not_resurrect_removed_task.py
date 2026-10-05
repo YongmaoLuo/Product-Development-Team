@@ -168,6 +168,42 @@ def test_update_task_status_does_not_resurrect_a_removed_task(tmp_path, conn):
     assert "gone" not in repo.load_all(PLAN_ID)
 
 
+def test_update_task_commit_sha_does_not_resurrect_a_removed_task(tmp_path, conn):
+    """The third writer needs the same guard as the other two.
+
+    ``update_task_commit_sha`` had a membership check, but it wrapped
+    only the ``runtime_overrides`` mirror — the SQLite write sat outside
+    it, so the guard was present in the source and absent in effect.
+    A refiner split that deleted a parent therefore left behind a
+    content-free row (status / title / description all NULL, commit_sha
+    set), and the dispatcher reported "No schedulable micro-layer
+    found" while the real children were still pending.
+    """
+    agent, tm, _ = _harness(tmp_path, [_task("1")], PlanTaskRepository(conn))
+    repo = PlanTaskRepository(conn)
+
+    tm.update_task_commit_sha("gone", "a" * 40)
+
+    assert "gone" not in repo.load_all(PLAN_ID), (
+        "update_task_commit_sha re-created a row for a task the plan no "
+        "longer contains — its guard wrapped runtime_overrides only, "
+        "leaving the SQLite upsert unguarded"
+    )
+
+
+def test_the_commit_sha_guard_does_not_over_block_a_live_task(tmp_path, conn):
+    """A task the plan still contains must still record its commit."""
+    agent, tm, _ = _harness(tmp_path, [_task("1")], PlanTaskRepository(conn))
+    repo = PlanTaskRepository(conn)
+    sha = "b" * 40
+
+    tm.update_task_commit_sha("1", sha)
+
+    rows = repo.load_all(PLAN_ID)
+    assert "1" in rows, "the guard must not block a task the plan contains"
+    assert (rows["1"].get("commit_sha") if isinstance(rows["1"], dict) else rows["1"]) == sha
+
+
 def test_the_guard_does_not_over_block_a_live_task(tmp_path, conn):
     """A task the plan still contains must keep persisting normally."""
     agent, tm, _ = _harness(
