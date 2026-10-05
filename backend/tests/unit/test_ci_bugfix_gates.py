@@ -284,13 +284,13 @@ def test_ci_contains_bugfix_test_gates() -> None:
     )
     assert e2e_name_match is not None, (
         "ci.yml must declare a top-level `e2e-...:` job (the mock-plan "
-        "E2E that runs on every push to main by default)."
+        "E2E that runs on every pull request by default)."
     )
     e2e_name = e2e_name_match.group(1).strip()
     assert "mock" in e2e_name.lower() or "plan" in e2e_name.lower(), (
         f"the default e2e job's `name:` must mention 'mock' or 'plan' "
         f"so the contract is self-documenting (got name={e2e_name!r}). "
-        f"The mock-plan E2E must run on every push to main while the "
+        f"The mock-plan E2E must run on every pull request while the "
         f"real-plan E2E is gated behind a workflow_dispatch input."
     )
 
@@ -429,7 +429,7 @@ def test_ci_real_migration_requires_explicit_input() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — a push to main must actually run the layered gates
+# Test 3 — a pull request must actually run the layered gates
 # ---------------------------------------------------------------------------
 #
 # 2026-09-22. Run 35725018566 (a push to main) reported
@@ -440,20 +440,25 @@ def test_ci_real_migration_requires_explicit_input() -> None:
 # ``needs: integration-tests`` on the e2e job whose own ``if`` explicitly
 # ALLOWS a push to main.
 #
-# This repo's workflow is a local merge into main followed by a direct
-# push — there are no PRs — so "PR gate" meant "never runs". A green
-# conclusion that skipped most of the pipeline is worse than a red one:
-# it is a gate that reports success without checking anything.
+# Those predicates were correct then — the repo merged locally and
+# pushed main directly, so the only trigger was ``push``. The
+# ``main: pull request required`` ruleset (2026-09-29) inverted it, and
+# ci.yml dropped its ``push:`` trigger on 2026-10-05, leaving the pull
+# request as the single path to main. The failure shape did not
+# change, only the trigger it hides behind: a schedule- or
+# dispatch-only predicate on a lane, or on anything in its ``needs:``
+# chain, is now just as dead.
+#
+# A green conclusion that skipped most of the pipeline is worse than a
+# red one: it is a gate that reports success without checking anything.
 #
 # The predicates below must stay in lockstep. If a future maintainer
-# narrows one of them back to pull_request-only, these tests fail rather
-# than the pipeline quietly going dark.
+# narrows one of them away from ``pull_request``, these tests fail
+# rather than the pipeline quietly going dark.
 
-#: The predicate half that permits a push to main. Matched as a
+#: A predicate fragment that permits a pull request. Matched as a
 #: substring so a job may combine it with other conditions.
-_MAIN_PUSH_PREDICATE = (
-    "github.event_name == 'push' && github.ref == 'refs/heads/main'"
-)
+_PULL_REQUEST_PREDICATE = "github.event_name == 'pull_request'"
 
 
 def _job_condition(text: str, job_id: str) -> str | None:
@@ -463,16 +468,16 @@ def _job_condition(text: str, job_id: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
-def _runs_on_main_push(text: str, job_id: str) -> bool:
-    """True when ``job_id`` is not excluded from a push to main."""
+def _runs_on_pull_request(text: str, job_id: str) -> bool:
+    """True when ``job_id`` is not excluded from a pull request."""
     condition = _job_condition(text, job_id)
     if condition is None:
         return True  # no predicate — runs on every trigger
-    return _MAIN_PUSH_PREDICATE in condition
+    return _PULL_REQUEST_PREDICATE in condition
 
 
 @pytest.mark.unit
-def test_every_layered_gate_runs_on_a_push_to_main() -> None:
+def test_every_layered_gate_runs_on_a_pull_request() -> None:
     """lint -> grep-guard -> unit -> integration -> e2e must all run.
 
     A gate that is skipped on the branch it is supposed to protect is
@@ -486,24 +491,24 @@ def test_every_layered_gate_runs_on_a_push_to_main() -> None:
         "e2e-on-demand",
     ):
         condition = _job_condition(text, job_id)
-        assert _runs_on_main_push(text, job_id), (
-            f"the {job_id!r} job is excluded from a push to main "
-            f"(if={condition!r}). This repo merges locally and pushes "
-            f"main directly — there is no PR — so a pull_request-only "
-            f"predicate means the job never runs at all, and a green "
-            f"run reports success without having checked anything."
+        assert _runs_on_pull_request(text, job_id), (
+            f"the {job_id!r} job is excluded from a pull request "
+            f"(if={condition!r}). ci.yml has no `push:` trigger, so the "
+            f"pull request is the only path to main — a schedule- or "
+            f"dispatch-only predicate means the job never runs before a "
+            f"merge, and a green run reports success without having "
+            f"checked anything."
         )
 
 
 @pytest.mark.unit
-def test_the_e2e_job_is_reachable_on_a_push_to_main() -> None:
-    """Every ``needs:`` ancestor of the e2e job must also run on main.
+def test_the_e2e_job_is_reachable_on_a_pull_request() -> None:
+    """Every ``needs:`` ancestor of the e2e job must also run on a PR.
 
     GitHub skips a job whose ``needs`` job was skipped. So an e2e job
-    with a push-to-main ``if`` is still dead if the job it needs is
-    pull_request-only — which is exactly how e2e went dark while its own
-    comment claimed "Default CI behaviour (push to main): runs the
-    MOCK-PLAN E2E only".
+    with a pull_request ``if`` is still dead if the job it needs is
+    schedule-only — which is exactly how e2e went dark twice while its
+    own comment claimed it was the default lane.
     """
     text = _read_workflow()
     pending = ["e2e-on-demand"]
@@ -514,9 +519,9 @@ def test_the_e2e_job_is_reachable_on_a_push_to_main() -> None:
             continue
         visited.add(job_id)
         assert _job_body(text, job_id) is not None
-        assert _runs_on_main_push(text, job_id), (
+        assert _runs_on_pull_request(text, job_id), (
             f"e2e-on-demand depends on {job_id!r}, which does not run on "
-            f"a push to main — GitHub skips a job whose `needs` job was "
+            f"a pull request — GitHub skips a job whose `needs` job was "
             f"skipped, so e2e would never run there either."
         )
         pending.extend(_needs_tokens(_job_body(text, job_id)) or [])
