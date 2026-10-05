@@ -20,9 +20,11 @@ on:
   pull_request:
     branches:
       - main
-  push:
-    branches:
-      - main
+  # No `push:` trigger — this is a required check, and it already runs on
+  # every pull request. The post-merge run added nothing (same tree,
+  # already green) and cost a full venv build per merge.
+  # `pages.yml` still has its push trigger and should keep it: that
+  # workflow's `deploy` job publishes the docs site from main.
 
 permissions:
   contents: read
