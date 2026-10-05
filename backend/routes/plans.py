@@ -14,6 +14,7 @@ from pathlib import Path
 from datetime import datetime
 import json
 import sqlite3
+import time
 
 # Late binding into the application module: ``server`` owns the shared
 # helpers, request models and module globals, and the suite monkeypatches
@@ -124,6 +125,27 @@ def _log_divergences(status: Any) -> None:
     )
 
 
+#: Verification verdicts that mean "this round is over". Used by the
+#: reconciliation in :func:`_build_plan_status` to decide when
+#: ``plan_routing.verification`` is allowed to override a stale
+#: ``plan_verification.verification_status``. Distinct from
+#: ``cards.VERIFICATION_TERMINAL_STATUSES``, which spells the same idea
+#: in the card's own vocabulary and also carries the
+#: ``verification_*`` phase-prefixed forms.
+_TERMINAL_VERIFICATION_STATUSES = frozenset({
+    "passed", "failed", "loop_stopped",
+    "verification_passed", "verification_failed",
+    "verification_loop_stopped",
+})
+
+#: ``(plan_id, stale_value, routing_value) -> last_logged_monotonic``.
+#: Bounded by pruning on write, and only ever as large as the number of
+#: distinct drifts seen in one process — not the poll rate.
+_RECONCILE_LOGGED: dict = {}
+_RECONCILE_LOG_WINDOW_SECONDS = 300.0
+_RECONCILE_LOG_MAX_ENTRIES = 256
+
+
 def _build_plan_status(plan_id: str) -> Any:
     """Assemble the one plan-status snapshot every reader renders from.
 
@@ -142,6 +164,10 @@ def _build_plan_status(plan_id: str) -> Any:
     v_round = 0
     v_max = 0
     v_stop: Optional[str] = None
+    # Bound before the try: the reconciliation below reads ``route``, and
+    # the except path leaves it unassigned. A status read must degrade,
+    # not raise NameError on top of the failure it is already handling.
+    route: Optional[Dict[str, Any]] = None
     try:
         conn, routing, verification = _server._open_verification_state()
         try:
@@ -167,6 +193,84 @@ def _build_plan_status(plan_id: str) -> Any:
         # this plan" is exactly the wrong moment to hand them a 500.
         _server.logger.exception("[plan_status] state.db read failed plan=%s", plan_id)
 
+    # Reconcile the two verification stores BEFORE the snapshot is built.
+    # ``plan_routing.verification`` is CAS-advanced by the state machine
+    # at every round boundary; ``plan_verification.verification_status``
+    # is written by a separate best-effort path. When the second write
+    # does not land, the top-level ``verification_status`` keeps saying
+    # "running" for a round that ended, and the card header — which is a
+    # pure function of this snapshot — says "🔄 验证中" above a body
+    # reading "执行中 → 正在跑 `[repair-*]`". The drift persists for as
+    # long as the repair round runs, which is long.
+    #
+    # Only a TERMINAL routing verdict overrides a non-terminal
+    # ``plan_verification`` value, and only the reverse. Two stores both
+    # claiming a live state is not a conflict — that is the normal shape
+    # of a round in progress — and picking a winner there would invent an
+    # answer neither store supports.
+    routing_verif = (route or {}).get("verification")
+    if isinstance(routing_verif, str):
+        # ``plan_routing.verification`` is a TEXT column holding JSON;
+        # whether ``routing.current()`` hands it back parsed depends on
+        # the repository version, and both shapes are in the wild. Take
+        # whichever arrives; a malformed blob is treated as "no routing
+        # verdict", which leaves ``plan_verification`` authoritative.
+        try:
+            routing_verif = json.loads(routing_verif) if routing_verif else {}
+        except (ValueError, TypeError):
+            routing_verif = {}
+    if not isinstance(routing_verif, dict):
+        routing_verif = {}
+    routing_v_status = str(routing_verif.get("status") or "").strip().lower()
+    if routing_v_status in _TERMINAL_VERIFICATION_STATUSES and v_status in (
+        "", "running", "in_progress", "pending", "not_started",
+    ):
+        # Rate-limited, not silent. ``/api/plan/{id}/status`` is polled
+        # several times a minute per plan (the notifier rebuilds from it
+        # and its stale-watch ticks on it), so an unconditional warning
+        # would bury the log under one line per poll for as long as the
+        # drift lasts — which is the whole repair round. First sighting
+        # per (plan, stale value) is logged; repeats within the window
+        # are counted and summarised when the window rolls.
+        _key = (plan_id, v_status or "<empty>", routing_v_status)
+        _now = time.monotonic()
+        if len(_RECONCILE_LOGGED) >= _RECONCILE_LOG_MAX_ENTRIES:
+            # Never grows without bound across a long-lived server that
+            # sees many plans. The oldest half is the least interesting:
+            # anything still drifting will re-log on its next window.
+            for _stale_key in sorted(
+                _RECONCILE_LOGGED, key=_RECONCILE_LOGGED.get,
+            )[: _RECONCILE_LOG_MAX_ENTRIES // 2]:
+                _RECONCILE_LOGGED.pop(_stale_key, None)
+        if _key not in _RECONCILE_LOGGED:
+            _RECONCILE_LOGGED[_key] = _now
+            _server.logger.warning(
+                "[plan_status] plan_verification.verification_status=%r is "
+                "stale against plan_routing.verification.status=%r plan=%s — "
+                "using the routing verdict. This repeats; the fix belongs in "
+                "the round-close write, not in the read path.",
+                v_status, routing_v_status, plan_id,
+            )
+        elif _now - _RECONCILE_LOGGED[_key] >= _RECONCILE_LOG_WINDOW_SECONDS:
+            _RECONCILE_LOGGED[_key] = _now
+            _server.logger.warning(
+                "[plan_status] plan_verification.verification_status=%r is "
+                "still stale against plan_routing.verification.status=%r "
+                "plan=%s — still using the routing verdict",
+                v_status, routing_v_status, plan_id,
+            )
+        v_status = routing_v_status
+        try:
+            v_round = int(routing_verif.get("round") or v_round or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            v_max = int(routing_verif.get("max_rounds") or v_max or 0)
+        except (TypeError, ValueError):
+            pass
+        if routing_verif.get("stop_reason"):
+            v_stop = routing_verif.get("stop_reason")
+
     rows = _read_task_rows(plan_id)
     current_task: Optional[Dict[str, Any]] = None
     next_task: Optional[Dict[str, Any]] = None
@@ -177,6 +281,23 @@ def _build_plan_status(plan_id: str) -> Any:
             current_task = entry
         elif status in ("", "pending") and next_task is None:
             next_task = entry
+
+    # What the executor is doing when no task row is in_progress. Read
+    # here, not from the ``execution`` sub-payload assembled below, so
+    # the header and the body are answered by the SAME read — the body
+    # sections are permitted to fail independently (each degrades to
+    # None), and a header that read them would inherit that flakiness.
+    try:
+        from execution_logger import ExecutionLogger
+
+        current_activity: Optional[Dict[str, Any]] = (
+            ExecutionLogger.current_activity(plan_id)
+        )
+    except Exception:
+        _server.logger.exception(
+            "[plan_status] current_activity read failed plan=%s", plan_id,
+        )
+        current_activity = None
 
     status_snapshot = PlanStatus(
         plan_id=plan_id,
@@ -192,6 +313,7 @@ def _build_plan_status(plan_id: str) -> Any:
         tasks=_task_counts(rows, _read_disk_task_ids(plan_id)),
         current_task=current_task,
         next_task=next_task,
+        current_activity=current_activity,
     )
 
     divergences = find_divergences(status_snapshot)

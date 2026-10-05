@@ -1434,6 +1434,114 @@ def _running_vps_from_activity(
     }
 
 
+#: Display labels for the round sub-steps, keyed by the ``kind`` this
+#: module derives. Kept next to the derivation so adding a kind forces a
+#: decision about how it reads; the card receives the finished string and
+#: never has to know these names.
+_VERIFICATION_ACTIVITY_LABELS = {
+    "planning": "📋 正在编排本轮验证点",
+    "running": "🔍 正在验证",
+    "judging": "⚖️ 正在复核验证结论",
+    "summarizing": "📊 正在汇总本轮结果",
+}
+
+
+def _verification_round_activity(
+    plan_dir: Path,
+    running: set,
+    activity: Dict[str, Dict[str, str]],
+) -> Optional[Dict[str, Any]]:
+    """Describe what the verification round is doing when no VP is in flight.
+
+    Returns ``{"kind", "label", "vp_id", "since"}`` or ``None``.
+
+    Why this exists: ``current_vp`` is populated by the executor's
+    semaphore-primary slot, so it is only set while a VP is executing.
+    A round spends most of its wall-clock time elsewhere — planning the
+    VP set, judging the verdicts, writing the report — and in those
+    windows the card fell through to a bare "🔄 验证中" naming nothing.
+    The round's two boundaries produce a nameless card each: one at
+    round start before the first ``vp_start``, one at round close after
+    the last ``vp_complete``.
+
+    The judgment phase is the expensive case, and the reason it needs
+    naming rather than merely tolerating. It walks the VPs one at a time
+    and can run for a long stretch. Its heartbeats publish
+    ``KIND_VP_STATE_CHANGED``, so the card IS rebuilt throughout — but
+    nothing the card renders moves, so ``card_fingerprint`` matches and
+    every one of those rebuilds is deduped away. Without this the card
+    freezes for the whole phase showing a verdict from a phase that has
+    already ended. Naming the sub-step makes the content differ, which
+    is what lets the dedup do its job.
+
+    ``running`` (the in-flight VP set) is passed in rather than re-derived
+    so this and the ``current_vp`` fallback in the caller cannot disagree
+    about which VPs are live.
+    """
+    logs_dir = plan_dir / "logs"
+    log_files = (
+        sorted(logs_dir.glob("verification_*.log"), key=lambda p: p.stat().st_mtime)
+        if logs_dir.exists() else []
+    )
+
+    if running:
+        # A VP is genuinely in flight. The caller already names it via
+        # ``current_vp``; stay out of the way rather than emitting a
+        # second, vaguer line about the same thing.
+        return None
+
+    if not log_files:
+        return {"kind": "planning", "label": _VERIFICATION_ACTIVITY_LABELS["planning"],
+                "vp_id": None, "since": None}
+
+    last_event_type: Optional[str] = None
+    last_vp_id: Optional[str] = None
+    last_ts: Optional[str] = None
+    started_any = False
+    try:
+        with open(log_files[-1], "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                et = entry.get("event_type")
+                ts = entry.get("timestamp")
+                vp_id = entry.get("verification_point_id")
+                if et == "vp_start":
+                    started_any = True
+                if et == "judgment_heartbeat" and isinstance(ts, str):
+                    last_event_type = "judgment_heartbeat"
+                    last_ts = ts
+                    last_vp_id = vp_id if isinstance(vp_id, str) and vp_id else None
+                elif et in ("vp_start", "vp_complete") and isinstance(ts, str):
+                    last_event_type = et
+                    last_ts = ts
+                    last_vp_id = vp_id if isinstance(vp_id, str) and vp_id else None
+    except OSError:
+        return None
+
+    if last_event_type == "judgment_heartbeat":
+        label = _VERIFICATION_ACTIVITY_LABELS["judging"]
+        if last_vp_id:
+            label += f" `[{last_vp_id}]`"
+        return {"kind": "judging", "label": label,
+                "vp_id": last_vp_id, "since": last_ts}
+    if not started_any:
+        return {"kind": "planning", "label": _VERIFICATION_ACTIVITY_LABELS["planning"],
+                "vp_id": None, "since": last_ts}
+    # Every VP in the round has completed and no judgment has started:
+    # the orchestrator is aggregating verdicts into the report.
+    return {"kind": "summarizing",
+            "label": _VERIFICATION_ACTIVITY_LABELS["summarizing"],
+            "vp_id": None, "since": last_ts}
+
+
 def _build_verification_progress(plan_id: str) -> dict:
     """Verification progress — wrapper owning the state-machine handle.
 
@@ -1787,12 +1895,30 @@ def _verification_progress_body(
         except Exception:
             stop_reason = None
 
+    # ``current_vp`` above answers "which VP is executing". This answers
+    # "what is the round doing when none is" — planning, judging,
+    # summarizing. Additive on purpose: several tests pin ``current_vp``'s
+    # existing semantics (including its being None outside a VP), and the
+    # card needs both. Gated on the round being live so a terminal plan's
+    # payload is byte-for-byte what it was before.
+    round_activity: Optional[dict] = None
+    if str(verification_status or "").lower() in ("running", "in_progress"):
+        try:
+            round_activity = _verification_round_activity(
+                plan_dir, running_vp_ids, _latest_activity,
+            )
+        except Exception:
+            _server.logger.exception(
+                "[verification_progress] round_activity failed plan=%s", plan_id,
+            )
+
     return {
         "plan_id": plan_id,
         "verification_status": verification_status,
         "verification_round": verification_round,
         "stop_reason": stop_reason,
         "current_vp": current_vp_payload,
+        "activity": round_activity,
         "completed_vps": completed_vps,
         "failed_vps": failed_vps,
         "skipped_vps": skipped_vps,
