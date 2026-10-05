@@ -13,7 +13,13 @@ historical regressions made this concrete:
     declared it would run on push to main, but its ``needs:
     integration-tests`` chained to a job that was itself gated to
     ``pull_request`` only — so GitHub skipped the chain and reported
-    green.
+    green. The same shape recurred on 2026-10-02 when the e2e job's
+    own ``if`` was narrowed.
+
+    Gate 5 below now roots that check at ``pull_request`` rather than
+    ``push``. ci.yml lost its ``push:`` trigger on 2026-10-05, so the
+    pull request is the only path to ``main`` and a chain that dies
+    there is dead outright.
 
   * Earlier the same year, the install / lint layer diverged from
     the local rule that pytest must go through ``backend/.venv``:
@@ -50,10 +56,10 @@ TDD spec (5 gates):
           ``backend/.venv`` or bootstrap's ``./.venv``; a bare
           ``python3 -m pytest`` line fails the gate.
 
-  Gate 5: ``test_e2e_job_runs_on_main_push``
+  Gate 5: ``test_e2e_job_runs_on_a_pull_request``
           A job invoking ``-m e2e`` exists AND it is reachable
-          from ``on.push.branches=[main]`` (its own ``if`` allows
-          the push AND no ``needs:`` ancestor is excluded).
+          from ``on.pull_request`` (its own ``if`` allows the pull
+          request AND no ``needs:`` ancestor is excluded).
 """
 
 from __future__ import annotations
@@ -182,26 +188,28 @@ def _needs_tokens(body: str) -> list[str] | None:
     return re.findall(r"[A-Za-z0-9_:-]+", raw)
 
 
-#: The predicate half that permits a push to main. Matched as a
-#: substring so a job may combine it with other conditions.
-_MAIN_PUSH_PREDICATE = (
-    "github.event_name == 'push' && github.ref == 'refs/heads/main'"
-)
+#: A predicate fragment that permits a pull request. Matched as a
+#: substring so a job may combine it with other conditions (the e2e
+#: and time-sensitive lanes also allow ``workflow_dispatch``).
+_PULL_REQUEST_PREDICATE = "github.event_name == 'pull_request'"
 
 
-def _runs_on_main_push(text: str, job_id: str) -> bool:
-    """True when ``job_id`` is not excluded from a push to main.
+def _runs_on_pull_request(text: str, job_id: str) -> bool:
+    """True when ``job_id`` is not excluded from a pull request.
 
-    The repo merges locally into main and pushes directly (no PRs),
-    so a ``pull_request``-only predicate means the job never runs
-    at all. Mirrors the predicate logic in
-    ``test_ci_bugfix_gates.py`` so a future refactor must update
-    both gates together.
+    Since 2026-10-05 the merge trigger is the ONLY trigger: ci.yml has
+    no ``push:`` branch any more, so ``main`` is protected only if this
+    workflow runs green on the pull request. A ``schedule``-only or
+    ``workflow_dispatch``-only predicate therefore means the lane never
+    runs before a merge — the same dead-chain failure this helper
+    exists to catch, one trigger over. Mirrors the predicate logic in
+    ``test_ci_bugfix_gates.py`` so a future refactor must update both
+    gates together.
     """
     condition = _job_condition(text, job_id)
     if condition is None:
         return True  # no predicate — runs on every trigger
-    return _MAIN_PUSH_PREDICATE in condition
+    return _PULL_REQUEST_PREDICATE in condition
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +336,7 @@ def test_every_pytest_invocation_uses_project_venv() -> None:
 
 
 # ---------------------------------------------------------------------------
-# TDD spec 5 — an e2e job runs on a push to main
+# TDD spec 5 — an e2e job runs on a pull request
 # ---------------------------------------------------------------------------
 
 
@@ -363,8 +371,8 @@ def _find_e2e_job(text: str) -> str | None:
 
 
 @pytest.mark.integration
-def test_e2e_job_runs_on_main_push() -> None:
-    """A job invoking ``-m e2e`` exists AND is reachable from a push to main.
+def test_e2e_job_runs_on_a_pull_request() -> None:
+    """A job invoking ``-m e2e`` exists AND is reachable from a pull request.
 
     Two halves:
 
@@ -373,15 +381,18 @@ def test_e2e_job_runs_on_main_push() -> None:
          pytest-e2e layer is invisible to CI.
 
       2. **Reachability**: the e2e job AND every job in its
-         ``needs:`` chain must NOT be excluded from a push to main
-         (``pull_request``-only predicates silently skip the whole
-         chain — the 2026-09-22 regression that this test was
-         written to pin).
+         ``needs:`` chain must NOT be excluded from a pull request
+         (a schedule-only or dispatch-only predicate silently skips
+         the whole chain — the 2026-09-22 regression that this test
+         was written to pin, which recurred in 2026-10-02 on the e2e
+         job and is now what this half guards).
 
-    The repo's workflow is a local merge into main followed by a
-    direct push (no PRs), so a push-only exclusion means the e2e
-    layer never runs and the audit's "all green" badge becomes a
-    lie.
+    This used to be rooted at ``push`` to main, back when the repo
+    merged locally and pushed main directly with no pull request.
+    The ``main: pull request required`` ruleset (2026-09-29) made
+    every commit on main arrive through a PR, and ci.yml lost its
+    ``push:`` trigger on 2026-10-05 — so the pull request is now the
+    only path to main, and a chain that dies there never runs at all.
     """
     text = ci_yml_text()
 
@@ -394,10 +405,10 @@ def test_e2e_job_runs_on_main_push() -> None:
     )
 
     # Walk the ``needs:`` graph from the e2e job to its roots. Every
-    # ancestor must also be reachable on a push to main — GitHub
-    # skips a job whose needs-job was skipped, so an e2e job with
-    # a push-to-main ``if`` is still dead if the job it needs is
-    # pull_request-only.
+    # ancestor must also be reachable on a pull request — GitHub
+    # skips a job whose needs-job was skipped, so an e2e job with a
+    # pull_request ``if`` is still dead if the job it needs is
+    # schedule-only.
     pending = [e2e_job_id]
     visited: set[str] = set()
     while pending:
@@ -406,11 +417,12 @@ def test_e2e_job_runs_on_main_push() -> None:
             continue
         visited.add(job_id)
         body = _job_body(text, job_id)
-        assert _runs_on_main_push(text, job_id), (
-            f"the {job_id!r} job invokes `-m e2e` but is excluded "
-            f"from a push to main (if={_job_condition(text, job_id)!r}). "
-            f"This repo merges locally and pushes main directly — "
-            f"there is no PR — so a pull_request-only predicate means "
-            f"the e2e layer never runs."
+        assert _runs_on_pull_request(text, job_id), (
+            f"the {job_id!r} job is in the `-m e2e` chain but is "
+            f"excluded from a pull request "
+            f"(if={_job_condition(text, job_id)!r}). ci.yml has no "
+            f"`push:` trigger, so the pull request is the only path to "
+            f"main — a schedule- or dispatch-only predicate means the "
+            f"e2e layer never runs before a merge."
         )
         pending.extend(_needs_tokens(body) or [])
