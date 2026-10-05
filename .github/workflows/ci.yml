@@ -20,24 +20,28 @@ name: CI
 #
 # Slim CI pipeline — target total runtime ≤ 15 minutes.
 #   1. PR gate:       lint + unit (sharded, with coverage) + integration
-#                     + e2e + time-sensitive   ← all of it gates the merge
-#   2. Main release:  the same set, on the merged result
-#   3. Nightly:       full automated regression suite (1482 tests,
-#                     not blocking the main release gate)
-#   4. Manual dispatch: maintainer-triggerable re-run of any layer
+#                     + e2e + time-sensitive   ← all of it gates the merge,
+#                     and it is the ONLY trigger that matters
+#   2. Nightly:       full automated regression suite (1482 tests),
+#                     not blocking the merge gate
+#   3. Manual dispatch: maintainer-triggerable re-run of any layer
+#
+# There is no post-merge run. It was removed on 2026-10-05 — see the
+# `on:` block for why it existed, and for the one repository setting the
+# removal depends on.
 #
 # Layered jobs (test-design decision point 7): unit / integration / e2e
 # / time-sensitive / nightly — each is its own job with its own marker,
 # timeout, and coverage gate. Every layer except nightly gates the merge,
-# so all of them run on `pull_request` as well as on a push to main; a
-# gate that only runs after the merge is a report, not a gate. They were
-# main-only until 2026-10-02 on the reading that e2e and the
-# time-sensitive set belonged to the release — measured, e2e is 17 tests
-# in 28 seconds and the time-sensitive lane is 30 in 32, so the cost was
-# a revert instead of a red PR. The time-sensitive lane is chained after
-# the unit shards (`needs: unit-tests`) because it is the one layer whose
-# assertions are about wall-clock time and therefore only mean something
-# on a runner that is not already busy.
+# so all of them run on `pull_request`; a gate that only runs after the
+# merge is a report, not a gate. They were main-only until 2026-10-02 on
+# the reading that e2e and the time-sensitive set belonged to the
+# release — measured, e2e is 17 tests in 28 seconds and the
+# time-sensitive lane is 30 in 32, so the cost was a revert instead of a
+# red PR. The time-sensitive lane is chained after the unit shards
+# (`needs: unit-tests`) because it is the one layer whose assertions are
+# about wall-clock time and therefore only mean something on a runner
+# that is not already busy.
 #
 # The unit lane is a MATRIX of three shards (2026-09-22). As a single
 # job it ran 4916 tests and died at ~49 minutes on a GitHub runner with
@@ -64,21 +68,17 @@ name: CI
 # The previous pipeline ran a "Run full backend suite (regression)"
 # step on every push to main that re-ran all 1482 unit + integration
 # tests in addition to the E2E suite. That step was responsible for
-# 45+ minute CI runs and pushed the main release gate well past
-# the 15-minute budget. It now lives only in the nightly regression
-# layer, which runs once a day and does not block the merge-to-main
-# gate. Style (bandit + provider-ID + legacy-URL-map scans) was
-# previously PR-only and is now enforced on push to main as well so the
-# contract is checked right before a release.
+# 45+ minute CI runs. It now lives only in the nightly regression layer,
+# which runs once a day and does not block the merge gate.
 #
 # Boundary semantics:
 #   - lint fail                          -> unit + integration skipped
 #   - unit fail (any shard)              -> coverage-gate + integration skipped
 #   - coverage-gate fail (<80%)          -> integration skipped
 #   - integration fail                   -> PR is blocked
-#   - e2e failure                        -> blocks main release
-#   - time-sensitive failure            -> blocks main release
-#   - nightly-regression failure         -> blocks release
+#   - e2e failure                        -> PR is blocked
+#   - time-sensitive failure             -> PR is blocked
+#   - nightly-regression failure         -> reports only; never blocked a merge
 #   - Coverage report (unit)             -> uploaded as artifact on every PR
 #   - New code line coverage             -> gate ≥ 80% (--cov-fail-under=80,
 #                                           via coverage-gate on the combined
@@ -88,8 +88,30 @@ name: CI
 on:
   pull_request:
     branches: [main]
-  push:
-    branches: [main]
+  # NO `push:` trigger — and that is load-bearing, not an omission.
+  #
+  # This workflow ran on `push: branches: [main]` from 2026-09-22 until
+  # 2026-10-05. It predates the `main: pull request required` ruleset
+  # (2026-09-29), back when the repo really did merge locally and push
+  # main directly; the push clause was added then because without it
+  # main was never tested at all. Once the ruleset landed, every commit
+  # on main arrived through a pull request, so the push run re-executed
+  # a suite that had just been green on the same tree — 30 jobs,
+  # ~30 runner-minutes, per merge, blocking nothing (the code is
+  # already on main by then).
+  #
+  # What makes the PR run sufficient to test main is
+  # `required_status_checks.strict = true` in main's branch protection
+  # ("Require branches to be up to date before merging"): a PR cannot be
+  # merged onto a base it is behind without "Update branch", which is a
+  # push to the PR branch, which re-triggers this workflow against the
+  # tree that will actually land. So the green that opens the merge
+  # button is the green for main's next commit.
+  #
+  # TURNING THAT SETTING OFF invalidates the reasoning above and
+  # requires putting a push trigger back. Nothing in this file detects
+  # the setting changing; `strict` lives in the repository settings, not
+  # in the tree, and no test here can read it.
   # Cloud nightly — the half of the nightly that CAN run on a hosted
   # runner: everything except the ``real_model`` tests (those call a real
   # model through the ``claude`` CLI and are skipped here by the
@@ -153,13 +175,14 @@ on:
         required: false
         default: ""
       # Explicit opt-in for the dangerous REAL plan migration suite.
-      # The mock-plan E2E runs on every push to main (see e2e-main
-      # below). The real-plan migration writes to the production
-      # ``plans/`` directory and MUST NEVER run on a routine push or
-      # PR; only an explicit ``run_real_plan_migration == 'true'``
-      # maintenance dispatch unlocks it. The boolean default is
-      # ``false`` so a bare ``Run workflow`` click cannot trigger
-      # the real-plan migration by accident.
+      # The mock-plan E2E runs on every pull request (see
+      # e2e-on-demand below). The real-plan migration writes to the
+      # production ``plans/`` directory and MUST NEVER run on a routine
+      # PR or the nightly cron; only an explicit
+      # ``run_real_plan_migration == 'true'`` maintenance dispatch
+      # unlocks it. The boolean default is ``false`` so a bare
+      # ``Run workflow`` click cannot trigger the real-plan migration by
+      # accident.
       run_real_plan_migration:
         description: "Run the REAL plan migration suite (writes to plans/) - DANGEROUS"
         required: true
@@ -186,11 +209,9 @@ jobs:
   lint:
     name: Lint (bandit static scan)
     runs-on: ubuntu-latest
-    # Style gate runs on every PR AND every push to main so that
-    # the style contract is enforced right before a release, not
-    # only at PR time. The bandit + provider-ID + legacy-URL-map
-    # scans are static and finish in well under a minute.
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    # Style gate. The bandit + provider-ID + legacy-URL-map scans are
+    # static and finish in well under a minute.
+    if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -264,11 +285,10 @@ jobs:
   grep-guard:
     name: Grep guard (forbidden filename regex sweep)
     runs-on: ubuntu-latest
-    # Static sweep, runs on PR AND push to main - cheap enough to
-    # always run, and gating on PR means a developer never has to
-    # wait for the unit gate to discover that they reintroduced a
-    # forbidden filename pattern.
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    # Static sweep. Cheap enough to always run, and gating on PR means
+    # a developer never has to wait for the unit gate to discover that
+    # they reintroduced a forbidden filename pattern.
+    if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -336,7 +356,7 @@ jobs:
   static-gates:
     name: Static gates (contracts)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -385,7 +405,7 @@ jobs:
   commit-hygiene:
     name: Commit messages carry no AI attribution trailer
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -398,11 +418,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-          else
-            BASE="${{ github.event.before }}"
-          fi
+          # Empty on a manual dispatch, which the resolution below turns
+          # into HEAD~1..HEAD (and says so). There is no push trigger, so
+          # `github.event.before` is gone.
+          BASE="${{ github.event.pull_request.base.sha }}"
 
           # Resolve the range, and say so loudly when we cannot. A range
           # git refuses to parse lists no commits at all, which would make
@@ -455,15 +474,18 @@ jobs:
   # job's cost is linear in the number of commits, and a pull request with
   # sixty commits wants squashing before review regardless.
   #
-  # This job is *detective* — it runs after the push. The ``pre-push`` hook
-  # (scripts/install_git_hooks.sh) runs the same script and is the only
-  # preventive half; it is also the cheap half, because rewriting an
-  # unmerged commit costs nothing.
+  # This job runs on the pull request, so it is now *preventive* rather
+  # than detective: a violation here closes the merge gate and nothing
+  # is published. While it also ran on push to main it was strictly
+  # detective — by then the commit was already public and force-push
+  # could not undo it. That run was removed 2026-10-05; the
+  # ``pre-push`` hook (scripts/install_git_hooks.sh) is still the
+  # cheapest half, because rewriting an unmerged commit costs nothing.
   # ---------------------------------------------------------------------------
   commit-range-privacy:
     name: Commits carry no private info (every commit in the range)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -513,11 +535,82 @@ jobs:
           # The workflow computes the base; the script owns the resolution
           # (including the loud fallback when the base does not resolve),
           # so the same code path runs here and in the pre-push hook.
-          PDT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # There is no push trigger, so a manual dispatch leaves this
+          # empty and the script checks ``HEAD~1..HEAD`` and says so.
+          PDT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           gitleaks version
           bash scripts/scan_commit_range.sh --ci --max-commits 5
+
+  # ---------------------------------------------------------------------------
+  # STAGE 1d — PR METADATA (the fourth surface)
+  #
+  # The tree gates read the tree. The range gate above reads the commits.
+  # Neither reads the branch name or the pull request title — and GitHub
+  # composes both into the merge commit message:
+  #
+  #     Merge pull request #27 from <owner>/<branch>
+  #
+  #     <title>
+  #
+  #     <body>
+  #
+  # So those words land on ``main`` permanently and publicly, having passed
+  # every other gate in this file. This job closes that surface using the
+  # same pure functions (``find_home_paths`` / ``find_attribution`` /
+  # ``find_local_measurements``) — four surfaces, one definition of a
+  # violation, no second copy of a rule to drift.
+  #
+  # It is cheap (no test run, no checkout of the base) so it sits upstream
+  # of the matrix rather than beside it.
+  #
+  # What it cannot do: decide that a branch name refers to an unrelated
+  # project. The identifiers that would decide that are themselves the
+  # leak — writing one into this repository to blacklist it publishes the
+  # private name inside the blacklist. That case is a human reading the
+  # pull request, which is the whole argument for checking here instead of
+  # after the merge.
+  # ---------------------------------------------------------------------------
+
+  pr-metadata-privacy:
+    name: PR title and branch carry no private info
+    runs-on: ubuntu-latest
+    # Pull request only. On a manual dispatch there is no pull request,
+    # so there is nothing to scan — and the scanner would (correctly)
+    # exit 2 rather than report a vacuous pass.
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Create the venv the scanner resolves
+        run: |
+          set -euo pipefail
+          python3 -m venv backend/.venv
+          # pytest only, same as the range scan above: the scanner
+          # imports the gate *modules*, and those import pytest for
+          # their own test functions; the rules are pure.
+          backend/.venv/bin/python3 -m pip install -q pytest
+
+      - name: Scan the branch name, title and body
+        env:
+          # These three compose the merge commit message. An unset one
+          # makes the scanner exit 2, so a dropped `env:` block fails
+          # loudly instead of scanning nothing and reporting success.
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          backend/.venv/bin/python3 \
+            backend/tests/static_gates/pr_metadata_scan.py
 
   # ---------------------------------------------------------------------------
   # STAGE 2 — UNIT (PR gate)
@@ -550,22 +643,22 @@ jobs:
     # Sizes measured with `--collect-only`: tests/unit 3254,
     # root-level tests/*.py 1468, the rest 194.
     timeout-minutes: 40
-    # 2026-09-22 — push-to-main included, same predicate as lint and
-    # grep-guard. It used to be ``github.event_name == 'pull_request'``
-    # only, which made this an empty gate in practice: this repo's
-    # workflow is a LOCAL merge into main followed by a direct push
-    # (there is no PR), so on a push the job was skipped and main was
-    # never unit-tested. The 35725018566 run on 2026-09-22 is the
-    # evidence — ``conclusion: success`` with unit, integration and e2e
-    # all ``skipped``; the only real checks were lint + grep-guard +
-    # slow.
+    # 2026-09-22 — this lane was widened to a push-to-main predicate,
+    # and it was CORRECT then: the repo merged locally and pushed main
+    # directly, with no pull request, so a PR-only ``if:`` left main
+    # never unit-tested. Run 35725018566 is the evidence —
+    # ``conclusion: success`` with unit, integration and e2e all
+    # ``skipped``; the only real checks were lint + grep-guard + slow.
+    # A second, subtler version of the same bug rode along: e2e carries
+    # ``needs: integration-tests``, so a PR-only condition on this job
+    # skipped the chain and GitHub reported green.
     #
-    # The e2e job below carries ``needs: integration-tests`` and an
-    # ``if`` that explicitly ALLOWS a push to main, so the PR-only
-    # condition here also silently defeated e2e on main — contradicting
-    # that job's own comment ("Default CI behaviour (push to main):
-    # runs the MOCK-PLAN E2E only").
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    # 2026-10-05 — narrowed back to pull_request only. The
+    # ``main: pull request required`` ruleset landed 2026-09-29, so every
+    # commit on main now arrives through a PR, and the push run was a
+    # second full pass over a tree that had just been green. See the
+    # ``on:`` block for the dependency this rests on.
+    if: github.event_name == 'pull_request'
     # Chain the layered gates: lint (style) + grep-guard (fast
     # static scan) BOTH must pass before unit runs. A grep-guard
     # failure on a forbidden filename pattern fails fast (seconds)
@@ -577,7 +670,7 @@ jobs:
     # parallel and the slowest is ~45s, so the serial cost on a green
     # pull request is a few seconds — cheap against twenty VMs burned
     # on a red one.
-    needs: [lint, grep-guard, commit-hygiene, commit-range-privacy, static-gates]
+    needs: [lint, grep-guard, commit-hygiene, commit-range-privacy, pr-metadata-privacy, static-gates]
     # ``fail-fast: false`` is deliberate: one shard dying must not
     # cancel the others, because the surviving shards are exactly the
     # evidence needed to locate the problem.
@@ -1254,7 +1347,7 @@ jobs:
     name: Coverage gate (≥80%)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'pull_request'
     needs: unit-tests
     steps:
       - name: Checkout
@@ -1316,10 +1409,10 @@ jobs:
   integration-tests:
     name: Integration tests (PR gate)
     runs-on: ubuntu-latest
-    # 2026-09-22 — push-to-main included; see the note on ``unit-tests``.
     # Kept in lockstep with ``unit-tests`` on purpose: the e2e job needs
-    # this one, so a divergence here silently removes e2e from main.
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    # this one, so a divergence here silently removes e2e from the
+    # merge gate.
+    if: github.event_name == 'pull_request'
     # Chain the layered gates: unit, the combined coverage floor, and
     # grep-guard must all pass before integration runs. If any upstream
     # gate fails (style violation, grep-guard regex hit, unit test
@@ -1368,10 +1461,9 @@ jobs:
           retention-days: 14
 
   # ---------------------------------------------------------------------------
-  # MAIN RELEASE — runs after merge to main (push event)
-  # Slim: lint (which already runs on push via the
-  # ``if`` above) + dry-run E2E only. The 1482-test regression
-  # suite lives in the nightly cron and is NOT a release blocker.
+  # E2E — dry-run (mock plan) only
+  # Slim: the mock-plan E2E, gated on the PR. The 1482-test regression
+  # suite lives in the nightly cron and is NOT a merge blocker.
   # ---------------------------------------------------------------------------
 
   e2e-on-demand:
@@ -1391,12 +1483,11 @@ jobs:
     # unit shards. See the `time_sensitive` marker definition in
     # `backend/pytest.ini`.
     #
-    # Default CI behaviour (push to main): runs the MOCK-PLAN E2E
-    # only. The dangerous REAL-plan migration lives in its own
-    # `real-plan-migration` job below, gated behind
-    # `inputs.run_real_plan_migration == 'true'` so a routine push
-    # or PR cannot trigger a real migration.
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    # Default CI behaviour: runs the MOCK-PLAN E2E only. The dangerous
+    # REAL-plan migration lives in its own `real-plan-migration` job
+    # below, gated behind `inputs.run_real_plan_migration == 'true'` so
+    # a routine PR or the nightly cron cannot trigger a real migration.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     # Chain after the layered gates: the mock-plan E2E is the
     # cheapest of the e2e jobs so it runs by default; a real-plan
     # migration lives behind `real-plan-migration` (gated by the
@@ -1426,15 +1517,14 @@ jobs:
           backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout requests
 
       # E2E exercises the full pipeline: agent → executor → LLM (stub) →
-      # verifier → report. These assert on wall-clock time; they only run on
-      # main, not on every PR. The full pytest suite (1482 tests) used
+      # verifier → report. The full pytest suite (1482 tests) used
       # to also run here as a "regression" step, but it pushed the
       # total CI time past 45 minutes — far above the 15-minute
-      # budget for a merge-to-main gate. The dry-run E2E tests are
-      # representative enough of the executor + verifier + report
-      # pipeline that we keep just this step on push; the full
-      # 1482-test suite moves to the nightly-regression job (which
-      # already runs once a day on a cron and is not blocking).
+      # budget. The dry-run E2E tests are representative enough of
+      # the executor + verifier + report pipeline that we keep just
+      # this step; the full 1482-test suite moves to the
+      # nightly-regression job (which already runs once a day on a
+      # cron and is not blocking).
       - name: Run E2E tests
         working-directory: backend
         run: ./.venv/bin/python3 -m pytest tests/ -m "e2e and not time_sensitive" --tb=short --timeout=600 -v
@@ -1455,11 +1545,11 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # STAGE 4b — SLOW (main release / manual dispatch)
+  # STAGE 4b — SLOW (manual dispatch)
   # Per test-design decision point 7: tests marked ``@pytest.mark.time_sensitive``
   # (long-running stress, soak, or full pipeline sweeps) are split out
   # from the regular suite so they do not block PR throughput. They run
-  # only on push to main or on manual ``workflow_dispatch``. The
+  # on every pull request and on manual ``workflow_dispatch``. The
   # dedicated job keeps that layer's timeout / artifact retention
   # independent from the (faster) e2e job.
   # ---------------------------------------------------------------------------
@@ -1480,7 +1570,7 @@ jobs:
     # scheduler contention. Chaining costs wall-clock — this job cannot
     # start until the shards finish — and buys a verdict that means
     # something.
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     needs: unit-tests
     steps:
       - name: Checkout
@@ -1661,7 +1751,7 @@ jobs:
   # production ``plans/`` directory and may invoke mocks with side
   # effects). It is gated behind the explicit ``workflow_dispatch``
   # input ``run_real_plan_migration == 'true'`` so it CANNOT run on
-  # a routine push to main, a PR, or the nightly cron.
+  # a routine pull request or the nightly cron.
   #
   # The boolean default for the input is ``false`` (declared in
   # the ``workflow_dispatch.inputs`` block above). A bare "Run
@@ -1743,7 +1833,7 @@ jobs:
       # WARNING emoji + "DANGEROUS" label is intentional — anyone
       # reading the run summary should immediately see that this
       # was a manual-dispatch real-plan migration, not a routine
-      # push-triggered run.
+      # pull-request run.
       - name: Annotate run summary
         if: always()
         run: |
@@ -1801,12 +1891,13 @@ jobs:
     # job inherits the skip that it exists to detect, and a skip counts
     # as a pass — the gate would invert from broken-but-green to
     # green-while-broken in exactly the case it was added for.
-    if: always() && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
     needs:
       - lint
       - grep-guard
       - commit-hygiene
       - commit-range-privacy
+      - pr-metadata-privacy
       - static-gates
       - unit-tests
       - coverage-gate
