@@ -11,13 +11,74 @@ import os
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from config_paths import resolve_plans_dir
 
 
 # Level priority for filtering
 _LEVEL_ORDER = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3, "CRITICAL": 4}
+
+
+# ---------------------------------------------------------------------------
+# Current-activity derivation
+# ---------------------------------------------------------------------------
+#
+# The operator's question is never "which phase is the plan in" but "what
+# is it doing RIGHT NOW". For most of a run the answer is a task, and a
+# task has a row in ``plan_tasks`` — so the card could name it. But a
+# meaningful slice of wall-clock time is spent on work that is NOT a
+# task and has no row: the refiner rewriting the task list, the
+# executor crossing a layer boundary, the tail of a run after the last
+# task completes.
+#
+# The refiner is the dominant case. It holds the executor for minutes at
+# a time while it rewrites the task list, and it writes no row of its
+# own, so ``current_task`` is None for that whole window. Two things
+# follow, and they compound:
+#
+#   * the card renders "executing" and then names nothing, which reads
+#     to the operator as a stall;
+#   * nothing refreshes it either. ``_TASK_LIFECYCLE_EVENTS`` below
+#     deliberately whitelists only the five ``task_*`` events — the
+#     refiner is an implementation detail as far as the bus is
+#     concerned — and the notifier's watch fingerprints task rows, which
+#     do not move while the refiner runs. So the card freezes on
+#     whatever the previous task left behind.
+#
+# This table maps log events onto the small closed vocabulary the card
+# renders. It lives here, next to the log, because the log is the only
+# durable record of what the executor subprocess is doing — the
+# executor's in-bus events never reach the notifier, which runs in the
+# server process. Display strings deliberately do NOT live here: this
+# layer reports facts, ``notifications/cards.py`` owns presentation.
+_ACTIVITY_EVENT_KINDS: Dict[str, str] = {
+    "refine_started": "refine",
+    "refine_structure_applied": "refine_done",
+    "refine_completed": "refine_done",
+    "refine_no_change": "refine_done",
+    "refine_load_tasks_failed": "refine_done",
+    "refine_exception": "refine_done",
+    "layer_started": "layer_boundary",
+    "layer_completed": "layer_boundary",
+    "task_started": "task",
+    "task_completed": "task_done",
+    "execution_completed": "idle",
+    "execution_stopped": "idle",
+    "execution_failed": "idle",
+}
+
+#: Events that end whatever the executor was doing and leave it with
+#: nothing in flight. After one of these the card should say the run is
+#: over rather than keep naming the last thing it saw.
+_ACTIVITY_TERMINALS = frozenset({"idle"})
+
+#: Events that hand control back to task dispatch, leaving nothing in
+#: flight. The boundary itself is NOT one of them: crossing a layer is
+#: work the executor is doing (it is choosing and locking the next
+#: batch), so it keeps its own kind and its own label rather than
+#: collapsing into "idle".
+_ACTIVITY_HANDOFFS = frozenset({"task_done", "refine_done"})
 
 
 # Event type registry — maps execution-log event names to their on-disk
@@ -291,6 +352,77 @@ class ExecutionLogger:
 
         # Return newest entries within limit
         return entries[-limit:]
+
+    @staticmethod
+    def current_activity(
+        plan_id: str, plans_dir: Optional[Path] = None
+    ) -> Dict[str, Any]:
+        """Return what the executor is doing right now, as a fact record.
+
+        ``{"kind", "started_at", "task_id", "event", "detail"}`` where
+        ``kind`` is one of the ``_ACTIVITY_EVENT_KINDS`` values,
+        ``started_at`` is the ISO timestamp the unit of work began, and
+        ``task_id`` / ``detail`` are populated when the log carried them.
+
+        Returns ``{"kind": "unknown", ...}`` when the log is missing or
+        carries no recognisable event — the card then falls back to the
+        bare phase label rather than inventing an activity.
+
+        This is a FALLBACK, not a replacement for ``current_task``: when
+        a ``plan_tasks`` row is ``in_progress`` that row is authoritative
+        (it carries the task title the executor actually committed to),
+        and this is consulted only for the windows where no such row
+        exists. Deriving it from the log rather than from in-memory
+        executor state is deliberate — the executor is a separate
+        process whose bus events never reach the notifier, but its log
+        is on disk and survives a server restart, which is the same
+        reason :meth:`diagnose` reads the file.
+        """
+        empty: Dict[str, Any] = {
+            "kind": "unknown",
+            "started_at": None,
+            "task_id": None,
+            "event": None,
+            "detail": None,
+        }
+        if plans_dir is None:
+            plans_dir = resolve_plans_dir()
+
+        # 500 is far more than the tail this ever inspects (the last
+        # activity-marking event is normally within a handful of lines)
+        # and far less than the 10k diagnose reads, so a plan with a
+        # multi-megabyte log stays cheap to poll every notifier tick.
+        entries = ExecutionLogger.read_logs(plan_id, plans_dir, limit=500)
+        if not entries:
+            return empty
+
+        for entry in reversed(entries):
+            event = entry.get("event")
+            kind = _ACTIVITY_EVENT_KINDS.get(event or "")
+            if kind is None:
+                continue
+            if kind in _ACTIVITY_TERMINALS or kind in _ACTIVITY_HANDOFFS:
+                # The executor has nothing in flight right now. Report
+                # the handoff moment itself so the card can say "just
+                # finished X" rather than an unqualified "idle", and so
+                # a genuinely wedged executor (nothing logged for an
+                # hour) is distinguishable from one between tasks.
+                return {
+                    "kind": "idle",
+                    "started_at": entry.get("ts"),
+                    "task_id": entry.get("task_id"),
+                    "event": event,
+                    "detail": None,
+                }
+            data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+            return {
+                "kind": kind,
+                "started_at": entry.get("ts"),
+                "task_id": entry.get("task_id"),
+                "event": event,
+                "detail": data.get("title") or None,
+            }
+        return empty
 
     @staticmethod
     def diagnose(plan_id: str, plans_dir: Optional[Path] = None) -> dict:

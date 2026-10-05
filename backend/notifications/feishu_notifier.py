@@ -85,6 +85,7 @@ from .plan_dir_resolver import (
 from .state_events import (
     KIND_PLAN_CLOSED,
     KIND_PLAN_PHASE_CHANGED,
+    KIND_STALE_REFRESH,
     KIND_TASK_STATE_CHANGED,
     KIND_VP_STATE_CHANGED,
     StateEvent,
@@ -395,6 +396,24 @@ def _render_card_as_markdown(card: dict, plan_id: str) -> str:
 DEFAULT_MIN_INTERVAL_SECONDS: float = 60.0
 
 
+#: How long a worker may run with the card unchanged before the notifier
+#: forces a refresh anyway.
+#:
+#: The fingerprint dedup is what keeps the chat quiet, and it is also
+#: what made the card lie by omission: any phase whose progress does not
+#: alter a single rendered field produces byte-identical rebuilds, every
+#: one of which is discarded. A round's judgment phase is the case that
+#: matters — it walks the VPs one at a time over a period long enough
+#: that an operator watching the card assumes it has hung.
+#:
+#: 5 minutes is chosen against the slowest useful signal: the operator
+#: watching a card wants to know a long job is still alive well before
+#: they start wondering whether it hung. It is a ceiling on staleness,
+#: not a cadence — a plan whose card IS changing pushes at its own rate
+#: and never consults this.
+DEFAULT_STALE_REFRESH_SECONDS: float = 300.0
+
+
 class FeishuNotifier:
     """Subscribes to ``STATE_EVENT_BUS`` and pushes cards to Feishu.
 
@@ -409,9 +428,11 @@ class FeishuNotifier:
         coalesce_seconds: float = 5.0,
         min_interval_seconds: float = DEFAULT_MIN_INTERVAL_SECONDS,
         backend_base_url: str = DEFAULT_BACKEND_BASE,
+        stale_refresh_seconds: float = DEFAULT_STALE_REFRESH_SECONDS,
     ) -> None:
         self._coalesce_seconds = coalesce_seconds
         self._min_interval_seconds = min_interval_seconds
+        self._stale_refresh_seconds = stale_refresh_seconds
         self._backend_base = backend_base_url
 
         # Per-plan state. Lock guards mutations to this dict AND
@@ -441,6 +462,7 @@ class FeishuNotifier:
         # Counter: synthetic events enqueued by the watch (surfaced
         # in /api/debug/notifications).
         self._exec_watch_refreshes = 0
+        self._stale_refreshes = 0
 
         # Worker thread lifecycle.
         self._stop_event = threading.Event()
@@ -610,6 +632,7 @@ class FeishuNotifier:
             tick_start = time.time()
             try:
                 self._watch_execution_progress()
+                self._watch_stale_cards()
                 self._drain_and_push()
             except Exception:
                 logger.exception("[feishu_notifier] tick failed")
@@ -702,6 +725,84 @@ class FeishuNotifier:
                 payload={"sub_kind": "exec_progress_watch"},
             ))
 
+    def _watch_stale_cards(self) -> None:
+        """Force a refresh for any plan whose card has gone quiet while
+        a worker is still running.
+
+        The fingerprint dedup suppresses pushes whose rendered content is
+        unchanged. That is the right default — without it a busy plan
+        re-posts an identical card every coalesce window — but it cannot
+        distinguish "nothing is happening" from "something is happening
+        that renders to no visible change". A round's judgment phase is
+        the case that matters: it walks the VPs one at a time, emitting
+        a heartbeat for each, every one of which rebuilds the card and
+        every one of which hashes to the value already pushed. The card
+        freezes for the whole phase while the watchdog in this same
+        process reports that the thread is alive with no VP in flight.
+
+        So: when a plan has a worker in flight and its last push is older
+        than ``_stale_refresh_seconds``, ask for a rebuild and let it
+        through the dedup. The push that comes out is usually identical
+        to the last one — that is the point. The operator sees a live
+        "🕐 刷新于" timestamp on a job they are watching instead of a
+        card that stopped moving, and if the work really has stalled the
+        card will show it.
+
+        Scoped to plans with a worker in flight. A plan that is idle has
+        nothing to report, and re-pushing it forever would be exactly
+        the spam the dedup exists to prevent.
+        """
+        if self._stale_refresh_seconds <= 0:
+            return
+        now = time.time()
+        due: List[str] = []
+        with self._states_lock:
+            for plan_id, state in self._states.items():
+                if state.permanently_disabled:
+                    continue
+                last = state.last_push_ts
+                if last is None or (now - last) < self._stale_refresh_seconds:
+                    continue
+                due.append(plan_id)
+        if not due:
+            return
+
+        for plan_id in due:
+            try:
+                with self._states_lock:
+                    state = self._states.get(plan_id)
+                if state is None or state.permanently_disabled:
+                    # Evicted between the scan above and here — the
+                    # terminal event closed the plan out from under us.
+                    continue
+                last_push = state.last_push_ts
+                payload = fetch_plan_status(
+                    plan_id, base_url=self._backend_base,
+                )
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if not (
+                payload.get("execution_in_flight")
+                or payload.get("verification_in_flight")
+            ):
+                # The worker finished between the snapshot and now. The
+                # terminal event already pushed; nothing to refresh.
+                continue
+            self._stale_refreshes += 1
+            logger.info(
+                "[feishu_notifier] stale card for in-flight plan=%s — "
+                "forcing a refresh (last push %.0fs ago, threshold %.0fs)",
+                plan_id, now - (last_push or now),
+                self._stale_refresh_seconds,
+            )
+            self._enqueue_event(StateEvent(
+                kind=KIND_STALE_REFRESH,
+                plan_id=plan_id,
+                payload={"sub_kind": "stale_watchdog"},
+            ))
+
     @staticmethod
     def _execution_state_fingerprint(
         progress: Optional[Dict[str, Any]],
@@ -710,9 +811,22 @@ class FeishuNotifier:
 
         Returns ``None`` when the payload carries no task state at all
         (nothing to compare), otherwise a comparable tuple of the
-        per-task ``(id, status)`` pairs, the in-progress task id and the
-        aggregate counts. ``end_ts`` is deliberately excluded: a task
-        that finishes already changes ``status``.
+        per-task ``(id, status)`` pairs, the in-progress task id, the
+        aggregate counts, and the executor's current activity.
+        ``end_ts`` is deliberately excluded: a task that finishes already
+        changes ``status``.
+
+        ``current_activity`` is in the signature for the same reason the
+        in-progress task id is: without it the watch is blind to every
+        window where the executor is working on something that is not a
+        task. The refiner is the expensive case — it rewrites the task
+        list, so no ``plan_tasks`` row moves for as long as it runs and
+        the fingerprint stays identical. That makes the watch emit
+        nothing AND leaves the card rendering whatever the previous task
+        had left behind: "正在跑 tasks" naming nothing. Keying on
+        ``(kind, started_at)`` rather than the kind alone is deliberate —
+        two consecutive refines of the same kind must still read as a
+        change, or the second is invisible.
         """
         if not isinstance(progress, dict):
             return None
@@ -731,7 +845,12 @@ class FeishuNotifier:
             (str(k), int(v)) for k, v in counts.items()
             if isinstance(v, int)
         )) if isinstance(counts, dict) else ()
-        return (status_pairs, current_id, counts_sig)
+        activity = progress.get("current_activity")
+        activity_sig = (
+            (str(activity.get("kind")), str(activity.get("started_at")))
+            if isinstance(activity, dict) else ("", "")
+        )
+        return (status_pairs, current_id, counts_sig, activity_sig)
 
 
     def _drain_and_push(self, final_flush: bool = False) -> None:
@@ -766,9 +885,13 @@ class FeishuNotifier:
             if state.permanently_disabled:
                 return
 
-            # Min-interval gate. Skip unless plan_closed or final flush.
+            # Min-interval gate. Skip unless plan_closed, final flush, or
+            # the stale-refresh watchdog. The watchdog is a third bypass
+            # because the thing it exists to catch is precisely a long
+            # silence: gating it on "enough time passed" would defeat it.
             bypass = (
                 KIND_PLAN_CLOSED in kinds
+                or KIND_STALE_REFRESH in kinds
                 or final_flush
             )
             if (
@@ -1132,6 +1255,23 @@ class FeishuNotifier:
                             "vps": _live_verif.get("vps") or [],
                             "counts": _live_verif.get("counts") or {},
                             "repair_tasks": _live_verif.get("repair_tasks") or [],
+                            # ``current_vp`` was missing from this
+                            # merge, which made the progress-card route
+                            # structurally unable to name a running
+                            # verification point: the unified line reads
+                            # it from ``verification_progress``, and on
+                            # this path the synthesised dict is passed as
+                            # ``verification_body_only`` instead, so an
+                            # omitted key is an omitted name. The card
+                            # looked permanently "nameless" for every
+                            # plan in an execution phase with
+                            # verification history.
+                            "current_vp": _live_verif.get("current_vp") or None,
+                            # Round sub-step for the windows with no VP
+                            # in flight (planning / judging /
+                            # summarizing). See
+                            # ``routes.verification._verification_round_activity``.
+                            "activity": _live_verif.get("activity") or None,
                         }
                 except Exception:
                     logger.debug(
@@ -1453,6 +1593,7 @@ class FeishuNotifier:
                 "deduped": self._deduped,
                 "empty_skipped": self._empty_skipped,
                 "exec_watch_refreshes": self._exec_watch_refreshes,
+                "stale_refreshes": self._stale_refreshes,
                 "pushes_ok": self._pushes_ok,
                 "pushes_failed": self._pushes_failed,
                 "self_heals": self._self_heals,

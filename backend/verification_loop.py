@@ -3186,6 +3186,75 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
         """
         _server._record_verification_terminal(plan_id, status, stop_reason)
 
+    def _record_round_verdict(
+        status: str, stop_reason: Optional[str], result: Optional[dict],
+    ) -> None:
+        """Write the round's verdict to ``plan_verification`` and nothing else.
+
+        Distinct from :func:`_record_terminal`, which additionally advances
+        the plan-level state machine and fires ``plan_closed``. This is the
+        half a REPAIR round needs: the round is over and has a verdict, but
+        the plan is not finished — an executor is about to run the repairs
+        and another round will follow. Firing the terminal path there would
+        publish ``plan_closed`` and evict the notifier's in-memory plan
+        state for a plan that is still very much running.
+
+        What it fixes: the repair exits returned to the executor without
+        writing any terminal status, so
+        ``plan_verification.verification_status`` kept the ``running``
+        value stamped at round start. ``/api/plan/{id}/status`` sources its
+        top-level ``verification_status`` from that column, and the card
+        header is a pure function of the snapshot — so the header reads
+        "🔄 验证中" above a body correctly naming the running repair task,
+        for the entire round. A repair round is long, so the card spends
+        the whole of it contradicting its own body.
+
+        Best-effort, like every other state write here: a failed write
+        must not abort a repair round that is otherwise ready to run. The
+        read-side reconciliation in ``routes.plans._build_plan_status``
+        covers the case where this one does not land, and
+        ``plan_status.find_divergences`` reports it when it happens.
+        """
+        if status not in {"passed", "failed", "loop_stopped"}:
+            # A non-verdict ("running" during an in-place update, or an
+            # unexpected spelling) is not something to persist as a round
+            # outcome. Leave the row alone rather than writing a value
+            # nothing else in the codebase knows how to read.
+            return
+        try:
+            from state_machine.db.connection import open as _open_db
+            from state_machine.db.schema import migrate as _migrate
+            from state_machine.repositories.verification_repository import (
+                VerificationRepository as _VerifRepo,
+            )
+
+            conn = _open_db(_server._state_db_path())
+            try:
+                _migrate(conn)
+                _VerifRepo(conn).complete_round(
+                    plan_id,
+                    {
+                        "status": status,
+                        "stop_reason": stop_reason,
+                        "recorded_by": "_record_round_verdict",
+                        "results": (result or {}).get("results"),
+                    },
+                    status=status,
+                    stop_reason=stop_reason,
+                )
+            finally:
+                conn.close()
+            _server.logger.info(
+                "[verification_terminal] round verdict recorded plan=%s "
+                "status=%s stop_reason=%s (repair path)",
+                plan_id, status, stop_reason,
+            )
+        except Exception:
+            _server.logger.exception(
+                "[verification_terminal] round verdict write failed plan=%s "
+                "status=%s", plan_id, status,
+            )
+
     # Create the orchestrator ONCE so its _previous_failed_ids state
     # persists across rounds — otherwise same_failure_repeated detection
     # (which closes the loop after two identical failed VPs) never fires
@@ -3529,6 +3598,23 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
             # (``_on_repair_complete``) already does. The two exits must
             # agree, or the same verdict terminates a plan on one path and
             # starts another round on the other.
+            #
+            # Close the round in ``plan_verification`` before branching.
+            # Every TERMINAL exit below goes through
+            # ``_record_terminal`` → ``_persist_verification_terminal`` →
+            # ``VerificationRepository.complete_round``, which writes the
+            # verdict to ``plan_verification``. The REPAIR exits return
+            # straight to the executor without doing that, so the row
+            # keeps the ``running`` value written at round start while
+            # ``plan_routing`` has already recorded the terminal verdict.
+            # Since ``/api/plan/{id}/status`` takes its top-level
+            # ``verification_status`` from that row, the card header then
+            # reads "🔄 验证中" above a body naming the running repair
+            # task, for the whole round.
+            #
+            # Written here rather than at each exit so a future exit added
+            # below cannot repeat the omission.
+            _record_round_verdict(status, stop_reason, result)
             if status == "loop_stopped":
                 # 2026-09-12: even when the loop has converged, there
                 # may be pending RP-* tasks from earlier rounds that should
