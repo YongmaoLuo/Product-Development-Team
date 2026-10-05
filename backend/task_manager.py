@@ -658,32 +658,53 @@ class TaskManager:
                 task.commit_sha = sha
                 task.updated_time = datetime.utcnow().isoformat()
                 break
-        # Mirror into runtime_overrides so a subsequent ``load_tasks``
-        # sees the new value before the SQLite write round-trips.
-        if task_id in {t.id for t in self.tasks}:
+        # Membership guard (2026-10-04). The block below writes to two
+        # mirrors, and BOTH must be inside this guard — the refiner
+        # deletes a parent row when it splits a task into children, and
+        # any write after that re-creates it. ``PlanTaskRepository``
+        # uses ``INSERT ... ON CONFLICT DO UPDATE``, so a write for a
+        # task that is no longer in the plan does not fail; it silently
+        # resurrects a content-free row, because the payload carries
+        # runtime fields only. The observable residue is a
+        # ``plan_tasks`` row whose ``status`` / ``title`` /
+        # ``description`` are all NULL — the dispatcher then reports
+        # "No schedulable micro-layer found" and the run stops with the
+        # real children still pending.
+        #
+        # This mirrors the guard added to ``update_task_status`` and
+        # ``record_task_failure`` in September. It was missing here
+        # because the ``if`` that existed only wrapped the
+        # ``runtime_overrides`` dict, leaving the SQLite write outside
+        # it — a guard that looked present but covered half the target.
+        known_ids = {t.id for t in self.tasks}
+        if task_id in known_ids:
+            # Mirror into runtime_overrides so a subsequent ``load_tasks``
+            # sees the new value before the SQLite write round-trips.
             self.runtime_overrides[task_id] = {
                 **self.runtime_overrides.get(task_id, {}),
                 "commit_sha": sha,
                 "updated_time": datetime.utcnow().isoformat(),
             }
-        # Persist to ``plan_tasks`` (single source of truth for the
-        # per-task runtime overlay). ``_persist_status_to_sqlite``
-        # already accepts ``status`` + ``end_ts``; for ``commit_sha``
-        # we use a small dedicated helper that mirrors the same
-        # INSERT ... ON CONFLICT DO UPDATE pattern but writes the
-        # commit_sha column instead of ``status`` / ``end_ts``.
-        try:
-            self._persist_commit_sha_to_sqlite(task_id, sha)
-        except Exception as exc:  # noqa: BLE001
-            # Non-fatal: in-memory mirror + on-disk ``tasks.json``
-            # are still authoritative for the current process.
-            self._log_persist_failure(
-                self.tasks_file.parent.name if self.tasks_file else "?",
-                task_id,
-                exc,
-                0,
-                exhausted=False,
-            )
+            # Persist to ``plan_tasks`` (single source of truth for the
+            # per-task runtime overlay). ``_persist_status_to_sqlite``
+            # already accepts ``status`` + ``end_ts``; for ``commit_sha``
+            # we use a small dedicated helper that mirrors the same
+            # INSERT ... ON CONFLICT DO UPDATE pattern but writes the
+            # commit_sha column instead of ``status`` / ``end_ts``.
+            try:
+                self._persist_commit_sha_to_sqlite(task_id, sha)
+            except Exception as exc:  # noqa: BLE001
+                # Non-fatal: in-memory mirror + on-disk ``tasks.json``
+                # are still authoritative for the current process.
+                self._log_persist_failure(
+                    self.tasks_file.parent.name if self.tasks_file else "?",
+                    task_id,
+                    exc,
+                    0,
+                    exhausted=False,
+                )
+        else:
+            self._log_mirror_skipped(task_id, f"commit_sha={sha}", known_ids)
         # ``save_tasks()`` is what serialises ``task.commit_sha`` back
         # into ``tasks.json``. Without this, the next process that
         # loads ``tasks.json`` sees ``commit_sha=None`` for this row
@@ -1009,23 +1030,28 @@ class TaskManager:
         status: str,
         known_ids: set,
     ) -> None:
-        """Emit a loud record when a status write skips the SQLite mirror.
+        """Emit a loud record when a runtime write skips the SQLite mirror.
 
         Called from :meth:`update_task_status` when ``task_id`` is not in
-        ``self.tasks``. That is a legitimate state (the refiner dropped
-        the task, and re-creating its row would resurrect a deleted task
-        — see ``test_persist_does_not_resurrect_removed_task``), so this
-        does not raise. It must still be visible: the disk file carries
-        no status, so a skipped mirror is indistinguishable from "this
-        task never completed" on the next reload.
+        ``self.tasks``, and from :meth:`update_task_commit_sha` for the
+        same reason. That is a legitimate state (the refiner dropped
+        the task when it split it, and re-creating its row would
+        resurrect a deleted task — see
+        ``test_persist_does_not_resurrect_removed_task``), so this does
+        not raise. It must still be visible: the disk file carries no
+        runtime state, so a skipped mirror is indistinguishable from
+        "this task never completed" on the next reload.
+
+        ``status`` is a free-form label for the value that was not
+        written — the status itself for ``update_task_status``,
+        ``commit_sha=<sha>`` for ``update_task_commit_sha``.
         """
         import sys
         msg = (
-            f"[TaskManager.update_task_status] SQLite mirror SKIPPED for "
-            f"task_id={task_id!r} status={status!r}: the task is not in "
-            f"the current plan (known tasks={len(known_ids)}). The status "
-            f"will NOT survive a reload — tasks.json does not carry "
-            f"runtime state."
+            f"[TaskManager] SQLite mirror SKIPPED for task_id={task_id!r} "
+            f"({status}): the task is not in the current plan "
+            f"(known tasks={len(known_ids)}). The value will NOT survive a "
+            f"reload — tasks.json does not carry runtime state."
         )
         print(msg, file=sys.stderr)
         logger = getattr(self, "logger", None)
