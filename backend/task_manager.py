@@ -704,7 +704,13 @@ class TaskManager:
                     exhausted=False,
                 )
         else:
-            self._log_mirror_skipped(task_id, f"commit_sha={sha}", known_ids)
+            # Identify the value by a short prefix, not in full: the
+            # message goes to stderr and to the log, and the label
+            # exists to let an operator find the write, not to
+            # reconstruct the SHA from the log alone.
+            self._log_mirror_skipped(
+                task_id, f"commit_sha={sha[:12]}…", known_ids
+            )
         # ``save_tasks()`` is what serialises ``task.commit_sha`` back
         # into ``tasks.json``. Without this, the next process that
         # loads ``tasks.json`` sees ``commit_sha=None`` for this row
