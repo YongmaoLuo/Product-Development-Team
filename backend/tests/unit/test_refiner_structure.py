@@ -632,3 +632,113 @@ def test_apply_returns_true_when_the_refinement_is_applied(tmp_path, conn):
     assert agent._apply_refiner_structure(
         current, [_task("40-1")], SubTask(id="40", title="t", description="d"),
     ) is True
+
+
+# ---------------------------------------------------------------------------
+# A protected task that was split must still be removed
+# ---------------------------------------------------------------------------
+#
+# 2026-10-05. Protection covers a repair task's *content*: the refiner
+# is an LLM and must not rewrite what a repair round decided. It was
+# applied to a task's *existence* as well, and the two collided the
+# moment a repair task failed and got split — the exact thing the
+# refiner is called to do.
+#
+#   protected parent + refiner emits {parent}-1/-2/-3
+#     -> parent reinstated unconditionally
+#     -> removed_ids stays empty
+#     -> agent._apply_refiner_structure never deletes the row
+#     -> record_task_failure pins it at "failed"
+#     -> the parent sits there forever beside children that all
+#        completed, and the plan reports failed tasks of which several
+#        have no unfinished work under them at all.
+#
+# Four repair parents were stranded this way in one plan
+# (repair-r1-01, repair-r1-01-2, repair-r2-01, repair-r2-03).
+
+
+def test_split_protected_parent_is_removed():
+    parent = _task("repair-r2-03", task_group="repair-round-2")
+    updated = [
+        parent,
+        _task("repair-r2-03-1", task_group="repair-round-2"),
+        _task("repair-r2-03-2", task_group="repair-round-2"),
+        _task("repair-r2-03-3", task_group="repair-round-2"),
+    ]
+
+    plan = plan_refiner_structure([parent], updated)
+
+    assert plan.removed_ids == ("repair-r2-03",), (
+        "a split parent must be removed even though it is protected"
+    )
+    assert plan.added_ids == (
+        "repair-r2-03-1", "repair-r2-03-2", "repair-r2-03-3",
+    )
+    assert "repair-r2-03" not in [t["id"] for t in plan.effective]
+
+
+def test_split_protected_parent_is_removed_even_when_the_refiner_keeps_it():
+    """The refiner often returns the parent alongside its own children.
+
+    Reinstatement keyed on "the refiner still mentioned it" would keep
+    the parent alive; the split is the signal, not the mention.
+    """
+    parent = _task("repair-r1-01", task_group="repair-round-1")
+    updated = [parent, _task("repair-r1-01-1", task_group="repair-round-1")]
+
+    plan = plan_refiner_structure([parent], updated)
+
+    assert plan.removed_ids == ("repair-r1-01",)
+    assert plan.reinstated_ids == ()
+
+
+def test_unprotected_split_parent_is_still_removed():
+    """Regression: the ordinary, unprotected path must not change."""
+    parent = _task("40")
+    updated = [_task("40-1"), _task("40-2")]
+
+    plan = plan_refiner_structure([parent], updated)
+
+    assert plan.removed_ids == ("40",)
+    assert plan.added_ids == ("40-1", "40-2")
+
+
+def test_protected_task_dropped_without_being_split_is_still_reinstated():
+    """Protection still holds when there is no split to justify removal."""
+    protected = _task("repair-r1-01", task_group="repair-round-1")
+    other = _task("9")
+
+    plan = plan_refiner_structure([protected, other], [other])
+
+    assert plan.reinstated_ids == ("repair-r1-01",)
+    assert plan.removed_ids == ()
+
+
+def test_protected_task_edited_without_being_split_is_still_reverted():
+    """Content protection is untouched by the split exemption."""
+    original = _task("repair-r1-01", title="原文", task_group="repair-round-1")
+    edited = _task("repair-r1-01", title="被改写", task_group="repair-round-1")
+
+    plan = plan_refiner_structure([original], [edited])
+
+    assert plan.reverted_ids == ("repair-r1-01",)
+    assert [t["title"] for t in plan.effective] == ["原文"]
+
+
+def test_sibling_prefix_is_not_mistaken_for_a_split():
+    """``repair-r2-03`` must not read ``repair-r2-030`` as a child.
+
+    Ids are hierarchical, so a child carries a separator after the
+    parent id; a bare ``startswith`` on the id would let an unrelated
+    task suppress a protected parent. Here the refiner drops the parent
+    while keeping the longer id, so the split exemption must not
+    fire and the parent must be reinstated as usual.
+    """
+    parent = _task("repair-r2-03", task_group="repair-round-2")
+    unrelated = _task("repair-r2-030", task_group="repair-round-2")
+
+    plan = plan_refiner_structure([parent, unrelated], [unrelated])
+
+    assert plan.removed_ids == ()
+    assert plan.reinstated_ids == ("repair-r2-03",)
+    assert "repair-r2-03" in [t["id"] for t in plan.effective]

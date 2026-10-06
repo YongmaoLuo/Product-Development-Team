@@ -63,6 +63,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+import credentials
+
 from .cards import (
     VERIFICATION_PHASES,
     VERIFICATION_TERMINAL_STATUSES,
@@ -282,6 +284,23 @@ def _resolve_telegram_chat_id(plan_id: str) -> Optional[str]:
     )
 
 
+def _telegram_bot_token() -> Optional[str]:
+    """The Telegram bot token, from wherever this install keeps secrets.
+
+    The token is a credential, so it is asked of :mod:`credentials`
+    rather than read out of the environment. An install that keeps it
+    in a keychain holds a perfectly good token and an empty environment,
+    and a probe that read the environment would report that channel as
+    disabled — a dead channel that looks exactly like an operator who
+    never asked for one.
+
+    The chat ids are deliberately *not* routed through the provider:
+    they are routing configuration, not secrets, and an address is not
+    something to put behind a keychain lookup.
+    """
+    return credentials.read_secret("telegram_bot_token")
+
+
 def _telegram_channel_provisioned(plan_id: str) -> bool:
     """A bot token AND a chat id are resolvable for ``plan_id``.
 
@@ -294,7 +313,7 @@ def _telegram_channel_provisioned(plan_id: str) -> bool:
     specific setting unusable on its own.
     """
     return bool(
-        os.environ.get("TELEGRAM_BOT_TOKEN")
+        _telegram_bot_token()
         and _resolve_telegram_chat_id(plan_id)
     )
 
@@ -308,7 +327,7 @@ def _telegram_channel_provisioned_any() -> bool:
     would show "disabled" for an operator who configured only per-plan
     ids, which is a supported setup.
     """
-    if not os.environ.get("TELEGRAM_BOT_TOKEN"):
+    if not _telegram_bot_token():
         return False
     if os.environ.get("TELEGRAM_CHAT_ID"):
         return True
@@ -1417,10 +1436,10 @@ class FeishuNotifier:
             # stay silent so the worker log isn't flooded.
             if not self._telegram_disabled_logged:
                 logger.info(
-                    "[feishu_notifier] telegram channel disabled: "
-                    "TELEGRAM_BOT_TOKEN and a chat id (TELEGRAM_CHAT_ID or "
-                    "TELEGRAM_CHAT_ID_<plan_id>) are not both set; skipping "
-                    "telegram push for all plans until env is fixed",
+                    "[feishu_notifier] telegram channel disabled: no bot "
+                    "token and no chat id (TELEGRAM_CHAT_ID or "
+                    "TELEGRAM_CHAT_ID_<plan_id>) are configured; skipping "
+                    "telegram push for all plans",
                 )
                 self._telegram_disabled_logged = True
             return False

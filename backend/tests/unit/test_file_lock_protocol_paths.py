@@ -38,6 +38,7 @@ if str(_BACKEND_DIR) not in sys.path:
 
 from file_lock_protocol import (  # noqa: E402
     LOCK_ROOT_ENV_VAR,
+    SOCKET_ENV_VAR,
     fallback_locks_dir,
     socket_path,
 )
@@ -129,4 +130,48 @@ def test_the_suite_redirects_the_lock_root() -> None:
     assert os.environ.get(LOCK_ROOT_ENV_VAR), (
         "the suite is deriving lock state under the machine's temp root; "
         "each case's tmp_path workspace would leave a directory behind"
+    )
+
+
+def test_an_unset_socket_override_keeps_workspaces_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``PDT_LOCK_BROKER`` unset is the case where derivation must run.
+
+    ``socket_path`` consults ``PDT_LOCK_BROKER`` first and returns the
+    override verbatim, so an ambient value inherited from whatever
+    launched the suite collapses *every* workspace onto one socket: three
+    unrelated project directories hash to three different digests, but
+    the override short-circuits the digest, so the suite observes one
+    path everywhere and the two assertions that separate workspaces
+    fail against a value nothing in the test set.
+
+    That is an ambient-environment failure, not a logic one — the
+    override branch is the deployment's documented way to pin a socket,
+    and it is deliberately not narrowed here. So the contract pinned
+    here is the derivation itself: with the variable absent, distinct
+    workspaces must still land on distinct sockets.
+    """
+    monkeypatch.delenv(SOCKET_ENV_VAR, raising=False)
+    assert socket_path("/tmp/ws-a") != socket_path("/tmp/ws-b")
+
+
+def test_the_suite_owns_the_socket_override() -> None:
+    """Asserted from a test rather than trusted to conftest.
+
+    ``conftest`` takes ``PDT_LOCK_BROKER`` over at import for the same
+    reason it takes ``PDT_LOCK_ROOT``: a variable exported by the
+    process that launched the suite must not be able to decide whether
+    the suite passes. Here the failure mode is sharp — one ambient value
+    would make every workspace share a socket — and the two cases above
+    are the ones that catch it, so the takeover is pinned at its own
+    line rather than left to a test that may be deleted.
+    """
+    import os
+
+    assert not os.environ.get(SOCKET_ENV_VAR, "").strip(), (
+        "an ambient PDT_LOCK_BROKER is in effect for the whole suite: "
+        "socket_path returns it verbatim for every project_dir, so "
+        "workspace-scoped lock behaviour is untestable and a stale "
+        "value from the launching process decides the gate result"
     )

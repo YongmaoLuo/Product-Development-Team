@@ -33,6 +33,14 @@ does not protect, and for what to do if you genuinely need it off-loopback.
 - **Credential-bearing files.** Temp files that carry provider credentials
   are written into a private directory with a private mode, and the
   credential is redacted once the process that needed it has exited.
+- **Notification secrets in a process listing — when the keychain path is
+  enabled.** The two notification secrets can be read from a dedicated
+  keychain and delivered over a file descriptor, so `ps eew` and
+  `KERN_PROCARGS2` show an fd number rather than the secret. This is
+  opt-in and off by default: an installation that has not run the
+  migration is still reading them from the environment, and
+  `secrets verify` is what tells the two apart. See
+  [Keychain migration](operations/keychain-migration.md).
 
 **Not protected, and not intended to be:**
 
