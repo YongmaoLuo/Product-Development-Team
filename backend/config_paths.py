@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 # ---------------------------------------------------------------------------
 # Anchors
@@ -303,6 +303,37 @@ def resolve_provider_capacity_file() -> Path:
             candidate = (PROJECT_ROOT / candidate).resolve()
         return candidate
     return resolve_config_dir() / "provider_capacity.yaml"
+
+
+def resolve_sandbox_profile_file() -> Optional[Path]:
+    """Return the Seatbelt profile sub-agents run under, or ``None``.
+
+    Precedence (first hit wins):
+
+    1. ``PDT_SANDBOX_PROFILE`` environment variable.
+    2. ``<config dir>/sandbox_profile.sb``.
+
+    ``None`` means "no sandbox configured", and the executor then spawns
+    Claude unsandboxed exactly as it always has. A deployment that
+    points this at a profile gets a **fail-closed** guarantee: see
+    :mod:`claude_sandbox`, where a configured-but-unusable profile
+    raises rather than silently falling back. That asymmetry is the
+    whole point — a sandbox that quietly turns itself off is worse than
+    no sandbox, because the operator's `/sandbox` status (or, here, the
+    mere presence of the env var) says otherwise.
+
+    macOS-only. On any other platform the profile cannot be applied and
+    :mod:`claude_sandbox` raises rather than running unsandboxed, for
+    the same reason.
+    """
+    env_value = os.environ.get("PDT_SANDBOX_PROFILE")
+    if env_value:
+        candidate = Path(env_value).expanduser()
+        if not candidate.is_absolute():
+            candidate = (PROJECT_ROOT / candidate).resolve()
+        return candidate
+    bundled = resolve_config_dir() / "sandbox_profile.sb"
+    return bundled if bundled.is_file() else None
 
 
 def resolve_provider_order_file() -> Path:
