@@ -7,6 +7,7 @@ bootstraps a 3.9 venv and imports this conftest before collecting.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -392,6 +393,36 @@ os.environ.setdefault("PDT_DISABLE_TEMP_SWEEP", "1")
 if not os.environ.get("PDT_LOCK_ROOT"):
     os.environ["PDT_LOCK_ROOT"] = tempfile.mkdtemp(prefix="lk-")
 _LOCK_ROOT = Path(os.environ["PDT_LOCK_ROOT"])
+
+# The broker socket is the second half of the pair above, and it needs the
+# opposite treatment: ``socket_path`` consults ``PDT_LOCK_BROKER`` first and
+# returns it **verbatim**, ignoring ``project_dir`` entirely. Redirecting the
+# root above is therefore not enough to make the socket hermetic — an
+# ambient value short-circuits the whole derivation.
+#
+# The value is written by the executor into the environment block of each
+# sub-agent's settings (``coding_tool`` renders ``socket_path(self.cwd)``
+# there), so it is a process-environment variable inherited by anything
+# the suite launches — including ``run_tests.sh`` itself. It is derived
+# from one workspace and published verbatim, which is the shape that
+# makes taking it over worthwhile: the override collapses *every*
+# workspace onto that one socket. Three unrelated ``project_dir`` values
+# hash to three different digests and land on three different sockets,
+# but under the override they all return the same literal path, so tests
+# asserting that workspaces are separated fail against a value no test
+# in the file set. That is a machine-level variable deciding the gate's
+# verdict.
+#
+# Cleared unconditionally rather than defaulted with ``setdefault`` /
+# ``if not``: there is no suite-owned value to fall back *to* — an absent
+# variable is precisely the state in which the digest derivation runs and
+# the assertions mean what they say. A caller that genuinely wants a pinned
+# socket for one case sets it with ``monkeypatch.setenv`` inside that case,
+# which outranks this and is undone with it. The production override
+# semantics are untouched on purpose: pinning a socket is how a deployment
+# opts out of discovery, and the gap was suite-side environment ownership,
+# not the override.
+os.environ.pop("PDT_LOCK_BROKER", None)
 
 # Credential-payload scratch directories. Every dispatch mints one
 # ``pdt-subagent-*`` directory through ``secret_files.private_dir``, and
@@ -1019,8 +1050,19 @@ def clean_execution_state(monkeypatch):
     """
     import server
 
+    # Descriptors and child processes are reclaimed on every path out of
+    # this fixture, including the slimmed-module path below, so the
+    # registries are emptied before the test rather than after it: a
+    # session interrupted mid-teardown would otherwise carry the last
+    # test's registrations into the next one.
+    _OPEN_FDS.clear()
+    _CHILD_PROCESSES.clear()
+
     if not hasattr(server, "_execution_state"):
-        yield
+        try:
+            yield
+        finally:
+            _reclaim_registered_resources()
         return
 
     #: ``(thread, process)`` for every application worker started during
@@ -1085,6 +1127,13 @@ def clean_execution_state(monkeypatch):
         # only covers scheduler starvation on a loaded machine.
         thread.join(timeout=10)
 
+    # Before the assertion below, which ends this fixture when it fires
+    # and would leave every registered descriptor open. A descriptor a
+    # test was handed and never spent is the same defect as a worker that
+    # outlived its test: it belongs to the process, and the next test is
+    # the one that inherits it.
+    _reclaim_registered_resources()
+
     stuck = [thread for thread, _ in workers if thread.is_alive()]
 
     if hasattr(server, "_execution_state"):
@@ -1102,6 +1151,349 @@ def clean_execution_state(monkeypatch):
         f"tests/api/test_execution_state_persistence.py for a fake that "
         f"parks its worker on purpose and is still reclaimable."
     )
+
+
+# ---------------------------------------------------------------------------
+# Provider secrets: isolating the memo, minting canaries, and reclaiming
+# the descriptors and children a credential test starts.
+# ---------------------------------------------------------------------------
+#
+# ``backend/credentials.py`` memoises a resolved secret for the life of
+# the *process*, and pytest runs a whole shard in one interpreter. One
+# test that turns the keychain path on and reads a value successfully
+# therefore leaves that answer behind for every test that runs after it,
+# in a direction nobody can predict from the file: the next test either
+# inherits a secret it never configured, or — the other half of the same
+# coin — a stale "missing" hides the value its own environment provides.
+# Both are the "green alone, red in the suite" failure, and both move
+# whenever a file is added.
+#
+# Three pieces, each usable on its own by the tests that follow this
+# change:
+#
+#   * ``reset_credentials_cache_per_test`` (autouse) empties the memo
+#     around every test, through the module's own public entry point —
+#     ``credentials.reset_cache()``, which exists precisely so a caller
+#     can end a memo's lifetime without a restart.
+#   * ``canary`` mints a value that is unmistakably synthetic.
+#   * ``register_open_fd`` / ``register_child_process`` hand a descriptor
+#     or a child to the teardown that already reclaims a test's workers,
+#     so the provider's own resources ride the existing rule rather than
+#     a second one somebody has to remember.
+
+#: Descriptors and child processes a test registered, and what the most
+#: recent teardown reclaimed. Module-level because what they describe
+#: belongs to the process, not to a test.
+_OPEN_FDS: list = []
+_CHILD_PROCESSES: list = []
+_RECLAIMED_FDS: list = []
+_RECLAIMED_CHILDREN: list = []
+
+#: The marker every canary carries. It is what makes a value legible in
+#: the places a fixture value actually turns up — a captured environment,
+#: a log line, a screenshot of a notification — and it is also what
+#: keeps the value away from the shape a real credential has. A secret
+#: scanner is looking for provider-shaped strings, and a canary that
+#: matched one would be a canary somebody eventually has to add to an
+#: allowlist, which is an allowlist that will also miss the real thing.
+_CANARY_MARKER = "pdt-test"
+
+#: The prefix template per kind. Only the prefix is written down; the
+#: unique suffix is derived at call time (below), so no complete canary
+#: value is a literal anywhere in this repository.
+#:
+#: The two index entries keep the *shape* their real counterparts have —
+#: a Feishu app id reads as ``cli_…``, a Telegram chat id as ``-100…`` —
+#: so a test handed one walks the path a deployment would walk. An index
+#: is not a secret, but a lookup under a key no deployment could produce
+#: is a lookup that fails before the behaviour under test is reached.
+_CANARY_KINDS = {
+    "feishu_secret": _CANARY_MARKER + "-feishu-secret",
+    "telegram_token": _CANARY_MARKER + "-telegram-token",
+    "feishu_index": "cli_" + _CANARY_MARKER + "-feishu-index",
+    "telegram_index": "-100" + _CANARY_MARKER + "-telegram-index",
+}
+
+#: How many hex characters the derived suffix carries. Long enough that
+#: two values in one test have not shared one across the suite's history;
+#: short enough that a reader scanning a log still reads the whole thing.
+_CANARY_SUFFIX_LENGTH = 8
+
+_CANARY_LOCK = threading.Lock()
+_CANARY_ISSUED = 0
+
+
+def _next_canary_suffix(scope) -> str:
+    """Return a short digest that no earlier call in this process returned.
+
+    Derived from the calling test's directory and a per-process counter,
+    and that pairing is what makes the two guarantees hold at once: the
+    counter separates two calls made by the *same* test (which are given
+    the same directory), and the directory separates two tests (whose
+    counters are consecutive but whose digests are of different inputs).
+    A digest rather than a random value, so a failure that prints a canary
+    prints the same string on the next run.
+    """
+    global _CANARY_ISSUED
+    with _CANARY_LOCK:
+        _CANARY_ISSUED += 1
+        serial = _CANARY_ISSUED
+    seed = "{}:{}".format(scope, serial)
+    return hashlib.sha256(seed.encode("utf-8", "surrogateescape")).hexdigest()[
+        :_CANARY_SUFFIX_LENGTH
+    ]
+
+
+def _register_open_fd(fd: int) -> int:
+    """Hand ``fd`` to the teardown; return it, so a call can be inlined.
+
+    Registration rather than a blind sweep: a descriptor the suite never
+    handed out is not the suite's to close, and a test that mints one by
+    hand has its own lifetime to manage.
+    """
+    _OPEN_FDS.append(fd)
+    return fd
+
+
+def _register_child_process(proc):
+    """Hand ``proc`` to the teardown; return it, so a call can be inlined.
+
+    Same rule as the descriptor: only a process the test declares is
+    reaped, because the suite's other processes — a server started by a
+    fixture, a helper a library owns — have owners of their own.
+    """
+    _CHILD_PROCESSES.append(proc)
+    return proc
+
+
+def _join_child(proc) -> None:
+    """Stop ``proc`` if it is still running, then wait for it.
+
+    Both halves, in this order, for the reason ``clean_execution_state``
+    gives for its workers: terminating only *asks* a child to stop, and a
+    child that has been asked and not waited on is a zombie — one that
+    still holds its table entry and is still this test's responsibility
+    until something calls ``wait`` on it. The cap is generous for the
+    same reason the thread join's is: it covers a loaded machine, not a
+    child that refuses to die.
+    """
+    if not callable(getattr(proc, "poll", None)):
+        # Not a process — a stand-in without a wait, which there is
+        # nothing to do about and no reason to fail the test over.
+        return
+    try:
+        if proc.poll() is None:
+            hook = getattr(proc, "terminate", None) or getattr(proc, "kill", None)
+            if callable(hook):
+                hook()
+        proc.wait(timeout=10)
+    except Exception:  # noqa: BLE001 - best-effort teardown, never the verdict
+        pass
+
+
+def _reclaim_registered_resources() -> None:
+    """Close every registered descriptor and join every registered child.
+
+    Called from ``clean_execution_state`` on every path out of that
+    fixture, because it is the one place the suite already states the
+    rule this enforces: a test hands back every resource it starts.
+    Registration makes the two symmetric — a worker thread is reclaimed
+    whether or not the test announced it, and a descriptor or a child
+    only when it did, so a test that starts one has to say so. That
+    asymmetry is the price of not closing descriptors the suite did not
+    open, and it is the cheaper of the two mistakes.
+    """
+    fds, children = list(_OPEN_FDS), list(_CHILD_PROCESSES)
+    _OPEN_FDS.clear()
+    _CHILD_PROCESSES.clear()
+    _RECLAIMED_FDS.clear()
+    _RECLAIMED_CHILDREN.clear()
+
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            # Already closed — by the code under test, or by a test that
+            # read the wire form directly. Both are correct endings, and
+            # both still count as reclaimed: the descriptor is not the
+            # suite's any more.
+            pass
+        _RECLAIMED_FDS.append(fd)
+
+    for proc in children:
+        _join_child(proc)
+        _RECLAIMED_CHILDREN.append(proc)
+
+
+@pytest.fixture(autouse=True)
+def reset_credentials_cache_per_test():
+    """Empty the provider credentials memo around every test.
+
+    Autouse, and run on both sides of the test, because the pollution it
+    prevents arrives from two directions. Resetting before means a test
+    never starts from an answer another test resolved; resetting after
+    means it never leaves one behind for the next. Either half alone
+    leaves a hole, and the hole is exactly the order-dependent failure
+    described above.
+
+    Through ``credentials.reset_cache()`` rather than by clearing the
+    dict: the module exposes that entry point for callers who cannot
+    restart the process, and a conftest that reached past it would be a
+    second, private way of doing the same thing — the kind that rots the
+    moment the memo grows a second store behind one name.
+
+    The import is local, like the other fixtures in this file that need a
+    backend module: a slimmed test session that does not ship
+    ``credentials`` gets a no-op instead of a collection error.
+    """
+    try:
+        import credentials
+    except ImportError:  # pragma: no cover - slimmed session
+        yield
+        return
+
+    credentials.reset_cache()
+    try:
+        yield
+    finally:
+        credentials.reset_cache()
+
+
+@pytest.fixture
+def canary():
+    """Return a factory that mints a synthetic provider credential.
+
+    Called as ``canary(kind, tmp_path)``: the kind selects the prefix
+    template, the path identifies the test whose value this is. The
+    returned string is ``<prefix>-<8 derived hex characters>``.
+
+    Four rules, each of which is a way a test fixture can go wrong:
+
+    * **The value is obviously synthetic.** It is not a plausible
+      credential that happens to be wrong; it says, in the first eight
+      characters, that it is test data. A placeholder is most often read
+      in a place nobody will go back to the test for — a captured
+      environment, an assertion message, a log the CI job kept.
+    * **The value is not the shape of a real one.** A canary that
+      matched a bot token or a bare app secret would be a string a
+      scanner has to be told to skip, and a scanner told to skip one
+      shape is a scanner that will miss the next one.
+    * **Every call is a different string.** Two tests minting the same
+      value cannot be told apart in a failure, and a value reused within
+      one test cannot prove that a per-test reset happened.
+    * **Nothing is written to disk.** The value is assembled here and
+      handed over; a stand-in keychain or a forged ``.env`` belongs in
+      the test's own ``tmp_path``, which is the only directory a test may
+      write without deciding whose machine it is.
+    """
+    def _make(kind: str, path) -> str:
+        try:
+            prefix = _CANARY_KINDS[kind]
+        except KeyError:
+            # Failed here rather than answered with an invented value: a
+            # fixture that guesses leaves the test running to completion
+            # against something it made up, and a later failure points at
+            # the provider instead of at the typo.
+            pytest.fail(
+                "unknown canary kind {!r}; the four are: {}".format(
+                    kind, ", ".join(sorted(_CANARY_KINDS))
+                )
+            )
+        return "{}-{}".format(prefix, _next_canary_suffix(path))
+
+    return _make
+
+
+@pytest.fixture
+def register_open_fd():
+    """Hand a descriptor to the teardown that reclaims a test's resources.
+
+    Returns the registration function rather than being one, so a caller
+    that already has a descriptor can write ``fd = register_open_fd(fd)``
+    and keep the value it was going to use anyway.
+    """
+    return _register_open_fd
+
+
+@pytest.fixture
+def register_child_process():
+    """Hand a child process to the teardown that reclaims a test's resources.
+
+    Same shape as ``register_open_fd``, and for the same reason: a test
+    that starts a process and never waits on it has left a zombie, and
+    this is the one place in the suite that will notice.
+    """
+    return _register_child_process
+
+
+@pytest.fixture
+def reclaimed():
+    """Return a reader for what the most recent teardown reclaimed.
+
+    Reads the *last* teardown's record, so a test can assert on what the
+    fixture did to a resource a previous test left — which is the only
+    way to observe a teardown from inside pytest, since the test that
+    started the resource is over by the time the fixture has closed it.
+    """
+    def _read() -> dict:
+        return {
+            "fds": tuple(_RECLAIMED_FDS),
+            "children": tuple(_RECLAIMED_CHILDREN),
+        }
+
+    return _read
+
+
+def residual_secret_env_report(names) -> dict:
+    """Report, per requested name, whether it is present in ``os.environ``.
+
+    A **reporter, not an executor.** The invariant behind it — a provider
+    secret reaches a child process through the keychain or a file
+    descriptor, never through the environment — cannot be established by
+    anything inside this repository: a value exported by the parent shell
+    is inherited by every child the operator starts, and no code change
+    here can reach back into that shell. So acceptance is two-staged
+    (test design decision point 9): the code-side assertions come first,
+    and this is what verifies the operational migration afterwards — a
+    residue the code cannot remove is diagnosed, not hidden.
+
+    Three properties, each of which is a way a diagnostic can make things
+    worse:
+
+    * **Read-only.** It reads ``os.environ`` and writes nothing. A probe
+      that popped the key it found would delete the evidence and leave
+      the machine exactly as dirty: the next test would read a clean
+      environment, the security assertion downstream would pass, and
+      every child the operator starts would still inherit the secret.
+    * **Per key, never a single answer.** The finding is acted on by
+      editing a shell profile or a job definition, and which file that is
+      depends on *which* variable is still exported. One boolean over the
+      whole set cannot name it.
+    * **Existence only, never a value.** The report is destined for a
+      failure message and a CI log; a probe that echoed what it found
+      would publish the secret at the moment somebody is already reading
+      about it. A key that is present and a key that is empty are the
+      same finding — both mean the environment will hand something to a
+      child — so presence is the whole of what there is to report.
+
+    Returns a plain ``dict`` in the order ``names`` was given, so a
+    caller can map a line of the report back to the variable it names.
+    """
+    return {name: name in os.environ for name in names}
+
+
+@pytest.fixture
+def residual_secret_env():
+    """Return :func:`residual_secret_env_report`.
+
+    A fixture wrapper rather than a module-level import, for the reason
+    ``test_bugfix_fixtures.py`` gives for the plan factories: pytest
+    resolves ``conftest.py`` by directory, so this works whether pytest
+    was invoked from the project root (``backend/tests/...``) or from
+    ``backend/`` (``tests/...``), and a ``from conftest import ...`` in a
+    test would break in the second case.
+    """
+    return residual_secret_env_report
 
 
 class StateDbReader:
