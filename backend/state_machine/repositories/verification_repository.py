@@ -239,6 +239,7 @@ class VerificationRepository:
         results: dict[str, Any],
         status: str = "failed",
         stop_reason: Optional[str] = None,
+        publish_closed: bool = True,
     ) -> None:
         """Mark the current verification round as completed.
 
@@ -249,6 +250,16 @@ class VerificationRepository:
                 Defaults to ``"failed"`` for backward compatibility with the pre-fix
                 call sites, but the verification pass / stop paths should pass
                 ``"passed"`` or ``"loop_stopped"`` respectively.
+            publish_closed: Whether to also fire ``plan_closed``. The method
+                does two separable things — record the round's verdict, and
+                announce that the PLAN is finished — and a REPAIR round needs
+                only the first: the round is over with a verdict, but an
+                executor is about to run the repairs and another round will
+                follow. Announcing a terminal there tells every subscriber
+                the plan is closed while it is still working, and forces a
+                card push past the coalesce window for a state that is about
+                to be superseded. Default ``True`` preserves the behaviour
+                every existing call site relies on.
             stop_reason: Why the round ended (e.g. ``max_rounds_reached``,
                 ``same_failure_repeated_after_max_attempts``). Written to
                 ``plan_verification.verification_stop_reason``.
@@ -289,13 +300,18 @@ class VerificationRepository:
             fields["verification_stop_reason"] = stop_reason
         self._update(plan_id, **fields)
 
-        # plan_closed hook: ``complete_round`` is the terminal exit
+        # plan_closed hook: ``complete_round`` is normally the terminal exit
         # for a verification round. Fire ``plan_closed`` so the
         # notifier bypasses coalescing and pushes the final card
         # immediately. Status flows into the event payload so the
         # operator sees the verdict on the card without waiting
-        # for the next event.
-        self._publish_plan_closed(plan_id, terminal_reason="round_complete", status=status)
+        # for the next event. Skipped when the caller is recording a
+        # round that is over but whose plan is not — see
+        # ``publish_closed``.
+        if publish_closed:
+            self._publish_plan_closed(
+                plan_id, terminal_reason="round_complete", status=status,
+            )
 
         # 2026-09-09 (unified card phase):
         # post-write invariant assertion. Raises

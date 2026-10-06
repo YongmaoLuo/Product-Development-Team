@@ -267,21 +267,35 @@ _ACTIVITY_IDLE_LABEL = "⏸ 执行器暂时空闲（刚完成上一单元）"
 
 
 def _format_elapsed(started_at: Optional[str]) -> str:
-    """Render a ``MM:SS`` / ``H:MM:SS`` duration since an ISO timestamp.
+    """Render a ``MM:SS`` / ``H:MM`` duration since an ISO timestamp.
 
-    Returns ``""`` for a missing or unparseable timestamp — the elapsed
-    suffix is a nicety, and a card that cannot compute it must still
-    render the activity rather than drop the line.
+    Returns ``""`` for a missing, unparseable or future timestamp — the
+    elapsed suffix is a nicety, and a card that cannot compute it must
+    still render the activity rather than drop the line.
+
+    A **naive** timestamp is read as UTC, because that is what the
+    producer writes: :meth:`execution_logger.ExecutionLogger.log` stamps
+    ``datetime.utcnow().isoformat()``. Mixing that with a naive
+    ``datetime.now()`` — which is local — does not fail, it silently
+    returns a wrong number: on a UTC+8 machine a unit of work that
+    started ten minutes ago renders as "已 8h10m". An operator reading
+    that has every reason to conclude the plan is stuck, so the
+    assumption is stated here rather than left to be rediscovered.
     """
     if not started_at or not isinstance(started_at, str):
         return ""
     try:
-        from datetime import datetime
+        from datetime import datetime, timezone
 
-        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        text = started_at
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        start = datetime.fromisoformat(text)
     except (ValueError, TypeError):
         return ""
-    delta = datetime.now(start.tzinfo) - start
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - start
     seconds = int(delta.total_seconds())
     if seconds < 0:
         # Clock skew between the writer process and this one, or a

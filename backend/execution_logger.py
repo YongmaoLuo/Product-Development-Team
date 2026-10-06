@@ -157,6 +157,90 @@ def register_event_type(event_name: str, render_prefix: str) -> bool:
     return True
 
 
+#: Where a tail read starts. 500 log entries run a few hundred bytes
+#: each, so this is comfortably more than one request's worth; the
+#: widening loop below covers the case where they are not, and the only
+#: cost of starting small is one extra seek on an unusually verbose log.
+#: Starting at 1 MiB instead was measurably slower on a multi-megabyte
+#: log for no benefit, because the split-and-parse of a big blob
+#: dominates and the answer almost never needs it.
+_TAIL_INITIAL_BYTES = 256 * 1024  # 256 KiB
+
+
+def _read_tail(log_file: Path, limit: int) -> List[Dict[str, Any]]:
+    """Parse at most the last ``limit`` JSON-lines entries of ``log_file``.
+
+    Seeks backwards from EOF rather than reading the file whole, so the
+    cost is the same whether the log is a kilobyte or a gigabyte.
+
+    The two limits are not independent and must not be allowed to
+    disagree. ``limit`` bounds how many entries come back; the byte cap
+    bounds how much is read to find them. If entries are long enough
+    that ``limit`` of them do not fit in the cap, a naive seek returns
+    too few — or none — and the caller degrades to "unknown", which is
+    the card going blank for a reason that has nothing to do with the
+    executor. So the budget is widened until ``limit`` entries have been
+    parsed or the whole file has been read, whichever comes first.
+
+    Two edge cases are handled explicitly rather than left to luck:
+
+    * **A partial first line.** Seeking lands mid-line, so the first
+      fragment is discarded. It cannot be parsed anyway.
+    * **Malformed and non-dict lines.** Skipped, and they do NOT count
+      toward ``limit`` — otherwise a log with junk on every line would
+      stop the reader early.
+    """
+    try:
+        size = log_file.stat().st_size
+    except OSError:
+        return []
+    if size == 0 or limit <= 0:
+        return []
+
+    budget = min(size, _TAIL_INITIAL_BYTES)
+    while True:
+        start = max(0, size - budget)
+        try:
+            with open(log_file, "rb") as f:
+                if start:
+                    f.seek(start)
+                blob = f.read()
+        except OSError:
+            return []
+
+        text = blob.decode("utf-8", errors="replace")
+        lines = text.split("\n")
+        if start:
+            # The seek almost certainly landed mid-line; drop the
+            # fragment. ``start`` is a line boundary only by accident.
+            lines = lines[1:]
+
+        # Walk backwards and stop as soon as ``limit`` entries are in
+        # hand. Parsing forwards and slicing at the end would decode
+        # every line in the budget to keep the last handful, which is
+        # the cost the seek was introduced to avoid.
+        entries: List[Dict[str, Any]] = []
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+                if len(entries) >= limit:
+                    break
+        entries.reverse()
+
+        if len(entries) >= limit or start == 0:
+            return entries
+        # Ran out of budget before filling ``limit`` and there is more
+        # file to the left — widen and try again.
+        budget = min(size, budget * 4)
+
+
 class ExecutionLogger:
     """Thread-safe structured logger that persists execution events to disk.
 
@@ -388,11 +472,23 @@ class ExecutionLogger:
         if plans_dir is None:
             plans_dir = resolve_plans_dir()
 
-        # 500 is far more than the tail this ever inspects (the last
-        # activity-marking event is normally within a handful of lines)
-        # and far less than the 10k diagnose reads, so a plan with a
-        # multi-megabyte log stays cheap to poll every notifier tick.
-        entries = ExecutionLogger.read_logs(plan_id, plans_dir, limit=500)
+        # Read the TAIL, not the file. ``read_logs`` parses every line and
+        # then discards all but the last N — the right shape for
+        # ``diagnose`` (it wants the whole history) and the wrong shape
+        # here: this runs on ``/api/plan/{id}/status`` and
+        # ``/api/execution/{id}/progress``, which the notifier polls
+        # several times a minute per plan. A long run's log is megabytes
+        # and grows without bound, so a full parse would put an
+        # ever-growing cost on the endpoint that renders the card.
+        #
+        # 500 lines is far more than the tail this ever inspects: the
+        # longest gap between activity events is a refine window, which
+        # emits on the order of tens of lines. The byte cap inside
+        # ``_read_tail`` keeps one pathological line from pulling in the
+        # whole file.
+        entries = _read_tail(
+            plans_dir / plan_id / "execution.log", limit=500,
+        )
         if not entries:
             return empty
 
