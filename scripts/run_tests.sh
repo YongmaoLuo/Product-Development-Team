@@ -16,10 +16,12 @@ VENV_PATH="$PROJECT_ROOT/backend/.venv"
 # Check if venv exists
 if [ ! -d "$VENV_PATH" ]; then
     echo "Error: Virtual environment not found at $VENV_PATH"
-    echo "Please create it first with:"
-    echo "  python3 -m venv backend/.venv"
-    echo "  source backend/.venv/bin/activate"
-    echo "  pip install -r backend/requirements.txt"
+    echo "Create it from the lockfile with:"
+    echo "  uv sync --project backend"
+    echo ""
+    echo "That builds backend/.venv at the versions backend/uv.lock pins,"
+    echo "on the Python backend/pyproject.toml declares. If uv is not"
+    echo "installed, see https://docs.astral.sh/uv/getting-started/installation/"
     exit 1
 fi
 
