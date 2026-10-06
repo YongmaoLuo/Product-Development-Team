@@ -1518,6 +1518,16 @@ def get_execution_progress(plan_id: str):
         "current": current,
         "next": next_task,
         "counts": counts,
+        # What the executor is doing when no task row says. ``current``
+        # is derived from ``plan_tasks`` and is None across every window
+        # the executor spends on work that is not a task — the refiner
+        # rewriting the task list, a layer boundary, the tail after the
+        # last task. The card rendered "正在跑 tasks" and then named
+        # nothing in those windows; this field is what it names instead.
+        # Never raises — a plan with no readable log reports
+        # ``{"kind": "unknown"}`` and the card falls back to the bare
+        # phase label rather than inventing an activity.
+        "current_activity": _current_activity(plan_id, plan_dir),
         "stop_reason": data.get("stop_reason") if isinstance(data, dict) else None,
         "stop_detail": data.get("stop_detail") if isinstance(data, dict) else None,
         "api_error": api_error,
@@ -1525,6 +1535,33 @@ def get_execution_progress(plan_id: str):
         "ended_at": s.get("ended_at"),
         "execution_stop_reason": s.get("stop_reason"),
     }
+
+
+def _current_activity(plan_id: str, plan_dir: Path) -> Dict[str, Any]:
+    """``ExecutionLogger.current_activity`` scoped to this plan's dir.
+
+    ``plan_dir`` is already resolved by the caller, so it is passed as
+    ``plans_dir/plan_id`` rather than letting the logger re-derive it —
+    the endpoint resolves the plan directory through the server's
+    configured root, which is the same value the logger would compute
+    but without a second lookup that could disagree under a test
+    redirect.
+
+    A failure here degrades to ``unknown`` rather than 500-ing the whole
+    progress payload: this field is a presentation nicety, and an
+    operator asking "how is this plan doing" must still get an answer
+    when the log is unreadable.
+    """
+    try:
+        from execution_logger import ExecutionLogger
+
+        return ExecutionLogger.current_activity(plan_id, plan_dir.parent)
+    except Exception:
+        _server.logger.exception(
+            "[execution_progress] current_activity failed plan=%s", plan_id,
+        )
+        return {"kind": "unknown", "started_at": None, "task_id": None,
+                "event": None, "detail": None}
 
 
 @router.get("/api/execution/{plan_id}/files")

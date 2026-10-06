@@ -149,6 +149,17 @@ class PlanStatus:
     current_task: Optional[Mapping[str, Any]] = None
     next_task: Optional[Mapping[str, Any]] = None
 
+    #: What the executor is doing when no task row says — the refiner
+    #: rewriting the task list, a layer boundary, the tail after the last
+    #: task. ``current_task`` is authoritative whenever it is set; this
+    #: covers the windows where it is ``None`` and the card would
+    #: otherwise say "executing" without naming anything. Derived from
+    #: ``plans/<id>/execution.log`` by
+    #: :meth:`execution_logger.ExecutionLogger.current_activity`, so it
+    #: is readable from any process — unlike the two liveness flags
+    #: above, which are serving-process only.
+    current_activity: Optional[Mapping[str, Any]] = None
+
     #: What did not line up while assembling this snapshot.
     divergences: Tuple[Divergence, ...] = ()
 
@@ -186,6 +197,9 @@ class PlanStatus:
             "tasks": dict(self.tasks),
             "current_task": dict(self.current_task) if self.current_task else None,
             "next_task": dict(self.next_task) if self.next_task else None,
+            "current_activity": (
+                dict(self.current_activity) if self.current_activity else None
+            ),
             "divergences": [
                 {"code": d.code, "detail": d.detail} for d in self.divergences
             ],
@@ -216,6 +230,7 @@ def from_payload(payload: Mapping[str, Any]) -> PlanStatus:
     tasks = payload.get("tasks")
     current = payload.get("current_task")
     nxt = payload.get("next_task")
+    activity = payload.get("current_activity")
     return PlanStatus(
         plan_id=str(payload.get("plan_id") or ""),
         phase=str(payload.get("phase") or ""),
@@ -228,6 +243,9 @@ def from_payload(payload: Mapping[str, Any]) -> PlanStatus:
         tasks=dict(tasks) if isinstance(tasks, Mapping) else {},
         current_task=dict(current) if isinstance(current, Mapping) else None,
         next_task=dict(nxt) if isinstance(nxt, Mapping) else None,
+        current_activity=(
+            dict(activity) if isinstance(activity, Mapping) else None
+        ),
     )
 
 
@@ -289,6 +307,41 @@ def find_divergences(status: PlanStatus) -> Tuple[Divergence, ...]:
             "phase_and_verdict_disagree",
             f"phase={status.phase!r} but the verification verdict is "
             f"{status.verification_status!r}",
+        ))
+
+    # Rule 3 — the two verification stores, one round behind.
+    # ``plan_routing.verification`` is CAS-advanced at every round
+    # boundary; ``plan_verification.verification_status`` is written by a
+    # separate best-effort path. When the second write does not land, the
+    # row keeps the ``running`` value stamped at round start, and since
+    # ``/api/plan/{id}/status`` takes its top-level
+    # ``verification_status`` from that row, the card header renders
+    # "🔄 验证中" above a body naming the repair task that is actually
+    # running, with ``verification_in_flight`` already False.
+    #
+    # Both writers are best-effort by design (every state write in this
+    # codebase swallows its exception so a failed write never breaks the
+    # workflow), which is exactly why the drift is silent. The
+    # reconciliation at the read site fixes the card; this rule is what
+    # makes the underlying miss visible instead.
+    #
+    # ``pending`` is deliberately NOT in the trigger set, though the
+    # read-side reconciliation does override it. ``reset`` writes
+    # ``pending`` into this column while a plan can legitimately be
+    # executing repair work, and a column that says "not started" is not
+    # a stale *claim* about anything — alarming on it would fire on every
+    # reset plan. The defect this rule exists for is a column still
+    # claiming a round is LIVE when no round is.
+    if (
+        not status.verification_in_flight
+        and v_status in ("running", "in_progress")
+        and status.execution_in_flight
+    ):
+        found.append(Divergence(
+            "stale_running_verification_during_execution",
+            f"plan_verification still reads {status.verification_status!r} "
+            f"while an execution is in flight and no verification round "
+            f"is live — the round-close write did not land",
         ))
 
     return tuple(found)

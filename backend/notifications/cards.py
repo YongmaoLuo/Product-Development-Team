@@ -240,6 +240,102 @@ _EXECUTION_PHASE_LABEL = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Executor activity vocabulary
+# ---------------------------------------------------------------------------
+#
+# ``execution_logger._ACTIVITY_EVENT_KINDS`` derives a small closed set of
+# "what is the executor doing" kinds from the execution log. Display
+# strings live HERE, not in the logger, for the same reason the phase
+# labels do: the log layer reports facts, this layer presents them.
+#
+# The two kinds that actually get rendered are the ones that describe
+# work with no ``plan_tasks`` row behind it. Everything else (``task``,
+# ``idle``) means a task row exists — or that there is genuinely nothing
+# running — and is handled by the task sections instead.
+_ACTIVITY_LABEL = {
+    "refine": "🧩 正在精化任务列表",
+    "layer_boundary": "🔀 正在切换任务层",
+}
+
+#: Shown when the executor's last recorded activity was a handoff and
+#: nothing has started since. Distinct from silence on purpose: "the
+#: executor just finished X and has not picked up the next unit yet" is
+#: the answer to "is it stuck?", and it is different from "I have no
+#: idea what it is doing".
+_ACTIVITY_IDLE_LABEL = "⏸ 执行器暂时空闲（刚完成上一单元）"
+
+
+def _format_elapsed(started_at: Optional[str]) -> str:
+    """Render a ``MM:SS`` / ``H:MM`` duration since an ISO timestamp.
+
+    Returns ``""`` for a missing, unparseable or future timestamp — the
+    elapsed suffix is a nicety, and a card that cannot compute it must
+    still render the activity rather than drop the line.
+
+    A **naive** timestamp is read as UTC, because that is what the
+    producer writes: :meth:`execution_logger.ExecutionLogger.log` stamps
+    ``datetime.utcnow().isoformat()``. Mixing that with a naive
+    ``datetime.now()`` — which is local — does not fail, it silently
+    returns a wrong number: on a UTC+8 machine a unit of work that
+    started ten minutes ago renders as "已 8h10m". An operator reading
+    that has every reason to conclude the plan is stuck, so the
+    assumption is stated here rather than left to be rediscovered.
+    """
+    if not started_at or not isinstance(started_at, str):
+        return ""
+    try:
+        from datetime import datetime, timezone
+
+        text = started_at
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        start = datetime.fromisoformat(text)
+    except (ValueError, TypeError):
+        return ""
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - start
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        # Clock skew between the writer process and this one, or a
+        # timestamp from the future. Showing a negative duration would
+        # be worse than showing none.
+        return ""
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def _activity_line(activity: Optional[Dict[str, Any]]) -> str:
+    """One line naming what the executor is doing, with how long.
+
+    Returns ``""`` when there is nothing to say — the caller then keeps
+    whatever it rendered before, rather than inventing a state.
+    """
+    if not isinstance(activity, dict):
+        return ""
+    kind = str(activity.get("kind") or "")
+    base = _ACTIVITY_LABEL.get(kind)
+    if base is None:
+        if kind == "idle":
+            base = _ACTIVITY_IDLE_LABEL
+        else:
+            # "unknown" (no readable log) and "task" (a task row exists
+            # and the task sections already name it) both mean the
+            # activity line has nothing to add.
+            return ""
+    line = base
+    elapsed = _format_elapsed(activity.get("started_at"))
+    if elapsed:
+        line += f"（已 {elapsed}）"
+    # The refiner names the task whose failure triggered it; that is the
+    # single most useful fact about a multi-minute silent window.
+    if kind == "refine" and activity.get("task_id"):
+        line += f"（因 `{activity['task_id']}` 失败）"
+    return line
+
+
 def _unified_phase_section(
     phase: Optional[str],
     verification_status: Optional[str],
@@ -248,6 +344,8 @@ def _unified_phase_section(
     verification_stop_reason: Optional[str] = None,
     current_task: Optional[Tuple[str, str]] = None,
     current_vp: Optional[Dict[str, Any]] = None,
+    current_activity: Optional[Dict[str, Any]] = None,
+    verification_activity: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Build a single, normalized "where am I now" header line.
 
@@ -314,6 +412,19 @@ def _unified_phase_section(
                 )
             else:
                 sub_parts.append(f"🔍 正在验证 `[{current_vp['id']}]`")
+        elif verification_status in ("running", "in_progress") and verification_activity:
+            # ``current_vp`` is only populated while a VP is executing.
+            # A round's other phases — planning the VP set, judging the
+            # verdicts, writing the report — have no VP in flight, and
+            # the card falls through to a bare "🔄 验证中" that names
+            # nothing. The judgment phase is the expensive case: it can
+            # run for a long time, and nothing it does alters a rendered
+            # field, so the fingerprint dedup discards every rebuild it
+            # triggers and the card sits frozen on a verdict from a
+            # phase that has already ended. ``verification_activity`` is
+            # the round's sub-step, derived server-side from the same log
+            # the VP lifecycle comes from.
+            sub_parts.append(verification_activity)
         elif verification_status:
             status_label = {
                 "pending": "⏳ 待启动",
@@ -336,6 +447,15 @@ def _unified_phase_section(
                 exec_label = f"正在跑 `[{tid}]` {ttitle}"
             else:
                 exec_label = f"正在跑 task `[{tid}]`"
+        elif exec_label == "正在跑 tasks":
+            # No task row is in_progress. The executor is not idle in
+            # every one of those windows — it is refining the task list
+            # or crossing a layer boundary, work that writes no row.
+            # Those windows are long enough to read as a stall, and they
+            # are the dominant cause of this line naming nothing.
+            activity_line = _activity_line(current_activity)
+            if activity_line:
+                exec_label = activity_line
         if exec_label:
             sub_parts.append(exec_label)
 
@@ -348,6 +468,7 @@ def _unified_phase_section(
 
 def _in_progress_tasks_section(
     task_progress: Optional[List[Dict[str, Any]]],
+    current_activity: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Render a "currently running tasks" block with title + id.
 
@@ -358,40 +479,53 @@ def _in_progress_tasks_section(
     recognise, the id-only line is unreadable. Each in_progress task
     gets its own line with `[id] title`, and only truncate the title
     if it overflows the 80-char display budget.
-    Returns ``[]`` when there are no in-progress tasks so the card
-    stays quiet during quiet phases (e.g. between verification
-    rounds when the executor is idle).
+
+    When no task is in_progress but the executor IS doing something
+    (refining the task list, crossing a layer boundary), the block
+    renders that instead of returning ``[]``. Returning empty was the
+    original intent — stay quiet between verification rounds — but it
+    is indistinguishable from "the operator should assume nothing is
+    happening", which is exactly the wrong default during a multi-minute
+    silent window.
+
+    Returns ``[]`` only when there is genuinely nothing to report.
     """
-    if not task_progress:
-        return []
     in_progress = [
-        t for t in task_progress
+        t for t in (task_progress or [])
         if isinstance(t, dict) and t.get("status") == "in_progress"
         and t.get("id")
     ]
-    if not in_progress:
-        return []
-    n = len(in_progress)
-    if n > 1:
-        heading = f"🔄 **正在执行（{n} 个并行）：**"
-    else:
-        heading = "🔄 **正在执行：**"
-    lines = [heading]
-    for t in in_progress:
-        tid = t.get("id", "")
-        title = (t.get("title") or "").strip()
-        # Truncate very long titles so the card stays compact
-        # (Feishu has a 4 KB element cap and a 30-line/element limit).
-        if len(title) > 80:
-            title = title[:77] + "…"
-        if title:
-            lines.append(f"- `[{tid}]` {title}")
+    if in_progress:
+        n = len(in_progress)
+        if n > 1:
+            heading = f"🔄 **正在执行（{n} 个并行）：**"
         else:
-            # Fallback for tasks without a title field (e.g. db_orphan
-            # rows) — show the id only so the section is never empty.
-            lines.append(f"- `{tid}`")
+            heading = "🔄 **正在执行：**"
+        lines = [heading]
+        for t in in_progress:
+            tid = t.get("id", "")
+            title = (t.get("title") or "").strip()
+            # Truncate very long titles so the card stays compact
+            # (Feishu has a 4 KB element cap and a 30-line/element limit).
+            if len(title) > 80:
+                title = title[:77] + "…"
+            if title:
+                lines.append(f"- `[{tid}]` {title}")
+            else:
+                # Fallback for tasks without a title field (e.g. db_orphan
+                # rows) — show the id only so the section is never empty.
+                lines.append(f"- `{tid}`")
+        return [
+            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}},
+            {"tag": "hr"},
+        ]
+
+    activity_line = _activity_line(current_activity)
+    if not activity_line:
+        return []
     return [
-        {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}},
+        {"tag": "div", "text": {"tag": "lark_md",
+                                "content": f"🔄 **正在执行：**\n- {activity_line}"}},
         {"tag": "hr"},
     ]
 
@@ -806,9 +940,29 @@ def _resolve_header(
     # an active or terminal sub-machine — a bare "pending" status with
     # no current_phase must NOT hijack the header (it would mask
     # mid-plan states like "executing").
-    if phase in VERIFICATION_PHASES or verification_status in (
-        "running", "in_progress",
-    ):
+    #
+    # Suppressed when an execution is in flight. The status field alone
+    # cannot tell "a round is running" from "the round-close write never
+    # landed and the column is stale" — a stale column makes the header
+    # read "🔄 验证中" above a body correctly showing a repair task
+    # running. Both liveness records are consulted elsewhere in this
+    # function; this is the one branch where they had to be, because a
+    # stale persisted column is the failure mode and only the live record
+    # can contradict it.
+    #
+    # ``execution_in_flight`` rather than ``verification_in_flight`` on
+    # purpose. The latter is False in every out-of-process rebuild
+    # (``_status_from_summary`` documents that as the degraded-but-safe
+    # direction), so gating on it would silently un-verify every card
+    # built by the compatibility shims and by any test that constructs a
+    # snapshot locally. ``execution_in_flight`` is False in exactly those
+    # same degraded paths, so they keep the old header, while a real
+    # serving process with a live repair round gets the truthful one.
+    if (
+        phase in VERIFICATION_PHASES or verification_status in (
+            "running", "in_progress",
+        )
+    ) and not execution_in_flight:
         return {
             "title": f"🔄 验证中 · {plan_id}{_round_suffix}",
             "color": "blue",
@@ -820,6 +974,25 @@ def _resolve_header(
     if total == 0:
         # Fall through to base phase label below.
         pass
+
+    # 4b. A repair round is executing. Reached whenever an execution is
+    # live and the plan has already been verified at least once —
+    # including the ordinary ``phase="executing"`` case, which falls
+    # through to the base label and renders "执行中" in RED next to a body
+    # saying a repair task is running. Red is the colour for "something
+    # is wrong"; here the thing that is wrong (the failed verification)
+    # is already being worked on, and saying so is the difference between
+    # an operator reading a status and an operator going to investigate
+    # an incident.
+    #
+    # Before this branch the label existed but was unreachable for the
+    # common shape: it sat inside the terminal-phase branch below, which
+    # a live ``executing`` phase never enters.
+    if execution_in_flight and verification_round > 0:
+        return {
+            "title": f"🔧 修复执行中 · {plan_id}{_round_suffix}",
+            "color": "blue",
+        }
 
     # 5. Execution terminal — decide by counts and stopped-early.
     #
@@ -1451,6 +1624,7 @@ def _verification_sections(
 def _execution_sections(
     tasks_info: Dict[str, Any],
     execution_progress: Optional[Dict[str, Any]],
+    activity: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Render the execution sub-sections (under the 📋 task area).
 
@@ -1512,6 +1686,20 @@ def _execution_sections(
         elements.append(
             {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}}
         )
+    else:
+        # No task row is in_progress. Say what the executor IS doing, so
+        # this block is never simply absent while the plan is running.
+        # The gap it covers is not a rendering nicety: the refiner holds
+        # the executor for minutes at a time, and during every one of
+        # those windows this block used to show a progress bar, a
+        # "最近完成活动" list, and no indication that anything was
+        # happening.
+        _activity_text = _activity_line(activity)
+        if _activity_text:
+            elements.append(
+                {"tag": "div", "text": {"tag": "lark_md",
+                                        "content": f"🔄 **当前任务：**\n- {_activity_text}"}}
+            )
 
     # 2026-09-12 plan v14 follow-up: surface the pending tasks so
     # operators can see which tasks the executor SHOULD be picking up
@@ -1788,14 +1976,48 @@ def build_card(
         ):
             _current_task = (str(_t["id"]), (_t.get("title") or "").strip())
             break
+    # Fallback for the windows with no task row: what the executor is
+    # doing instead. Sourced from the snapshot first, then the progress
+    # payload — the snapshot is authoritative (it is the same read the
+    # header came from), the payload is the path a caller that built its
+    # own snapshot takes.
+    _activity: Optional[Dict[str, Any]] = plan_status.current_activity
+    if not isinstance(_activity, dict):
+        _cand = (execution_progress or {}).get("current_activity")
+        _activity = _cand if isinstance(_cand, dict) else None
     # Same for the verification window: name the VP being verified
     # (2026-09-14). The payload's current_vp
     # carries id + title + started_at once the progress endpoint has
     # a live VP in flight.
+    #
+    # Both sources are consulted because they answer different routes:
+    # ``verification_progress`` on the verification card, and
+    # ``body_only`` on the progress card — where the notifier passes the
+    # live verification payload through as a body-only section so the
+    # round history stays visible during an execution phase. Reading
+    # only the first made the second route unable to name a VP at all.
     _current_vp: Optional[Dict[str, Any]] = None
-    _vp_candidate = (verification_progress or {}).get("current_vp")
-    if isinstance(_vp_candidate, dict) and _vp_candidate.get("id"):
-        _current_vp = _vp_candidate
+    for _src in (verification_progress, body_only):
+        _vp_candidate = (_src or {}).get("current_vp")
+        if isinstance(_vp_candidate, dict) and _vp_candidate.get("id"):
+            _current_vp = _vp_candidate
+            break
+    # ...and when no VP is in flight, the round's sub-step. Read from
+    # the LIVE progress payload, then from the body-only history — the
+    # body-only path is the one that used to be unable to name anything
+    # at all, because the notifier's synthesis of that dict dropped
+    # ``current_vp`` on the floor.
+    _v_activity: Optional[str] = None
+    for _src in (verification_progress, body_only):
+        if not isinstance(_src, dict):
+            continue
+        _a = _src.get("activity")
+        if isinstance(_a, dict) and _a.get("label"):
+            _v_activity = str(_a["label"])
+            break
+        if isinstance(_a, str) and _a.strip():
+            _v_activity = _a.strip()
+            break
 
     elements: List[Dict[str, Any]] = []
     elements.extend(_unified_phase_section(
@@ -1806,13 +2028,17 @@ def build_card(
         verification_stop_reason=v_stop_reason,
         current_task=_current_task,
         current_vp=_current_vp,
+        current_activity=_activity,
+        verification_activity=_v_activity,
     ))
     # Separator only when the banner actually rendered — a brand-new
     # plan with no state row yet has no stage, and a dangling ``<hr>``
     # would read as a rendering bug.
     if elements:
         elements.append({"tag": "hr"})
-    elements.extend(_execution_sections(tasks_info, execution_progress))
+    elements.extend(
+        _execution_sections(tasks_info, execution_progress, activity=_activity)
+    )
 
     # Pick the body section's source: live verification_progress wins,
     # fall back to verification_body_only (historical record that
