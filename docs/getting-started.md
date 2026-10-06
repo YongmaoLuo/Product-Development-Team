@@ -3,9 +3,8 @@
 ## 1. Create the virtualenv
 
 ```bash
-python3 -m venv backend/.venv
+uv sync --project backend
 source backend/.venv/bin/activate
-pip install -r backend/requirements.txt
 ```
 
 Everything below assumes this venv. Not as a convention — as a

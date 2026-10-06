@@ -223,20 +223,35 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
       - name: Install backend dependencies
+        # `uv sync` installs backend/uv.lock *and* creates
+        # backend/.venv, so this one step is what the old
+        # "install requirements" + "bootstrap project venv" pair used
+        # to be together. Every lane below runs pytest through
+        # backend/.venv/bin/python3 and never the system interpreter.
+        #
+        # `--locked` is the load-bearing flag: without it uv silently
+        # re-resolves instead of installing the lock, which is the
+        # dependency drift ENTRY-040 exists to end. uv itself is pinned
+        # rather than floating so the resolver is reproducible too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-
-      - name: Install bandit
-        run: pip install bandit
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       # -ll = medium+ severity. JSON output feeds into the next step.
       # Non-zero exit on findings -> PR is blocked.
+      #
+      # Invoked through the project venv, like every pytest invocation
+      # in this file. `uv sync` installs into backend/.venv, not into
+      # the setup-python environment, so a bare `bandit` is no longer on
+      # PATH — the same "never trust the system interpreter" rule the
+      # pytest lanes follow, applied to the one tool in this job.
       - name: Run bandit scan
         working-directory: backend
-        run: bandit -r . -ll -f json -o bandit-report.json || true
+        run: ./.venv/bin/bandit -r . -ll -f json -o bandit-report.json || true
 
       # Enforce bandit gate via grep (avoid embedding Python f-strings
       # in the YAML block scalar — they collide with YAML colon parsing
@@ -300,20 +315,23 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
       - name: Install backend dependencies
+        # `uv sync` installs backend/uv.lock *and* creates
+        # backend/.venv, so this one step is what the old
+        # "install requirements" + "bootstrap project venv" pair used
+        # to be together. Every lane below runs pytest through
+        # backend/.venv/bin/python3 and never the system interpreter.
+        #
+        # `--locked` is the load-bearing flag: without it uv silently
+        # re-resolves instead of installing the lock, which is the
+        # dependency drift ENTRY-040 exists to end. uv itself is pinned
+        # rather than floating so the resolver is reproducible too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-
-      # Bootstrap the project venv so we can call ``run_grep_guard``
-      # via the project's own interpreter - same venv-python rule
-      # that unit / integration / e2e / nightly already follow.
-      - name: Bootstrap project venv
-        run: |
-          python -m venv backend/.venv
-          backend/.venv/bin/python3 -m pip install --upgrade pip
-          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       # Run the scanner via the shared ``scripts/grep_guard.sh`` wrapper.
       # The wrapper owns:
@@ -368,20 +386,23 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
       - name: Install backend dependencies
+        # `uv sync` installs backend/uv.lock *and* creates
+        # backend/.venv, so this one step is what the old
+        # "install requirements" + "bootstrap project venv" pair used
+        # to be together. Every lane below runs pytest through
+        # backend/.venv/bin/python3 and never the system interpreter.
+        #
+        # `--locked` is the load-bearing flag: without it uv silently
+        # re-resolves instead of installing the lock, which is the
+        # dependency drift ENTRY-040 exists to end. uv itself is pinned
+        # rather than floating so the resolver is reproducible too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-
-      # The gates are pure pytest and import the backend modules they
-      # read, so they need the venv — the same rule every other lane
-      # follows (CLAUDE.md: never run pytest on the system interpreter).
-      - name: Bootstrap project venv
-        run: |
-          python -m venv backend/.venv
-          backend/.venv/bin/python3 -m pip install --upgrade pip
-          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       # No ``--cov``: these tests measure source shape, not behaviour,
       # and their own lines are excluded from the coverage aggregate by
@@ -502,16 +523,22 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
+      # This job needs no project dependencies of its own: the scanner
+      # imports the gate *modules*, those import pytest for their own
+      # test functions, and the rules the scanner calls (find_home_paths
+      # / find_attribution / find_local_measurements) are pure. It used
+      # to install pytest alone. It now takes the same locked sync as
+      # every other lane, because "install one package by hand" was the
+      # shape that put unpinned pytest into venvs in the first place —
+      # and the extra packages cost this job nothing.
       - name: Create the venv the scanner resolves
         run: |
           set -euo pipefail
-          python3 -m venv backend/.venv
-          # pytest only. The scanner imports the gate *modules*, and those
-          # import pytest for their own test functions; the rules it calls
-          # (find_home_paths / find_attribution / find_local_measurements)
-          # are pure and need nothing else.
-          backend/.venv/bin/python3 -m pip install -q pytest
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       - name: Install gitleaks (pinned by version and checksum)
         env:
@@ -591,15 +618,22 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
+      # This job needs no project dependencies of its own: the scanner
+      # imports the gate *modules*, those import pytest for their own
+      # test functions, and the rules the scanner calls (find_home_paths
+      # / find_attribution / find_local_measurements) are pure. It used
+      # to install pytest alone. It now takes the same locked sync as
+      # every other lane, because "install one package by hand" was the
+      # shape that put unpinned pytest into venvs in the first place —
+      # and the extra packages cost this job nothing.
       - name: Create the venv the scanner resolves
         run: |
           set -euo pipefail
-          python3 -m venv backend/.venv
-          # pytest only, same as the range scan above: the scanner
-          # imports the gate *modules*, and those import pytest for
-          # their own test functions; the rules are pure.
-          backend/.venv/bin/python3 -m pip install -q pytest
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       - name: Scan the branch name, title and body
         env:
@@ -738,22 +772,23 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
       - name: Install backend dependencies
+        # `uv sync` installs backend/uv.lock *and* creates
+        # backend/.venv, so this one step is what the old
+        # "install requirements" + "bootstrap project venv" pair used
+        # to be together. Every lane below runs pytest through
+        # backend/.venv/bin/python3 and never the system interpreter.
+        #
+        # `--locked` is the load-bearing flag: without it uv silently
+        # re-resolves instead of installing the lock, which is the
+        # dependency drift ENTRY-040 exists to end. uv itself is pinned
+        # rather than floating so the resolver is reproducible too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-          pip install pytest pytest-cov pytest-timeout coverage
-
-      # Create the project venv so that subsequent steps can invoke it via
-      # `backend/.venv/bin/python3`. The bootstrap step only succeeds if the
-      # venv does not already exist (idempotent via the `|| true` fallback).
-      - name: Bootstrap project venv
-        run: |
-          python -m venv backend/.venv
-          backend/.venv/bin/python3 -m pip install --upgrade pip
-          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
-          backend/.venv/bin/python3 -m pip install pytest pytest-cov pytest-timeout coverage
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       # --- Mitigate actions/runner-images#13770 (2026-09-29) ---------------
       #
@@ -1158,18 +1193,23 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
       - name: Install backend dependencies
+        # `uv sync` installs backend/uv.lock *and* creates
+        # backend/.venv, so this one step is what the old
+        # "install requirements" + "bootstrap project venv" pair used
+        # to be together. Every lane below runs pytest through
+        # backend/.venv/bin/python3 and never the system interpreter.
+        #
+        # `--locked` is the load-bearing flag: without it uv silently
+        # re-resolves instead of installing the lock, which is the
+        # dependency drift ENTRY-040 exists to end. uv itself is pinned
+        # rather than floating so the resolver is reproducible too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-
-      - name: Bootstrap project venv
-        run: |
-          python -m venv backend/.venv
-          backend/.venv/bin/python3 -m pip install --upgrade pip
-          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
-          backend/.venv/bin/python3 -m pip install pytest pytest-timeout
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       # Same mitigation as the unit shards, for the same reason — this lane
       # bisects the wedge, so it must not be able to hit it. See the long
@@ -1360,18 +1400,23 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
       - name: Install backend dependencies
+        # `uv sync` installs backend/uv.lock *and* creates
+        # backend/.venv, so this one step is what the old
+        # "install requirements" + "bootstrap project venv" pair used
+        # to be together. Every lane below runs pytest through
+        # backend/.venv/bin/python3 and never the system interpreter.
+        #
+        # `--locked` is the load-bearing flag: without it uv silently
+        # re-resolves instead of installing the lock, which is the
+        # dependency drift ENTRY-040 exists to end. uv itself is pinned
+        # rather than floating so the resolver is reproducible too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-
-      - name: Bootstrap project venv
-        run: |
-          python -m venv backend/.venv
-          backend/.venv/bin/python3 -m pip install --upgrade pip
-          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
-          backend/.venv/bin/python3 -m pip install coverage
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       - name: Download coverage data
         uses: actions/download-artifact@v4
@@ -1431,21 +1476,23 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
       - name: Install backend dependencies
+        # `uv sync` installs backend/uv.lock *and* creates
+        # backend/.venv, so this one step is what the old
+        # "install requirements" + "bootstrap project venv" pair used
+        # to be together. Every lane below runs pytest through
+        # backend/.venv/bin/python3 and never the system interpreter.
+        #
+        # `--locked` is the load-bearing flag: without it uv silently
+        # re-resolves instead of installing the lock, which is the
+        # dependency drift ENTRY-040 exists to end. uv itself is pinned
+        # rather than floating so the resolver is reproducible too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-          pip install pytest pytest-asyncio pytest-timeout
-
-      # Create the project venv so the integration pytest invocation
-      # uses the same interpreter as the unit stage.
-      - name: Bootstrap project venv
-        run: |
-          python -m venv backend/.venv
-          backend/.venv/bin/python3 -m pip install --upgrade pip
-          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
-          backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       # Stub integration uses mock LLM/coding-tool to avoid real network calls.
       # Runs only the integration stub tests (NOT e2e).
@@ -1504,19 +1551,23 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
       - name: Install backend dependencies
+        # `uv sync` installs backend/uv.lock *and* creates
+        # backend/.venv, so this one step is what the old
+        # "install requirements" + "bootstrap project venv" pair used
+        # to be together. Every lane below runs pytest through
+        # backend/.venv/bin/python3 and never the system interpreter.
+        #
+        # `--locked` is the load-bearing flag: without it uv silently
+        # re-resolves instead of installing the lock, which is the
+        # dependency drift ENTRY-040 exists to end. uv itself is pinned
+        # rather than floating so the resolver is reproducible too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-          pip install pytest pytest-asyncio pytest-timeout requests
-
-      - name: Bootstrap project venv
-        run: |
-          python -m venv backend/.venv
-          backend/.venv/bin/python3 -m pip install --upgrade pip
-          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
-          backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout requests
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       # E2E exercises the full pipeline: agent → executor → LLM (stub) →
       # verifier → report. The full pytest suite (1482 tests) used
@@ -1612,18 +1663,23 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
       - name: Install backend dependencies
+        # `uv sync` installs backend/uv.lock *and* creates
+        # backend/.venv, so this one step is what the old
+        # "install requirements" + "bootstrap project venv" pair used
+        # to be together. Every lane below runs pytest through
+        # backend/.venv/bin/python3 and never the system interpreter.
+        #
+        # `--locked` is the load-bearing flag: without it uv silently
+        # re-resolves instead of installing the lock, which is the
+        # dependency drift ENTRY-040 exists to end. uv itself is pinned
+        # rather than floating so the resolver is reproducible too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-
-      - name: Bootstrap project venv
-        run: |
-          python -m venv backend/.venv
-          backend/.venv/bin/python3 -m pip install --upgrade pip
-          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
-          backend/.venv/bin/python3 -m pip install pytest pytest-timeout
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       # The credential E2E: a three-level relay of REAL child processes,
       # each of which has to be handed the secret on a descriptor the
@@ -1762,19 +1818,23 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
       - name: Install backend dependencies
+        # `uv sync` installs backend/uv.lock *and* creates
+        # backend/.venv, so this one step is what the old
+        # "install requirements" + "bootstrap project venv" pair used
+        # to be together. Every lane below runs pytest through
+        # backend/.venv/bin/python3 and never the system interpreter.
+        #
+        # `--locked` is the load-bearing flag: without it uv silently
+        # re-resolves instead of installing the lock, which is the
+        # dependency drift ENTRY-040 exists to end. uv itself is pinned
+        # rather than floating so the resolver is reproducible too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-          pip install pytest pytest-asyncio pytest-timeout requests
-
-      - name: Bootstrap project venv
-        run: |
-          python -m venv backend/.venv
-          backend/.venv/bin/python3 -m pip install --upgrade pip
-          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
-          backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout requests
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       # Slow layer exercises stress / soak / full-pipeline sweeps gated
       # by ``@pytest.mark.time_sensitive``. 30-minute per-test timeout covers
@@ -1839,19 +1899,23 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
       - name: Install backend dependencies
+        # `uv sync` installs backend/uv.lock *and* creates
+        # backend/.venv, so this one step is what the old
+        # "install requirements" + "bootstrap project venv" pair used
+        # to be together. Every lane below runs pytest through
+        # backend/.venv/bin/python3 and never the system interpreter.
+        #
+        # `--locked` is the load-bearing flag: without it uv silently
+        # re-resolves instead of installing the lock, which is the
+        # dependency drift ENTRY-040 exists to end. uv itself is pinned
+        # rather than floating so the resolver is reproducible too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-          pip install pytest pytest-asyncio pytest-timeout pytest-xdist requests
-
-      - name: Bootstrap project venv
-        run: |
-          python -m venv backend/.venv
-          backend/.venv/bin/python3 -m pip install --upgrade pip
-          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
-          backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout pytest-xdist requests
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       # Mitigate actions/runner-images#13770: the Ubuntu 24.04 runner image
       # ships with a ``read_ahead_kb`` value that consumes too much page cache
@@ -1970,19 +2034,23 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: backend/uv.lock
 
       - name: Install backend dependencies
+        # `uv sync` installs backend/uv.lock *and* creates
+        # backend/.venv, so this one step is what the old
+        # "install requirements" + "bootstrap project venv" pair used
+        # to be together. Every lane below runs pytest through
+        # backend/.venv/bin/python3 and never the system interpreter.
+        #
+        # `--locked` is the load-bearing flag: without it uv silently
+        # re-resolves instead of installing the lock, which is the
+        # dependency drift ENTRY-040 exists to end. uv itself is pinned
+        # rather than floating so the resolver is reproducible too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-          pip install pytest pytest-asyncio pytest-timeout requests
-
-      - name: Bootstrap project venv
-        run: |
-          python -m venv backend/.venv
-          backend/.venv/bin/python3 -m pip install --upgrade pip
-          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
-          backend/.venv/bin/python3 -m pip install pytest pytest-asyncio pytest-timeout requests
+          pip install uv==0.11.6
+          uv sync --project backend --locked
 
       # The actual REAL-plan migration invocation. This writes to
       # the production ``plans/`` directory and may invoke mocks

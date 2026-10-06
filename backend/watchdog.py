@@ -45,9 +45,10 @@ Module name note
 
 ``backend/watchdog.py`` shadows the PyPI ``watchdog`` filesystem
 package when ``backend/`` is on ``sys.path``. That package is not a
-dependency of this project (it is absent from ``requirements.txt``
-and from the venv), and the architecture document pins this exact
-path, so the shadowing is intentional and inert.
+dependency of this project (nothing in ``backend/pyproject.toml``
+names it and it is absent from ``backend/uv.lock``), and the
+architecture document pins this exact path, so the shadowing is
+intentional and inert.
 """
 
 from __future__ import annotations
