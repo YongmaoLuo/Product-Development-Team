@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -52,7 +53,37 @@ _BACKEND_TESTS_ROOT = _REPO_ROOT / "backend" / "tests"
 # Commit that started the audit round.  Modifications to existing test
 # functions AFTER this commit must be recorded in Appendix A.  Update
 # this when starting a new audit round.
-_BASELINE_COMMIT = "bd10ef77ec08de87e1cc1166f9d0860f658999eb"
+#
+# What the anchor means, precisely: it is the **first commit of the round
+# currently under audit**, and the diff the gate reads is
+# ``_BASELINE_COMMIT~1 .. HEAD`` — the whole of this round and nothing
+# older.  A round is the span over which the audit's own edits were made,
+# not "all history to date"; an older anchor widens the span to include
+# development rounds that the audit never touched, and the gate then
+# reports every ordinary feature edit as if the audit had weakened a test.
+#
+# Why this value.  The previous anchor (the merge that closed the round
+# before) had drifted 189 commits into the past, so the gate demanded an
+# Appendix A row for 83 test files that no audit round had touched.  That
+# is not a weakening to record — it is the gate reporting its own
+# staleness, and a contributor facing it has only two moves: append 83
+# rows of fiction, or delete the gate.  Both destroy the thing the gate
+# exists to protect, which is why a stale anchor is worse than a
+# permissive one.
+#
+# The re-anchor therefore moves to the boundary the round actually
+# started at: the first commit of the credentials-provider work, whose
+# parent is the merge closing the previous round.  The gate's scope is
+# now the round, and the in-round modifications it surfaces are the ones
+# a real audit made.
+#
+# Re-anchoring is not a licence to stop looking.  The row that this
+# boundary newly requires was written after reading the diff, and
+# ``test_a_test_body_change_after_the_anchor_is_still_caught`` below
+# exists so that the gate cannot be re-anchored into a vacuous pass: it
+# plants a post-anchor edit in a scratch repository and requires the
+# detection to fire on it.
+_BASELINE_COMMIT = "06fa8369e8ab0f6fe7195e22c8c8388f58b84364"
 
 # Header for Appendix A — exact text used in SECURITY_AUDIT.md.
 # The section heading must begin with this prefix so the parser knows
@@ -559,4 +590,182 @@ def test_no_bypass_shaped_replacement(appendix_rows: list[dict]) -> None:
         "phrasing; the replacement must tighten the safety check, not "
         "weaken it:\n  "
         + "\n  ".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reverse check — the gate must not be a shell
+# ---------------------------------------------------------------------------
+#
+# ``_BASELINE_COMMIT`` is a constant, and a constant is exactly the kind
+# of value that can be moved until the thing it feeds goes quiet.  The
+# failure this section forecloses is specific: re-anchor the baseline to
+# HEAD, and every diff the gate reads is empty, so
+# ``test_every_modified_test_has_an_entry`` returns on its
+# "no test files were modified" branch and reports green — while the
+# audit's real question ("was a test weakened in this round?") goes
+# entirely unasked.  A gate that cannot be distinguished from a gate that
+# is switched off is not a gate.
+#
+# So the direction is inverted: rather than assert that the current tree
+# happens to be clean, plant a weakening in a repository built for the
+# purpose and require the detection to fire on it.  The scratch
+# repository is what makes this durable — the test does not read the
+# project's own history, so it stays meaningful as the anchor moves
+# forward, and it cannot be satisfied by a baseline that happens to sit
+# past every edit.
+
+
+def _scratch_git(cwd: Path, *args: str) -> str:
+    """Run a git command in the scratch repo and return its stdout.
+
+    ``-c`` is a git *global* option: it has to sit between ``git`` and
+    the subcommand, or ``init`` rejects it as an unknown argument.
+    Passing identity this way rather than writing a config file keeps the
+    scratch repo to two commits with no setup step a test could get
+    wrong, and it keeps the assertions below free of ``returncode``
+    checking that is not the point of the test.
+    """
+    result = subprocess.run(
+        [
+            "git",
+            "-c", "user.name=Audit Gate",
+            "-c", "user.email=audit@gate.invalid",
+            *args,
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"git {' '.join(args)} failed in the scratch repo: {result.stderr}"
+    )
+    return result.stdout
+
+
+def _scratch_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Build a throwaway git repo and point this module at it.
+
+    Returns the path to a test file inside it.  The module's diff and
+    read helpers both resolve through ``_REPO_ROOT``, so rebinding it
+    here redirects the whole detection path — which is the point: the
+    real repository's history is not special-cased anywhere.
+    """
+    repo = tmp_path / "scratch"
+    test_file = repo / "backend" / "tests" / "unit" / "test_planted.py"
+    test_file.parent.mkdir(parents=True)
+    (repo / "backend" / "tests" / "contract").mkdir(parents=True)
+
+    def git(*args: str) -> str:
+        return _scratch_git(repo, *args)
+
+    test_file.write_text(
+        "def test_the_planted_assertion() -> None:\n"
+        "    assert 1 + 1 == 2\n",
+        encoding="utf-8",
+    )
+    (repo / "backend" / "tests" / "contract" / "untouched.py").write_text(
+        "def test_never_edited() -> None:\n    assert True\n",
+        encoding="utf-8",
+    )
+    git("init", "-q", "-b", "main")
+    git("add", "-A")
+    git("commit", "-q", "-m", "seed: the test file as it was written")
+
+    # The anchor is a *separate* commit, because the gate diffs
+    # ``_BASELINE_COMMIT~1``.  A single-commit repository would leave the
+    # anchor with no parent and the diff with nothing to compare.
+    (repo / "backend" / "tests" / "contract" / "anchor.py").write_text(
+        "def test_marks_the_round_boundary() -> None:\n    assert True\n",
+        encoding="utf-8",
+    )
+    git("add", "-A")
+    git("commit", "-q", "-m", "round anchor")
+    anchor = git("rev-parse", "HEAD").strip()
+
+    monkeypatch.setattr(_this_module(), "_REPO_ROOT", repo)
+    monkeypatch.setattr(_this_module(), "_BASELINE_COMMIT", anchor)
+    return test_file
+
+
+def _this_module():
+    """Return this module's namespace, for ``monkeypatch.setattr``.
+
+    The module under test is imported by pytest under its own name, and
+    these functions close over their module globals — so patching has to
+    reach the live module object, not a re-import of the file.
+    """
+    return sys.modules[__name__]
+
+
+def test_a_test_body_change_after_the_anchor_is_still_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-anchor edit to a test body must be reported as modified.
+
+    The negative half runs first and carries most of the weight: with the
+    scratch repository sitting exactly on its anchor, the gate must find
+    *nothing*.  Without that half, a detector that returned every file it
+    was shown would pass the positive assertion too, and the test would
+    be measuring "the helper ran" rather than "the helper discriminates".
+    """
+    test_file = _scratch_repo(tmp_path, monkeypatch)
+    module = _this_module()
+
+    assert module._modified_test_paths() == set(), (
+        "the gate reported modifications at a repository sitting exactly "
+        "on its anchor; it is not discriminating, so the positive half "
+        "below would prove nothing"
+    )
+
+    # Weaken it the way a careless edit does: the assertion goes from
+    # checking a value to accepting anything.
+    test_file.write_text(
+        "def test_the_planted_assertion() -> None:\n"
+        "    assert 1 + 1 is not None\n",
+        encoding="utf-8",
+    )
+    _scratch_git(_REPO_ROOT, "add", "-A")
+    _scratch_git(_REPO_ROOT, "commit", "-q", "-m", "weaken the assertion")
+
+    assert module._modified_test_paths() == {
+        "backend/tests/unit/test_planted.py"
+    }, (
+        "a test body was edited after the anchor and the gate did not "
+        "report it; the anchor has been moved past the edits it is meant "
+        "to cover, or the detection has stopped reading the diff"
+    )
+
+
+def test_a_new_test_file_after_the_anchor_is_not_a_modification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New coverage is not a weakening, and the gate must not say it is.
+
+    The other way an anchor rots: move it back far enough that ordinary
+    development lands inside the round, and the gate starts reporting
+    every feature edit as an audit weakening.  That is the condition the
+    re-anchor exists to undo, so the property is pinned from the other
+    end — a file that did not exist at the anchor is an addition
+    (``--diff-filter=M`` excludes it), not a modification of an existing
+    test, and must stay out of the report even once the anchor is old
+    enough to enclose it.
+    """
+    test_file = _scratch_repo(tmp_path, monkeypatch)
+    module = _this_module()
+
+    added = test_file.parent / "test_brand_new.py"
+    added.write_text(
+        "def test_added_after_the_round_started() -> None:\n    assert True\n",
+        encoding="utf-8",
+    )
+    _scratch_git(_REPO_ROOT, "add", "-A")
+    _scratch_git(_REPO_ROOT, "commit", "-q", "-m", "add a new test")
+
+    assert module._modified_test_paths() == set(), (
+        "a test file added after the anchor was reported as a modified "
+        "existing test; Appendix A is a record of weakened tests, and "
+        "binding it to new coverage is how the round grew to demand rows "
+        "for ordinary feature work"
     )
