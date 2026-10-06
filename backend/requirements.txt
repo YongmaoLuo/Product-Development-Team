@@ -31,7 +31,32 @@ jsonschema>=4.0
 psutil>=5.9
 # OS-level file locking used by the agent to coordinate access to project
 # files across tasks and processes.
-filelock>=3.13.0
+#
+# The upper bound is load-bearing, and the boundary was measured rather than
+# guessed. ``import filelock`` registers ``atexit`` handlers as a side
+# effect, so the count matters to
+# ``tests/integration/test_agent_no_atexit_settings.py``: that test spies on
+# ``atexit.register`` while importing ``agent`` and asserts nothing was
+# registered, and its own docstring says it counts *every* transitive
+# registration — anyio is caught the same way.
+#
+# Measured on Python 3.11, the version CI runs:
+#
+#   3.13.0 .. 3.20.3  ->  1 handler  ->  the suite passes
+#   3.20.4 ..          ->  2+ handlers ->  the suite fails
+#
+# The step is small but it is not at a major boundary, which is why the
+# comment carries the numbers instead of a version somebody remembered.
+# A routine ``pip install -r`` resolving to 3.20.4 turned ``main`` red with
+# no change here to blame, and every merge gate failed until the bound was
+# written down.
+#
+# Production is unaffected either way — the handlers are the library's own
+# bookkeeping, and ``agent.py`` registers nothing. The honest fix is to
+# narrow that test's contract so it counts agent.py's own registrations
+# rather than the whole import graph; until then the bound below is what
+# keeps an unrelated upgrade from landing on main red.
+filelock>=3.13.0,<3.20.4
 
 # Feishu IM push (backend/notifications/feishu_notifier.py). Required for
 # the in-process event-driven card push that replaces the legacy polling
