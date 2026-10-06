@@ -3,9 +3,8 @@
 ## 1. 创建虚拟环境
 
 ```bash
-python3 -m venv backend/.venv
+uv sync --project backend
 source backend/.venv/bin/activate
-pip install -r backend/requirements.txt
 ```
 
 下面所有内容都假定在这个 venv 里。这不是约定，是硬要求：
