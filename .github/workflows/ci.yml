@@ -20,8 +20,9 @@ name: CI
 #
 # Slim CI pipeline — target total runtime ≤ 15 minutes.
 #   1. PR gate:       lint + unit (sharded, with coverage) + integration
-#                     + e2e + time-sensitive   ← all of it gates the merge,
-#                     and it is the ONLY trigger that matters
+#                     + e2e + keychain E2E (macOS) + time-sensitive
+#                     ← all of it gates the merge, and it is the ONLY
+#                     trigger that matters
 #   2. Nightly:       full automated regression suite (1482 tests),
 #                     not blocking the merge gate
 #   3. Manual dispatch: maintainer-triggerable re-run of any layer
@@ -77,6 +78,7 @@ name: CI
 #   - coverage-gate fail (<80%)          -> integration skipped
 #   - integration fail                   -> PR is blocked
 #   - e2e failure                        -> PR is blocked
+#   - keychain E2E failure (macOS)       -> PR is blocked
 #   - time-sensitive failure             -> PR is blocked
 #   - nightly-regression failure         -> reports only; never blocked a merge
 #   - Coverage report (unit)             -> uploaded as artifact on every PR
@@ -1545,6 +1547,185 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
+  # STAGE 3b — KEYCHAIN E2E (macOS runner, PR gate)
+  #
+  # A keychain is a macOS facility. Every other job in this file runs on
+  # ``ubuntu-latest``, where ``/usr/bin/security`` does not exist and
+  # ``credentials._keychain_available()`` answers False — so the
+  # credential suite takes its "this platform has no keychain" branch
+  # and passes. That is the correct behaviour for a machine with no
+  # keychain, and it is no evidence at all that the real read works: the
+  # only assertions that could fail on a defective read never execute.
+  #
+  # The obvious repair is the wrong one. Marking the tests
+  # ``skipif not darwin`` leaves the security acceptance running only on
+  # whichever machine the author happens to own — a gate nobody's CI runs
+  # is a report, and a report that is green because it did not run is
+  # worse than no report. So this is a job on a macOS runner instead,
+  # and it is a MERGE GATE: same ``if:`` string as every other gating
+  # job, no ``continue-on-error``, and listed in the merge gate's
+  # ``needs``. ``backend/tests/static_gates/
+  # test_keychain_macos_job_is_a_merge_gate.py`` pins those four
+  # properties, because the failure mode — a lane quietly demoted to
+  # advisory — is invisible in the job list.
+  #
+  # Selection is by PATH, not by marker, and deliberately so.
+  # ``backend/pytest.ini`` runs ``--strict-markers`` and
+  # ``test_ci_lanes_match_marker_contracts.py`` pins one ``-m``
+  # expression per job, so a marker for this lane would have to be
+  # excluded by the default lanes, collected by some other lane, and
+  # registered in a baseline list — three files to keep in sync, in
+  # order to name three files that can simply be named here. The
+  # ``/proc`` credential probe is a Linux-only shape and stays in the
+  # Linux lane; this job is the darwin half of the same coverage.
+  #
+  # ``needs: [static-gates]`` for the reason every other lane carries it:
+  # a macOS runner is the most expensive thing in this workflow, so it
+  # must not be started before the contracts have had their say. Wired
+  # through the gate rather than the shards so the job is not waiting on
+  # twenty of them to say something about three files.
+  # ---------------------------------------------------------------------------
+
+  e2e-keychain:
+    name: Keychain E2E (macOS runner, real keychain path)
+    runs-on: macos-latest
+    # A credential defect found on main is a revert; found on the pull
+    # request it is a comment, so the gate is on `pull_request`.
+    #
+    # This predicate was written before the rest of the file was re-rooted
+    # onto `pull_request` alone on 2026-10-05, and it kept the older
+    # push-to-main clause. The clause is now dead — this workflow has no
+    # `push:` trigger — so it is inert rather than wrong, and
+    # `test_macos_job_triggers_on_pull_request` only requires that
+    # `pull_request` appear in the condition. Narrowing it to match the
+    # other gating jobs is a separate, deliberate change; leaving it costs
+    # nothing but the reader has to know why the two differ.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: [static-gates]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Bootstrap project venv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python3 -m pip install --upgrade pip
+          backend/.venv/bin/python3 -m pip install -r backend/requirements.txt
+          backend/.venv/bin/python3 -m pip install pytest pytest-timeout
+
+      # The credential E2E: a three-level relay of REAL child processes,
+      # each of which has to be handed the secret on a descriptor the
+      # publisher opened. A mock of ``subprocess`` can only assert that
+      # the module called something with some arguments; whether those
+      # arguments are a command line that works is a property of the
+      # process, not of the call. It spawns interpreters, so it is
+      # registered in ``_SUBPROCESS_DRIVERS`` — the list that tells the
+      # lane contracts which files must declare the ``integration``
+      # marker rather than being collected by a unit shard.
+      - name: Run the credential E2E (fd isolation across real processes)
+        working-directory: backend
+        run: ./.venv/bin/python3 -m pytest tests/integration/test_credentials_fd_isolation.py --tb=short --timeout=300
+
+      # The macOS-only probes. These files are hermetic — they build
+      # their stand-in keychain in ``tmp_path`` against a redirected
+      # ``$HOME`` and touch no real secret — but what they exercise is
+      # the ``sys.platform == "darwin"`` branch of the resolution
+      # skeleton, and that branch is dead code on every other runner in
+      # this file. Running them here is what makes the branch live.
+      #
+      # ``test_credentials_security_lookup.py`` covers the read itself
+      # (the argv, a nonzero exit for an item that is not there, a
+      # trailing newline, a tool that hangs); the cache invariants
+      # cover what happens when the same lookup is asked twice.
+      - name: Run the macOS keychain probes
+        working-directory: backend
+        run: ./.venv/bin/python3 -m pytest tests/integration/test_credentials_security_lookup.py tests/integration/test_credentials_cache_invariants.py --tb=short --timeout=300
+
+      # The whole delivery, end to end, with nothing replaced. The step
+      # above proves the command line this repository *believes* in reaches
+      # a keychain, because it runs that command line against a stand-in
+      # binary. It cannot say the real ``/usr/bin/security`` honours it.
+      #
+      # This step is the only place in CI that can. It creates a real
+      # temporary keychain, files a canary in it, reads it back through the
+      # real tool, hands the value to a real child interpreter on a
+      # descriptor, and then asks two independent kernel-level probes
+      # (``ps eew`` and ``KERN_PROCARGS2``) whether the child's environment
+      # carries that canary — each with a positive control, so a probe that
+      # has stopped working reports a failure rather than a clean result.
+      #
+      # Selected by path, like every step in this job: the file declares no
+      # marker of its own, and a new marker would be a name the default
+      # lanes, the serial lane and a static gate all then have to learn.
+      # Pinned by ``test_the_macos_lane_collects_the_whole_delivery_e2e`` in
+      # ``tests/static_gates/test_keychain_macos_job_is_a_merge_gate.py`` —
+      # the file skips itself off macOS, so a lane that dropped it would
+      # leave the acceptance green and unexecuted everywhere.
+      #
+      # ``--timeout=300`` is per test and matches the two steps above. The
+      # job's own ceiling is 20 minutes for every step together, so a budget
+      # larger than the room left would mean a wedged test is reaped by the
+      # runner — which uploads nothing — instead of failing loudly and
+      # reaching the ``if: always()`` upload below. Each case bounds its own
+      # waits far below this anyway; it is here to catch what they do not.
+      #
+      # ``PDT_REQUIRE_KEYCHAIN_E2E`` puts the file in its **strict**
+      # position, and that is the whole reason this step is a gate rather
+      # than a report. By default the file's capability gate *skips* on a
+      # machine that cannot start ``/usr/bin/security`` or ``ps``: the step
+      # is green, the summary says nothing ran, and no reader of a green
+      # check can tell "six cases passed" from "six cases were absent".
+      #
+      # Here that default is the wrong one. This is the only lane in the
+      # workflow that runs on a runner which *has* a keychain, so a keychain
+      # tool that will not start there is a broken lane — a misconfigured
+      # image, a policy refusing the binary — and not a fact about the code
+      # under test. Silently skipping would convert that misconfiguration
+      # into a green acceptance for the credential path, which is precisely
+      # the substitution this job exists to prevent. Strict, the same
+      # condition fails the case and turns the merge gate red.
+      #
+      # Off macOS the file still skips, and no lane can overrule that: the
+      # switch changes what a *missing capability* means on a machine that
+      # should have it, not whether the platform is macOS at all. Hence this
+      # step stays on the macOS lane — pinned by
+      # ``test_the_e2e_step_sets_the_strict_switch`` and
+      # ``test_the_e2e_file_is_not_wired_into_a_linux_job`` in
+      # ``tests/static_gates/test_keychain_macos_job_is_a_merge_gate.py``,
+      # which read the switch name and its accepted values out of the test
+      # file itself rather than from a copy kept here.
+      - name: Run the macOS whole-delivery E2E (real keychain, real child, real probes)
+        working-directory: backend
+        env:
+          PDT_REQUIRE_KEYCHAIN_E2E: "1"
+        run: ./.venv/bin/python3 -m pytest tests/e2e/test_keychain_full_delivery_macos.py --tb=short --timeout=300
+
+      - name: Upload keychain E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keychain-e2e-report-${{ github.run_id }}
+          path: backend/.pytest_cache/
+          # upload-artifact v4.4+ skips dot-prefixed path components
+          # unless told otherwise, and reports 'No files were found' —
+          # which reads as "the run produced nothing".
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
   # STAGE 4b — SLOW (manual dispatch)
   # Per test-design decision point 7: tests marked ``@pytest.mark.time_sensitive``
   # (long-running stress, soak, or full pipeline sweeps) are split out
@@ -1874,7 +2055,7 @@ jobs:
   # The fix is `if: always()` — the gate runs even when its dependencies
   # were skipped — plus a body that inspects `needs.*.result` and fails on
   # anything that is not `success`. A skipped dependency is NOT tolerated
-  # here either: for these nine jobs a skip on a pull request means
+  # here either: for these ten jobs a skip on a pull request means
   # something upstream went wrong or an `if:` was narrowed, and in both
   # cases the honest answer is "this gate is not covered", not "fine".
   #
@@ -1919,6 +2100,7 @@ jobs:
       - coverage-gate
       - integration-tests
       - e2e-on-demand
+      - e2e-keychain
       - existing-test
     runs-on: ubuntu-latest
     steps:
@@ -1946,7 +2128,7 @@ jobs:
 
           needs = json.loads(os.environ["NEEDS_JSON"])
           # Anything other than `success` blocks. `skipped` is included
-          # on purpose: see the job comment — for these nine jobs a skip
+          # on purpose: see the job comment — for these ten jobs a skip
           # on a pull request is a broken gate, not a satisfied one.
           bad = {
               name: result.get("result")

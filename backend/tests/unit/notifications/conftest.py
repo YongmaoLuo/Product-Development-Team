@@ -8,7 +8,29 @@ from __future__ import annotations
 
 import pytest
 
+import credentials
 from status_payload import build_payload
+
+
+@pytest.fixture(autouse=True)
+def _unmemoised_secret():
+    """Give every test its own resolution of every secret.
+
+    ``credentials`` memoises a secret for the life of the process,
+    which is right for a deployment and wrong for a test: the
+    deployment here is whatever the previous test's ``setenv`` left
+    behind. Left alone, the memo makes these suites order-dependent —
+    a test that clears ``TELEGRAM_BOT_TOKEN`` hands the next test a
+    cached "no token", and one that sets it hands the next test a
+    cached "token" that no longer exists. Both are answers about a
+    process that is not running any more.
+
+    Resetting on the way in *and* on the way out keeps a resolution
+    from escaping into a suite that never asked for it.
+    """
+    credentials.reset_cache()
+    yield
+    credentials.reset_cache()
 
 
 @pytest.fixture

@@ -1503,6 +1503,11 @@ def is_repair_task(task: object) -> bool:
 class AutonomousAgent:
     """Configurable autonomous agent for various task types."""
 
+    #: Per-component ceiling for a filename on APFS/HFS+ (255 bytes).
+    #: A parsed ``FILE:`` target longer than this was never a path.
+    #: See :meth:`_plausible_written_path`.
+    _MAX_PATH_BYTES = 255
+
     def __init__(
         self,
         requirement: Optional[str],
@@ -2938,6 +2943,49 @@ class AutonomousAgent:
         self._thread_local_repos.repo = repo
         return repo
 
+    def _plausible_written_path(self, raw: str) -> Optional[Path]:
+        """Return ``raw`` as a project-relative path, or ``None``.
+
+        The caller writes whatever this returns, so it is the only
+        gate a parsed ``FILE:`` target passes through before it
+        reaches the filesystem. ``None`` means "this was never a
+        path" — the response regex swept up prose — and the caller
+        skips the block.
+
+        2026-10-05: a task died on ``[Errno 63] File name too long``.
+        The subagent's report discussed a clobbered file inside a
+        fenced block, the regex captured 5.5 KB of that prose as the
+        "path", and the executor joined it onto ``project_dir`` and
+        tried to create it as a single 5.5 KB filename. The limit
+        below is the filesystem's own per-component cap; anything
+        past it is prose by definition.
+        """
+        if not raw:
+            return None
+        if len(raw.encode("utf-8", "replace")) > self._MAX_PATH_BYTES:
+            return None
+        # An embedded newline or NUL means the capture spans more than
+        # one line of prose, whatever the text claims to be.
+        if any(ch in raw for ch in "\n\r\0"):
+            return None
+        candidate = Path(raw)
+        if candidate.is_absolute():
+            try:
+                candidate = candidate.relative_to(self.project_dir)
+            except ValueError:
+                # Outside the project tree. Reducing it to ``.name``
+                # would silently redirect the write onto a same-named
+                # file at the project root, so refuse it outright.
+                return None
+        try:
+            root = self.project_dir.resolve()
+            resolved = (self.project_dir / candidate).resolve()
+        except OSError:
+            return None
+        if resolved != root and root not in resolved.parents:
+            return None
+        return candidate
+
     def parse_files_from_response(self, response: str) -> dict:
         """
         Parse file changes from AI response.
@@ -2946,19 +2994,28 @@ class AutonomousAgent:
             response: AI response text
 
         Returns:
-            Dictionary mapping file paths to content
+            Dictionary mapping file paths to content. A block whose
+            captured target is not a usable in-project path is
+            skipped rather than written — see
+            :meth:`_plausible_written_path`.
         """
         files = {}
         pattern = r"FILE:\s*(.*?)\n```(?:\w+)?\n(.*?)\n```"
         matches = re.findall(pattern, response, re.DOTALL)
         for path, content in matches:
-            path = path.strip()
-            path_obj = Path(path)
-            if path_obj.is_absolute():
-                try:
-                    path_obj = path_obj.relative_to(self.project_dir)
-                except ValueError:
-                    path_obj = Path(path_obj.name)
+            stripped = path.strip()
+            path_obj = self._plausible_written_path(stripped)
+            if path_obj is None:
+                if self.logger:
+                    self.logger.warning(
+                        "file_write_path_rejected",
+                        "Skipped a parsed FILE: block: its target is not "
+                        "a usable in-project path "
+                        f"({len(stripped.encode('utf-8', 'replace'))} "
+                        "bytes). Treating the block as prose, not a "
+                        "write directive.",
+                    )
+                continue
             files[str(path_obj)] = content
         return files
 
@@ -4625,17 +4682,28 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                         getattr(task, "verification_only", False)
                         or self._looks_like_audit_task(task)
                     )
+                    # A task whose own test command passes only on a
+                    # clean tree is a restore / revert task: an empty
+                    # diff IS its success condition, so the gate below
+                    # would be rejecting the exact state it demands.
+                    # See :meth:`_expects_clean_tree`.
+                    expects_clean_tree = self._expects_clean_tree(task)
                     if not changed_files and not self._task_declared_files_exist(task):
-                        if is_audit:
+                        if is_audit or expects_clean_tree:
                             if self.logger:
                                 self.logger.info(
                                     "task_audit_no_diff_accepted",
                                     f"Task [{task.id}] is audit-style "
-                                    f"(verification_only={getattr(task, 'verification_only', False)}); "
+                                    f"(verification_only={getattr(task, 'verification_only', False)}, "
+                                    f"expects_clean_tree={expects_clean_tree}); "
                                     f"empty diff accepted per 2026-08-24 dual-criterion rule. "
                                     f"Completion decided by cross_verify + test_command exit code.",
                                     task_id=task.id,
-                                    data={"attempt": attempt + 1, "audit": True},
+                                    data={
+                                        "attempt": attempt + 1,
+                                        "audit": True,
+                                        "expects_clean_tree": expects_clean_tree,
+                                    },
                                 )
                             print(
                                 f"Empty output accepted (audit task): "
@@ -5966,6 +6034,43 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         "invasiveness",
         "不变量",
     )
+
+    def _expects_clean_tree(self, task: SubTask) -> bool:
+        """True when the task's own ``test_command`` can only pass on a
+        clean working tree.
+
+        A restore / revert task declares its success criterion as "the
+        tree matches the committed copy", usually by running
+        ``git diff --exit-code HEAD -- <path>`` as its test. The
+        empty-diff gate reads that same clean tree as "the subagent
+        did nothing" and fails the task — so the two signals
+        contradict each other, and the task can only pass by producing
+        precisely what the gate rejects.
+
+        2026-10-05: task ``20-5-12-3-1`` ("restore the clobbered gate
+        file from HEAD") died this way while its ``test_command`` sat
+        in the same task row asserting the very clean tree it was
+        being denied for having.
+
+        This reads the task's declared success criterion instead of
+        guessing from prose, so it does not widen the audit-task
+        carve-out that :func:`is_repair_task` deliberately guards
+        (see :meth:`_looks_like_audit_task` for that post-mortem).
+
+        The ``git diff`` must sit in command position — start of the
+        string, or after a shell separator — so a task that merely
+        *mentions* the flag inside a quoted argument
+        (``echo 'git diff --exit-code'``) is not read as demanding a
+        clean tree.
+        """
+        command = getattr(task, "test_command", None) or ""
+        return bool(
+            re.search(
+                r"(?:^|&&|\|\||[;|(])\s*"
+                r"git\s+diff\b[^|;&\n]*--(?:exit-code|quiet)\b",
+                command,
+            )
+        )
 
     def _looks_like_audit_task(self, task: SubTask) -> bool:
         """Heuristically decide whether ``task`` is audit-style.

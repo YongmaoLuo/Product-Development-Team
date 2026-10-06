@@ -1,0 +1,117 @@
+; Sub-agent sandbox profile
+; =============================================================================
+; Confines every coding sub-agent this project spawns to an OS sandbox.
+;
+; Copy this file to your config directory and edit it:
+;
+;     mkdir -p .config && cp example/sandbox_profile.sb.example \
+;         .config/sandbox_profile.sb
+;
+; ``PDT_SANDBOX_PROFILE`` overrides the path.
+;
+; -----------------------------------------------------------------------------
+; WHAT THIS IS FOR
+; -----------------------------------------------------------------------------
+; Sub-agents are spawned as
+;
+;     claude --verbose --output-format stream-json \
+;            --permission-mode bypassPermissions
+;
+; ``bypassPermissions`` removes the confirmation prompts, so without a
+; profile the agent has unrestricted filesystem access and there is no gate
+; anywhere in the path. A profile is the only boundary that still holds when
+; the prompts are off.
+;
+; -----------------------------------------------------------------------------
+; FAIL-CLOSED, AND WHY
+; -----------------------------------------------------------------------------
+; Configuring a profile that cannot be applied stops the run. It does not
+; fall back to an unsandboxed spawn. That asymmetry is deliberate: a sandbox
+; that quietly turns itself off is worse than no sandbox, because the
+; configuration still claims it is on. A machine-wide wrapper once left a
+; status command reporting "sandboxed" while enforcing nothing, and a plan
+; then failed at its first task with
+; ``sandbox_apply: Operation not permitted`` on every attempt.
+;
+; Not configuring a profile at all changes nothing — sub-agents run exactly
+; as they always have.
+;
+; -----------------------------------------------------------------------------
+; FORMAT
+; -----------------------------------------------------------------------------
+; Apple Seatbelt, read by ``sandbox-exec``. Rules are evaluated
+; **last match wins**, so ordering is load-bearing: a broad ``deny`` placed
+; after a narrow ``allow`` cancels it.
+;
+;   (version 1)
+;   (allow default)          ; everything is permitted unless denied below
+;   (deny  file-write* ...)  ; writes refused
+;   (allow file-read* ...)   ; reads permitted again — must come AFTER
+;                            ; the deny it is meant to override
+;
+; ``file-read-metadata`` grants stat/getattr without granting ``read(2)``.
+; It is what lets a process resolve a path (``cd`` into a working directory)
+; while the directory's contents stay unreadable.
+;
+; This profile is deliberately minimal: it confines writes away from the
+; system and from the user's private directories, and says nothing about
+; your projects. Add the rules your own layout needs.
+;
+; -----------------------------------------------------------------------------
+; NOTES
+; -----------------------------------------------------------------------------
+; * macOS only. On any other platform a configured profile is a
+;   configuration error and the run stops — ``sandbox-exec`` does not exist
+;   there, and running unsandboxed because a config file was left behind is
+;   the failure mode above.
+; * If this process is already inside a sandbox, a nested profile is only
+;   accepted when the enclosing one contains it. Pointing this at the same
+;   profile the enclosing sandbox uses works; pointing it at a different
+;   one stops the run with an error saying so.
+; * Keep the profile free of anything specific to one machine. Paths that
+;   only resolve on your checkout are configuration, not source.
+; -----------------------------------------------------------------------------
+
+(version 1)
+(allow default)
+
+; --- Writes: refuse the operating system's own files -----------------------
+(deny file-write*
+  (subpath "/System")
+  (subpath "/usr")
+  (subpath "/bin")
+  (subpath "/sbin")
+  (subpath "/Library")
+  (subpath "/private/etc"))
+
+; --- Installed applications and package managers --------------------------
+; These are the "modify the machine" paths. A build that needs to write
+; here is a build that has escaped its sandbox, not one to accommodate.
+(deny file-write*
+  (subpath "/Applications"))
+
+; --- The user's private directories ---------------------------------------
+(deny file-read* file-write*
+  (subpath "/Users/you/Desktop")
+  (subpath "/Users/you/Downloads")
+  (subpath "/Users/you/Movies")
+  (subpath "/Users/you/Music")
+  (subpath "/Users/you/Pictures")
+  (subpath "/Users/you/Public"))
+
+; --- Credentials -----------------------------------------------------------
+(deny file-read* file-write*
+  (subpath "/Users/you/.ssh")
+  (subpath "/Users/you/.gnupg")
+  (subpath "/Users/you/.aws")
+  (subpath "/Users/you/.kube"))
+
+; --- Scratch space ---------------------------------------------------------
+; Listed last so it wins over the system-path deny above: a sandbox that
+; cannot write a temporary file cannot run a compiler.
+(allow file-read* file-write*
+  (subpath "/tmp")
+  (subpath "/private/tmp")
+  (subpath "/Users/you/.claude")
+  (subpath "/Users/you/.cache")
+  (subpath "/Users/you/Library/Caches"))

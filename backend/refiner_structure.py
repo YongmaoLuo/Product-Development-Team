@@ -233,6 +233,20 @@ def plan_refiner_structure(
     for tid, original in current_by_id.items():
         if not is_protected(original, protected_prefix):
             continue
+        # A task the refiner split into ``{tid}-1``/``{tid}-2``/… is
+        # superseded by those children. Protection exists so the
+        # refiner cannot rewrite a repair task's *content*; it must
+        # not keep a split parent alive beside its own children.
+        #
+        # Dropping the parent here is what puts it in ``removed_ids``
+        # and lets the caller delete the row. While a protected parent
+        # survived, ``removed_ids`` stayed empty, the row was never
+        # deleted, and ``record_task_failure`` then pinned it at
+        # ``failed`` beside children that had all completed.
+        # 2026-10-05: four repair parents were stranded this way.
+        if any(cid.startswith(f"{tid}-") for cid in refiner_by_id):
+            effective_by_id.pop(tid, None)
+            continue
         replacement = refiner_by_id.get(tid)
         if replacement is None:
             reinstated.append(tid)

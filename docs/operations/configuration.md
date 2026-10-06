@@ -73,6 +73,15 @@ Credentials come from `backend/.env`, which is gitignored.
 `backend/.env.ci` holds committed **placeholders** — it is a test fixture,
 and a real key must never go into it.
 
+The two notification secrets can instead be read from a dedicated macOS
+keychain and handed to the processes that need them over a file
+descriptor, keeping them out of `ps eww` output. That path is **opt-in and
+off by default** — a deployment that changes nothing is unaffected, and an
+installation that has not run the migration is still reading secrets out of
+`.env`. See [Keychain migration](keychain-migration.md) before assuming
+otherwise; `secrets verify` reports which source each secret is actually
+coming from.
+
 ## Runtime state
 
 Everything a checkout *produces* rather than *ships* lives under a single
@@ -93,3 +102,48 @@ checkout produces sits next to the files it ships.
     it from `__file__` anywhere, which is a mistake this project has made
     twice and gated against
     (`backend/tests/static_gates/test_state_db_path_has_one_resolver.py`).
+
+## Sub-agent sandbox
+
+Coding sub-agents are spawned as `claude --permission-mode
+bypassPermissions`. `bypassPermissions` removes the confirmation
+prompts, so on its own it leaves the agent with unrestricted
+filesystem access and no gate anywhere in the path. An OS sandbox is
+the boundary that still holds when the prompts are off.
+
+Point `PDT_SANDBOX_PROFILE` at a Seatbelt profile — or copy
+`example/sandbox_profile.sb.example` to
+`.config/sandbox_profile.sb` and edit it:
+
+```bash
+mkdir -p .config && cp example/sandbox_profile.sb.example \
+    .config/sandbox_profile.sb
+```
+
+**Nothing configured means nothing changes.** A deployment with no
+profile spawns the identical argv it always did.
+
+**A profile that cannot be applied stops the run.** There is no
+fallback to an unsandboxed spawn, and that asymmetry is the point: a
+sandbox that quietly disables itself is worse than no sandbox,
+because the configuration still says it is on. Three cases raise:
+
+- the file does not exist, or the kernel refuses it;
+- `sandbox-exec` is not on PATH (it is macOS-only, so a profile left
+  configured on Linux stops the run rather than being ignored);
+- this process is already inside a sandbox and macOS will not accept a
+  nested profile the enclosing one does not contain. Point
+  `PDT_SANDBOX_PROFILE` at the *same* profile the enclosing sandbox
+  was started with — an identical profile nests fine.
+
+!!! warning "Rule order is load-bearing"
+    Seatbelt is **last match wins**. A broad `deny` placed after a
+    narrow `allow` cancels it — a workspace allow followed by a
+    blanket deny of its parent leaves the workspace with no access at
+    all, and the failure reads as "the sandbox is broken" rather than
+    "the rules are in the wrong order".
+
+    `file-read-metadata` is the tool for paths that must be
+    resolvable but not readable: it grants `stat` without granting
+    `read(2)`, so a process can `cd` into a working directory while the
+    directory's contents stay closed.
