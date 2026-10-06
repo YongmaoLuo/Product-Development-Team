@@ -71,11 +71,21 @@ logger = logging.getLogger(__name__)
 #   plan_closed         — terminal reached. The notifier flushes a final card
 #                          immediately, bypassing the coalesce window, then
 #                          evicts the in-memory plan state.
+#   stale_refresh       — NOT a state change. The notifier's own watchdog
+#                          raises it when a worker has been in flight
+#                          longer than a push should have gone out and
+#                          the rendered card would be byte-identical to
+#                          the last one. It exists because the dedup
+#                          that keeps the chat quiet also silences
+#                          genuine progress that renders to no visible
+#                          change — see ``_watch_stale_cards`` in
+#                          ``notifications/feishu_notifier``.
 
 KIND_PLAN_PHASE_CHANGED = "plan_phase_changed"
 KIND_TASK_STATE_CHANGED = "task_state_changed"
 KIND_VP_STATE_CHANGED = "vp_state_changed"
 KIND_PLAN_CLOSED = "plan_closed"
+KIND_STALE_REFRESH = "stale_refresh"
 
 
 # ---------------------------------------------------------------------------
