@@ -257,25 +257,58 @@ def send_to_telegram(text: str, config: Dict[str, Any]) -> Optional[int]:
     return message_id
 
 
-def edit_telegram_message(
-    text: str, config: Dict[str, Any], message_id: Any
-) -> bool:
-    """Replace the text of an existing message. ``True`` when accepted.
+def _is_unchanged(resp: Any) -> bool:
+    """True when Telegram rejected an edit because the text is identical.
 
-    A ``False`` here is never fatal — the caller falls back to a fresh
-    send. The common reasons are all non-fatal: the content did not
-    change (HTTP 400 ``message is not modified``), the message was
-    deleted, the bot was removed from the chat, or Telegram is down.
+    Telegram answers ``editMessageText`` on unchanged content with HTTP
+    400 and ``"message is not modified"``. That is not a failure — the
+    message on screen is already exactly what we wanted. It is
+    indistinguishable by status code alone from a real rejection
+    (message deleted, bot removed from the chat), which is why this
+    looks at the body.
+
+    Conflating the two is what made the mirror accumulate duplicates: a
+    ``False`` return sent the caller down the "fall back to a fresh
+    send" path, so every render that happened to be byte-identical to
+    the live message produced a NEW message. This is easy to hit
+    because the Feishu and Telegram renderings of one card are not
+    identical — a change to a Feishu-only element leaves the Telegram
+    text unchanged, and that update used to open a second message
+    instead of leaving the first one alone.
+    """
+    if resp is None or resp.status_code != 400:
+        return False
+    return "message is not modified" in (resp.text or "").lower()
+
+
+#: Outcome of an edit attempt. ``UNCHANGED`` is a success: the live
+#: message already carries the desired text, so the message id stays
+#: valid and no send is needed.
+EDIT_EDITED = "edited"
+EDIT_UNCHANGED = "unchanged"
+EDIT_FAILED = "failed"
+
+
+def edit_telegram_message_outcome(
+    text: str, config: Dict[str, Any], message_id: Any
+) -> str:
+    """Replace the text of an existing message; report how it went.
+
+    Returns one of :data:`EDIT_EDITED`, :data:`EDIT_UNCHANGED` or
+    :data:`EDIT_FAILED`. The common non-fatal reasons for a non-``EDITED``
+    result are: the content did not change (Telegram 400, see
+    :func:`_is_unchanged`), the message was deleted, the bot was removed
+    from the chat, or Telegram is down.
     """
     if not isinstance(config, dict) or not config.get("enabled"):
-        return False
+        return EDIT_FAILED
     bot_token = config.get("bot_token")
     chat_id = config.get("chat_id")
     if not bot_token or not chat_id:
-        return False
+        return EDIT_FAILED
     resolved_id = _coerce_message_id(message_id)
     if resolved_id is None:
-        return False
+        return EDIT_FAILED
 
     payload = {
         "chat_id": chat_id,
@@ -299,22 +332,44 @@ def edit_telegram_message(
             "latency_ms=%.1f",
             masked, resolved_id, latency_ms,
         )
-        return False
+        return EDIT_FAILED
+    if _is_unchanged(resp):
+        # Expected whenever two consecutive renders are byte-identical.
+        # Not an error, and specifically NOT a reason to send again.
+        logger.info(
+            "telegram_edit_no_change chat_id=%s message_id=%d "
+            "latency_ms=%.1f — live message already current",
+            masked, resolved_id, latency_ms,
+        )
+        return EDIT_UNCHANGED
     if resp.status_code != 200:
-        # ``message is not modified`` lands here and is expected whenever
-        # two consecutive renders are byte-identical.
         logger.warning(
-            "telegram_edit_no_change chat_id=%s message_id=%d status_code=%d "
+            "telegram_edit_fail chat_id=%s message_id=%d status_code=%d "
             "latency_ms=%.1f body=%s",
             masked, resolved_id, resp.status_code, latency_ms, resp.text[:200],
         )
-        return False
+        return EDIT_FAILED
 
     logger.info(
         "telegram_edit_ok chat_id=%s message_id=%d latency_ms=%.1f",
         masked, resolved_id, latency_ms,
     )
-    return True
+    return EDIT_EDITED
+
+
+def edit_telegram_message(
+    text: str, config: Dict[str, Any], message_id: Any
+) -> bool:
+    """Boolean form of :func:`edit_telegram_message_outcome`.
+
+    ``True`` only when the edit was actually applied. Kept for callers
+    that just want "did the write land" — note that ``UNCHANGED`` is
+    ``False`` here, which is the historical behaviour and the safe
+    direction for a caller that uses ``False`` to mean "send a fresh
+    message": use :func:`edit_telegram_message_outcome` when that would
+    duplicate a message that is already correct.
+    """
+    return edit_telegram_message_outcome(text, config, message_id) == EDIT_EDITED
 
 
 def send_or_edit_telegram(
@@ -323,11 +378,13 @@ def send_or_edit_telegram(
     """Keep one live message per card: edit it, or send a fresh one.
 
     Returns the id of the message that is now live on the channel — the
-    same id when the edit succeeded, the new id when it fell back to a
-    send, or ``None`` when neither worked.
+    same id when the edit succeeded *or* when Telegram reported the text
+    was already current, the new id when the edit genuinely failed and
+    we fell back to a send, or ``None`` when neither worked.
     """
     resolved_id = _coerce_message_id(last_message_id)
     if resolved_id is not None:
-        if edit_telegram_message(text, config, resolved_id):
+        outcome = edit_telegram_message_outcome(text, config, resolved_id)
+        if outcome in (EDIT_EDITED, EDIT_UNCHANGED):
             return resolved_id
     return send_to_telegram(text, config)
