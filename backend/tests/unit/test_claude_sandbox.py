@@ -65,6 +65,18 @@ def _no_ambient_profile(monkeypatch):
     """No test should inherit a profile from the developer's own setup."""
     monkeypatch.delenv("PDT_SANDBOX_PROFILE", raising=False)
 
+#: ``_validate`` checks the platform before it checks anything the tests
+#: below mock out, so a test that never reaches ``sandbox-exec`` still
+#: needs the macOS gate. Without it the whole group fails on a Linux
+#: runner with "sandbox-exec is a macOS facility" — which is the
+#: production behaviour working correctly and the test being unable to
+#: see past it. The one case that deliberately exercises the non-macOS
+#: branch (``test_non_macos_raises_rather_than_ignoring_the_profile``)
+#: is *not* gated, because it sets the platform itself.
+_REQUIRES_MACOS = pytest.mark.skipif(
+    sys.platform != "darwin", reason="sandbox-exec is macOS-only"
+)
+
 
 # ---------------------------------------------------------------------------
 # Not configured — the default must be exactly what it always was
@@ -95,6 +107,7 @@ def test_unconfigured_does_not_touch_env(monkeypatch):
     assert claude_sandbox.ACTIVE_ENV not in env
 
 
+@_REQUIRES_MACOS
 def test_caller_command_list_is_not_mutated(monkeypatch, tmp_path):
     monkeypatch.setenv("PDT_SANDBOX_PROFILE", str(_write(tmp_path, _APPLICABLE)))
     original = list(CMD)
@@ -107,6 +120,7 @@ def test_caller_command_list_is_not_mutated(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@_REQUIRES_MACOS
 def test_configured_profile_wraps_the_argv(monkeypatch, tmp_path):
     monkeypatch.setenv("PDT_SANDBOX_PROFILE", str(_write(tmp_path, _APPLICABLE)))
     decision = wrap_command(CMD)
@@ -122,6 +136,7 @@ def test_configured_profile_wraps_the_argv(monkeypatch, tmp_path):
     assert decision.command[-len(CMD):] == CMD
 
 
+@_REQUIRES_MACOS
 def test_wrapped_env_records_the_profile(monkeypatch, tmp_path):
     profile = _write(tmp_path, _APPLICABLE)
     monkeypatch.setenv("PDT_SANDBOX_PROFILE", str(profile))
@@ -133,6 +148,7 @@ def test_wrapped_env_records_the_profile(monkeypatch, tmp_path):
     )
 
 
+@_REQUIRES_MACOS
 def test_profile_content_is_left_alone(monkeypatch, tmp_path):
     profile = _write(tmp_path, _APPLICABLE)
     before = profile.read_text(encoding="utf-8")
@@ -160,6 +176,7 @@ def test_unparseable_profile_raises_rather_than_spawning(monkeypatch, tmp_path):
         wrap_command(CMD)
 
 
+@_REQUIRES_MACOS
 def test_error_names_the_cause_and_the_fix(monkeypatch, tmp_path):
     """The operator sees a subprocess refusal and nothing else."""
     monkeypatch.setattr(claude_sandbox, "already_sandboxed", lambda: True)
@@ -191,6 +208,7 @@ def test_non_macos_raises_rather_than_ignoring_the_profile(monkeypatch, tmp_path
     assert "macOS facility" in str(excinfo.value)
 
 
+@_REQUIRES_MACOS
 def test_missing_sandbox_exec_raises(monkeypatch, tmp_path):
     monkeypatch.setenv("PDT_SANDBOX_PROFILE", str(_write(tmp_path, _APPLICABLE)))
     monkeypatch.setattr(claude_sandbox, "_sandbox_exec", lambda: None)
@@ -322,7 +340,7 @@ def _write(tmp_path: Path, content: str) -> Path:
 EXAMPLE = BACKEND_DIR.parent / "example" / "sandbox_profile.sb.example"
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="sandbox-exec is macOS-only")
+@_REQUIRES_MACOS
 def test_the_shipped_example_profile_applies():
     assert EXAMPLE.is_file(), f"missing {EXAMPLE}"
     proc = subprocess.run(
