@@ -1368,6 +1368,79 @@ def _read_all_vp_starts(plan_dir: Path) -> Dict[str, str]:
     return starts
 
 
+def _read_latest_round_state(
+    plan_dir: Path,
+) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Any], Dict[str, Any]]:
+    """One pass over the NEWEST round log →
+    ``(vp_activity, judgment, last_vp_event)``.
+
+    ``vp_activity`` is ``{vp_id: {"start": iso|"", "complete": iso|""}}``.
+    ``judgment`` is the most recent ``judgment_heartbeat``
+    (``{"stage", "vp_id", "ts"}``), or ``{}`` if there was none.
+    ``last_vp_event`` is the most recent ``vp_start`` / ``vp_complete``
+    (``{"event_type", "vp_id", "ts"}``), or ``{}``.
+
+    All three come from the same file in the same pass on purpose. The
+    VP lifecycle and the judgment phase are two views of one timeline; a
+    reader that returns them separately has to re-parse the file for the
+    second, and this runs on ``/api/verification/{id}/progress``, which
+    the notifier polls continuously while a round is live. Round logs
+    reach tens of megabytes on a long run, so the second pass is not
+    free. The caller also needs ``last_vp_event`` to decide which of the
+    two is genuinely the most recent thing that happened — that
+    comparison cannot be made from either half alone.
+    """
+    logs_dir = plan_dir / "logs"
+    if not logs_dir.exists():
+        return {}, {}, {}
+    log_files = sorted(
+        logs_dir.glob("verification_*.log"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not log_files:
+        return {}, {}, {}
+    activity: Dict[str, Dict[str, str]] = {}
+    judgment: Dict[str, Any] = {}
+    last_vp: Dict[str, Any] = {}
+    try:
+        with open(log_files[-1], "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                et = entry.get("event_type")
+                ts = entry.get("timestamp")
+                vp_id = entry.get("verification_point_id")
+                if et == "judgment_heartbeat":
+                    # Keep the LAST one, and only accept a usable
+                    # timestamp — a heartbeat with a malformed ts is not
+                    # a position in the timeline.
+                    if isinstance(ts, str):
+                        judgment = {
+                            "stage": (entry.get("data") or {}).get("stage")
+                            if isinstance(entry.get("data"), dict) else None,
+                            "vp_id": vp_id if isinstance(vp_id, str) else None,
+                            "ts": ts,
+                        }
+                    continue
+                if et not in ("vp_start", "vp_complete"):
+                    continue
+                if not isinstance(vp_id, str) or not isinstance(ts, str):
+                    continue
+                slot = activity.setdefault(vp_id, {"start": "", "complete": ""})
+                slot["start" if et == "vp_start" else "complete"] = ts
+                last_vp = {"event_type": et, "vp_id": vp_id, "ts": ts}
+    except OSError:
+        return {}, {}, {}
+    return activity, judgment, last_vp
+
+
 def _read_latest_round_vp_activity(plan_dir: Path) -> Dict[str, Dict[str, str]]:
     """Return ``{vp_id: {"start": iso|"", "complete": iso|""}}`` from
     the NEWEST verification round log only.
@@ -1385,40 +1458,12 @@ def _read_latest_round_vp_activity(plan_dir: Path) -> Dict[str, Dict[str, str]]:
     The newest round log is the live truth: a ``vp_start`` with no
     subsequent ``vp_complete`` in that file means the VP is running
     RIGHT NOW, regardless of what the persisted verdicts say.
+
+    Thin wrapper over :func:`_read_latest_round_state` so both views of
+    the round cost one pass. The judgment half is discarded here because
+    every caller of this function wants only the VP lifecycle.
     """
-    logs_dir = plan_dir / "logs"
-    if not logs_dir.exists():
-        return {}
-    log_files = sorted(
-        logs_dir.glob("verification_*.log"),
-        key=lambda p: p.stat().st_mtime,
-    )
-    if not log_files:
-        return {}
-    activity: Dict[str, Dict[str, str]] = {}
-    try:
-        with open(log_files[-1], "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                et = entry.get("event_type")
-                if et not in ("vp_start", "vp_complete"):
-                    continue
-                vp_id = entry.get("verification_point_id")
-                ts = entry.get("timestamp")
-                if not isinstance(vp_id, str) or not isinstance(ts, str):
-                    continue
-                slot = activity.setdefault(vp_id, {"start": "", "complete": ""})
-                slot["start" if et == "vp_start" else "complete"] = ts
-    except OSError:
-        return {}
+    activity, _judgment, _last_vp = _read_latest_round_state(plan_dir)
     return activity
 
 
@@ -1432,6 +1477,86 @@ def _running_vps_from_activity(
         for vp_id, act in activity.items()
         if act.get("start") and not act.get("complete")
     }
+
+
+#: Display labels for the round sub-steps, keyed by the ``kind`` this
+#: module derives. Kept next to the derivation so adding a kind forces a
+#: decision about how it reads; the card receives the finished string and
+#: never has to know these names.
+_VERIFICATION_ACTIVITY_LABELS = {
+    "planning": "📋 正在编排本轮验证点",
+    "running": "🔍 正在验证",
+    "judging": "⚖️ 正在复核验证结论",
+    "summarizing": "📊 正在汇总本轮结果",
+}
+
+
+def _verification_round_activity(
+    running: set,
+    activity: Dict[str, Dict[str, str]],
+    judgment: Dict[str, Any],
+    last_vp: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Describe what the verification round is doing when no VP is in flight.
+
+    Returns ``{"kind", "label", "vp_id", "since"}`` or ``None``.
+
+    Why this exists: ``current_vp`` is populated by the executor's
+    semaphore-primary slot, so it is only set while a VP is executing.
+    A round spends most of its wall-clock time elsewhere — planning the
+    VP set, judging the verdicts, writing the report — and in those
+    windows the card fell through to a bare "🔄 验证中" naming nothing.
+    The round's two boundaries produce a nameless card each: one at
+    round start before the first ``vp_start``, one at round close after
+    the last ``vp_complete``.
+
+    The judgment phase is the expensive case, and the reason it needs
+    naming rather than merely tolerating. It walks the VPs one at a time
+    and can run for a long stretch. Its heartbeats publish
+    ``KIND_VP_STATE_CHANGED``, so the card IS rebuilt throughout — but
+    nothing the card renders moves, so ``card_fingerprint`` matches and
+    every one of those rebuilds is deduped away. Without this the card
+    freezes for the whole phase showing a verdict from a phase that has
+    already ended. Naming the sub-step makes the content differ, which
+    is what lets the dedup do its job.
+
+    ``running`` (the in-flight VP set) is passed in rather than re-derived
+    so this and the ``current_vp`` fallback in the caller cannot disagree
+    about which VPs are live. ``activity`` is the caller's already-parsed
+    view of the same log — re-reading it here would double the cost of
+    the poll this runs inside.
+    """
+    if running:
+        # A VP is genuinely in flight. The caller already names it via
+        # ``current_vp``; stay out of the way rather than emitting a
+        # second, vaguer line about the same thing.
+        return None
+
+    if not activity:
+        # No VP has started in this round yet. Either the round is being
+        # planned, or the log is unreadable — both mean the same thing to
+        # the card, which is "not far enough along to name anything".
+        return {"kind": "planning",
+                "label": _VERIFICATION_ACTIVITY_LABELS["planning"],
+                "vp_id": None, "since": None}
+
+    # ``judgment`` wins only if it is genuinely the most recent thing
+    # that happened. A VP that started after the last heartbeat means the
+    # round moved on (a re-check, or a second pass), and calling that
+    # "judging" would name a phase that already ended.
+    if judgment and (not last_vp or judgment["ts"] >= last_vp["ts"]):
+        label = _VERIFICATION_ACTIVITY_LABELS["judging"]
+        vp_id = judgment.get("vp_id")
+        if vp_id:
+            label += f" `[{vp_id}]`"
+        return {"kind": "judging", "label": label,
+                "vp_id": vp_id, "since": judgment["ts"]}
+
+    # Every VP in the round has reached a terminal state and nothing is
+    # being judged: the orchestrator is aggregating verdicts.
+    return {"kind": "summarizing",
+            "label": _VERIFICATION_ACTIVITY_LABELS["summarizing"],
+            "vp_id": None, "since": last_vp.get("ts")}
 
 
 def _build_verification_progress(plan_id: str) -> dict:
@@ -1605,7 +1730,9 @@ def _verification_progress_body(
     # verdict. Drop it from the persisted terminal lists and add it
     # to the running set; the round's own vp_complete will re-write
     # the verdict when it lands.
-    _latest_activity = _read_latest_round_vp_activity(plan_dir)
+    _latest_activity, _latest_judgment, _latest_vp_event = (
+        _read_latest_round_state(plan_dir)
+    )
     _running_now = _running_vps_from_activity(_latest_activity)
     if _running_now:
         completed_vps = [v for v in completed_vps if v not in _running_now]
@@ -1787,12 +1914,31 @@ def _verification_progress_body(
         except Exception:
             stop_reason = None
 
+    # ``current_vp`` above answers "which VP is executing". This answers
+    # "what is the round doing when none is" — planning, judging,
+    # summarizing. Additive on purpose: several tests pin ``current_vp``'s
+    # existing semantics (including its being None outside a VP), and the
+    # card needs both. Gated on the round being live so a terminal plan's
+    # payload is byte-for-byte what it was before.
+    round_activity: Optional[dict] = None
+    if str(verification_status or "").lower() in ("running", "in_progress"):
+        try:
+            round_activity = _verification_round_activity(
+                running_vp_ids, _latest_activity, _latest_judgment,
+                _latest_vp_event,
+            )
+        except Exception:
+            _server.logger.exception(
+                "[verification_progress] round_activity failed plan=%s", plan_id,
+            )
+
     return {
         "plan_id": plan_id,
         "verification_status": verification_status,
         "verification_round": verification_round,
         "stop_reason": stop_reason,
         "current_vp": current_vp_payload,
+        "activity": round_activity,
         "completed_vps": completed_vps,
         "failed_vps": failed_vps,
         "skipped_vps": skipped_vps,
