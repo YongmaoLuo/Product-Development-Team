@@ -1891,7 +1891,23 @@ jobs:
     # job inherits the skip that it exists to detect, and a skip counts
     # as a pass — the gate would invert from broken-but-green to
     # green-while-broken in exactly the case it was added for.
-    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+    #
+    # `pull_request` ONLY, and that is deliberate (2026-10-05). This job
+    # aggregates the pull request's jobs, so a manual dispatch has nothing
+    # for it to aggregate — and the two rules above, applied to a dispatch,
+    # produce a guaranteed red: every one of those jobs is
+    # `pull_request`-only, so all eleven report `skipped`, and `skipped`
+    # is not `success`. The run would be red whatever the tree contained,
+    # which is worse than useless — a maintainer running one layer by hand
+    # sees a closed gate and has to work out that "skipped" meant "you did
+    # not ask for this", not "this is broken".
+    #
+    # The dispatch trigger itself stays, and so does the one thing only it
+    # can do: `inputs.staircase` drives the `unit-staircase` job, the
+    # wedge bisection for a shard that hangs the runner. Runs 36576222631
+    # and 36708885554 are the two that used it, and they are the reason
+    # the trigger exists.
+    if: always() && github.event_name == 'pull_request'
     needs:
       - lint
       - grep-guard

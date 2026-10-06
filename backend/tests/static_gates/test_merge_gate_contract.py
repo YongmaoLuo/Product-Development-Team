@@ -199,6 +199,74 @@ class TestItCoversEveryPullRequestJob:
         )
 
 
+class TestItStaysOffTriggersItCannotJudge:
+    """The gate reads ``needs.*.result``; that is only meaningful where
+    those jobs actually run.
+
+    Its two rules are both pull-request rules: ``always()`` so a failed
+    dependency cannot skip the gate, and "skipped is not success" so an
+    inherited skip cannot pass for green. Applied to ``workflow_dispatch``
+    they combine into a red that carries no information — every one of the
+    gate's dependencies is ``pull_request``-only, so all of them report
+    ``skipped`` on a dispatch, and the gate reports failure for a tree
+    that may be perfectly green.
+
+    That is worse than an absent check. A maintainer running one layer by
+    hand — which is what the trigger is for — sees a closed gate and has
+    to work out that "skipped" meant "you did not ask for this" rather
+    than "something is broken". Every run carries the same red cross, so
+    the first real failure is the one that gets looked past.
+    """
+
+    def test_it_does_not_run_on_workflow_dispatch(self, gate: dict) -> None:
+        condition = str(gate.get("if", ""))
+        assert "workflow_dispatch" not in condition, (
+            "the merge gate runs on a manual dispatch, where all of its "
+            f"dependencies are skipped by design (if={condition!r}) — so "
+            "it reports a closed gate on every hand-run, whatever the "
+            "tree contains. The `staircase` bisection is what the "
+            "dispatch trigger is for; it does not need this job."
+        )
+
+    def test_the_dispatch_trigger_still_exists(self, workflow: dict) -> None:
+        """Narrowing the gate must not cost the repository the trigger.
+
+        ``inputs.staircase`` drives ``unit-staircase``, the wedge
+        bisection for a shard that hangs the runner past every timeout.
+        No other trigger can run it, and runs 36576222631 / 36708885554
+        are the two that used it.
+        """
+        triggers = workflow.get("on", workflow.get(True))
+        assert isinstance(triggers, dict) and "workflow_dispatch" in triggers, (
+            "ci.yml no longer declares a workflow_dispatch trigger; "
+            "`inputs.staircase` has no other way to reach `unit-staircase`, "
+            "and a wedged shard can only be bisected one data point at a "
+            "time by hand"
+        )
+
+    def test_the_staircase_job_is_still_reachable_by_dispatch(self, jobs: dict) -> None:
+        condition = str(jobs.get("unit-staircase", {}).get("if", ""))
+        assert "workflow_dispatch" in condition and "inputs.staircase" in condition, (
+            "`unit-staircase` is gated to "
+            f"{condition!r}; without the staircase input there is no way "
+            "to run a single shard on demand"
+        )
+
+    def test_it_still_runs_on_pull_requests(self, gate: dict) -> None:
+        """The other half of the same edit — narrowing must not overreach.
+
+        Without this the previous assertion is satisfied by deleting the
+        ``if:`` entirely, which would stop the required check from ever
+        reporting and wedge every merge.
+        """
+        condition = str(gate.get("if", ""))
+        assert "pull_request" in condition, (
+            f"the gate no longer runs on a pull request (if={condition!r}); "
+            f"{GATE_DISPLAY_NAME!r} is a required check, so it would sit "
+            f"pending and block every merge"
+        )
+
+
 class TestTheBodyRefusesToBeFooled:
     """Execute the gate rather than read it.
 
