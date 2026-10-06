@@ -24,17 +24,41 @@ forbid the pattern:
    half of the exact same feature — was already localised and reads its
    credentials from the environment. Telegram was the leftover.
 
-So the transport lives in this package now, and is configured exactly
-like every other credential in this project: from the environment.
+So the transport lives in this package now, and is configured like
+every other credential in this project: through the credentials
+provider, which decides where a secret is read from.
 
 Environment variables consumed
 ------------------------------
-``TELEGRAM_BOT_TOKEN``
-    Bot token issued by BotFather. Required.
 ``TELEGRAM_CHAT_ID``
     Default target chat / channel id. Required unless the caller
     resolves a per-plan id itself (``TELEGRAM_CHAT_ID_<plan_id>``) and
     passes it to :func:`load_telegram_config`.
+
+``TELEGRAM_BOT_TOKEN``
+    **Not read by this module.** The bot token is a secret, so it is
+    resolved by :func:`credentials.read_secret` under the logical name
+    ``telegram_bot_token``; the provider owns the source, the switch and
+    the fallback. The variable is named here because a deployment still
+    exports it when the keychain is off — it is the provider's fallback
+    key, not a second opinion this transport collects.
+
+Why the two values are not read the same way. The token is a
+credential: a variable holding it is readable by every process of every
+user on the machine, and survives into shell history, crash reports and
+process listings. The chat id is not a secret — it is the *index* the
+keychain entry holding the token is looked up by, and it is routing
+metadata that whatever decides where a card goes has to be able to read.
+Putting the second in the keychain would hide a non-secret; leaving the
+first in the environment would keep a credential there. They are two
+different questions, so they have two sources.
+
+The token is read from the provider *alone*, never as a fallback behind
+an environment read here. The ordering matters and is easy to get
+backwards: a deployment part-way through the migration still exports
+``TELEGRAM_BOT_TOKEN`` as an empty string, and ``env or provider`` would
+let that empty string win and report a channel with a working keychain
+entry as not provisioned.
 
 With no token, or no chat id, every call short-circuits: sends return
 ``None``, edits return ``False``, and no network call is made. That is
@@ -69,7 +93,17 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+import credentials
+
 logger = logging.getLogger(__name__)
+
+#: The logical name the credentials provider registers the bot token
+#: under. Named once so the string a reviewer checks is the string the
+#: lookup is made with: the provider keys its spec table, its memo and
+#: its keychain account lookup by this name, and a name it does not know
+#: answers ``None`` — which is indistinguishable from "not provisioned"
+#: at the far end of a send.
+BOT_TOKEN_SECRET = "telegram_bot_token"
 
 #: Telegram MarkdownV2 reserves these 18 characters; the API rejects the
 #: request unless every occurrence is prefixed with a backslash.
@@ -134,7 +168,12 @@ def mask_chat_id(chat_id: Optional[str]) -> Optional[str]:
 
 
 def load_telegram_config(chat_id: Optional[str] = None) -> Dict[str, Any]:
-    """Build the transport config for one send, from the environment.
+    """Build the transport config for one send.
+
+    The bot token is whatever the credentials provider resolved for
+    :data:`BOT_TOKEN_SECRET`; the chat id is read from the environment,
+    because it is an index rather than a secret. The module docstring
+    says why the two sources differ.
 
     Args:
         chat_id: target chat. Pass the per-plan value
@@ -147,7 +186,15 @@ def load_telegram_config(chat_id: Optional[str] = None) -> Dict[str, Any]:
         present, which is what every transport function short-circuits
         on.
     """
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or None
+    # One source for the token, and not a fallback behind an environment
+    # read: a deployment part-way through the migration still exports
+    # ``TELEGRAM_BOT_TOKEN`` as an empty string, and reading the variable
+    # here first would let that empty string answer for a keychain entry
+    # that holds a working token. The provider already treats an empty
+    # variable as no value, so the ``or None`` only normalises what a
+    # provider could not have returned — a keychain item whose stored
+    # value is itself empty.
+    bot_token = credentials.read_secret(BOT_TOKEN_SECRET) or None
     resolved_chat_id = (chat_id or os.environ.get("TELEGRAM_CHAT_ID")) or None
     return {
         "bot_token": bot_token,

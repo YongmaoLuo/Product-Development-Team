@@ -61,6 +61,12 @@ provider 集合编译进**每一次**安装。这里刻意**没有**任何"带�
 凭据来自 `backend/.env`，它是 gitignored 的。`backend/.env.ci` 放的是提交进仓的
 **占位值** —— 它是测试夹具，真密钥永远不要放进去。
 
+两个通知 secret 也可以改为从独立的 macOS 钥匙串读取，再经文件描述符交给需要它们的
+进程，从而不出现在 `ps eew` 的输出里。这条路径**需要主动开启、默认关闭** —— 不做任何
+改动的部署完全不受影响，而没有走过迁移的安装仍然是从 `.env` 读 secret。在假定它已经
+生效之前请先看[钥匙串迁移](keychain-migration.md)；`secrets verify` 会报出每个 secret
+实际来自哪个来源。
+
 ## 运行态
 
 一个 checkout **产出**的（而不是**分发**的）所有东西，都放在一个 gitignored 的
@@ -78,3 +84,41 @@ provider 集合编译进**每一次**安装。这里刻意**没有**任何"带�
     `backend/config_paths.py` 里声明一次；不要在别处从 `__file__` 重新推导它 ——
     这个项目已经犯过两次，并为此立了门禁
     （`backend/tests/static_gates/test_state_db_path_has_one_resolver.py`）。
+
+## 子 agent 沙箱
+
+代码子 agent 的启动方式是 `claude --permission-mode
+bypassPermissions`。`bypassPermissions` 去掉了确认提示，因此单靠它，
+agent 拥有不受限的文件系统访问，整条路径上没有任何关卡。OS 沙箱是
+「提示关掉之后仍然成立」的那道边界。
+
+把 `PDT_SANDBOX_PROFILE` 指向一个 Seatbelt profile —— 或者把
+`example/sandbox_profile.sb.example` 复制成 `.config/sandbox_profile.sb`
+再按需修改：
+
+```bash
+mkdir -p .config && cp example/sandbox_profile.sb.example \
+    .config/sandbox_profile.sb
+```
+
+**不配置等于什么都不变。** 没有 profile 的部署启动的 argv 与以往逐字相同。
+
+**配了但装不上会直接停掉。** 不会退化成无沙箱启动，这个不对称正是重点：
+一个会悄悄关掉自己的沙箱比没有沙箱更糟，因为配置仍然声称它开着。三种情况
+会抛错：
+
+- 文件不存在，或内核拒绝应用它；
+- `sandbox-exec` 不在 PATH 上（它只存在于 macOS，所以在 Linux 上留着
+  配置会停掉运行，而不是被忽略）；
+- 当前进程已经在某个沙箱里，而 macOS 不接受外层未包含的内层 profile。
+  把 `PDT_SANDBOX_PROFILE` 指向**与外层沙箱同一份** profile —— 逐字节相同
+  的 profile 套得进去。
+
+!!! warning "规则次序是有语义的"
+    Seatbelt 是**后匹配胜出**。宽的 `deny` 排在窄的 `allow` 之后会把它抵消
+    —— 工作区的 allow 后面跟一条对父目录的整块 deny，工作区就完全没有
+    权限了，而这个故障读起来像「沙箱坏了」而不是「规则次序写反了」。
+
+    `file-read-metadata` 是给「路径需要能解析、但内容不该能读」用的：它授予
+    `stat` 而不授予 `read(2)`，于是进程可以 `cd` 进工作目录，而该目录的内容
+    仍然是关着的。
