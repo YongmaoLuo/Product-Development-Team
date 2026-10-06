@@ -40,7 +40,7 @@ from notifications.cards import _unified_phase_section
 
 
 @pytest.fixture(scope="module")
-def round_activity_fn():
+def round_mod():
     """``routes.verification`` under test, imported lazily.
 
     ``server`` has to be imported first: it pulls in the routers at its
@@ -51,9 +51,23 @@ def round_activity_fn():
     relies on.
     """
     import server  # noqa: F401
-    from routes.verification import _verification_round_activity
+    import routes.verification as rv
 
-    return _verification_round_activity
+    return rv
+
+
+def _derive(rv, plan_dir, running=None):
+    """Parse the round log once, then derive — as the endpoint does.
+
+    Exercises the real pairing: the derivation is handed the same
+    single-pass result the caller already has, so a second parse cannot
+    hide behind the test.
+    """
+    activity, judgment, last_vp = rv._read_latest_round_state(plan_dir)
+    return rv._verification_round_activity(
+        running if running is not None else rv._running_vps_from_activity(activity),
+        activity, judgment, last_vp,
+    )
 
 
 @pytest.fixture
@@ -100,32 +114,30 @@ def _activity_from(entries: list, running: Optional[set] = None) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_planning_before_any_vp_starts(plan_dir: Path, round_activity_fn):
+def test_planning_before_any_vp_starts(plan_dir: Path, round_mod):
     """Round start: the VP set is being assembled, so there is no VP to
     name — but there is still a definite answer."""
     _write(plan_dir, [])
 
-    result = round_activity_fn(plan_dir, running=set(), activity={})
+    result = _derive(round_mod, plan_dir, running=set())
 
     assert result is not None
     assert result["kind"] == "planning"
     assert result["label"]
 
 
-def test_none_while_a_vp_is_genuinely_in_flight(plan_dir: Path, round_activity_fn):
+def test_none_while_a_vp_is_genuinely_in_flight(plan_dir: Path, round_mod):
     """A VP in flight is the caller's job to name via ``current_vp``.
     Emitting a second, vaguer line about the same moment would be noise."""
     entries = [_vp_start("VP-001", "2026-10-05T20:40:00")]
     _write(plan_dir, entries)
 
-    result = round_activity_fn(
-        plan_dir, running={"VP-001"}, activity=_activity_from(entries),
-    )
+    result = _derive(round_mod, plan_dir, running={"VP-001"})
 
     assert result is None
 
 
-def test_judging_names_the_vp_under_review(plan_dir: Path, round_activity_fn):
+def test_judging_names_the_vp_under_review(plan_dir: Path, round_mod):
     """The 98-minute case. Without this the card said nothing at all."""
     entries = [
         _vp_start("VP-001", "2026-10-05T20:40:00"),
@@ -135,16 +147,14 @@ def test_judging_names_the_vp_under_review(plan_dir: Path, round_activity_fn):
     ]
     _write(plan_dir, entries)
 
-    result = round_activity_fn(
-        plan_dir, running=set(), activity=_activity_from(entries),
-    )
+    result = _derive(round_mod, plan_dir, running=set())
 
     assert result["kind"] == "judging"
     assert "[VP-007]" in result["label"]
     assert result["since"] == "2026-10-05T21:35:13"
 
 
-def test_summarizing_between_last_vp_and_judgment(plan_dir: Path, round_activity_fn):
+def test_summarizing_between_last_vp_and_judgment(plan_dir: Path, round_mod):
     """Every VP done, report not yet aggregated — the round-close window
     that produced the second nameless card."""
     entries = [
@@ -153,14 +163,12 @@ def test_summarizing_between_last_vp_and_judgment(plan_dir: Path, round_activity
     ]
     _write(plan_dir, entries)
 
-    result = round_activity_fn(
-        plan_dir, running=set(), activity=_activity_from(entries),
-    )
+    result = _derive(round_mod, plan_dir, running=set())
 
     assert result["kind"] == "summarizing"
 
 
-def test_judgment_then_more_judgment_keeps_the_latest(plan_dir: Path, round_activity_fn):
+def test_judgment_then_more_judgment_keeps_the_latest(plan_dir: Path, round_mod):
     entries = [
         _vp_start("VP-001", "2026-10-05T20:40:00"),
         _vp_complete("VP-001", "2026-10-05T20:47:00"),
@@ -169,20 +177,94 @@ def test_judgment_then_more_judgment_keeps_the_latest(plan_dir: Path, round_acti
     ]
     _write(plan_dir, entries)
 
-    result = round_activity_fn(
-        plan_dir, running=set(), activity=_activity_from(entries),
-    )
+    result = _derive(round_mod, plan_dir, running=set())
 
     assert "[VP-017]" in result["label"]
 
 
-def test_unreadable_log_degrades_to_planning(plan_dir: Path, round_activity_fn):
+def test_unreadable_log_degrades_to_planning(plan_dir: Path, round_mod):
     """No raise, and no invented verdict — the round has not visibly
     started, which is what an empty log means."""
-    result = round_activity_fn(plan_dir, running=set(), activity={})
+    result = _derive(round_mod, plan_dir, running=set())
 
     assert result is not None
     assert result["kind"] == "planning"
+
+
+def test_a_vp_starting_after_the_last_heartbeat_is_not_judging(
+    plan_dir: Path, round_mod,
+):
+    """Ordering, not mere presence, decides.
+
+    A heartbeat earlier in the round does not make the round "judging"
+    once a VP has started again — a re-check is a re-check, and naming a
+    phase that already ended is the same defect this function exists to
+    remove.
+    """
+    entries = [
+        _vp_start("VP-001", "2026-10-05T20:40:00"),
+        _vp_complete("VP-001", "2026-10-05T20:47:00"),
+        _judgment("VP-001", "2026-10-05T20:53:36"),
+        _vp_start("VP-001", "2026-10-05T21:10:00"),
+        _vp_complete("VP-001", "2026-10-05T21:20:00"),
+    ]
+    _write(plan_dir, entries)
+
+    result = _derive(round_mod, plan_dir, running=set())
+
+    assert result["kind"] == "summarizing", result
+
+
+def test_a_vp_in_flight_beats_an_earlier_heartbeat(plan_dir: Path, round_mod):
+    entries = [
+        _judgment("VP-001", "2026-10-05T20:53:36"),
+        _vp_start("VP-001", "2026-10-05T21:10:00"),
+    ]
+    _write(plan_dir, entries)
+
+    assert _derive(round_mod, plan_dir, running={"VP-001"}) is None
+
+
+def test_one_parse_serves_both_views(round_mod, plan_dir: Path):
+    """The VP lifecycle and the judgment phase are two views of one
+    timeline. Reading them in separate passes would double the cost of
+    every poll of ``/api/verification/{id}/progress``."""
+    _write(plan_dir, [
+        _vp_start("VP-001", "2026-10-05T20:40:00"),
+        _vp_complete("VP-001", "2026-10-05T20:47:00"),
+        _judgment("VP-007", "2026-10-05T21:35:13"),
+    ])
+
+    activity, judgment, last_vp = round_mod._read_latest_round_state(plan_dir)
+
+    assert activity["VP-001"] == {
+        "start": "2026-10-05T20:40:00", "complete": "2026-10-05T20:47:00",
+    }
+    assert judgment["vp_id"] == "VP-007"
+    assert judgment["stage"] == "supplement_review"
+    assert last_vp["vp_id"] == "VP-001"
+    # The old entry point still answers the old question.
+    assert round_mod._read_latest_round_vp_activity(plan_dir) == activity
+
+
+def test_a_heartbeat_without_a_timestamp_is_not_a_position(
+    plan_dir: Path, round_mod,
+):
+    """A malformed heartbeat must not overwrite a good earlier one, and
+    must not become the reported phase."""
+    entries = [
+        _vp_start("VP-001", "2026-10-05T20:40:00"),
+        _vp_complete("VP-001", "2026-10-05T20:47:00"),
+        _judgment("VP-007", "2026-10-05T21:35:13"),
+        {"verification_point_id": "VP-009", "event_type": "judgment_heartbeat",
+         "timestamp": None, "data": {}},
+    ]
+    _write(plan_dir, entries)
+
+    result = _derive(round_mod, plan_dir, running=set())
+
+    assert result["kind"] == "judging"
+    assert "[VP-007]" in result["label"]
 
 
 # ---------------------------------------------------------------------------

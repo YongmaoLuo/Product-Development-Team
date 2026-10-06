@@ -159,6 +159,7 @@ class PlanStatus:
     #: is readable from any process — unlike the two liveness flags
     #: above, which are serving-process only.
     current_activity: Optional[Mapping[str, Any]] = None
+
     #: What did not line up while assembling this snapshot.
     divergences: Tuple[Divergence, ...] = ()
 
@@ -323,9 +324,17 @@ def find_divergences(status: PlanStatus) -> Tuple[Divergence, ...]:
     # workflow), which is exactly why the drift is silent. The
     # reconciliation at the read site fixes the card; this rule is what
     # makes the underlying miss visible instead.
+    #
+    # ``pending`` is deliberately NOT in the trigger set, though the
+    # read-side reconciliation does override it. ``reset`` writes
+    # ``pending`` into this column while a plan can legitimately be
+    # executing repair work, and a column that says "not started" is not
+    # a stale *claim* about anything — alarming on it would fire on every
+    # reset plan. The defect this rule exists for is a column still
+    # claiming a round is LIVE when no round is.
     if (
         not status.verification_in_flight
-        and v_status in ("running", "in_progress", "pending")
+        and v_status in ("running", "in_progress")
         and status.execution_in_flight
     ):
         found.append(Divergence(

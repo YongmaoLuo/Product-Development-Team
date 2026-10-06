@@ -37,7 +37,7 @@ from pathlib import Path
 
 import pytest
 
-from execution_logger import ExecutionLogger
+from execution_logger import ExecutionLogger, _read_tail
 from notifications.cards import _activity_line, _unified_phase_section
 from notifications.feishu_notifier import FeishuNotifier
 
@@ -155,6 +155,86 @@ def test_unrecognised_events_only_degrades_to_unknown(plans_dir: Path):
 
 
 # ---------------------------------------------------------------------------
+# Tail reading
+# ---------------------------------------------------------------------------
+#
+# ``current_activity`` seeks backwards from EOF rather than parsing the
+# whole file, because it runs on the endpoints the notifier polls
+# continuously and a long run's log is megabytes and growing. These pin
+# the cases where a seek differs from a full read.
+
+
+def test_tail_read_ignores_a_partial_first_line(plans_dir: Path, monkeypatch):
+    """Seeking lands mid-line. The fragment cannot be parsed and must be
+    dropped, not allowed to abort the read."""
+    _write_log(plans_dir, [
+        _ev("refine_started", "2026-10-05T06:16:00", title="t"),
+        _ev("file_lock_acquired", "2026-10-05T06:17:00"),
+    ])
+    # Shrink the starting budget so the seek path is the one exercised.
+    monkeypatch.setattr("execution_logger._TAIL_INITIAL_BYTES", 8)
+
+    activity = ExecutionLogger.current_activity("p1", plans_dir)
+
+    assert activity["kind"] == "refine", activity
+
+
+def test_tail_read_ignores_malformed_lines(plans_dir: Path):
+    _write_log(plans_dir, [
+        _ev("refine_started", "2026-10-05T06:16:00", title="t"),
+    ])
+    with open(plans_dir / "p1" / "execution.log", "a", encoding="utf-8") as f:
+        f.write("{not json at all\n")
+        f.write("[1,2,3]\n")  # valid JSON, wrong shape
+        f.write("\n")
+
+    assert ExecutionLogger.current_activity("p1", plans_dir)["kind"] == "refine"
+
+
+def test_tail_read_works_on_a_file_larger_than_the_byte_cap(tmp_path: Path):
+    """The realistic case: a long run's log far exceeds the cap, and the
+    answer must still come from the end."""
+    plans = tmp_path / "p1"
+    plans.mkdir(parents=True)
+    with open(plans / "execution.log", "w", encoding="utf-8") as f:
+        for i in range(20000):
+            f.write(json.dumps(_ev("file_lock_acquired", f"2026-10-05T00:00:{i%60:02d}")) + "\n")
+        f.write(json.dumps(_ev("task_started", "2026-10-05T09:00:00", title="t")) + "\n")
+
+    activity = ExecutionLogger.current_activity("p1", tmp_path)
+
+    assert activity["kind"] == "task"
+    assert activity["started_at"] == "2026-10-05T09:00:00"
+
+
+def test_tail_read_matches_a_full_read(plans_dir: Path):
+    """Same answer whichever path is taken — the optimisation must not
+    be able to change what is reported."""
+    entries = [
+        _ev("task_started", "2026-10-05T05:00:00", title="t"),
+        _ev("task_completed", "2026-10-05T05:10:00"),
+        _ev("refine_started", "2026-10-05T05:11:00", title="t"),
+    ]
+    _write_log(plans_dir, entries)
+
+    via_tail = ExecutionLogger.current_activity("p1", plans_dir)
+    via_full = _read_tail(plans_dir / "p1" / "execution.log", limit=500)
+
+    assert via_tail["kind"] == "refine"
+    assert [e.get("event") for e in via_full][-1] == "refine_started"
+
+
+def test_tail_read_handles_a_missing_file(tmp_path: Path):
+    assert ExecutionLogger.current_activity("nope", tmp_path)["kind"] == "unknown"
+
+
+def test_tail_read_handles_an_empty_file(plans_dir: Path):
+    (plans_dir / "p1" / "execution.log").write_text("", encoding="utf-8")
+
+    assert ExecutionLogger.current_activity("p1", plans_dir)["kind"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Card rendering
 # ---------------------------------------------------------------------------
 
@@ -201,6 +281,85 @@ def test_idle_activity_is_distinguishable_from_silence():
     )
 
     assert "空闲" in line
+
+
+# ---------------------------------------------------------------------------
+# Elapsed time
+# ---------------------------------------------------------------------------
+#
+# A wrong duration is worse than a missing one: an operator reading
+# "已 8h10m" about work that started ten minutes ago has every reason to
+# conclude the plan is stuck. The producer writes naive UTC, so the
+# formatter has to know that.
+
+
+def test_naive_timestamps_are_read_as_utc():
+    """``ExecutionLogger`` stamps ``datetime.utcnow().isoformat()`` — naive
+    UTC. Reading that against a naive local "now" is off by the machine's
+    UTC offset, silently."""
+    from datetime import datetime, timedelta
+
+    from notifications.cards import _format_elapsed
+
+    started = (datetime.utcnow() - timedelta(minutes=10)).isoformat()
+
+    assert _format_elapsed(started) == "10m00s"
+
+
+def test_aware_timestamps_are_honoured_as_written():
+    from datetime import datetime, timedelta, timezone
+
+    from notifications.cards import _format_elapsed
+
+    started = (
+        datetime.now(timezone.utc) - timedelta(minutes=10)
+    ).isoformat().replace("+00:00", "Z")
+
+    assert _format_elapsed(started) == "10m00s"
+
+
+def test_elapsed_scales_to_hours():
+    from datetime import datetime, timedelta
+
+    from notifications.cards import _format_elapsed
+
+    started = (datetime.utcnow() - timedelta(hours=2, minutes=5)).isoformat()
+
+    assert _format_elapsed(started) == "2h05m"
+
+
+def test_unusable_timestamps_render_nothing():
+    """The suffix is a nicety. A card that cannot compute it must still
+    render the activity rather than drop the line or invent a number."""
+    from datetime import datetime, timedelta
+
+    from notifications.cards import _activity_line, _format_elapsed
+
+    assert _format_elapsed(None) == ""
+    assert _format_elapsed("") == ""
+    assert _format_elapsed("not-a-time") == ""
+    # Future timestamp (clock skew between processes) — no negative.
+    assert _format_elapsed(
+        (datetime.utcnow() + timedelta(hours=1)).isoformat()
+    ) == ""
+
+    for bad in (None, "", "not-a-time"):
+        line = _activity_line({"kind": "refine", "started_at": bad})
+        assert "正在精化任务列表" in line, bad
+
+
+def test_a_refine_line_carries_its_elapsed_time():
+    from datetime import datetime, timedelta
+
+    from notifications.cards import _activity_line
+
+    started = (datetime.utcnow() - timedelta(minutes=4)).isoformat()
+    line = _activity_line(
+        {"kind": "refine", "started_at": started, "task_id": "9-9"},
+    )
+
+    assert "4m" in line
+    assert "`9-9`" in line
 
 
 # ---------------------------------------------------------------------------

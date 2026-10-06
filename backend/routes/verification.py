@@ -1368,6 +1368,79 @@ def _read_all_vp_starts(plan_dir: Path) -> Dict[str, str]:
     return starts
 
 
+def _read_latest_round_state(
+    plan_dir: Path,
+) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Any], Dict[str, Any]]:
+    """One pass over the NEWEST round log →
+    ``(vp_activity, judgment, last_vp_event)``.
+
+    ``vp_activity`` is ``{vp_id: {"start": iso|"", "complete": iso|""}}``.
+    ``judgment`` is the most recent ``judgment_heartbeat``
+    (``{"stage", "vp_id", "ts"}``), or ``{}`` if there was none.
+    ``last_vp_event`` is the most recent ``vp_start`` / ``vp_complete``
+    (``{"event_type", "vp_id", "ts"}``), or ``{}``.
+
+    All three come from the same file in the same pass on purpose. The
+    VP lifecycle and the judgment phase are two views of one timeline; a
+    reader that returns them separately has to re-parse the file for the
+    second, and this runs on ``/api/verification/{id}/progress``, which
+    the notifier polls continuously while a round is live. Round logs
+    reach tens of megabytes on a long run, so the second pass is not
+    free. The caller also needs ``last_vp_event`` to decide which of the
+    two is genuinely the most recent thing that happened — that
+    comparison cannot be made from either half alone.
+    """
+    logs_dir = plan_dir / "logs"
+    if not logs_dir.exists():
+        return {}, {}, {}
+    log_files = sorted(
+        logs_dir.glob("verification_*.log"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not log_files:
+        return {}, {}, {}
+    activity: Dict[str, Dict[str, str]] = {}
+    judgment: Dict[str, Any] = {}
+    last_vp: Dict[str, Any] = {}
+    try:
+        with open(log_files[-1], "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                et = entry.get("event_type")
+                ts = entry.get("timestamp")
+                vp_id = entry.get("verification_point_id")
+                if et == "judgment_heartbeat":
+                    # Keep the LAST one, and only accept a usable
+                    # timestamp — a heartbeat with a malformed ts is not
+                    # a position in the timeline.
+                    if isinstance(ts, str):
+                        judgment = {
+                            "stage": (entry.get("data") or {}).get("stage")
+                            if isinstance(entry.get("data"), dict) else None,
+                            "vp_id": vp_id if isinstance(vp_id, str) else None,
+                            "ts": ts,
+                        }
+                    continue
+                if et not in ("vp_start", "vp_complete"):
+                    continue
+                if not isinstance(vp_id, str) or not isinstance(ts, str):
+                    continue
+                slot = activity.setdefault(vp_id, {"start": "", "complete": ""})
+                slot["start" if et == "vp_start" else "complete"] = ts
+                last_vp = {"event_type": et, "vp_id": vp_id, "ts": ts}
+    except OSError:
+        return {}, {}, {}
+    return activity, judgment, last_vp
+
+
 def _read_latest_round_vp_activity(plan_dir: Path) -> Dict[str, Dict[str, str]]:
     """Return ``{vp_id: {"start": iso|"", "complete": iso|""}}`` from
     the NEWEST verification round log only.
@@ -1385,40 +1458,12 @@ def _read_latest_round_vp_activity(plan_dir: Path) -> Dict[str, Dict[str, str]]:
     The newest round log is the live truth: a ``vp_start`` with no
     subsequent ``vp_complete`` in that file means the VP is running
     RIGHT NOW, regardless of what the persisted verdicts say.
+
+    Thin wrapper over :func:`_read_latest_round_state` so both views of
+    the round cost one pass. The judgment half is discarded here because
+    every caller of this function wants only the VP lifecycle.
     """
-    logs_dir = plan_dir / "logs"
-    if not logs_dir.exists():
-        return {}
-    log_files = sorted(
-        logs_dir.glob("verification_*.log"),
-        key=lambda p: p.stat().st_mtime,
-    )
-    if not log_files:
-        return {}
-    activity: Dict[str, Dict[str, str]] = {}
-    try:
-        with open(log_files[-1], "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                et = entry.get("event_type")
-                if et not in ("vp_start", "vp_complete"):
-                    continue
-                vp_id = entry.get("verification_point_id")
-                ts = entry.get("timestamp")
-                if not isinstance(vp_id, str) or not isinstance(ts, str):
-                    continue
-                slot = activity.setdefault(vp_id, {"start": "", "complete": ""})
-                slot["start" if et == "vp_start" else "complete"] = ts
-    except OSError:
-        return {}
+    activity, _judgment, _last_vp = _read_latest_round_state(plan_dir)
     return activity
 
 
@@ -1447,9 +1492,10 @@ _VERIFICATION_ACTIVITY_LABELS = {
 
 
 def _verification_round_activity(
-    plan_dir: Path,
     running: set,
     activity: Dict[str, Dict[str, str]],
+    judgment: Dict[str, Any],
+    last_vp: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     """Describe what the verification round is doing when no VP is in flight.
 
@@ -1476,70 +1522,41 @@ def _verification_round_activity(
 
     ``running`` (the in-flight VP set) is passed in rather than re-derived
     so this and the ``current_vp`` fallback in the caller cannot disagree
-    about which VPs are live.
+    about which VPs are live. ``activity`` is the caller's already-parsed
+    view of the same log — re-reading it here would double the cost of
+    the poll this runs inside.
     """
-    logs_dir = plan_dir / "logs"
-    log_files = (
-        sorted(logs_dir.glob("verification_*.log"), key=lambda p: p.stat().st_mtime)
-        if logs_dir.exists() else []
-    )
-
     if running:
         # A VP is genuinely in flight. The caller already names it via
         # ``current_vp``; stay out of the way rather than emitting a
         # second, vaguer line about the same thing.
         return None
 
-    if not log_files:
-        return {"kind": "planning", "label": _VERIFICATION_ACTIVITY_LABELS["planning"],
+    if not activity:
+        # No VP has started in this round yet. Either the round is being
+        # planned, or the log is unreadable — both mean the same thing to
+        # the card, which is "not far enough along to name anything".
+        return {"kind": "planning",
+                "label": _VERIFICATION_ACTIVITY_LABELS["planning"],
                 "vp_id": None, "since": None}
 
-    last_event_type: Optional[str] = None
-    last_vp_id: Optional[str] = None
-    last_ts: Optional[str] = None
-    started_any = False
-    try:
-        with open(log_files[-1], "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                et = entry.get("event_type")
-                ts = entry.get("timestamp")
-                vp_id = entry.get("verification_point_id")
-                if et == "vp_start":
-                    started_any = True
-                if et == "judgment_heartbeat" and isinstance(ts, str):
-                    last_event_type = "judgment_heartbeat"
-                    last_ts = ts
-                    last_vp_id = vp_id if isinstance(vp_id, str) and vp_id else None
-                elif et in ("vp_start", "vp_complete") and isinstance(ts, str):
-                    last_event_type = et
-                    last_ts = ts
-                    last_vp_id = vp_id if isinstance(vp_id, str) and vp_id else None
-    except OSError:
-        return None
-
-    if last_event_type == "judgment_heartbeat":
+    # ``judgment`` wins only if it is genuinely the most recent thing
+    # that happened. A VP that started after the last heartbeat means the
+    # round moved on (a re-check, or a second pass), and calling that
+    # "judging" would name a phase that already ended.
+    if judgment and (not last_vp or judgment["ts"] >= last_vp["ts"]):
         label = _VERIFICATION_ACTIVITY_LABELS["judging"]
-        if last_vp_id:
-            label += f" `[{last_vp_id}]`"
+        vp_id = judgment.get("vp_id")
+        if vp_id:
+            label += f" `[{vp_id}]`"
         return {"kind": "judging", "label": label,
-                "vp_id": last_vp_id, "since": last_ts}
-    if not started_any:
-        return {"kind": "planning", "label": _VERIFICATION_ACTIVITY_LABELS["planning"],
-                "vp_id": None, "since": last_ts}
-    # Every VP in the round has completed and no judgment has started:
-    # the orchestrator is aggregating verdicts into the report.
+                "vp_id": vp_id, "since": judgment["ts"]}
+
+    # Every VP in the round has reached a terminal state and nothing is
+    # being judged: the orchestrator is aggregating verdicts.
     return {"kind": "summarizing",
             "label": _VERIFICATION_ACTIVITY_LABELS["summarizing"],
-            "vp_id": None, "since": last_ts}
+            "vp_id": None, "since": last_vp.get("ts")}
 
 
 def _build_verification_progress(plan_id: str) -> dict:
@@ -1713,7 +1730,9 @@ def _verification_progress_body(
     # verdict. Drop it from the persisted terminal lists and add it
     # to the running set; the round's own vp_complete will re-write
     # the verdict when it lands.
-    _latest_activity = _read_latest_round_vp_activity(plan_dir)
+    _latest_activity, _latest_judgment, _latest_vp_event = (
+        _read_latest_round_state(plan_dir)
+    )
     _running_now = _running_vps_from_activity(_latest_activity)
     if _running_now:
         completed_vps = [v for v in completed_vps if v not in _running_now]
@@ -1905,7 +1924,8 @@ def _verification_progress_body(
     if str(verification_status or "").lower() in ("running", "in_progress"):
         try:
             round_activity = _verification_round_activity(
-                plan_dir, running_vp_ids, _latest_activity,
+                running_vp_ids, _latest_activity, _latest_judgment,
+                _latest_vp_event,
             )
         except Exception:
             _server.logger.exception(

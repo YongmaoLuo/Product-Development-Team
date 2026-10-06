@@ -3241,6 +3241,10 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                     },
                     status=status,
                     stop_reason=stop_reason,
+                    # The round is over; the plan is not. Announcing a
+                    # terminal here would tell every subscriber the plan
+                    # is closed seconds before an executor starts on it.
+                    publish_closed=False,
                 )
             finally:
                 conn.close()
