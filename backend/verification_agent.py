@@ -71,6 +71,11 @@ from verification_plan_completeness import (  # noqa: E402
     find_missing_gates,
     render_gap_feedback,
 )
+from verification_ac_coverage import (  # noqa: E402
+    annotate_acceptance_gap as _annotate_acceptance_gap,
+    find_uncovered_criteria,
+    render_gap_feedback as render_acceptance_gap_feedback,
+)
 
 
 class ApiTestSchemaViolation(RuntimeError):
@@ -525,6 +530,27 @@ class Orchestrator:
                 "issues": [i.detail for i in issues],
             })
         return report
+
+    def _collect_prd_acceptance(self) -> List[str]:
+        """The PRD's acceptance criteria, as plain strings.
+
+        Read from ``prd.json`` rather than from the markdown so the
+        coverage check sees the same list the planner was shown. An
+        unreadable or absent PRD yields ``[]``, which disables the
+        check rather than failing the round — a plan that exists
+        without a PRD is already reported elsewhere.
+        """
+        from verification_plan_delta import collect_acceptance
+
+        try:
+            return collect_acceptance(self.plan_dir)
+        except Exception:  # noqa: BLE001 - never fail planning on this
+            logger.warning(
+                "[verification] could not read PRD acceptance criteria; "
+                "the coverage check is disabled for this round",
+                exc_info=True,
+            )
+            return []
 
     def _violation_fix_guidance(
         self,
@@ -1021,9 +1047,18 @@ class Orchestrator:
                 # 2026-09-18（D5）：项目里有全量 CI / E2E 入口，计划里却没有
                 # 对应的 Phase 2 关卡 —— that run's Nightly CI 关卡就是这么丢的。
                 _gate_gaps = find_missing_gates(plan_data, _gate_entries)
+                # 2026-10-06：PRD 验收标准里有、计划里没有任何 VP 引用它。
+                # 同一条重生成回路。that run 的「FD 传递·多级」在计划阶段
+                # 一条 VP 都没有，靠执行期的增量评估才补上 —— 也就是说测
+                # 试设计阶段漏掉一整条验收标准，报告仍然 PASSED。
+                _acceptance_items = self._collect_prd_acceptance()
+                _ac_gaps = (
+                    find_uncovered_criteria(plan_data, _acceptance_items)
+                    if _acceptance_items else []
+                )
                 _violation_count = (
                     len(_service_violations) + len(_api_schema_violations)
-                    + len(_gate_gaps)
+                    + len(_gate_gaps) + len(_ac_gaps)
                 )
                 if _violation_count:
                     _sections: List[str] = []
@@ -1053,6 +1088,10 @@ class Orchestrator:
                         _sections.append(
                             render_gap_feedback(_gate_gaps)
                         )
+                    if _ac_gaps:
+                        _sections.append(
+                            render_acceptance_gap_feedback(_ac_gaps)
+                        )
                     _report = "\n".join(_sections)
                     print(
                         f"[Verification] {_violation_count} verification "
@@ -1060,7 +1099,8 @@ class Orchestrator:
                         f"({len(_service_violations)} service reference "
                         f"issue(s), {len(_api_schema_violations)} api_test "
                         f"schema issue(s), {len(_gate_gaps)} missing "
-                        f"Phase-2 gate(s)):\n{_report}"
+                        f"Phase-2 gate(s), {len(_ac_gaps)} uncovered PRD "
+                        f"acceptance criterion/criteria):\n{_report}"
                     )
                     if (
                         _best_violations is None
@@ -1144,6 +1184,27 @@ class Orchestrator:
                         "the project has entry points for: %s",
                         len(_missing_gates),
                         [m.evidence for m in _missing_gates],
+                    )
+
+                # 同理：重试额度用尽后仍有 PRD 验收标准没有任何 VP 覆盖 →
+                # 标注在计划上（``acceptance_gap``）并大声记录。这不是
+                # 阻断性的 —— 计划照存，VP 照跑 —— 但"这轮少验了一条验收
+                # 标准"必须写在计划里，而不是让人从一份全绿的报告反推。
+                _uncovered = find_uncovered_criteria(
+                    plan_data, self._collect_prd_acceptance(),
+                )
+                if _annotate_acceptance_gap(plan_data, _uncovered):
+                    logger.warning(
+                        "[Verification] plan leaves %d PRD acceptance "
+                        "criterion/criteria unverified by any VP: %s",
+                        len(_uncovered),
+                        [m.evidence for m in _uncovered],
+                    )
+                    print(
+                        f"[Verification] WARNING: {len(_uncovered)} PRD "
+                        f"acceptance criterion/criteria have no VP — "
+                        f"recorded in the plan as acceptance_gap:\n"
+                        + "\n".join(f"  - {m.evidence}" for m in _uncovered)
                     )
 
                 # Save plan

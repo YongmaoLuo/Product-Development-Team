@@ -55,6 +55,8 @@ import urllib.request
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
+from credentials import read_secret
+
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +86,19 @@ class FeishuUnavailable(Exception):
 class FeishuClient:
     """Minimal Feishu IM client (send + patch interactive cards).
 
-    Construction reads ``FEISHU_APP_ID`` and ``FEISHU_APP_SECRET``
-    from the environment. If ``lark-oapi`` is not importable, the
-    constructor raises ``FeishuUnavailable`` — callers (the
-    notifier) must handle that explicitly rather than catching
-    ImportError, so the failure mode is named.
+    The two credentials are read from two different places, because
+    they are two different kinds of value. ``FEISHU_APP_ID`` is an
+    *index* — the account a keychain item is looked up by — and an
+    index is not a secret, so it stays in the environment. The app
+    secret is a secret, so it comes from :mod:`credentials`, which
+    decides between the OS keychain and the plaintext variable. A
+    consumer that read the variable itself would leave the deployment
+    half-migrated with no way to tell from the outside.
+
+    If ``lark-oapi`` is not importable, the constructor raises
+    ``FeishuUnavailable`` — callers (the notifier) must handle that
+    explicitly rather than catching ImportError, so the failure mode
+    is named.
     """
 
     def __init__(
@@ -107,11 +117,13 @@ class FeishuClient:
             ) from exc
 
         self.app_id = app_id or os.environ.get("FEISHU_APP_ID", "")
-        self.app_secret = app_secret or os.environ.get("FEISHU_APP_SECRET", "")
+        self.app_secret = app_secret or read_secret("feishu_app_secret") or ""
 
         if not self.app_id or not self.app_secret:
             raise FeishuUnavailable(
-                "FEISHU_APP_ID / FEISHU_APP_SECRET not set in environment"
+                "Feishu is not configured: set FEISHU_APP_ID, and make the "
+                "app secret resolvable — in the OS keychain, or in "
+                "FEISHU_APP_SECRET on a machine with no keychain."
             )
 
         # Lazy import — lark is heavy and we want the constructor to

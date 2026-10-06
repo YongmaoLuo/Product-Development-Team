@@ -25,6 +25,9 @@ from datetime import datetime, timedelta, timezone
 
 from utils.process import kill_process_group
 from utils.secret_files import private_dir, redact_all, write_private_json
+# Sub-agent sandbox wrapping (2026-10-06). Dependency-free (stdlib only)
+# and it imports nothing from this module, so a top-level import is safe.
+import claude_sandbox
 # Capacity gating for scene-routed dispatch (2026-09-17). This module is
 # dependency-free (stdlib only), so a top-level import carries no cycle
 # risk — unlike ``provider_routing`` / ``provider_order``, which pull in
@@ -1580,6 +1583,29 @@ class ClaudeCodingTool(CodingTool):
                 cmd += ["--settings", str(effective_settings_path)]
             elif self.settings is not None:
                 cmd += ["--settings", str(self.settings)]
+
+            # 2026-10-06: confine the sub-agent when the operator
+            # configured a sandbox. `bypassPermissions` removes the
+            # confirmation prompts, so without this the agent has
+            # unrestricted filesystem access with no gate anywhere in
+            # the path. Fails loudly rather than falling back — see
+            # backend/claude_sandbox.py for why a sandbox that quietly
+            # disables itself is the worse outcome.
+            _sandbox = claude_sandbox.wrap_command(cmd, env)
+            cmd = _sandbox.command
+            if self.logger:
+                if _sandbox.reason == "applied":
+                    self.logger.info(
+                        "subagent_sandboxed",
+                        f"Sub-agent running under {_sandbox.profile}",
+                        data={"profile": str(_sandbox.profile)},
+                    )
+                else:
+                    self.logger.info(
+                        "subagent_sandbox_absent",
+                        "No sandbox configured; sub-agent runs unsandboxed",
+                        data={"profile": None},
+                    )
 
             # Launch subprocess. Interactive mode: stdin is plain text,
             # write the prompt then close stdin (which signals the LLM

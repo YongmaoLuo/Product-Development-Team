@@ -168,8 +168,17 @@ def test_the_serial_lane_collects_perf() -> None:
 #: budget their behaviour needs. Each must carry the ``integration`` marker,
 #: because the unit lanes' expression excludes it and their per-test ceiling
 #: does not fit a cold interpreter start plus a backend import.
+#:
+#: ``test_credentials_fd_isolation.py`` builds a three-level relay of real
+#: child processes to prove the secret reaches a process that did not open
+#: the descriptor, so it belongs here for the same reason as the entry
+#: above. Unregistered it would still be COLLECTED — the default lanes'
+#: ``-m`` does not filter a file out, only the tests inside it — and would
+#: run under a 60s per-test ceiling a chain of cold interpreter starts
+#: cannot meet.
 _SUBPROCESS_DRIVERS = (
     "backend/tests/integration/test_agent_execute_task_first5.py",
+    "backend/tests/integration/test_credentials_fd_isolation.py",
 )
 
 
@@ -659,7 +668,15 @@ def test_the_bisect_lane_runs_the_shape_it_bisects(flag: str) -> None:
 #: in 32. What they cost is not minutes, it is the fact that a main-only
 #: gate reports a broken pipeline *after* it is on main, where the fix is
 #: a revert.
-_MERGE_GATING_JOBS = ("e2e-on-demand", "existing-test")
+#:
+#: ``e2e-keychain`` joined for the same reason and one more: it is the
+#: only lane that runs where a keychain exists, so every assertion that
+#: could catch a defective credential read lives in it and nowhere else.
+#: Listed rather than derived, because the list is the thing a future edit
+#: has to update — a job that is not named here is a job whose trigger
+#: nobody re-checks. ``test_keychain_macos_job_is_a_merge_gate.py`` is
+#: the gate that notices when one drops out.
+_MERGE_GATING_JOBS = ("e2e-on-demand", "existing-test", "e2e-keychain")
 
 
 @pytest.mark.parametrize("job_name", _MERGE_GATING_JOBS)

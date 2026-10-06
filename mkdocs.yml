@@ -65,6 +65,7 @@ nav:
   - Operations:
       - Running it: operations/running.md
       - Configuration: operations/configuration.md
+      - Keychain migration: operations/keychain-migration.md
   - Development:
       - Tests: development/testing.md
       - Contributing: development/contributing.md
