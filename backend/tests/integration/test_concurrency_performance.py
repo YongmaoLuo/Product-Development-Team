@@ -161,11 +161,38 @@ def _run_task_with_locks(
     manager = FileLockManager()
     manager.acquire(target_files, str(project_dir), timeout=per_task_lock_timeout)
     start = time.monotonic()
+    end = start
     try:
         time.sleep(sleep_seconds)
     finally:
+        # `end` is read while the lock is STILL HELD, before
+        # ``release()`` — that is the "pre-release" half of the
+        # window this function documents.
+        #
+        # Reading it after ``release()`` returns is a false-positive
+        # generator, and it is not a small one. ``release()`` frees
+        # the OS-level lock at some instant T; a waiting task's
+        # ``acquire()`` can then return and read its own ``start``
+        # before this task has finished returning from ``release()``
+        # and reached the ``monotonic()`` call. If that task's
+        # start lands inside this task's window, the overlap sweep
+        # reports peak 2 for a lock that was held by exactly one task
+        # at every instant.
+        #
+        # The window is the time for a thread to return from a
+        # function and call ``monotonic()``: microseconds on a quiet
+        # machine, enough to lose the race on a loaded runner with
+        # sixteen threads contending. It showed up on CI as
+        # `file src/file_1.py was held by 2 tasks simultaneously,
+        # expected 1` while passing 5/5 locally, and it is a
+        # property of the measurement rather than of the lock.
+        #
+        # Reading `end` first makes a false positive impossible by
+        # construction: the lock is still held at that instant, so no
+        # other task can have acquired it yet, and every other task's
+        # `start` is necessarily greater.
+        end = time.monotonic()
         manager.release()
-    end = time.monotonic()
     return start, end
 
 
@@ -616,6 +643,52 @@ def test_mixed_tasks_correct_overlap(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # TDD test 4: 50 tasks / 5 files — deadlock-free stress
 # ---------------------------------------------------------------------------
+
+
+def test_the_hold_window_ends_before_the_lock_is_released(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``end`` is captured while the lock is still held, not after.
+
+    The overlap sweep reads these intervals as "this task was holding
+    this file between start and end". If ``end`` were read after
+    ``release()``, a task that had already given the lock up would
+    still be counted as holding it for the duration of the release
+    call — long enough, under runner load, for the next task's
+    ``start`` to land inside it. The sweep would then report an
+    overlap for a lock that was held by exactly one task at every
+    instant, and the failure would name a lock bug that did not
+    happen.
+
+    Slowing ``release`` down makes the difference measurable instead
+    of a race: a window that includes the release is longer than the
+    sleep it is supposed to bound.
+    """
+    release_cost = 0.25
+    real_release = FileLockManager.release
+
+    def slow_release(self: FileLockManager) -> None:
+        real_release(self)
+        time.sleep(release_cost)
+
+    monkeypatch.setattr(FileLockManager, "release", slow_release)
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    sleep_seconds = 0.05
+
+    start, end = _run_task_with_locks(
+        project_dir, ["src/file_0.py"], sleep_seconds
+    )
+
+    window = end - start
+    assert window < sleep_seconds + release_cost / 2, (
+        f"the hold window was {window:.3f}s for a {sleep_seconds}s task; "
+        f"it absorbed part of a {release_cost}s release, so it is being "
+        f"measured across the point where the lock is already free — "
+        f"which is what lets a released task overlap the next task's "
+        f"window and report a lock bypass that never happened"
+    )
 
 
 def test_deadlock_free_stress(tmp_path: Path) -> None:
