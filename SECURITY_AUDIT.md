@@ -698,6 +698,49 @@ backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_pr_metadata_
 
 ---
 
+### Finding ENTRY-040
+
+档位: should-fix
+
+问题: **仓库依赖三处声明，谁也不核对谁。** `backend/requirements.txt` 是一份 `>=` 下界清单，于是每个 CI job 都从零重新解析整张图 —— 解析器那天挑中的版本，就是当天被测的版本。`filelock` 因此走到 3.20.4：它 `import` 时注册第二个 `atexit` 回调，`test_agent_no_atexit_settings.py` 断言一个都没注册，于是 `main` 红了，而这次变红没有任何一处改动可以背锅。同一份文件之外，工作流里还有若干 `pip install` 绕开它，直接把**未经钉死的 pytest 本身**装进 venv —— 覆盖掉文件里写的版本；有一个 lane 用 `-n 2` 跑 pytest，而它需要的 `pytest-xdist` 在任何清单里都没有声明。第三处，`backend/.venv` 是 Python 3.9 而每个 CI job 跑 3.11，两边对同一个测试给出不同答案：同一条断言在一个上面通过、在另一个上面失败，于是「本地结果」和「CI 结果」不再是关于同一件事的答案。没有任何门禁核对这三者。
+
+影响: 一条**没有任何检查的漂移通道**，形状与 ENTRY-036 至 ENTRY-039 一致 —— 不是门禁坏了，是门禁根本不在那个位置。它的后果与前几条不同：前几条泄露的是标识符，这一条改变的是**被测物本身**。一次常规升级可以换掉测试框架或被测库的版本，而仓库里没有任何一处文件记录过这件事发生过；事后的取证只剩下「那次 CI 跑的是什么版本」这个问题无人回答。版本不一致那一条更隐蔽：它不产生红，它产生**看起来正常的红**，于是本机结论被当成 CI 结论的对照，而两者根本不是一回事。
+
+攻击路径: 前置条件 — 无（这是可复现的构建配置缺陷，不是运行时漏洞；列出它是为了让本轮改动可归因）；触发步骤 — 一次不触碰本仓的常规依赖升级，被解析器解到上界之外；可观测后果 — 合入门禁在没有任何相关改动的情况下变红，而反过来，一次真的回归也可能被解释成「又漂移了」，于是重跑、重解释、放过。
+
+修复: 依赖声明移到 `backend/pyproject.toml`，旁边放 `backend/uv.lock`，`backend/requirements.txt` 删除。工作流里每一个后端安装都换成 `uv sync --project backend --locked`；`--locked` 让 uv 在锁与清单不一致时**直接失败**，这正是 `pip install -r` 做不到的那件事。绕过清单的 `pip install` 全部取消：它们装的包（`bandit`、`coverage`、`pytest-xdist`、`requests`）改为声明在 `dev` 依赖组里，随锁一起钉死。Python 版本由清单的 `requires-python = ">=3.11,<3.12"` 结构性保证 —— 声明成一个区间的下界与上界，而不是「3.11 以上」，因为没测过的解释器不该被声称可用；建出来的 venv 不可能是别的版本。原有的 `test_install_steps_are_unchanged` 改写为同一契约的 uv 表述：仍禁止安装被窄化（`--no-dev` 是 uv 的窄化写法，按名字拒掉），并额外断言 `--locked` 存在 —— 后者比原先的字面串检查**更强**，因为它能抓住一种静默变化，而字面串永远看不见。新增 `backend/tests/static_gates/test_dependency_manifest_and_lock_agree.py`，四个断言分别核对：锁记录的 requirements 与清单一致（读 `[package.metadata]`，**不需要装 uv 就能跑**）、清单里每个声明都在锁的包表里有可安装条目、清单/lock/工作流三处的 `python-version` 指向同一个系列、工作流里没有任何裸 `pip install` 把包带出锁之外。这四条门禁的判据都是「把结论写进断言消息里」，而不是「扫描器还在」—— 本仓自己踩过那个坑（见 ENTRY-039 记录的 `pr_metadata-privacy` 事故形状）。
+
+**它做不到什么，写在这里免得被当成万能的**：它读文件，不解析。锁内部自洽但钉住了一个已撤回的版本，它看不出来 —— 那是 `uv sync --locked` 的职责，而 CI 每个 job 都跑它。反过来这条门禁刻意不依赖 uv，所以它能在没装 uv 的机器上跑；只在一种机器上能跑的门禁不是门禁。
+
+验证方式:
+```bash
+backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_dependency_manifest_and_lock_agree.py backend/tests/integration/test_ci_gate_reuse_contract.py -q
+```
+
+---
+
+### Finding ENTRY-041
+
+档位: should-fix
+
+问题: **读钥匙串的超时是 5 秒,而锁着的钥匙串把这��读取变成人机交互。** macOS 在条目所属钥匙串处于锁定状态时,不返回错误也不返回空值,而是在屏幕上弹一个密码框,只有有人把密码敲进去,值才回来。5 秒短于「读完一个弹窗并开始打字」所需的时间,所以这个界到期的时刻,密码通常刚打了一半。
+
+影响: 失败被报成「没配置」而不是「超时」。`backend/credentials.py` 的 `_resolve_from_keychain` 把一次读取失败、一条非零退出、以及一次超时全部映射成同一个 `(None, "missing")`,调用方拿到的是「钥匙串里没有这个 secret」——于是一条**关于钥匙串状态的断言**被一个**关于时间预算的事实**满足了。这是本仓反复出现的那一类:失败状态有多种成因,被压成一个之后,读代码的人只能从错误信息推断成因,而错误信息恰恰是压过的那一层。
+
+更具体的后果是操作者看到的东西与实际发生的相反:弹窗可能活得比打开它的进程更久(工具已被杀,窗口留下),也可能在密码正确、但已无读者的时刻消失。同一个提示因此同时像「输了也没用」和「不输就卡住」,而真实原因(时间不够)不出现��任何一条消息里。
+
+攻击路径: 前置条件 — macOS,且 `credentials._KEYCHAIN_PATH` 指向的钥匙串处于锁定状态(重启、闲置超时、注销后都是这个状态);触发步骤 — 以 `PDT_DISABLE_KEYCHAIN_SECRETS=0` 启动,且明文变量未配置;可观测后果 — 通知通道在启动时自报未配置并停用,而机器上其实有可用的条目 —— 操作者若输入了正确密码,看到的是一个仍然报错的界面,且没有任何消息说明失败与密码无关。
+
+修复: `backend/credentials.py` 的 `_KEYCHAIN_TIMEOUT_SECONDS` 由 5.0 提高到 60.0。界保留,因为它最初要解决的那个问题是真的:无头机器上没有弹窗,没有界的话调用不是慢而是卡死,子进程会活过这次读取。60 秒仍然封住卡死,只是把「人需要的时间」留出来。**不改失败状态的映射** —— 那是另一条独立的改动,而把 timeout 与 item-not-found 分成两个返回值会迫使每一个调用方处理一种它们无从应对的分类(见同一文件里 `_run_security` 的 docstring)。这里修的是预算,不是语义。
+
+端到端的那一半:以 `PDT_DISABLE_KEYCHAIN_SECRETS=0` 启动、且根 `.env` 无明文时,读取会在弹窗上等密码;从进程启动到 `FeishuClient initialized` 之间会有一段以人的输入长度衡量的间隔,而修复前这个间隔的下界比 5 秒还长 —— 到期时读取拿到的是「没配置」,而不是「超时」。
+
+验证方式:
+
+```bash
+backend/.venv/bin/python3 -m pytest backend/tests/unit/test_credentials_switch.py backend/tests/integration/test_credentials_security_lookup.py backend/tests/integration/test_credentials_cache_invariants.py -q
+```
+
 ## Appendix A — modified tests
 
 The audit policy permits modifying existing tests that encoded
@@ -848,7 +891,7 @@ alone is not enough — see the test source for the exact contract).
 | `scripts/run_tests.sh` | ENTRY-012 | Lifted options to `set -euo pipefail`; retargeted default to `backend/tests`. | One line covers ENTRY-012 and ENTRY-013; row lets the gate accept either. |
 | `example/provider_capacity.yaml.example` | ENTRY-016 | Every `pattern:` carries the `^Example ` placeholder prefix. | Operator-template example edited to neutralise leaked provider names. |
 | `example/provider_routing.yaml.example` | ENTRY-016 | Every tier entry carries the `^Example ` placeholder prefix. | Same gate, separate files; same reason as capacity example. |
-| `.github/workflows/ci.yml` | ENTRY-007 | Non-empty `jobs:`, `pip install -r backend/requirements.txt`, venv pytest prefix. | ENTRY-007 to ENTRY-011 share one file; one row covers all five. |
+| `.github/workflows/ci.yml` | ENTRY-007 | Non-empty `jobs:`, `uv sync --project backend --locked`, venv pytest prefix. | ENTRY-007 to ENTRY-011 share one file; one row covers all five. The install spelling changed under ENTRY-040; the contract did not. |
 | `.github/workflows/test_json_cleanup.yml` | ENTRY-037 | `pull_request` trigger carries no `paths:` filter. | It is a required check; a path-filtered required check stays pending forever. |
 | `.github/workflows/pages.yml` | ENTRY-037 | `pull_request` trigger carries no `paths:` filter; `build (strict)` is required. | The header claims a rotten link blocks the PR; two separate conditions kept that false. |
 | `.github/workflows/ci.yml` | ENTRY-038 | `static-gates` job is upstream of every PR lane; shards execute in a run-seeded shuffled order. | Shares one file with ENTRY-007..011; one row per concern keeps the reason a change was made attributable. |
@@ -856,3 +899,5 @@ alone is not enough — see the test source for the exact contract).
 | `frontend/app.js` | ENTRY-001 | Calls `api()` instead of bare `fetch`; partial migration tracked here. | ENTRY-003 names the migration; row records the touched file. |
 | `.gitignore` | ENTRY-016 | Confirms `.config/` is ignored and no tracked file lives under it. | Rule set here; row keeps the gate honest if the ignore drifts. |
 | `backend/verification_subagent.py` | ENTRY-014 | Tightened `_evidence_contract` to reject ellipsis and outside-project paths. | Pin path-validation at the verifier; closes the `/tmp` hole. |
+| `backend/pyproject.toml` | ENTRY-040 | New: the dependency manifest that replaced `backend/requirements.txt`. Carries `requires-python`, the runtime list, the `dev` group, and the reasoning behind each pin. | ENTRY-040's prose names the file by role rather than by path; one row keeps the gate honest when the prose is reworded. |
+| `backend/uv.lock` | ENTRY-040 | New: the locked transitive closure every CI job installs from. | Generated, but tracked — a generated file that is also a merge gate still needs a reason a change was authorised. |

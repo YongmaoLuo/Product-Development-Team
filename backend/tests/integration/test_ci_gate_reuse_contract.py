@@ -31,8 +31,8 @@ historical regressions made this concrete:
 This module pins five contracts so neither regression returns under
 a different shape. The tests are deliberately string-level rather
 than AST-level — the audit's job is to make the gate *obvious*, not
-to allow future maintainers to rename ``pip install -r
-backend/requirements.txt`` and still pass.
+to allow future maintainers to rename ``uv sync --project backend
+--locked`` and still pass.
 
 Public surface
 --------------
@@ -46,7 +46,8 @@ TDD spec (5 gates):
           YAML parses; top-level ``jobs:`` block exists.
 
   Gate 2: ``test_install_steps_are_unchanged``
-          ``pip install -r backend/requirements.txt`` is still present.
+          every install is ``uv sync --project backend --locked``,
+          and nothing passes ``--no-dev``.
 
   Gate 3: ``test_grep_guard_step_still_present``
           ``bash ../scripts/grep_guard.sh`` is still present.
@@ -67,6 +68,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+from typing import List
 
 import pytest
 import yaml
@@ -247,18 +249,83 @@ def test_ci_definition_parses() -> None:
 
 @pytest.mark.integration
 def test_install_steps_are_unchanged() -> None:
-    """``pip install -r backend/requirements.txt`` must still appear.
+    """Every ``uv sync`` the workflow runs must be ``--locked``, and none may be ``--no-dev``.
 
     Pinned at the audit level: a contributor who narrows the install
     to ``pip install .`` (omitting the dev/test extras) would let
     pytest collection fail silently on CI without any one test
     noticing.
+
+    The spelling changed on 2026-10-06 when ``backend/requirements.txt``
+    gave way to ``backend/pyproject.toml`` + ``backend/uv.lock``, but the
+    contract underneath did not — and the replacement is strictly
+    stronger, so this is the same gate pointed at a better mechanism:
+
+    * ``--locked`` makes uv *fail* when ``uv.lock`` and
+      ``pyproject.toml`` disagree. The old ``pip install -r`` resolved
+      the whole graph afresh on every job, so a routine upgrade could
+      change what CI tested with no edit to blame. That is not a
+      narrower gate, it is a different kind: it catches a *silent*
+      change the substring check could never have seen.
+    * ``--no-dev`` is the uv spelling of dropping the test extras, so
+      it is rejected by name. ``uv sync`` installs the ``dev`` group by
+      default and nothing in the repository may turn that off.
+
+    Scanned through the YAML rather than as text, and only over ``run:``
+    payloads. The first version of this gate matched any line
+    mentioning ``uv sync`` — which meant the explanatory comment above
+    each install step (``# `uv sync` installs backend/uv.lock…``) read
+    as an install missing ``--locked``. A gate that trips on prose
+    about itself gets deleted the first time someone improves the prose.
     """
     text = ci_yml_text()
-    assert "pip install -r backend/requirements.txt" in text, (
-        "ci.yml no longer contains `pip install -r backend/requirements.txt`; "
-        "the install step was changed and may have dropped a dev/test "
-        "extra. Restore the original install line."
+
+    assert "pip install -r backend/requirements.txt" not in text, (
+        "ci.yml still installs from backend/requirements.txt, which no "
+        "longer exists and is not covered by uv.lock. Route every "
+        "install through `uv sync --project backend --locked`."
+    )
+
+    workflow = yaml.safe_load(text)
+    offenders: List[str] = []
+    seen = 0
+
+    for job_name, job in workflow["jobs"].items():
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if not isinstance(run, str):
+                continue
+            for raw in run.splitlines():
+                line = raw.strip()
+                if not line.startswith("uv sync"):
+                    continue
+                seen += 1
+                where = f"job {job_name!r}, step {step.get('name', '<unnamed>')!r}"
+                if "--locked" not in line:
+                    offenders.append(
+                        f"  {where}: {line!r} — no --locked. Without the "
+                        f"flag uv silently re-resolves instead of "
+                        f"installing backend/uv.lock, which is the exact "
+                        f"drift this manifest exists to prevent."
+                    )
+                if "--no-dev" in line:
+                    offenders.append(
+                        f"  {where}: {line!r} — --no-dev drops the dev "
+                        f"group, which carries pytest, pytest-asyncio, "
+                        f"pytest-timeout, pytest-cov, pytest-xdist, "
+                        f"coverage, bandit and the rest of what the "
+                        f"suite is run with. Collection then fails with "
+                        f"no test to notice."
+                    )
+
+    assert seen, (
+        "no `uv sync` invocation was found in any `run:` block of ci.yml; "
+        "the install step was changed and no longer routes through the "
+        "lockfile. Restore `uv sync --project backend --locked`."
+    )
+    assert not offenders, (
+        "these install steps in ci.yml are not the locked sync:\n"
+        + "\n".join(offenders)
     )
 
 

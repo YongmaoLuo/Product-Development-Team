@@ -125,9 +125,8 @@ it is:
 ### Installation and startup / 安装与启动
 
 ```bash
-python3 -m venv backend/.venv
+uv sync --project backend        # builds backend/.venv from backend/uv.lock
 source backend/.venv/bin/activate
-pip install -r backend/requirements.txt
 
 cp backend/.env.ci backend/.env      # non-secret placeholders
 

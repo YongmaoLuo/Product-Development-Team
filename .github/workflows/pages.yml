@@ -65,9 +65,12 @@ jobs:
           cache-dependency-path: docs/requirements.txt
 
       # Docs-only dependencies, deliberately kept out of
-      # backend/requirements.txt so the server never installs a static
+      # backend/pyproject.toml so the server never installs a static
       # site generator and a docs change never invalidates the backend's
-      # dependency layer.
+      # dependency layer. The split is structural now — the backend's
+      # venv comes from `uv sync --project backend` and this lane's
+      # install is a separate pip call against a separate file, so
+      # neither can reach the other's packages.
       - name: Install docs dependencies
         run: python -m pip install -r docs/requirements.txt
 

@@ -1,0 +1,146 @@
+# Backend dependency manifest for PDT.
+#
+# This file replaced `backend/requirements.txt` on 2026-10-06. It is the
+# single source of truth; `uv.lock` beside it pins the *entire*
+# transitive closure, and `uv sync --locked` installs exactly that and
+# fails loudly if the two have drifted apart.
+#
+# Why the format changed (the defect is reproducible, not stylistic):
+#
+#   * `requirements.txt` was a list of `>=` floors. Every CI run
+#     re-resolved the whole graph from scratch, so the version a job
+#     tested was whichever one the resolver happened to pick that day.
+#     `filelock` drifted to 3.20.4 and turned `main` red with no change
+#     to blame — see the note on that pin below.
+#   * Twenty `pip install` lines in CI bypassed the file entirely and
+#     installed unpinned copies of pytest itself, overriding whatever
+#     the file said. `pytest-xdist` was used by a job (`-n 2`) and was
+#     not declared anywhere at all.
+#   * Nothing recorded which Python the venv was supposed to be. The
+#     checkout's `backend/.venv` sat at 3.9 while every CI job ran 3.11
+#     for eleven days, and the two disagreed about test outcomes.
+#
+# The last one is now structural: `requires-python` below is enforced by
+# uv itself, so a venv that is not the declared version cannot be built
+# at all. `backend/tests/static_gates/` pins the agreement between this
+# field, the lockfile, and the `python-version:` in ci.yml.
+
+[project]
+name = "pdt-backend"
+version = "0.1.1"
+description = "Product Development Team backend"
+requires-python = ">=3.11,<3.12"
+
+# Upper bound on purpose. CI runs 3.11 and that is the only version this
+# tree has ever been tested on; an untested interpreter is not claimed
+# to work. Contributors on 3.12 get uv's own "requires-python
+# unsatisfied" error naming this line, instead of a suite that fails in
+# ways nobody can reproduce.
+dependencies = [
+    "GitPython>=3.1.0",
+    "PyYAML>=6.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+    "python-dotenv>=1.0.0",
+    "APScheduler>=3.10.0",
+    # httpx is required by starlette.testclient / fastapi.testclient.
+    # The integration / API test suites import ``TestClient`` for
+    # in-process endpoint tests, so a clean install must include it.
+    # Production uses it too (``backend/client.py`` and the Telegram
+    # notifier), so this is a runtime dependency rather than an extra.
+    "httpx>=0.27.0",
+    # Validates the verification-plan schema (``backend/framework/
+    # watchdog_signal.py`` reads the emitted payloads).
+    "jsonschema>=4.0",
+    # OS-level file locking used by the agent to coordinate access to
+    # project files across tasks and processes.
+    #
+    # The upper bound is load-bearing, and the boundary was measured
+    # rather than guessed. ``import filelock`` registers ``atexit``
+    # handlers as a side effect, so the count matters to
+    # ``tests/integration/test_agent_no_atexit_settings.py``: that test
+    # spies on ``atexit.register`` while importing ``agent`` and asserts
+    # nothing was registered, and its own docstring says it counts
+    # *every* transitive registration — anyio is caught the same way.
+    #
+    # Measured on Python 3.11, the version CI runs:
+    #
+    #   3.13.0 .. 3.20.3  ->  1 handler  ->  the suite passes
+    #   3.20.4 ..          ->  2+ handlers ->  the suite fails
+    #
+    # The step is small but it is not at a major boundary, which is why
+    # the comment carries the numbers instead of a version somebody
+    # remembered. Production is unaffected either way — the handlers are
+    # the library's own bookkeeping, and ``agent.py`` registers nothing.
+    # The honest fix is to narrow that test's contract so it counts
+    # agent.py's own registrations rather than the whole import graph;
+    # until then this bound is what keeps an unrelated upgrade from
+    # landing on main red.
+    "filelock>=3.13.0,<3.20.4",
+    # Feishu IM push (backend/notifications/feishu_notifier.py).
+    # Required for the in-process event-driven card push that replaces
+    # the legacy polling bridge (commit 917ba667). Without this dep
+    # feishu_notifier self-disables at server startup and silently
+    # degrades to "no push".
+    "lark-oapi>=1.7.0",
+]
+
+[dependency-groups]
+# Everything the suite is *run* with, as opposed to the libraries it
+# imports. `uv sync` installs this group by default, and so does every
+# CI job — no job passes `--no-dev`, which
+# `test_the_dev_group_covers_every_ci_install` enforces. The previous
+# arrangement lost packages twice: the dev/test tooling was missing
+# from a clean install until 2026-09-24 (pytest.ini's `timeout` and
+# `timeout_method` were silently ignored rather than applied), and
+# `pytest-xdist` was used by a job without being declared anywhere.
+dev = [
+    # Imported across the unit / integration / E2E suites; a clean
+    # install needs these to collect tests.
+    "freezegun>=1.0",
+    "requests-mock>=1.10",
+    # Declared in its own right rather than relied on transitively:
+    # tests import ``requests`` directly, and it used to reach CI only
+    # because eight jobs ran a bare `pip install ... requests`.
+    "requests>=2.31.0",
+    # ``tests/e2e/test_teardown_cleanup.py`` uses ``psutil`` to verify
+    # that subsidiary processes have been torn down (no zombies left
+    # after the suite ends). The test calls
+    # ``pytest.importorskip("psutil")`` so a missing dep produces a
+    # clean skip rather than a hard fail, but installing it lets the
+    # teardown contract actually be exercised.
+    "psutil>=5.9",
+    # ~100 ``async def test_*`` coroutines across the suite
+    # (verification API, auth boundary, session errors, lock hooks …)
+    # are driven by pytest-asyncio in STRICT mode (see pytest.ini).
+    # Without the plugin a clean install errors every one with "async
+    # def functions are not natively supported".
+    "pytest-asyncio>=1.0",
+    # pytest.ini sets `timeout = 300` / `timeout_method = thread`, and
+    # CI passes --timeout= on the command line. Without the plugin
+    # neither is honoured — the suite would hang forever instead of
+    # failing.
+    "pytest-timeout>=2.3",
+    # CI's unit shards pass --cov=.; without the plugin pytest exits
+    # with "unrecognized arguments: --cov".
+    "pytest-cov>=5.0",
+    # Invoked directly by the shards that merge coverage data, and a
+    # dependency of pytest-cov — declared so the pin is ours rather than
+    # whatever pytest-cov happens to allow today.
+    "coverage>=7.0",
+    # The nightly / staircase lanes run pytest across N workers (-n 2).
+    # Previously installed by a bare `pip install ... pytest-xdist` in
+    # one job and declared nowhere, so any resolver change could drop
+    # it and the lane would fail to start.
+    "pytest-xdist>=3.0",
+    # Static security scan for the lint lane.
+    "bandit>=1.7",
+]
+
+[tool.uv]
+# `backend/` has an `__init__.py` because it is imported as
+# ``backend.<module>`` from the repository root. Without this, uv
+# treats the directory as a distributable package and tries to build
+# and install it during `uv sync`; the project is an application, not
+# a library, and has no build backend.
+package = false
