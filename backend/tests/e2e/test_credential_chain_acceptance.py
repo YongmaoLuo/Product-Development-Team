@@ -146,6 +146,7 @@ import hashlib
 import inspect
 import os
 import re
+import shutil
 import subprocess
 import sys
 import unittest.mock
@@ -1834,7 +1835,21 @@ def test_the_cleanup_checks_disposability_before_it_deletes(tmp_path, monkeypatc
 
 
 def test_a_refused_keychain_is_not_deleted(monkeypatch):
-    """When the guard refuses, the delete does not happen at all."""
+    """When the guard refuses, the delete does not happen at all.
+
+    Like its twin in the macOS-delivery suite, this case can only reach
+    the guard's second branch by pointing a home at the operator's own
+    directory tree, so the fake ``create-keychain`` really does create a
+    directory and a zero-byte file there. It therefore owes the machine a
+    cleanup, which it did not have: every run left
+    ``<real home>/not-a-redirect/Library/Keychains/`` behind.
+
+    The cleanup is conditional on the directory not having existed
+    beforehand, because ``rmtree`` does not ask whether the name was
+    somebody's before it was this suite's.
+    """
+    litter = _REAL_HOME / "not-a-redirect"
+    pre_existed = litter.exists()
     deleted = []
 
     def _fake_security(*args, **kwargs):
@@ -1847,14 +1862,18 @@ def test_a_refused_keychain_is_not_deleted(monkeypatch):
 
     monkeypatch.setattr(sys.modules[__name__], "_security", _fake_security)
 
-    with pytest.raises(pytest.fail.Exception, match="delete"):
-        with _real_keychain(_REAL_HOME / "not-a-redirect"):
-            pass
+    try:
+        with pytest.raises(pytest.fail.Exception, match="delete"):
+            with _real_keychain(litter):
+                pass
 
-    assert deleted == [], (
-        "the guard refused, so nothing may have been deleted. Deleted: "
-        "{}".format(deleted)
-    )
+        assert deleted == [], (
+            "the guard refused, so nothing may have been deleted. Deleted: "
+            "{}".format(deleted)
+        )
+    finally:
+        if not pre_existed:
+            shutil.rmtree(litter, ignore_errors=True)
 
 
 @_requires_macos_keychain
