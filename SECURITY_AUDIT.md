@@ -719,6 +719,28 @@ backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_dependency_m
 
 ---
 
+### Finding ENTRY-041
+
+档位: should-fix
+
+问题: **读钥匙串的超时是 5 秒,而锁着的钥匙串把这��读取变成人机交互。** macOS 在条目所属钥匙串处于锁定状态时,不返回错误也不返回空值,而是在屏幕上弹一个密码框,只有有人把密码敲进去,值才回来。5 秒短于「读完一个弹窗并开始打字」所需的时间,所以这个界到期的时刻,密码通常刚打了一半。
+
+影响: 失败被报成「没配置」而不是「超时」。`backend/credentials.py` 的 `_resolve_from_keychain` 把一次读取失败、一条非零退出、以及一次超时全部映射成同一个 `(None, "missing")`,调用方拿到的是「钥匙串里没有这个 secret」——于是一条**关于钥匙串状态的断言**被一个**关于时间预算的事实**满足了。这是本仓反复出现的那一类:失败状态有多种成因,被压成一个之后,读代码的人只能从错误信息推断成因,而错误信息恰恰是压过的那一层。
+
+更具体的后果是操作者看到的东西与实际发生的相反:弹窗可能活得比打开它的进程更久(工具已被杀,窗口留下),也可能在密码正确、但已无读者的时刻消失。同一个提示因此同时像「输了也没用」和「不输就卡住」,而真实原因(时间不够)不出现��任何一条消息里。
+
+攻击路径: 前置条件 — macOS,且 `credentials._KEYCHAIN_PATH` 指向的钥匙串处于锁定状态(重启、闲置超时、注销后都是这个状态);触发步骤 — 以 `PDT_DISABLE_KEYCHAIN_SECRETS=0` 启动,且明文变量未配置;可观测后果 — 通知通道在启动时自报未配置并停用,而机器上其实有可用的条目 —— 操作者若输入了正确密码,看到的是一个仍然报错的界面,且没有任何消息说明失败与密码无关。
+
+修复: `backend/credentials.py` 的 `_KEYCHAIN_TIMEOUT_SECONDS` 由 5.0 提高到 60.0。界保留,因为它最初要解决的那个问题是真的:无头机器上没有弹窗,没有界的话调用不是慢而是卡死,子进程会活过这次读取。60 秒仍然封住卡死,只是把「人需要的时间」留出来。**不改失败状态的映射** —— 那是另一条独立的改动,而把 timeout 与 item-not-found 分成两个返回值会迫使每一个调用方处理一种它们无从应对的分类(见同一文件里 `_run_security` 的 docstring)。这里修的是预算,不是语义。
+
+端到端的那一半:以 `PDT_DISABLE_KEYCHAIN_SECRETS=0` 启动、且根 `.env` 无明文时,读取会在弹窗上等密码;从进程启动到 `FeishuClient initialized` 之间会有一段以人的输入长度衡量的间隔,而修复前这个间隔的下界比 5 秒还长 —— 到期时读取拿到的是「没配置」,而不是「超时」。
+
+验证方式:
+
+```bash
+backend/.venv/bin/python3 -m pytest backend/tests/unit/test_credentials_switch.py backend/tests/integration/test_credentials_security_lookup.py backend/tests/integration/test_credentials_cache_invariants.py -q
+```
+
 ## Appendix A — modified tests
 
 The audit policy permits modifying existing tests that encoded
