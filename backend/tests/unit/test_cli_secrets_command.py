@@ -463,3 +463,89 @@ def test_module_and_script_entrypoints_agree(tmp_path):
     # through a captured exception: the requirement is that a platform
     # the command cannot serve is answered in a sentence.
     assert b"Traceback" not in module_form.stderr
+
+# ---------------------------------------------------------------------------
+# verify: saying *why* a secret is missing
+# ---------------------------------------------------------------------------
+
+
+def test_verify_explains_a_missing_secret_rather_than_only_reporting_it(
+    monkeypatch, capsys, tmp_path
+):
+    """``source=missing`` is one word for at least four situations.
+
+    The operator who reads it has no way to tell which one they have,
+    and they are fixed in four different places. The switch being off is
+    the most common by far and the least alarming; a locked keychain is
+    the one that also cost a minute of blocking first, and sending
+    someone to look for a credential that was never set up because the
+    message said "missing" is the failure this line removes.
+    """
+    # The autouse fixture leaves the switch at "1" and both credential
+    # keys unset, which is exactly "switched off, nothing in the
+    # environment".
+    assert cli.cmd_secrets_verify() == 1
+    out = capsys.readouterr().out
+
+    assert "source=missing" in out
+    assert credentials._SWITCH_ENV_KEY in out
+    assert "feishu_app_secret" in out
+
+
+def test_verify_names_the_missing_index_when_the_keychain_is_on(
+    monkeypatch, capsys, tmp_path
+):
+    """A different cause with a different fix: the lookup was never
+    attempted, so an item cannot be what is missing."""
+    monkeypatch.setenv(credentials._SWITCH_ENV_KEY, "0")
+    monkeypatch.setattr(credentials, "_is_macos", lambda: True)
+    # No FEISHU_APP_ID, so there is no account to look anything up by.
+    monkeypatch.delenv("FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+    assert cli.cmd_secrets_verify() == 1
+    out = capsys.readouterr().out
+
+    assert "FEISHU_APP_ID" in out
+    assert "is locked" not in out
+
+
+def test_verify_says_nothing_extra_when_every_secret_resolves(
+    monkeypatch, capsys, tmp_path
+):
+    """A command that narrates the healthy rows trains the reader to skip
+    the output that matters."""
+    monkeypatch.setenv(
+        credentials.SECRET_SPECS["feishu_app_secret"].fallback_env_key, "s"
+    )
+    monkeypatch.setenv(
+        credentials.SECRET_SPECS["telegram_bot_token"].fallback_env_key, "t"
+    )
+
+    assert cli.cmd_secrets_verify() == 0
+    out = capsys.readouterr().out
+
+    assert "source=os.environ" in out
+    assert "missing" not in out
+
+
+def test_the_explanation_never_prints_a_secret(
+    monkeypatch, capsys, canary, tmp_path
+):
+    """The line exists to be read by a person pasting output into an
+    issue. A diagnostic that carried the credential would make it the
+    worst possible thing to paste."""
+    secret = canary("feishu_secret", tmp_path)
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_abc")
+    monkeypatch.setenv(
+        credentials.SECRET_SPECS["feishu_app_secret"].fallback_env_key, secret
+    )
+    monkeypatch.delenv(
+        credentials.SECRET_SPECS["telegram_bot_token"].fallback_env_key,
+        raising=False,
+    )
+
+    cli.cmd_secrets_verify()
+    out = capsys.readouterr().out
+
+    assert secret not in out
