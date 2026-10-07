@@ -731,14 +731,14 @@ backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_dependency_m
 
 攻击路径: 前置条件 — macOS,且 `credentials._KEYCHAIN_PATH` 指向的钥匙串处于锁定状态(重启、闲置超时、注销后都是这个状态);触发步骤 — 以 `PDT_DISABLE_KEYCHAIN_SECRETS=0` 启动,且明文变量未配置;可观测后果 — 通知通道在启动时自报未配置并停用,而机器上其实有可用的条目 —— 操作者若输入了正确密码,看到的是一个仍然报错的界面,且没有任何消息说明失败与密码无关。
 
-修复: `backend/credentials.py` 的 `_KEYCHAIN_TIMEOUT_SECONDS` 由 5.0 提高到 60.0。界保留,因为它最初要解决的那个问题是真的:无头机器上没有弹窗,没有界的话调用不是慢而是卡死,子进程会活过这次读取。60 秒仍然封住卡死,只是把「人需要的时间」留出来。**不改失败状态的映射** —— 那是另一条独立的改动,而把 timeout 与 item-not-found 分成两个返回值会迫使每一个调用方处理一种它们无从应对的分类(见同一文件里 `_run_security` 的 docstring)。这里修的是预算,不是语义。
+修复: `backend/credentials.py` 的 `_KEYCHAIN_TIMEOUT_SECONDS` 由 5.0 提高到 60.0。界保留,因为它最初要解决的那个问题是真的:无头机器上没有弹窗,没有界的话调用不是慢而是卡死,子进程会活过这次读取。60 秒仍然封住卡死,只是把「人需要的时间」留出来。**失败状态不改返回值** —— `read_secret` 仍然只返回 `None`,调用方要处理的分类一个也没多;把 timeout 与 item-not-found 分成两个返回值会迫使每一个调用方处理一种它们无从应对的分类(见同一文件里 `_run_security` 的 docstring),那条理由因此依然成立。它要解决的「多种成因被压成一个」改在**给人用**的那一问上兑现:`credentials.diagnose_secret(name)` 按解析用过的顺序逐层排除,返回一句可执行的说明(开关关着 / 账号索引没设 / 钥匙串锁着 / 钥匙串工具跑不起来 / 条目根本没建),`backend/cli.py` 的 `secrets verify` 在每个未解析的 secret 下面打印这一句,已解析成功的不打印 —— 一个连健康项都要念一遍的命令只会训练读者跳过真正要紧的输出。provider 侧另加一条日志,且只在一种情况下发声:读取失败之后用 `security show-keychain-info` 区分「锁着」与「工具跑不起来」;后者与钥匙串状态无关,报成「锁着」会让操作者去解锁一个本就开着的钥匙串,建议无法执行却挂在真实症状上,因而被相信。这里修的是预算与可诊断性,不是返回值。
 
 端到端的那一半:以 `PDT_DISABLE_KEYCHAIN_SECRETS=0` 启动、且根 `.env` 无明文时,读取会在弹窗上等密码;从进程启动到 `FeishuClient initialized` 之间会有一段以人的输入长度衡量的间隔,而修复前这个间隔的下界比 5 秒还长 —— 到期时读取拿到的是「没配置」,而不是「超时」。
 
 验证方式:
 
 ```bash
-backend/.venv/bin/python3 -m pytest backend/tests/unit/test_credentials_switch.py backend/tests/integration/test_credentials_security_lookup.py backend/tests/integration/test_credentials_cache_invariants.py -q
+backend/.venv/bin/python3 -m pytest backend/tests/unit/test_credentials_switch.py backend/tests/unit/test_credentials_locked_keychain.py backend/tests/unit/test_cli_secrets_command.py backend/tests/integration/test_credentials_security_lookup.py backend/tests/integration/test_credentials_cache_invariants.py -q
 ```
 
 ## Appendix A — modified tests
