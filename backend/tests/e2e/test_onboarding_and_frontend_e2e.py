@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -368,34 +369,36 @@ def server(tmp_path_factory):
 # ---------------------------------------------------------------------------
 
 
-def _pip_install_requirements() -> subprocess.CompletedProcess[str]:
-    """Run ``pip install -r backend/requirements.txt`` in the project venv.
+def _uv_sync_locked() -> subprocess.CompletedProcess[str]:
+    """Run the README's install step: ``uv sync --project backend``.
 
-    Mirrors the README's install step. ``--quiet`` so the captured
-    output stays small enough to print on failure; ``check=False`` so
-    we can return the result for an explicit assertion rather than
-    letting ``CompletedProcess.check()`` raise and lose context.
+    Mirrors the documented command verbatim, so a drift in the README
+    is caught here rather than by a new contributor on their first run.
+    ``--locked`` is the flag that matters: without it uv re-resolves
+    instead of installing ``backend/uv.lock``, and the thing this test
+    is checking — that the pinned set is installable — stops being what
+    actually happened. ``check=False`` so the caller can assert on the
+    result with the captured output attached, rather than having
+    ``CompletedProcess.check()`` raise and lose the context.
+
+    ``uv`` is resolved off ``PATH`` rather than assumed: it is the one
+    tool in this step that is not inside the venv it is building.
     """
-    if not VENV_PYTHON.exists():
+    uv = shutil.which("uv")
+    if uv is None:
         raise AssertionError(
-            f"{VENV_PYTHON} is missing — the README assumes the venv "
-            f"exists. Re-run the install step before the suite."
+            "uv is not on PATH — the README's install step starts with "
+            "`uv sync`. See "
+            "https://docs.astral.sh/uv/getting-started/installation/ for "
+            "how to install it."
         )
     return subprocess.run(
-        [
-            str(VENV_PYTHON),
-            "-m",
-            "pip",
-            "install",
-            "--quiet",
-            "-r",
-            str(BACKEND_DIR / "requirements.txt"),
-        ],
+        [uv, "sync", "--project", str(BACKEND_DIR), "--locked"],
         cwd=str(PROJECT_ROOT),
         capture_output=True,
         text=True,
         check=False,
-        timeout=300,
+        timeout=600,
     )
 
 
@@ -587,10 +590,10 @@ def test_onboarding_walk_succeeds(
 
     Three commands, three assertions:
 
-      1. ``pip install -r backend/requirements.txt`` — the venv
-         already exists, so this is a "wheel set is consistent"
-         check. Exit code 0 means every pinned version is still
-         resolvable.
+      1. ``uv sync --project backend`` — the venv already exists, so
+         this is a "locked set is still installable" check. Exit code
+         0 means every version in ``backend/uv.lock`` still resolves
+         and the lock still matches ``backend/pyproject.toml``.
       2. The server is alive (``GET /health`` returns 200) — the
          fixture already booted it, so this is the "server still
          serves traffic after the walk" assertion.
@@ -605,12 +608,14 @@ def test_onboarding_walk_succeeds(
     """
     base_url, proc, _workdir = server
 
-    # --- Step 1: pip install --------------------------------------------------
-    install = _pip_install_requirements()
+    # --- Step 1: uv sync -------------------------------------------------------
+    install = _uv_sync_locked()
     assert install.returncode == 0, (
-        f"README step 1 (`pip install -r backend/requirements.txt`) "
-        f"failed with exit code {install.returncode}; the pinned "
-        f"wheels are no longer consistent with the venv. "
+        f"README step 1 (`uv sync --project backend`) "
+        f"failed with exit code {install.returncode}; backend/uv.lock "
+        f"is no longer installable — either a version in it has been "
+        f"yanked, or pyproject.toml and the lock have drifted apart "
+        f"(which is what --locked is checking). "
         f"stdout={install.stdout[:500]!r} stderr={install.stderr[:500]!r}"
     )
 

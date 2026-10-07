@@ -211,11 +211,26 @@ _KEYCHAIN_PATH = "Library/Keychains/runtime-secrets.keychain-db"
 _KEYCHAIN_PATH_ENV_KEY = "PDT_KEYCHAIN_PATH"
 
 #: How long the keychain tool may take before the read gives up. A
-#: locked keychain makes the first call block on an unlock prompt; on a
-#: headless machine there is no prompt, so without a bound the call is
-#: not slow but stuck. The tool is killed and reaped by the same call
-#: that observes the expiry, so the child does not outlive the read.
-_KEYCHAIN_TIMEOUT_SECONDS = 5.0
+#: locked keychain makes the first call block on an unlock prompt, and
+#: on a headless machine there is no prompt at all — so without a bound
+#: the call is not slow but stuck. The tool is killed and reaped by the
+#: same call that observes the expiry, so the child does not outlive
+#: the read.
+#:
+#: 60 seconds, not 5, and the difference is the whole point. A locked
+#: keychain turns this read into a *human* interaction: macOS puts a
+#: password dialog on screen and the value comes back only after
+#: somebody types into it. Five seconds is shorter than it takes to
+#: read a dialog and start typing, so the bound expires with the
+#: password half-entered — the tool is killed, the read reports "no
+#: value", and the notifier reports itself unconfigured. The operator
+#: sees a dialog that either outlived the process that opened it or
+#: closed on a correct password that no longer had a reader.
+#:
+#: The bound still has a job: it caps the stuck case, which is the one
+#: that motivated it. Sixty seconds of a blocked startup on a headless
+#: box is a nuisance; an unbounded wait is a hang with a GUI attached.
+_KEYCHAIN_TIMEOUT_SECONDS = 60.0
 
 #: The only two values that mean "do not disable the keychain". Every
 #: other value, including an unset variable, disables it.
