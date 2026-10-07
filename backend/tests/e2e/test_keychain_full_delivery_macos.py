@@ -784,6 +784,7 @@ import inspect
 import os
 import re
 import select
+import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -2617,7 +2618,30 @@ def test_the_cleanup_checks_disposability_before_it_deletes(tmp_path, monkeypatc
 
 
 def test_a_refused_keychain_is_not_deleted(tmp_path, monkeypatch):
-    """When the guard refuses, the delete does not happen at all."""
+    """When the guard refuses, the delete does not happen at all.
+
+    This case is the one place in the file that *must* point a home at
+    the operator's own directory tree — the guard's second branch fires
+    on a keychain resolving under the real home, and no other path
+    reaches it. So the fake ``create-keychain`` really does create a
+    directory and a zero-byte file there, because
+    ``temporary_keychain`` checks the file exists before yielding.
+
+    Which means this case owes the machine a cleanup. It did not have
+    one: every run left ``<real home>/not-a-redirect/Library/
+    Keychains/runtime-secrets.keychain-db`` behind, in the one
+    directory this file's whole guard exists to keep its hands out of.
+    The litter is harmless — the tool never ran, so it is a 0-byte file
+    and no keychain was ever added to any search list — but a test that
+    writes into the operator's home and calls that acceptable is a test
+    whose neighbours will do worse.
+
+    The cleanup is conditional on the directory not having existed
+    beforehand: ``not-a-redirect`` is a name a person could plausibly
+    have given a real directory, and ``rmtree`` does not ask.
+    """
+    litter = _REAL_HOME / "not-a-redirect"
+    pre_existed = litter.exists()
     deleted = []
 
     def _fake_security(*args, **kwargs):
@@ -2630,14 +2654,18 @@ def test_a_refused_keychain_is_not_deleted(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sys.modules[__name__], "_security", _fake_security)
 
-    with pytest.raises(pytest.fail.Exception, match="delete"):
-        with temporary_keychain(_REAL_HOME / "not-a-redirect"):
-            pass
+    try:
+        with pytest.raises(pytest.fail.Exception, match="delete"):
+            with temporary_keychain(litter):
+                pass
 
-    assert deleted == [], (
-        "the guard refused, so nothing may have been deleted. Deleted: "
-        "{}".format(deleted)
-    )
+        assert deleted == [], (
+            "the guard refused, so nothing may have been deleted. Deleted: "
+            "{}".format(deleted)
+        )
+    finally:
+        if not pre_existed:
+            shutil.rmtree(litter, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
