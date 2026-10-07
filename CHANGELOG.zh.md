@@ -7,49 +7,130 @@
 
 [English](CHANGELOG.md)
 
-## [0.1.1] - 2026-10-03
+## [0.1.2] - 2026-10-07
 
-这一版从头到尾只讲一件事：**会报告的检查，不等于会拦住的检查。** 下面每一条，要么
-让一道门禁真的能拦住合并，要么修掉一处「自动化在回答另一个问题」的地方。
+**一轮运行能碰什么，一份绿灯报告证明了什么。** 这一版新增三项能力：通知密钥可以
+存在 macOS 钥匙串里、子 agent 可以运行在操作系统沙箱里、验证阶段不能再对着一条
+没有任何验证点的验收标准说通过。其余条目，是你在计划运行过程中看得见的东西的修复，
+以及仓库自己的检查 —— 它们现在真的能拦住一次合并，而不只是报告。
+
+### 新增
+
+- **通知密钥可以不经过环境变量，改由 macOS 钥匙串供给。** 飞书 app secret 与
+  Telegram bot token 可以存在本项目自己的钥匙串里（不是 login keychain —— 那里
+  存着这个账号历来保存过的所有凭据），再由需要它的进程通过一个文件描述符拿到：
+  值不进任何环境变量，`ps eew` 里看到的也只是描述符编号。默认关闭、仅限 macOS：
+  什么都不改的部署照旧从 `backend/.env` 读；Linux 上钥匙串根本不会被查询。开启之后
+  不做回退 —— 条目缺失就报缺失，不会悄悄降级去读明文变量，因为「降级成一个同机
+  任何进程都能读到的值」比明确失败更糟。用
+  `backend/.venv/bin/python3 -m backend.cli secrets verify` 看每条密钥实际来自
+  哪里；在它给出 `source=keychain` 之前，迁移还不算完成。见
+  [钥匙串迁移](docs/operations/keychain-migration.md)。
+  （[#34](https://github.com/YongmaoLuo/Product-Development-Team/pull/34)）
+
+- **子 agent 可以运行在操作系统沙箱里。** 子 agent 以关掉确认提示的方式启动 ——
+  而那正是文件系统最需要一道「不是提示的边界」的时刻：把 `PDT_SANDBOX_PROFILE`
+  指向一份 Seatbelt profile（模板见 `example/sandbox_profile.sb.example`），
+  每个子 agent 就落在它里面跑。什么都不配，行为与从前完全一致；配了却装不上则
+  **停止**，不会退回去无沙箱启动 —— 会自己悄悄关掉的沙箱比没有沙箱更糟，因为配置
+  仍然声称它是开着的。见[配置](docs/operations/configuration.md)。
+  （[#34](https://github.com/YongmaoLuo/Product-Development-Team/pull/34)）
+
+- **验证不能再放过一条没有任何验证点的验收标准。** 在这之前，一条验收标准可能在
+  测试设计阶段被整条漏掉而无人察觉：没有验证点去判它，报告照旧是 PASSED，这个遗漏
+  从外面完全看不见。现在验证计划会对着 PRD 的验收标准做核对：有标准没有被任何
+  验证点声明覆盖，就把规划送回去补上对应验证点；重试之后仍然缺的，记在计划本身上，
+  而不是消失在一份报告里。匹配刻意保持保守 —— 只认带显式【标签】的标准，没有标签的
+  句子跳过不猜：对一个本来健康的计划误报，比漏报更贵。
+  （[#34](https://github.com/YongmaoLuo/Product-Development-Team/pull/34)）
 
 ### 变更
 
-- **门禁能拦了，而且排在省事的那一侧。** GitHub 把被跳过的 required check 算作
-  通过，而一个失败 job 的下游是*被跳过*而不是*失败* —— 所以「把下游设成 required」
-  从来没有覆盖到测试套件。把带路径过滤的 workflow 设成 required 更糟：它的 check
-  会永远停在 Pending，卡住每一次合并，而没有任何操作能让它变绿。现在由一个终端门禁
-  读取每个 job 的结果，只要有一个不是成功就判失败；任何 workflow 都不得对
-  `pull_request` 触发器做路径过滤；`main` 加了分支保护。仓库那两百多条静态契约
-  —— 对代码树整体成立的约定 —— 现在是自己一个 job，所有 PR 上的测试 job 都依赖
-  它：一条坏掉的契约代价是一台 runner，而不是二十台。
-  ([#25](https://github.com/YongmaoLuo/Product-Development-Team/issues/25)、
-  [#26](https://github.com/YongmaoLuo/Product-Development-Team/issues/26))
+- **合并由「跑过的检查」拦住，不再由「被跳过的检查」放行。** GitHub 把被跳过的
+  检查算作通过，所以把测试**下游**的检查设成必须通过，从来没有真正覆盖到测试；
+  现在有一道检查会读取这个 PR 上每一个检查的结果，只要有一个不是成功就判失败。
+  仓库的静态契约检查拆成单独一步、排在全部测试之前：一条坏掉的契约只烧一台机器，
+  而不是二十台。守护合并的那道检查也不再出现在手动运行里 —— 在那里它按构造就是
+  红的。`main` 也不再于合并之后重跑整套：PR 已经跑过，而且跑的就是将要落地的那棵树。
+  （[#23](https://github.com/YongmaoLuo/Product-Development-Team/pull/23)、
+  [#24](https://github.com/YongmaoLuo/Product-Development-Team/pull/24)、
+  [#30](https://github.com/YongmaoLuo/Product-Development-Team/pull/30)、
+  [#31](https://github.com/YongmaoLuo/Product-Development-Team/pull/31)）
 
-- **被评审过的 commit，就是落地的 commit。** squash 合并已关闭，评审者看过的
-  commit 就是进入 `main` 的 commit。隐私与密钥门禁扫描的是整个 commit 区间，而不
-  只是工作区 —— 一个已经进了 commit 的凭据，会在到达远端之前被拦下。
+- **隐私与密钥扫描现在覆盖历史，以及合并往历史里复制的东西。** 只读工作区的检查
+  看不见「某次提交加了一个私有标识、后来某次提交把它删掉」这种形状：树是干净的，
+  而那次提交仍然可以按 SHA 取到。扫描现在走遍一个区间里的每一次提交，并且覆盖
+  GitHub 原样复制进 `main` 历史的那三个字段 —— 分支名、PR 标题、PR 正文。另有一个
+  pre-push hook（`scripts/install_git_hooks.sh`）：让失败发生在推送之前，那时修它
+  是改写，而不是一起历史事故。
+  （[#2](https://github.com/YongmaoLuo/Product-Development-Team/pull/2)、
+  [#30](https://github.com/YongmaoLuo/Product-Development-Team/pull/30)）
+
+- **安装后端改为走一份钉死的依赖集合。** `uv sync --project backend` 取代原来的
+  pip 步骤；`backend/pyproject.toml` 与 `backend/uv.lock` 钉住整棵传递依赖树 ——
+  一份全新的 clone 装到的就是 CI 测过的那套版本。CI 用 `--locked` 安装：清单与锁
+  一旦对不上就直接失败，而不是当天重新解析出别的版本。Python 3.11 也从「假设」
+  变成结构性要求（`>=3.11,<3.12`）：uv 拒绝在这棵树从未测过的解释器上建环境。
+  （[#35](https://github.com/YongmaoLuo/Product-Development-Team/pull/35)、
+  [#36](https://github.com/YongmaoLuo/Product-Development-Team/pull/36)）
+
+- **带 provider 密钥的私有文件有了固定住处。** 子 agent 的 settings 文件里是
+  路由到的那家 provider 的 key；它一直是私有写入、进程退出后脱敏，但落在系统临时
+  目录里 —— 每台机器路径不同，而且没有任何东西会回收它。现在统一落在
+  `~/.pdt-scratch`：每个用户一个可预期的位置，私有权限，每一次派发留下的目录在
+  30 天后被移除 —— 那是留给「脱敏后的副本还能回看」的时间窗。
+  （[#11](https://github.com/YongmaoLuo/Product-Development-Team/pull/11)）
 
 ### 修复
 
-- **CI 失败会报红，而不是消失。** 进程清理路径可能把信号发给同一用户的所有进程：
-  `os.killpg(1, sig)` 在内核里就是 `kill(-1, sig)`，是一次广播，不是「1 号进程组」
-  —— 在 runner 上，这包括那个持有步骤超时与日志上传的 worker，于是一个本该失败的
-  job 一直挂到平台级上限，什么也没发布出来。现在守卫会拒绝 `pgid <= 1`：这是一次
-  **值域**检查，而不只是类型检查，模拟出来的、没有解析出来的 pid 都到不了那个调用。
-  ([#20](https://github.com/YongmaoLuo/Product-Development-Team/issues/20))
+- **计划进度卡片在任何时刻都说得清「现在在跑什么」。** 飞书卡片（以及伴随它的
+  Telegram 消息）曾经会沉默 —— 验证轮在规划或判定时只剩一句没有名字的「验证中」；
+  会长时间冻结在旧正文上；会在修复轮之后让表头与正文互相打架；会把时长按错误的
+  时区算出来，于是一个十分钟的窗口显示成八小时；Telegram 还会为没变过的状态新开
+  一条消息。现在，任务或验证点自己说不出名字时，当前活动从执行日志里推导；表头与
+  正文对着同一份来源对账；内容没变的卡片是原地更新。
+  （[#33](https://github.com/YongmaoLuo/Product-Development-Team/pull/33)）
 
-- **两处探测在回答另一个问题。** 端口探测问的是「哪个进程*提到*了这个端口」，而不是
-  「哪个进程在*监听*它」，于是一个停在 `CLOSE_WAIT` 的客户端套接字会被当成监听者，
-  一次干净的停止可能被报成失败。端到端防御层是同一种错：它去找一个全新 checkout 里
-  并不存在的目录 —— 也就是说，它在 PR 上从未真正跑过。现在两处都检查自己声称要检查
-  的东西，端到端这一层也改在合并前跑，而不是合并后。
-  ([#22](https://github.com/YongmaoLuo/Product-Development-Team/issues/22))
+- **被拆分的任务，不再作为一条空记录回来。** 执行器把一个任务拆成子任务之后，
+  一次运行时的记账写入可能把已删除的父节点重新造出来 —— 没有状态、没有标题 ——
+  调度器随即停在 `No schedulable micro-layer found`，而真实的子任务全部留在
+  pending。现在，把已删除任务挡在外面的守卫覆盖每一条写入路径；被跳过的写入会记
+  一条日志，而不是悄悄丢掉。
+  （[#29](https://github.com/YongmaoLuo/Product-Development-Team/pull/29)）
 
-- **一次全绿，是全绿于这套测试，而不是全绿于它碰巧跑的顺序。** 测试把运行态写进两个
-  进程级字典，彼此之间没有任何清理，于是一条跨越它们做计数的断言，只因为自己在运行
-  序列里的位置而对。现在每条用例都从空的运行态开始，每个并行分片按打乱的顺序执行
-  自己的文件，并把种子打进日志 —— 下一次可复现，通过也不再靠顺序上的运气。
-  ([#26](https://github.com/YongmaoLuo/Product-Development-Team/issues/26))
+- **任务不再因为「不是它自己的原因」而失败。** 子 agent 报告里的一段散文可能被当成
+  文件路径写到磁盘（一次运行因此死在 `File name too long`）；捕获到的目标不是可用的
+  项目内路径时，现在按散文跳过，而不是当作写入指令。一个自己声明的测试命令要求
+  「工作树干净」的任务（恢复 / 回滚类任务，空 diff 正是它的成功条件）会被空 diff
+  门禁判失败 —— 门禁拒绝的恰好是它被要求做出的结果；这类任务现在被识别。而一个被
+  执行器拆分出子节点的任务，可能作为 failed 的父节点留在已经全部完成的子节点旁边；
+  拆分不再保留父节点。
+  （[#34](https://github.com/YongmaoLuo/Product-Development-Team/pull/34)）
+
+- **停止一个服务，不再被报成失败；启动一个服务，只认自己拉起的那个进程。**
+  「端口上有没有东西」这个问题，以前问的是哪个进程*提到*了这个端口，而不是哪个
+  进程在*监听*它 —— 一条已经关闭的客户端连接足以让空端口看起来被占着，于是一次
+  成功的停止被报成失败；启动也只要端口上有人应答就记为 started，哪怕应答的根本
+  不是本工具拉起的进程。现在只认监听者，而且只有监听者就是被拉起的那个进程，
+  启动才算数。
+  （[#21](https://github.com/YongmaoLuo/Product-Development-Team/pull/21)）
+
+- **一次清理，不会再变成一次广播。** 负责结束一个子进程连同它启动的一切的代码，
+  会接受不是真实进程 id 的值；而 1 这个值在内核里不是「第一个进程组」，是对同一
+  用户的所有进程发信号 —— 在你自己的机器上，那就是你开着的每一个进程。现在调用
+  之前先检查值：0 和 1 被拒绝，各种以前能从类型检查下面溜过去的占位值同样被拒绝。
+  （[#14](https://github.com/YongmaoLuo/Product-Development-Team/pull/14)、
+  [#21](https://github.com/YongmaoLuo/Product-Development-Team/pull/21)）
+
+- **一次全绿，说明的是代码，不是它碰巧跑在哪台机器、哪个顺序里。** 测试之间不再
+  互相遗留运行态，一条断言不会因为自己在运行序列里的位置而对；每个并行测试集合按
+  打乱的顺序执行自己的文件，并把种子打进日志，下一次可复现。这些测试集合也被切到
+  能在所跑机器的时间预算内完成的规模。并发压力测试不会再报出「两个任务同时持有
+  一把锁」—— 它测量重叠的窗口原本多算到了锁释放之后，那个违例是测量的产物，
+  不是锁的。
+  （[#7](https://github.com/YongmaoLuo/Product-Development-Team/pull/7)、
+  [#24](https://github.com/YongmaoLuo/Product-Development-Team/pull/24)、
+  [#32](https://github.com/YongmaoLuo/Product-Development-Team/pull/32)）
 
 ## [0.1.0] - 2026-09-29
 
@@ -95,5 +176,5 @@
   进一个被 gitignore 的目录 —— 于是没有任何一次部署的具体 provider 名字，被编译进
   别人的安装。见[安全](docs/security.md)。
 
-[0.1.1]: https://github.com/YongmaoLuo/Product-Development-Team/compare/v0.1.0...v0.1.1
+[0.1.2]: https://github.com/YongmaoLuo/Product-Development-Team/compare/v0.1.0...v0.1.2
 [0.1.0]: https://github.com/YongmaoLuo/Product-Development-Team/releases/tag/v0.1.0
