@@ -9,7 +9,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional
 
 from agent import autonomous_coding
 import credentials
@@ -530,6 +530,7 @@ def cmd_secrets_verify(verify_against: Optional[str] = None) -> int:
             (name, "source={}".format(credentials.secret_source(name)))
             for name in names
         ])
+        _print_missing_reasons(names)
         note = _unsupported_keychain_note()
         if note is not None:
             print(note)
@@ -546,6 +547,7 @@ def cmd_secrets_verify(verify_against: Optional[str] = None) -> int:
             (name, "source={}".format(credentials.secret_source(name)))
             for name in names
         ])
+        _print_missing_reasons(names)
         print(BASELINE_UNREADABLE_NOTE)
         return 1
 
@@ -560,6 +562,7 @@ def cmd_secrets_verify(verify_against: Optional[str] = None) -> int:
     _print_rows([
         (name, credentials.secret_source(name), verdicts[name]) for name in names
     ])
+    _print_missing_reasons(names)
 
     note = _unsupported_keychain_note()
     if note is not None:
@@ -569,6 +572,34 @@ def cmd_secrets_verify(verify_against: Optional[str] = None) -> int:
     return 0 if all(
         verdict == COMPARE_EQUAL for verdict in verdicts.values()
     ) else 1
+
+
+def _print_missing_reasons(names: Iterable[str]) -> None:
+    """Print why each unresolved secret has no value.
+
+    ``source=missing`` is one word standing for at least four different
+    problems — the keychain is switched off, the index is not set, the
+    keychain is locked, or the item was never filed — and the operator
+    who reads it has no way to tell which one they have. They fix those
+    in four different places, and the locked case additionally cost up to
+    a minute of blocking before it could report anything at all.
+
+    Only unresolved secrets produce a line. A resolved one has nothing to
+    explain, and a command that narrates the healthy rows teaches the
+    reader to skip the output that matters.
+    """
+    reasons = [
+        reason
+        for reason in (
+            credentials.diagnose_secret(name) for name in names
+        )
+        if reason is not None
+    ]
+    if not reasons:
+        return
+    print()
+    for reason in reasons:
+        print(reason)
 
 
 def cmd_secrets_show() -> int:
