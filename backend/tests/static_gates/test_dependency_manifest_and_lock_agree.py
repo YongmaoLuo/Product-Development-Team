@@ -502,3 +502,88 @@ def test_project_console_scripts_go_through_the_project_venv(workflow: Path) -> 
         "way the pytest lanes already do:\n"
         + "\n".join(offenders)
     )
+
+# ─── The stale-lock message ──────────────────────────────────────────────────
+#
+# `uv sync --locked` already fails on drift — that is the whole point of the
+# flag. Its message, however, is:
+#
+#     The lockfile at `uv.lock` needs to be updated, but `--locked` was
+#     provided. To update the lockfile, run `uv lock`.
+#
+# A *relative* path. Every install step in this workflow says `--project
+# backend`, and there are 18 of them, so "which lockfile" is a real question
+# rather than a rhetorical one — and the path in the message does not answer
+# it. The `lint` job's "Check the lockfile is current" step does, before any
+# install runs.
+#
+# One job, not all eighteen: merge-gate needs lint, so a failure there closes
+# the gate. Repeating the same message in every lane would be noise, and the
+# other lanes sync the same backend/uv.lock, so they would all fail anyway.
+
+
+def _lint_steps() -> list[dict]:
+    workflow = yaml.safe_load(_CI_YML.read_text(encoding="utf-8"))
+    return workflow["jobs"]["lint"]["steps"]
+
+
+def test_the_lock_is_checked_before_it_is_installed() -> None:
+    """A stale lock is reported as itself, not as an install failure."""
+    names = [s.get("name", "") for s in _lint_steps()]
+    check = "Check the lockfile is current"
+    if check not in names:
+        pytest.skip(f"{check} is not present")
+    install = "Install backend dependencies"
+    assert names.index(check) < names.index(install), (
+        "the lock check must run before the install, or a stale lock is "
+        "reported as whatever `uv sync --locked` happened to fail on"
+    )
+
+
+def test_the_lock_check_uses_uv_lock_check() -> None:
+    """`--check` is what makes this a check rather than a re-resolve."""
+    for step in _lint_steps():
+        if step.get("name") != "Check the lockfile is current":
+            continue
+        script = step.get("run", "")
+        assert "uv lock --project backend --check" in script, (
+            "the step must use `uv lock --check`, not `uv lock` — the latter "
+            "silently updates the lockfile and passes, which would make the "
+            "check green without the new resolution being recorded anywhere"
+        )
+        return
+    pytest.skip("the lock check step is not present")
+
+
+def test_the_stale_lock_message_names_the_file_and_the_fix() -> None:
+    """An error a reader can act on without opening another file."""
+    scripts = "\n".join(
+        step.get("run", "") for step in _lint_steps()
+    )
+    assert "uv.lock is stale" in scripts, "the annotation does not say what moved"
+    assert "backend/uv.lock" in scripts, "the message does not name the lockfile"
+    # "and commit" is load-bearing: re-locking in CI would make the check
+    # pass without the new resolution being recorded in the repository.
+    assert "commit backend/uv.lock" in scripts, (
+        "the message must say the regenerated lockfile has to be committed"
+    )
+
+
+def test_the_error_message_survives_shell_expansion() -> None:
+    """Unescaped backticks in a `run:` block are command substitution.
+
+    The message quotes the fix as `uv lock --project backend`. Written
+    literally, bash runs that as a command and the log shows "Run  and
+    commit backend/uv.lock" — an error message with the one useful part
+    missing, which is worse than no message because it looks deliberate.
+    """
+    for step in _lint_steps():
+        if step.get("name") != "Check the lockfile is current":
+            continue
+        script = step.get("run", "")
+        assert r"\`uv lock --project backend\`" in script, (
+            "the quoted command in the error message must escape its "
+            "backticks: unescaped, bash substitutes it away"
+        )
+        return
+    pytest.skip("the lock check step is not present")
