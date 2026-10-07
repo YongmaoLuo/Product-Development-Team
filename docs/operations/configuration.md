@@ -82,6 +82,25 @@ installation that has not run the migration is still reading secrets out of
 otherwise; `secrets verify` reports which source each secret is actually
 coming from.
 
+When a secret has no value, `secrets verify` prints *why*, one line per
+unresolved secret: the switch is off, the account index is not set, the
+keychain is locked, the keychain tool could not be run at all, or no
+item is filed. Those are fixed in five different places, and the last
+three are the ones worth distinguishing. A locked keychain also blocks
+for up to 60 seconds waiting on an unlock prompt before it can report
+anything. A tool that cannot be executed — some sandboxes and agent
+sessions get `EPERM` on `/usr/bin/security` — has nothing to do with the
+keychain's state, and telling that operator to unlock something is advice
+that cannot possibly work. The same warning is logged by the provider
+itself, so a notifier that reports itself unconfigured is not the only
+evidence. A secret that *is* resolved prints nothing: a command that
+narrates the healthy rows teaches the reader to skip the output that
+matters.
+
+```bash
+backend/.venv/bin/python3 -m backend.cli secrets verify
+```
+
 ## Runtime state
 
 Everything a checkout *produces* rather than *ships* lives under a single

@@ -232,6 +232,21 @@ _KEYCHAIN_PATH_ENV_KEY = "PDT_KEYCHAIN_PATH"
 #: box is a nuisance; an unbounded wait is a hang with a GUI attached.
 _KEYCHAIN_TIMEOUT_SECONDS = 60.0
 
+#: The three things the lock probe can establish. They are kept apart
+#: because they call for opposite responses: one is fixed in Keychain
+#: Access, and the other cannot be fixed there at all — it means this
+#: process is not allowed to run the tool, so the advice is "run it
+#: somewhere else", not "unlock something".
+KEYCHAIN_UNLOCKED = "unlocked"
+KEYCHAIN_LOCKED = "locked"
+KEYCHAIN_UNAVAILABLE = "unavailable"
+
+#: The bound on the lock probe below. It asks a question the keychain
+#: answers without a dialog, so it is given only enough room to start a
+#: process and fail — a longer bound would extend the wait the primary
+#: read already risked, on the path where somebody is already waiting.
+_LOCK_PROBE_TIMEOUT_SECONDS = 10.0
+
 #: The only two values that mean "do not disable the keychain". Every
 #: other value, including an unset variable, disables it.
 _SWITCH_ENV_KEY = "PDT_DISABLE_KEYCHAIN_SECRETS"
@@ -418,6 +433,49 @@ def _decode_payload(raw: bytes) -> str:
     return raw.decode("utf-8", errors="surrogateescape")
 
 
+def _keychain_state() -> str:
+    """Return what the lock probe could establish about the keychain.
+
+    ``security show-keychain-info`` succeeds only on an unlocked
+    keychain, so a nonzero exit means it could not confirm one. Which of
+    the two remaining explanations that is — *locked*, or *the tool could
+    not be run at all* — is the whole reason this returns a label rather
+    than a boolean.
+
+    Collapsing them would produce the most expensive kind of wrong
+    answer available here. A process that is not permitted to execute
+    ``/usr/bin/security`` — a sandbox, some CI runners, an agent
+    session — fails this probe for a reason that has nothing to do with
+    the keychain's state, and reporting that as "locked" sends an
+    operator to Keychain Access to unlock a keychain that is already
+    open. The advice would be unfollowable, and it would be attached to
+    a real symptom, so it would be believed.
+
+    Run only after a read has already failed. On the happy path this
+    would be a second process started for no information, and a process
+    per lookup is exactly the cost the resolution memo exists to avoid.
+    """
+    if not _is_macos():
+        return KEYCHAIN_UNAVAILABLE
+    argv: List[str] = [_SECURITY_BIN, "show-keychain-info", _keychain_file()]
+    try:
+        completed = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=_LOCK_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # A binary this process may not execute, one that is not there,
+        # and one that outran the bound all mean the same thing to a
+        # caller: the keychain cannot be consulted from here, and no
+        # amount of unlocking will change that.
+        log.debug("keychain probe could not run: %s", exc)
+        return KEYCHAIN_UNAVAILABLE
+    return KEYCHAIN_UNLOCKED if completed.returncode == 0 else KEYCHAIN_LOCKED
+
+
 def _resolve_from_keychain(spec: SecretSpec) -> Tuple[Optional[str], str]:
     """Return ``(value, source)`` for ``spec``, reading the OS keychain.
 
@@ -434,6 +492,14 @@ def _resolve_from_keychain(spec: SecretSpec) -> Tuple[Optional[str], str]:
     turned the keychain on gets told the keychain has nothing for this
     secret, rather than a quiet downgrade to a value every process of
     every user on the machine can read.
+
+    A locked keychain is the one failure worth a log line, and it is
+    logged here rather than left to the caller. Every other failure
+    collapses into "no value" on purpose, but a locked keychain produces
+    a caller that reports itself unconfigured with nothing in its own
+    logs to say why — which reads as "this credential was never set up"
+    and sends the operator to the wrong place entirely. See
+    :func:`diagnose_secret`, which is the same question asked on demand.
     """
     account = _env_value(spec.account_env_key)
     if account is None:
@@ -449,6 +515,28 @@ def _resolve_from_keychain(spec: SecretSpec) -> Tuple[Optional[str], str]:
     ]
     raw = _run_security(argv, _KEYCHAIN_TIMEOUT_SECONDS)
     if raw is None:
+        state = _keychain_state()
+        if state == KEYCHAIN_LOCKED:
+            log.warning(
+                "%s could not be read: the keychain %s is locked. Unlock it "
+                "(Keychain Access, or `security unlock-keychain %s`) and "
+                "restart. A read against a locked keychain can also block for "
+                "up to %d seconds waiting on an unlock prompt that nobody is "
+                "there to answer.",
+                spec.logical_name,
+                _keychain_file(),
+                _keychain_file(),
+                int(_KEYCHAIN_TIMEOUT_SECONDS),
+            )
+        elif state == KEYCHAIN_UNAVAILABLE:
+            log.warning(
+                "%s could not be read and this process cannot run "
+                "/usr/bin/security to say why — it is missing or not "
+                "permitted here, which is the case inside some sandboxes. "
+                "Unlocking the keychain will not help; run the process "
+                "somewhere the keychain tool is allowed to run.",
+                spec.logical_name,
+            )
         return (None, SOURCE_MISSING)
 
     return (_decode_payload(raw), SOURCE_KEYCHAIN)
@@ -545,6 +633,82 @@ def reset_cache() -> None:
     "look again" without a restart. It is safe to call at any time.
     """
     _CACHE.clear()
+
+
+def diagnose_secret(name: str) -> Optional[str]:
+    """Return why ``name`` has no value, or None when it has one.
+
+    :func:`read_secret` answers "is there a value" and collapses every
+    way of not having one into ``None``, because the caller asking it is
+    asking whether a transport is configured, not what went wrong. That
+    collapse is what makes it safe to call from a hot path, and it is
+    also what makes a locked keychain invisible: a notifier reports
+    itself unconfigured, and nothing in its own logs distinguishes "this
+    was never set up" from "the keychain was locked when we looked" —
+    two problems an operator fixes in completely different places, and
+    the second one also costs a minute of blocking first.
+
+    So the two questions are separate functions. This one is for a human
+    reading a log or running a command, and it names the specific thing
+    to change.
+
+    Resolution runs first, so the answer describes the same state the
+    caller would have observed rather than a second, possibly different
+    one. It never raises: a name that is not registered is a sentence,
+    not an exception.
+    """
+    spec = SECRET_SPECS.get(name)
+    if spec is None:
+        return (
+            f"no secret named {name!r} is registered in SECRET_SPECS; "
+            f"known names: {sorted(SECRET_SPECS)}"
+        )
+
+    if _resolve(name)[0] != SOURCE_MISSING:
+        return None
+
+    # In the order the resolution used, so the sentence names the first
+    # thing that would have to change.
+    if keychain_disabled():
+        return (
+            f"{name}: the keychain is switched off, so "
+            f"{spec.fallback_env_key} was used and it is not set either. "
+            f"Set {_SWITCH_ENV_KEY}=0 to consult the keychain, or populate "
+            f"{spec.fallback_env_key}."
+        )
+
+    if _env_value(spec.account_env_key) is None:
+        return (
+            f"{name}: {_SWITCH_ENV_KEY} says the keychain is on, but "
+            f"{spec.account_env_key} is not set, so there is no account to "
+            f"look the item up by. The index is configuration, not a secret "
+            f"— it stays in .env."
+        )
+
+    state = _keychain_state()
+    if state == KEYCHAIN_LOCKED:
+        return (
+            f"{name}: the keychain {_keychain_file()} is locked. Unlock it "
+            f"(Keychain Access, or `security unlock-keychain "
+            f"{_keychain_file()}`) and restart. A read against a locked "
+            f"keychain can block for up to "
+            f"{int(_KEYCHAIN_TIMEOUT_SECONDS)} seconds first."
+        )
+
+    if state == KEYCHAIN_UNAVAILABLE:
+        return (
+            f"{name}: /usr/bin/security could not be run by this process, so "
+            f"the keychain could not be consulted at all. It is missing or "
+            f"not permitted here — some sandboxes and CI runners cannot "
+            f"execute it. Unlocking the keychain will not change this; the "
+            f"process has to run somewhere the tool is allowed to run."
+        )
+
+    return (
+        f"{name}: the keychain is unlocked but holds no item with the account "
+        f"{spec.account_env_key}. File one with "
+        f"`security add-generic-password -U -a <{spec.account_env_key}> -w`."
+    )
 
 
 # ---------------------------------------------------------------------------
