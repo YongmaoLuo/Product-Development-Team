@@ -128,7 +128,7 @@ it is:
 uv sync --project backend        # builds backend/.venv from backend/uv.lock
 source backend/.venv/bin/activate
 
-cp backend/.env.ci backend/.env      # non-secret placeholders
+cp .env.example .env             # optional — every setting in it is optional
 
 # From the repository root — the app is a package (`backend/`), so `-m` is
 # what puts both the root and `backend/` on `sys.path`.
@@ -218,7 +218,7 @@ is in [Contributing](docs/development/contributing.md#where-a-file-belongs).
 |---|---|
 | `.pdt/` | The state family — `state.db` (+ `-wal`/`-shm`), `pdt_server_boot_id`, `backups/`, `nightly-results.json`. **One-off and machine-local scripts belong here too, not in `scripts/`** |
 | `plans/` | One directory per plan: interview, PRD, arch, tasks, execution, verification |
-| `backend/.env` | This deployment's credentials and provider routing |
+| `.env` | This deployment's non-secret settings — the keychain *indexes*, timezone, notification targets |
 | `.config/` | Per-user tool state (provider blacklist, ordering) |
 | `tools/` | The operator fleet's subsidiary processes |
 | `site/`, `.pytest_cache/`, `ac_server_boot_id`, `CLAUDE.md` | Build output, caches, and this checkout's own operator notes |
@@ -250,10 +250,18 @@ elsewhere:
 | `PDT_PROVIDER_CAPACITY_FILE` | path to the capacity YAML |
 | `PDT_PROVIDER_ROUTING_FILE` | path to the routing YAML |
 
-Credentials come from `backend/.env` (gitignored). `backend/.env.ci` holds
-committed placeholders — a test fixture; **never** put a real key in it.
-Runtime state (the state database, its boot counter, its backups) lives
-under a single gitignored `<repo>/.pdt/`.
+Credentials do **not** come from a dotenv file. A provider API key is
+supplied at runtime by whatever provider layer a deployment runs —
+`backend/cc_switch.py` is the integration this codebase ships, and it
+reads one provider row at a time; the two notification secrets (Feishu
+app secret, Telegram bot token) are read from a macOS keychain. What
+`.env` (gitignored, templated by the committed `.env.example`) carries is
+the non-secret half — the `account` each keychain item is filed under,
+timezone, and the notification targets. It is entirely optional: a
+deployment that exports its configuration directly, or that has no
+notifications at all, runs without the file. Runtime state (the state
+database, its boot counter, its backups) lives under a single gitignored
+`<repo>/.pdt/`.
 
 More: **[Configuration](docs/operations/configuration.md)**.
 

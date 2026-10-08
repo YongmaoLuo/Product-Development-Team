@@ -83,16 +83,12 @@ _CREDENTIAL_ENV_KEYS = tuple(
     for key in (spec.fallback_env_key, spec.account_env_key)
 ) + ("PDT_DISABLE_KEYCHAIN_SECRETS",)
 
-#: The three variables ``env_config.load_env()`` demands before the CLI
-#: parses anything. They are placeholders: the loader only checks that
-#: they exist, and a subprocess that reached the parser with these
-#: filled in behaves exactly as one that reached it from a developer's
-#: own ``.env``.
-_LOADER_PLACEHOLDERS = (
-    "ANTHROPIC_API_KEY",
-    "NOTION_TOKEN",
-    "NOTION_PARENT_PAGE_ID",
-)
+# ``env_config.load_env()`` used to demand three variables before the CLI
+# parsed anything, and these tests filled them with placeholders so the
+# subprocess would get that far. It demands nothing now (2026-10-08), so
+# there is nothing to fill in: a child process started with a bare
+# environment reaches the parser exactly as one started from a
+# developer's own ``.env`` used to.
 
 
 @pytest.fixture(autouse=True)
@@ -413,9 +409,9 @@ def test_module_and_script_entrypoints_agree(tmp_path):
 
     The environment is built here rather than inherited, so the child's
     output is this test's and not the developer's shell. Every
-    credential key is *set* rather than merely removed: the CLI loads
-    ``backend/.env`` before it parses, and a variable that is absent
-    from the child is exactly the one that file is allowed to fill.
+    credential key is *set* rather than merely removed, so a key cannot
+    arrive from the developer's own shell to stand in for one this test
+    meant to supply.
 
     The exit code is compared rather than pinned to 0, because it is a
     property of the machine and not of the spelling — and this machine
@@ -435,8 +431,6 @@ def test_module_and_script_entrypoints_agree(tmp_path):
     child_env = dict(os.environ)
     for key in _CREDENTIAL_ENV_KEYS:
         child_env.pop(key, None)
-    for key, value in zip(_LOADER_PLACEHOLDERS, ("placeholder-a", "placeholder-b", "placeholder-c")):
-        child_env[key] = value
     child_env["PDT_DISABLE_KEYCHAIN_SECRETS"] = "1"
     for index, name in enumerate(credentials.SECRET_SPECS):
         spec = credentials.SECRET_SPECS[name]

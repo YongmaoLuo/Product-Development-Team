@@ -385,9 +385,9 @@ class TestClaudeCodingToolEnvLoading:
     def test_load_api_key_returns_none_when_missing(self, tmp_path, monkeypatch):
         """Return None when neither env var nor .env file has the key."""
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        # 2026-09-13: chdir to a bare tmp dir — running from backend/
-        # would otherwise pick up the developer's real backend/.env
-        # (the loader deliberately reads the CWD's .env).
+        # 2026-09-13: chdir to a bare tmp dir — running from the
+        # repository root would otherwise pick up the developer's real
+        # .env (the loader deliberately reads the CWD's .env).
         monkeypatch.chdir(tmp_path)
         key = ClaudeCodingTool._load_api_key_from_env()
         assert key is None
