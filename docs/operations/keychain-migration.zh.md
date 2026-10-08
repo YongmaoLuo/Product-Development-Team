@@ -9,14 +9,14 @@ macOS 钥匙串读取，再经文件描述符交给需要它们的进程，而�
 
 ## 改变了什么，没改变什么
 
-索引键仍然留在 `backend/.env` —— `FEISHU_APP_ID` 与 `TELEGRAM_CHAT_ID` 是配置而不是
+索引键仍然留在 `.env` —— `FEISHU_APP_ID` 与 `TELEGRAM_CHAT_ID` 是配置而不是
 凭据，把它们一并迁进去只会让非机密配置平白进入凭据管理，没有收益。迁移的只有两个
 secret。
 
 | | 改造前 | 改造后 |
 |---|---|---|
-| 索引键 | `backend/.env` | `backend/.env`（不变） |
-| secret | `backend/.env` → `os.environ` | 钥匙串 → 管道 → 环境变量里只有 fd 号 |
+| 索引键 | `.env` | `.env`（不变） |
+| secret | `.env` → `os.environ` | 钥匙串 → 管道 → 环境变量里只有 fd 号 |
 | `ps eww <pid>` 能看到 secret | 能 | 不能 |
 | Linux / Windows | 不变 | 不变 |
 
@@ -61,11 +61,11 @@ account 是**索引键的值**，既不是 secret 本身也不是 service 名。
 
 ```bash
 # 从 .env 读索引值，全程不回显
-FEISHU_APP_ID=$(grep -m1 '^FEISHU_APP_ID=' backend/.env | cut -d= -f2-)
-TELEGRAM_CHAT_ID=$(grep -m1 '^TELEGRAM_CHAT_ID=' backend/.env | cut -d= -f2-)
+FEISHU_APP_ID=$(grep -m1 '^FEISHU_APP_ID=' .env | cut -d= -f2-)
+TELEGRAM_CHAT_ID=$(grep -m1 '^TELEGRAM_CHAT_ID=' .env | cut -d= -f2-)
 
-security add-generic-password -U -a "$FEISHU_APP_ID"   -w "$(grep -m1 '^FEISHU_APP_SECRET=' backend/.env | cut -d= -f2-)" ~/Library/Keychains/runtime-secrets.keychain-db
-security add-generic-password -U -a "$TELEGRAM_CHAT_ID" -w "$(grep -m1 '^TELEGRAM_BOT_TOKEN=' backend/.env | cut -d= -f2-)" ~/Library/Keychains/runtime-secrets.keychain-db
+security add-generic-password -U -a "$FEISHU_APP_ID"   -w "$(grep -m1 '^FEISHU_APP_SECRET=' .env | cut -d= -f2-)" ~/Library/Keychains/runtime-secrets.keychain-db
+security add-generic-password -U -a "$TELEGRAM_CHAT_ID" -w "$(grep -m1 '^TELEGRAM_BOT_TOKEN=' .env | cut -d= -f2-)" ~/Library/Keychains/runtime-secrets.keychain-db
 ```
 
 `-U` 表示存在即更新，所以凭据轮换之后重跑这条是安全的。
@@ -88,7 +88,7 @@ PDT_DISABLE_KEYCHAIN_SECRETS=0 backend/.venv/bin/python3 -m backend.cli secrets 
 ## 3. 打开开关
 
 ```bash
-echo 'PDT_DISABLE_KEYCHAIN_SECRETS=0' >> backend/.env
+echo 'PDT_DISABLE_KEYCHAIN_SECRETS=0' >> .env
 ```
 
 然后把两个 secret 从 `.env` 里删掉。留着它们系统不会替你报错：钥匙串启用时它们只是
@@ -96,7 +96,7 @@ echo 'PDT_DISABLE_KEYCHAIN_SECRETS=0' >> backend/.env
 
 ```bash
 # 在通知确认可用之前，先在仓库外留一份
-cp backend/.env "$HOME/.pdt-env-backup"
+cp .env "$HOME/.pdt-env-backup"
 ```
 
 ## 4. 确认
@@ -120,8 +120,8 @@ curl -s -H "X-PDT-Request: 1" http://127.0.0.1:8000/api/notifications/status
 钥匙串路径是叠加式的，所以回滚就是删掉一行：
 
 ```bash
-sed -i '' '/^PDT_DISABLE_KEYCHAIN_SECRETS=/d' backend/.env
-cp "$HOME/.pdt-env-backup" backend/.env
+sed -i '' '/^PDT_DISABLE_KEYCHAIN_SECRETS=/d' .env
+cp "$HOME/.pdt-env-backup" .env
 ```
 
 钥匙串和它的条目会留在原处。删除钥匙串（`security delete-keychain <path>`）是另一件

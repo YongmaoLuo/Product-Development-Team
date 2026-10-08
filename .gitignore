@@ -29,13 +29,12 @@ frontend/node_modules/
 coverage/
 .nyc_output/
 
-# Local secrets — never commit. The non-secret test template
-# (backend/.env.ci) and the documented example (backend/.env.example)
-# are deliberately tracked.
+# Local secrets — never commit. The documented example (`.env.example`,
+# at the repository root) is deliberately tracked; `.env.ci` was a second
+# tracked template for the same file and was removed with it in 2026-10-08.
 .env
 .env.local
 .env.*.local
-!.env.ci
 !.env.example
 
 # Runtime state

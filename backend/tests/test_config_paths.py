@@ -54,13 +54,31 @@ def test_repo_level_paths_hang_off_project_root():
     # encode the layout that was deliberately replaced.
     assert config_paths.STATE_DIR == root / ".pdt"
     assert config_paths.STATE_DB == config_paths.STATE_DIR / "state.db"
+    # The dotenv moved here in 2026-10-08. It used to be ``backend/.env``
+    # in this module while ``server`` read ``<repo>/.env`` — two different
+    # files for one setting, which is the drift this assertion now pins
+    # shut. Asserting the backend path again would re-open it.
+    assert config_paths.ENV_FILE == root / ".env"
 
 
 def test_backend_level_paths_hang_off_backend_dir():
     backend = config_paths.BACKEND_DIR
     assert config_paths.CONFIGS_DIR == backend / "configs"
     assert config_paths.BACKEND_CONFIG_YAML == backend / "config.yaml"
-    assert config_paths.ENV_FILE == backend / ".env"
+
+
+def test_the_dotenv_template_sits_beside_the_dotenv():
+    """The committed example and the file it documents are one location.
+
+    A template under ``backend/`` describing a file at the repository root
+    is the same class of drift the ``ENV_FILE`` assertion above rules out,
+    one level up: it sends a reader to ``cp backend/.env.example .env``,
+    which lands the example in the wrong directory.
+    """
+    root = config_paths.PROJECT_ROOT
+    assert (root / ".env.example").is_file()
+    assert not (config_paths.BACKEND_DIR / ".env.example").exists()
+    assert not (config_paths.BACKEND_DIR / ".env.ci").exists()
 
 
 @pytest.mark.parametrize(

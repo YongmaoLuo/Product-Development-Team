@@ -389,16 +389,16 @@ def _load_baseline(path: str) -> Optional[Dict[str, str]]:
       the keychain held. A baseline that cannot hold the credential it
       is meant to check reports a mismatch that is not one.
     * **Surrounding whitespace is not part of the value**, on either
-      side of the ``=``. That is the reading ``backend/.env`` itself
-      gets, and a value compared against a spelling the file's own
-      loader would have trimmed is a comparison against a value no
-      process on this machine holds.
+      side of the ``=``. That is the reading ``.env`` itself gets, and a
+      value compared against a spelling the file's own loader would have
+      trimmed is a comparison against a value no process on this
+      machine holds.
 
     Keyed by the spec table's own ``fallback_env_key`` — the spelling
-    ``backend/.env`` uses, and the one variable that holds a *value*
-    rather than an index. The logical name is not also accepted: two
-    spellings per secret is a second grammar, and a file carrying both
-    for one key would have to pick one silently.
+    ``.env`` uses, and the one variable that holds a *value* rather than
+    an index. The logical name is not also accepted: two spellings per
+    secret is a second grammar, and a file carrying both for one key
+    would have to pick one silently.
     """
     try:
         # Read as bytes and decode here rather than through

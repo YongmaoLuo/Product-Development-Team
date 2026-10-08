@@ -469,7 +469,7 @@ WHITELIST: dict[Path, str] = {
         "than out of a literal, which is why the gate does not flag its "
         "own reads."
     ),
-    Path("backend/.env.example"): (
+    Path(".env.example"): (
         "The deployment-facing example. It has to name both keys — a "
         "keychain deployment is configured by the index keys it lists and "
         "the fallback keys it comments out — and an example that could "
@@ -636,7 +636,7 @@ def test_whitelist_entries_carry_a_reason() -> None:
     """Two exemptions, two reasons, both non-empty."""
     assert set(WHITELIST) == {
         Path("backend/credentials.py"),
-        Path("backend/.env.example"),
+        Path(".env.example"),
     }, (
         "the whitelist is the provider and the deployment-facing example "
         "file, and nothing else. An exemption that is not one of these two "

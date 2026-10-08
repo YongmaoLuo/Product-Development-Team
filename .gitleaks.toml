@@ -1,11 +1,11 @@
 [extend]
 useDefault = true
 
-# `backend/.env.ci` is a committed, non-secret template. Its
-# `ANTHROPIC_API_KEY` value deliberately keeps the `sk-ant-` prefix,
-# because `backend/env_config.validate_config()` rejects anything else —
-# that prefix check is worth keeping honest. The value is a placeholder
-# and must not fail the scan forever.
-[[allowlists]]
-description = "committed placeholder in the non-secret CI env template"
-paths = ['''backend/\.env\.ci''']
+# No allowlist entries. There used to be one for `backend/.env.ci`, a
+# committed non-secret template whose placeholder API key kept the
+# `sk-ant-` prefix to satisfy `env_config.validate_config()`. Both the
+# template and the validator are gone as of 2026-10-08 — no key is read
+# from a dotenv at all, so no placeholder for one is needed.
+# `.env.example` is committed and was never allowlisted: it names secrets
+# only in commented `# KEY=value` form and holds no credential-shaped
+# value.

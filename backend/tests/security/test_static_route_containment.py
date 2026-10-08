@@ -116,12 +116,25 @@ def test_traversal_payloads_are_refused(client, payload):
 def test_the_repository_is_not_reachable_as_static_content(client):
     """The repo root sits one level up and was reachable before the fix.
 
-    ``plans/``, ``.config/`` and ``backend/.env`` all live beside the
-    frontend directory, so a single ``../`` was enough to start reading
-    the checkout.
+    ``plans/``, ``.config/`` and ``.env`` all live beside the frontend
+    directory, so a single ``../`` was enough to start reading the
+    checkout. ``.env`` is probed bare as well as through ``backend/``:
+    it moved to the repository root in 2026-10-08, and a containment
+    probe that only ever named the old location would keep passing
+    while the file it names is one that no longer exists.
     """
-    for probe in ("README.md", "CLAUDE.md", "backend%2f.env", "backend%2fserver.py"):
-        assert client.get(f"/%2e%2e%2f{probe}").status_code == 404
+    probes = (
+        "README.md",
+        "CLAUDE.md",
+        ".env",
+        "%2eenv",
+        "backend%2f.env",
+        "backend%2fserver.py",
+    )
+    for probe in probes:
+        assert client.get(f"/%2e%2e%2f{probe}").status_code == 404, (
+            f"the static route served a repository file through ../{probe}"
+        )
 
 
 def test_legitimate_assets_still_work(client):
