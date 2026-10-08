@@ -22,16 +22,21 @@ requirement:
     modules the suite actually loads. There is no fallback configuration
     that would make the system interpreter work.
 
-## 2. Provide a `.env`
+## 2. Provide a `.env` — optional
 
-Non-secret placeholders are enough to boot:
+The server starts with no `.env` at all. Create one only if you want
+notifications, a non-default timezone, or a non-default keychain:
 
 ```bash
-cp backend/.env.ci backend/.env
+cp .env.example .env
 ```
 
-`backend/.env` is gitignored and is where real credentials go.
-`backend/.env.ci` is a **test fixture** — never put a real key in it.
+`.env` is gitignored; `.env.example` is the committed, non-secret
+template. It holds no credential — a provider API key is supplied at
+runtime by the provider layer, and the two notification secrets are read
+from a macOS keychain ([Credentials](operations/configuration.md#credentials)).
+Every line in it is commented out, so copying it changes nothing until
+you fill one in.
 
 ## 3. Start the server
 

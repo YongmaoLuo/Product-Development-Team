@@ -2,7 +2,7 @@
 
 The two real notification secrets — the Feishu app secret and the Telegram
 bot token — can be read from a dedicated macOS keychain instead of from
-`backend/.env`, and handed to the processes that need them over a file
+`.env`, and handed to the processes that need them over a file
 descriptor rather than through the environment.
 
 **This is opt-in and ships disabled.** A deployment that changes nothing
@@ -13,15 +13,15 @@ attacker on the same machine can read out of a process listing.
 
 ## What changes, and what does not
 
-The index keys stay in `backend/.env` — `FEISHU_APP_ID` and
+The index keys stay in `.env` — `FEISHU_APP_ID` and
 `TELEGRAM_CHAT_ID` are configuration, not credentials, and moving them
 would put a non-secret under credential management for no gain. Only the
 two secrets move.
 
 | | before | after |
 |---|---|---|
-| index keys | `backend/.env` | `backend/.env` (unchanged) |
-| secrets | `backend/.env` → `os.environ` | keychain → pipe → fd number in the environment |
+| index keys | `.env` | `.env` (unchanged) |
+| secrets | `.env` → `os.environ` | keychain → pipe → fd number in the environment |
 | `ps eww <pid>` shows the secret | yes | no |
 | Linux / Windows | unchanged | unchanged |
 
@@ -75,11 +75,11 @@ name. The provider locates entries by account alone and never passes a
 
 ```bash
 # read the index values out of .env without echoing them
-FEISHU_APP_ID=$(grep -m1 '^FEISHU_APP_ID=' backend/.env | cut -d= -f2-)
-TELEGRAM_CHAT_ID=$(grep -m1 '^TELEGRAM_CHAT_ID=' backend/.env | cut -d= -f2-)
+FEISHU_APP_ID=$(grep -m1 '^FEISHU_APP_ID=' .env | cut -d= -f2-)
+TELEGRAM_CHAT_ID=$(grep -m1 '^TELEGRAM_CHAT_ID=' .env | cut -d= -f2-)
 
-security add-generic-password -U -a "$FEISHU_APP_ID"   -w "$(grep -m1 '^FEISHU_APP_SECRET=' backend/.env | cut -d= -f2-)" ~/Library/Keychains/runtime-secrets.keychain-db
-security add-generic-password -U -a "$TELEGRAM_CHAT_ID" -w "$(grep -m1 '^TELEGRAM_BOT_TOKEN=' backend/.env | cut -d= -f2-)" ~/Library/Keychains/runtime-secrets.keychain-db
+security add-generic-password -U -a "$FEISHU_APP_ID"   -w "$(grep -m1 '^FEISHU_APP_SECRET=' .env | cut -d= -f2-)" ~/Library/Keychains/runtime-secrets.keychain-db
+security add-generic-password -U -a "$TELEGRAM_CHAT_ID" -w "$(grep -m1 '^TELEGRAM_BOT_TOKEN=' .env | cut -d= -f2-)" ~/Library/Keychains/runtime-secrets.keychain-db
 ```
 
 `-U` updates in place, so re-running after a credential rotation is safe.
@@ -107,7 +107,7 @@ PDT_DISABLE_KEYCHAIN_SECRETS=0 backend/.venv/bin/python3 -m backend.cli secrets 
 ## 3. Turn it on
 
 ```bash
-echo 'PDT_DISABLE_KEYCHAIN_SECRETS=0' >> backend/.env
+echo 'PDT_DISABLE_KEYCHAIN_SECRETS=0' >> .env
 ```
 
 Then remove the two secrets from `.env`. Leaving them there is not a
@@ -117,7 +117,7 @@ already stale.
 
 ```bash
 # keep a copy outside the repo until notifications have been confirmed working
-cp backend/.env "$HOME/.pdt-env-backup"
+cp .env "$HOME/.pdt-env-backup"
 ```
 
 ## 4. Confirm
@@ -144,8 +144,8 @@ curl -s -H "X-PDT-Request: 1" http://127.0.0.1:8000/api/notifications/status
 The keychain path is additive, so rollback is removing one line:
 
 ```bash
-sed -i '' '/^PDT_DISABLE_KEYCHAIN_SECRETS=/d' backend/.env
-cp "$HOME/.pdt-env-backup" backend/.env
+sed -i '' '/^PDT_DISABLE_KEYCHAIN_SECRETS=/d' .env
+cp "$HOME/.pdt-env-backup" .env
 ```
 
 The keychain and its items are left in place. Deleting the keychain

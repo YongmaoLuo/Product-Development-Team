@@ -18,16 +18,18 @@ source backend/.venv/bin/activate
     激活 venv 是让 `pytest` 导入到测试真正加载的那些模块的**唯一**办法。没有
     任何兜底配置能让系统解释器跑起来。
 
-## 2. 准备 `.env`
+## 2. 准备 `.env` —— 可选
 
-非机密的占位值就足够启动：
+没有 `.env` 服务也能起来。只有在你要通知、非默认时区或非默认钥匙串时才需要建：
 
 ```bash
-cp backend/.env.ci backend/.env
+cp .env.example .env
 ```
 
-`backend/.env` 是 gitignored 的，真凭据放那里。`backend/.env.ci` 是**测试夹具**
-—— 永远不要往里面放真密钥。
+`.env` 是 gitignored 的；`.env.example` 是提交进仓的非机密模板。它里面**没有凭据** ——
+provider 的 API key 由运行时那层 provider 供给，两个通知 secret 走 macOS 钥匙串
+（见[凭据](operations/configuration.zh.md#凭据)）。模板里每一行都是注释掉的，所以拷过去
+本身什么也不改，只有你填了某一行才生效。
 
 ## 3. 启动服务
 

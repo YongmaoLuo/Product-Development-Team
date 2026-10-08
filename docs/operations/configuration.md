@@ -69,18 +69,24 @@ per round and shared by every group. See
 
 ## Credentials
 
-Credentials come from `backend/.env`, which is gitignored.
-`backend/.env.ci` holds committed **placeholders** — it is a test fixture,
-and a real key must never go into it.
+No credential comes out of `.env`. A provider API key is supplied at
+runtime by whatever provider layer a deployment runs —
+`backend/cc_switch.py` is the integration this codebase ships, and it
+reads one provider row at a time; the two notification secrets (Feishu
+app secret, Telegram bot token) are read from a dedicated macOS keychain
+and handed to the processes that need them over a file descriptor,
+keeping them out of `ps eww` output. What `.env` (gitignored, templated
+by the committed `.env.example`) carries is the non-secret half: the
+`account` each keychain item is filed under, the timezone, and the
+notification targets.
 
-The two notification secrets can instead be read from a dedicated macOS
-keychain and handed to the processes that need them over a file
-descriptor, keeping them out of `ps eww` output. That path is **opt-in and
-off by default** — a deployment that changes nothing is unaffected, and an
-installation that has not run the migration is still reading secrets out of
-`.env`. See [Keychain migration](keychain-migration.md) before assuming
-otherwise; `secrets verify` reports which source each secret is actually
-coming from.
+That keychain path is **opt-in and off by default**. Left alone,
+`PDT_DISABLE_KEYCHAIN_SECRETS` unset, both notification secrets are read
+from the plaintext variables in `.env` instead — so an installation that
+has not run the migration is still putting them in a file on disk. See
+[Keychain migration](keychain-migration.md) before assuming otherwise;
+`secrets verify` reports which source each secret is actually coming
+from.
 
 When a secret has no value, `secrets verify` prints *why*, one line per
 unresolved secret: the switch is off, the account index is not set, the

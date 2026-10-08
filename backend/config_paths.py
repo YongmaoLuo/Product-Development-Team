@@ -102,6 +102,29 @@ STATE_DIR: Path = PROJECT_ROOT / ".pdt"
 #: repeated with a different prefix here.
 STATE_DB: Path = STATE_DIR / "state.db"
 
+#: The deployment's dotenv file: ``<repo>/.env``. Gitignored; the
+#: committed, non-secret template is ``<repo>/.env.example``.
+#:
+#: **Declared at the repository root, not under ``backend/`` (2026-10-08).**
+#: Three different files were being resolved for this one thing, and they
+#: did not agree:
+#:
+#:   * this constant said ``backend/.env``;
+#:   * :mod:`env_config` derived its own ``Path(__file__).parent / ".env"`` —
+#:     the same path, reached by a second and independent route;
+#:   * :mod:`server` read ``_PROJECT_ROOT / ".env"`` — a *different file*,
+#:     and the one the server actually used.
+#:
+#: So a deployment could satisfy the CLI's loader from ``backend/.env``
+#: while the server ran on the root file, with the two free to disagree
+#: about every value they shared. The root is also the right answer on its
+#: own terms: the dotenv carries deployment-wide settings rather than
+#: backend-package ones, so it belongs beside the other deployment-wide
+#: inputs. Declaring it once, here, is what stops the drift returning —
+#: both readers now resolve through this constant.
+ENV_FILE: Path = PROJECT_ROOT / ".env"
+
+
 # ---------------------------------------------------------------------------
 # Backend-level paths
 # ---------------------------------------------------------------------------
@@ -130,9 +153,6 @@ ARCH_PRINCIPLES_YAML: Path = CONFIGS_DIR / "arch_principles.yaml"
 
 #: Server-level config (supervisor fleet, ``provider_order_file``, ...).
 BACKEND_CONFIG_YAML: Path = BACKEND_DIR / "config.yaml"
-
-#: Optional dotenv file read by :mod:`env_config`.
-ENV_FILE: Path = BACKEND_DIR / ".env"
 
 # ---------------------------------------------------------------------------
 # provider-order contract state
