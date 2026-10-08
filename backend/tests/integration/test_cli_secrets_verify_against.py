@@ -46,7 +46,7 @@ project is trying to bound.
 
 The baseline file itself
 ------------------------
-A ``KEY=value`` file, the spelling ``backend/.env`` already uses, keyed
+A ``KEY=value`` file, the spelling ``.env`` already uses, keyed
 by the spec table's own ``fallback_env_key``. Three deliberate limits.
 No interpolation, so a value is compared as written rather than as
 whatever the shell it was written in would have produced. A line with
@@ -107,10 +107,10 @@ _CREDENTIAL_ENV_KEYS = tuple(
     for key in (spec.fallback_env_key, spec.account_env_key)
 ) + ("PDT_DISABLE_KEYCHAIN_SECRETS",)
 
-#: The three variables ``env_config.load_env()`` demands before the CLI
-#: parses anything. Placeholders — the loader only checks that they
-#: exist.
-_LOADER_PLACEHOLDERS = ("ANTHROPIC_API_KEY", "NOTION_TOKEN", "NOTION_PARENT_PAGE_ID")
+# ``env_config.load_env()`` used to demand three variables before the CLI
+# parsed anything, and these tests filled them with placeholders so the
+# subprocess would get that far. It demands nothing now (2026-10-08), so
+# there is nothing to fill in.
 
 
 def _sentinel(canary, kind, tmp_path, tag) -> str:
@@ -458,10 +458,10 @@ def test_real_subprocess_reads_the_baseline_and_prints_no_value(
     not exist, and no in-process test can see it.
 
     Every credential key is *set* rather than removed, for the same
-    reason the unit suite sets them: the CLI loads ``backend/.env``
-    before it parses, and a key absent from the child is exactly the
-    one that file is allowed to fill. The keychain is switched off so
-    the deployment being described is the same one on every platform.
+    reason the unit suite sets them: so that a key cannot arrive from the
+    developer's own shell to stand in for one this test meant to
+    supply. The keychain is switched off so the deployment being
+    described is the same one on every platform.
 
     The exit code is compared as "0 or 1" rather than pinned: whether
     ``/usr/bin/security`` can be executed is a property of the runner
@@ -475,8 +475,6 @@ def test_real_subprocess_reads_the_baseline_and_prints_no_value(
     child_env = dict(os.environ)
     for key in _CREDENTIAL_ENV_KEYS:
         child_env.pop(key, None)
-    for key, value in zip(_LOADER_PLACEHOLDERS, ("placeholder-a", "placeholder-b", "placeholder-c")):
-        child_env[key] = value
     child_env["PDT_DISABLE_KEYCHAIN_SECRETS"] = "1"
     for name, value in values.items():
         child_env[credentials.SECRET_SPECS[name].fallback_env_key] = value

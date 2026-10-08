@@ -669,18 +669,21 @@ def test_cli_passes_tasks_file_through(monkeypatch, tmp_path):
     from cli import main
     import cli as cli_module
 
-    # ``cli.main`` calls ``env_config.load_env()``, which requires these
-    # three and otherwise raises RuntimeError. Satisfy them here rather
-    # than inheriting them from ``backend/.env``: that file is gitignored,
-    # so it exists on a developer machine and not on a CI runner, and the
-    # test then failed on CI for an environment reason while passing
-    # locally (observed as
+    # This test used to set three placeholder variables because
+    # ``cli.main`` calls ``env_config.load_env()``, which required them and
+    # raised ``RuntimeError`` otherwise. It does not any more (2026-10-08):
+    # no API key is read from a dotenv by this repository, and the other two
+    # required names never had a reader at all, so ``load_env()`` starts on
+    # a bare environment.
+    #
+    # That was the third recurrence of one cause: a required variable that
+    # lives in a gitignored file, which exists on a developer machine and
+    # not on a CI runner. The test then failed on CI for an environment
+    # reason while passing locally (observed as
     # ``FAILED tests/unit/test_agent_persist.py::test_cli_passes_tasks_file_through``
-    # in staircase shard u-55, run 35852698516). This test pins the
-    # cli.py -> autonomous_coding() wiring, not env handling; pinning it
-    # to a developer's credentials is exactly what made it CI-red.
-    for _key in ("ANTHROPIC_API_KEY", "NOTION_TOKEN", "NOTION_PARENT_PAGE_ID"):
-        monkeypatch.setenv(_key, "test-value")
+    # in staircase shard u-55, run 35852698516). Removing the requirement
+    # fixes the class rather than the instance; the test below now runs
+    # wherever it is checked out, with no environment at all.
 
     project_dir = tmp_path / "project"
     _git_init(project_dir)

@@ -108,6 +108,7 @@ from dynamic_provider_concurrency import (
     set_shared_tracker,
 )
 from config_paths import (
+    ENV_FILE,
     STATE_DB,
     STATE_DB_ENV,
     resolve_provider_order_file,
@@ -282,12 +283,17 @@ _BACKEND_DIR = Path(__file__).parent.resolve()
 # own startup (``load_dotenv()`` at tools/main.py:1891), so both processes
 # get consistent credentials from the single source of truth
 # (project-root .env).
+#
+# The path comes from ``config_paths.ENV_FILE`` rather than being derived
+# here. It used to be spelled ``_PROJECT_ROOT / ".env"`` at this site,
+# ``backend/.env`` in ``config_paths``, and ``Path(__file__).parent /
+# ".env"`` in ``env_config`` — three spellings, two different files, and
+# this one the odd man out. See ``config_paths.ENV_FILE``.
 try:
     from dotenv import load_dotenv
 
-    _DOTENV_PATH = _PROJECT_ROOT / ".env"
-    if _DOTENV_PATH.exists():
-        load_dotenv(_DOTENV_PATH, override=False)
+    if ENV_FILE.exists():
+        load_dotenv(ENV_FILE, override=False)
 except ImportError:  # dotenv not installed — fall back to caller-provided env
     pass
 

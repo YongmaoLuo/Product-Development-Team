@@ -58,14 +58,17 @@ provider 集合编译进**每一次**安装。这里刻意**没有**任何"带�
 
 ## 凭据
 
-凭据来自 `backend/.env`，它是 gitignored 的。`backend/.env.ci` 放的是提交进仓的
-**占位值** —— 它是测试夹具，真密钥永远不要放进去。
+没有任何凭据来自 `.env`。provider 的 API key 由运行时那层 provider 供给 ——
+`backend/cc_switch.py` 是本仓提供的那个对接，它一行一行地读；两个通知 secret
+（飞书 app secret、Telegram bot token）从独立的 macOS 钥匙串读取，再经文件描述符
+交给需要它们的进程，从而不出现在 `ps eww` 的输出里。`.env`（gitignored，模板是提交进仓的 `.env.example`）装的是**非机密
+的那一半**：每个钥匙串条目建在哪个 `account` 下、时区、以及通知目标。
 
-两个通知 secret 也可以改为从独立的 macOS 钥匙串读取，再经文件描述符交给需要它们的
-进程，从而不出现在 `ps eew` 的输出里。这条路径**需要主动开启、默认关闭** —— 不做任何
-改动的部署完全不受影响，而没有走过迁移的安装仍然是从 `.env` 读 secret。在假定它已经
-生效之前请先看[钥匙串迁移](keychain-migration.md)；`secrets verify` 会报出每个 secret
-实际来自哪个来源。
+这条钥匙串路径**需要主动开启、默认关闭**。放着不管 —— `PDT_DISABLE_KEYCHAIN_SECRETS`
+未设置 —— 两个通知 secret 就仍然是从 `.env` 里的明文变量读的，也就是说没有走过迁移的
+安装仍然把它们明文放在磁盘上的一个文件里。在假定它已经生效之前请先看
+[钥匙串迁移](keychain-migration.md)；`secrets verify` 会报出每个 secret 实际来自哪个
+来源。
 
 当某个 secret 取不到值时，`secrets verify` 会**说明原因**，每个未解析的 secret 一行：
 开关关着、账号索引没设、钥匙串锁着、钥匙串工具根本跑不起来、或者条目根本没建。
