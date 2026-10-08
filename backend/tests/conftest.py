@@ -611,66 +611,33 @@ def fake_cc_switch_home(monkeypatch, tmp_path):
 # The process environment file
 # ---------------------------------------------------------------------------
 #
-# 2026-09-23, third instance of the same cause as the two fixtures above:
-# something the code requires is **runtime state that a git checkout does
-# not carry**. `env_config.load_env()` requires ANTHROPIC_API_KEY,
-# NOTION_TOKEN and NOTION_PARENT_PAGE_ID and raises RuntimeError when any
-# is absent; they normally live in `backend/.env`, which `.gitignore`
-# excludes. Present on a developer machine, absent on a runner.
+# 2026-10-08: this section used to materialise ``backend/.env.ci`` as
+# ``backend/.env`` for the whole session, so the suite ran with the three
+# placeholder variables ``env_config.REQUIRED_VARS`` demanded. That
+# demand is gone, and so is the fixture.
 #
-# It is worth noting *why* this one survived so long: the failure it causes
-# is hidden behind the shard wedge. `tests/unit/test_agent_persist.py::test_cli_passes_tasks_file_through`
-# has been failing on every CI run, and nobody has seen it, because the
-# full `unit` shard stops before reaching it. It took staircase shard u-55
-# (run 35852698516) — the first shard small enough to finish — to surface it.
+# The history is worth one line because the failure it caused was invisible
+# for a long time. The fixture was itself the third instance of the same
+# cause as the two above it: something the code requires is **runtime
+# state that a git checkout does not carry**. ``load_env()`` raised
+# ``RuntimeError`` when a variable was absent, the variables lived in a
+# gitignored file, and so
+# ``tests/unit/test_agent_persist.py::test_cli_passes_tasks_file_through``
+# failed on every CI run while passing locally. Nobody saw it because the
+# full ``unit`` shard wedges before reaching that test; it took staircase
+# shard u-55 (run 35852698516) — the first shard small enough to finish —
+# to surface it. The fix at the time was to feed the suite placeholders.
 #
-# `backend/.env.ci` is the committed, non-secret template (see its header).
-# This materialises it as `backend/.env` when that file is absent, and
-# removes it again afterwards, so the checkout is left as found.
+# The fix now is that there is nothing to feed it. No API key is read from
+# a dotenv by this repository — the key is supplied by the provider layer
+# — the other two required names never had a reader at all, and
+# ``env_config.REQUIRED_VARS`` is empty. A fresh checkout runs the suite
+# with no environment file, which is the point.
 #
-# Failure stays loud: this fixture only supplies the three placeholders the
-# loader demands. A missing *other* variable still raises from
-# `env_config.load_env()` at the point of use — the loader does not retry,
-# sleep or degrade, which is the behaviour a missing configuration should
-# have. `tests/unit/test_env_config_fails_fast.py` pins that.
-
-_BACKEND_ROOT = Path(__file__).resolve().parents[1]
-_ENV_TEMPLATE = _BACKEND_ROOT / ".env.ci"
-_ENV_TARGET = _BACKEND_ROOT / ".env"
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _env_file_for_tests():
-    """Give the suite the same environment a developer machine has.
-
-    Yields the path in force (the real ``.env``, the materialised template,
-    or ``None`` when neither could be used). Nothing asserts on the value;
-    it exists so the fixture is visible in ``--fixtures`` and debuggable.
-    """
-    if _ENV_TARGET.exists():
-        # A developer's own credentials — never touch them.
-        yield _ENV_TARGET
-        return
-
-    if not _ENV_TEMPLATE.exists():  # pragma: no cover - template is committed
-        yield None
-        return
-
-    try:
-        _ENV_TARGET.write_text(
-            _ENV_TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8",
-        )
-    except OSError:  # pragma: no cover - read-only checkout
-        yield None
-        return
-
-    try:
-        yield _ENV_TARGET
-    finally:
-        try:
-            _ENV_TARGET.unlink()
-        except OSError:  # pragma: no cover - defensive
-            pass
+# Nothing below replaces it: the loader has no required variables, so
+# there is no configuration a missing file can withhold. If a
+# deployment-specific requirement is ever added to ``REQUIRED_VARS``,
+# the session fixture that satisfies it comes back with it.
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):

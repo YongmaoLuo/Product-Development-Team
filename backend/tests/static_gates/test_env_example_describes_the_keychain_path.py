@@ -44,10 +44,16 @@ from pathlib import Path
 
 import credentials
 
-#: ``backend/.env.example``, resolved from this file's own location so the
+#: ``<repo>/.env.example``, resolved from this file's own location so the
 #: gate reads the same file whether pytest was launched from the repository
 #: root or from ``backend/`` (which is what the CI gate lane does).
-_ENV_EXAMPLE = Path(__file__).resolve().parents[2] / ".env.example"
+#:
+#: One level higher than it used to point. The template documented
+#: ``backend/.env`` and therefore sat beside the file it described; it now
+#: documents ``<repo>/.env`` and sits beside that. The gate is the reason
+#: this move is safe rather than silent — a template that drifted away
+#: from its file would go on describing a credential path nobody reads.
+_ENV_EXAMPLE = Path(__file__).resolve().parents[3] / ".env.example"
 
 #: The four keys the example file is about: two that stay here because they
 #: are the keychain *index*, two that are credentials and therefore do not.
