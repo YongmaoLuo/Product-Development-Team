@@ -59,9 +59,10 @@ What is pinned
   republishes on a pipe of its own, C reads: a handoff that only works
   for the process that started it is a handoff that does not work.
 * No environment along the chain carries the secret. A is the only level
-  holding it in one, and only because that is where the module resolves
-  it from; every environment past the first spawn carries a descriptor
-  number, which is checked entry by entry.
+  holding it in one — put there by the test, so that the stubbed keychain
+  standing in for A's has something to return — while every environment
+  past the first spawn carries a descriptor number, which is checked
+  entry by entry.
 
 Resource discipline
 -------------------
@@ -108,10 +109,11 @@ LOGICAL_NAME = "feishu_app_secret"
 #: written out, so a change to the prefix is a change this file follows.
 FD_ENV_VAR = credentials.secret_fd_env_var(LOGICAL_NAME)
 
-#: The variable the parent's *own* environment has to carry for the
-#: module to resolve anything at all: the plaintext fallback is the only
-#: source left once the keychain is off. Read from the spec table so a
-#: renamed row cannot leave this suite setting a variable nothing reads.
+#: The variable that carries the value A publishes, read from the spec
+#: table so a renamed row cannot leave this suite setting a variable
+#: nothing reads. ``publish_secret_fd`` goes to the keychain, so what the
+#: fixture does with this name is hand it to the keychain *stand-in* —
+#: the value still enters the chain here and nowhere else.
 FALLBACK_ENV_KEY = credentials.SECRET_SPECS[LOGICAL_NAME].fallback_env_key
 
 #: How long a child may take. Generous, because it covers a loaded CI
@@ -213,10 +215,10 @@ sys.exit(0)
 # started it is not a handoff, and nothing short of a second real process
 # can tell the two apart.
 #
-# B cannot use ``publish_secret_fd`` to re-publish: that function
-# resolves the secret from *its own* environment, which by construction
-# holds no secret, so it would return ``None`` — the correct answer, and
-# a dead end. B therefore writes the wire form itself, through the
+# B cannot use ``publish_secret_fd`` to re-publish: that function reads
+# the keychain, and B's environment carries no keychain index and no
+# value, so it would return ``None`` — the correct answer, and a dead
+# end. B therefore writes the wire form itself, through the
 # module's own encoder, deliberately: the bytes C receives are then the
 # bytes ``publish_secret_fd`` would have written. A relay that re-encoded
 # the payload by hand would be exercising a second, private format, and
@@ -313,21 +315,34 @@ class ChildResult(NamedTuple):
 
 
 @pytest.fixture(autouse=True)
-def _keychain_off_and_developer_secrets_cleared(monkeypatch):
-    """Put the module on its documented fallback path, and nowhere else.
+def _a_stubbed_keychain_and_no_developer_secrets(monkeypatch):
+    """Give the parent a keychain that holds exactly what the test exported.
 
-    Two things decide which source a lookup answers from, and both are
-    pinned here rather than assumed. The keychain is switched off — the
-    variable that would enable it is removed, and the module's own
-    predicate is then asserted to agree, so a change that inverts the
-    switch fails this fixture instead of quietly sending every test in
-    the file to a platform tool. And the keys derived from
-    ``SECRET_SPECS`` are cleared, so a workstation that really does
-    export a provider secret cannot make a "could not read" result pass.
-    The list is derived, never written out: a row added to the table
-    would otherwise inherit whatever the machine running the suite has
-    exported, and the assertions here would pass on a CI runner and fail
-    on a workstation.
+    Three things, and each closes a way this file could pass for the
+    wrong reason.
+
+    **The keys derived from ``SECRET_SPECS`` are cleared**, so a
+    workstation that really does export a provider secret cannot make a
+    "could not read" result pass. The list is derived, never written out:
+    a row added to the table would otherwise inherit whatever the machine
+    running the suite has exported, and the assertions here would pass on
+    a CI runner and fail on a workstation.
+
+    **The platform keychain is switched off, and the switch is asserted**
+    rather than assumed. ``publish_secret_fd`` is the *launcher's* read
+    now — it goes to the keychain directly and does not consult this
+    switch — so what the switch guards here is the other direction: the
+    real ``/usr/bin/security`` must never be the thing that answers, on
+    any machine this suite runs on.
+
+    **The keychain read is stubbed**, at the process boundary rather than
+    above it, so everything the handoff does on top of the read stays
+    real. The stand-in answers from the spec's own fallback variable,
+    which is what lets the four tests below keep saying "put a value
+    here, publish it" in exactly the terms they always did — with the
+    keychain read that now sits in front of the publish in between. That
+    the value arrives from a stand-in rather than a real keychain is not
+    a property any of them is about; they are about the pipe.
 
     The memo is not touched. ``tests/conftest.py`` already empties it
     around every test, autouse, and a second reset would be a second way
@@ -342,6 +357,14 @@ def _keychain_off_and_developer_secrets_cleared(monkeypatch):
         "the keychain is not off, so a lookup here would consult the "
         "platform instead of the environment this file controls"
     )
+
+    def _stubbed_keychain(spec):
+        value = os.environ.get(spec.fallback_env_key)
+        if value:
+            return (value, credentials.SOURCE_KEYCHAIN)
+        return (None, credentials.SOURCE_MISSING)
+
+    monkeypatch.setattr(credentials, "_resolve_from_keychain", _stubbed_keychain)
 
 
 @pytest.fixture

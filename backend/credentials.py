@@ -183,7 +183,34 @@ log = logging.getLogger("credentials")
 
 #: The system binary that reads the macOS keychain. Named once so the
 #: command line a reviewer checks is the command line that runs.
+#:
+#: Two different jobs go through this path and only one of them reads a
+#: secret. :func:`_keychain_state` asks it whether the keychain is
+#: *locked* — a question about the container, answered without opening an
+#: item — and :func:`_resolve_from_keychain` asks it for a password, which
+#: is the call an item's access control list governs. Only the second is
+#: redirectable; see :data:`_SECRET_READER_ENV_KEY`.
 _SECURITY_BIN = "/usr/bin/security"
+
+#: Points the *read* at a different binary.
+#:
+#: A keychain item's access control list names the applications allowed to
+#: read it, and the default entry is the application that filed the item —
+#: here ``/usr/bin/security``, an Apple-signed binary that every process
+#: on the machine may execute. So the default ACL grants the secret to
+#: anything that can run one command. A deployment that wants the ACL to
+#: name something narrower signs a reader of its own and sets this to its
+#: path; the reader is invoked with the same argv
+#: (``find-generic-password -a <account> -w <keychain>``), so nothing else
+#: about the read changes. See ``tools/pdt-secret-reader/``.
+#:
+#: This deliberately does **not** redirect :func:`_keychain_state`. That
+#: probe runs ``show-keychain-info``, which no reader implements and which
+#: needs no ACL entry, because no item is ever opened. Leaving it on the
+#: system tool is what lets a failed read still report "the keychain is
+#: locked" — rather than "the tool could not be run" — on the very
+#: deployments that narrowed their ACL.
+_SECRET_READER_ENV_KEY = "PDT_SECRET_READER_PATH"
 
 #: This project's own keychain, relative to the user's home directory.
 #: Joining it onto the home directory happens where the read happens, so
@@ -252,10 +279,16 @@ _LOCK_PROBE_TIMEOUT_SECONDS = 10.0
 _SWITCH_ENV_KEY = "PDT_DISABLE_KEYCHAIN_SECRETS"
 _SWITCH_ENABLING_VALUES = frozenset({"0", "false"})
 
-#: The three labels :func:`secret_source` can return.
+#: The four labels :func:`secret_source` can return.
 SOURCE_KEYCHAIN = "keychain"
 SOURCE_ENVIRONMENT = "os.environ"
 SOURCE_MISSING = "missing"
+#: Handed down by a parent over an anonymous pipe — see
+#: :func:`publish_secret_fd`. The label is separate from ``"keychain"``
+#: on purpose: the server process no longer reads the keychain at all
+#: (the launcher does, before exec'ing it), so a row reading
+#: ``"keychain"`` would name a lookup this process cannot perform.
+SOURCE_INHERITED_FD = "inherited_fd"
 
 #: The prefix of the variable that carries a secret's descriptor number
 #: to a child process. Named once so the string a reviewer checks is the
@@ -366,6 +399,26 @@ def _keychain_file() -> str:
     return str(Path.home() / path)
 
 
+def _secret_reader_bin() -> str:
+    """Return the binary a keychain **read** should go through.
+
+    ``PDT_SECRET_READER_PATH`` wins when it carries a value; unset or
+    empty falls back to :data:`_SECURITY_BIN`, which is what every
+    deployment used before a narrower reader existed and is still the
+    right answer for one that never narrowed anything.
+
+    Read on every call rather than bound at import, for the same reason
+    :func:`_keychain_file` and :func:`keychain_disabled` are: the value
+    belongs to the deployment, and one captured at import is a copy taken
+    before the environment could say otherwise.
+
+    Whichever binary this returns is invoked with the same argv — see
+    :func:`_resolve_from_keychain` — so swapping it changes *which code
+    the item's ACL trusts* and nothing else.
+    """
+    return _env_value(_SECRET_READER_ENV_KEY) or _SECURITY_BIN
+
+
 def _run_security(argv: Sequence[str], timeout: float) -> Optional[bytes]:
     """Run the keychain tool, returning its stdout — or None on any failure.
 
@@ -457,6 +510,13 @@ def _keychain_state() -> str:
     """
     if not _is_macos():
         return KEYCHAIN_UNAVAILABLE
+    # Deliberately not :func:`_secret_reader_bin`. This asks about the
+    # container, not about an item, so no ACL entry is consulted and the
+    # system tool answers it on every deployment — including one whose
+    # ACL no longer trusts ``security`` for a *read*. A reader of our own
+    # would have to reimplement ``show-keychain-info`` to be usable here,
+    # and a probe that could not run would report a narrowed ACL as an
+    # unrunnable tool.
     argv: List[str] = [_SECURITY_BIN, "show-keychain-info", _keychain_file()]
     try:
         completed = subprocess.run(
@@ -506,7 +566,7 @@ def _resolve_from_keychain(spec: SecretSpec) -> Tuple[Optional[str], str]:
         return (None, SOURCE_MISSING)
 
     argv: List[str] = [
-        _SECURITY_BIN,
+        _secret_reader_bin(),
         "find-generic-password",
         "-a",
         account,
@@ -555,6 +615,59 @@ def _resolve_from_env(spec: SecretSpec) -> Tuple[Optional[str], str]:
     return (value, SOURCE_ENVIRONMENT)
 
 
+def _resolve_from_inherited_fd(name: str) -> Tuple[Optional[str], str]:
+    """Return ``(value, source)`` from the pipe a parent handed down.
+
+    ``name`` is the logical name, and it is also what derives the
+    variable holding the descriptor — see :func:`secret_fd_env_var`.
+
+    No descriptor named means no pipe was passed. That is not an error
+    and not necessarily a misconfiguration: it is the ordinary state of
+    a process started by hand rather than by the launcher, and of every
+    process on a platform with no keychain.
+
+    A descriptor that is *named* but unusable — a parent that published
+    and then died before the child read, a number that is not an
+    integer, a payload that is not the object the writer promised —
+    also reports ``(None, SOURCE_MISSING)`` and lets the caller try the
+    next source. The descriptor is spent either way, because
+    :func:`read_secret_fd` closes it on every path; leaving a half-read
+    pipe open would hand it to whatever reads a descriptor next.
+
+    The variable naming the descriptor is left in place. It holds a
+    number naming a closed pipe, so it carries nothing, and removing it
+    would be the "export then delete" shape the module docstring warns
+    about: a cosmetic change that makes a deployment look migrated
+    while the parent's own environment is untouched.
+    """
+    raw_fd = _env_value(secret_fd_env_var(name))
+    if raw_fd is None:
+        return (None, SOURCE_MISSING)
+
+    try:
+        fd = int(raw_fd)
+    except ValueError:
+        log.debug("inherited fd for %s is not an integer: %r", name, raw_fd)
+        return (None, SOURCE_MISSING)
+
+    try:
+        payload = read_secret_fd(fd)
+    except (OSError, ValueError) as exc:
+        # A pipe whose writer never arrived, and a payload the writer
+        # should not have produced, are the same problem here: this
+        # source has no value. Both are worth a log line, because both
+        # mean the handoff did not arrive intact.
+        log.debug("inherited fd for %s did not yield a value: %s", name, exc)
+        return (None, SOURCE_MISSING)
+
+    value = payload.get(name)
+    if value is None:
+        log.debug("inherited fd for %s carried a payload without it", name)
+        return (None, SOURCE_MISSING)
+
+    return (value, SOURCE_INHERITED_FD)
+
+
 def _resolve(name: str) -> Tuple[str, Optional[str]]:
     """Return ``(source, value)`` for ``name``, consulting the memo.
 
@@ -563,6 +676,24 @@ def _resolve(name: str) -> Tuple[str, Optional[str]]:
     separate resolutions is how they would come to disagree — with the
     disagreement depending on which one a caller happened to call
     first.
+
+    Order: **inherited fd → environment → missing**, and the keychain is
+    deliberately not one of the three.
+
+    The fd comes first because it is the production path: the launcher
+    (:mod:`backend.secret_launcher`) reads the keychain, publishes each
+    secret to an anonymous pipe, and ``exec``\\s this server with the
+    descriptors. The keychain is not offered as a fallback because a
+    lookup here would be a second attempt at the *same* keychain the
+    launcher just read — it would fail for the same reason — and a
+    fallback turns a broken handoff into a silent downgrade rather than
+    the named failure it is. :func:`read_secret_from_keychain` remains
+    for the two callers that genuinely read it: the launcher, and the
+    operator's ``secrets`` CLI.
+
+    The environment is consulted only when the keychain is switched off,
+    which is the CI / container / Linux path and is unchanged. With the
+    switch on, an fd that did not arrive reports ``"missing"``.
     """
     cached = _CACHE.get(name)
     if cached is not None:
@@ -575,17 +706,10 @@ def _resolve(name: str) -> Tuple[str, Optional[str]]:
         # configured" question onto every caller, and one of them
         # would answer it differently.
         resolved = (SOURCE_MISSING, None)
-    elif keychain_disabled():
-        value, source = _resolve_from_env(spec)
-        resolved = (source, value)
     else:
-        # Enabled: the keychain is the source, and the index decides
-        # whether the lookup can happen at all. With no index there is
-        # nothing to look up, and the plaintext variable is not
-        # substituted for it — an operator who asked for a keychain
-        # gets told the keychain is not configured, rather than a
-        # quiet downgrade to a secret every process can read.
-        value, source = _resolve_from_keychain(spec)
+        value, source = _resolve_from_inherited_fd(spec.logical_name)
+        if source == SOURCE_MISSING and keychain_disabled():
+            value, source = _resolve_from_env(spec)
         resolved = (source, value)
 
     _CACHE[name] = resolved
@@ -595,10 +719,15 @@ def _resolve(name: str) -> Tuple[str, Optional[str]]:
 def secret_source(name: str) -> str:
     """Return where the secret ``name`` is read from.
 
-    One of ``"keychain"``, ``"os.environ"`` or ``"missing"``. The
+    One of ``"inherited_fd"``, ``"os.environ"`` or ``"missing"``. The
     label answers "where did this come from", so a caller can log it
     without knowing which platform it is running on. A name that is
     not in :data:`SECRET_SPECS` is ``"missing"``.
+
+    ``"keychain"`` is not among them: this resolver does not read the
+    keychain any more (see :func:`_resolve`). To ask *that* question go
+    through :func:`read_secret_from_keychain`, whose answer is about the
+    machine rather than about this process.
     """
     return _resolve(name)[0]
 
@@ -606,21 +735,46 @@ def secret_source(name: str) -> str:
 def read_secret(name: str) -> Optional[str]:
     """Return the value of the secret ``name``, or None.
 
-    None means the secret is not available: the keychain is disabled
-    and no fallback variable is populated, the keychain is enabled and
-    no index names the item, or the name is not in the spec table. It
-    is not an error — an unconfigured transport is a state the
-    notifiers already handle — so this function does not raise.
+    None means the secret is not available: no descriptor was handed
+    down and either the keychain is switched on — so there is no
+    environment fallback by design — or it is switched off and no
+    fallback variable is populated. It is not an error; an unconfigured
+    transport is a state the notifiers already handle, so this function
+    does not raise.
     """
     return _resolve(name)[1]
+
+
+def read_secret_from_keychain(name: str) -> Optional[str]:
+    """Return the value of ``name`` by reading the keychain **directly**.
+
+    This is the one entry point that still runs ``/usr/bin/security``,
+    and it exists for exactly two callers:
+
+    * :mod:`backend.secret_launcher` — which reads the keychain once at
+      startup and hands the values to the server over pipes, so the
+      server itself never has to.
+    * the operator's ``secrets`` CLI, whose whole job is to report what
+      this machine's keychain holds. A diagnostic that could only
+      report the fd would tell the operator nothing they could act on.
+
+    Not for request paths. A caller here pays a subprocess and possibly
+    an ACL prompt every time, which is the cost the fd handoff exists to
+    pay once instead.
+    """
+    spec = SECRET_SPECS.get(name)
+    if spec is None:
+        return None
+    value, _source = _resolve_from_keychain(spec)
+    return value
 
 
 def secret_available(name: str) -> bool:
     """Return whether a source is configured for the secret ``name``.
 
     This reports configuration, not readability: it is
-    ``secret_source(name) != "missing"``, so a keychain-sourced secret
-    is available as soon as its index is present.
+    ``secret_source(name) != "missing"``, so an inherited-fd secret is
+    available as soon as its descriptor variable is present.
     """
     return _resolve(name)[0] != SOURCE_MISSING
 
@@ -656,6 +810,17 @@ def diagnose_secret(name: str) -> Optional[str]:
     caller would have observed rather than a second, possibly different
     one. It never raises: a name that is not registered is a sentence,
     not an exception.
+
+    "No value" here means **no value from any source this machine has**,
+    which is why the keychain is consulted on the last branch rather
+    than assumed. :func:`_resolve` deliberately does not read the
+    keychain — the server must not, it gets its values over a descriptor
+    — so a diagnostic that stopped at ``_resolve`` would report "the
+    keychain holds no item" for a secret the keychain is holding, and it
+    would do it in the one command an operator runs *because* they
+    suspect the keychain. The read happens last, and only after the
+    probe has said the keychain is unlocked and reachable, so it is the
+    only branch that pays for it.
     """
     spec = SECRET_SPECS.get(name)
     if spec is None:
@@ -703,6 +868,14 @@ def diagnose_secret(name: str) -> Optional[str]:
             f"execute it. Unlocking the keychain will not change this; the "
             f"process has to run somewhere the tool is allowed to run."
         )
+
+    # Unlocked, indexed, and every server-side source still empty — so
+    # the only thing left to rule out is the keychain actually holding
+    # it. Asked rather than assumed: this is the branch that would
+    # otherwise claim the item was never filed, and it would make that
+    # claim about a deployment whose whole configuration is that item.
+    if read_secret_from_keychain(name) is not None:
+        return None
 
     return (
         f"{name}: the keychain is unlocked but holds no item with the account "
@@ -776,17 +949,27 @@ def publish_secret_fd(name: str) -> int | None:
     variable, no temporary file, no argument vector where a process
     listing would show it.
 
-    ``None`` means there is no secret to publish, which is the same
-    answer :func:`read_secret` gives and the same one
-    :func:`secret_source` labels ``"missing"``. No pipe is opened in
-    that case: a "no secret" answer that still allocated two descriptors
-    would leak them on every call, for the life of the process, since
-    nothing else would ever close them.
+    ``None`` means there is no secret to publish. The value comes from
+    the keychain directly — this is the launcher's read, not the
+    server's — so ``None`` here means the keychain had nothing, which
+    :func:`secret_source` would label ``"missing"`` if it were asked in
+    the publishing process. No pipe is opened in that case: a "no
+    secret" answer that still allocated two descriptors would leak them
+    on every call, for the life of the process, since nothing else would
+    ever close them.
 
     The write end is closed before the read end is returned, and that is
     not a formality — it is what puts the reader at EOF. A write end
     left open is a pipe whose writer is still nominally alive, and the
     read on the other side would wait for it forever.
+
+    The returned descriptor is marked **inheritable**. PEP 446 made
+    descriptors non-inheritable by default, so without that flag a
+    caller that hand-rolled its own ``exec`` would hand the child a
+    number naming a descriptor that had already been closed — and the
+    child reports a closed pipe as "missing", not as an error, so the
+    symptom would be a silently unconfigured notifier rather than a
+    failure anyone could see.
 
     Raises ``ValueError`` for a payload too large for the pipe's
     buffer. The write is non-blocking so that case surfaces as an error
@@ -794,7 +977,7 @@ def publish_secret_fd(name: str) -> int | None:
     the buffer's capacity would never return, and a secret that
     enormous is not a secret but a mistake worth naming.
     """
-    value = read_secret(name)
+    value = read_secret_from_keychain(name)
     if value is None:
         return None
 
@@ -812,6 +995,12 @@ def publish_secret_fd(name: str) -> int | None:
                 ) from None
     finally:
         os.close(write_fd)
+
+    # Inheritable, so that a caller handing this over with ``os.execv``
+    # (rather than ``subprocess`` with ``pass_fds``, which repairs the
+    # flag itself) does not hand the child a number naming a descriptor
+    # that ``exec`` already closed. See the docstring.
+    os.set_inheritable(read_fd, True)
 
     return read_fd
 

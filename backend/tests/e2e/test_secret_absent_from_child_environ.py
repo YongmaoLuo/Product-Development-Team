@@ -535,14 +535,34 @@ def published_secret(monkeypatch, canary, tmp_path, register_open_fd):
     The value is a canary — synthetic, per-test, and never written to
     disk — because the assertion here is about where a value *travels*, and
     a real credential would put a real credential into every failure
-    message this file can produce. It is placed in the fallback variable
-    because on Linux that is the only source the provider has, and
-    ``monkeypatch`` unwinds it at the end of the case whatever the case
-    asserted, so the next one reads the ambient environment this fixture
+    message this file can produce.
+
+    It is placed where :func:`credentials.publish_secret_fd` actually
+    reads, and that is the keychain: the function is the *launcher's* read,
+    and the launcher has no environment fallback to offer, because a
+    deployment that asked for a keychain must not be quietly served from a
+    plaintext variable. So the canary goes behind the one call that would
+    reach this machine's own keychain, and the account index names it.
+    ``monkeypatch`` unwinds both at the end of the case whatever the case
+    asserted, so the next one reads the ambient environment the fixture
     above checked rather than this one's scaffolding.
+
+    Leaving it in the fallback variable instead — which is what this
+    fixture used to do — reads as a handoff only where a real keychain item
+    happens to be filed under the ambient index, and publishes nothing at
+    all where there is neither. That is a green run on the machine that
+    filed the item and a failure on the runner that did not.
     """
     secret = canary("feishu_secret", tmp_path)
-    monkeypatch.setenv(FALLBACK_ENV_KEY, secret)
+    monkeypatch.setenv(
+        credentials.SECRET_SPECS[LOGICAL_NAME].account_env_key, "cli_e2e_handoff"
+    )
+
+    def _the_keychain_holds_it(argv, timeout):
+        return secret.encode("utf-8") + b"\n"
+
+    monkeypatch.setattr(credentials, "_run_security", _the_keychain_holds_it)
+
     fd = credentials.publish_secret_fd(LOGICAL_NAME)
     assert fd is not None, (
         "the provider published nothing, so there is no handoff to inspect"
