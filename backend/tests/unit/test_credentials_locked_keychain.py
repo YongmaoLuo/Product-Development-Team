@@ -2,10 +2,11 @@
 
 Why this suite exists
 ---------------------
-``read_secret`` returns ``None`` for every way of not having a value,
-and that is deliberate: the caller asks whether a transport is
-configured, not what went wrong, and a notifier that raised on an
-unconfigured deployment would take the whole process down over a
+``read_secret_from_keychain`` returns ``None`` for every way of not
+having a keychain value, and that is deliberate: the caller — the
+launcher, on its way to ``exec``\\ing the server — asks whether a secret
+can be read, not what went wrong, and a launcher that raised on an
+unconfigured deployment would take the whole backend down over a
 notification it was never going to send.
 
 The cost of that collapse is that ``missing`` is one word standing for
@@ -26,6 +27,12 @@ up, and finds it, and concludes the message must be wrong.
 So two things are pinned here: the WARNING that names a locked keychain
 (noisily, and *only* for that case), and :func:`diagnose_secret`, which
 answers the same question on demand.
+
+The entry point these cases drive is the **direct** read, which is the
+launcher's — the server resolves from a descriptor and never touches the
+keychain at all. A case that drove ``read_secret`` would be asserting
+about a process that does not probe, and would pass over a lock warning
+that never fired.
 
 Nothing here runs ``/usr/bin/security``. The read is replaced at
 :func:`credentials._run_security`, which is also what makes the count of
@@ -136,7 +143,7 @@ class TestLockedKeychainIsNamed:
         _fail_read(monkeypatch, state=credentials.KEYCHAIN_LOCKED)
 
         with caplog.at_level(logging.WARNING, logger="credentials"):
-            assert credentials.read_secret("feishu_app_secret") is None
+            assert credentials.read_secret_from_keychain("feishu_app_secret") is None
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
@@ -159,7 +166,7 @@ class TestLockedKeychainIsNamed:
         monkeypatch.setattr(credentials, "_keychain_state", lambda: credentials.KEYCHAIN_LOCKED)
 
         with caplog.at_level(logging.WARNING, logger="credentials"):
-            credentials.read_secret("feishu_app_secret")
+            credentials.read_secret_from_keychain("feishu_app_secret")
 
         assert "the-actual-secret-value" not in caplog.text
 
@@ -177,7 +184,7 @@ class TestLockedKeychainIsNamed:
         _fail_read(monkeypatch, state=credentials.KEYCHAIN_UNLOCKED)
 
         with caplog.at_level(logging.WARNING, logger="credentials"):
-            assert credentials.read_secret("feishu_app_secret") is None
+            assert credentials.read_secret_from_keychain("feishu_app_secret") is None
 
         assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
@@ -187,7 +194,7 @@ class TestLockedKeychainIsNamed:
         monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
 
         with caplog.at_level(logging.WARNING, logger="credentials"):
-            assert credentials.read_secret("feishu_app_secret") is None
+            assert credentials.read_secret_from_keychain("feishu_app_secret") is None
 
         assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
@@ -209,21 +216,31 @@ class TestLockedKeychainIsNamed:
             lambda: pytest.fail("the lock was probed on a successful read"),
         )
 
-        assert credentials.read_secret("feishu_app_secret") == "value"
+        assert credentials.read_secret_from_keychain("feishu_app_secret") == "value"
         assert len(fake.calls) == 1
 
     def test_a_failed_read_probes_the_lock_exactly_once(
         self, keychain_on, monkeypatch
     ):
         """The probe is what turns an unexplained miss into a named
-        cause, so it must actually run — once, and memoised with the
-        resolution rather than repeated on every call.
+        cause, so it must actually run — once per read, and not twice for
+        one answer.
 
         Counted at ``subprocess.run`` rather than at ``_run_security``,
         because that is where the probe goes: it has to bypass the
         wrapper in order to tell "the tool failed" from "the tool could
         not be run", which is the one distinction this module exists to
         keep.
+
+        The second read probes again, and that is this entry point's
+        documented shape rather than a regression. It keeps no memo: the
+        caller that matters, :func:`secret_launcher.publish_secrets`,
+        reads each secret once as the process comes up and then ``exec``\\s
+        away, so a cache here would be an answer stored for a process
+        that is about to stop existing. The cost the memo used to bound —
+        a lookup per notification — is bounded at the launch instead, and
+        that the launch really reads each secret exactly once is pinned
+        in ``tests/integration/test_secret_launcher_publish.py``.
         """
         fake = _FakeSecurity(None, returncode=1)
         monkeypatch.setenv("FEISHU_APP_ID", "cli_abc")
@@ -240,11 +257,16 @@ class TestLockedKeychainIsNamed:
 
         monkeypatch.setattr(credentials.subprocess, "run", _counting_run)
 
-        assert credentials.read_secret("feishu_app_secret") is None
+        assert credentials.read_secret_from_keychain("feishu_app_secret") is None
         assert len(probes) == 1, [p[1] for p in probes]
 
-        credentials.read_secret("feishu_app_secret")
-        assert len(probes) == 1, "the probe was re-run on a memoised miss"
+        credentials.read_secret_from_keychain("feishu_app_secret")
+        assert len(probes) == 2, (
+            "the second read did not probe. A memo on this entry point "
+            "would be an answer held for a process that is about to exec "
+            "away; the number of reads is bounded by the launcher's loop, "
+            "not by a cache here"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -320,15 +342,21 @@ class TestDiagnoseSecret:
         assert reason is not None
         assert "the-actual-secret-value" not in reason
 
-    def test_diagnosing_does_not_change_what_read_secret_returns(
+    def test_diagnosing_does_not_change_what_the_read_returns(
         self, keychain_on, monkeypatch
     ):
         """It is a question, not a repair: asking must not resolve
-        differently from not asking."""
+        differently from not asking.
+
+        Compared against the **direct** read, because that is the one
+        that runs the keychain — ``diagnose_secret`` re-derives a
+        resolution, and in a process no launcher started the two can only
+        agree if they are asking about the same sources.
+        """
         monkeypatch.setenv("FEISHU_APP_ID", "cli_abc")
         monkeypatch.setattr(credentials, "_run_security", _FakeSecurity(b"value\n"))
 
-        assert credentials.read_secret("feishu_app_secret") == "value"
+        assert credentials.read_secret_from_keychain("feishu_app_secret") == "value"
         assert credentials.diagnose_secret("feishu_app_secret") is None
 
 
@@ -360,7 +388,7 @@ class TestLockedIsNotTheSameAsUnrunnable:
         monkeypatch.setattr(credentials.subprocess, "run", _unrunnable)
 
         with caplog.at_level(logging.WARNING, logger="credentials"):
-            assert credentials.read_secret("feishu_app_secret") is None
+            assert credentials.read_secret_from_keychain("feishu_app_secret") is None
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, [r.getMessage() for r in caplog.records]

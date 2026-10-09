@@ -1914,11 +1914,15 @@ jobs:
       #
       # ``test_credentials_security_lookup.py`` covers the read itself
       # (the argv, a nonzero exit for an item that is not there, a
-      # trailing newline, a tool that hangs); the cache invariants
-      # cover what happens when the same lookup is asked twice.
+      # trailing newline, a tool that hangs); ``test_secret_launcher_publish``
+      # covers what happens when the same lookup is asked twice. That
+      # second invariant used to live in ``test_credentials_cache_invariants``,
+      # which counted the processes the *server* started — and the server
+      # starts none any more, so the counter moved to the launcher, which
+      # is the process that reads.
       - name: Run the macOS keychain probes
         working-directory: backend
-        run: ./.venv/bin/python3 -m pytest tests/integration/test_credentials_security_lookup.py tests/integration/test_credentials_cache_invariants.py --tb=short --timeout=300
+        run: ./.venv/bin/python3 -m pytest tests/integration/test_credentials_security_lookup.py tests/integration/test_secret_launcher_publish.py --tb=short --timeout=300
 
       # The whole delivery, end to end, with nothing replaced. The step
       # above proves the command line this repository *believes* in reaches

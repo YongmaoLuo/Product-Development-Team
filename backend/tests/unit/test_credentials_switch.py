@@ -65,6 +65,7 @@ MODULE_PATH = BACKEND_DIR / "credentials.py"
 _ENV_KEYS = (
     "PDT_DISABLE_KEYCHAIN_SECRETS",
     "PDT_KEYCHAIN_PATH",
+    "PDT_SECRET_READER_PATH",
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
     "TELEGRAM_CHAT_ID",
@@ -368,15 +369,21 @@ def test_keychain_disabled_falls_back_to_the_environment(
 def test_keychain_enabled_with_index_key_selects_the_keychain(
     monkeypatch, name, index_key
 ):
-    """The keychain is the source whenever it is enabled and the index is set.
+    """The keychain read is aimed by the index key, and not by the env.
 
     The index key is a non-secret identifier, so leaving it in the
     environment is what makes a keychain deployment possible at all.
-    When both the switch and the index are in place the secret comes
-    from the keychain and *not* from the environment variable, even
-    when that variable also happens to hold a value — otherwise the
-    keychain would be decorative on exactly the machines that
+    When both the switch and the index are in place the direct read
+    comes from the keychain and *not* from the environment variable,
+    even when that variable also happens to hold a value — otherwise
+    the keychain would be decorative on exactly the machines that
     configured it.
+
+    ``read_secret`` is deliberately not asserted here any more. The
+    server does not read the keychain — a launcher reads it once and
+    hands the value over a pipe (:mod:`backend.secret_launcher`) — so
+    the caller that still builds this command line is the direct read
+    named below, and it is the one whose argv this test is about.
 
     The read is stubbed at the process boundary, which is where the
     only part of this that belongs to a machine rather than to a
@@ -404,9 +411,7 @@ def test_keychain_enabled_with_index_key_selects_the_keychain(
 
     monkeypatch.setattr(credentials, "_run_security", _recording_run_security)
 
-    assert credentials.secret_source(name) == "keychain"
-    assert credentials.secret_available(name) is True
-    assert credentials.read_secret(name) == "the-keychain-value"
+    assert credentials.read_secret_from_keychain(name) == "the-keychain-value"
 
     # One read, and it is the one this test describes: the keychain
     # tool, asked for the item named by the index variable, in the
@@ -725,7 +730,7 @@ def test_override_branch_reaches_the_command_line_as_spelled(
         # a look again; without this the second read would replay the
         # first one's answer and the override would never reach a process.
         credentials.reset_cache()
-        assert credentials.read_secret("feishu_app_secret") == "the-keychain-value"
+        assert credentials.read_secret_from_keychain("feishu_app_secret") == "the-keychain-value"
         return started[-1]
 
     # Spelled here rather than read from the module, for the reason given
@@ -773,6 +778,109 @@ def test_override_branch_reaches_the_command_line_as_spelled(
         assert "login" not in argv[-1].lower(), (
             f"the read was pointed at the login keychain: {argv[-1]!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Which binary performs the read
+# ---------------------------------------------------------------------------
+
+
+def test_the_reader_defaults_to_the_system_tool(monkeypatch):
+    """An installation that configures nothing still gets ``/usr/bin/security``.
+
+    The override exists for deployments that narrowed their keychain
+    item's access control list to a binary of their own. It must not
+    become the default: a deployment that never set it is one whose ACL
+    still names the system tool, and pointing its reads somewhere else
+    would turn a working configuration into a prompting one. An empty
+    value is unset — there is no such binary as "".
+    """
+    monkeypatch.delenv("PDT_SECRET_READER_PATH", raising=False)
+    assert credentials._secret_reader_bin() == credentials._SECURITY_BIN
+
+    monkeypatch.setenv("PDT_SECRET_READER_PATH", "")
+    assert credentials._secret_reader_bin() == credentials._SECURITY_BIN
+
+
+def test_the_reader_override_reaches_the_command_line(monkeypatch, tmp_path):
+    """The override changes the binary, and nothing else about the read.
+
+    Asserted on the whole recorded argv rather than on the helper's
+    return value, for the reason the keychain-path test above gives: a
+    command line is the only one of the three facts — constant, helper
+    return, executed argv — that can be read off a record without
+    importing anything. The point of the override is that a deployment
+    can change *which code its ACL trusts* without changing anything
+    else, and an argv assertion is what shows that nothing else moved.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PDT_DISABLE_KEYCHAIN_SECRETS", "0")
+    monkeypatch.setenv("FEISHU_APP_ID", "account-value")
+    reader = str(tmp_path / "somewhere" / "pdt-secret-reader")
+    monkeypatch.setenv("PDT_SECRET_READER_PATH", reader)
+
+    started = []
+
+    def _recording_run_security(argv, timeout):
+        started.append(list(argv))
+        return b"the-keychain-value\n"
+
+    monkeypatch.setattr(credentials, "_run_security", _recording_run_security)
+
+    credentials.reset_cache()
+    assert (
+        credentials.read_secret_from_keychain("feishu_app_secret")
+        == "the-keychain-value"
+    )
+
+    assert started == [[
+        reader,
+        "find-generic-password",
+        "-a",
+        "account-value",
+        "-w",
+        str(home / DEDICATED_KEYCHAIN_FILE),
+    ]], started
+
+
+def test_the_lock_probe_keeps_the_system_tool(monkeypatch):
+    """A narrowed ACL must not blind the probe that explains a miss.
+
+    The probe runs ``show-keychain-info`` — a question about the
+    *container*, not about an item — so no ACL entry is consulted, and
+    the system tool answers it on every deployment, including one whose
+    ACL has stopped trusting ``security`` for a read.
+
+    Redirecting it would mean a reader of ours had to reimplement
+    ``show-keychain-info`` before it was usable at all. Worse, a probe
+    that could not run reports ``KEYCHAIN_UNAVAILABLE`` — "the tool could
+    not be run" — for what is actually a locked keychain, which is the
+    one message an operator most needs to be told correctly and the one
+    that sends them somewhere they cannot fix it from.
+    """
+    monkeypatch.setenv("PDT_SECRET_READER_PATH", "/somewhere/pdt-secret-reader")
+    monkeypatch.setattr(credentials, "_is_macos", lambda: True)
+
+    started = []
+
+    class _Completed:
+        returncode = 0
+
+    def _recording_run(argv, *args, **kwargs):
+        started.append(list(argv))
+        return _Completed()
+
+    monkeypatch.setattr(credentials.subprocess, "run", _recording_run)
+
+    credentials._keychain_state()
+
+    assert started, "the lock probe started no process"
+    assert started[0][0] == credentials._SECURITY_BIN, (
+        "the lock probe followed PDT_SECRET_READER_PATH, so a deployment "
+        "whose ACL names a reader of its own would report an unrunnable "
+        "tool instead of a locked keychain"
+    )
 
 
 def test_no_subprocess_on_a_non_macos_platform(monkeypatch):
