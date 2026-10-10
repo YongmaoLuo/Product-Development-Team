@@ -34,6 +34,7 @@ from git_manager import GitManager
 from refiner import TaskRefiner
 from task import SubTask, UNKNOWN_MODIFICATIONS_SENTINEL, NO_FILE_CHANGES_SENTINEL
 from test_command_quality import inspect_command as inspect_test_command
+from test_command_quality import find_vacuous_pass as _find_vacuous_pass
 from config import AgentConfig
 from config_registry import ConfigRegistry
 from retry_manager import RetryManager
@@ -641,6 +642,13 @@ def _is_plan_failed(tasks: list) -> bool:
 # is unlikely to help and human inspection is required. See
 # :meth:`AutonomousAgent._breakdown_task` for the enforcement site.
 EXECUTOR_BREAKDOWN_MAX = 5
+
+# How many times one execution run may let the refiner restructure the
+# plan before it stops asking. See ``AutonomousAgent._refinement_count``
+# for why the bound is a count rather than a shape rule, and
+# ``20261010-CC-Switch-Remote-Aut`` (eleven refinements, 31 → 55 tasks)
+# for the run that motivated it.
+EXECUTOR_MAX_REFINEMENTS = 8
 
 
 def _filter_terminal_tasks(tasks: list[SubTask]) -> tuple[list[SubTask], int]:
@@ -1619,6 +1627,31 @@ class AutonomousAgent:
         self.retry_manager = RetryManager()
         self.rollback_manager = RollbackManager(str(project_dir))
         self.refiner = TaskRefiner(self.coding_tool, self.config, logger=logger)
+
+        # 2026-10-11 (丁): session-local budget on how many times the
+        # refiner may restructure this plan.
+        #
+        # ``_refine_after_failure`` runs whenever a task fails, and the
+        # refiner's usual answer is "split the failed task in three". In
+        # the 20261010-CC-Switch-Remote-Aut plan eleven failures turned
+        # into a task list that grew 31 → 55, every round logged as
+        # ``+3 added, -1 removed``. The failures were environmental
+        # (``cargo`` missing from the executor's PATH), which from inside
+        # the refiner looked exactly like a defective command — so it
+        # kept minting work instead of fixing anything, and nothing
+        # bounded it. ``EXECUTOR_BREAKDOWN_MAX`` above is dead code: its
+        # enforcement site (``_breakdown_task``) was removed when the
+        # split path moved to the refiner, and no cap travelled with it.
+        #
+        # The bound is deliberately a count rather than a shape rule.
+        # Shape rules — split depth, net growth per round — are always
+        # expressible in terms the refiner can satisfy while still
+        # thrashing, and that is not hypothetical: this run never split
+        # deeper than ``12-6-4``, it simply did it eleven times. When the
+        # budget runs out the failed task stays failed and the plan
+        # surfaces, which is the right trade — an unbounded tail of
+        # invented tasks is strictly worse than a plan that stops.
+        self._refinement_count = 0
 
         # Architecture decision points 1 & 2 — the dispatcher
         # only modifies runtime state fields, and writes go through
@@ -5208,7 +5241,47 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
             )
         except (subprocess.TimeoutExpired, OSError):
             return None
-        return proc.returncode == 0
+        if proc.returncode != 0:
+            return False
+
+        # 2026-10-11: exit 0 is not by itself proof that the work is on
+        # disk.
+        #
+        # A module-wide runner filter naming something that does not
+        # exist exits 0 with ``running 0 tests``. The pre-flight read
+        # that as "already done", marked the task completed WITHOUT
+        # spawning a subagent, and the work was never done — tasks
+        # 1-1-2 / 1-1-3 / 5-3 / 6-3 in the 20261010-CC-Switch-Remote-Aut
+        # plan were all skipped this way. Same remedy as the
+        # unusable-command branch above, and for the same reason: the
+        # exit code is the only signal the pre-flight has, so when it is
+        # meaningless the answer is ``None`` (fall through to the real
+        # subagent path), never ``True``.
+        _vacuous = _find_vacuous_pass(
+            (proc.stdout or "") + "\n" + (proc.stderr or "")
+        )
+        if _vacuous is not None:
+            if self.logger:
+                try:
+                    self.logger.warning(
+                        "task_preflight_skip_refused_vacuous_command",
+                        f"Task [{task.id}] not skipped by pre-flight: its "
+                        f"test_command exits 0 without running any test "
+                        f"({_vacuous.code})",
+                        task_id=task.id,
+                        data={
+                            "code": _vacuous.code,
+                            "detail": _vacuous.detail,
+                            "test_command": clean_cmd[:500],
+                            "output_tail": (
+                                (proc.stdout or "") + (proc.stderr or "")
+                            )[-800:],
+                        },
+                    )
+                except Exception:  # pragma: no cover - logger is best-effort
+                    pass
+            return None
+        return True
 
     # 2026-09-17: a subagent's final answer used to live only in the
     # executor's memory. When an attempt failed, the conclusion — often
@@ -5549,6 +5622,13 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         # Run every test command. All must pass for the verdict to be PASSED.
         aggregate_exit = 0
         failure_tail = ""
+        # Output of the legs that *did* pass. The vacuity gate below has
+        # to read the runner's own summary line, and that line is only
+        # produced by a leg that exited 0 — the failing branch keeps
+        # ``failure_tail`` instead. Head + tail, because cargo prints
+        # ``running N tests`` first and ``test result: …`` last, and a
+        # full `cargo test` transcript is far larger than either.
+        passing_output = ""
         for cmd in test_cmds:
             try:
                 proc = run_bounded(
@@ -5571,9 +5651,48 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 tail = (proc.stdout or "")[-1000:] + (proc.stderr or "")[-500:]
                 failure_tail = f"[exit {proc.returncode}] {cmd}\n{tail}"
                 break
+            _leg = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            passing_output += _leg[:4000] + "\n…\n" + _leg[-2000:] + "\n"
 
         # Decision table
         if aggregate_exit == 0:
+            # 2026-10-11: exit 0 is only a PASSED verdict if the run
+            # actually executed a test.
+            #
+            # `cargo test --lib no_such_mod` exits 0 printing
+            # ``running 0 tests``. Four tasks in the
+            # 20261010-CC-Switch-Remote-Aut plan were recorded
+            # ``completed`` on exactly that — with zero commits and the
+            # module they were supposed to create never written — because
+            # exit 0 was taken as the whole story. In that case the
+            # command half of the dual-criterion rule is vacuous, which
+            # is the single-signal mode the rule exists to prevent. So
+            # the verdict is FAILED, with its own event name: the refiner
+            # must be told "this command proved nothing" (its own defect)
+            # rather than "the code is broken" (which invites it to
+            # rewrite the command instead of the code).
+            _vacuous = _find_vacuous_pass(passing_output)
+            if _vacuous is not None:
+                reason = (
+                    f"test_command exited 0 but ran no tests "
+                    f"({_vacuous.code}): {_vacuous.detail} Treating as "
+                    f"FAILED — a command that executes nothing cannot "
+                    f"certify this task."
+                )
+                if self.logger:
+                    self.logger.error(
+                        "test_cross_verify_vacuous_pass",
+                        "Subagent's test_command exited 0 with zero tests run",
+                        task_id=task.id,
+                        data={
+                            "code": _vacuous.code,
+                            "detail": _vacuous.detail,
+                            "ai_claimed_passed": ai_claimed_passed,
+                            "test_commands": [c[:300] for c in test_cmds],
+                            "output_tail": passing_output[-1200:],
+                        },
+                    )
+                return False, reason
             if not ai_claimed_passed:
                 # Disagreement: AI said FAILED, pytest said 0. Trust pytest
                 # but record the disagreement so the AI's reasoning is
@@ -6544,6 +6663,26 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 the refiner is invoked with ``file_context=""``.
             exit_code: Exit code from test command
         """
+        if self._refinement_count >= EXECUTOR_MAX_REFINEMENTS:
+            if self.logger:
+                self.logger.error(
+                    "refine_budget_exhausted",
+                    (
+                        f"Task [{task.id}] failed, but this run has already "
+                        f"refined the plan {self._refinement_count} times "
+                        f"(cap {EXECUTOR_MAX_REFINEMENTS}); not refining "
+                        f"again. The task stays failed."
+                    ),
+                    task_id=task.id,
+                    data={
+                        "refinements": self._refinement_count,
+                        "cap": EXECUTOR_MAX_REFINEMENTS,
+                        "task_count": len(self.task_manager.tasks),
+                    },
+                )
+            return
+        self._refinement_count += 1
+
         print("Refining task list...")
         if self.logger:
             self.logger.info("refine_started", f"Refining tasks after [{task.id}] failure",
@@ -6816,6 +6955,32 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         )
         if plan.is_noop:
             return True
+
+        # 2026-10-11: surface the judge-preservation outcome up front.
+        #
+        # Neither list is an error on its own — the refiner is allowed to
+        # try, we simply do not let it win — but an operator has to see
+        # it, because a refiner that keeps rewriting the test which
+        # grades a task has stopped repairing and started negotiating
+        # with the verdict. This is the signal that would have made the
+        # 20261010-CC-Switch-Remote-Aut runaway legible on iteration one
+        # instead of iteration eleven.
+        if plan.judge_rewritten_ids or plan.judge_inherited_ids:
+            if self.logger:
+                self.logger.warning(
+                    "refine_judge_command_preserved",
+                    (
+                        f"Refiner tried to change the test_command of "
+                        f"{len(plan.judge_rewritten_ids)} existing task(s) "
+                        f"and {len(plan.judge_inherited_ids)} split "
+                        f"child(ren); the original commands were kept"
+                    ),
+                    task_id=task.id,
+                    data={
+                        "judge_rewritten_ids": list(plan.judge_rewritten_ids),
+                        "judge_inherited_ids": list(plan.judge_inherited_ids),
+                    },
+                )
 
         # Snapshot the live SubTask objects (not a model_dump) so the
         # rollback below can restore them — including the

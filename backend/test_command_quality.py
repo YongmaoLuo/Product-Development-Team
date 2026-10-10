@@ -537,6 +537,108 @@ def _no_execution_issue(command: str) -> Optional[CommandIssue]:
     )
 
 
+#: Runner summary lines that say "the runner started and collected
+#: nothing to run". Every pattern is anchored to a line the runner
+#: itself prints, so a fixture's own text cannot masquerade as one.
+#:
+#: The cargo entries are the ones this list exists for:
+#: ``cargo test --lib no_such_module`` prints ``running 0 tests`` and
+#: exits 0, so a module-wide filter naming a module that does not exist
+#: is indistinguishable — by exit code alone — from a passing run.
+_ZERO_TEST_SIGNATURES: Tuple[Tuple["re.Pattern[str]", str], ...] = (
+    (re.compile(r"^running 0 tests?$", re.MULTILINE), "cargo"),
+    (
+        re.compile(r"^test result: ok\. 0 passed; 0 failed", re.MULTILINE),
+        "cargo",
+    ),
+    (re.compile(r"^no tests ran in ", re.MULTILINE), "pytest"),
+    (re.compile(r"^collected 0 items", re.MULTILINE), "pytest"),
+    # go prints this on the package's own line, alongside the package
+    # path (`?   example.com/pkg   [no test files]`), so it cannot be
+    # anchored to the whole line.
+    (re.compile(r"\[no test files\]"), "go"),
+    (re.compile(r"^No tests found", re.MULTILINE), "jest"),
+    (re.compile(r"^No test files found", re.MULTILINE), "vitest"),
+)
+
+#: The counterpart: positive evidence that a test really ran. A zero
+#: signature on its own is NOT a verdict — a plain ``cargo test`` prints
+#: ``running 0 tests`` for every target that happens to be empty while
+#: hundreds of tests run in the others. "Vacuous" means the whole run
+#: shows no positive count anywhere. Patterns with a capture group must
+#: report a count above zero; those without one are positive by presence.
+_POSITIVE_TEST_SIGNATURES: Tuple["re.Pattern[str]", ...] = (
+    re.compile(r"^running (\d+) tests?$", re.MULTILINE),          # cargo
+    re.compile(r"^test result: .*?(\d+) passed", re.MULTILINE),   # cargo
+    re.compile(r"(\d+) passed\b"),                                # pytest / jest
+    re.compile(r"(\d+) passing\b"),                               # mocha
+    re.compile(r"(\d+) failed\b"),                                # pytest / jest
+    re.compile(r"^ok\s+\S+", re.MULTILINE),                       # go
+)
+
+
+def _has_positive_test_evidence(output: str) -> bool:
+    """True when ``output`` carries a count proving at least one test ran."""
+    for pattern in _POSITIVE_TEST_SIGNATURES:
+        for match in pattern.finditer(output):
+            if not match.groups():
+                return True
+            try:
+                if int(match.group(1)) > 0:
+                    return True
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                continue
+    return False
+
+
+def find_vacuous_pass(output: str) -> Optional[CommandIssue]:
+    """A run that exited 0 having executed no tests at all.
+
+    This is the runtime counterpart of the *shape* checks above. Those
+    can only see what a command looks like; this one reads what the
+    runner actually reported, which is the only way to catch a filter
+    that names something absent. The module docstring of
+    ``tasks_generator``'s falsifiability probe has recorded the defect
+    for a while — "``cargo test --lib no_such_test`` exits 0" — but it
+    was a **generation-time** probe, so it never saw a command the
+    refiner wrote during execution.
+
+    The cost of missing it is not a wrong exit code, it is a wrong
+    ``completed``: in the 20261010-CC-Switch-Remote-Aut plan four tasks
+    were recorded completed on exactly this signature, with zero commits
+    and the module they were supposed to create never written at all.
+    Exit code 0 from a run that executed nothing makes the command half
+    of the dual-criterion rule vacuous — the single-signal mode that
+    rule exists to prevent.
+
+    Returns ``None`` when the output shows a test really ran, when no
+    runner summary is recognisable at all (an unknown runner must not be
+    judged by another runner's grammar), or when ``output`` is empty.
+    """
+    if not output:
+        return None
+    runner: Optional[str] = None
+    for pattern, name in _ZERO_TEST_SIGNATURES:
+        if pattern.search(output):
+            runner = name
+            break
+    if runner is None:
+        return None
+    if _has_positive_test_evidence(output):
+        return None
+    return CommandIssue(
+        code="vacuous_pass",
+        detail=(
+            f"the {runner} output reports a run that collected no tests, "
+            f"so exit code 0 says only that nothing was executed — not "
+            f"that this task's work is present. A runner filter naming "
+            f"something that does not exist (`cargo test --lib "
+            f"no_such_mod`) exits 0 exactly this way. Point the command "
+            f"at the test the task actually adds, or drop the filter."
+        ),
+    )
+
+
 def commands_of(task: Any) -> List[str]:
     """Every non-empty test command carried by ``task``, either schema form.
 

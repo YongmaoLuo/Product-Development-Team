@@ -31,6 +31,7 @@ from test_command_quality import (  # noqa: E402
     commands_of,
     find_semicolon_exit_issue,
     find_unreachable_targets,
+    find_vacuous_pass,
     has_test_runner,
     inspect_command,
     inspect_task,
@@ -647,3 +648,117 @@ def test_the_spec_echo_family_is_flagged():
     never distinguish "the fix worked" from "nothing was changed".
     """
     assert [i.code for i in inspect_command(SPEC_ECHO)] == ["no_execution"]
+
+
+# ---------------------------------------------------------------------------
+# ``find_vacuous_pass`` — the runtime half of the same defect.
+#
+# ``inspect_command`` sees a command's *shape* and cannot catch a filter
+# that names something absent: ``cargo test --lib no_such_mod`` is a
+# perfectly well-formed Rust invocation. Only the runner's own output
+# distinguishes it from a passing run. Four tasks in the
+# 20261010-CC-Switch-Remote-Aut plan were recorded ``completed`` on
+# exactly that signature — zero commits, the module they were supposed
+# to create never written — because exit 0 was taken as the whole story.
+# ---------------------------------------------------------------------------
+
+
+#: The literal command that did the damage: a module-wide filter naming a
+#: module that did not exist yet.
+CARGO_ZERO_TESTS = (
+    "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --manifest-path "
+    "src-tauri/Cargo.toml --lib remote::auth::secret"
+)
+
+CARGO_ZERO_TESTS_OUTPUT = """
+   Compiling cc-switch v3.8.0 (/Users/u/p/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.4s
+     Running unittests src/lib.rs (target/debug/deps/cc_switch_lib-0a1b2c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2863 filtered out
+"""
+
+
+def test_cargo_filter_matching_nothing_is_flagged():
+    """The exact failure mode, end to end."""
+    assert CARGO_ZERO_TESTS.startswith('PATH="$HOME/.cargo/bin:$PATH"'), (
+        "keep this fixture honest — the PATH prefix is what the refiner "
+        "added to 25 commands before anyone noticed"
+    )
+    issue = find_vacuous_pass(CARGO_ZERO_TESTS_OUTPUT)
+    assert issue is not None, (
+        "a `cargo test --lib <module>` that collected nothing must not "
+        "count as a passing run"
+    )
+    assert issue.code == "vacuous_pass"
+    assert "cargo" in issue.detail
+
+
+def test_cargo_run_that_executed_tests_is_not_flagged():
+    output = (
+        "running 12 tests\n"
+        "test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured\n"
+    )
+    assert find_vacuous_pass(output) is None
+
+
+def test_one_empty_target_among_populated_ones_is_not_flagged():
+    """A plain ``cargo test`` prints ``running 0 tests`` for every empty
+    target while the rest run. That is normal, not vacuous — the verdict
+    is "the whole run collected nothing", so any positive count anywhere
+    clears it.
+    """
+    output = (
+        "running 0 tests\n\n"
+        "test result: ok. 0 passed; 0 failed; 0 ignored\n"
+        "     Running tests/gate.rs\n"
+        "running 7 tests\n"
+        "test result: ok. 7 passed; 0 failed; 0 ignored\n"
+    )
+    assert find_vacuous_pass(output) is None
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        pytest.param("no tests ran in 0.01s\n", id="pytest-no-tests-ran"),
+        pytest.param(
+            "collected 0 items\n\nno tests ran in 0.02s\n",
+            id="pytest-collected-zero",
+        ),
+        pytest.param("?   \texample.com/x\t[no test files]\n", id="go"),
+        pytest.param("\nNo tests found, exiting with code 0\n", id="jest"),
+    ],
+)
+def test_other_runners_reporting_zero_are_flagged(output):
+    issue = find_vacuous_pass(output)
+    assert issue is not None
+    assert issue.code == "vacuous_pass"
+
+
+def test_pytest_that_ran_tests_is_not_flagged():
+    output = "collected 3 items\n\ntest_a.py ...\n\n3 passed in 0.05s\n"
+    assert find_vacuous_pass(output) is None
+
+
+def test_go_package_without_tests_beside_a_passing_one_is_not_flagged():
+    """``go test ./...`` prints the marker per package."""
+    output = (
+        "?   \texample.com/a\t[no test files]\n"
+        "ok  \texample.com/b\t0.012s\n"
+    )
+    assert find_vacuous_pass(output) is None
+
+
+def test_silence_is_not_a_verdict():
+    """An unrecognised summary must not be read through another runner's
+    grammar, and an empty one has nothing to say. ``cargo fmt --check``,
+    ``cargo clippy`` and ``! grep -q …`` all exit 0 with no test summary
+    at all and must stay passable — the detector has to stay quiet rather
+    than guess.
+    """
+    assert find_vacuous_pass("") is None
+    assert find_vacuous_pass("Checking cc-switch v3.8.0\n") is None
+    assert find_vacuous_pass("all checks passed, nothing to report\n") is None

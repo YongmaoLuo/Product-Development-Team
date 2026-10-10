@@ -42,7 +42,7 @@ can be tested directly (see ``tests/unit/test_refiner_structure.py``).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 #: ``task_group`` prefix marking tasks the refiner does not own. Matched
 #: with ``startswith`` so it covers both the legacy ``RP-*`` ids
@@ -66,6 +66,62 @@ _PROTECTED_COMPARE_FIELDS: Tuple[str, ...] = (
     "model_type",
     "project_dir",
 )
+
+#: The fields that make up a task's **judging command** — the objective
+#: half of the dual-criterion completion rule.
+#:
+#: Deliberately separate from ``_PROTECTED_COMPARE_FIELDS``, because the
+#: rule they carry is universal rather than group-scoped. A task that can
+#: rewrite its own judge is grading its own homework whether or not it
+#: belongs to the repair group, and the fields the refiner may
+#: legitimately refine (``title``, ``description``, ``depends_on``,
+#: ``files_to_modify``) are exactly the ones that must NOT be frozen.
+_JUDGE_FIELDS: Tuple[str, ...] = ("test_command", "test_commands")
+
+
+def _split_parent_id(
+    task_id: str,
+    candidates: Mapping[str, Any],
+) -> Optional[str]:
+    """The id ``task_id`` is a split child of, if any.
+
+    The convention is ``{parent}-{n}``. Ids are hierarchical, so the
+    matching parent is the **longest** candidate the child extends: with
+    both ``1`` and ``1-1`` present, ``1-1-2`` is a child of ``1-1``, not
+    of ``1``. A bare ``startswith`` on the id would also read
+    ``40-10``… as a child of ``4``, which is why the separator is part of
+    the test (the same trap ``test_sibling_prefix_is_not_mistaken_for_a_split``
+    documents for the parent→children direction).
+    """
+    best: Optional[str] = None
+    for candidate in candidates:
+        if not candidate or candidate == task_id:
+            continue
+        if task_id.startswith(str(candidate) + "-") and (
+            best is None or len(str(candidate)) > len(best)
+        ):
+            best = str(candidate)
+    return best
+
+
+def _judge_commands(task: Any) -> Tuple[Tuple[str, ...], str]:
+    """Normalised ``(list_form, single_form)`` view of a task's judge.
+
+    Normalised because the two shapes are interchangeable and an LLM
+    echoes them inconsistently: ``test_commands: []`` and an absent
+    ``test_commands`` mean the same thing, and so do ``""`` and a missing
+    ``test_command``. Comparing raw values would report a rewrite every
+    time the model switched shape without changing the command.
+    """
+    try:
+        raw_list = task.get("test_commands") or []
+        raw_single = task.get("test_command") or ""
+    except AttributeError:
+        return (), ""
+    commands = tuple(
+        str(item).strip() for item in raw_list if str(item or "").strip()
+    )
+    return commands, str(raw_single).strip()
 
 
 def is_protected(
@@ -154,10 +210,28 @@ class RefinerStructurePlan:
     #: about the repair round" vs "the LLM tried to edit it").
     reverted_ids: Tuple[str, ...]
 
+    #: **Any** task — protected or not — whose judging command the
+    #: refiner tried to change. The original command was restored and the
+    #: rest of the refiner's edit kept. Distinct from
+    #: :attr:`reverted_ids` on purpose: that one means "the LLM tried to
+    #: edit a repair task", this one means "the LLM tried to rewrite the
+    #: test that grades a task". An operator needs to tell those apart —
+    #: the second is the signature of a refiner that has decided the
+    #: cheapest way to pass is to change the judge.
+    judge_rewritten_ids: Tuple[str, ...] = ()
+
+    #: Split children whose judging command was replaced by their
+    #: parent's. These are new ids, so :attr:`judge_rewritten_ids` cannot
+    #: see them — there is no before-state to compare against — which is
+    #: exactly how a refiner gets a fresh, self-authored judge every time
+    #: it splits a failed task.
+    judge_inherited_ids: Tuple[str, ...] = ()
+
     @property
     def is_noop(self) -> bool:
         return not (self.removed_ids or self.added_ids or self.reinstated_ids
-                    or self.reverted_ids)
+                    or self.reverted_ids or self.judge_rewritten_ids
+                    or self.judge_inherited_ids)
 
     def to_dict(self) -> Dict[str, Any]:
         """Log payload. Lists, not sets, so the JSON is stable."""
@@ -166,6 +240,8 @@ class RefinerStructurePlan:
             "removed_ids": list(self.removed_ids),
             "reinstated_ids": list(self.reinstated_ids),
             "reverted_ids": list(self.reverted_ids),
+            "judge_rewritten_ids": list(self.judge_rewritten_ids),
+            "judge_inherited_ids": list(self.judge_inherited_ids),
             "effective_count": len(self.effective),
         }
 
@@ -226,6 +302,66 @@ def plan_refiner_structure(
         order.append(tid)
         refiner_by_id[tid] = task
 
+    # ------------------------------------------------------------------
+    # The judging command belongs to the task, not to the refiner.
+    #
+    # 2026-10-11. The refiner's answer to a failure is almost always
+    # "split the failed task in three": the 20261010-CC-Switch-Remote-Aut
+    # plan grew 31 → 55 tasks over eleven refinements, every one of them
+    # logged as ``+3 added, -1 removed``. The environment defect behind
+    # those failures (``cargo`` missing from the executor's PATH) was
+    # indistinguishable, from inside the refiner, from a defective
+    # command — so it took the shortest path to green and rewrote the
+    # test, prefixing 25 commands with ``PATH="$HOME/.cargo/bin:$PATH"``
+    # and titling the new tasks "让目标测试命令对 PATH 免疫".
+    #
+    # Nothing caught it. ``is_protected`` below only guards
+    # ``task_group.startswith("repair")``, and every task in that plan
+    # had ``task_group = None``, so the protection fired zero times; and
+    # the split children were new ids, so no before/after comparison
+    # could see the command they invented. Both halves are closed here.
+    # ------------------------------------------------------------------
+
+    # (1) A split child inherits its parent's judging command.
+    #
+    # The parent's command already passed the generation-time shape and
+    # falsifiability gates, and it is already RED (the parent failed),
+    # so reusing it costs nothing and removes the refiner's only means of
+    # authoring a fresh judge. A child whose scope genuinely needs a
+    # different command is a *verification-point* defect: the established
+    # exit for that is to retire the VP and add a new one
+    # (``repair_generator``: "绝不修改已有验证点……test_command 都不许改"),
+    # never an in-place rewrite of the thing that grades the task.
+    judge_inherited: List[str] = []
+    for tid in order:
+        if tid in current_by_id:
+            # Pre-existing: rule (2) below governs it, not this one.
+            continue
+        parent_id = _split_parent_id(tid, current_by_id)
+        if parent_id is None:
+            continue
+        child = refiner_by_id.get(tid)
+        if not isinstance(child, dict):
+            continue
+        parent = current_by_id[parent_id]
+        if not any(parent.get(f) for f in _JUDGE_FIELDS):
+            # A parent with no command has nothing to bequeath; leaving
+            # the child's own (or absent) command alone is correct.
+            continue
+        patched = dict(child)
+        changed = False
+        for field in _JUDGE_FIELDS:
+            if field in parent:
+                if patched.get(field) != parent[field]:
+                    patched[field] = parent[field]
+                    changed = True
+            elif field in patched:
+                patched.pop(field)
+                changed = True
+        if changed:
+            refiner_by_id[tid] = patched
+            judge_inherited.append(tid)
+
     reinstated: List[str] = []
     reverted: List[str] = []
     effective_by_id: Dict[str, Dict[str, Any]] = dict(refiner_by_id)
@@ -255,6 +391,35 @@ def plan_refiner_structure(
         # Protected: the pre-refinement dict wins unconditionally.
         effective_by_id[tid] = original
 
+    # (2) The judging command is write-once for EVERY task, not just the
+    # protected ones.
+    #
+    # This runs after the protected loop so it cannot disturb that
+    # loop's ``reverted`` verdict, which compares whole content and must
+    # keep seeing the refiner's raw entry. For a non-protected task the
+    # refiner is free to refine everything that describes the work — its
+    # title, its description, its dependencies, which files it touches —
+    # but not the command that decides whether the work is done. Only
+    # the judge fields are restored; everything else the refiner wrote
+    # stands, so a legitimate refinement is not thrown away.
+    judge_rewritten: List[str] = []
+    for tid, original in current_by_id.items():
+        if is_protected(original, protected_prefix):
+            continue  # handled above: the whole original dict already won
+        replacement = effective_by_id.get(tid)
+        if not isinstance(replacement, dict):
+            continue
+        if _judge_commands(replacement) == _judge_commands(original):
+            continue
+        patched = dict(replacement)
+        for field in _JUDGE_FIELDS:
+            if field in original:
+                patched[field] = original[field]
+            else:
+                patched.pop(field, None)
+        effective_by_id[tid] = patched
+        judge_rewritten.append(tid)
+
     effective: List[Dict[str, Any]] = [
         effective_by_id[tid] for tid in order if tid in effective_by_id
     ]
@@ -268,4 +433,10 @@ def plan_refiner_structure(
         added_ids=tuple(sorted(effective_ids - set(current_by_id))),
         reinstated_ids=tuple(sorted(reinstated)),
         reverted_ids=tuple(sorted(reverted)),
+        judge_rewritten_ids=tuple(
+            sorted(i for i in judge_rewritten if i in effective_ids)
+        ),
+        judge_inherited_ids=tuple(
+            sorted(i for i in judge_inherited if i in effective_ids)
+        ),
     )
