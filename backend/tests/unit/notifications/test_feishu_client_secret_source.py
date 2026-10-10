@@ -52,7 +52,21 @@ _SWITCH_KEY = "PDT_DISABLE_KEYCHAIN_SECRETS"
 #: and ``_keychain_holds`` below would then stub a process the module is
 #: no longer starting. A case whose result depends on which machine runs
 #: it is a case that proves nothing.
+#:
+#: Cleared rather than left in place, and that is now load-bearing in the
+#: other direction too: ``_secret_reader_bin`` returns ``None`` when this
+#: is unset, so a deployment with no reader issues no keychain read at
+#: all. Every helper below that wants a lookup therefore *sets* it — to
+#: the stand-in below — rather than relying on a default binary.
 _READER_PATH_KEY = "PDT_SECRET_READER_PATH"
+
+#: The binary a test configures as this deployment's reader. Never
+#: executed: ``credentials._run_security`` is stubbed below it, so the
+#: path only has to be one the test can recognise on the recorded argv.
+#: Spelled out rather than read from the environment, because an
+#: assertion that compares the module's answer with the variable the test
+#: just set is not an assertion.
+STUB_READER = "/opt/pdt/tests/stub-secret-reader"
 
 #: What the keychain returns in the cases below. Not a credential and
 #: not shaped like one: a suite that needs a real secret to prove a
@@ -111,9 +125,16 @@ def _keychain_holds(sentinel, monkeypatch) -> None:
     returned onto a pipe, and name the descriptor in the environment.
     Both halves stay real, so a client that stopped going through the
     provider still fails here.
+
+    The reader is configured rather than left to a default, because there
+    is no longer one: with ``PDT_SECRET_READER_PATH`` unset the module
+    starts nothing and reports "no value", which would make every case
+    below pass for a reason that has nothing to do with the client.
     """
+    monkeypatch.setenv(_READER_PATH_KEY, STUB_READER)
+
     def fake_run(argv, timeout):
-        assert argv[0].endswith("security"), argv
+        assert argv[0] == STUB_READER, argv
         assert "-a" in argv and "-w" in argv
         return sentinel.encode("utf-8") + b"\n"
 
@@ -131,8 +152,11 @@ def _keychain_has_nothing(monkeypatch) -> None:
     """Make the keychain read fail the way a missing item does.
 
     A nonzero exit — the ordinary case for a machine where the switch
-    was turned on and the item was never added.
+    was turned on and the item was never added. A reader is configured
+    so that the read is actually *issued* and fails, which is a different
+    case from never being issued at all.
     """
+    monkeypatch.setenv(_READER_PATH_KEY, STUB_READER)
     monkeypatch.setattr(
         credentials,
         "_run_security",

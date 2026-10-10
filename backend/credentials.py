@@ -157,14 +157,14 @@ know nothing about how the value was found.
 
 Scope
 -----
-This module reads no files and opens no socket. It does start one
-process — the platform's keychain tool — and that call is the only
-place in the project where a secret is fetched by shelling out, which is
-why its command line and its failure modes are pinned by a test that
-invokes a real executable rather than a mock. It is stdlib-only, and it
-imports nothing from the notifier package: a credentials lookup that
-pulled in an HTTP client could not be used by the code that *populates*
-the credentials.
+This module reads no files and opens no socket. It does start a
+process — a keychain tool, named by :data:`_SECRET_READER_ENV_KEY` and
+nothing else — and that call is the only place in the project where a
+secret is fetched by shelling out, which is why its command line and its
+failure modes are pinned by a test that invokes a real executable rather
+than a mock. It is stdlib-only, and it imports nothing from the notifier
+package: a credentials lookup that pulled in an HTTP client could not be
+used by the code that *populates* the credentials.
 """
 
 from __future__ import annotations
@@ -203,6 +203,11 @@ _SECURITY_BIN = "/usr/bin/security"
 #: path; the reader is invoked with the same argv
 #: (``find-generic-password -a <account> -w <keychain>``), so nothing else
 #: about the read changes. See ``tools/pdt-secret-reader/``.
+#:
+#: **There is no fallback to :data:`_SECURITY_BIN`.** Unset and empty both
+#: mean *no binary to issue the read against*, so no read is attempted at
+#: all — see :func:`_secret_reader_bin` for why a read through the system
+#: tool is not a state a deployment can be left in by accident.
 #:
 #: This deliberately does **not** redirect :func:`_keychain_state`. That
 #: probe runs ``show-keychain-info``, which no reader implements and which
@@ -399,24 +404,43 @@ def _keychain_file() -> str:
     return str(Path.home() / path)
 
 
-def _secret_reader_bin() -> str:
-    """Return the binary a keychain **read** should go through.
+def _secret_reader_bin() -> Optional[str]:
+    """Return the binary a keychain **read** is issued against, or None.
 
-    ``PDT_SECRET_READER_PATH`` wins when it carries a value; unset or
-    empty falls back to :data:`_SECURITY_BIN`, which is what every
-    deployment used before a narrower reader existed and is still the
-    right answer for one that never narrowed anything.
+    ``PDT_SECRET_READER_PATH`` when it carries a value, and **None**
+    otherwise — which means *no read is issued at all*, not "the system
+    tool". There is deliberately no fallback, and the reason is the same
+    one that made the switch worth adding in the first place: the binary
+    underneath would be :data:`_SECURITY_BIN`, an Apple-signed binary
+    every process on this machine may execute, reading items whose
+    access control lists exist precisely so that something else cannot.
+    Falling back to it would leave a deployment that believes it
+    narrowed its ACL reading through an unreviewable path, and nothing
+    would say so from outside — the reader answers ``keychain`` either
+    way. So a deployment that forgets the switch looks exactly like one
+    that set it, and the ACL says the wrong thing is trusted.
+
+    So this is fail-closed the way :func:`keychain_disabled` is: unset
+    means the value is unavailable, no process is started, and
+    :func:`diagnose_secret` is where that gets said out loud. Note that
+    "unavailable" is not an error state the caller has to handle — it is
+    the same ``"missing"`` every other way of having no value reports,
+    and that collapse is deliberate: see :func:`_resolve_from_keychain`.
 
     Read on every call rather than bound at import, for the same reason
     :func:`_keychain_file` and :func:`keychain_disabled` are: the value
     belongs to the deployment, and one captured at import is a copy taken
-    before the environment could say otherwise.
+    before the environment could say otherwise. An absent variable and an
+    empty one are the same thing here, for the reason
+    :func:`_env_value` gives — an empty path names no binary.
 
-    Whichever binary this returns is invoked with the same argv — see
-    :func:`_resolve_from_keychain` — so swapping it changes *which code
-    the item's ACL trusts* and nothing else.
+    The value is handed on **as written**. It is not resolved against the
+    home directory and not checked for existence here: a relative path is
+    a deployment decision about how the process is started, and a path
+    that has gone missing is a fact to report rather than one to paper
+    over. :func:`diagnose_secret` says which of the two it is.
     """
-    return _env_value(_SECRET_READER_ENV_KEY) or _SECURITY_BIN
+    return _env_value(_SECRET_READER_ENV_KEY)
 
 
 def _run_security(argv: Sequence[str], timeout: float) -> Optional[bytes]:
@@ -507,6 +531,23 @@ def _keychain_state() -> str:
     Run only after a read has already failed. On the happy path this
     would be a second process started for no information, and a process
     per lookup is exactly the cost the resolution memo exists to avoid.
+
+    **This one keeps :data:`_SECURITY_BIN`, and it must.**
+    :func:`_secret_reader_bin` redirects the other call in this module and
+    deliberately does not redirect this one, for three reasons that all
+    point the same way: the probe asks about the *container*, so no access
+    control entry is consulted and the system tool answers it on every
+    deployment, including one whose items have stopped trusting
+    ``security`` for a *read* — which is precisely the deployment most
+    likely to run this probe; ``pdt-secret-reader`` does not implement
+    ``show-keychain-info``, so following the switch would mean the reader
+    has to grow a second command before it is usable as a reader at all;
+    and a probe that cannot run answers ``KEYCHAIN_UNAVAILABLE`` for what
+    is really a *locked keychain*, which is the one message an operator
+    most needs to get right and the one they act on.
+
+    ``test_the_lock_probe_keeps_the_system_tool`` fails if this is ever
+    pointed at the reader.
     """
     if not _is_macos():
         return KEYCHAIN_UNAVAILABLE
@@ -553,6 +594,23 @@ def _resolve_from_keychain(spec: SecretSpec) -> Tuple[Optional[str], str]:
     secret, rather than a quiet downgrade to a value every process of
     every user on the machine can read.
 
+    The reader is checked the same way and for the same reason. With no
+    ``PDT_SECRET_READER_PATH`` there is no binary to issue the read
+    against, so nothing is started and the answer is the same "no value"
+    a failed read gives — and what that branch deliberately does *not* do
+    is substitute :data:`_SECURITY_BIN`. A read through that binary is
+    one any process on this machine can perform, with no prompt and
+    nothing to consent to, which is the entire reason
+    ``tools/pdt-secret-reader/`` exists; it is not a state a deployment
+    can be left on by accident. It is a configuration state rather than
+    a fault in the read, and the two are held apart here: the return
+    stays the same "no value" a failed read gives, but the branch logs
+    at ``warning`` so a production log kept at INFO records that the
+    reader was never configured instead of only recording that some
+    secret was unavailable. :func:`diagnose_secret` is where an
+    operator is told which of the three "no reader" problems they have,
+    and it names this one.
+
     A locked keychain is the one failure worth a log line, and it is
     logged here rather than left to the caller. Every other failure
     collapses into "no value" on purpose, but a locked keychain produces
@@ -565,8 +623,22 @@ def _resolve_from_keychain(spec: SecretSpec) -> Tuple[Optional[str], str]:
     if account is None:
         return (None, SOURCE_MISSING)
 
+    reader = _secret_reader_bin()
+    if reader is None:
+        # Same shape and same reason as the check above: no reader, no
+        # command line, no process started, and the caller gets the same
+        # "no value" a failed read gives it. Nothing is downgraded and no
+        # empty string is handed back as a secret — a read that cannot be
+        # made is not a read that returned nothing.
+        log.warning(
+            "%s: %s is not set, so no keychain read was attempted",
+            spec.logical_name,
+            _SECRET_READER_ENV_KEY,
+        )
+        return (None, SOURCE_MISSING)
+
     argv: List[str] = [
-        _secret_reader_bin(),
+        reader,
         "find-generic-password",
         "-a",
         account,
@@ -748,8 +820,10 @@ def read_secret(name: str) -> Optional[str]:
 def read_secret_from_keychain(name: str) -> Optional[str]:
     """Return the value of ``name`` by reading the keychain **directly**.
 
-    This is the one entry point that still runs ``/usr/bin/security``,
-    and it exists for exactly two callers:
+    This is the one entry point that still starts a keychain process at
+    all — through whichever binary :func:`_secret_reader_bin` names, which
+    on a deployment that configured one is not ``/usr/bin/security`` at
+    all — and it exists for exactly two callers:
 
     * :mod:`backend.secret_launcher` — which reads the keychain once at
       startup and hands the values to the server over pipes, so the
@@ -804,7 +878,13 @@ def diagnose_secret(name: str) -> Optional[str]:
 
     So the two questions are separate functions. This one is for a human
     reading a log or running a command, and it names the specific thing
-    to change.
+    to change. Three of the ways of having no value are about *which
+    binary could answer* — none configured at all, one configured that is
+    not an executable file, and one that ran and found no item — and they
+    are kept apart because they are fixed in three different places. The
+    first two are asked before the lock probe precisely because the
+    sentence the probe's answer would produce blames the keychain, which
+    is not what went wrong in either of them.
 
     Resolution runs first, so the answer describes the same state the
     caller would have observed rather than a second, possibly different
@@ -848,6 +928,38 @@ def diagnose_secret(name: str) -> Optional[str]:
             f"{spec.account_env_key} is not set, so there is no account to "
             f"look the item up by. The index is configuration, not a secret "
             f"— it stays in .env."
+        )
+
+    # Which binary would answer. Both of these are asked here rather than
+    # left to the fall-through below, which reports a *keychain* that has
+    # nothing for this secret: that is true, and it is not why the read
+    # failed, so an operator sent there re-runs the same read and gets the
+    # same sentence. They are asked before the lock probe for the same
+    # reason — the sentence the probe's answer produces blames the
+    # keychain, and neither of these has anything to do with it.
+    reader = _secret_reader_bin()
+    if reader is None:
+        return (
+            f"{name}: {_SWITCH_ENV_KEY} says the keychain is on, but "
+            f"{_SECRET_READER_ENV_KEY} is not set, so there is no binary to "
+            f"issue the read against and no read was attempted. Nothing "
+            f"falls back to {_SECURITY_BIN} — that binary is executable by "
+            f"every process on this machine and reads these items with no "
+            f"prompt and nothing to consent to, which is what "
+            f"tools/pdt-secret-reader/ exists to replace. Build it and "
+            f"adopt it: `./setup.sh build`, then `./setup.sh adopt --widen` "
+            f"in tools/pdt-secret-reader/ — the adopt run is what writes "
+            f"{_SECRET_READER_ENV_KEY} into .env."
+        )
+
+    if not (os.path.isfile(reader) and os.access(reader, os.X_OK)):
+        return (
+            f"{name}: {_SECRET_READER_ENV_KEY} names {reader}, which is not "
+            f"an executable file, so the read could not be issued against "
+            f"it and no other binary is tried. Re-run `./setup.sh build` in "
+            f"tools/pdt-secret-reader/ to put the reader back where that "
+            f"line points, or `./setup.sh adopt` to have the line rewritten "
+            f"to the one it builds."
         )
 
     state = _keychain_state()

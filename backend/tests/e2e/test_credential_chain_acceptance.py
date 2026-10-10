@@ -465,7 +465,11 @@ def keychain(tmp_path, monkeypatch, canary):
     # keychain ACL the walk below would run the operator's signed reader
     # instead of the stand-in built here, and every consumer would report
     # itself unconfigured. CI has no ``.env``, so leaving it set is green
-    # there and red on the one machine that migrated.
+    # there and red on the one machine that migrated. It is cleared and
+    # then **set** to the stand-in below, because there is no fallback any
+    # more: an unset reader issues no read at all, and every consumer would
+    # report itself unconfigured for a reason that has nothing to do with
+    # what this walk is covering.
     for key in (
         "PDT_TEST_ARGV_LOG",
         "PDT_TEST_KEYCHAIN_DIR",
@@ -493,6 +497,7 @@ def keychain(tmp_path, monkeypatch, canary):
     monkeypatch.setenv(credentials._SWITCH_ENV_KEY, "0")
     monkeypatch.setenv("PDT_TEST_ARGV_LOG", str(argv_log))
     monkeypatch.setenv("PDT_TEST_KEYCHAIN_DIR", str(items))
+    monkeypatch.setenv(credentials._SECRET_READER_ENV_KEY, str(binary))
     monkeypatch.setattr(credentials, "_is_macos", lambda: True)
     monkeypatch.setattr(credentials, "_SECURITY_BIN", str(binary))
     written = {
@@ -500,6 +505,7 @@ def keychain(tmp_path, monkeypatch, canary):
         credentials._SWITCH_ENV_KEY: "0",
         "PDT_TEST_ARGV_LOG": str(argv_log),
         "PDT_TEST_KEYCHAIN_DIR": str(items),
+        credentials._SECRET_READER_ENV_KEY: str(binary),
     }
     for name in CONSUMER_NAMES:
         key = credentials.SECRET_SPECS[name].account_env_key
