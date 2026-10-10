@@ -589,10 +589,13 @@ whole procedure — no editing, and nothing to remember.
 
 If it is aimed at `/usr/bin/security` and a `--narrow` dropped that from
 the items, `--widen` will *not* bring it back: it only ever asks for
-**this** reader, which is what makes it safe to repeat. Delete
-`PDT_SECRET_READER_PATH` from `.env` and read once through `security` —
-the dialog comes up, **Always Allow** files it, and the line can go
-back.
+**this** reader, which is what makes it safe to repeat. Point
+`PDT_SECRET_READER_PATH` at `/usr/bin/security` **explicitly** for the
+one read — the dialog comes up, **Always Allow** files it, and the line
+goes back to this reader afterwards. Set it to the path rather than
+deleting the line: an unset reader now issues no read at all, so
+removing it would leave you with a keychain you still cannot read and no
+way to re-file it.
 
 The reader stays trusted either way, on purpose: it is the one program
 that can rewrite a list, so removing it would remove the recovery path
@@ -669,9 +672,17 @@ operation on something other than what was asked for.
 
 ## Switching the backend over
 
-**Implemented.** `backend/credentials.py` reads
-`PDT_SECRET_READER_PATH`, and unset means `/usr/bin/security` — so
-nothing changed for any deployment that does not set it.
+**Implemented.** `backend/credentials.py` reads `PDT_SECRET_READER_PATH`
+and **unset means no read is issued at all** — there is no fallback to
+`/usr/bin/security`. A deployment that has the keychain switched on and
+no reader configured gets `"missing"` for every secret, and
+`backend/cli.py secrets verify` names that case specifically rather than
+reporting an empty keychain.
+
+That is deliberate, and it is the other half of what this directory is
+for: a fallback would mean the ACL a deployment narrowed still has
+`security` answering its reads, invisibly, and `setup.sh adopt` would
+have nothing to prove. If you turn the keychain on, run `adopt`.
 
 The helper is **argv-compatible** with the command line the backend
 already builds:

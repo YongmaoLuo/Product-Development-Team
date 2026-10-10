@@ -145,6 +145,13 @@ class KeychainDouble:
         self._monkeypatch = monkeypatch
         self.home = home
         self.argv_log = argv_log
+        #: The path this deployment configured as its reader, which is the
+        #: same stand-in binary ``credentials._SECURITY_BIN`` is pointed
+        #: at. Read from here rather than from either constant, so an
+        #: argv assertion compares the recorded command line against the
+        #: fixture's own choice instead of against whatever the module
+        #: happens to think the binary is.
+        self.reader = argv_log.parent / "security"
 
     @property
     def keychain_file(self) -> str:
@@ -229,12 +236,19 @@ def keychain_double(tmp_path, monkeypatch):
     because the suite happens to run elsewhere), the switch (so the
     keychain is on), ``$HOME`` (so the keychain path the module builds
     is a path inside ``tmp_path`` rather than a real login keychain),
-    and ``PDT_SECRET_READER_PATH`` (cleared, so the read goes through
-    the stand-in rather than through whatever reader this deployment's
-    ``.env`` names). The module's own constant for the binary is pointed
-    at the stand-in, and the timeout is pulled down to half a second so
-    the hanging test costs half a second rather than the production
-    value.
+    and ``PDT_SECRET_READER_PATH`` — cleared first, so whatever reader
+    this deployment's ``.env`` names cannot answer, then **set** to the
+    stand-in, because there is no fallback any more and a deployment
+    with no reader configured issues no read at all. That last half is
+    the change that broke this fixture when the fallback went away, and
+    it is the fixture doing the right thing: the stand-in now plays the
+    *reader*, which is the role a real deployment gives it.
+
+    The module's own constant for the binary is pointed at the same file,
+    so the lock probe (``show-keychain-info``, which keeps
+    ``_SECURITY_BIN`` and must) is answered by the same stand-in. The
+    timeout is pulled down to half a second so the hanging test costs half
+    a second rather than the production value.
     """
     for key in _DOUBLE_ENV + _DEPLOYMENT_ENV:
         monkeypatch.delenv(key, raising=False)
@@ -248,6 +262,7 @@ def keychain_double(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PDT_DISABLE_KEYCHAIN_SECRETS", "0")
+    monkeypatch.setenv("PDT_SECRET_READER_PATH", str(binary))
     monkeypatch.setattr(credentials, "_is_macos", lambda: True)
     monkeypatch.setattr(credentials, "_SECURITY_BIN", str(binary))
     # A second, not the production five: long enough that a loaded
@@ -351,7 +366,7 @@ def test_the_recorded_command_line_names_the_dedicated_keychain(
     assert argv, "no subprocess was started, so there is no argv to check"
 
     assert argv == [
-        str(credentials._SECURITY_BIN),
+        str(keychain_double.reader),
         "find-generic-password",
         "-a",
         "cli_sentinel_a1",

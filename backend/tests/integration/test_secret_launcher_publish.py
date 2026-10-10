@@ -357,10 +357,13 @@ def keychain_double(tmp_path, monkeypatch):
     elsewhere), the switch (so the keychain is on), ``$HOME`` (so the
     keychain path the module builds is inside ``tmp_path`` rather than
     resolving into this machine's own keychains), the binary constant
-    (so the tool it starts is the counter in this file rather than the
-    platform's), and ``PDT_SECRET_READER_PATH`` (cleared, so the read
-    goes through that counter rather than through whatever reader this
-    deployment's ``.env`` names).
+    (so the lock probe is answered by the counter in this file rather
+    than by the platform's), and ``PDT_SECRET_READER_PATH`` — cleared
+    first, so whatever reader this deployment's ``.env`` names cannot
+    answer, then **set** to the stand-in, because there is no fallback
+    any more and a deployment with no reader configured issues no read at
+    all. The stand-in now plays the reader, which is the role a real
+    deployment gives it.
 
     Every file the stand-in creates is under ``tmp_path``: the count
     files, the payload, and the executable itself. A file outside it
@@ -383,6 +386,7 @@ def keychain_double(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PDT_DISABLE_KEYCHAIN_SECRETS", "0")
+    monkeypatch.setenv("PDT_SECRET_READER_PATH", str(binary))
     monkeypatch.setattr(credentials, "_is_macos", lambda: True)
     monkeypatch.setattr(credentials, "_SECURITY_BIN", str(binary))
 
@@ -476,11 +480,18 @@ def _child_env(keychain_double, tmp_path, logical_name: str, account: str) -> di
     The rest is the minimum a child needs to be a fair test of the
     fallback instead: the import path, the redirected home, the switch
     left **on** (so a keychain read is available to it), the index it
-    would look up, and the stand-in's own three names — so that a child
-    which *did* fall back to the keychain would be counted rather than
-    silently failing to run. Copying the whole environment would carry
-    whatever the machine running the suite has exported — including, on a
-    workstation that really notifies, the provider secret itself.
+    would look up, the reader it would read through, and the stand-in's
+    own names — so that a child which *did* fall back to the keychain
+    would be counted rather than silently failing to run. Copying the
+    whole environment would carry whatever the machine running the suite
+    has exported — including, on a workstation that really notifies, the
+    provider secret itself.
+
+    The reader is named explicitly rather than omitted, and the omission
+    would be the interesting mistake: with no ``PDT_SECRET_READER_PATH``
+    the child would start no keychain process at all and would report
+    the secret missing for a reason that has nothing to do with the
+    handoff under test.
     """
     spec = credentials.SECRET_SPECS[logical_name]
     return {
@@ -488,6 +499,7 @@ def _child_env(keychain_double, tmp_path, logical_name: str, account: str) -> di
         "PYTHONPATH": str(_BACKEND_DIR),
         "HOME": str(keychain_double.home),
         credentials._SWITCH_ENV_KEY: "0",
+        credentials._SECRET_READER_ENV_KEY: keychain_double.binary,
         spec.account_env_key: account,
         credentials.secret_fd_env_var(logical_name): os.environ.get(
             credentials.secret_fd_env_var(logical_name), ""
