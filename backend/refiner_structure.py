@@ -42,7 +42,7 @@ can be tested directly (see ``tests/unit/test_refiner_structure.py``).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 #: ``task_group`` prefix marking tasks the refiner does not own. Matched
 #: with ``startswith`` so it covers both the legacy ``RP-*`` ids
@@ -77,31 +77,6 @@ _PROTECTED_COMPARE_FIELDS: Tuple[str, ...] = (
 #: legitimately refine (``title``, ``description``, ``depends_on``,
 #: ``files_to_modify``) are exactly the ones that must NOT be frozen.
 _JUDGE_FIELDS: Tuple[str, ...] = ("test_command", "test_commands")
-
-
-def _split_parent_id(
-    task_id: str,
-    candidates: Mapping[str, Any],
-) -> Optional[str]:
-    """The id ``task_id`` is a split child of, if any.
-
-    The convention is ``{parent}-{n}``. Ids are hierarchical, so the
-    matching parent is the **longest** candidate the child extends: with
-    both ``1`` and ``1-1`` present, ``1-1-2`` is a child of ``1-1``, not
-    of ``1``. A bare ``startswith`` on the id would also read
-    ``40-10``… as a child of ``4``, which is why the separator is part of
-    the test (the same trap ``test_sibling_prefix_is_not_mistaken_for_a_split``
-    documents for the parent→children direction).
-    """
-    best: Optional[str] = None
-    for candidate in candidates:
-        if not candidate or candidate == task_id:
-            continue
-        if task_id.startswith(str(candidate) + "-") and (
-            best is None or len(str(candidate)) > len(best)
-        ):
-            best = str(candidate)
-    return best
 
 
 def _judge_commands(task: Any) -> Tuple[Tuple[str, ...], str]:
@@ -218,20 +193,16 @@ class RefinerStructurePlan:
     #: test that grades a task". An operator needs to tell those apart —
     #: the second is the signature of a refiner that has decided the
     #: cheapest way to pass is to change the judge.
+    #:
+    #: Only tasks that already existed when the refinement started can
+    #: appear here. A task the refiner *creates* has no first version to
+    #: protect: authoring its command is exactly what the refiner is for.
     judge_rewritten_ids: Tuple[str, ...] = ()
-
-    #: Split children whose judging command was replaced by their
-    #: parent's. These are new ids, so :attr:`judge_rewritten_ids` cannot
-    #: see them — there is no before-state to compare against — which is
-    #: exactly how a refiner gets a fresh, self-authored judge every time
-    #: it splits a failed task.
-    judge_inherited_ids: Tuple[str, ...] = ()
 
     @property
     def is_noop(self) -> bool:
         return not (self.removed_ids or self.added_ids or self.reinstated_ids
-                    or self.reverted_ids or self.judge_rewritten_ids
-                    or self.judge_inherited_ids)
+                    or self.reverted_ids or self.judge_rewritten_ids)
 
     def to_dict(self) -> Dict[str, Any]:
         """Log payload. Lists, not sets, so the JSON is stable."""
@@ -241,7 +212,6 @@ class RefinerStructurePlan:
             "reinstated_ids": list(self.reinstated_ids),
             "reverted_ids": list(self.reverted_ids),
             "judge_rewritten_ids": list(self.judge_rewritten_ids),
-            "judge_inherited_ids": list(self.judge_inherited_ids),
             "effective_count": len(self.effective),
         }
 
@@ -303,64 +273,30 @@ def plan_refiner_structure(
         refiner_by_id[tid] = task
 
     # ------------------------------------------------------------------
-    # The judging command belongs to the task, not to the refiner.
+    # The judging command is write-once, not never-written.
     #
-    # 2026-10-11. The refiner's answer to a failure is almost always
-    # "split the failed task in three": the 20261010-CC-Switch-Remote-Aut
-    # plan grew 31 → 55 tasks over eleven refinements, every one of them
-    # logged as ``+3 added, -1 removed``. The environment defect behind
-    # those failures (``cargo`` missing from the executor's PATH) was
-    # indistinguishable, from inside the refiner, from a defective
-    # command — so it took the shortest path to green and rewrote the
-    # test, prefixing 25 commands with ``PATH="$HOME/.cargo/bin:$PATH"``
-    # and titling the new tasks "让目标测试命令对 PATH 免疫".
+    # 2026-10-11. Someone has to author a test_command the first time:
+    # either the task generator, or the refiner when it splits a failed
+    # task into children. A child is a *different task* with a smaller
+    # scope, so it needs its own judge — freezing the parent's onto it
+    # would grade the child against work it was never asked to do.
     #
-    # Nothing caught it. ``is_protected`` below only guards
-    # ``task_group.startswith("repair")``, and every task in that plan
-    # had ``task_group = None``, so the protection fired zero times; and
-    # the split children were new ids, so no before/after comparison
-    # could see the command they invented. Both halves are closed here.
+    # What must not happen is the *second* write. A command that grades
+    # a task and can be edited by the same loop that is being graded is
+    # not a judge, and the 20261010-CC-Switch-Remote-Aut plan is the
+    # worked example: eleven refinements grew the list 31 → 55, each
+    # logged as ``+3 added, -1 removed``, and 25 commands ended up
+    # carrying a ``PATH="$HOME/.cargo/bin:$PATH"`` prefix the refiner
+    # invented to "fix" an environment defect it could not see.
+    #
+    # So: a NEW task's command is the refiner's to write (it is graded
+    # on its quality by the caller — see
+    # ``AutonomousAgent._enforce_new_subtask_test_command``), and an
+    # EXISTING task's command is frozen. ``is_protected`` below only
+    # guards ``task_group.startswith("repair")``, and every task in that
+    # plan had ``task_group = None``, so it fired zero times; the rule
+    # below is what covers the rest.
     # ------------------------------------------------------------------
-
-    # (1) A split child inherits its parent's judging command.
-    #
-    # The parent's command already passed the generation-time shape and
-    # falsifiability gates, and it is already RED (the parent failed),
-    # so reusing it costs nothing and removes the refiner's only means of
-    # authoring a fresh judge. A child whose scope genuinely needs a
-    # different command is a *verification-point* defect: the established
-    # exit for that is to retire the VP and add a new one
-    # (``repair_generator``: "绝不修改已有验证点……test_command 都不许改"),
-    # never an in-place rewrite of the thing that grades the task.
-    judge_inherited: List[str] = []
-    for tid in order:
-        if tid in current_by_id:
-            # Pre-existing: rule (2) below governs it, not this one.
-            continue
-        parent_id = _split_parent_id(tid, current_by_id)
-        if parent_id is None:
-            continue
-        child = refiner_by_id.get(tid)
-        if not isinstance(child, dict):
-            continue
-        parent = current_by_id[parent_id]
-        if not any(parent.get(f) for f in _JUDGE_FIELDS):
-            # A parent with no command has nothing to bequeath; leaving
-            # the child's own (or absent) command alone is correct.
-            continue
-        patched = dict(child)
-        changed = False
-        for field in _JUDGE_FIELDS:
-            if field in parent:
-                if patched.get(field) != parent[field]:
-                    patched[field] = parent[field]
-                    changed = True
-            elif field in patched:
-                patched.pop(field)
-                changed = True
-        if changed:
-            refiner_by_id[tid] = patched
-            judge_inherited.append(tid)
 
     reinstated: List[str] = []
     reverted: List[str] = []
@@ -391,8 +327,8 @@ def plan_refiner_structure(
         # Protected: the pre-refinement dict wins unconditionally.
         effective_by_id[tid] = original
 
-    # (2) The judging command is write-once for EVERY task, not just the
-    # protected ones.
+    # The judging command is write-once for EVERY task that already
+    # exists, not just the protected ones.
     #
     # This runs after the protected loop so it cannot disturb that
     # loop's ``reverted`` verdict, which compares whole content and must
@@ -435,8 +371,5 @@ def plan_refiner_structure(
         reverted_ids=tuple(sorted(reverted)),
         judge_rewritten_ids=tuple(
             sorted(i for i in judge_rewritten if i in effective_ids)
-        ),
-        judge_inherited_ids=tuple(
-            sorted(i for i in judge_inherited if i in effective_ids)
         ),
     )

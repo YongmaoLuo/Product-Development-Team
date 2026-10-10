@@ -1067,6 +1067,12 @@ def inspect_task(task: Any) -> List[Tuple[str, CommandIssue]]:
 #: generation pass.
 DEFAULT_FALSIFIABILITY_TIMEOUT_S = 300
 
+#: Shell exit codes meaning "the command could not be started at all":
+#: 127 is ``command not found``, 126 is ``found but not executable``.
+#: Neither is evidence about the code under test, so neither may be read
+#: as the red half of a verdict. See :func:`check_falsifiable`.
+_SHELL_CANNOT_EXECUTE_EXITS = frozenset({126, 127})
+
 #: The backend checkout itself: ``test_command_quality.py`` lives in
 #: ``backend/``, so two levels up is the repository root.
 _AC_REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1191,5 +1197,30 @@ def check_falsifiable(
         return False, (
             "already exits 0 before the work is done — this command "
             "cannot distinguish a correct fix from no change at all"
+        )
+    if completed.returncode in _SHELL_CANNOT_EXECUTE_EXITS:
+        # 126/127 are the shell saying "I could not run that" — the
+        # binary is missing or not executable. That is the *same* class
+        # as the ``OSError`` branch above (something that would fail on
+        # every run regardless of the fix), and the docstring above
+        # already commits to ``ok=False`` for it. Testing only the
+        # ``OSError`` path was not enough: ``shell=True`` means a
+        # missing binary never raises, it exits 127.
+        #
+        # This is the hole the 20261010-CC-Switch-Remote-Aut plan fell
+        # through. ``cargo`` was absent from the executor's PATH, so
+        # EVERY ``cargo test …`` command exited 127 — and 127 is
+        # non-zero, so this probe read each of them as "fails as
+        # required before the work" and waved the whole task list
+        # through. The generation-time falsifiability gate was not
+        # merely passing a bad command; the environment defect turned it
+        # off entirely, which is why nothing downstream noticed 25
+        # commands that could never turn green.
+        return False, (
+            f"cannot run: the shell exited {completed.returncode} "
+            f"(command not found / not executable). A failure to *start* "
+            f"says nothing about whether the work is done, so it cannot "
+            f"serve as the red half of the verdict — fix the environment "
+            f"or the command's path, not the task."
         )
     return True, f"fails as required before the work (exit {completed.returncode})"

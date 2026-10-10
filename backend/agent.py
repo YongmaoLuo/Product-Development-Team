@@ -35,6 +35,7 @@ from refiner import TaskRefiner
 from task import SubTask, UNKNOWN_MODIFICATIONS_SENTINEL, NO_FILE_CHANGES_SENTINEL
 from test_command_quality import inspect_command as inspect_test_command
 from test_command_quality import find_vacuous_pass as _find_vacuous_pass
+from test_command_quality import check_falsifiable as _check_falsifiable
 from config import AgentConfig
 from config_registry import ConfigRegistry
 from retry_manager import RetryManager
@@ -2705,6 +2706,110 @@ class AutonomousAgent:
                 },
             )
         return corrected
+
+    #: Set ``PDT_DISABLE_FALSIFIABILITY_PROBE=1`` to skip executing a new
+    #: sub-task's command during refinement. Same variable (and the same
+    #: reason) ``RepairTaskGenerator`` honours: the gate runs the command
+    #: as a subprocess, so an operator debugging refinement in an
+    #: environment where the project cannot execute — missing toolchain,
+    #: offline — needs a way out that is not "edit the code".
+    FALSIFIABILITY_PROBE_ENV = "PDT_DISABLE_FALSIFIABILITY_PROBE"
+
+    #: Wall-clock ceiling for that probe. Shorter than the generation-time
+    #: default (``DEFAULT_FALSIFIABILITY_TIMEOUT_S``) because this runs on
+    #: the failure path, where several new sub-tasks may be probed back to
+    #: back while the rest of the plan waits.
+    NEW_SUBTASK_PROBE_TIMEOUT_S = 120
+
+    def _enforce_new_subtask_test_command(self, new_task: dict) -> None:
+        """Gate the command the refiner just wrote for a task it created.
+
+        A refinement legitimately **authors** the ``test_command`` of the
+        tasks it creates. A split child is a *different* task with a
+        smaller scope, so it needs its own judge; reusing the parent's
+        would grade it against work it was never asked to do. That is the
+        opposite of the rule for tasks that already existed, which are
+        frozen by :func:`refiner_structure.plan_refiner_structure` (it
+        reports ``judge_rewritten_ids`` when the refiner tries).
+
+        Authoring the first version is not the same as authoring *any*
+        version, though, and the second half is where this plan went
+        wrong: ``_refine_after_failure`` ran neither the shape inspector
+        nor the falsifiability probe over the refiner's output, while the
+        generation path runs both. So the refiner could answer a failure
+        with a command that proves nothing and nothing objected. In the
+        20261010-CC-Switch-Remote-Aut plan that is exactly what happened —
+        eleven refinements, 25 commands rewritten to carry a
+        ``PATH="$HOME/.cargo/bin:$PATH"`` prefix, none of them ever able
+        to go green.
+
+        A command that fails the gate is **discarded, not shipped** — the
+        same trade ``RepairTaskGenerator._resolve_repair_test_command``
+        already makes, and for the same reason: a command that cannot
+        report failure guarantees a false verdict every time, whereas no
+        command degrades to the audit second pass, which can still decide.
+        """
+        commands: List[str] = []
+        for raw in new_task.get("test_commands") or []:
+            text = str(raw or "").strip()
+            if text and text not in commands:
+                commands.append(text)
+        single = str(new_task.get("test_command") or "").strip()
+        if single and single not in commands:
+            commands.append(single)
+        if not commands:
+            return
+
+        project_dir = new_task.get("project_dir") or str(self.project_dir)
+        probe_disabled = (
+            os.environ.get(self.FALSIFIABILITY_PROBE_ENV) not in (None, "", "0")
+        )
+
+        rejected: List[Tuple[str, str]] = []
+        for command in commands:
+            issues = inspect_test_command(command)
+            if issues:
+                rejected.append((command, f"{issues[0].code}: {issues[0].detail}"))
+                continue
+            if probe_disabled:
+                continue
+            ok, detail = _check_falsifiable(
+                command,
+                cwd=str(project_dir),
+                timeout=self.NEW_SUBTASK_PROBE_TIMEOUT_S,
+            )
+            if not ok:
+                rejected.append((command, detail))
+        if not rejected:
+            return
+
+        bad = {command for command, _ in rejected}
+        new_task["test_commands"] = [
+            c for c in (new_task.get("test_commands") or [])
+            if str(c or "").strip() not in bad
+        ]
+        if str(new_task.get("test_command") or "").strip() in bad:
+            new_task.pop("test_command", None)
+
+        if self.logger is not None:
+            try:
+                self.logger.warning(
+                    "refine_new_command_discarded",
+                    (
+                        f"Discarded {len(rejected)} refiner-authored "
+                        f"test_command(s) on new sub-task "
+                        f"[{new_task.get('id', '?')}]: {rejected[0][1][:200]}"
+                    ),
+                    task_id=str(new_task.get("id", "?")),
+                    data={
+                        "rejected": [
+                            {"test_command": c[:400], "why": why[:400]}
+                            for c, why in rejected
+                        ],
+                    },
+                )
+            except Exception:  # pragma: no cover - logger is best-effort
+                pass
 
     # ------------------------------------------------------------------
     # Architecture decision point 7: dispatcher files_to_modify
@@ -6756,6 +6861,10 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     corrected = self._enforce_subtask_workspace(ut, task)
                     ut.clear()
                     ut.update(corrected)
+                    # Authoring a new task's judge is the refiner's job;
+                    # authoring one that cannot do its job is not. See
+                    # ``_enforce_new_subtask_test_command``.
+                    self._enforce_new_subtask_test_command(ut)
 
             # 2026-09-16 (D1): ONE decision, TWO stores.
             #
@@ -6965,20 +7074,18 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         # with the verdict. This is the signal that would have made the
         # 20261010-CC-Switch-Remote-Aut runaway legible on iteration one
         # instead of iteration eleven.
-        if plan.judge_rewritten_ids or plan.judge_inherited_ids:
+        if plan.judge_rewritten_ids:
             if self.logger:
                 self.logger.warning(
                     "refine_judge_command_preserved",
                     (
                         f"Refiner tried to change the test_command of "
-                        f"{len(plan.judge_rewritten_ids)} existing task(s) "
-                        f"and {len(plan.judge_inherited_ids)} split "
-                        f"child(ren); the original commands were kept"
+                        f"{len(plan.judge_rewritten_ids)} existing task(s); "
+                        f"the original commands were kept"
                     ),
                     task_id=task.id,
                     data={
                         "judge_rewritten_ids": list(plan.judge_rewritten_ids),
-                        "judge_inherited_ids": list(plan.judge_inherited_ids),
                     },
                 )
 

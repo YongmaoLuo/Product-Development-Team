@@ -256,6 +256,50 @@ def test_falsifiable_treats_a_timeout_as_inconclusive(tmp_path):
     assert "inconclusive" in detail
 
 
+def test_falsifiable_rejects_a_command_whose_runner_does_not_exist(tmp_path):
+    """126/127 mean "could not start", which is not evidence about the work.
+
+    20261010-CC-Switch-Remote-Aut. ``cargo`` was absent from the
+    executor's PATH, so every ``cargo test …`` command exited 127. 127 is
+    non-zero, so this probe read each of them as "fails as required
+    before the work" and waved the whole task list through — the
+    generation-time falsifiability gate was not passing a bad command,
+    the environment defect had switched it off. Nothing downstream could
+    then notice 25 commands that could never turn green.
+    """
+    ok, detail = check_falsifiable(
+        "definitely-not-a-real-binary --version", cwd=str(tmp_path),
+    )
+    assert ok is False, (
+        "a command that cannot start must never count as the red half of "
+        "a verdict"
+    )
+    assert "127" in detail
+    assert "cannot run" in detail
+
+
+def test_the_cannot_start_rule_does_not_swallow_ordinary_failures(tmp_path):
+    """Only 126/127 are "could not start" — every other non-zero is a
+    real failure and still satisfies the red invariant."""
+    ok, detail = check_falsifiable("exit 126", cwd=str(tmp_path))
+    assert ok is False
+    ok, detail = check_falsifiable("exit 3", cwd=str(tmp_path))
+    assert ok is True
+    assert "exit 3" in detail
+    ok, detail = check_falsifiable("exit 101", cwd=str(tmp_path))
+    assert ok is True, "a real test-runner failure code must stay falsifiable"
+
+
+def test_the_cannot_start_rule_covers_a_missing_command_in_a_chain(tmp_path):
+    """``shell=True`` means a missing binary never raises — it exits 127.
+    The ``OSError`` branch alone could not see it."""
+    ok, detail = check_falsifiable(
+        "no_such_tool_xyz --check && echo unreachable", cwd=str(tmp_path),
+    )
+    assert ok is False
+    assert "cannot run" in detail
+
+
 # ---------------------------------------------------------------------------
 # ``probe_scope_is_usable``: the gate on EXECUTING a task's command
 # ---------------------------------------------------------------------------

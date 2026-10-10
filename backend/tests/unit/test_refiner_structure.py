@@ -744,19 +744,27 @@ def test_sibling_prefix_is_not_mistaken_for_a_split():
     assert "repair-r2-03" in [t["id"] for t in plan.effective]
 
 
+
 # ---------------------------------------------------------------------------
-# The judging command belongs to the task, not to the refiner (2026-10-11).
+# The judging command is write-once, not never-written (2026-10-11).
 #
-# The 20261010-CC-Switch-Remote-Aut plan grew 31 → 55 tasks over eleven
-# refinements, every one logged as ``+3 added, -1 removed``, because the
-# refiner's answer to a failure was to split the failed task in three and
-# to rewrite the test that graded it. It was solving a PATH problem by
-# prefixing 25 commands with ``PATH="$HOME/.cargo/bin:$PATH"`` and titling
-# the new tasks "让目标测试命令对 PATH 免疫". Nothing stopped it: the
-# protection above only covers ``task_group.startswith("repair")`` and
-# every task in that plan had ``task_group = None``, and the split
-# children were new ids, so no before/after comparison could see the
-# command they invented.
+# Someone has to author a test_command the first time — the generator, or
+# the refiner when it splits a failed task into children. A child is a
+# *different task* with a smaller scope, so reusing the parent's command
+# would grade it against work it was never asked to do.
+#
+# What must not happen is the SECOND write. The
+# 20261010-CC-Switch-Remote-Aut plan grew 31 → 55 tasks over eleven
+# refinements, every one logged as ``+3 added, -1 removed``, and 25
+# commands ended up carrying a ``PATH="$HOME/.cargo/bin:$PATH"`` prefix
+# the refiner invented to "fix" an environment defect it could not see.
+# Nothing stopped it: the protection above only covers
+# ``task_group.startswith("repair")`` and every task in that plan had
+# ``task_group = None``.
+#
+# The quality of a *first* write is a separate question, and it lives in
+# the agent (``_enforce_new_subtask_test_command``) because judging it
+# means running the command.
 # ---------------------------------------------------------------------------
 
 
@@ -766,10 +774,10 @@ def test_non_protected_task_cannot_rewrite_its_own_judge():
     The refiner may still refine everything that *describes* the work.
     Only the command that decides whether the work is done is frozen.
     """
-    original = _task("13", title="原题", test_command="cargo test --lib remote::e2e::x")
+    original = _task("13", title="\u539f\u9898", test_command="cargo test --lib remote::e2e::x")
     tampered = dict(
         original,
-        title="更准确的题",
+        title="\u66f4\u51c6\u786e\u7684\u9898",
         test_command='PATH="$HOME/.cargo/bin:$PATH" cargo test --lib remote::e2e::x',
     )
 
@@ -781,7 +789,7 @@ def test_non_protected_task_cannot_rewrite_its_own_judge():
         "the pre-refinement command must win for every task, not just "
         "the repair group"
     )
-    assert kept["title"] == "更准确的题", (
+    assert kept["title"] == "\u66f4\u51c6\u786e\u7684\u9898", (
         "a legitimate descriptive refinement must survive — only the "
         "judge fields are frozen"
     )
@@ -810,79 +818,6 @@ def test_judge_rewrite_is_reported_even_when_nothing_else_changed():
     )["test_command"] == "cargo test --lib remote::auth::secret"
 
 
-def test_split_child_inherits_the_parents_judge_command():
-    """A new id has no before-state, so rule (1) has to cover it.
-
-    The parent's command already passed the generation-time shape and
-    falsifiability gates and is already RED; the child's invented one is
-    discarded unread.
-    """
-    parent = _task("1", test_command="cargo test --test gate")
-    children = [
-        _task("1-1", test_command='PATH="$HOME/.cargo/bin:$PATH" cargo test --lib no_such'),
-        _task("1-2"),  # the refiner wrote no command at all
-        _task("1-3", test_command="cargo test --lib no_such_either"),
-    ]
-
-    plan = plan_refiner_structure([parent], children)
-
-    assert plan.judge_inherited_ids == ("1-1", "1-2", "1-3")
-    assert plan.removed_ids == ("1",)
-    by_id = {t["id"]: t for t in plan.effective}
-    for child_id in ("1-1", "1-2", "1-3"):
-        assert by_id[child_id]["test_command"] == "cargo test --test gate", (
-            f"{child_id} must be graded by the command that graded its parent"
-        )
-
-
-def test_split_child_of_a_commandless_parent_is_left_alone():
-    """Nothing to inherit — and inventing a command is not an improvement."""
-    parent = _task("5", test_command="")
-    children = [_task("5-1", test_command="pytest -k something")]
-    plan = plan_refiner_structure([parent], children)
-
-    assert plan.judge_inherited_ids == ()
-    assert plan.effective[0]["test_command"] == "pytest -k something"
-
-
-def test_a_new_task_with_no_matching_parent_keeps_its_command():
-    """A genuinely new task (a gap the refiner spotted) is not a split,
-    and there is no parent command to inherit."""
-    plan = plan_refiner_structure(
-        [_task("9")], [_task("9"), _task("99", test_command="pytest -k gap")]
-    )
-
-    assert plan.judge_inherited_ids == ()
-    assert ("99",) == plan.added_ids
-    assert next(t for t in plan.effective if t["id"] == "99")["test_command"] == (
-        "pytest -k gap"
-    )
-
-
-def test_a_pre_existing_child_shaped_id_is_not_treated_as_a_split():
-    """``1-2`` may be an authored id rather than a child of ``1``.
-
-    Rule (1) only applies to ids the refiner just invented; a task that
-    was already in the list keeps its own command under rule (2).
-    """
-    parent = _task("1", test_command="cargo test --test a")
-    sibling = _task("1-2", test_command="cargo test --test b")
-
-    plan = plan_refiner_structure(
-        [parent, sibling],
-        [
-            _task("1", test_command="cargo test --test a"),
-            _task("1-2", test_command="cargo test --test b"),
-        ],
-    )
-
-    assert plan.judge_inherited_ids == ()
-    assert plan.judge_rewritten_ids == ()
-    assert next(t for t in plan.effective if t["id"] == "1-2")["test_command"] == (
-        "cargo test --test b"
-    )
-
-
 def test_switching_between_the_two_command_shapes_is_not_a_rewrite():
     """``test_commands: []`` and an absent ``test_commands`` mean the same
     thing; an LLM that echoes the other shape has not changed the judge."""
@@ -895,26 +830,60 @@ def test_switching_between_the_two_command_shapes_is_not_a_rewrite():
     assert plan.is_noop
 
 
-def test_a_longer_id_sharing_a_prefix_is_not_a_parent():
-    """``40-10`` must not read ``4`` as its parent — the separator is part
-    of the test, same trap as the sibling case above."""
-    assert plan_refiner_structure(
-        [_task("4", test_command="cargo test --test a")],
-        [_task("4"), _task("40-10", test_command="cargo test --test b")],
-    ).judge_inherited_ids == ()
+def test_a_split_child_authors_its_own_judge():
+    """The half that must NOT be frozen.
+
+    A split child is a different task with a smaller scope; its command
+    is the refiner's to write, and must come through untouched.
+    """
+    parent = _task("1", test_command="cargo test --test gate")
+    children = [
+        _task("1-1", test_command="cargo test --lib remote::auth::secret"),
+        _task("1-2", test_command="cargo test --test auth_token_gate"),
+        _task("1-3"),  # the refiner chose to write no command at all
+    ]
+
+    plan = plan_refiner_structure([parent], children)
+
+    assert plan.judge_rewritten_ids == ()
+    assert plan.removed_ids == ("1",)
+    by_id = {t["id"]: t for t in plan.effective}
+    assert by_id["1-1"]["test_command"] == "cargo test --lib remote::auth::secret"
+    assert by_id["1-2"]["test_command"] == "cargo test --test auth_token_gate"
+    assert by_id["1-3"]["test_command"] == "pytest -q"  # _task default, untouched
 
 
-def test_the_deepest_matching_parent_wins():
-    """With both ``1`` and ``1-1`` present, ``1-1-2`` is a child of ``1-1``."""
-    root = _task("1", test_command="cargo test --test root")
-    mid = _task("1-1", test_command="cargo test --test mid")
-
+def test_a_brand_new_task_authors_its_own_judge():
+    """A gap the refiner spotted is a new task, not a rewrite."""
     plan = plan_refiner_structure(
-        [root, mid],
-        [_task("1"), _task("1-1"), _task("1-1-2", test_command="cargo test --lib no_such")],
+        [_task("9")], [_task("9"), _task("99", test_command="pytest -k gap")]
     )
 
-    assert plan.judge_inherited_ids == ("1-1-2",)
+    assert plan.judge_rewritten_ids == ()
+    assert plan.added_ids == ("99",)
     assert next(
-        t for t in plan.effective if t["id"] == "1-1-2"
-    )["test_command"] == "cargo test --test mid"
+        t for t in plan.effective if t["id"] == "99"
+    )["test_command"] == "pytest -k gap"
+
+
+def test_a_pre_existing_child_shaped_id_is_still_frozen():
+    """``1-2`` may be an authored id rather than a child of ``1``.
+
+    Whatever its name looks like, it existed before the refinement, so
+    the write-once rule governs it — not the new-task exemption.
+    """
+    parent = _task("1", test_command="cargo test --test a")
+    sibling = _task("1-2", test_command="cargo test --test b")
+
+    plan = plan_refiner_structure(
+        [parent, sibling],
+        [
+            _task("1", test_command="cargo test --test a"),
+            _task("1-2", test_command="cargo test --test CHANGED"),
+        ],
+    )
+
+    assert plan.judge_rewritten_ids == ("1-2",)
+    assert next(
+        t for t in plan.effective if t["id"] == "1-2"
+    )["test_command"] == "cargo test --test b"
