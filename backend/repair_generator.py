@@ -47,6 +47,34 @@ from test_command_quality import check_falsifiable, inspect_command
 from verification_persistence import VerificationPersistenceManager
 
 
+# 2026-10-11: cap on failure text handed to the repair-task LLM.
+# Kept local to this module rather than imported from
+# ``verification_agent`` to avoid pulling that module (and its prompt
+# stack) into every importer of the repair generator.
+_MAX_REPAIR_PROMPT_CHARS = 8000
+
+
+def _clamp_for_prompt(text: Any, limit: int = _MAX_REPAIR_PROMPT_CHARS,
+                      label: str = "text") -> str:
+    """Clip ``text`` to ``limit`` chars, declaring the cut when one happens.
+
+    The repair agent repairs against this text, so a silent slice does
+    not merely lose detail — it makes the agent repair against a
+    fragment it cannot tell is a fragment, which is how four rounds
+    went off-target on VP-016. Losing the tail is acceptable; losing
+    the *fact* that the tail is missing is not, so the annotation
+    states the original length too.
+    """
+    rendered = str(text or "")
+    if len(rendered) <= limit:
+        return rendered
+    notice = (
+        f"…[{label} 已截断，原长 {len(rendered)} 字符，"
+        f"此处保留前 {limit}]"
+    )
+    return rendered[:limit] + notice
+
+
 REPAIR_SYSTEM_PROMPT = """你是一位资深技术架构师。你的任务是基于验证失败证据，生成需求导向的修复任务。
 
 **核心原则：不要针对pytest错误修复，必须回到原始PRD验收标准理解需求偏离**
@@ -924,7 +952,7 @@ class RepairTaskGenerator:
                     "description": (
                         f"## 背景\n"
                         f"`{vp_id}` 触发了 binary_freshness 预检失败（BLOCKED verdict），binary 的 mtime 早于源码 mtime 或根本没编译。\n\n"
-                        f"**证据摘录 (actual_result):**\n```\n{actual_result[:600]}\n```\n\n"
+                        f"**证据摘录 (actual_result):**\n```\n{_clamp_for_prompt(actual_result, label='actual_result')}\n```\n\n"
                         f"**底层类型:** `{evidence.get('vp_id', '')}`\n\n"
                         f"## 目标\n"
                         f"在 `{self.project_dir}` 项目根里运行 fresh rebuild，让 binary mtime ≥ source mtime，让 binary_freshness 预检 PASSED。\n\n"
@@ -1776,14 +1804,22 @@ def _build_repair_contents_prompt(
                     # column has none) — they use an ordinal ``label``
                     # ("既往失败 #2") instead of a fabricated round.
                     heading = h.get("label") or f"Round {h.get('round', '?')}"
+                    # 2026-10-11: these two were ``[:600]``. With
+                    # ``actual_result`` now carrying every verdict
+                    # reason (see
+                    # ``Orchestrator._verdict_to_result``) the 600-char
+                    # slice removed exactly the tail that states which
+                    # criterion failed, so the repair agent could see a
+                    # history entry in which every criterion passed.
+                    # 8000 + an explicit truncation marker instead.
                     parts.append(
                         f"- **{heading}** "
                         f"actual_result: "
-                        f"{(h.get('actual_result') or '')[:600]}"
+                        f"{_clamp_for_prompt(h.get('actual_result'), label='actual_result')}"
                     )
                     parts.append(
                         f"  evidence: "
-                        f"{(h.get('evidence') or '')[:600]}"
+                        f"{_clamp_for_prompt(h.get('evidence'), label='evidence')}"
                     )
                 parts.append("")
     parts.append(f"共 {len(failed_vps)} 个失败 VP：")
@@ -1826,8 +1862,14 @@ def _build_repair_contents_prompt(
             # Legacy inlined shape — still supported so an older
             # ``verification_report.json`` reader (or a caller that has
             # not migrated yet) keeps producing a usable prompt.
-            parts.append(f"actual_result: {vp.get('actual_result', '')[:1000]}")
-            parts.append(f"evidence: {vp.get('evidence', '')[:1000]}")
+            parts.append(
+                f"actual_result: "
+                f"{_clamp_for_prompt(vp.get('actual_result'), label='actual_result')}"
+            )
+            parts.append(
+                f"evidence: "
+                f"{_clamp_for_prompt(vp.get('evidence'), label='evidence')}"
+            )
             if vp.get("test_command"):
                 parts.append(f"test_command (from plan): {vp.get('test_command')[:500]}")
             if vp.get("expected_result"):
