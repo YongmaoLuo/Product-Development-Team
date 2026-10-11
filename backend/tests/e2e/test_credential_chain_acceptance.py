@@ -158,6 +158,7 @@ from typing import Dict, Iterator, List, Mapping, Optional
 import pytest
 
 import credentials
+import secret_launcher
 
 #: ``backend/``, resolved from this file rather than written out: the
 #: repository is checked out at a different path on every machine, and this
@@ -459,7 +460,21 @@ def keychain(tmp_path, monkeypatch, canary):
     resolved from the keychain" are the same observation, and the source
     label would be the only thing telling them apart.
     """
-    for key in ("PDT_TEST_ARGV_LOG", "PDT_TEST_KEYCHAIN_DIR"):
+    # ``PDT_SECRET_READER_PATH`` is the fourth: it reaches this process out
+    # of the project-root ``.env``, so on a machine that has narrowed its
+    # keychain ACL the walk below would run the operator's signed reader
+    # instead of the stand-in built here, and every consumer would report
+    # itself unconfigured. CI has no ``.env``, so leaving it set is green
+    # there and red on the one machine that migrated. It is cleared and
+    # then **set** to the stand-in below, because there is no fallback any
+    # more: an unset reader issues no read at all, and every consumer would
+    # report itself unconfigured for a reason that has nothing to do with
+    # what this walk is covering.
+    for key in (
+        "PDT_TEST_ARGV_LOG",
+        "PDT_TEST_KEYCHAIN_DIR",
+        "PDT_SECRET_READER_PATH",
+    ):
         monkeypatch.delenv(key, raising=False)
 
     home = tmp_path / "home"
@@ -482,6 +497,7 @@ def keychain(tmp_path, monkeypatch, canary):
     monkeypatch.setenv(credentials._SWITCH_ENV_KEY, "0")
     monkeypatch.setenv("PDT_TEST_ARGV_LOG", str(argv_log))
     monkeypatch.setenv("PDT_TEST_KEYCHAIN_DIR", str(items))
+    monkeypatch.setenv(credentials._SECRET_READER_ENV_KEY, str(binary))
     monkeypatch.setattr(credentials, "_is_macos", lambda: True)
     monkeypatch.setattr(credentials, "_SECURITY_BIN", str(binary))
     written = {
@@ -489,6 +505,7 @@ def keychain(tmp_path, monkeypatch, canary):
         credentials._SWITCH_ENV_KEY: "0",
         "PDT_TEST_ARGV_LOG": str(argv_log),
         "PDT_TEST_KEYCHAIN_DIR": str(items),
+        credentials._SECRET_READER_ENV_KEY: str(binary),
     }
     for name in CONSUMER_NAMES:
         key = credentials.SECRET_SPECS[name].account_env_key
@@ -546,6 +563,47 @@ def published(keychain, register_open_fd):
     )
     register_open_fd(fd)
     return value, fd
+
+
+@pytest.fixture
+def launched(keychain, register_open_fd):
+    """Run the launcher, and hand back everything it started.
+
+    This is the production entry point rather than this file's
+    reconstruction of it. ``secret_launcher.publish_secrets`` is what runs
+    between the supervisor's ``fork`` and the server's ``exec``, so a walk
+    built on it is a walk over the chain that actually runs — and the
+    claim "the server does not read the keychain" is then a claim about
+    the code that ships, not about the parts of it a test chose to call.
+
+    Two things a launch leaves behind, and neither is given back by the
+    launcher itself: the descriptors it published (which the teardown
+    closes) and the variables naming them (which this fixture removes).
+    The launcher does not clean up because in production the process
+    ``exec``\\s away a moment later with both still open — that is the
+    point of them — so the tidying belongs here, where the process has to
+    survive the test.
+
+    The variables the launch writes join ``keychain.written``, so step 1's
+    two-tier sweep covers every variable this deployment sets rather than
+    only the ones the fixture set by hand.
+    """
+    def _launch() -> int:
+        count = secret_launcher.publish_secrets()
+        for name in credentials.SECRET_SPECS:
+            variable = credentials.secret_fd_env_var(name)
+            raw = os.environ.get(variable)
+            if raw is None:
+                continue
+            register_open_fd(int(raw))
+            keychain.written[variable] = raw
+        return count
+
+    yield _launch
+
+    for name in credentials.SECRET_SPECS:
+        os.environ.pop(credentials.secret_fd_env_var(name), None)
+    credentials.reset_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -677,15 +735,24 @@ def _without_published_indexes(environment: Mapping[str, str], keychain) -> Dict
 # ---------------------------------------------------------------------------
 
 
-def test_the_value_is_in_the_keychain_and_in_no_environment_variable(keychain):
+def test_the_value_is_in_the_keychain_and_in_no_environment_variable(keychain, launched):
     """Step 1: the secret exists, and this process is not how it arrives.
 
-    The label is checked alongside the sweep, and both are needed. A sweep
-    on its own would pass on a process where the value was nowhere at all,
-    including a provider that resolved nothing — which is precisely the
-    state every later step is trying to distinguish from this one. So the
-    value has to be readable *and* named as keychain-sourced before the
-    absence of it from the environment means anything.
+    Two halves, and neither alone is the claim.
+
+    **The keychain holds the value.** The launcher's read — the same
+    function ``secret_launcher`` calls — returns it, so the credential is
+    where the operator filed it and every step below is following a
+    value that exists.
+
+    **This process does not read the keychain to get it.** After the
+    launch, the provider names ``inherited_fd`` as the source and returns
+    the same value. Asserting the label rather than only the value is what
+    makes the pair evidence: a provider that had gone back to the keychain
+    itself would return the same bytes and name ``keychain``, and a sweep
+    on its own would pass on a process where the value was nowhere at all.
+    Under the handoff the label can only be ``inherited_fd``, which is the
+    one-word statement that the read happened somewhere else.
 
     The sweep covers the whole environment rather than only the two
     fallback variables named in the spec table: "not in the process
@@ -714,15 +781,24 @@ def test_the_value_is_in_the_keychain_and_in_no_environment_variable(keychain):
     """
     value = keychain.value()
 
-    assert credentials.secret_source(LOGICAL_NAME) == credentials.SOURCE_KEYCHAIN, (
-        "the provider did not name the keychain as the source of {}, so the "
-        "sweep below would be reporting a secret this process never had".format(
-            LOGICAL_NAME
-        )
+    assert credentials.read_secret_from_keychain(LOGICAL_NAME) == value, (
+        "the keychain does not hold the value this walk is following, so "
+        "there is nothing for the handoff below to deliver"
+    )
+
+    assert launched() == len(CONSUMER_NAMES), (
+        "the launcher published fewer secrets than the spec table declares, "
+        "so the server would start with a descriptor missing"
+    )
+    assert credentials.secret_source(LOGICAL_NAME) == credentials.SOURCE_INHERITED_FD, (
+        "the provider did not name the descriptor as the source of {}, so "
+        "either it went back to the keychain or it resolved nothing — and "
+        "the sweep below would be reporting a secret this process never "
+        "had".format(LOGICAL_NAME)
     )
     assert credentials.read_secret(LOGICAL_NAME) == value, (
-        "the provider reported a keychain source and returned a different "
-        "value, which is the disagreement this walk exists to catch"
+        "the provider reported an inherited descriptor and returned a "
+        "different value, which is the disagreement this walk exists to catch"
     )
     assert credentials.secret_available(LOGICAL_NAME) is True
 
@@ -771,16 +847,18 @@ def test_the_value_is_in_the_keychain_and_in_no_environment_variable(keychain):
 # ---------------------------------------------------------------------------
 
 
-def test_the_provider_asks_for_the_account_and_nothing_else(keychain):
+def test_the_provider_asks_for_the_account_and_nothing_else(keychain, launched):
     """Step 2: the item is located by the account, and by no service name.
 
-    The argv is read out of the stand-in's own log rather than out of a
-    patch of ``subprocess.run``, so what is checked is the command line
-    that ran. It is asserted element by element and the ``-s`` flag is
-    asserted *absent* rather than merely unused: ``security`` also finds an
-    item by service, and a command carrying one has adopted a keychain
-    layout that is a fact about one machine's keychain, written into this
-    repository's source and true for exactly that operator.
+    The lookup is driven through the launcher — the process that performs
+    it in production — and then read out of the stand-in's own argv log
+    rather than out of a patch of ``subprocess.run``, so what is checked
+    is the command line that ran. It is asserted element by element and
+    the ``-s`` flag is asserted *absent* rather than merely unused:
+    ``security`` also finds an item by service, and a command carrying one
+    has adopted a keychain layout that is a fact about one machine's
+    keychain, written into this repository's source and true for exactly
+    that operator.
 
     The keychain file is required to be named, for the opposite reason: an
     unqualified lookup searches whichever keychain the process happens to
@@ -790,18 +868,16 @@ def test_the_provider_asks_for_the_account_and_nothing_else(keychain):
     Every row of the table is walked, because the claim is about the
     lookup and the table is where the lookup is declared — a chain that
     reads one secret by account and the other by service is half-migrated
-    with nothing in the outside showing it.
+    with nothing in the outside showing it. The launcher walks the same
+    table, so one call covers all of them; a lookup driven by hand would
+    be this file's idea of the loop rather than the loop.
     """
-    for name in CONSUMER_NAMES:
-        credentials.read_secret(name)
-    credentials.reset_cache()
-    for name in CONSUMER_NAMES:
-        credentials.read_secret(name)
+    assert launched() == len(CONSUMER_NAMES)
 
     argv = keychain.argv()
     assert argv, (
         "no process was started, so there is no command line to check: the "
-        "provider resolved every secret without consulting the keychain"
+        "launcher resolved every secret without consulting the keychain"
     )
 
     for name in CONSUMER_NAMES:
@@ -885,7 +961,9 @@ class _Notified(object):
         return False
 
 
-def test_every_consumer_reports_configured_and_leaks_no_value(keychain, monkeypatch):
+def test_every_consumer_reports_configured_and_leaks_no_value(
+    keychain, launched, monkeypatch
+):
     """Step 3: three consumers, one resolved value, three "configured".
 
     Each transport is asked in its own vocabulary, because a single shared
@@ -894,6 +972,12 @@ def test_every_consumer_reports_configured_and_leaks_no_value(keychain, monkeypa
     is that it constructed at all, which is the only signal it has; and
     the notifier's is the ``enabled`` field of its status report, which is
     what an operator actually reads.
+
+    The consumers read what the server reads, so the launcher runs first.
+    That is the whole point of stopping here rather than at step 2: the
+    transports resolve through ``credentials``, and a chain that delivered
+    a descriptor the consumers never consult would pass every claim made
+    above and fail this one.
 
     The status report is then swept for the value. ``stats()`` is the one
     place in this project that renders deployment state for a human, and
@@ -911,6 +995,12 @@ def test_every_consumer_reports_configured_and_leaks_no_value(keychain, monkeypa
     from notifications.telegram_client import load_telegram_config
 
     value = keychain.value()
+
+    assert launched() == len(CONSUMER_NAMES), (
+        "the launcher published fewer secrets than there are consumers, so "
+        "a transport below would report itself unconfigured for a reason "
+        "that is not about the transport"
+    )
 
     telegram = load_telegram_config()
     assert telegram["enabled"] is True, (

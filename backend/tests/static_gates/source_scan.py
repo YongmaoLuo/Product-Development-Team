@@ -14,12 +14,23 @@ This module pins the single definition.
 
 What "first party" means here
 -----------------------------
-* Top-level directories checked into the repository that hold
-  application source: ``backend/`` (Python backend), ``frontend/``
-  (web UI), ``scripts/`` (operator helpers), ``example/`` (config
-  templates).
+* **Every top-level directory the repository tracks.** The list is meant
+  to be *complete*, not curated:
+  ``test_every_tracked_directory_is_scanned`` derives the expected set
+  from ``git ls-tree`` and fails when a tracked directory is missing from
+  :data:`SCAN_ROOTS`, so a directory added later cannot go unread.
+
+  That gate exists because this list was curated once and then drifted.
+  It was written when the repository had four source directories, and
+  ``tools/``, ``tests/``, ``.claude/``, ``.github/`` and ``docs/`` each
+  arrived afterwards without joining it. A directory that is not named
+  here is a directory no gate reads — and nothing says so, because every
+  gate's own "the scan is not empty" assertion keeps passing on the roots
+  that *are* listed.
 * ``.config/`` is **not** included — it is gitignored, holds
-  per-deployment secrets, and is intentionally never scanned.
+  per-deployment secrets, and is intentionally never scanned. Nor is any
+  other untracked directory (``plans/``, ``site/``): they are not in the
+  repository, so there is nothing to publish and nothing to check.
 * ``tests/`` directories are *included*: unit tests, fixture
   samples, and the static gates themselves are all first-party code
   and the home-path rule applies to them. The exclusion of
@@ -42,11 +53,26 @@ from pathlib import Path
 #: Top-level first-party source roots. Every directory here is
 #: checked into the repository; ``.config/`` is intentionally absent
 #: because it is gitignored and holds per-deployment secrets.
+#:
+#: **This is meant to be every tracked top-level directory, not a
+#: selection of them.** It was a selection for as long as it took for
+#: someone to notice: ``tools/``, ``tests/``, ``.claude/``, ``.github/``
+#: and ``docs/`` were all tracked, all scan-able, and all outside every
+#: privacy gate — silently, because each gate checks only the roots named
+#: here and nothing checked that this list was complete.
+#: ``test_every_tracked_directory_is_scanned`` now does. Adding a
+#: directory to the repository without adding it here is a red run rather
+#: than an unread directory.
 SCAN_ROOTS: tuple[Path, ...] = (
     Path("backend"),
     Path("frontend"),
     Path("scripts"),
     Path("example"),
+    Path("tools"),
+    Path("tests"),
+    Path("docs"),
+    Path(".claude"),
+    Path(".github"),
 )
 
 #: Directory names that look like first-party source but must never
@@ -80,6 +106,13 @@ SOURCE_EXTENSIONS: frozenset[str] = frozenset({
     ".json",
     ".md",
     ".sh",
+    # ``example/`` holds templates named ``<thing>.yaml.example`` and
+    # ``<thing>.sb.example``, so their ``Path.suffix`` is ``.example`` —
+    # neither ``.yaml`` nor ``.sb`` in this set reaches them. Without this
+    # entry ``example/`` is a scan root that reads nothing, which is how
+    # the home-path occurrences in ``sandbox_profile.sb.example`` went
+    # unreported for as long as they did.
+    ".example",
 })
 
 

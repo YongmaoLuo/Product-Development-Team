@@ -7,6 +7,38 @@
 
 [English](CHANGELOG.md)
 
+## [Unreleased]
+
+**钥匙串读取搬离了那个处理请求的进程。** 两个通知 secret 现在由启动器在启动时解析一次、
+发布到匿名管道，然后 `exec` 出服务端 —— 于是应答 HTTP 的进程完全不跑钥匙串工具。与之
+配套的还有一个可选读取器：把条目的访问控制名单收窄成只认你自己签名的那个二进制，让
+`/usr/bin/security`（机器上任何进程都能执行）不再构成授权本身。
+
+### 新增
+
+- **`backend.secret_launcher`：读一次钥匙串，然后变成服务端。** 它解析每个通知 secret、
+  把值写进匿名管道、在环境变量里指明描述符，最后 `exec` 出 `backend.server` ——
+  PID 不变，所以 supervisor 对这条服务的观察不会变。服务端随后读的是自己继承来的
+  描述符，因此 `credentials.read_secret` 报 `"inherited_fd"`，钥匙串那一条分支已经
+  不存在了。开关关着的部署不受影响，仍然用 `python -m backend.server` 起。见
+  [钥匙串迁移](docs/operations/keychain-migration.md)。
+
+- **`tools/pdt-secret-reader/`：一个你自己签名的读取器，以及信任它的那次改写。**
+  `security` 建的条目，访问控制名单里写的是 `/usr/bin/security` —— 一个机器上任何进程
+  都能执行的 Apple 签名二进制；于是这份默认名单把 secret 交给了任何能跑一条命令的
+  东西，而且是无提示的。`setup.sh build` 签发一张自签名证书和一个签名读取器，
+  `adopt --widen` 把读取器加进每个条目的名单、同时保留已经信任的那些，
+  `adopt --narrow` 再把名单改写成只有读取器一个。设了 `PDT_SECRET_READER_PATH` 时读取
+  经由它进行，argv 与 `security` 完全相同，所以读取本身没有任何别的变化。流程、退出
+  码，以及它**防不住**什么，都在它的 README 里。
+
+### 变更
+
+- **`secrets verify` 现在问的是机器，不是进程。** 这条命令直接读钥匙串，因为那才是
+  操作者能据以行动的问题：不经启动器起的服务端会把一切都报成 `missing`，什么也解释
+  不了。它照旧打印 `source=keychain`，但这个标签现在的意思是「这台机器的钥匙串里有」，
+  而不是「服务端能解析出来」。
+
 ## [0.1.2] - 2026-10-07
 
 **一轮运行能碰什么，一份绿灯报告证明了什么。** 这一版新增三项能力：通知密钥可以

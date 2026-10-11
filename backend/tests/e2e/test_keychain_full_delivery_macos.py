@@ -2163,6 +2163,18 @@ def deployment(tmp_path, monkeypatch, canary):
     the spec table has an account exported and an item filed under it, and no
     plaintext fallback is exported at all.
 
+    The reader is named, and it is named as :data:`_SECURITY_BIN` — the real
+    system tool, this file's own constant, the one the capability gate keys
+    on. That is not a second thing replaced: this deployment *filed its own
+    items* through that tool a few lines above, so the access control lists
+    on them name it, and a deployment that has not narrowed its ACL is
+    exactly what the reader variable is for. It is set because
+    ``credentials._secret_reader_bin`` is fail-closed — an unset reader means
+    no read is issued at all — and a test that left it unset would report
+    "nothing was published" for a reason that has nothing to do with the
+    handoff, or worse, pass on a machine whose environment happens to carry
+    a reader and fail on one whose does not.
+
     The platform is *not* patched. This file is macOS-gated, so
     ``sys.platform`` already says what the read needs it to say, and patching
     it here would make the file's one claim — that nothing is replaced — false
@@ -2185,6 +2197,9 @@ def deployment(tmp_path, monkeypatch, canary):
 
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.setenv(credentials._SWITCH_ENV_KEY, "0")
+        # See the docstring: this file filed its own items through the real
+        # tool, so the real tool is the reader this deployment configures.
+        monkeypatch.setenv(credentials._SECRET_READER_ENV_KEY, _SECURITY_BIN)
         for name, account in accounts.items():
             monkeypatch.setenv(credentials.SECRET_SPECS[name].account_env_key, account)
             # The whole point of the file in one line: with a fallback

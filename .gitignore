@@ -36,6 +36,12 @@ coverage/
 .env.local
 .env.*.local
 !.env.example
+# The temporary file `tools/pdt-secret-reader/setup.sh adopt` writes the
+# whole of .env into before renaming it over the original. It is mktemp'd
+# (so the name is unpredictable) but it is still every secret in the clear,
+# and it lives in the one directory git is watching most closely. `.env`
+# above matches the exact name only, so nothing else here covers it.
+.env.setup-tmp*
 
 # Runtime state
 #
