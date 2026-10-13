@@ -160,7 +160,13 @@ def test_generate_repair_contents_forwards_outcomes(tmp_path, monkeypatch):
 
     class _Tool:
         def query_json(self, prompt, system_instruction, timeout=None):
-            seen["prompt"] = prompt
+            # The generator asks more than once when a verification point
+            # has no command to reuse: once for the content, then for the
+            # bounded fill loop. Record every prompt so this asserts on
+            # the *content* one — which is what ``repair_outcomes`` is
+            # rendered into — instead of silently reading whichever call
+            # happened to be last.
+            seen.setdefault("prompts", []).append(prompt)
             return {"tasks": [{
                 "failed_vp_id": "VP-023",
                 "title": "T", "description": "D", "acceptance_criteria": "A",
@@ -174,5 +180,6 @@ def test_generate_repair_contents_forwards_outcomes(tmp_path, monkeypatch):
             "repair_task_id": "repair-r2-01", "repair_status": "failed",
         }},
     )
-    assert "repair-r2-01" in seen["prompt"]
-    assert "执行结果: failed" in seen["prompt"]
+    content_prompt = seen["prompts"][0]
+    assert "repair-r2-01" in content_prompt
+    assert "执行结果: failed" in content_prompt

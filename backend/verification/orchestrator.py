@@ -774,6 +774,40 @@ class VerificationOrchestrator:
             seq_base=seq_base,
         ).assemble(repair_contents)
         self._current_repair_tasks = repair_tasks
+
+        # 2026-10-11 (W5): retire earlier rounds' duplicate repair rows
+        # for the VPs this round just re-queued. Without this, the
+        # executor's queue (``_get_pending_repair_tasks``) carries both
+        # the stale row and its replacement and runs the same fix twice.
+        # Best-effort and non-fatal — the round must proceed even if the
+        # bookkeeping fails; a missed supersede costs one duplicated
+        # repair, whereas a raised exception here would cost the whole
+        # round. Deferred import: ``verification_loop`` reaches this
+        # module through ``server``, so importing it at module scope
+        # here would be circular.
+        if repair_tasks:
+            try:
+                from verification_loop import (
+                    _supersede_prior_round_repairs,
+                )
+                _retired = _supersede_prior_round_repairs(
+                    self.plan_dir.name,
+                    round_number,
+                    [rt.get("failed_vp_id") for rt in repair_tasks],
+                )
+                if _retired:
+                    print(
+                        f"[Repair] round {round_number}: retired "
+                        f"{len(_retired)} pending repair task(s) from "
+                        f"earlier rounds as superseded: "
+                        f"{', '.join(sorted(_retired))}"
+                    )
+            except Exception as supersede_exc:  # noqa: BLE001
+                print(
+                    f"[Repair] round {round_number}: supersede check "
+                    f"skipped ({supersede_exc})"
+                )
+
         # 2026-09-08: single-writer refactor (mirrors the refiner
         # cleanup in agent.py). Previously the auto-loop wrote a
         # ``verification_tasks_round_N.json`` snapshot and the executor

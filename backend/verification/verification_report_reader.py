@@ -46,6 +46,39 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+def _vp_runnable_command(vp_plan: Dict[str, Any]) -> str:
+    """Return the VP's runnable shell command, or ``""`` if it has none.
+
+    2026-10-11. ``verification_plan.json`` names the field
+    ``evidence_command``; ``test_command`` is the legacy spelling this
+    module used to read. All three read sites here checked only
+    ``test_command``, a key the plan format does not emit — so every
+    one of them was vacuous and the plan's own command was never seen.
+    The consequence was silent and total: ``extract_vp_test_commands``
+    returned ``{}``, so every repair task reached the executor with
+    ``test_command=""`` and its verdict rested on the sub-agent's own
+    say-so (``agent._cross_verify`` → ``test_cross_verify_unverified``).
+
+    Resolution order is ``evidence_command`` first, ``test_command`` as
+    the compatibility fallback, so a plan written by either writer is
+    read. Returns the stripped string, or ``""`` when neither key holds
+    a usable non-empty string.
+
+    Note this changes nothing about what ``evidence_command`` *means*
+    on the verification side — there it is the corroboration command
+    (``verification_ci_runner.py``, ``prompts.py``). This reader is
+    choosing to reuse it as the repair round's objective criterion,
+    because the thing it replaces is "no command at all, so trust the
+    AI", and running the command that exercises the VP's subject is
+    the closest objective signal available.
+    """
+    for key in ("evidence_command", "test_command"):
+        value = vp_plan.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def extract_failed_vps_from_report(
     report_path: Path,
     plan_path: Optional[Path] = None,
@@ -166,9 +199,16 @@ def extract_failed_vps_from_report(
             # Plan-only fields — only included when the plan exists so the
             # caller can rely on ``"test_command" in entry`` to mean "the
             # plan had a runnable command".
+            #
+            # 2026-10-11: ``evidence_command`` is the field
+            # ``verification_plan.json`` actually carries; ``test_command``
+            # is the legacy spelling kept as a fallback alias. Reading only
+            # ``test_command`` made every read below vacuous, because that
+            # is not the key the plan emits. See ``_vp_runnable_command``.
             if vp_plan:
-                if vp_plan.get("test_command"):
-                    entry["test_command"] = str(vp_plan["test_command"])
+                _cmd = _vp_runnable_command(vp_plan)
+                if _cmd:
+                    entry["test_command"] = _cmd
                 if vp_plan.get("expected_result"):
                     entry["expected_result"] = str(vp_plan["expected_result"])
             failed.append(entry)
@@ -213,7 +253,14 @@ def _collect_log_paths(plan_dir: Path) -> List[str]:
 
 
 def extract_vp_test_commands(plan_path: Path) -> Dict[str, str]:
-    """Return ``{vp_id: test_command}`` for every VP in the plan.
+    """Return ``{vp_id: command}`` for every VP in the plan.
+
+    The returned mapping is still *named* ``test_command`` downstream —
+    it is what :class:`~repair_generator.RepairTaskAssembler` stamps
+    onto the repair task — but the field it is read from is
+    ``evidence_command``, with ``test_command`` as the legacy fallback.
+    See :func:`_vp_runnable_command` for why, and for what reading the
+    wrong key cost.
 
     :func:`extract_failed_vps_with_paths` deliberately redacts the
     command into a bounded ``test_command_summary`` (and a
@@ -244,9 +291,9 @@ def extract_vp_test_commands(plan_path: Path) -> Dict[str, str]:
         if not isinstance(vp, dict):
             continue
         vp_id = str(vp.get("id", "") or "").strip()
-        command = vp.get("test_command")
-        if vp_id and isinstance(command, str) and command.strip():
-            commands[vp_id] = command.strip()
+        command = _vp_runnable_command(vp)
+        if vp_id and command:
+            commands[vp_id] = command
     return commands
 
 
@@ -366,13 +413,18 @@ def extract_failed_vps_with_paths(
                 "evidence_paths": evidence_paths,
             }
             if vp_plan:
-                if vp_plan.get("test_command"):
-                    entry["test_command_path"] = (
-                        f"{plan_abs}#/{vp_id}/test_command"
-                    )
-                    entry["test_command_summary"] = _summarize(
-                        vp_plan["test_command"]
-                    )
+                # 2026-10-11: point at whichever key actually carries the
+                # command. The pointer is handed to the repair agent as
+                # "read exactly this location", so a pointer naming a key
+                # the plan does not have is worse than emitting none.
+                for _cmd_key in ("evidence_command", "test_command"):
+                    _raw_cmd = vp_plan.get(_cmd_key)
+                    if isinstance(_raw_cmd, str) and _raw_cmd.strip():
+                        entry["test_command_path"] = (
+                            f"{plan_abs}#/{vp_id}/{_cmd_key}"
+                        )
+                        entry["test_command_summary"] = _summarize(_raw_cmd)
+                        break
                 if vp_plan.get("expected_result"):
                     entry["expected_result_summary"] = _summarize(
                         vp_plan["expected_result"]

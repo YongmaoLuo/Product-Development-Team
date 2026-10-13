@@ -14,7 +14,7 @@ for the late-binding rule that governs every extracted module.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Tuple, Any
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Any
 from pathlib import Path
 from datetime import datetime
 import json
@@ -383,6 +383,102 @@ def _mark_task_skipped(
             file=__import__("sys").stderr,
         )
         return False
+
+
+def _supersede_prior_round_repairs(
+    plan_id: str, round_number: int, vp_ids: Iterable[str],
+) -> List[str]:
+    """Retire earlier rounds' pending repair tasks for the same VPs.
+
+    2026-10-11 (approved as 4c). A repair batch is regenerated every
+    round for the VPs that are still failing. Without this, round N's
+    row and round N+1's row for ``VP-007`` both sit in ``plan_tasks``
+    as ``pending``, and ``_get_pending_repair_tasks`` — the executor's
+    queue — returns both. Over several rounds that piles the same fix up
+    once per round for every VP still failing, so most of the queue is
+    a re-queue of work already queued.
+
+    Scope is deliberately narrow — same ``failed_vp_id``, strictly
+    earlier round, still ``pending``. A repair for a *different* VP is
+    untouched even in the same round, and a row that already ran
+    (``completed`` / ``failed``) keeps its history. We are not
+    retiring "old repair work", we are retiring duplicates of work
+    that is about to be re-queued.
+
+    Why ``skipped`` is the right terminal status here (and only here):
+
+    ``skipped`` is a terminal *success* status under
+    ``agent.is_dependency_ready`` — it unlocks downstream. That is why
+    it must never be used for a task blocked behind a failed upstream
+    (the partial-completion branch in ``routes/execution.py`` does that
+    wrongly and must not be copied; the repair path deliberately does
+    not mark those at all). It IS safe here because the superseded row
+    should stop existing: its whole purpose was "VP-007 gets fixed".
+    Anything downstream of it is waiting on *that fact*, and the round N+1
+    row we just assembled is the thing that will actually deliver it.
+    Marking the duplicate ``skipped`` therefore blocks nothing real and
+    removes a row that would otherwise re-run the identical fix.
+
+    Returns the list of task ids retired (empty on any failure).
+    """
+    targets = {str(v) for v in (vp_ids or ()) if v}
+    if not targets:
+        return []
+    try:
+        from state_machine.db.connection import open as open_db
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.plan_task_repository import (
+            PlanTaskRepository,
+        )
+        conn = open_db(_server._state_db_path())
+    except Exception:
+        return []
+    retired: List[str] = []
+    try:
+        try:
+            migrate(conn)
+        except Exception:
+            return []
+        repo = PlanTaskRepository(conn)
+        rows = conn.execute(
+            "SELECT task_id, failed_vp_id, round, status FROM plan_tasks "
+            "WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchall()
+        for task_id, failed_vp_id, row_round, status in rows:
+            if failed_vp_id not in targets:
+                continue
+            if str(status or "").lower() != "pending":
+                continue
+            # Only retire rows from a STRICTLY EARLIER round. Rows in
+            # this round (or a later one, which should not exist yet)
+            # are left alone.
+            try:
+                if row_round is None or int(row_round) >= int(round_number):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if _mark_task_skipped(
+                plan_id, str(task_id),
+                reason=f"superseded_by_round_{round_number}",
+            ):
+                retired.append(str(task_id))
+                _server.logger.info(
+                    "[repair_supersede] retired %s (vp=%s round=%s) — "
+                    "superseded by round %s",
+                    task_id, failed_vp_id, row_round, round_number,
+                )
+        return retired
+    except Exception:
+        _server.logger.exception(
+            "[repair_supersede] failed plan=%s round=%s", plan_id, round_number,
+        )
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _load_verification_runtime_state(plan_id: str) -> Optional[Dict[str, Any]]:
@@ -2128,8 +2224,56 @@ def _run_repair_execution_async(
                 state["executor_finished_cleanly"] = True
                 state["executor_returncode"] = process.returncode
                 if process.returncode == 0:
-                    state["status"] = "completed"
-                    state["stop_reason"] = None
+                    # ------------------------------------------------------------
+                    # 2026-10-11: a 0 return code means "the subprocess did
+                    # not crash", nothing more. The repair path used to read
+                    # it as "the repair round is done", which is false
+                    # whenever the executor bailed out early: ``agent.py``
+                    # hits ``No schedulable micro-layer found`` and just
+                    # ``break``s — no exception, no non-zero exit. That
+                    # wrote ``exec_status='completed'`` with
+                    # ``stop_reason IS NULL`` for a round whose repair
+                    # tasks were still ``pending`` and would never run.
+                    #
+                    # So cross-check the authoritative runtime overlay the
+                    # same way the main execution path does
+                    # (``routes/execution.py`` → ``_count_unfinished_tasks``).
+                    # That helper had exactly one caller — the main path —
+                    # and the repair path was the blind spot.
+                    # ------------------------------------------------------------
+                    _unfinished = _count_unfinished_tasks(plan_id, tasks_file)
+                    _left = int(_unfinished.get("pending_or_unstarted", 0) or 0)
+                    if _left > 0:
+                        # Accounting only. The unfinished rows stay exactly
+                        # as they are (``pending`` / ``in_progress`` /
+                        # ``failed``) — they genuinely did not run and are
+                        # genuinely not entitled to run behind a failed
+                        # upstream.
+                        #
+                        # In particular this does NOT mark them ``skipped``.
+                        # The main path's ``partial_completion`` branch does,
+                        # and copying that here would be a real weakening of
+                        # the dependency contract: ``skipped`` is a terminal
+                        # SUCCESS status that unlocks downstream under
+                        # ``agent.is_dependency_ready``, so labelling a task
+                        # "blocked behind a failed upstream" as skipped would
+                        # let its downstream start without the upstream's
+                        # output. Only the status and stop_reason are written.
+                        state["status"] = "failed"
+                        state["stop_reason"] = (
+                            f"repair_exited_with_unfinished_tasks:{_left}"
+                        )
+                        state["repair_unfinished_tasks"] = _left
+                        _server.logger.warning(
+                            "[repair_async] executor exited 0 but %d "
+                            "repair task(s) never reached a terminal "
+                            "success state plan=%s round=%s — recording "
+                            "failure instead of completion",
+                            _left, plan_id, state.get("round"),
+                        )
+                    else:
+                        state["status"] = "completed"
+                        state["stop_reason"] = None
                 else:
                     state["status"] = "failed"
                     state["stop_reason"] = "repair_non_zero_exit"
@@ -2771,6 +2915,55 @@ def _dead_end_terminal(
     _server._persist_verification_terminal(
         plan_id, final_status, reason, chain_ending=True,
     )
+
+
+#: 2026-10-11 — independent protection counter for the undrained-repair
+#: stop. Deliberately separate from ``DEFAULT_MAX_VERIFICATION_ROUNDS``
+#: (which bounds verification rounds) and from
+#: ``_MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS`` (which bounds repeats of the
+#: same VP failure). This one bounds "the post-repair callback kept
+#: refusing to re-verify" — the degenerate shape where repair never
+#: converges and the chain would otherwise be re-dispatched forever.
+_MAX_REPAIR_NOT_DRAINED_GUARDS = 3
+
+#: ``{plan_id: consecutive_undrained_repair_stops}``. Module-level rather
+#: than per-closure so a re-dispatched loop that rebuilds its own
+#: callback still shares the count.
+_repair_not_drained_guard: Dict[str, int] = {}
+
+
+def _repair_path_stop_reason(plan_id: str) -> Optional[str]:
+    """The stop reason the repair execution path recorded, or ``None``.
+
+    Returns a non-``None`` value only when the in-memory execution
+    record says the *repair* subprocess ran and the ``returncode == 0``
+    branch decided it had unfinished tasks. A main execution run, or a
+    record with no verdict yet, yields ``None`` so the caller falls
+    through to its normal behaviour.
+    """
+    try:
+        with _server._execution_state_lock:
+            state = _server._execution_state.get(plan_id) or {}
+            if state.get("_source") != "repair_execution":
+                return None
+            reason = state.get("stop_reason")
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(reason, str):
+        return None
+    return reason or None
+
+
+def _bump_repair_not_drained_guard(plan_id: str) -> int:
+    """Increment and return the consecutive undrained-repair count."""
+    hits = int(_repair_not_drained_guard.get(plan_id, 0)) + 1
+    _repair_not_drained_guard[plan_id] = hits
+    return hits
+
+
+def _clear_repair_not_drained_guard(plan_id: str) -> None:
+    """Reset the guard once the repair batch actually drained."""
+    _repair_not_drained_guard.pop(plan_id, None)
 
 
 def _repair_generation_failed(plan_id: str, error: str) -> None:
@@ -3809,6 +4002,15 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                 a real executor pass — the prior failures may
                 genuinely be fixed and we shouldn't auto-loop-stop on
                 the fresh set's first occurrence.
+
+                2026-10-11: a fourth branch, checked first — if the repair
+                path recorded ``repair_exited_with_unfinished_tasks:N``
+                and repair work is still queued, the chain stops with
+                ``loop_stopped`` instead of starting another
+                verification round. Bounded by its own
+                :data:`_MAX_REPAIR_NOT_DRAINED_GUARDS` counter, which is
+                unrelated to the round budget: this bounds "repair never
+                drains", not "too many verification rounds".
                 """
                 _server.logger.info(
                     "[Auto-Verification] Repair execution finished plan=%s "
@@ -3829,6 +4031,69 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                         return
                 except Exception:  # noqa: BLE001
                     pass
+
+                # ------------------------------------------------------------------
+                # 2026-10-11 — do not re-verify over an undrained repair batch.
+                #
+                # ``_run_repair_execution_async`` now cross-checks the runtime
+                # overlay before calling a 0 return code a completion (see the
+                # ``repair_exited_with_unfinished_tasks`` branch). This is the
+                # consumer of that fact. Previously the return code was turned
+                # into one log line and dropped, and the callback went on to
+                # ``start_verification_cycle(..., resume=True)`` no matter
+                # what — so a round whose repair executor bailed out at the
+                # first micro-layer was immediately followed by a fresh
+                # verification of code that was never repaired. Each such round
+                # re-measures the same untouched tree, so the VP it
+                # re-measures is guaranteed to fail again and buy the
+                # next one — a loop that spends its whole round budget
+                # without ever touching the defect.
+                #
+                # Two signals must agree before we stop, so a benign
+                # bookkeeping hiccup cannot strand a plan:
+                #   1. the repair path recorded an unfinished-task stop
+                #      reason, AND
+                #   2. ``_get_pending_repair_tasks`` still finds queued
+                #      repair work.
+                # ------------------------------------------------------------------
+                _repair_stop_reason = _repair_path_stop_reason(plan_id)
+                if _repair_stop_reason:
+                    _still_pending = _get_pending_repair_tasks(plan_id)
+                    if _still_pending:
+                        _guard_hits = _bump_repair_not_drained_guard(plan_id)
+                        if _guard_hits >= _MAX_REPAIR_NOT_DRAINED_GUARDS:
+                            _reason = (
+                                f"repair_never_drained:"
+                                f"{_repair_stop_reason}:"
+                                f"{_guard_hits}x"
+                            )
+                        else:
+                            _reason = (
+                                f"repair_batch_not_drained:"
+                                f"{_repair_stop_reason}:"
+                                f"{len(_still_pending)}_pending"
+                            )
+                        _server.logger.error(
+                            "[Auto-Verification] repair round did not "
+                            "drain — NOT starting the next verification "
+                            "round plan=%s: %d repair task(s) still "
+                            "pending (repair stop_reason=%s, guard hit "
+                            "%d/%d). Re-verifying now would only "
+                            "re-measure unrepaired code and buy a known "
+                            "FAIL.",
+                            plan_id, len(_still_pending),
+                            _repair_stop_reason, _guard_hits,
+                            _MAX_REPAIR_NOT_DRAINED_GUARDS,
+                        )
+                        _record_terminal("loop_stopped", _reason)
+                        return
+                    # The overlay disagrees with the reason string — the
+                    # queue is empty after all. Reset the guard and fall
+                    # through to the normal re-entry.
+                    _clear_repair_not_drained_guard(plan_id)
+                else:
+                    _clear_repair_not_drained_guard(plan_id)
+
                 try:
                     # 2026-09-12 (state machine closed-loop fix):
                     # ``executing → verification`` is the proper
