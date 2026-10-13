@@ -453,6 +453,10 @@ ACKNOWLEDGED_CALL_SITES: Dict[str, str] = {
         "fields 由 task 的运行期属性逐个 `is not None` 累积 —— 按构造即部分更新",
     "verification_loop.py::_mark_task_skipped":
         "fields={'status','failure_reason','end_ts'} —— 标记跳过",
+    "verification_loop.py::_reap_orphaned_in_progress_tasks":
+        "fields={'status'}，且只作用于当前 status='in_progress' 的行 —— "
+        "拥有者进程已死，回收为 pending。刻意不写 end_ts / failure_reason / "
+        "commit_sha / attempt：那不是判决，未完成的任务不能留下终态痕迹",
     "state_machine/repositories/_task_progress_migration.py"
     "::migrate_tasks_json_to_progress":
         "旧 task_progress JSON 一次性迁移，runtime_entry 为整行运行态",

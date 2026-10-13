@@ -833,11 +833,109 @@ def _reconcile_orphaned_verification_stages() -> None:
         _server._verification_state.pop(plan_id, None)
 
 
+#: How many task ids one ``[task_sweep]`` warning line names before it
+#: truncates. A plan with a wide fan-out of simultaneously interrupted
+#: tasks would otherwise turn a single warning into an unbounded line.
+_TASK_SWEEP_LOG_ID_LIMIT = 10
+
+
+def _reap_orphaned_in_progress_tasks(plan_id: str) -> int:
+    """Return a dead plan's orphaned ``in_progress`` tasks to ``pending``.
+
+    Who owns an ``in_progress`` row: the executor subprocess writes it
+    right before it dispatches a task. The caller has already
+    established that precisely that process is gone — either from the
+    boot-time liveness probe in ``_recover_execution_states`` or from
+    the runtime watchdog's ``_lazy_check_execution``. So every
+    ``status='in_progress'`` row still standing for this plan is
+    residue from a run that no longer has an owner.
+
+    Nothing reclaims that residue on its own: no later pass revisits
+    ``plan_tasks``, and the progress surfaces read the row directly, so
+    the plan keeps reporting "currently running ``<task>``" for as
+    long as the row stands, with no process executing anything behind
+    it.
+
+    Why ``pending`` rather than ``failed``: the two are the same thing
+    to the scheduler. ``agent._TERMINAL_TASK_STATUSES`` excludes only
+    ``completed`` / ``failed`` / ``skipped`` / ``superseded``, and
+    keeps ``in_progress`` in the DAG as a crash-recovery point — so
+    ``_load_tasks`` treats ``pending`` and ``in_progress`` alike and
+    this transition changes no scheduling behaviour at all. The only
+    thing that changes is whether the plan still claims to be running
+    a task.
+
+    ``failed`` would be the opposite of what happened. The task was
+    interrupted, never judged, and ``failed`` is terminal: it
+    permanently blocks every downstream task on a verdict nothing ever
+    reached.
+
+    Only ``in_progress`` rows are touched. Terminal rows
+    (``completed`` / ``failed`` / ``skipped`` / ``superseded``) carry
+    real verdicts and rows already ``pending`` have nothing to reclaim;
+    both are left exactly as they are.
+
+    Idempotent: a second call finds no ``in_progress`` rows and is a
+    no-op.
+
+    Never raises. This is the cleanup half of a crash-recovery funnel,
+    and a funnel that cannot fail must not be handed a way to fail —
+    the caller still owes the remaining recovery side effects.
+    Connection handling mirrors ``_get_pending_repair_tasks``: opened,
+    migrated, and closed on every path.
+    """
+    orphans: List[str] = []
+    try:
+        from state_machine.db.connection import open as open_db
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.plan_task_repository import (
+            PlanTaskRepository,
+        )
+
+        conn = open_db(_server._state_db_path())
+        try:
+            migrate(conn)
+            repo = PlanTaskRepository(conn)
+            orphans = sorted(
+                task_id
+                for task_id, entry in repo.load_all(plan_id).items()
+                if (entry or {}).get("status") == "in_progress"
+            )
+            for task_id in orphans:
+                repo.update_task(plan_id, task_id, {"status": "pending"})
+        finally:
+            conn.close()
+    except Exception:
+        # A plan whose state DB is unreadable, or one carrying a task
+        # id this repository rejects, must not stop the rest of
+        # recovery. Whatever was not reaped stays for the next pass.
+        _server.logger.warning(
+            "[task_sweep] plan=%s orphaned in_progress task sweep failed",
+            plan_id, exc_info=True,
+        )
+        return 0
+
+    if not orphans:
+        return 0
+    listed = ", ".join(orphans[:_TASK_SWEEP_LOG_ID_LIMIT])
+    if len(orphans) > _TASK_SWEEP_LOG_ID_LIMIT:
+        listed += f", +{len(orphans) - _TASK_SWEEP_LOG_ID_LIMIT} more"
+    _server.logger.warning(
+        "[task_sweep] plan=%s reaped %d orphaned in_progress task(s): %s",
+        plan_id, len(orphans), listed,
+    )
+    return len(orphans)
+
+
 def _mark_failed_dead(plan_id: str) -> None:
     """Mark an execution as failed because its process is gone.
 
     Idempotent: only acts if status is still 'running'; only transitions
-    plan_state when the current phase is not already terminal.
+    plan_state when the current phase is not already terminal. Once the
+    idempotency gate has admitted this call, the owning process is
+    known to be gone, so the plan's orphaned ``in_progress`` task rows
+    are handed back to the scheduler too (see
+    :func:`_reap_orphaned_in_progress_tasks`).
     """
     from datetime import datetime
     from state_machine.db.connection import open as open_db
@@ -865,6 +963,12 @@ def _mark_failed_dead(plan_id: str) -> None:
             persist_conn.close()
     except ExecPlanNotFoundError:
         pass
+
+    # Past this point the idempotency gate has already admitted the
+    # call, so the owner is gone and its ``in_progress`` rows are
+    # residue. Reap them before the terminal phase write so the plan
+    # stops claiming a current task even if the phase write fails.
+    _reap_orphaned_in_progress_tasks(plan_id)
 
     plan_dir = _server._plan_dir(plan_id)
     if plan_dir.exists():
