@@ -33,27 +33,21 @@ execution:
     e2e: 3600                # 1-hour cap
     full_ci: 3600            # 1-hour cap
 
-  # FALLBACK width: how many verification points one method-group runs in
-  # parallel when nothing can be measured.
+  # 2026-10-13: ``parallelism_cap`` is REMOVED, and this is the hole it
+  # left.
   #
-  # It used to be the throttle. It is not any more. The width a run
-  # actually uses is derived from the verification scene's own providers —
-  # each declared cap, scaled by how much of that provider's 5-hour window
-  # is left — using the same quota reading the dispatch path is handed, and
-  # it is re-read every time it binds rather than frozen at construction.
-  # See ``verification_agent._verification_vp_capacity`` and
-  # ``dynamic_provider_concurrency.fleet_capacity``.
+  # It was the throttle for a while, then the "fallback width" for a
+  # verification scene whose chain could not be resolved. Both roles were
+  # a number nobody could measure: the round's real concurrency is decided
+  # per dispatch by ``acquire_provider_with_dynamic_capacity``, which
+  # hands out a provider slot or does not, from the fleet as it stands at
+  # that moment — before the ``claude`` subprocess is spawned, so the pool
+  # bounds the LLM calls and the subprocesses together.
   #
-  # So this number now applies in exactly one case: the scene's chain
-  # cannot be resolved at all (CC Switch unreachable, no tier matching). It
-  # is deliberately NOT the number "0 providers available → run 4": a
-  # measured zero is a real answer from the meters and is used as one, so a
-  # fleet that is entirely shut admits nothing rather than dispatching four
-  # verification points into a window that is closed.
+  # There is consequently nothing left here to configure, and a stale
+  # ``parallelism_cap`` in this file would be read by nobody and believed
+  # by whoever opens it next.
   #
-  # Two bounds still nest, and while the scene resolves they are the *same
-  # figure*: one group gate, one plan-wide gate, both sized from the live
-  # fleet. The plan-wide layer exists so per-group fan-outs cannot multiply
-  # past the number of slots the providers actually have; see
-  # ``verification_agent._plan_wide_vp_cap`` for what it falls back to.
-  parallelism_cap: 4
+  # To change how many verification points run at once, change the
+  # provider capacity the dispatch path reads — per-provider caps and
+  # remaining 5-hour budget — not this file.

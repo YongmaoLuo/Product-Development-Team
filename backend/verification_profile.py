@@ -4,10 +4,16 @@ Execution Profile Generator
 
 Builds a static execution profile from a verification plan: total
 estimated wall-clock duration, per-method groups, per-method timeouts,
-parallelism cap, and any sub-task splits that have already been
-scheduled. Extracted out of the VerificationAgent so the projection can
-be unit-tested in isolation and reused (e.g. for the "verification
-budget" card on the bridge) without re-walking the plan.
+the concurrency a round actually reached, and any sub-task splits that
+have already been scheduled. Extracted out of the VerificationAgent so
+the projection can be unit-tested in isolation and reused (e.g. for the
+"verification budget" card on the bridge) without re-walking the plan.
+
+Note: there is no "parallelism cap" here any more (2026-10-13). The
+verification round has no framework-level width — the provider slot pool
+decides how many verification points run at once, per dispatch — so this
+module reports what a run measured rather than a number an operator
+configured.
 
 The generator is a pure value calculator: no I/O, no LLM, no
 filesystem. The only input is the plan dict (or a list of
@@ -22,7 +28,6 @@ from typing import Any, Dict, List, Mapping, Optional, Union
 
 from verification_config import (
     DEFAULT_GLOBAL_TIMEOUT_SECONDS,
-    DEFAULT_PARALLELISM_CAP,
     DEFAULT_PER_METHOD_TIMEOUT_SECONDS,
     TimeoutPolicy,
 )
@@ -33,10 +38,10 @@ class ExecutionProfileGenerator:
 
     The generator partitions the plan's verification points by
     ``verification_method`` and estimates the wall-clock duration of
-    each group as ``count * per_method_timeout`` (sequential, with the
-    parallelism cap only mattering at orchestration time). Sub-task
-    splits that have already been recorded on individual VPs (via
-    :class:`SplitDecision`) are surfaced as a flat list so the
+    each group as ``count * per_method_timeout`` (sequential; real
+    concurrency is decided at dispatch time and only ever shortens this).
+    Sub-task splits that have already been recorded on individual VPs
+    (via :class:`SplitDecision`) are surfaced as a flat list so the
     orchestrator can decide whether to schedule them.
     """
 
@@ -49,10 +54,11 @@ class ExecutionProfileGenerator:
         if timeout_policy is None:
             timeout_policy = TimeoutPolicy.defaults()
         self._timeout_policy = timeout_policy
-        # The width actually in force, when the caller knows it. ``None``
-        # is the honest default for a pure value object: the real number
-        # comes from the provider pool at dispatch time, and reading it
-        # here would make every profile build a CC Switch round-trip.
+        # The concurrency a round actually reached, when the caller
+        # measured one. ``None`` is the honest default for a pure value
+        # object: this class has no access to a run, so it reports a
+        # measurement only when handed one, and says ``None`` otherwise
+        # rather than inventing a width.
         self._vp_capacity: Optional[int] = (
             None if vp_capacity is None else max(0, int(vp_capacity))
         )
@@ -117,22 +123,28 @@ class ExecutionProfileGenerator:
           started; updated at runtime by the orchestrator.
         - ``subtask_splits`` (``list``)
         - ``per_method_timeouts`` (``dict``)
-        - ``parallelism_cap`` (``int``) — **the fallback width**, not the
-          width a run actually used. The group gate sizes itself from
-          the verification scene's providers (how many VPs the fleet can
-          serve this second, scaling with what is left of their 5-hour
-          budget) and consults this only when the scene's chain cannot be
-          resolved, so a reader taking ``parallelism_cap`` as "how many
-          verification points ran at once" would be reading the number
-          that was *not* used.
-        - ``vp_capacity_source`` (``str``) — which of the two was in
-          force: ``"provider_pool"`` or ``"parallelism_cap_fallback"``.
-          Reported so the fallback cannot pass for the real thing.
-        - ``vp_capacity`` (``int`` or ``None``) — the width in force,
-          when the caller knows it. ``None`` here means the caller did not
-          supply one, which is the normal case: this class is a pure
-          value calculator and reading the live provider pool would mean
-          a CC Switch round-trip on every profile build.
+        - ``vp_capacity_observed`` (``int`` or ``None``) — **the
+          concurrency a round actually reached**, measured inside the
+          executor at the moment items were in the runner together
+          (``BaseExecutor.peak_in_flight``) and handed in by the caller.
+          ``None`` when no round has run, or when the caller could not
+          measure one — which is the normal case here, since this class
+          is a pure value calculator with no access to a run.
+
+          This field used to publish a *declared* width alongside
+          ``parallelism_cap`` as its fallback. Both are gone (2026-10-13):
+          the verification round no longer carries a width at all, so a
+          declared one would be a number describing a constraint that
+          does not exist. What is left is a measurement of a run that
+          happened, which cannot be wrong about a round it did not
+          observe — and ``None`` says exactly that.
+        - ``vp_capacity_source`` (``str``) — always ``"provider_pool"``.
+          The provider slot pool is the only thing that bounds a
+          verification round, and it decides per dispatch rather than
+          being configured. Retained as an explicit field so a consumer
+          that branches on it keeps working, and so the answer to "what
+          set the width" is stated in the payload instead of inferred
+          from an absent key.
         """
         group_list = [dict(g) for g in self._group_profiles]
         return {
@@ -142,13 +154,8 @@ class ExecutionProfileGenerator:
             "current_group_index": 0,
             "subtask_splits": [dict(s) for s in self._subtask_splits],
             "per_method_timeouts": dict(self._effective_per_method_timeouts()),
-            "parallelism_cap": int(self._timeout_policy.parallelism_cap),
-            "vp_capacity_source": (
-                "provider_pool"
-                if self._vp_capacity is not None
-                else "parallelism_cap_fallback"
-            ),
-            "vp_capacity": self._vp_capacity,
+            "vp_capacity_source": "provider_pool",
+            "vp_capacity_observed": self._vp_capacity,
         }
 
     # ------------------------------------------------------------------

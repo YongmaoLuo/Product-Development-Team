@@ -645,26 +645,41 @@ class _GatedWatchdog(_CountingWatchdog):
 
 
 class TestTheDeclaredCapIsTheFallbackNotTheCeiling:
-    def test_the_typed_cap_is_not_the_source_of_the_width(
+    def test_there_is_no_typed_width_left_to_be_the_source_of_one(
         self, capacities, scene, _quota_reader,
     ):
-        """The number the order was about, stated as an absence.
+        """The number the order was about, now as a total absence.
 
-        ``parallelism_cap`` is still four, the file still says four, and
-        the width is twenty. If this test ever has to be deleted because
-        the figure changed, the change that made it necessary is the one
-        worth reading.
+        This test previously asserted that ``parallelism_cap`` was still
+        four *and* that the width was not four — i.e. that a typed number
+        existed and was being overruled. The second half is the goal; the
+        first half was the thing to remove, and it is gone: there is no
+        width in the config layer to be overruled, overruled-into-4, or
+        mistaken for a fleet reading.
+
+        So the shape of the claim inverts. Before, "not four" proved the
+        derived number won. Now the *only* way to get a typed width back
+        is for it to exist, so the test pins the non-existence directly:
+        an assertion that can only fail if someone re-adds the number.
         """
+        import verification_config
         from verification_config import TimeoutPolicy
 
-        assert TimeoutPolicy.defaults().parallelism_cap == 4
+        assert not hasattr(TimeoutPolicy.defaults(), "parallelism_cap"), (
+            "a typed width is back on TimeoutPolicy"
+        )
+        assert not hasattr(verification_config, "DEFAULT_PARALLELISM_CAP"), (
+            "a typed width is back on verification_config"
+        )
 
+        # And the derivation still works -- it is the *only* width source
+        # left, so "it still reads twenty" is no longer enough on its own.
         scene(TWO)
         _quota_reader["map"] = {
             "Vendor A": _open("Vendor A"),
             "Vendor B": _open("Vendor B"),
         }
-        assert _verification_vp_capacity() != 4
+        assert _verification_vp_capacity() == CAP_OF_A + CAP_OF_B
 
     def test_the_plan_wide_bound_reads_the_same_number_while_the_scene_resolves(
         self, capacities, scene, _quota_reader,
@@ -740,14 +755,23 @@ class TestTheDeclaredCapIsTheFallbackNotTheCeiling:
 
 
 class TestTheProfileReportsTheWidthThatWasUsed:
-    def test_the_fallback_is_labelled_as_the_fallback(self):
-        """A field nobody can tell the truth of is worse than none.
+    def test_the_profile_publishes_no_fallback_because_there_is_none(self):
+        """An absent key cannot be misread; a labelled one could be.
 
-        ``parallelism_cap`` is still in the payload — a consumer reads it
-        — and it is still four. What changed is what it *means*: it is
-        the width used when nothing was derivable, and the payload now
-        says so rather than letting a reader take four for the width a
-        twenty-slot run actually used.
+        The payload used to carry ``parallelism_cap: 4`` *and* a
+        ``vp_capacity_source`` that said ``parallelism_cap_fallback``, so
+        that a reader taking four for a twenty-slot run would at least have
+        had to have ignored the label next to it. Labelling was the best
+        available answer while a fallback existed.
+
+        It no longer does. ``acquire_provider_with_dynamic_capacity`` is
+        the only thing that bounds the round, so there is exactly one
+        source and it is never conditional — which makes the label
+        redundant and the key a liability: an integer sitting in a profile
+        is read as *the* width by anything that does not know the history.
+        So both keys are asserted absent, which is a stronger claim than
+        "present and labelled": a key that is not there cannot be
+        mislabelled by a future edit either.
         """
         from verification_profile import ExecutionProfileGenerator
         from verification_config import TimeoutPolicy
@@ -755,60 +779,99 @@ class TestTheProfileReportsTheWidthThatWasUsed:
         unlabelled = ExecutionProfileGenerator(
             None, TimeoutPolicy.defaults()
         ).build()
-        assert unlabelled["parallelism_cap"] == 4
-        assert unlabelled["vp_capacity"] is None
-        assert unlabelled["vp_capacity_source"] == "parallelism_cap_fallback"
+        assert "parallelism_cap" not in unlabelled
+        assert "vp_capacity" not in unlabelled, (
+            "the measurement is published under its own name; the old key "
+            "would read as a declared width"
+        )
+        assert unlabelled["vp_capacity_source"] == "provider_pool"
+        assert unlabelled["vp_capacity_observed"] is None
 
         labelled = ExecutionProfileGenerator(
             None, TimeoutPolicy.defaults(), vp_capacity=20
         ).build()
-        assert labelled["vp_capacity"] == 20
+        assert labelled["vp_capacity_observed"] == 20
         assert labelled["vp_capacity_source"] == "provider_pool"
 
-    def test_the_agent_supplies_the_live_number_and_survives_not_getting_one(
+    def test_the_agent_supplies_the_measured_number_and_says_none_before_a_round(
         self, monkeypatch,
     ):
-        """The wiring, and the degradation.
+        """The wiring, and the degradation -- re-pointed at the measurement.
 
-        The generator is a pure value calculator — reading the live pool
-        inside it would make every profile build a CC Switch round-trip —
-        so the live number is supplied by the agent. And a resolver that
-        raises must not take the profile down with it: the run is more
-        important than the card describing it.
+        This previously pinned ``_live_vp_capacity``: that the agent could
+        ask the pool what it *would* admit, before the round, and that a
+        resolver which raises must not take the profile down with it.
+
+        Both halves belong to a model that is gone. There is no pre-round
+        derivation to ask (nothing derives a width before the round runs),
+        and the resolver is not consulted at all any more, so it can no
+        longer raise on this path. What replaces them:
+
+        * the number comes from the round that ran
+          (``BaseExecutor.peak_in_flight``), so before any round has run
+          the honest answer is ``None`` rather than a pre-flight guess;
+        * and because the report no longer calls the resolver, a resolver
+          that raises is inert — the profile is built from a measurement
+          or from nothing, never from a read that can fail.
+
+        The generator stays a pure value calculator for the same reason it
+        was one before: reading the pool inside it would make every
+        profile build a CC Switch round-trip.
         """
         from verification_config import TimeoutPolicy
         from verification_profile import ExecutionProfileGenerator
+        import verification_agent
 
-        assert _agent_live_capacity(lambda: 20) == 20
-        assert _agent_live_capacity(lambda: None) is None
-        assert _agent_live_capacity(_boom) is None
+        assert not hasattr(verification_agent.Orchestrator, "_live_vp_capacity"), (
+            "a pre-round derivation is back; nothing should be able to "
+            "answer 'how wide will this be' any more"
+        )
 
-        # And the fallback still builds a usable profile.
+        # Before a round: no width, and no resolver call to fail.
+        assert _stand_in(lambda: 20)._report_vp_capacity() is None
+        assert _stand_in(_boom)._report_vp_capacity() is None
+
+        # After one: the measurement, supplied by the caller.
+        stand_in = _stand_in(lambda: 20)
+        stand_in._note_vp_capacity(20)
+        assert stand_in._report_vp_capacity() == 20
+
+        # And a profile with nothing to report still builds.
         profile = ExecutionProfileGenerator(
             None, TimeoutPolicy.defaults(), vp_capacity=None
         ).build()
-        assert profile["vp_capacity_source"] == "parallelism_cap_fallback"
+        assert profile["vp_capacity_source"] == "provider_pool"
+        assert profile["vp_capacity_observed"] is None
 
 
 class TestTheReportQuotesTheWidthThatBound:
     """A report must not describe a round with a number it did not use.
 
-    Three build sites write ``execution_profile``, and only one of them
-    runs *before* the round. The two that run after it cannot re-derive
-    the width without either costing a CC Switch read to describe a run
-    that is already over, or answering a different question — what the
-    fleet looks like *now* — while the field's name says what the run
-    *did*. So the gate's own reading is remembered and published.
+    Three build sites write ``execution_profile``, and two of them run
+    after the round. Neither can re-derive the width without either
+    costing a CC Switch read to describe a run that is already over, or
+    answering a different question — what the fleet looks like *now* —
+    while the field's name says what the run *did*. So what the round
+    measured is remembered and published.
+
+    What is measured, and when, both changed. The number is no longer the
+    width a gate *bound at* (there is no gate) but the peak the executor
+    reached, and it does not exist before the round at all — which is why
+    the first case below used to read a stand-in and now reads ``None``.
     """
 
-    def test_the_width_a_gate_bound_is_what_a_later_report_publishes(self):
-        # Nothing has bound yet — before the round starts, or on a plan
-        # with no groups — so the live reading stands in. That is a real
-        # answer rather than a placeholder, and it is the same one the
-        # gate would have used.
+    def test_a_report_describes_the_round_that_ran_not_the_fleet_left_behind(self):
+        # Before the round there is nothing to describe, so the report
+        # quotes nothing. Previously this read 20 here: a pre-flight
+        # stand-in for a gate that was about to be built, published by a
+        # report for a round that had not started.
         stand_in = _stand_in(lambda: 20)
-        assert stand_in._report_vp_capacity() == 20
+        assert stand_in._report_vp_capacity() is None, (
+            "a report published before any round has run quoted a width "
+            "for a round that did not happen"
+        )
 
+        # The round runs and reports what it reached.
         stand_in._note_vp_capacity(20)
         assert stand_in._report_vp_capacity() == 20
 
@@ -824,6 +887,10 @@ class TestTheReportQuotesTheWidthThatBound:
 
         Recording it would publish ``vp_capacity: null`` with
         ``source: provider_pool``, which is the opposite of what it says.
+
+        (Assertion unchanged from before the width ceiling was removed --
+        the rule about ``None`` outlived the model that needed it, and this
+        test is why. Only the helper below had to change.)
         """
         stand_in = _stand_in(lambda: None)
         stand_in._note_vp_capacity(None)
@@ -831,36 +898,58 @@ class TestTheReportQuotesTheWidthThatBound:
         assert stand_in._report_vp_capacity() is None
 
     def test_zero_is_recorded_because_zero_is_a_width(self):
-        """The case a truthiness check would drop.
+        """The case a truthfulness check would drop.
 
         A round that ran on a fleet which reported nothing serving is a
         round that happened at zero, and the report has to be able to
         say so — otherwise it falls through to "nothing was derivable"
         and labels a measured closure as an unmeasured one.
+
+        (Assertion unchanged, and still reachable: ``peak_in_flight`` is 0
+        for a round whose VPs were all still waiting on a provider slot
+        when the executor unwound, and that is a fact about the round
+        rather than an absence of one. The writer is ``if peak is not
+        None`` -- exactly this test's shape, which is why a truthiness
+        check would be a regression nobody would notice until a report
+        silently stopped being able to say "nothing ran".)
         """
         stand_in = _stand_in(lambda: None)
         stand_in._note_vp_capacity(0)
         assert stand_in._last_vp_capacity == 0
         assert stand_in._report_vp_capacity() == 0
 
-    def test_the_report_falls_back_to_the_live_width_when_none_bound(self):
-        """A report built without a round — the minimal/fallback paths."""
+    def test_a_report_built_without_a_round_quotes_no_width(self):
+        """A report built without a round -- the minimal/fallback paths.
+
+        This previously fell back to a live reading and quoted 7. That
+        answered a *different question* under a field named for the run:
+        the report was describing the fleet rather than the round, for the
+        two build sites that run after the round and would have paid a CC
+        Switch read to do it.
+        """
         stand_in = _stand_in(lambda: 7)
-        assert stand_in._report_vp_capacity() == 7
+        assert stand_in._report_vp_capacity() is None, (
+            "the report quoted a live fleet reading for a round that never "
+            "ran"
+        )
 
 
 def _stand_in(resolver):
     """The agent's width methods, bound to a stand-in.
 
     Constructing the real orchestrator needs a plan directory, a
-    persistence manager and a log — none of which these questions are
+    persistence manager and a log -- none of which these questions are
     about. Both methods are pure over the resolver and the remembered
     width, so they are read off the class and called against one.
+
+    ``resolver`` is still bound because ``_report_vp_capacity`` has to be
+    able to prove it does *not* consult it: the tests above change the
+    resolver and assert the answer does not move.
     """
     stand_in = type("_StandIn", (), {})()
     stand_in.vp_capacity_resolver = resolver
     stand_in._last_vp_capacity = None
-    for name in ("_live_vp_capacity", "_note_vp_capacity", "_report_vp_capacity"):
+    for name in ("_note_vp_capacity", "_report_vp_capacity"):
         setattr(stand_in, name, getattr(verification_agent.Orchestrator, name).__get__(stand_in))
     return stand_in
 
@@ -869,47 +958,60 @@ def _boom():
     raise RuntimeError("provider surface is unavailable")
 
 
-def _agent_live_capacity(resolver):
-    """Read ``agent._live_vp_capacity`` off a stand-in, without a plan dir.
-
-    Constructing the real orchestrator needs a plan directory, a
-    persistence manager and a log — none of which the question is about.
-    The method is pure over ``vp_capacity_resolver``, so it is bound to
-    the class and called against a stand-in.
-    """
-    return _stand_in(resolver)._live_vp_capacity()
-
-
 # ---------------------------------------------------------------------------
 # The hardcoded figure, read from where it is written
 # ---------------------------------------------------------------------------
 
 
-def test_parallelism_cap_is_still_there_and_still_the_fallback():
-    """Stated against the config, so its meaning is written down.
+def test_parallelism_cap_is_gone_from_the_yaml_and_the_config():
+    """The inverse of what this used to assert, and deliberately so.
 
-    Deleting the key would have been the easy version of this change, and
+    This test previously pinned the *opposite* claim: that
+    ``parallelism_cap:`` is still in ``verification.yaml`` with a comment
+    saying it is the fallback, and it said so as a considered position --
+    "Deleting the key would have been the easy version of this change, and
     it would have deleted the operator's only throttle for the case where
-    nothing is derivable — a verification scene whose chain will not
-    resolve. The key stays; what it means changes, and this is where that
-    is recorded.
+    nothing is derivable."
+
+    That reasoning was sound *under a model that still had a number to
+    fall back to*. The dispatch path never needed one:
+    ``acquire_provider_with_dynamic_capacity`` either hands out a slot or
+    returns ``None``, and an unresolvable chain is a routing failure it
+    already reports by name rather than a width problem. So the fallback
+    had no case left to serve, and keeping it meant keeping a number that
+    was read by nobody and believed by whoever opened the file next.
+
+    So the claim inverts. What this measures now is that the number is
+    absent from every layer that used to carry it -- the YAML, the config
+    object, the module -- and that the hole it left is documented, because
+    an unexplained gap in a config file is how the next person ends up
+    re-adding it. Absence is the stronger assertion too: a number that is
+    not there cannot drift out of sync with anything.
     """
     import verification_config
+    from verification_config import TimeoutPolicy
 
     yaml_path = Path(verification_config.__file__).parent / "configs" / "verification.yaml"
     text = yaml_path.read_text(encoding="utf-8")
 
-    assert "parallelism_cap" in text, (
-        "the fallback width must remain configurable"
-    )
-    key = text.find("parallelism_cap:")
-    assert key != -1, "the fallback width must remain configurable"
+    # Checked against the *parsed* document, not the raw text: the comment
+    # standing where the key was names ``parallelism_cap`` on purpose, to
+    # explain the hole. A substring search would fail that on principle.
+    import yaml
 
-    beside = text[:key].rsplit("\n\n", 1)[-1].lower()
-    assert "fallback" in beside, (
-        "the comment beside parallelism_cap must say what it is now the "
-        "fallback for; a key whose comment still calls itself the "
-        "throttle is the number this change was asked to remove, "
-        f"re-described. Beside the key:\n{beside[-600:]}"
+    document = yaml.safe_load(text) or {}
+    assert "parallelism_cap" not in document.get("execution", {}), (
+        "a width this project no longer has is still a live key in "
+        f"verification.yaml; it would be read by nobody and believed by "
+        f"whoever opens it next. Parsed execution block: "
+        f"{document.get('execution')}"
     )
-    assert "derived" in beside, "and it must say where the real width comes from"
+    assert not hasattr(TimeoutPolicy.defaults(), "parallelism_cap")
+    assert not hasattr(verification_config, "DEFAULT_PARALLELISM_CAP")
+
+    # The hole is explained where it is, so nobody re-adds the key to
+    # "fix" what reads like an oversight.
+    assert "provider_pool" in text or "acquire_provider_with_dynamic_capacity" in text, (
+        "the comment standing where the key was must say what decides "
+        f"concurrency now. Current text:\n{text}"
+    )

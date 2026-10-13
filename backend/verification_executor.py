@@ -184,8 +184,9 @@ class VerificationExecutor(BaseExecutor):
       * ``sub_agent_runner`` — async callable ``(vp_node) -> verdict_dict``.
         The base class's run loop awaits it behind a concurrency gate
         (see :meth:`run`) — a fixed-width semaphore when the caller
-        passes no ``gate``, and a live one that re-reads its width on
-        every bind on the production verification path.
+        passes a positive ``max_parallel`` and no ``gate``, and no gate
+        at all when the caller passes ``max_parallel=0``, which is what
+        the production verification path does.
 
     The class is intentionally stateless across instances: every
     mutation goes through :meth:`_save_state`, so two processes
@@ -469,16 +470,25 @@ class VerificationExecutor(BaseExecutor):
         progress state-file is written.
 
         Args:
-            max_parallel: Fixed fallback width, used only when no
-                ``gate`` is supplied. The verification path always
-                supplies one — a width that describes the live provider
-                fleet beats a number an operator typed — so this is
-                what remains for a caller driving the executor directly.
+            max_parallel: Fixed width for the gather, used only when no
+                ``gate`` is supplied. **The production caller passes
+                ``0``** — unbounded — see
+                :meth:`verification_agent.Orchestrator.run_full_verification`.
+                The default of ``1`` is *serial*, not "unset", so a caller
+                that omits the argument gets a run one verification point
+                at a time. What actually bounds a verification round is
+                the provider slot pool, which hands out a slot per
+                dispatch; this argument is what that pool does *not* have
+                to fight with.
             gate: Concurrency gate (``await acquire()`` / ``release()``)
                 whose width is re-read on every bind. The production
-                caller is :meth:`verification_agent.Orchestrator.run_full_verification`,
-                which builds one from ``_VpCapacityGate`` sized by the
-                verification scene's live provider capacity.
+                caller passes neither, so this is the generic hook rather
+                than something the round uses.
+
+        After the run, :attr:`~base_executor.BaseExecutor.peak_in_flight`
+        is the concurrency the round actually reached — measured inside
+        the executor, and the only honest width report now that no width
+        is declared.
         """
         await super().run(max_parallel=max_parallel, gate=gate)
         # After super().run() returns, BaseExecutor has set

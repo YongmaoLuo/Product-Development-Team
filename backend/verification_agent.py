@@ -158,8 +158,17 @@ def _verification_vp_capacity(
     is a configuration failure the dispatch path already reports loudly
     (``SceneProviderUnavailable``), so it must not also be turned into a
     gate that admits nobody: a misrouted scene then hangs the plan
-    silently instead of failing with the reason. The caller's own
-    ``parallelism_cap`` applies in that case, as it always did.
+    silently instead of failing with the reason.
+
+    Scope note (2026-10-13): the live verification round no longer calls
+    this. ``run_full_verification`` builds no width at all — the provider
+    slot pool decides per dispatch — so nothing derives a total to be a
+    ceiling. What remains here serves the legacy per-group path
+    (:meth:`Orchestrator.execute_verification_plan_async` →
+    :meth:`Orchestrator._execute_group`), which is production-dead but
+    still exercised by tests and e2e. Deleting that path was out of
+    scope; deleting this reader with it would have taken the tests with
+    it.
 
     Every read degrades rather than raises — an unreadable quota payload
     leaves every provider selectable (fail-open, the dispatch path's own
@@ -200,6 +209,16 @@ def _verification_vp_capacity(
 
 class _VpCapacityGate:
     """A bound whose width is read from somewhere live, every time it binds.
+
+    .. warning::
+       **Not used by the live verification round** (2026-10-13). The live
+       round builds no width and no gate: ``run_full_verification`` calls
+       ``executor.run(max_parallel=0)`` and lets
+       :func:`dynamic_provider_concurrency.acquire_provider_with_dynamic_capacity`
+       decide per dispatch. This class survives only for the legacy
+       per-group path (:meth:`Orchestrator._execute_group`), which is
+       production-dead but still exercised by tests and e2e; deleting
+       that path was out of scope for this change.
 
     ``asyncio.Semaphore`` takes its width once, at construction, and
     holds it for the life of the run. That is the right shape for a
@@ -362,23 +381,26 @@ def _plan_wide_vp_cap() -> Optional[int]:
     under-counts a provider nobody wrote a rule for, so it is not the
     fleet the dispatch path will actually use.
 
-    So it is now the fallback, and only that. While a bound is derivable
-    from the live scene (:func:`_verification_vp_capacity`) that number
-    is both the plan's width and each group's — the same figure at two
-    layers, which is what keeps the plan bound from becoming the new
-    ceiling the per-group one just stopped being. This function answers
-    for the case where nothing is derivable: the chain could not be
-    resolved, so the declared capacity is the only fleet size on record.
+    So it is the fallback, and only that, on the legacy per-group path.
+    While a bound is derivable from the live scene
+    (:func:`_verification_vp_capacity`) that number is both the plan's
+    width and each group's — the same figure at two layers, which is
+    what keeps the plan bound from becoming the new ceiling the
+    per-group one just stopped being. This function answers for the case
+    where nothing is derivable: the chain could not be resolved, so the
+    declared capacity is the only fleet size on record.
 
     ``None`` when no capacity is configured either. Then there is no
     declared fleet size at all, and inventing one would put the same
-    kind of hand-written number back — the operator's own
-    ``parallelism_cap`` is the only throttle that exists, and it applies.
+    kind of hand-written number back — so the gate it feeds admits
+    everyone, and the provider slot pool is what bounds the run. That is
+    the same answer the live round gives unconditionally.
 
-    An operator who sets ``parallelism_cap`` still gets exactly the
-    throttle they asked for in that case (pinned by
-    ``test_orchestrator_respects_parallelism_cap_2``); what they no
-    longer get is a fleet smaller than their providers can serve.
+    2026-10-13: the operator's own ``parallelism_cap`` used to stand
+    behind this one as a second fallback. It is gone, so an unresolvable
+    chain on this legacy path now falls through to ``None`` (unbounded)
+    rather than to a typed-in four. The live round was unaffected either
+    way — it consults no width at all.
     """
     ceiling = provider_capacity.configured_capacity_ceiling()
     return ceiling if ceiling > 0 else None
@@ -540,10 +562,14 @@ class Orchestrator:
                 answer, which the fallback path has to be exercised
                 against.
 
-                **This is the round's width.** There is no ``max_parallel``
-                argument any more, and deliberately so: it was the one
-                thing two construction sites could disagree about, and
-                they did (see :meth:`_build_vp_capacity_gate`).
+                **Legacy-path width only (2026-10-13).** The live round
+                does not read this: :meth:`run_full_verification` builds
+                no width at all, because the provider slot pool decides
+                per dispatch. This resolver feeds the gate on the
+                production-dead per-group path
+                (:meth:`execute_verification_plan_async` →
+                :meth:`_execute_group`), which tests and e2e still drive.
+                It is retained for that path rather than deleted with it.
         """
         self.plan_dir = Path(plan_dir)
         self.project_dir = Path(project_dir)
@@ -551,10 +577,11 @@ class Orchestrator:
         self.vp_capacity_resolver = (
             vp_capacity_resolver or _verification_vp_capacity
         )
-        # The width a gate in this round actually bound at. ``None`` until
-        # one does, and the report paths use it rather than re-deriving,
-        # so a report cannot claim the fallback was in force for a round
-        # that ran on the fleet.
+        # The concurrency the last round actually reached — measured, not
+        # declared (see :meth:`_note_vp_capacity`). ``None`` until a
+        # round has run; the report paths publish it as-is rather than
+        # deriving something, so a report cannot describe a round with a
+        # number the round never had.
         self._last_vp_capacity: Optional[int] = None
         # Task-11 subagent callback chain: when set, the executor's
         # verdict recording path writes via VerificationRepository
@@ -673,95 +700,41 @@ class Orchestrator:
         #: :meth:`generate_verification_plan` 填充，供审计/展示读取。
         self._last_phase_summary: Dict[str, Any] = {}
 
-    def _live_vp_capacity(self) -> Optional[int]:
-        """The width a run would actually use, or ``None`` if unknowable.
+    def _note_vp_capacity(self, peak: Optional[int]) -> None:
+        """Record the concurrency the round reached, for the report to quote.
 
-        Read through the injected resolver rather than from
-        :mod:`dynamic_provider_concurrency` directly so a test can pin
-        the declared/fallback path without touching the machine's real
-        provider pool — see
-        ``tests/unit/test_verification_derived_vp_capacity.py``.
+        **Measured, not declared.** The round carries no width any more,
+        so there is nothing to note *before* it and nothing to derive
+        during it: the provider slot pool decides, per dispatch, how many
+        verification points may be in flight
+        (:func:`dynamic_provider_concurrency.acquire_provider_with_dynamic_capacity`).
+        What the round actually reached is
+        :attr:`base_executor.BaseExecutor.peak_in_flight` — items inside
+        the runner at the same moment — and that is what this records.
 
-        The read is guarded because this is called from report-building
-        paths that must never fail on a provider-surface problem: the
-        question is "what will the group gate use", and an unanswerable
-        question already has an answer (``None``) that the profile knows
-        how to report as ``parallelism_cap_fallback``.
+        The alternative was to re-read the live pool at report time, and
+        it is wrong twice over: it costs a CC Switch round-trip to
+        describe a run that is already over, and it answers a *different*
+        question — what the fleet looks like now — while claiming to
+        describe what the run did. A measured peak cannot have that
+        problem, because it is not a claim about anything but the past.
+
+        ``None`` means "nothing measured" and is never recorded: a report
+        built before the round (or on a plan with nothing to run) has no
+        peak, and publishing a number there would be inventing one.
         """
-        try:
-            return self.vp_capacity_resolver()
-        except Exception:  # noqa: BLE001 — reporting must not break a run
-            return None
-
-    def _note_vp_capacity(self, width: Optional[int]) -> None:
-        """Record the width a gate bound at, for the report to quote.
-
-        Kept rather than re-derived. A report built after the round has
-        finished asking the live provider pool would (a) cost a CC Switch
-        read to describe a run that is already over and (b) answer a
-        *different* question — what the fleet looks like now — while
-        claiming to describe what the run did. The number the gate
-        actually bound is the one the profile is for.
-
-        ``None`` is never recorded: "nothing was derivable" and "nothing
-        has bound yet" are the same answer to every reader here, and
-        neither is a width.
-        """
-        if width is not None:
-            self._last_vp_capacity = int(width)
+        if peak is not None:
+            self._last_vp_capacity = int(peak)
 
     def _report_vp_capacity(self) -> Optional[int]:
-        """The width to publish: what bound, or the live one if none did."""
-        if self._last_vp_capacity is not None:
-            return self._last_vp_capacity
-        return self._live_vp_capacity()
+        """The concurrency to publish: what the round measured, else ``None``.
 
-    def _build_vp_capacity_gate(self) -> "_VpCapacityGate":
-        """The width this round runs at, as a gate that re-reads it.
-
-        The live verification path's answer to "how many VPs at once",
-        and the reason the round's width is no longer an ``int`` that
-        two call sites can disagree about. It used to be: the auto loop
-        resolved one (``_resolve_max_parallel`` → 5) and the post-repair
-        re-entry took a class default of ``1``, so the same plan ran its
-        repair round a fifth as wide as its first round — 87ms apart on
-        the same machine, same providers, same plan. Nothing about the
-        second round's work was smaller; only the number that reached it
-        was.
-
-        So the width is derived here, once, by every caller, and read
-        fresh at each bind by :class:`_VpCapacityGate` — including the
-        three seconds into a round where a provider's 5-hour window has
-        closed and the fleet it can serve has shrunk.
-
-        Two readers, in the order :class:`_VpCapacityGate` tries them:
-
-          * :attr:`vp_capacity_resolver` — the live scene. This is the
-            width whenever the verification chain resolves at all.
-          * ``parallelism_cap`` — the operator's declared fallback,
-            reached only when nothing is derivable (CC Switch
-            unreachable, no tier matching, no live provider rows).
-            ``max(1, ...)`` because a declared cap of ``0`` must not
-            become a gate that admits nobody: the scene's own answer to
-            "every provider shut" is ``0`` and that is a deliberate
-            reading of the meters, but a *fallback* of ``0`` would be a
-            config typo silently parking the whole plan.
-
-        Mirrors the group gate :meth:`_execute_group` builds, on purpose:
-        one rule for "how wide", two call sites that cannot drift.
+        No live fallback. The old one answered "what would the gate use
+        if a round started now", which was a width; this field is a
+        measurement of a round that happened. Substituting one for the
+        other would put the old lie back under a new name.
         """
-        gate = _VpCapacityGate(
-            self.vp_capacity_resolver,
-            lambda: max(1, int(self.timeout_policy.parallelism_cap)),
-        )
-        # Record what this round is sized from, so the profile can
-        # report the width that actually ran instead of the declared
-        # cap that did not. Called once, here, because that is the
-        # decision the report is describing — the gate then re-reads
-        # itself during the round without re-opening the question of
-        # which policy was in force.
-        self._note_vp_capacity(gate.capacity())
-        return gate
+        return self._last_vp_capacity
 
     def _normalize_service_declarations(self, plan_data: dict) -> dict:
         """Parse + validate the plan's ``services`` block and annotate
@@ -1664,15 +1637,17 @@ class Orchestrator:
         # Build a vp_id → group_index map by walking the profile's
         # group_profiles (which preserves first-seen method order).
         #
-        # The live width rides along so the profile does not report
-        # ``parallelism_cap`` as if it were the number that ran. This is
-        # the only place the value object is allowed to see it — it is
-        # otherwise pure, and the round-trip belongs to the caller that
-        # is about to dispatch.
+        # No capacity rides along, and this is the whole story now: the
+        # round has no width to declare, so the value object is not told
+        # one. It used to be handed ``self._live_vp_capacity()`` here —
+        # a live read whose only purpose was to stop the profile
+        # publishing some other number as if it were the width, and with
+        # ``parallelism_cap`` gone there is no other number left to
+        # contradict. Passing nothing also saves a CC Switch round-trip
+        # on a path that only needs group indices.
         profile = ExecutionProfileGenerator(
             plan_data,
             timeout_policy=self.timeout_policy,
-            vp_capacity=self._live_vp_capacity(),
         ).build()
         vp_to_group_index: Dict[str, int] = {}
         for group_index, group in enumerate(profile.get("group_profiles", []) or []):
@@ -1946,7 +1921,8 @@ class Orchestrator:
         so existing call-sites (and tests) that treat verification as a
         blocking step keep working unchanged. The async version is the
         canonical implementation that groups VPs by method and runs
-        each group concurrently under a ``parallelism_cap`` semaphore.
+        each group concurrently behind a gate sized from the live
+        provider fleet.
 
         As with :meth:`_execute_verification_point`, when this method
         is called from inside a running event loop (under
@@ -1973,6 +1949,15 @@ class Orchestrator:
     ) -> dict:
         """Async version of :meth:`execute_verification_plan`.
 
+        .. warning::
+           **Legacy path — not the live verification round.** The live
+           round is :meth:`run_full_verification`, which goes through
+           :class:`VerificationExecutor` and builds no width at all
+           (2026-10-13). This method is kept because tests and e2e still
+           drive it, and deleting it was not in scope. It retains a
+           gate-based bound, so its width semantics are *not* the live
+           round's.
+
         Pipeline:
 
         1. Load the plan (or use the one passed in).
@@ -1986,9 +1971,9 @@ class Orchestrator:
            re-read every time either binds: the plan-wide one and each
            group's own. Both come from the verification scene's
            providers — how many VPs the fleet can actually serve this
-           second — and both fall back to the configured
-           ``parallelism_cap`` only when that scene cannot be resolved at
-           all (:func:`_verification_vp_capacity`).
+           second — and both fall back to the declared fleet ceiling
+           only when that scene cannot be resolved at all
+           (:func:`_verification_vp_capacity`).
         5. :meth:`_execute_group` emits a ``group_started`` and
            ``group_completed`` event on the persistence log so
            downstream observers (the JSONL log parser, the
@@ -2057,10 +2042,10 @@ class Orchestrator:
             # declared ceiling underneath it would have held it to
             # whatever the operator happened to have written in
             # ``provider_capacity.yaml`` instead. When the scene cannot
-            # be resolved, both fall back: the plan to the declared
-            # ceiling and each group to ``parallelism_cap``, as before.
+            # be resolved, both fall back to that declared ceiling
+            # (``parallelism_cap``, the per-group fallback until
+            # 2026-10-13, is gone).
             plan_gate = _plan_wide_bound(self.vp_capacity_resolver)
-            self._note_vp_capacity(plan_gate.capacity())
             coros = [
                 self._execute_group(method, vps, plan_gate)
                 for method, vps in non_manual_groups
@@ -2457,18 +2442,26 @@ class Orchestrator:
             plan_gate = _plan_wide_bound(self.vp_capacity_resolver)
 
         # Two bounds, and they say the same thing whenever the scene can
-        # be resolved. The group's own is the one an operator used to be
-        # typing into ``parallelism_cap``; it is now the *fallback*, used
-        # only when the verification scene's chain cannot be resolved and
-        # so nothing is derivable. The plan bound is the fleet ceiling:
-        # a running VP is mostly a ``claude`` subprocess, so letting the
-        # per-group caps multiply past it just parks coroutines in the
-        # provider slot wait.
-        group_gate = _VpCapacityGate(
-            self.vp_capacity_resolver,
-            lambda: max(1, int(self.timeout_policy.parallelism_cap)),
-        )
-        self._note_vp_capacity(group_gate.capacity())
+        # be resolved. The group's own reader is the live scene with the
+        # declared fleet ceiling behind it — the same pair
+        # :func:`_plan_wide_bound` uses. Its fallback used to be
+        # ``parallelism_cap``, an operator-typed number kept alive
+        # precisely for a chain that cannot be resolved; that number is
+        # gone (2026-10-13), and the declared ceiling is what is left to
+        # stand behind an unresolvable chain.
+        #
+        # NOTE: this is the legacy per-group path, not the live round.
+        # ``run_full_verification`` builds no gate at all — see there.
+        # This survives because :meth:`execute_verification_plan_async`
+        # and :meth:`execute_phase2_parallel` still call it, and deleting
+        # that path is not this change's business. It is production-dead
+        # (no production caller reaches either of those two methods).
+        group_gate = _plan_wide_bound(self.vp_capacity_resolver)
+        # No ``_note_vp_capacity`` here, unlike the live path. That field
+        # is a *measurement* of a round that ran; a gate's configured
+        # width is not one, and recording it would publish a derived
+        # number under a name that promises an observed one.
+        _ = group_gate
 
         async def _run_with_semaphore(vp: Dict[str, Any]) -> Dict[str, Any]:
             # The semantic this loop exists to establish: a gate slot means
@@ -4290,19 +4283,34 @@ class Orchestrator:
         # ordering, and short-circuit all live on the executor.
         try:
             executor = self._build_verification_executor(plan_data)
-            # The round's width is derived from the live provider fleet
-            # and re-read at every bind — see ``_build_vp_capacity_gate``
-            # for why this is not an int that each caller supplies.
-            gate = self._build_vp_capacity_gate()
+            # No width, and no gate. How many verification points run at
+            # once is decided per dispatch by the provider slot pool —
+            # ``acquire_provider_with_dynamic_capacity`` hands out a slot
+            # or does not, from the fleet as it stands that second, and it
+            # does so *before* the ``claude`` subprocess is spawned
+            # (``coding_tool._run_claude_interactive``), so the pool bounds
+            # the LLM calls and the subprocesses together.
+            #
+            # ``max_parallel=0`` is explicit and is NOT the same as
+            # omitting it. ``BaseExecutor.run`` defaults to ``1``, and
+            # ``1`` is on the bounded side of ``if max_parallel > 0``:
+            # a round that dropped the argument would run one
+            # verification point at a time and look perfectly healthy.
+            # "0" is the docstring's unbounded sentinel.
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
-                asyncio.run(executor.run(gate=gate))
+                asyncio.run(executor.run(max_parallel=0))
             else:
                 # Loop is running (e.g. pytest-asyncio test).
                 import nest_asyncio  # type: ignore
                 nest_asyncio.apply()
-                asyncio.run(executor.run(gate=gate))
+                asyncio.run(executor.run(max_parallel=0))
+            # What the round actually reached, measured inside the
+            # runner. This is the observable that replaces the width:
+            # nothing here is a declared number, so it cannot disagree
+            # with the run it describes.
+            self._note_vp_capacity(executor.peak_in_flight)
             execution_results = self._build_execution_results_from_executor(
                 plan_data, executor
             )

@@ -196,6 +196,20 @@ class BaseExecutor(ABC):
         self._state_file: Optional[Path] = None
         self._progress_file: Optional[Path] = None
 
+        # How many items this run ever had in flight at the same moment,
+        # and how many it has right now. Measured rather than declared.
+        #
+        # This exists because the verification round no longer carries a
+        # width at all: the provider pool decides, per dispatch, how many
+        # verification points may run at once
+        # (``acquire_provider_with_dynamic_capacity``). A run that
+        # reports "the width" would be reporting the one thing it no
+        # longer knows, so what it reports instead is what actually
+        # happened — which is the number an operator asking "how wide did
+        # this run?" is asking about.
+        self._in_flight: int = 0
+        self._peak_in_flight: int = 0
+
         # Load subclass state and progress.
         self._load_or_init_state()
         self._load_progress()
@@ -353,18 +367,19 @@ class BaseExecutor(ABC):
 
         Args:
             max_parallel: Maximum number of items to run concurrently
-                within a single layer.  ``1`` means serial (the old
-                default); ``0`` or negative means unlimited.
+                within a single layer.  ``1`` means serial (the default);
+                ``0`` or negative means unlimited.
 
-                **Superseded by ``gate`` on the verification path.**
-                ``max_parallel`` fixes a width once, here, and every
-                item in every layer of the run then has to live with it
-                however wrong it goes: a 5-typed-in number is not a
-                description of what the providers are serving this
-                second. ``gate`` replaces that with an object whose
-                width is asked for at every bind, and it wins whenever
-                it is supplied — ``max_parallel`` is read only to build
-                the fixed-width fallback for a caller that has no gate.
+                **The verification path passes ``0`` and passes nothing
+                else** — see
+                :meth:`verification_agent.Orchestrator.run_full_verification`.
+                That is deliberate and load-bearing, because the default
+                is ``1``: a caller that simply omits the argument gets
+                a *serial* round, not an unbounded one. The verification
+                round has no framework width at all — the provider pool
+                decides per dispatch how many verification points run at
+                once — so ``0`` here is how it says "do not add one of
+                your own".
             gate: Optional concurrency gate — anything with
                 ``await acquire()`` and ``release()``, which is both
                 :class:`asyncio.Semaphore` and
@@ -373,6 +388,11 @@ class BaseExecutor(ABC):
                 capacity, and the gate that *does* lives one layer up so
                 a change to how a width is derived does not have to
                 reach in here.
+
+                The verification round passes no gate, so this is the
+                generic hook and the round declines it: adding a gate
+                there would be re-introducing the framework-level
+                ceiling this path exists to not have.
 
                 The gate is created once per ``run`` and shared by every
                 layer, exactly where the semaphore used to be built. That
@@ -411,6 +431,13 @@ class BaseExecutor(ABC):
         # semaphore outright rather than being intersected with it: a
         # derived width that is then clamped by a typed-in number is the
         # same hard cap this replaced, only with extra steps.
+        #
+        # ``max_parallel > 0`` is the whole rule, and the ``1`` default
+        # sits on the *bounded* side of it. The verification round
+        # therefore has to pass ``0`` explicitly to be unbounded — see
+        # the ``max_parallel`` docstring above. A round that dropped the
+        # argument would not fail loudly; it would silently serialise,
+        # which is the failure this line is commented to prevent.
         if gate is None:
             gate = asyncio.Semaphore(max_parallel) if max_parallel > 0 else None
 
@@ -456,26 +483,41 @@ class BaseExecutor(ABC):
         ``_run`` and turned into a result, but a cancellation lands
         between ``acquire`` and ``_run``, and a gate left held by a
         cancelled item shrinks the round by one slot every time.
+
+        The in-flight counter brackets the same region, so a peak means
+        "this many items were inside the runner simultaneously" — which
+        is the question a reader of :attr:`peak_in_flight` is asking.
+        It is counted *inside* the gate rather than outside on purpose:
+        a waiter queued behind a gate is not running, and counting it
+        would report the width of the queue as the width of the run.
         """
         item_id = self._derive_item_id(item)
 
         async def _run() -> Dict[str, Any]:
-            self._current_item = item_id
-            self._updated_at = _now_iso()
-            self._save_progress()
-
+            self._enter_flight()
             try:
-                result = self.item_runner(item)
-                if inspect.isawaitable(result):
-                    result = await result
-            except Exception as exc:
-                result = self._make_error_result(exc)
+                self._current_item = item_id
+                self._updated_at = _now_iso()
+                self._save_progress()
 
-            self._record_result(item_id, result)
-            self._current_item = None
-            self._updated_at = _now_iso()
-            self._save_progress()
-            return result
+                try:
+                    result = self.item_runner(item)
+                    if inspect.isawaitable(result):
+                        result = await result
+                except Exception as exc:
+                    result = self._make_error_result(exc)
+
+                self._record_result(item_id, result)
+                self._current_item = None
+                self._updated_at = _now_iso()
+                self._save_progress()
+                return result
+            finally:
+                # Paired with the ``finally`` in the gate arm below, and
+                # for the same reason: a cancellation can land between
+                # ``acquire`` and the body, and a counter left raised
+                # inflates every peak after it.
+                self._leave_flight()
 
         if gate is not None:
             await gate.acquire()
@@ -484,6 +526,35 @@ class BaseExecutor(ABC):
             finally:
                 gate.release()
         return await _run()
+
+    # ------------------------------------------------------------------
+    # Observed concurrency
+    # ------------------------------------------------------------------
+
+    def _enter_flight(self) -> None:
+        self._in_flight += 1
+        if self._in_flight > self._peak_in_flight:
+            self._peak_in_flight = self._in_flight
+
+    def _leave_flight(self) -> None:
+        if self._in_flight > 0:
+            self._in_flight -= 1
+
+    @property
+    def peak_in_flight(self) -> int:
+        """The most items this run ever had inside the runner at once.
+
+        Measured, never configured. On the verification path this is the
+        replacement for the "width" the round used to carry: with no
+        framework gate, the number that *was* the run's width is the
+        number the provider pool let it reach.
+        """
+        return self._peak_in_flight
+
+    @property
+    def in_flight(self) -> int:
+        """Items inside the runner right now."""
+        return self._in_flight
 
     def _build_items_from_plan(self) -> List[Dict[str, Any]]:
         """Default item extraction.  Subclasses may override."""

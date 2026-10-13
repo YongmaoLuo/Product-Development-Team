@@ -188,7 +188,7 @@ def agent_factory(tmp_path, monkeypatch):
     # test must measure a width, not an empty round.
     counter = {"n": 0}
 
-    def _make(width=7, cap=4, cls=_ProbeAgent):
+    def _make(width=7, cls=_ProbeAgent):
         counter["n"] += 1
         plan_dir = tmp_path / ("plan-%d" % counter["n"])
         plan_dir.mkdir()
@@ -201,8 +201,12 @@ def agent_factory(tmp_path, monkeypatch):
             coding_tool=None,
             verif_repo=repo,
         )
+        # ``width`` used to be the *width of the round*. It is now only a
+        # resolver reading, and the live path does not call it at all --
+        # which is the claim this file now measures. It is still wired up
+        # so that a round which accidentally consults the resolver again
+        # shows up as a width rather than passing unnoticed.
         agent.vp_capacity_resolver = lambda: width
-        agent.timeout_policy.parallelism_cap = cap
         agent.persistence.start_round(1)
         return agent
 
@@ -228,14 +232,43 @@ def _run_round(agent, count, round_number=1, resume=False):
 
 
 @pytest.mark.unit
-class TestTheWidthIsDerived:
-    def test_a_pinned_capacity_of_seven_runs_seven_at_once(self, agent_factory):
-        """7 in, 7 at once -- from ``run_full_verification``, no width arg.
+class TestTheFrameworkLayerIsNotTheConstraint:
+    """The round is no longer sized before it starts.
 
-        Neither old value would pass this: the auto loop's 5 caps it at
-        five, and the re-entry path's 1 would serialise the whole plan.
+    Every test in this class used to assert the opposite: that a pinned
+    number *did* set how many verification points ran at once. Pin 7, get
+    7; pin 3, get 3. That is the model this change removed -- a width
+    computed from somewhere other than the providers, in advance, and then
+    held for the whole run even as the fleet changed underneath it.
+
+    What replaces it is not a different number. ``run_full_verification``
+    passes ``max_parallel=0`` and builds no gate, so the executor admits
+    every verification point in the plan, and the *provider slot pool* is
+    the only thing that decides how much of that is working at once
+    (``acquire_provider_with_dynamic_capacity``). So the claim these tests
+    can make from this harness is the negative one, and it is the one that
+    matters: **nothing between the plan and the runner bounds the round.**
+
+    What the pool then does is measured in
+    ``test_verification_no_width_ceiling.py``, which lets verification
+    points actually contend for slots rather than sleeping. That split is
+    deliberate -- this harness replaces the sub-agent boundary, so it
+    cannot see the pool at all, and a test here claiming to measure the
+    pool would be measuring its own stub.
+    """
+
+    def test_a_pinned_capacity_of_seven_does_not_bound_a_sixteen_point_round(
+        self, agent_factory,
+    ):
+        """Pin 7, run 16 -- and all sixteen go at once.
+
+        The old assertion was ``peak == 7``: the resolver's number, read
+        before the round, frozen for its duration. The new one is
+        ``peak == 16``, which is the same fact seen from the other side. A
+        precomputed width that says 7 cannot produce a peak of 16, so this
+        fails if a gate is rebuilt -- not merely if the number changes.
         """
-        agent = agent_factory(width=7, cap=4)
+        agent = agent_factory(width=7)
 
         _run_round(agent, 16)
 
@@ -243,28 +276,35 @@ class TestTheWidthIsDerived:
             "only %d of 16 VPs ran: %s"
             % (len(agent.probe.entered), agent.probe.entered)
         )
-        assert agent.probe.peak == 7, (
-            "the scene says 7 VPs can be served but %d ran at once. A "
-            "width that is not the derived one is a fixed cap wearing the "
-            "gate's name." % agent.probe.peak
+        assert agent.probe.peak == 16, (
+            "the resolver was pinned at 7 and %d VPs still ran at once. A "
+            "width that is not the plan size is a cap, and a cap is the "
+            "thing this project stopped pre-agreeing on." % agent.probe.peak
         )
 
-    def test_two_different_capacities_give_two_different_widths(
+    def test_two_different_resolver_readings_give_the_same_width(
         self, agent_factory,
     ):
-        """The number tracks the fleet rather than coinciding with it once.
+        """The falsifier: two pins that cannot both be a coincidence.
 
-        A single 7 would also pass if the gate were ignoring its reader
-        and some other number happened to be 7. Two pins that differ
-        cannot both be a coincidence.
+        Pinning 3 and 9 and asserting peaks of 3 and 9 was the old way of
+        showing the width *tracked* the fleet. Inverting both sides --
+        same plan, same unbounded round, different readings -- shows the
+        opposite: the reading is not consulted at all. If a gate were
+        rebuilt around the resolver these would come out 3 and 9, and this
+        fails.
         """
+        peaks = {}
         for width in (3, 9):
-            agent = agent_factory(width=width, cap=4)
+            agent = agent_factory(width=width)
             _run_round(agent, 16)
-            assert agent.probe.peak == width, (
-                "pinned capacity %d, measured peak %d"
-                % (width, agent.probe.peak)
-            )
+            peaks[width] = agent.probe.peak
+
+        assert peaks == {3: 16, 9: 16}, (
+            "resolver readings changed the round width (%r): something on "
+            "the live path is still asking what the fleet looks like and "
+            "sizing the round from the answer" % (peaks,)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -488,44 +528,68 @@ class _FakeCodingTool:
         raise AssertionError("the loop must not reach the LLM")
 
 
-# ---------------------------------------------------------------------------
-# 3. parallelism_cap is the fallback, not the ceiling
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
-class TestParallelismCapIsTheFallback:
-    def test_a_resolvable_scene_uses_the_derived_width_not_the_cap(
+class TestNoDeclaredWidthReachesTheRound:
+    """The old class here was ``TestParallelismCapIsTheFallback``.
+
+    Its two tests pinned a cap and a scene and asserted which one won:
+    "a resolvable scene uses the derived width, not the cap", "an
+    unresolvable scene falls back to the declared cap". Both are about
+    *arbitrating between two numbers*, and there are no two numbers left.
+
+    The property underneath them survives, though, and it is the one worth
+    keeping: what a round does must not depend on a number somebody typed.
+    These two tests state that from the two ends -- a resolvable scene and
+    an unresolvable one must run identically wide, and the round must not
+    read the resolver at all.
+    """
+
+    def test_a_resolvable_scene_and_an_unresolvable_one_run_identically(
         self, agent_factory,
     ):
-        """The cap says 2, the fleet says 9 -- the fleet wins.
+        """width=9 and width=None produce the same round.
 
-        The order is the claim. ``parallelism_cap`` is a *fallback*, and a
-        fallback that is consulted first is a ceiling wearing a fallback's
-        name.
+        Under the old model these diverged: 9 VPs at once against the
+        derived width, 4 against the cap. That divergence *was* the
+        fallback, and it was the complaint -- two numbers for one round.
+        Now there is one rule and neither reading can change it.
         """
-        agent = agent_factory(width=9, cap=2)
+        peaks = {}
+        for label, width in (("resolvable", 9), ("unresolvable", None)):
+            agent = agent_factory(width=width)
+            _run_round(agent, 16)
+            peaks[label] = agent.probe.peak
 
-        _run_round(agent, 16)
-
-        assert agent.probe.peak == 9, (
-            "measured %d at once with a resolvable scene of 9 and "
-            "parallelism_cap=2. The cap is overruleable and the derived "
-            "width is not." % agent.probe.peak
+        assert peaks == {"resolvable": 16, "unresolvable": 16}, (
+            "the scene resolving or not changed the round width (%r). An "
+            "unresolvable chain is a routing failure the dispatch path "
+            "reports by name; it is not a reason to invent a width."
+            % (peaks,)
         )
 
-    def test_an_unresolvable_scene_falls_back_to_the_declared_cap(
-        self, agent_factory,
-    ):
-        """No chain -> nothing derivable -> the operator's own number runs."""
-        agent = agent_factory(width=None, cap=3)
+    def test_the_round_never_reads_the_resolver(self, agent_factory):
+        """Stated structurally: no reader on the live path at all.
 
+        The behavioural test above would also pass against a resolver that
+        happens to be ignored for the pin values it uses. This one cannot:
+        the resolver is replaced with a callable that raises, so any
+        consultation of it -- before the round, during it, or while
+        building the report -- takes the round down rather than quietly
+        returning something plausible.
+        """
+        agent = agent_factory(width=7)
+
+        def _must_not_be_called():
+            raise AssertionError(
+                "the live round asked the resolver what the fleet looks "
+                "like; nothing on this path may size a round in advance"
+            )
+
+        agent.vp_capacity_resolver = _must_not_be_called
         _run_round(agent, 16)
 
-        assert agent.probe.peak == 3, (
-            "with nothing derivable the declared cap of 3 should have been "
-            "the width; %d VPs ran at once instead." % agent.probe.peak
-        )
+        assert agent.probe.peak == 16
+        assert len(agent.probe.entered) == 16
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +607,7 @@ class TestNoneIsNotZero:
         It must not become a gate that admits nobody: a misrouted scene
         then hangs the plan silently instead of failing with the reason.
         """
-        agent = agent_factory(width=7, cap=4)
+        agent = agent_factory(width=7)
         executor = agent._build_verification_executor(_plan(12))
         gate = _VpCapacityGate(lambda: None, lambda: None)
 
@@ -565,7 +629,7 @@ class TestNoneIsNotZero:
         round rather than running it wide, and that parking is
         distinguishable from the ``None`` case above within seconds.
         """
-        agent = agent_factory(width=7, cap=4)
+        agent = agent_factory(width=7)
         executor = agent._build_verification_executor(_plan(12))
         gate = _VpCapacityGate(lambda: 0, lambda: 0, recheck_sec=30.0)
 
@@ -586,52 +650,83 @@ class TestNoneIsNotZero:
         )
 
 
-# ---------------------------------------------------------------------------
-# 5. The width is observable — a change in the width must be visible
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
-class TestTheWidthIsObservable:
-    def test_the_width_a_gate_binds_at_is_the_one_the_report_quotes(
+class TestTheMeasuredPeakIsObservable:
+    """Both tests here used to assert that the *declared* width was published.
+
+    "The width a gate binds at is the one the report quotes", "the profile
+    publishes the derived width not the declared cap" -- the subject was a
+    number computed before the round. What is published now is a
+    measurement taken inside the runner afterwards
+    (``BaseExecutor.peak_in_flight``).
+
+    The danger the old tests watched for is real and has not gone away: a
+    report that publishes a number the round did not use is misleading in
+    exactly the same way whether the number is declared or derived. It is
+    harder to do by accident now, because there is nothing to declare --
+    but it is pinned from the other direction instead. The resolver is
+    pinned at 13 and the plan has 20 verification points, so "reports the
+    resolver's number" and "reports the measured peak" are different
+    numbers, and only one of them is a measurement.
+    """
+
+    def test_the_report_quotes_the_peak_the_round_reached_not_the_resolver(
         self, agent_factory,
     ):
-        """``_note_vp_capacity`` on the path the round actually takes.
+        """20 VPs, resolver pinned at 13, report says 20.
 
-        Without this the change would be invisible from outside: the gate
-        could size the round correctly and every report would still say
-        the old declared cap, because ``parallelism_cap`` is what the
-        profile has always published. The round's width is now a derived
-        number, so it has to be recorded somewhere the report reads --
-        which is what ``_build_vp_capacity_gate`` does and what Phase 3
-        then hands to ``ExecutionProfileGenerator``.
+        If anything ever publishes the resolver again this reads 13 and
+        fails. If anything publishes nothing at all it reads ``None`` and
+        fails. Only the measurement passes.
         """
-        agent = agent_factory(width=13, cap=4)
+        agent = agent_factory(width=13)
 
-        _run_round(agent, 4)
+        _run_round(agent, 20)
 
-        assert agent._report_vp_capacity() == 13, (
-            "the report would quote %r while the round ran 13 wide"
-            % (agent._report_vp_capacity(),)
+        reported = agent._report_vp_capacity()
+        assert reported == 20, (
+            "the report would quote %r while the round ran %d wide (the "
+            "resolver was pinned at 13, which is not one of them)"
+            % (reported, agent.probe.peak)
+        )
+        assert reported == agent.probe.peak, (
+            "the report and the instrument disagree: %r vs %d"
+            % (reported, agent.probe.peak)
         )
 
-    def test_the_profile_publishes_the_derived_width_not_the_declared_cap(
+    def test_the_profile_publishes_the_measured_peak_and_no_declared_width(
         self, agent_factory,
     ):
-        """What an operator (or the bridge UI) reads off the profile."""
+        """What an operator (or the bridge UI) reads off the profile.
+
+        The old version asserted ``vp_capacity == 13`` and
+        ``parallelism_cap == 4`` -- that is, it asserted the payload
+        carried both a derived width and the typed number, so a reader
+        could tell which one ran. With no typed number there is nothing to
+        tell apart, so the keys are asserted *absent*: an integer in a
+        profile is read as the round's width by anything that does not
+        know the history, and a declared one there would be a claim about
+        a round nobody measured.
+        """
         from verification_profile import ExecutionProfileGenerator
 
-        agent = agent_factory(width=13, cap=4)
-        _run_round(agent, 4)
+        agent = agent_factory(width=13)
+        _run_round(agent, 20)
 
         profile = ExecutionProfileGenerator(
             {"verification_results": []},
             vp_capacity=agent._report_vp_capacity(),
         ).build()
 
-        assert profile["vp_capacity"] == 13, profile
-        assert profile["parallelism_cap"] == 4, (
-            "the declared cap must still be published — it is the "
-            "fallback, and a reader has to be able to see that the "
-            "width that ran was not it: %r" % (profile,)
+        assert profile["vp_capacity_observed"] == 20, profile
+        assert profile["vp_capacity_observed"] == agent.probe.peak, profile
+        assert profile["vp_capacity_source"] == "provider_pool", profile
+        assert "parallelism_cap" not in profile, (
+            "the payload still carries a declared width, which nothing on "
+            "the live path reads: %r" % (profile,)
         )
+        assert "vp_capacity" not in profile, (
+            "the old key would read as a declared width; the measurement "
+            "is published under its own name: %r" % (profile,)
+        )
+
