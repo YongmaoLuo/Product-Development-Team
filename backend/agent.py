@@ -4279,14 +4279,23 @@ class AutonomousAgent:
         """
         # Per-task SubagentConfig tmpfile regeneration (decisions 2/3 + 4).
         # Each task in the run() loop gets a fresh
-        # ``subagent_settings_<uuid>.json`` under its own private dir
-        # so the Claude subprocess launched for THIS task is wired with
-        # its own ``--settings`` tmpfile (env block + hooks payload) and
-        # ``CLAUDE_SETTINGS_PATH`` env var for hook correlation. Without
-        # this, every task in a run would share one tmpfile, breaking
-        # cross-process correlation in execution.log when two tasks run
-        # close together. ``write_tmp_settings`` is idempotent in
-        # producing a new path each call (uuid4).
+        # ``subagent_settings_<uuid>.json`` under its own private dir, and
+        # the Claude subprocess launched for THIS task is wired with its
+        # own ``--settings`` tmpfile. What makes the per-task write load-
+        # bearing is the correlation key, not the provider config:
+        # ``pre_tool_use.sh`` reads ``$CLAUDE_SETTINGS_PATH`` on every tool
+        # call and logs it, so a shared tmpfile would make two tasks
+        # dispatched close together indistinguishable in the activity log.
+        # The file therefore has to be per-task even though it no longer
+        # carries anything task-specific beyond its own path.
+        #
+        # It carries NO provider endpoint or credential
+        # (``defer_provider_config``): this write happens before routing
+        # has chosen a provider, so the only provider available to it is
+        # the run-level one, which is not necessarily the one this call is
+        # routed to. The dispatch writes the file that actually reaches
+        # ``claude --settings`` once routing has chosen. ``write_tmp_settings``
+        # is idempotent in producing a new path each call (uuid4).
         if getattr(self, "subagent_cfg", None) is not None:
             try:
                 new_settings_path = self.subagent_cfg.write_tmp_settings(
@@ -7500,6 +7509,23 @@ def autonomous_coding(
             # empty values would *replace* the user's working Claude Code
             # configuration rather than leave it alone.
             inherit_env=inherit_env,
+            # This file is written BEFORE any provider is selected, so it
+            # gets no provider config. ``provider_name`` / ``base_url`` /
+            # ``api_key`` above are the run-level provider, resolved once
+            # for the whole run from the optimizer's chain — the full CC
+            # Switch list, with no scene/tier filtering — so they are not
+            # necessarily a provider the tier table approves for this
+            # call. Writing them here produced a file that nothing ever
+            # re-reads: the dispatch writes its own per-call settings file
+            # once routing has chosen, and passes THAT to
+            # ``claude --settings``. The redaction pass is keyed on the
+            # effective settings path, so this pre-selection file was
+            # never redacted and never deleted — its key just accumulated
+            # in the tmp root, describing a provider that was never the one
+            # serving the call. Hooks and the correlation path still go in
+            # here, because the dispatch reads this file as the template
+            # for the per-call one.
+            defer_provider_config=True,
         )
 
         try:
@@ -7514,6 +7540,26 @@ def autonomous_coding(
             "task_summary": subagent_cfg.task_summary,
         }
 
+        # ``settings=`` is the TEMPLATE, and the template is what makes the
+        # dispatch able to build the real settings file: ClaudeCodingTool
+        # reads this file for its hooks block, adds the guard hook and the
+        # ``PDT_*`` env (file-lock broker, subagent uuid, task id), copies
+        # in the ANTHROPIC_* values of whichever provider routing actually
+        # selected, and writes that per-call file itself. Passing a path
+        # that does not exist would skip all of it — see the
+        # ``settings is not None`` arm in ``_run_claude_interactive``.
+        #
+        # Passing ``None`` is therefore not an option, and would not be a
+        # smaller file: it would mean no ``--settings`` at all, so no
+        # project hooks, no guard hook, no file-lock broker env, and no
+        # per-call settings file to carry the selected provider's
+        # endpoint. Hence a real, current path — one that holds hooks and
+        # the correlation key, and no credentials.
+        #
+        # ``base_url`` / ``auth_token`` below stay: they are the documented
+        # fallback for calls that run with NO scene, where there is no tier
+        # table to be approved against. A scene-routed call that resolves
+        # no provider fails instead of using them.
         coding_tool = ClaudeCodingTool(
             cwd=str(project_path),
             logger=logger,

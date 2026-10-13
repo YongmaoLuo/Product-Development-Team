@@ -8,7 +8,7 @@ Analyzes task execution results and refines the task list.
 import json
 from typing import List, Dict, Optional
 
-from coding_tool import CodingTool
+from coding_tool import CodingTool, JsonSession, query_json_in_session
 from config import AgentConfig
 from config_registry import ConfigRegistry
 from task import SubTask
@@ -127,6 +127,17 @@ class TaskRefiner:
         current_context = base_context
         final_report = None
 
+        # One resumable session for the whole refinement of this task
+        # list. Both loops below re-ask the same question rather than a
+        # new one: a round-N+1 prompt is round N plus the validator's
+        # objection, and a re-ask after an unparseable reply is the
+        # original ask with a format nudge appended. The context prompt
+        # names the files to read instead of inlining them, so a fresh
+        # session per attempt pays for that reading every time. The
+        # handle is per ``refine()`` call on purpose: a different task is
+        # a different subject, and starts a different session.
+        session = JsonSession()
+
         try:
             for round_idx in range(MAX_REFINER_ROUNDS):
                 if self.logger:
@@ -143,8 +154,9 @@ class TaskRefiner:
                 round_context = current_context
                 for json_retry in range(MAX_REFINER_JSON_RETRIES + 1):
                     try:
-                        response = self.coding_tool.query_json(
-                            round_context, system_instruction=refiner_prompt,
+                        response = query_json_in_session(
+                            self.coding_tool, session, round_context,
+                            system_instruction=refiner_prompt,
                             scene="refiner",
                         )
                         break
