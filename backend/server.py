@@ -2672,6 +2672,7 @@ from verification_loop import (  # noqa: E402,F401
     _kill_sub_agent_process,
     _handle_stuck_sub_agent,
     _count_unfinished_tasks,
+    _verification_event_logger,
     _are_all_unfinished_blocked_by_failed_upstream,
     _mark_task_skipped,
     _mark_verification_round_running,

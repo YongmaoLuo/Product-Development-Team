@@ -590,7 +590,10 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
 
         try:
             _server._verification_state[plan_id]["updated_at"] = datetime.now().isoformat()
-            coding_tool = _server.create_coding_tool(tool_type, cwd=str(project_dir), scene="verification")
+            coding_tool = _server.create_coding_tool(
+                tool_type, cwd=str(project_dir), scene="verification",
+                logger=_server._verification_event_logger(plan_dir),
+            )
             max_parallel = req.max_parallel if req and req.max_parallel is not None else _server._resolve_max_parallel(coding_tool)
             # Wire the SQLite VerificationRepository so the agent can
             # persist Phase 1 execution envelopes to

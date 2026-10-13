@@ -34,6 +34,42 @@ import time
 # this module (see the wiring at the bottom of server.py).
 import server as _server
 
+
+def _verification_event_logger(plan_dir: Path):
+    """The plan's existing structured logger, for the verification coding tool.
+
+    ``create_coding_tool`` takes its logger as an argument and the
+    verification call sites never passed one, so ``ClaudeCodingTool.logger``
+    was ``None`` for every dispatch the verification path made. Every
+    provider-routing event is emitted under ``if self.logger:``, so the whole
+    set — the slot queue, the park wait, the closed-window probe, the
+    all-pools-exhausted warning, and ``provider_selected`` (the only one
+    carrying ``in_flight`` / ``fleet_in_flight``) — was silently dropped on
+    exactly the path that needed it. The queue itself still worked; it was
+    the record of it that was missing.
+
+    This is not a new logger. It is :func:`execution_logger.get_logger`, the
+    same factory the generation phases call, returning the same
+    ``ExecutionLogger`` writing the same ``<plans_dir>/<plan_id>/execution.log``
+    that ``agent.py`` and ``VerificationAgent`` already write to — so a
+    verification dispatch event lands in the log the operator already reads
+    for that plan, with no second sink to reconcile.
+
+    ``None`` is a supported answer and means "exactly what happens today":
+    the dispatch runs and emits nothing. The ``ExecutionLogger`` constructor
+    creates the plan directory, so an unwritable plans directory would
+    otherwise turn a logging aid into a dispatch failure. That is why the
+    construction is guarded, and why a failure degrades to ``None`` rather
+    than propagating.
+    """
+    try:
+        from execution_logger import get_logger
+
+        return get_logger(plan_id=plan_dir.name)
+    except Exception:  # noqa: BLE001 — logging must never break a dispatch
+        return None
+
+
 def _count_unfinished_tasks(plan_id: str, tasks_file: Path) -> Dict[str, int]:
     """Cross-check tasks.json against the runtime task_progress overlay.
 
@@ -3281,7 +3317,10 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
     # (which closes the loop after two identical failed VPs) never fires
     # because the state is reset every iteration.
     try:
-        coding_tool = _server.create_coding_tool(tool, cwd=str(project_dir), scene="verification")
+        coding_tool = _server.create_coding_tool(
+            tool, cwd=str(project_dir), scene="verification",
+            logger=_verification_event_logger(plan_dir),
+        )
         max_parallel = _server._resolve_max_parallel(coding_tool)
         # Wire the SQLite VerificationRepository so the agent can
         # persist Phase 1 execution envelopes to
@@ -3894,6 +3933,7 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                     try:
                         _coding_tool = _server.create_coding_tool(
                             tool, cwd=str(project_dir), scene="verification",
+                            logger=_verification_event_logger(plan_dir),
                         )
                         _verif_repo = None
                         try:
