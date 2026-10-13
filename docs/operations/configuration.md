@@ -2,15 +2,21 @@
 
 ## `backend/config.yaml` is intentionally thin
 
-Three things are worth knowing:
+Two things are worth knowing:
 
-- **Nothing is required to run.** It ships with no provider order file and
-  no subsidiary processes. The server boots and the workflow runs; features
-  that need an external component simply have nothing to read.
-- **`provider_order_file`** points at a JSON contract describing a fallback
-  provider chain. There is no built-in chain — if you want provider
-  failover, point this at whatever produces that file. The
-  `PROVIDER_ORDER_FILE` environment variable overrides the config value.
+- **Nothing is required to run.** It ships with no subsidiary processes.
+  The server boots and the workflow runs; features that need an external
+  component simply have nothing to read.
+- **The provider fallback chain is not configured here.** There is no key
+  that points at one and no built-in chain. At startup the backend asks CC
+  Switch for the chain — over its HTTP provider list, or over its database
+  when nothing is serving — so the order you see in CC Switch is the order
+  the backend dispatches in. There is deliberately no second place to
+  configure it: the chain used to come from a JSON file this repository
+  did not write and nothing wrote any more, which let the backend and CC
+  Switch disagree about it for as long as neither was restarted.
+  `PDT_PROVIDER_ORDER_API_URL` overrides the address of CC Switch's HTTP
+  API; the database is found under `~/.cc-switch/`.
 - **`subsidiary_processes`** is an empty list. It is a generic mechanism for
   bringing up long-running helper processes during the FastAPI lifespan,
   with two load-bearing properties: entries start **in order**, and a failed

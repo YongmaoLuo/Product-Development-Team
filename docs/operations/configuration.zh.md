@@ -2,13 +2,17 @@
 
 ## `backend/config.yaml` 刻意很薄
 
-三点值得知道：
+两点值得知道：
 
-- **什么都不配也能跑。** 它不带 provider order 文件、也不带子公司进程。服务照常启动、
-  工作流照常运行；依赖外部组件的功能只是没东西可读而已。
-- **`provider_order_file`** 指向一份描述 provider 回退链的 JSON 契约。没有内置链 ——
-  想要 provider failover 就把它指向任何产出该文件的东西。环境变量
-  `PROVIDER_ORDER_FILE` 覆盖配置值。
+- **什么都不配也能跑。** 它不带子公司进程。服务照常启动、工作流照常运行；
+  依赖外部组件的功能只是没东西可读而已。
+- **provider 回退链不在这里配。** 没有任何键指向它，也没有内置链。启动时后端
+  直接向 CC Switch 要这条链 —— 优先走它的 HTTP provider 列表，没有服务在跑时
+  走它的数据库 —— 所以你在 CC Switch 里看到的顺序，就是后端派发用的顺序。这里
+  刻意不提供第二个配置点：这条链以前来自一份本仓不写、也没人再更新的 JSON 文件，
+  结果是后端与 CC Switch 对链的认知可以一直不一致，直到两边有一边重启为止。
+  `PDT_PROVIDER_ORDER_API_URL` 可以覆盖 CC Switch HTTP API 的地址；数据库在
+  `~/.cc-switch/` 下。
 - **`subsidiary_processes`** 是空列表。它是一个通用机制，用于在 FastAPI lifespan
   期间拉起长期运行的辅助进程，有两条承重性质：条目**按顺序**启动；启动失败会
   **中止整个启动**，除非该条目标了 `optional: true`。

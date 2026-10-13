@@ -225,9 +225,10 @@ is in [Contributing](docs/development/contributing.md#where-a-file-belongs).
 
 ## Configuration / 配置
 
-`backend/config.yaml` is intentionally thin — nothing is required to run.
-There is no built-in provider chain (point `provider_order_file` at
-whatever produces that contract), and `subsidiary_processes` ships empty.
+`backend/config.yaml` is intentionally thin — nothing is required to run,
+and `subsidiary_processes` ships empty. The provider fallback chain is not
+configured there at all: the backend asks CC Switch for it at startup, so
+the order you see in CC Switch is the order it dispatches in.
 
 Provider concurrency caps and provider routing are **operator-specific**.
 They ship as committed templates under `example/`; you copy them into the

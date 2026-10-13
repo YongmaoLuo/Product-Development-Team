@@ -6,13 +6,14 @@ replaced VP-010. The deleted invariant was "every provider ID conforms
 to a kebab-case regex" — an assertion about a *local* vocabulary this
 project invented. Providers no longer have a second name: the string
 CC Switch shows (``providers.name``) is the string
-``provider_routing.yaml`` matches its regexes against, the string
-``provider-order.json`` carries, and the key every lookup uses. So
-"is it kebab-case?" is not a question the system asks any more, and
-the invariant that actually protects the dispatch is:
+``provider_routing.yaml`` matches its regexes against, the string the
+chain carries, and the key every lookup uses. So "is it kebab-case?"
+is not a question the system asks any more, and the invariant that
+actually protects the dispatch is:
 
-    **every provider name that survives into the chain resolves to a
-    live CC Switch row — and a name that does not, does not survive.**
+    **every provider name CC Switch reports can be looked up by exactly
+    that name, and anything that cannot be resolved is dropped before it
+    reaches a dispatch.**
 
 Critical paths covered
 ----------------------
@@ -23,12 +24,18 @@ Critical paths covered
    ``CCSwitchError``.
 2. ``cc_switch.list_provider_names`` — the
    enumeration is the DB's own roster, and nothing outside it.
-3. ``provider_order.load_fallback_order`` — the returned chain is the
-   optimizer JSON filtered to names the DB declares, in JSON order.
-4. Cross-cutting: everything in the chain round-trips back through the
-   by-name lookup. That is the property an operator depends on — a
-   chain entry that cannot be resolved is a sub-agent dispatched with
-   whatever the parent env happened to say.
+3. ``provider_order.load_fallback_order`` — the returned chain is what
+   CC Switch reported, in CC Switch's order. It applies no membership
+   filter of its own: filtering would make the chain a function of the
+   database as well as of CC Switch, which is how a chain can disagree
+   with the application the operator is looking at.
+4. ``server.load_providers`` — where the names are resolved, and where
+   one that does not resolve is dropped with a warning. That is the
+   layer that has the information to make the decision.
+5. Cross-cutting: everything that survives into the dispatch chain
+   round-trips back through the by-name lookup. That is the property an
+   operator depends on — a chain entry that cannot be resolved is a
+   sub-agent dispatched with whatever the parent env happened to say.
 """
 
 from __future__ import annotations
@@ -36,7 +43,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 from unittest import mock
@@ -78,26 +84,33 @@ def _make_fake_cc_switch_db(db_path: Path, provider_names: List[str]) -> Path:
 
     Production ``providers`` schema: the row's ``name`` is the provider's
     identity, and the endpoint + credential live in
-    ``settings_config.env``.
+    ``settings_config.env``. ``app_type`` and the ordering columns are
+    here because the chain reader filters on the app type and sorts by
+    them.
     """
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute(
             "CREATE TABLE providers ("
-            "id TEXT PRIMARY KEY, name TEXT, settings_config TEXT"
-            ")"
+            "id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL, "
+            "settings_config TEXT NOT NULL, created_at INTEGER, "
+            "sort_index INTEGER, is_current BOOLEAN NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (id, app_type))"
         )
         for i, name in enumerate(provider_names):
             conn.execute(
-                "INSERT INTO providers (id, name, settings_config) "
-                "VALUES (?, ?, ?)",
+                "INSERT INTO providers (id, app_type, name, settings_config, "
+                "created_at, sort_index) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     f"row-{i}",
+                    "claude",
                     name,
                     _settings({
                         "ANTHROPIC_BASE_URL": f"https://example.test/{i}/v1",
                         "ANTHROPIC_AUTH_TOKEN": f"sk-{i}",
                     }),
+                    i,
+                    i,
                 ),
             )
         conn.commit()
@@ -120,21 +133,34 @@ def _install_fake_home_db(
     return db_path
 
 
-def _write_valid_order_json(path: Path, order: List[str]) -> None:
-    """Write a ``provider-order.json`` payload the schema validator accepts."""
-    path.write_text(
-        json.dumps(
-            {
-                "version": provider_order.SCHEMA_VERSION,
-                "updated_at": datetime.now(timezone.utc)
-                .astimezone()
-                .isoformat(),
-                "source": "producer",
-                "order": list(order),
-                "providers": {name: {} for name in order},
-            }
-        ),
-        encoding="utf-8",
+#: An authority nothing can be listening on, so the HTTP leg fails the
+#: way it does when CC Switch is closed and the database has to answer.
+API_DOWN = "http://127.0.0.1:1"
+
+
+def _serve_cc_switch(monkeypatch: pytest.MonkeyPatch, order: List[str]) -> None:
+    """Make CC Switch's HTTP provider list report ``order``."""
+    body = json.dumps(
+        {"providers": [{"id": f"id-{i}", "name": n} for i, n in enumerate(order)]}
+    ).encode()
+
+    class _Response:
+        status = 200
+
+        def read(self):
+            return body
+
+        def getcode(self):
+            return 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        provider_order.urllib.request, "urlopen", lambda *a, **k: _Response()
     )
 
 
@@ -232,37 +258,42 @@ def test_enumeration_skips_rows_that_cannot_drive_a_subagent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 2. Optimizer chain -- every surviving entry names a live row
+# 2. The chain is CC Switch's roster, and the lookup can answer for it
 # ---------------------------------------------------------------------------
 
 
-def test_load_fallback_order_drops_names_with_no_row(tmp_path, monkeypatch):
-    """An entry the DB does not declare is dropped, and order is preserved."""
-    _install_fake_home_db(
-        tmp_path, monkeypatch, ["Vendor B Pro", "Vendor A Pro"]
-    )
+def test_the_chain_is_the_cc_switch_roster_verbatim(
+    tmp_path, monkeypatch, real_cc_switch
+):
+    """The reader applies no membership filter.
 
-    order_file = tmp_path / "provider-order.json"
-    _write_valid_order_json(
-        order_file,
-        ["Vendor A Pro", "Ghost Provider", "Vendor B Pro", "parent"],
-    )
+    A name CC Switch reported is in the chain whether or not a row
+    resolves it. Filtering here would make the chain a function of the
+    database as well as of CC Switch — and would drop precisely the
+    newest row, the one CC Switch has and this backend has not learned
+    to parse yet. That is a transient state, not a misconfiguration,
+    and hiding it would make an operator's freshly-added provider look
+    as though it had never been added.
+    """
+    declared = ["Vendor A Pro", "Vendor B Pro"]
+    _install_fake_home_db(tmp_path, monkeypatch, declared)
+
+    order = ["Vendor A Pro", "Ghost Provider", "Vendor B Pro", "parent"]
+    _serve_cc_switch(monkeypatch, order)
 
     provider_order.cache_clear()
-    with mock.patch.object(
-        provider_order, "_default_order_file", return_value=order_file
-    ):
-        chain = provider_order.load_fallback_order()
+    chain = provider_order.load_fallback_order()
 
-    assert chain == ["Vendor A Pro", "Vendor B Pro"], (
-        f"load_fallback_order returned {chain!r}. Any name without a live "
-        "CC Switch row MUST be dropped before the chain reaches dispatch, "
-        "and the survivors keep the optimizer's order."
+    assert chain == order, (
+        f"load_fallback_order returned {chain!r}; expected CC Switch's "
+        f"own list {order!r}, unfiltered and in order"
     )
 
 
-def test_every_chain_entry_round_trips_through_the_lookup(tmp_path, monkeypatch):
-    """The property the dispatch depends on: chain entries are resolvable.
+def test_every_declared_chain_entry_round_trips_through_the_lookup(
+    tmp_path, monkeypatch, real_cc_switch
+):
+    """The property the dispatch depends on: declared names are resolvable.
 
     This is the assertion that subsumes "is the name well-formed?" — a
     name is usable exactly when looking it up returns a row. An entry
@@ -272,14 +303,9 @@ def test_every_chain_entry_round_trips_through_the_lookup(tmp_path, monkeypatch)
     declared = ["Vendor B Pro", "Vendor A Pro", "Vendor C App"]
     db_path = _install_fake_home_db(tmp_path, monkeypatch, declared)
 
-    order_file = tmp_path / "provider-order.json"
-    _write_valid_order_json(order_file, [*declared, "parent"])
-
+    _serve_cc_switch(monkeypatch, declared)
     provider_order.cache_clear()
-    with mock.patch.object(
-        provider_order, "_default_order_file", return_value=order_file
-    ):
-        chain = provider_order.load_fallback_order()
+    chain = provider_order.load_fallback_order()
 
     assert chain == declared
     for entry in chain:
@@ -292,27 +318,22 @@ def test_every_chain_entry_round_trips_through_the_lookup(tmp_path, monkeypatch)
         assert cfg.base_url, f"chain entry {entry!r} resolved to no endpoint"
 
 
-def test_load_fallback_order_raises_when_the_roster_is_unreadable(
-    tmp_path, monkeypatch
+def test_load_fallback_order_raises_when_neither_cc_switch_surface_answers(
+    tmp_path, monkeypatch, real_cc_switch
 ):
-    """No CC Switch database ⇒ a hard error, not a silent empty chain.
+    """No CC Switch at all ⇒ a hard error, not a silent empty chain.
 
-    An empty chain and an unreadable database mean opposite things: the
-    first is "the optimizer listed nothing usable", the second is "this
-    process cannot see the roster at all". Collapsing them would let a
+    An empty chain and an unresolvable one mean opposite things: the
+    first is "CC Switch lists nothing usable", the second is "this
+    process cannot see CC Switch at all". Collapsing them would let a
     broken deployment look like a deliberate configuration.
     """
     monkeypatch.setenv("HOME", str(tmp_path))  # no ~/.cc-switch/cc-switch.db
-
-    order_file = tmp_path / "provider-order.json"
-    _write_valid_order_json(order_file, ["Vendor B Pro"])
+    monkeypatch.setenv("PDT_PROVIDER_ORDER_API_URL", "http://127.0.0.1:1")
 
     provider_order.cache_clear()
-    with mock.patch.object(
-        provider_order, "_default_order_file", return_value=order_file
-    ):
-        with pytest.raises(ProviderOrderError):
-            provider_order.load_fallback_order()
+    with pytest.raises(ProviderOrderError):
+        provider_order.load_fallback_order()
 
 
 # ---------------------------------------------------------------------------
@@ -320,8 +341,16 @@ def test_load_fallback_order_raises_when_the_roster_is_unreadable(
 # ---------------------------------------------------------------------------
 
 
-def test_a_bogus_name_cannot_reach_the_dispatch_chain(tmp_path, monkeypatch):
-    """End to end: an unknown name is filtered out at every layer."""
+def test_a_bogus_name_cannot_reach_the_dispatch_chain(
+    tmp_path, monkeypatch, real_cc_switch
+):
+    """End to end: an unknown name is refused at every layer it can be.
+
+    It survives the chain reader — that is CC Switch's list, not an
+    opinion about it — and is dropped by ``server.load_providers``,
+    which is the layer that can tell whether a name resolves. The
+    dispatch never sees it either way.
+    """
     declared = ["Vendor B Pro", "Vendor A Pro"]
     db_path = _install_fake_home_db(tmp_path, monkeypatch, declared)
 
@@ -333,16 +362,33 @@ def test_a_bogus_name_cannot_reach_the_dispatch_chain(tmp_path, monkeypatch):
     # 2. Enumeration does not offer it.
     assert bogus not in list_provider_names(db_path=db_path)
 
-    # 3. The chain never carries it, even when the optimizer file asks.
-    order_file = tmp_path / "provider-order.json"
-    _write_valid_order_json(order_file, [bogus, *declared])
-    provider_order.cache_clear()
-    with mock.patch.object(
-        provider_order, "_default_order_file", return_value=order_file
-    ):
-        chain = provider_order.load_fallback_order()
+    # 3. The chain carries it — CC Switch listed it — and the startup
+    #    resolver drops it, naming it in a warning.
+    import logging
 
-    assert bogus not in chain, (
-        f"an unknown provider {bogus!r} appeared in the dispatch chain {chain!r}"
+    import server
+
+    _serve_cc_switch(monkeypatch, [bogus, *declared])
+    provider_order.cache_clear()
+    caplog_records: List[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            caplog_records.append(record.getMessage())
+
+    handler = _Capture()
+    logging.getLogger("server").addHandler(handler)
+    try:
+        providers = server.load_providers()
+    finally:
+        logging.getLogger("server").removeHandler(handler)
+
+    resolved = [cfg.name for cfg in providers]
+    assert bogus not in resolved, (
+        f"an unknown provider {bogus!r} reached the dispatch chain "
+        f"{resolved!r}"
     )
-    assert chain == declared
+    assert resolved == declared
+    assert any(bogus in m for m in caplog_records), (
+        f"the skip must name what was skipped; got {caplog_records!r}"
+    )
