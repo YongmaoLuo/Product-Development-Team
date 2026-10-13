@@ -3030,6 +3030,26 @@ def _dead_end_terminal(
 #: converges and the chain would otherwise be re-dispatched forever.
 _MAX_REPAIR_NOT_DRAINED_GUARDS = 3
 
+#: 2026-10-13 — how many times a ``failed`` repair task may be revived
+#: before it is abandoned for good.
+#:
+#: Before this, ``_get_pending_repair_tasks`` accepted ``status ==
+#: 'pending'`` only, so a repair task that had failed once was dead
+#: forever: nothing re-queued it, nothing counted it, nothing said so.
+#: On plan the 2026-10-10 plan 36 of 93 ``repair-*`` rows
+#: sat at ``failed`` and 31 of those had never run at all — the provider
+#: chain was pointed at a model that did not exist, so the first attempt
+#: died in the provider before a single tool call. The work was buried
+#: with no counter and no log line anywhere.
+#:
+#: The cap is a per-row ``attempt`` budget, deliberately NOT the round
+#: budget: ``_MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS`` bounds repeats of a
+#: failure *set* and is reset when the set changes, so a single VP that
+#: never converges while others flip in and out is not bounded by it.
+#: Three revivals is enough for a real defect to see a second and third
+#: try; past that the failure is structural, not transient.
+_MAX_REPAIR_REVIVAL_ATTEMPTS = 3
+
 #: ``{plan_id: consecutive_undrained_repair_stops}``. Module-level rather
 #: than per-closure so a re-dispatched loop that rebuilds its own
 #: callback still shares the count.
@@ -3119,8 +3139,176 @@ def _repair_generation_failed(plan_id: str, error: str) -> None:
     _server._record_verification_terminal(plan_id, "failed", reason)
 
 
-def _get_pending_repair_tasks(plan_id: str) -> List[Dict[str, Any]]:
-    """Return all RP-* tasks in ``pending`` status from state.db.
+def _round_failed_vp_ids(orch: Any, report: Any) -> set:
+    """The VP ids THIS round's verdict failed, straight from the orchestrator.
+
+    2026-10-13. The revival criterion in :func:`_get_pending_repair_tasks`
+    needs the round's failure set, and it has to be the orchestrator's own
+    notion of "failed" — ``_extract_failed_ids`` already knows about the
+    ``timeout`` / ``SPLIT`` / ``hard_timeout`` statuses and about the
+    ``rounds[-1].results`` fallback that the top-level
+    ``verification_results`` list needs once a round has been snapshotted
+    and cleared. Re-deriving any of that here would be a second, drifting
+    definition of "failed".
+
+    So this is a pass-through, not a new reader: it calls the orchestrator
+    method the auto-loop already called two lines earlier
+    (``check_cycle_conditions`` computes the same set), and degrades to
+    ``None`` — revival off — if the orchestrator or the report is absent.
+    Nothing here reads disk, which is the point: the round's verdict is a
+    value the loop is already holding.
+    """
+    extractor = getattr(orch, "_extract_failed_ids", None)
+    if not callable(extractor) or not isinstance(report, dict):
+        return None
+    try:
+        return set(extractor(report) or ())
+    except Exception:  # noqa: BLE001 — a revival criterion must not
+        _server.logger.exception(  # abort a round that is otherwise fine
+            "[repair_task_revive] could not extract failed ids plan-wide "
+            "— revival disabled for this round",
+        )
+        return None
+
+
+def _split_parent_ids(all_tasks: Dict[str, Dict[str, Any]]) -> set:
+    """Ids in ``all_tasks`` that the breakdown flow has split into children.
+
+    A breakdown writes ``f"{parent}-{n}"`` children and, depending on the
+    run, either deletes the parent's row (``refiner_structure`` 2026-10-05)
+    or leaves it at ``failed`` beside children that already ran. Both
+    shapes are in the live database right now: plan
+    the 2026-10-12 production plan has ``repair-r1-01``
+    removed with ``repair-r1-01-1/-2/-3`` present, while
+    ``the 2026-10-04 plan`` still carries ``repair-r1-01`` at
+    ``failed`` next to its own children, and
+    ``the 2026-09-26 plan`` nests three deep
+    (``repair-r4-01`` → ``repair-r4-01-5`` → four more).
+
+    Either way the parent's *work* lives in the children. Re-queueing the
+    parent would run the same fix a second time, so the caller uses this
+    set to keep them out of the executor queue.
+
+    Pure function over the rows already read; no extra query. ``{parent}-1``
+    is only ever a child id — no id in either scheme ends in a bare numeric
+    segment that is not a breakdown ordinal.
+    """
+    parents: set = set()
+    for tid in all_tasks:
+        if not isinstance(tid, str) or "-" not in tid:
+            continue
+        parent, _, suffix = tid.rpartition("-")
+        if parent and suffix.isdigit():
+            parents.add(parent)
+    return parents
+
+
+def _revive_failed_repair_task(
+    plan_id: str, tid: str, entry: Dict[str, Any],
+) -> bool:
+    """Re-queue one ``failed`` repair task whose VP failed again.
+
+    Returns ``True`` when the row was revived and MUST be returned by the
+    caller as queued work, ``False`` when it is abandoned (at the attempt
+    cap, or already split into children) — both of which are logged, never
+    skipped in silence.
+
+    2026-10-13. Three rules, each of which closes a hole the naive
+    ``status == 'pending'`` filter left open:
+
+    * **Attempt cap.** ``attempt`` is bumped and written to
+      ``plan_tasks`` on every revival; a row already at
+      :data:`_MAX_REPAIR_REVIVAL_ATTEMPTS` is abandoned with a
+      ``repair_task_abandoned_max_attempts`` event carrying the last
+      ``failure_reason``. The column was dead until now — nothing wrote
+      it (``SubTask`` has no ``attempt`` field, so
+      ``AutonomousAgent._persist_task_status``'s
+      ``getattr(task, "attempt", None)`` was always ``None``) and all 322
+      rows in the live database read ``NULL``.
+
+    * **Split parent.** A task the breakdown flow already split has
+      ``f"{tid}-{n}"`` children whose work IS this task's work. Reviving
+      the parent would execute the same fix twice.
+
+    * **Status reset.** ``status`` goes back to ``pending``, not just the
+      counter. ``failed`` is in ``agent._TERMINAL_TASK_STATUSES``, so a
+      row left at ``failed`` is classified terminal by the executor's
+      ``_load_tasks`` Phase-2 orphan reconcile and marked ``superseded``
+      without ever being scheduled — the revival would count and then do
+      nothing. Flipping the status is also what makes this idempotent: the
+      auto-loop calls this helper more than once per round verdict
+      (``_pending`` then ``_pending_db``), and after the first call the row
+      is ``pending``, so ``attempt`` advances exactly once per revival.
+
+    ``failure_reason`` is deliberately left in place — the executor feeds
+    it into the next attempt's prompt
+    (``AutonomousAgent._build_prior_failure_block``), which is the whole
+    point of retrying a failure rather than replaying it blind.
+    """
+    attempt = entry.get("attempt")
+    try:
+        attempt = int(attempt) if attempt is not None else 0
+    except (TypeError, ValueError):
+        attempt = 0
+    if attempt >= _MAX_REPAIR_REVIVAL_ATTEMPTS:
+        _server.logger.warning(
+            "[repair_task_abandoned_max_attempts] plan=%s task=%s "
+            "vp=%s attempt=%s max_attempts=%s — repair task [%s] failed "
+            "and its VP is still failing, but it has already been revived "
+            "%s time(s); abandoning it. It will NOT be re-queued from "
+            "this row. last_failure_reason=%s",
+            plan_id, tid, entry.get("failed_vp_id"), attempt,
+            _MAX_REPAIR_REVIVAL_ATTEMPTS, tid, attempt,
+            (entry.get("failure_reason") or "")[:500],
+        )
+        return False
+    new_attempt = attempt + 1
+    try:
+        from state_machine.db.connection import open as _open_db
+        from state_machine.db.schema import migrate as _migrate
+        from state_machine.repositories.plan_task_repository import (
+            PlanTaskRepository as _PlanTaskRepo,
+        )
+        conn = _open_db(_server._state_db_path())
+        try:
+            _migrate(conn)
+            _PlanTaskRepo(conn).update_task(
+                plan_id, tid,
+                {"status": "pending", "attempt": new_attempt},
+            )
+        finally:
+            conn.close()
+    except Exception:
+        # A revival whose counter could not be persisted is not safe to
+        # hand on: the row would go back to ``pending`` in this process's
+        # view but stay ``failed`` on disk, and the executor would
+        # classify it terminal. Report it loudly and leave the row alone.
+        _server.logger.exception(
+            "[repair_task_revive_failed] could not revive plan=%s task=%s "
+            "attempt=%s — left as-is",
+            plan_id, tid, new_attempt,
+        )
+        return False
+    entry["status"] = "pending"
+    entry["attempt"] = new_attempt
+    _server.logger.warning(
+        "[repair_task_revived] plan=%s task=%s vp=%s attempt=%s "
+        "max_attempts=%s — repair task [%s] had failed and its VP is "
+        "still failing; re-queued as attempt %s/%s. "
+        "last_failure_reason=%s",
+        plan_id, tid, entry.get("failed_vp_id"), new_attempt,
+        _MAX_REPAIR_REVIVAL_ATTEMPTS, tid, new_attempt,
+        _MAX_REPAIR_REVIVAL_ATTEMPTS,
+        (entry.get("failure_reason") or "")[:500],
+    )
+    return True
+
+
+def _get_pending_repair_tasks(
+    plan_id: str,
+    failed_vp_ids: Optional[Iterable[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Return the repair tasks the executor must run, from ``state.db``.
 
     2026-09-12: regardless of whether the latest
     ``check_cycle_conditions`` produced new repair_tasks, the executor
@@ -3131,11 +3319,37 @@ def _get_pending_repair_tasks(plan_id: str) -> List[Dict[str, Any]]:
     pending RP-* tasks orphaned forever and breaking the iteration
     chain.
 
-    This helper reads ``state.db.plan_tasks`` directly via
-    :class:`PlanTaskRepository.load_all` and filters for
-    ``task_id LIKE 'RP-%'`` and ``status == 'pending'``. Empty list on
-    DB error so the caller can fall back to the orchestrator's
+    This helper reads ``state.db.plan_tasks`` directly and filters for
+    repair-shaped ids (see :func:`_is_repair_task_id` below). Empty list
+    on DB error so the caller can fall back to the orchestrator's
     ``repair_tasks`` payload.
+
+    Parameters
+    ----------
+    plan_id:
+        The plan whose ``plan_tasks`` rows are the queue.
+    failed_vp_ids:
+        The verification-point ids THIS round's verdict found failing —
+        ``VerificationOrchestrator._extract_failed_ids(report)`` at the
+        call sites that have a report, and ``None`` everywhere else.
+
+        It is the sole criterion for reviving a ``failed`` row
+        (2026-10-13). A repair task that failed is re-queued when — and
+        only when — the VP it was written for is still in this round's
+        failure set: the work was never done, so it has to be offered
+        again. Pass ``None`` and the revival branch is inert, which is
+        what the read-only probes want (the operator-facing reset in
+        ``routes/verification.py`` and the undrained-repair guard in
+        ``_on_repair_complete``, neither of which has a round verdict in
+        hand).
+
+        Rows whose ``failed_vp_id`` is NULL are never revived — there is
+        no VP to test them against. That is not hypothetical: the
+        breakdown children inherit no ``failed_vp_id`` (``repair-r1-01-1``
+        in the 2026-10-12 production plan reads NULL), so
+        when a child fails it stays failed and the contract's own rule
+        strands it the same way it used to strand the parents. Called out
+        in the 2026-10-13 report rather than silently widened here.
     """
     try:
         from state_machine.db.connection import open as _open_db
@@ -3160,7 +3374,8 @@ def _get_pending_repair_tasks(plan_id: str) -> List[Dict[str, Any]]:
             # keeps the read path free of any field-filtering gotchas.
             cur = conn.execute(
                 "SELECT task_id, title, description, task_group, "
-                "test_command, failed_vp_id, round, status "
+                "test_command, failed_vp_id, round, status, attempt, "
+                "breakdown_count, failure_reason "
                 "FROM plan_tasks WHERE plan_id = ?",
                 (plan_id,),
             )
@@ -3175,11 +3390,18 @@ def _get_pending_repair_tasks(plan_id: str) -> List[Dict[str, Any]]:
                     "failed_vp_id": row[5],
                     "round": row[6],
                     "status": row[7],
+                    "attempt": row[8],
+                    "breakdown_count": row[9],
+                    "failure_reason": row[10],
                 }
         finally:
             conn.close()
     except Exception:
         return []
+    # An empty / omitted failure set disables revival entirely: "this VP
+    # is still failing" must be a fact, not a default.
+    round_failures: set = set(failed_vp_ids) if failed_vp_ids else set()
+    split_parents = _split_parent_ids(all_tasks)
     pending: List[Dict[str, Any]] = []
     # 2026-09-12 plan v2: accept BOTH the legacy ``RP-<n>`` id format
     # (pre-v9) AND the post-v9 ``R<round>-<i>`` id format. The two
@@ -3205,8 +3427,27 @@ def _get_pending_repair_tasks(plan_id: str) -> List[Dict[str, Any]]:
             continue
         if not _is_repair_task_id(tid, entry.get("task_group")):
             continue
-        if entry.get("status") != "pending":
-            continue
+        status = entry.get("status")
+        if status != "pending":
+            if status != "failed" or not round_failures:
+                continue
+            vp_id = entry.get("failed_vp_id")
+            if not vp_id or vp_id not in round_failures:
+                continue
+            if tid in split_parents:
+                _server.logger.warning(
+                    "[repair_task_skipped_split_into_children] plan=%s "
+                    "task=%s vp=%s attempt=%s children=%s — repair task "
+                    "[%s] is failed but the breakdown flow already split "
+                    "it; its work is in those children, so the parent is "
+                    "not re-queued",
+                    plan_id, tid, vp_id, entry.get("attempt"),
+                    sorted(k for k in all_tasks if k.startswith(tid + "-")),
+                    tid,
+                )
+                continue
+            if not _revive_failed_repair_task(plan_id, tid, entry):
+                continue
         pending.append({
             "id": tid,
             "title": entry.get("title") or "",
@@ -3891,7 +4132,9 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                 # orphaned. run pending RP-* tasks regardless of the
                 # current round's outcome — only treat as PASSED when
                 # both verification AND the executor queue are clear.
-                _pending = _get_pending_repair_tasks(plan_id)
+                _pending = _get_pending_repair_tasks(
+                    plan_id, _round_failed_vp_ids(orch, report),
+                )
                 if _pending:
                     _server.logger.info(
                         "[Auto-Verification] Round %d PASSED but %d "
@@ -3977,7 +4220,9 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                 # may be pending RP-* tasks from earlier rounds that should
                 # still be executed. pending RP-* tasks must run regardless
                 # of what ``check_cycle_conditions`` returns.
-                _pending = _get_pending_repair_tasks(plan_id)
+                _pending = _get_pending_repair_tasks(
+                    plan_id, _round_failed_vp_ids(orch, report),
+                )
                 if _pending:
                     _server.logger.warning(
                         "[Auto-Verification] Round %d: loop converged "
@@ -4051,7 +4296,9 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
             # NOT mean "no work to do"; it means "no new tasks to
             # generate". The actual executor work is whatever's still
             # pending in the DB.
-            _pending_db = _get_pending_repair_tasks(plan_id)
+            _pending_db = _get_pending_repair_tasks(
+                plan_id, _round_failed_vp_ids(orch, report),
+            )
             if _pending_db:
                 _server.logger.info(
                     "[Auto-Verification] Round %d: %d pending RP-* "
@@ -4419,7 +4666,10 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                         # tasks OR DB has pending tasks from prior
                         # rounds, run the executor.
                         _new_repair = _result.get("repair_tasks") or []
-                        _pending_in_db = _get_pending_repair_tasks(plan_id)
+                        _pending_in_db = _get_pending_repair_tasks(
+                            plan_id,
+                            _round_failed_vp_ids(_new_orch, _report),
+                        )
                         if _pending_in_db and not _new_repair:
                             _server.logger.info(
                                 "[Auto-Verification] Post-repair round "

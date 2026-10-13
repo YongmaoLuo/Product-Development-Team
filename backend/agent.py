@@ -671,6 +671,35 @@ def _is_plan_failed(tasks: list) -> bool:
 # :meth:`AutonomousAgent._breakdown_task` for the enforcement site.
 EXECUTOR_BREAKDOWN_MAX = 5
 
+# How deep the breakdown flow may nest a REPAIR task before the executor
+# stops splitting it and leaves it failed.
+#: 2026-10-13. ``EXECUTOR_BREAKDOWN_MAX`` above is dead code — its only
+#: enforcement site was :meth:`AutonomousAgent._breakdown_task`, deleted
+#: when the split path moved to the refiner, and no cap travelled with it.
+#: What is left is ``EXECUTOR_MAX_REFINEMENTS`` — a budget of 8 for the
+#: WHOLE run, shared by every failure, reset by every fresh repair
+#: execution. Neither bound is per-task and neither survives a round
+#: boundary, so a repair task that keeps failing can be split again in
+#: the next round, on the next freshly-generated row, indefinitely.
+#:
+#: That is not theoretical. ``plan_tasks`` in the live database nests
+#: three deep: ``the 2026-10-04 plan`` carries
+#: ``repair-r1-01`` → ``repair-r1-01-2`` → ``repair-r1-01-2-{1..4}``,
+#: and ``the 2026-09-26 plan`` carries
+#: ``repair-r4-01`` → ``repair-r4-01-5`` → four more. Every level
+#: re-derives the same failing fix from scratch.
+#:
+#: The value mirrors ``vp_split.DEFAULT_MAX_SPLIT_DEPTH`` ("a depth-2
+#: child that still fails can only go to repair") so the two split
+#: mechanisms speak the same number, and it counts breakdown DEPTH — the
+#: thing that actually compounds — rather than a count of refinements,
+#: which a single split can spend several of.
+#:
+#: Scoped to repair tasks on purpose: this is the one path whose
+#: breakdown budget was lost with ``_breakdown_task``, and widening it to
+#: ordinary plan tasks would change behaviour this change is not about.
+REPAIR_MAX_BREAKDOWN_DEPTH = 2
+
 # How many times one execution run may let the refiner restructure the
 # plan before it stops asking. See ``AutonomousAgent._refinement_count``
 # for why the bound is a count rather than a shape rule, and
@@ -769,6 +798,54 @@ def _compute_leaf_tasks(tasks: list[SubTask]) -> set[str]:
         if not any(other.startswith(tid + "-") for other in all_ids):
             leaves.add(tid)
     return leaves
+
+
+def _stamp_breakdown_depths(
+    effective: list,
+    current_tasks: list,
+) -> dict:
+    """Give every breakdown child its inherited ``breakdown_count``.
+
+    A child ``"40-2"`` split out of ``"40"`` inherits ``40``'s depth and
+    adds one, so a chain that keeps splitting reads 0, 1, 2 and then stops
+    (see :data:`REPAIR_MAX_BREAKDOWN_DEPTH`). Entries whose id is not a
+    breakdown child of a pre-existing task — a brand-new task the refiner
+    invented with no parent, or a sibling that merely sorts after another
+    one — are left untouched.
+
+    Mutates ``effective`` in place (the same dicts ``set_tasks`` goes on
+    to write to ``tasks.json``) and returns ``{child_id: depth}`` for the
+    ``plan_tasks`` write, which has to go through ``update_task``
+    because ``breakdown_count`` is a runtime column.
+
+    Pure bookkeeping: it changes no scheduling decision, it only records
+    a number that was previously always absent.
+    """
+    current_ids = {
+        str(t.get("id")) for t in (current_tasks or []) if t.get("id")
+    }
+    depths = {
+        str(t.get("id")): int(t.get("breakdown_count") or 0)
+        for t in (current_tasks or [])
+        if t.get("id")
+    }
+    stamped: dict = {}
+    for entry in effective or []:
+        if not isinstance(entry, dict):
+            continue
+        tid = str(entry.get("id") or "")
+        if not tid or tid in current_ids:
+            continue
+        parent, _, suffix = tid.rpartition("-")
+        # Same shape test as ``refiner_structure``'s split-parent rule:
+        # the child is exactly ``f"{parent}-{ordinal}"``.
+        if not parent or not suffix.isdigit() or parent not in current_ids:
+            continue
+        depth = depths.get(parent, 0) + 1
+        entry["breakdown_count"] = depth
+        depths[tid] = depth
+        stamped[tid] = depth
+    return stamped
 
 
 def _build_layers(tasks: list) -> list:
@@ -2128,6 +2205,19 @@ class AutonomousAgent:
                         t.status = persisted["status"]
                         if persisted.get("failure_reason") is not None:
                             t.failure_reason = persisted["failure_reason"]
+                        # 2026-10-13: ``breakdown_count`` lives only in
+                        # SQLite — ``save_tasks`` strips it from
+                        # ``tasks.json`` on every write, same as
+                        # ``status`` / ``failure_reason`` — so without
+                        # this line a breakdown child reloaded in the
+                        # NEXT executor run comes back at the model
+                        # default of 0 and
+                        # :data:`REPAIR_MAX_BREAKDOWN_DEPTH` never binds
+                        # across a round boundary. Hydrated here for the
+                        # same reason the two above are: it is the only
+                        # other copy that survives a reload.
+                        if persisted.get("breakdown_count") is not None:
+                            t.breakdown_count = persisted["breakdown_count"]
                         continue
                     # 2026-09-22 — no usable runtime row. This used to be
                     # a silent fall-through to ``pending``, which is the
@@ -6822,6 +6912,38 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     },
                 )
             return
+        # 2026-10-13 — per-task repair breakdown budget. Same shape as
+        # the run-wide cap above, one level down: a repair task that has
+        # already been split once and fails again is offered one more
+        # split; past ``REPAIR_MAX_BREAKDOWN_DEPTH`` it stays failed.
+        # See that constant for why the split has no other bound (the
+        # run-wide 8 is shared across every failure and is reset by every
+        # fresh repair execution, so it never bounds a single task — and
+        # the live database shows the result nesting three deep).
+        if (
+            is_repair_task(task)
+            and int(getattr(task, "breakdown_count", 0) or 0)
+            >= REPAIR_MAX_BREAKDOWN_DEPTH
+        ):
+            if self.logger:
+                self.logger.error(
+                    "repair_breakdown_budget_exhausted",
+                    (
+                        f"Repair task [{task.id}] failed at breakdown depth "
+                        f"{task.breakdown_count} (cap "
+                        f"{REPAIR_MAX_BREAKDOWN_DEPTH}); not splitting it "
+                        f"again. The task stays failed and the next "
+                        f"verification round decides what happens next."
+                    ),
+                    task_id=task.id,
+                    data={
+                        "plan_id": self.plan_id,
+                        "breakdown_count": task.breakdown_count,
+                        "max_depth": REPAIR_MAX_BREAKDOWN_DEPTH,
+                        "task_count": len(self.task_manager.tasks),
+                    },
+                )
+            return
         self._refinement_count += 1
 
         print("Refining task list...")
@@ -7131,6 +7253,39 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         # that keeps content-free placeholders off disk.
         before_tasks = list(self.task_manager.tasks)
 
+        # 2026-10-13: stamp the breakdown depth onto every child BEFORE
+        # either store is written, so ``tasks.json`` (``set_tasks`` below)
+        # and ``plan_tasks`` (``add_task`` in step 2b) carry the same
+        # number. This is the field ``REPAIR_MAX_BREAKDOWN_DEPTH`` reads,
+        # and until now it was written by nothing: every one of the 322
+        # ``plan_tasks`` rows in the live database reads NULL, and
+        # ``SubTask`` defaults it to 0 on load, so the budget could not
+        # have bound anything even if it had been enforced.
+        _stamped_depths = _stamp_breakdown_depths(
+            plan.effective, current_tasks_dict,
+        )
+        if _stamped_depths and self.logger:
+            try:
+                self.logger.info(
+                    "refine_breakdown_depth_stamped",
+                    (
+                        f"Stamped breakdown depth on {len(_stamped_depths)} "
+                        f"new breakdown child task(s)"
+                    ),
+                    task_id=task.id,
+                    # ``dict`` is not sliceable — an earlier ``[:50]``
+                    # here raised TypeError and the bare ``except``
+                    # below swallowed it, so the event never fired at
+                    # all. Bound the item list explicitly instead.
+                    data={
+                        "children": dict(
+                            list(_stamped_depths.items())[:50],
+                        ),
+                    },
+                )
+            except Exception:
+                pass
+
         # --- 1. tasks.json -------------------------------------------------
         # A malformed refinement must never kill the plan. Two shapes
         # reach this call (both raised from ``set_tasks``/``save_tasks``
@@ -7222,6 +7377,20 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                         task_progress_repo.add_task(
                             self.plan_id, sub_task_payload,
                         )
+                        # ``breakdown_count`` is a RUNTIME column
+                        # (``_WRITABLE_RUNTIME_COLUMNS``), so
+                        # ``add_task`` drops it from ``sub_task_payload``
+                        # without a word and the child lands at NULL —
+                        # which is exactly how all 322 rows in the live
+                        # database got there. Write it explicitly, right
+                        # after the row exists, as a partial update that
+                        # touches nothing else.
+                        depth = _stamped_depths.get(tid)
+                        if depth is not None:
+                            task_progress_repo.update_task(
+                                self.plan_id, tid,
+                                {"breakdown_count": depth},
+                            )
                     except (
                         TaskProgressConflictError,
                         TaskProgressNotFound,

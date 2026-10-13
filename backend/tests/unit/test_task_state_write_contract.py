@@ -453,6 +453,18 @@ ACKNOWLEDGED_CALL_SITES: Dict[str, str] = {
         "fields 由 task 的运行期属性逐个 `is not None` 累积 —— 按构造即部分更新",
     "verification_loop.py::_mark_task_skipped":
         "fields={'status','failure_reason','end_ts'} —— 标记跳过",
+    "verification_loop.py::_revive_failed_repair_task":
+        "fields={'status','attempt'}，且只作用于本轮失败集里 VP 仍失败、"
+        "未超重试上限、非拆分父行的 repair 行 —— status 由 failed 翻回 "
+        "pending（一次判决内幂等：翻回后同一轮再被读到就不是 failed，"
+        "不会二次计数），attempt 由 None/旧值 +1。刻意不写 end_ts / "
+        "failure_reason / commit_sha：failure_reason 是事故现场（"
+        "[API_ERROR:404] 那 31 行），复活不得抹掉它",
+    "agent.py::AutonomousAgent._apply_refiner_structure":
+        "fields={'breakdown_count'}，且只作用于刚拆出来的子行 —— 把继承来的"
+        "拆分深度补写回 DB。add_task 只写静态列、会把运行期列丢掉（全部 322 "
+        "行 breakdown_count 为 NULL 就是这么来的），所以深度必须在这里单独写。"
+        "刻意不写 status / failure_reason：拆分不改判决",
     "verification_loop.py::_reap_orphaned_in_progress_tasks":
         "fields={'status'}，且只作用于当前 status='in_progress' 的行 —— "
         "拥有者进程已死，回收为 pending。刻意不写 end_ts / failure_reason / "
