@@ -269,15 +269,20 @@ More: **[Configuration](docs/operations/configuration.md)**.
 ## How to run the tests / 如何跑测试
 
 ```bash
-# from the repository root, with backend/.venv activated — the default lane
-backend/.venv/bin/python3 -m pytest backend/tests -m unit -q
+# from the repository root, with backend/.venv activated — the unit lane
+backend/.venv/bin/python3 -m pytest backend/tests/unit -q
 
 # or via the canonical wrapper, which resolves the venv for you
 scripts/run_tests.sh
 ```
 
-`-m unit` skips the `time_sensitive`, `integration`, `e2e` and `real_model` markers;
-the missing models are satisfied by stubs the conftest installs.
+The lane is the **directory** `backend/tests/unit` (4108 tests, ~167 s serial) —
+it is what CI and the verification gate run, and unlike a marker it cannot
+drift. `-m unit` selects 4193: the same tree plus a few files outside it that
+mark themselves `unit`. Add `-n 8` to run the lane in ~40 s.
+[Tests](docs/development/testing.md) has the measurements, the reason `-n auto`
+does not work yet, and the story of how `-m unit` came to select the entire
+suite for a while.
 
 Two collection rules worth knowing: `pytest.ini` is directory-sensitive
 (from `backend/` pytest reads `backend/pytest.ini`, from the root it reads

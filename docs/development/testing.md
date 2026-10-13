@@ -8,14 +8,12 @@ fails at *collection*, not at some later, more explicable point.
 ## The lanes
 
 ```bash
-# The default CI lane. -m unit skips the time_sensitive / integration / e2e /
-# real_model markers; the missing models are satisfied by the stubs
-# backend/tests/conftest.py installs.
-backend/.venv/bin/python3 -m pytest backend/tests -m unit -q
+# The unit lane. The directory, not the marker — see the note below.
+backend/.venv/bin/python3 -m pytest backend/tests/unit -q
 
 # Integration: spawns the server and talks to it over HTTP. Needs no live
 # model, but does need a free loopback port.
-backend/.venv/bin/python3 -m pytest backend/tests -m "not time_sensitive" -q
+backend/.venv/bin/python3 -m pytest backend/tests -m integration -q
 
 # End-to-end: a full plan lifecycle through dry-run fake backends.
 # Main branch only, per the test-design decision.
@@ -24,6 +22,81 @@ backend/.venv/bin/python3 -m pytest backend/tests -m e2e -q
 # One module, loudly
 backend/.venv/bin/python3 -m pytest backend/tests/<file>.py -xvs
 ```
+
+!!! note "The marker and the directory are not the same set"
+    `tests/unit/conftest.py` auto-marks everything under that directory, and a
+    handful of files *outside* it mark themselves
+    (`tests/security/test_request_guard_rejections.py`,
+    `tests/test_server_json_cleanup.py`, …) because they are unit-level tests
+    living elsewhere. Measured on the development machine:
+
+    | selector | collected |
+    |---|---|
+    | `backend/tests/unit` — the directory; what CI and the verify gate run | **4108** |
+    | `backend/tests -m unit` — the marker | **4193** |
+
+    Prefer the directory. It is what the gate runs, and it cannot drift.
+
+    **Until the hook was scoped the marker selected 6679 — the entire suite.** A
+    subdirectory conftest's `pytest_collection_modifyitems` is a
+    **session-level** hook, so the loop in `tests/unit/conftest.py` marked
+    every test pytest had collected rather than the ones under its own
+    directory, contradicting its own docstring. That pulled in `tests/e2e/`,
+    which prompts for the keychain. `README.md` and this page both advertised
+    `-m unit` as the unit lane; the hook is now scoped, so the marker means
+    what it always claimed to.
+
+!!! warning "A marker and a directory are not the same set"
+    They overlap without being equal, for the same reason. Measured the same
+    day: `backend/tests/integration` collects 252, `-m integration` collects
+    116; `backend/tests/e2e` collects 95, `-m e2e` collects 97. The e2e set is
+    the *larger* one because `tests/e2e/test_provider_quota_wake_end_to_end.py`
+    carries no marker at all — it is inside the directory and inside no marker
+    expression, which is why CI's `-m "not e2e and …"` cannot exclude it. That
+    file sleeps through a quota window, so it costs a 300 s timeout every run
+    that reaches it.
+
+## Running in parallel
+
+`pytest-xdist` is installed in `backend/.venv`. Measured on the development
+machine (10 cores;
+the machine carried ~4 load from unrelated work throughout, so the serial
+figures are if anything pessimistic):
+
+| lane | serial | `-n` | parallel |
+|---|---|---|---|
+| `tests/unit` | 167 s | `-n 10` | **39 s** |
+| CI marker expression | 377 s | `-n 8` | **64 s** |
+
+The worker sweep on `tests/unit`: 1 → 167 s, 4 → 54 s, 6 → 41 s, 8 → 42 s,
+10 → 39 s, 12 → aborts, 18 (`-n auto`) → **aborts in 4 s**.
+
+`-n auto` is the trap here — it resolves to 18 workers on this machine and
+dies with
+
+```
+ERROR gw14 - Different tests were collected between gw2 and gw14.
+```
+
+The cause is `tests/unit/test_provider_quota_dispatch.py:_stamp()`, which
+computes `datetime.now() + 30min` **at import time** and hands the result to
+`parametrize` as an argument — so the wall-clock string *is* the test id.
+Workers that start in different seconds disagree about what they collected.
+That is also why `-n 4` is green today by luck rather than by design: nothing
+bounds how far apart the workers may start. Use an explicit count (`-n 8`),
+and treat anything above 10 as unsupported until `_stamp` stops putting the
+clock into an id.
+
+Two further hazards, recorded so the next person does not rediscover them:
+
+- **All workers share one scratch root.** `backend/tests/conftest.py` keys
+  `PDT_TEST_SESSION_ROOT` on the environment, so the xdist controller mints
+  one directory and every worker inherits it — N workers against a single
+  SQLite `state.db`. Per-test autouse fixtures mask this today; it is the
+  next thing to break once the collection race is fixed.
+- **`time_sensitive` and `perf` must stay serial.** They assert on wall-clock
+  (see the rationale in `backend/pytest.ini`), which is why `-n` belongs on
+  the command line and not in `addopts`.
 
 !!! tip "Prefer the wrapper"
     `scripts/run_tests.sh` is the canonical entry point. It resolves the

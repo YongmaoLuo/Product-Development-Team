@@ -155,6 +155,18 @@ def _killpg_tripwire_report() -> None:
 
 def pytest_sessionfinish(session, exitstatus) -> None:
     _killpg_tripwire_report()
+    # The controller's own scratch roots. A serial run has already had both
+    # removed by ``_hermetic_state_db_dir`` by the time this fires, and
+    # ``ignore_errors=True`` makes the second attempt a no-op rather than an
+    # error. Under xdist it is the only process that mints a root nobody else
+    # will close: the controller loads this module but runs no test, so no
+    # session fixture is ever instantiated in it, and its directory would
+    # otherwise be the one directory per run that survives — which is the
+    # leak the idempotency note above exists to prevent, reintroduced by the
+    # fix for it.
+    if not _XDIST_WORKER:
+        shutil.rmtree(_TEST_STATE_DB_DIR, ignore_errors=True)
+        shutil.rmtree(_LOCK_ROOT, ignore_errors=True)
 
 
 _install_killpg_tripwire()
@@ -328,8 +340,42 @@ def capacity_from_text(tmp_path, monkeypatch):
 # teardown removes is the only one that exists. An externally-set value
 # wins, which is also what lets a caller point the suite somewhere it
 # owns.
+#
+# Under xdist that key is no longer enough on its own, because the key is
+# inherited rather than per-process. The controller loads this module during
+# ``_preparse`` — before it starts any worker — so by the time the workers
+# are execnet children that copy its ``os.environ``, the variable is already
+# set and every worker reuses the controller's one directory. N processes,
+# one ``state.db``, one plans tree. Measured on ``tests/unit -n 4``: exactly
+# one scratch directory appears for the whole run, not four.
+#
+# So the key has to carry the worker id, which is what ``PYTEST_XDIST_WORKER``
+# holds (``gw0``/``gw1``/... in a worker, absent in the controller). A worker
+# therefore scopes itself to ``<root>/<worker id>`` rather than adopting the
+# root verbatim, which keeps the two halves of the contract at once: the
+# workers stop sharing one ``state.db``, and a caller who pinned the variable
+# still owns the directory they named — it is scoped per worker, not
+# discarded. Idempotency needs one more key to tell "this is the value I
+# installed" from "this is the value I inherited":
+# ``_PDT_TEST_SESSION_ROOT_OWNER`` records which process installed it, so
+#
+#   * the dotted re-import inside one worker sees its own id and reuses;
+#   * a different worker sees a different id and scopes itself separately;
+#   * a serial run, which has no worker id, mints once and reuses, exactly
+#     as the ``if`` above it always did.
+_XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER") or ""
+_SESSION_ROOT_OWNER = "_PDT_TEST_SESSION_ROOT_OWNER"
+
 if not os.environ.get("PDT_TEST_SESSION_ROOT"):
     os.environ["PDT_TEST_SESSION_ROOT"] = tempfile.mkdtemp(prefix="ac-test-state-")
+    os.environ[_SESSION_ROOT_OWNER] = ""
+elif _XDIST_WORKER and os.environ.get(_SESSION_ROOT_OWNER) != _XDIST_WORKER:
+    _WORKER_STATE_DB_DIR = (
+        Path(os.environ["PDT_TEST_SESSION_ROOT"]) / _XDIST_WORKER
+    )
+    _WORKER_STATE_DB_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ["PDT_TEST_SESSION_ROOT"] = str(_WORKER_STATE_DB_DIR)
+    os.environ[_SESSION_ROOT_OWNER] = _XDIST_WORKER
 _TEST_STATE_DB_DIR = Path(os.environ["PDT_TEST_SESSION_ROOT"])
 os.environ["PDT_STATE_DB_PATH"] = str(_TEST_STATE_DB_DIR / "state.db")
 

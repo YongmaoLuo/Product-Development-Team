@@ -7,12 +7,11 @@
 ## 各条 lane
 
 ```bash
-# 默认 CI lane。-m unit 会跳过 time_sensitive / integration / e2e / real_model 标记；
-# 缺的模型由 backend/tests/conftest.py 装的桩满足。
-backend/.venv/bin/python3 -m pytest backend/tests -m unit -q
+# 单测 lane。用目录，不用标记 —— 见下面的说明。
+backend/.venv/bin/python3 -m pytest backend/tests/unit -q
 
 # 集成：起服务并通过 HTTP 跟它说话。不需要真实模型，但需要一个空闲回环端口。
-backend/.venv/bin/python3 -m pytest backend/tests -m "not time_sensitive" -q
+backend/.venv/bin/python3 -m pytest backend/tests -m integration -q
 
 # 端到端：走 dry-run 假后端跑完整计划生命周期。按测试设计的决定，只在 main 跑。
 backend/.venv/bin/python3 -m pytest backend/tests -m e2e -q
@@ -20,6 +19,70 @@ backend/.venv/bin/python3 -m pytest backend/tests -m e2e -q
 # 单个模块，输出拉满
 backend/.venv/bin/python3 -m pytest backend/tests/<file>.py -xvs
 ```
+
+!!! note "标记和目录不是同一个集合"
+    `tests/unit/conftest.py` 会自动给该目录下的所有用例打标记，而目录**之外**还有
+    少数文件自己给自己打（`tests/security/test_request_guard_rejections.py`、
+    `tests/test_server_json_cleanup.py` 等 —— 它们是住在别处的单测层用例）。
+    两个选择器收到的条数不同：
+
+    | 选择器 | 收到 |
+    |---|---|
+    | `backend/tests/unit` —— 目录；CI 和验证门跑的就是它 | **4108** |
+    | `backend/tests -m unit` —— 标记 | **4193** |
+
+    **优先用目录。** 它是门禁跑的那条，而且不会漂。
+
+    **在那个钩子收窄作用域之前，这个标记收到的是 6679 条 —— 整个套件。** 子目录 conftest 的
+    `pytest_collection_modifyitems` 是 **session 级**钩子，所以 `tests/unit/conftest.py`
+    里那个 `items` 循环给 pytest 收到的**每一个**用例都打了标记，而不是只管自己目录
+    下的 —— 这跟它自己的 docstring 写的正相反。于是 `tests/e2e/` 被拖了进来，而它会
+    弹钥匙串。`README.md` 和本页当时都把 `-m unit` 当成单测 lane 在教；那个钩子现在
+    已经收窄，标记终于名副其实。
+
+!!! warning "标记和目录不是同一个集合（第二条）"
+    因为同样的原因，两者有交集但不相等。同一天实测：`backend/tests/integration` 收
+    252 条，`-m integration` 收 116 条；`backend/tests/e2e` 收 95 条，`-m e2e` 收 97 条。
+    e2e 那个**标记**反而更大，因为
+    `tests/e2e/test_provider_quota_wake_end_to_end.py` **一个标记都没打** ——
+    它在目录里，却不在任何标记表达式里，这就是 CI 的 `-m "not e2e and …"`
+    排不掉它的原因。那个文件会 sleep 过一整个配额窗口，所以每跑到它就要付
+    一次 300 秒超时。
+
+## 并行跑
+
+`pytest-xdist` 已经装在 `backend/.venv` 里。下面这组数字取自一台 10 核机器（跑的
+时候机器上还挂着约 4 的无关负载，所以串行那几栏只会偏悲观）：
+
+| lane | 串行 | `-n` | 并行 |
+|---|---|---|---|
+| `tests/unit` | 167 s | `-n 10` | **39 s** |
+| CI 标记表达式 | 377 s | `-n 8` | **64 s** |
+
+`tests/unit` 上的 worker 扫描：1 → 167 s，4 → 54 s，6 → 41 s，8 → 42 s，
+10 → 39 s，12 → 中止，18（`-n auto`）→ **4 秒中止**。
+
+`-n auto` 是这里的陷阱 —— 它在这台机器上解析成 18 个 worker，然后这样死掉：
+
+```
+ERROR gw14 - Different tests were collected between gw2 and gw14.
+```
+
+根因是 `tests/unit/test_provider_quota_dispatch.py:_stamp()`：它在 **import 期**算出
+`datetime.now() + 30min`，把这个结果当成 `parametrize` 的实参传进去 —— 于是那个
+墙上时间字符串**就是用例 id**。在不同秒启动的 worker 之间，它就"收集到了不同的东西"。
+这同时也是 `-n 4` 今天绿是**运气而非设计**的原因：没有任何东西限制 worker 之间能
+差多远启动。**用显式数字（`-n 8`），并且在 `_stamp` 不再往 id 里塞时钟之前，
+把 10 以上的 worker 数一律当成不受支持。**
+
+另外两个隐患，记在这里免得下一个人重新踩：
+
+- **所有 worker 共用一个 scratch root。** `backend/tests/conftest.py` 把
+  `PDT_TEST_SESSION_ROOT` 挂在环境变量上，于是 xdist 的 controller 建一个目录、
+  每个 worker 都继承它 —— N 个 worker 打同一个 SQLite `state.db`。今天靠 per-test
+  的 autouse fixture 兜住了；收集竞态一旦修好，这就是下一个要炸的地方。
+- **`time_sensitive` 和 `perf` 必须保持串行。** 它们断言的就是墙上时间（理由见
+  `backend/pytest.ini`），所以 `-n` 要写在命令行上，**不能**写进 `addopts`。
 
 !!! tip "优先用包装脚本"
     `scripts/run_tests.sh` 是规范入口。它解析 venv、把目标默认成 `backend/tests`，

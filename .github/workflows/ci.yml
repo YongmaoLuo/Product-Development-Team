@@ -1091,6 +1091,37 @@ jobs:
           # still has room to run.
           WATCHDOG_SECONDS=900
 
+          # ``-n 8`` — this lane's pytest invocation runs across 8 workers.
+          #
+          # It is a per-invocation flag on purpose. ``addopts`` in
+          # ``backend/pytest.ini`` is global, so a ``-n`` written there would
+          # reach every lane in this workflow — including
+          # ``existing-test``, whose tests assert on WALL-CLOCK parallelism
+          # contracts ("4 VPs in flight finish in 10s, not 40s"). pytest.ini
+          # says in as many words that those must have the runner to
+          # themselves; parallelising them would make the very bound they
+          # assert unmeasurable. Only the two lanes that carry the gating
+          # marker expression get it.
+          #
+          # What it costs, and what made it safe to do at all:
+          #
+          #   * every ``parametrize`` ID has to be stable across processes.
+          #     xdist aborts a run with "Different tests were collected
+          #     between gw2 and gw14" when two workers import a module in
+          #     different seconds and a wall-clock value has become a case
+          #     ID. ``tests/unit/test_provider_quota_dispatch.py`` was one
+          #     such place and now pins its IDs.
+          #   * every worker needs its OWN scratch root. The controller sets
+          #     ``PDT_TEST_SESSION_ROOT`` while loading the conftest and its
+          #     workers inherit the value, so keying the root on the variable
+          #     alone gave every worker one ``state.db``.
+          #
+          # 8 is the measured plateau, not the biggest number that boots:
+          # ``pytest tests/unit`` is 167 s serial and 39 s at ``-n 10``, and
+          # past 8 workers the curve flattens and then reverses. Sharding
+          # across 20 runner VMs has already taken the coarse-grained
+          # parallelism, so this is about the cores *inside* one VM.
+
           # --- order independence ------------------------------------------
           # Shuffle the order this shard *executes* its files in, seeded
           # from the run so it differs every time but is reproducible from
@@ -1161,6 +1192,7 @@ jobs:
           timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
             ./.venv/bin/python3 -m pytest $EXEC_ORDER \
               -m "not e2e and not integration and not time_sensitive and not perf" \
+              -n 8 \
               --cov=. \
               --cov-report= \
               --tb=short \
@@ -1462,10 +1494,24 @@ jobs:
           # killing the shard; see `backend/utils/process.py`.
           WATCHDOG_SECONDS=1500
           set +e
+          # ``-n 8``, matching the ``unit-tests`` shard it bisects. That
+          # match is the whole point of the flag here: a bisect harness that
+          # runs a *different* shape from the shard it is bisecting cannot
+          # find a bug that only the shard's shape has — which is the defect
+          # ``test_the_bisect_lane_runs_the_shape_it_bisects`` was written
+          # about when the staircase ran without ``--cov=.``. Taking it from
+          # the shard it bisects rather than from a separate judgement is
+          # what keeps that gate's promise true; if the shard's worker count
+          # changes, this line is the one that has to change with it.
+          #
+          # It carries the same two preconditions the shard's does (pinned
+          # ``parametrize`` IDs, one scratch root per worker) because they
+          # are properties of the suite, not of the lane.
           COVERAGE_FILE=.coverage.staircase-${{ matrix.shard }} \
           timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
             ./.venv/bin/python3 -m pytest $TARGETS \
               -m "not e2e and not integration and not time_sensitive and not perf" \
+              -n 8 \
               --cov=. \
               --cov-report= \
               --tb=short \
