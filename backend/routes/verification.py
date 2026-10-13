@@ -594,7 +594,10 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
                 tool_type, cwd=str(project_dir), scene="verification",
                 logger=_server._verification_event_logger(plan_dir),
             )
-            max_parallel = req.max_parallel if req and req.max_parallel is not None else _server._resolve_max_parallel(coding_tool)
+            # ``req.max_parallel`` is accepted and **ignored** — see
+            # ``StartVerificationRequest.max_parallel``. The round's
+            # width is derived from the live provider fleet, so there
+            # is no longer a number here for a request body to set.
             # Wire the SQLite VerificationRepository so the agent can
             # persist Phase 1 execution envelopes to
             # ``plan_verification.execution_results`` (task #3.5). The
@@ -602,7 +605,7 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
             # ``_open_verification_state``.
             orch = _server.VerificationOrchestrator(
                 plan_dir, project_dir, coding_tool=coding_tool,
-                max_parallel=max_parallel, verif_repo=verification,
+                verif_repo=verification,
             )
             _server._verification_state[plan_id]["orchestrator"] = orch
             ps = _server.PlanState(plan_dir)

@@ -628,6 +628,14 @@ DEFAULT_MAX_VERIFICATION_ROUNDS = 4
 def _resolve_max_parallel(coding_tool) -> int:
     """Return the VP concurrency cap based on the plan's primary provider.
 
+    DEPRECATED — no production caller remains. The verification round's
+    width comes from :func:`verification_agent._verification_vp_capacity`,
+    which sums what every provider in the scene's own chain can serve
+    right now, rather than what the *first* provider's static cap says.
+    Kept, with its tests, because it still answers a true question
+    ("what does the primary provider declare?") and deleting it would be
+    a wider change than retiring it from the width decision.
+
     Resolution order:
       1. ``coding_tool.provider_priority[0]`` — the first provider in
          the priority list is treated as the primary provider for the
@@ -1421,7 +1429,21 @@ class StartVerificationRequest(BaseModel):
     auto_fix: Optional[bool] = True
     tool: Optional[str] = None
     force: Optional[bool] = False  # If True, re-run verification even if report exists
-    max_parallel: Optional[int] = 1  # VP-level concurrency (1=serial, 0=unlimited)
+    #: DEPRECATED — accepted, ignored, and on its way out.
+    #:
+    #: This field used to set how many verification points a round ran
+    #: at once. It no longer does: the width is derived from the live
+    #: provider fleet at every bind (``verification_agent._VpCapacityGate``),
+    #: so there is nothing left for a request body to pin. A body that
+    #: still sends it keeps being accepted rather than 422-ing, because
+    #: a stored curl/script from before the change should not break a
+    #: running plan — but the value is not read.
+    #:
+    #: No producer existed in this repo even when it *was* read (no
+    #: frontend, script, or test sends it), so dropping it is a
+    #: compatibility question about operators outside the repo, not
+    #: about callers inside it.
+    max_parallel: Optional[int] = 1
 
 
 class TaskDeltaRequest(BaseModel):

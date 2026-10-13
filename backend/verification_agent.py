@@ -515,7 +515,6 @@ class Orchestrator:
 
     def __init__(self, plan_dir: Path, project_dir: Path,
                  coding_tool: Optional[CodingTool] = None,
-                 max_parallel: int = 1,
                  verif_repo: Optional[Any] = None,
                  vp_capacity_resolver: Optional[Callable[[], Optional[int]]] = None):
         """
@@ -525,7 +524,6 @@ class Orchestrator:
             plan_dir: Plan directory containing PRD/arch/test documents
             project_dir: Project directory to verify
             coding_tool: Optional coding tool (defaults to ClaudeCodingTool)
-            max_parallel: VP-level concurrency for VerificationExecutor
             verif_repo: Optional VerificationRepository handle. When
                 provided, the per-VP verdict callback routes through
                 ``verif_repo.append_verdict`` (single BEGIN IMMEDIATE +
@@ -541,11 +539,15 @@ class Orchestrator:
                 it — and because "no bound is derivable" is a real
                 answer, which the fallback path has to be exercised
                 against.
+
+                **This is the round's width.** There is no ``max_parallel``
+                argument any more, and deliberately so: it was the one
+                thing two construction sites could disagree about, and
+                they did (see :meth:`_build_vp_capacity_gate`).
         """
         self.plan_dir = Path(plan_dir)
         self.project_dir = Path(project_dir)
         self.coding_tool = coding_tool or ClaudeCodingTool()
-        self.max_parallel = max_parallel
         self.vp_capacity_resolver = (
             vp_capacity_resolver or _verification_vp_capacity
         )
@@ -713,6 +715,53 @@ class Orchestrator:
         if self._last_vp_capacity is not None:
             return self._last_vp_capacity
         return self._live_vp_capacity()
+
+    def _build_vp_capacity_gate(self) -> "_VpCapacityGate":
+        """The width this round runs at, as a gate that re-reads it.
+
+        The live verification path's answer to "how many VPs at once",
+        and the reason the round's width is no longer an ``int`` that
+        two call sites can disagree about. It used to be: the auto loop
+        resolved one (``_resolve_max_parallel`` → 5) and the post-repair
+        re-entry took a class default of ``1``, so the same plan ran its
+        repair round a fifth as wide as its first round — 87ms apart on
+        the same machine, same providers, same plan. Nothing about the
+        second round's work was smaller; only the number that reached it
+        was.
+
+        So the width is derived here, once, by every caller, and read
+        fresh at each bind by :class:`_VpCapacityGate` — including the
+        three seconds into a round where a provider's 5-hour window has
+        closed and the fleet it can serve has shrunk.
+
+        Two readers, in the order :class:`_VpCapacityGate` tries them:
+
+          * :attr:`vp_capacity_resolver` — the live scene. This is the
+            width whenever the verification chain resolves at all.
+          * ``parallelism_cap`` — the operator's declared fallback,
+            reached only when nothing is derivable (CC Switch
+            unreachable, no tier matching, no live provider rows).
+            ``max(1, ...)`` because a declared cap of ``0`` must not
+            become a gate that admits nobody: the scene's own answer to
+            "every provider shut" is ``0`` and that is a deliberate
+            reading of the meters, but a *fallback* of ``0`` would be a
+            config typo silently parking the whole plan.
+
+        Mirrors the group gate :meth:`_execute_group` builds, on purpose:
+        one rule for "how wide", two call sites that cannot drift.
+        """
+        gate = _VpCapacityGate(
+            self.vp_capacity_resolver,
+            lambda: max(1, int(self.timeout_policy.parallelism_cap)),
+        )
+        # Record what this round is sized from, so the profile can
+        # report the width that actually ran instead of the declared
+        # cap that did not. Called once, here, because that is the
+        # decision the report is describing — the gate then re-reads
+        # itself during the round without re-opening the question of
+        # which policy was in force.
+        self._note_vp_capacity(gate.capacity())
+        return gate
 
     def _normalize_service_declarations(self, plan_data: dict) -> dict:
         """Parse + validate the plan's ``services`` block and annotate
@@ -4241,15 +4290,19 @@ class Orchestrator:
         # ordering, and short-circuit all live on the executor.
         try:
             executor = self._build_verification_executor(plan_data)
+            # The round's width is derived from the live provider fleet
+            # and re-read at every bind — see ``_build_vp_capacity_gate``
+            # for why this is not an int that each caller supplies.
+            gate = self._build_vp_capacity_gate()
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
-                asyncio.run(executor.run(max_parallel=self.max_parallel))
+                asyncio.run(executor.run(gate=gate))
             else:
                 # Loop is running (e.g. pytest-asyncio test).
                 import nest_asyncio  # type: ignore
                 nest_asyncio.apply()
-                asyncio.run(executor.run(max_parallel=self.max_parallel))
+                asyncio.run(executor.run(gate=gate))
             execution_results = self._build_execution_results_from_executor(
                 plan_data, executor
             )

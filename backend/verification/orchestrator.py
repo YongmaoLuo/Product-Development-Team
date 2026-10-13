@@ -52,17 +52,19 @@ class VerificationOrchestrator:
         plan_dir: Path,
         project_dir: Path,
         coding_tool: Optional[CodingTool] = None,
-        max_parallel: int = 1,
         verif_repo: Optional[Any] = None,
     ):
         self.plan_dir = Path(plan_dir)
         self.project_dir = Path(project_dir)
         self.plan_state = PlanState(self.plan_dir)
         self.coding_tool = coding_tool or ClaudeCodingTool()
-        self.max_parallel = max_parallel
+        # No ``max_parallel``. The agent derives the round's width from
+        # the live provider fleet (``_build_vp_capacity_gate``), so every
+        # orchestrator — including the fresh one the post-repair callback
+        # builds in ``verification_loop`` — runs the same width by
+        # construction rather than by remembering what to pass.
         self.verification_agent = VerificationAgent(
             self.plan_dir, self.project_dir, self.coding_tool,
-            max_parallel=max_parallel,
             verif_repo=verif_repo,
         )
         self.repair_generator = RepairTaskGenerator(

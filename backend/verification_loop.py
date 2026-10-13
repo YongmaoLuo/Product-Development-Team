@@ -3862,7 +3862,6 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
             tool, cwd=str(project_dir), scene="verification",
             logger=_verification_event_logger(plan_dir),
         )
-        max_parallel = _server._resolve_max_parallel(coding_tool)
         # Wire the SQLite VerificationRepository so the agent can
         # persist Phase 1 execution envelopes to
         # ``plan_verification.execution_results`` (task #3.5).
@@ -3876,7 +3875,7 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
             verif_repo = None
         orch = _server.VerificationOrchestrator(
             plan_dir, project_dir, coding_tool=coding_tool,
-            max_parallel=max_parallel, verif_repo=verif_repo,
+            verif_repo=verif_repo,
         )
         v_state = _server._verification_state.get(plan_id)
         if v_state:

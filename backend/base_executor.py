@@ -323,7 +323,7 @@ class BaseExecutor(ABC):
     # Shared scheduling logic
     # ------------------------------------------------------------------
 
-    async def run(self, max_parallel: int = 1) -> None:
+    async def run(self, max_parallel: int = 1, *, gate: Any = None) -> None:
         """Drive the plan through to completion, layer by layer.
 
         Algorithm:
@@ -355,6 +355,31 @@ class BaseExecutor(ABC):
             max_parallel: Maximum number of items to run concurrently
                 within a single layer.  ``1`` means serial (the old
                 default); ``0`` or negative means unlimited.
+
+                **Superseded by ``gate`` on the verification path.**
+                ``max_parallel`` fixes a width once, here, and every
+                item in every layer of the run then has to live with it
+                however wrong it goes: a 5-typed-in number is not a
+                description of what the providers are serving this
+                second. ``gate`` replaces that with an object whose
+                width is asked for at every bind, and it wins whenever
+                it is supplied — ``max_parallel`` is read only to build
+                the fixed-width fallback for a caller that has no gate.
+            gate: Optional concurrency gate — anything with
+                ``await acquire()`` and ``release()``, which is both
+                :class:`asyncio.Semaphore` and
+                ``verification_agent._VpCapacityGate``. Duck-typed on
+                purpose: this base class knows nothing about provider
+                capacity, and the gate that *does* lives one layer up so
+                a change to how a width is derived does not have to
+                reach in here.
+
+                The gate is created once per ``run`` and shared by every
+                layer, exactly where the semaphore used to be built. That
+                scope is the claim being made: the width bounds the
+                round, not the layer, so a gate built per layer would
+                hand out a fresh budget at every layer boundary and
+                reset its own ``in_flight`` each time.
         """
         items = self._build_items_from_plan()
 
@@ -381,7 +406,13 @@ class BaseExecutor(ABC):
         # Filter out empty layers (pure cycles etc.).
         layers = [layer for layer in layers if layer]
 
-        semaphore = asyncio.Semaphore(max_parallel) if max_parallel > 0 else None
+        # One gate per run, shared by every layer — see the ``gate``
+        # argument's note on scope. A supplied gate replaces the fixed
+        # semaphore outright rather than being intersected with it: a
+        # derived width that is then clamped by a typed-in number is the
+        # same hard cap this replaced, only with extra steps.
+        if gate is None:
+            gate = asyncio.Semaphore(max_parallel) if max_parallel > 0 else None
 
         for layer_idx, layer in enumerate(layers):
             # (a) Short-circuit check
@@ -395,7 +426,7 @@ class BaseExecutor(ABC):
 
             # (b) Execute layer concurrently
             coros = [
-                self._execute_one_item(it, semaphore)
+                self._execute_one_item(it, gate)
                 for it in layer
             ]
             await asyncio.gather(*coros, return_exceptions=True)
@@ -414,9 +445,18 @@ class BaseExecutor(ABC):
     async def _execute_one_item(
         self,
         item: Dict[str, Any],
-        semaphore: Optional[asyncio.Semaphore],
+        gate: Any = None,
     ) -> Dict[str, Any]:
-        """Execute a single item through the runner, with optional semaphore."""
+        """Execute a single item through the runner, behind an optional gate.
+
+        ``gate`` is the ``acquire()``/``release()`` protocol, so the
+        fixed-width ``asyncio.Semaphore`` and the live-width
+        ``_VpCapacityGate`` are the same call site. The ``finally`` is
+        the load-bearing part: a runner that raises is caught inside
+        ``_run`` and turned into a result, but a cancellation lands
+        between ``acquire`` and ``_run``, and a gate left held by a
+        cancelled item shrinks the round by one slot every time.
+        """
         item_id = self._derive_item_id(item)
 
         async def _run() -> Dict[str, Any]:
@@ -437,9 +477,12 @@ class BaseExecutor(ABC):
             self._save_progress()
             return result
 
-        if semaphore is not None:
-            async with semaphore:
+        if gate is not None:
+            await gate.acquire()
+            try:
                 return await _run()
+            finally:
+                gate.release()
         return await _run()
 
     def _build_items_from_plan(self) -> List[Dict[str, Any]]:
