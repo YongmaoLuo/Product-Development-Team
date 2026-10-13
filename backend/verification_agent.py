@@ -4354,8 +4354,23 @@ class Orchestrator:
             # wrapped in try/except so an unexpected error in the
             # freshness path never blocks VP execution; the operator
             # sees the warning in stderr instead.
+            #
+            # 2026-10-14（事件循环不再被重建冻死）：the two blocking calls
+            # here — ``check_binary_freshness`` (stat/git over the whole
+            # project) and ``attempt_intelligent_rebuild`` (fast-path
+            # ``cargo build`` + an LLM rebuild sub-agent that can run for
+            # minutes) — are dispatched through ``asyncio.to_thread``.
+            # This closure runs on the round's single event loop
+            # (``run_full_verification`` → ``asyncio.run(executor.run())``
+            # → ``BaseExecutor._execute_one_item``), so a synchronous call
+            # here froze EVERY sibling VP: one VP waiting on a rebuild
+            # stalled the whole round for as long as the build took
+            # (2026-10-13 CC-Switch plan: 86 minutes of zero log output,
+            # then the watchdog failed the round). The audit logging stays
+            # on the loop so the event ordering is unchanged.
             try:
-                freshness = check_binary_freshness(
+                freshness = await asyncio.to_thread(
+                    check_binary_freshness,
                     self.project_dir, cache=self._freshness_cache,
                 )
                 if freshness.is_stale:
@@ -4381,7 +4396,8 @@ class Orchestrator:
                     # ``rebuild_result.success`` is trustworthy.
                     from binary_rebuild_agent import attempt_intelligent_rebuild
                     from sub_agent_registry import sub_agent_registry
-                    rebuild_result = attempt_intelligent_rebuild(
+                    rebuild_result = await asyncio.to_thread(
+                        attempt_intelligent_rebuild,
                         self.project_dir,
                         freshness,
                         coding_tool=self.coding_tool,
@@ -4390,7 +4406,8 @@ class Orchestrator:
                         registry=sub_agent_registry,
                     )
                     if rebuild_result.success:
-                        freshness = check_binary_freshness(
+                        freshness = await asyncio.to_thread(
+                            check_binary_freshness,
                             self.project_dir, cache=self._freshness_cache,
                         )
                     if freshness.is_stale:
@@ -4526,10 +4543,11 @@ class Orchestrator:
     #
     # Two related entry points on this class:
     #
-    # 1. ``_binary_freshness_pre_check`` — runs synchronously in
-    #    ``_sub_agent_runner`` (above) BEFORE every VP. Returns the
-    #    ``FreshnessReport`` so the caller can decide to BLOCK on
-    #    a stale result.
+    # 1. ``_binary_freshness_pre_check`` — runs in ``_sub_agent_runner``
+    #    (above) BEFORE every VP, with its blocking calls dispatched via
+    #    ``asyncio.to_thread`` so the round's event loop keeps serving
+    #    the sibling VPs. Returns the ``FreshnessReport`` so the caller
+    #    can decide to BLOCK on a stale result.
     #
     # 2. ``_append_binary_freshness_result`` — the TDD-contract
     #    surface that mutates an existing ``verification_report.json``
