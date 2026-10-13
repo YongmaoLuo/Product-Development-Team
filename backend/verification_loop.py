@@ -1504,6 +1504,17 @@ def _lazy_check_sub_agents() -> None:
     containing ``SubAgentHandle``s with a ``scoped_tool`` reference the
     watchdog can reach into to kill the underlying ``Popen``.
 
+    Only sub-agents that have a subprocess are in scope. A verification
+    point asleep on a closed quota window is filtered out inside
+    :meth:`SubAgentRegistry.find_stale`, before this function sees it:
+    such a point has no process to kill, no output to read, and no age
+    that means anything, and letting it through would both spend the
+    kill path on nothing and discard the handle that protects the
+    process which does start once the window reopens. A wait that long
+    is the provider's schedule, not a stall — the quota watchdog keeps
+    probing it without a ceiling (see ``backend/quota_watchdog.py``),
+    and this sweep is for the ones it cannot help.
+
     Threshold is loaded from ``SUB_AGENT_STALE_THRESHOLD_SEC`` env var
     at registry import time (default 1200s). Operators should not tune
     this to *less* than ``HARD_WALL_CLOCK_CAP_SECONDS`` (3600) —
@@ -1516,15 +1527,21 @@ def _lazy_check_sub_agents() -> None:
         return
     for handle in stale:
         try:
-            # 2026-08-26: second-chance liveness check — a long-running
-            # sub-agent (e.g. pytest verification re-running the suite
-            # inside one attempt) only calls ``mark_progress`` at stage
-            # transitions, so ``last_progress_ts`` can age past the
-            # threshold even while the sub-agent is actively streaming
-            # stdout. Read ``scoped_tool._last_output_ts`` (updated on
-            # every stdout line) and skip the kill if it's still fresh.
-            # Without this, the watchdog killed healthy 12-minute pytest
-            # runs at the 20-minute mark.
+            # Second-chance liveness check — a long-running sub-agent
+            # (e.g. pytest verification re-running the suite inside one
+            # attempt) only calls ``mark_progress`` at stage transitions,
+            # so ``last_progress_ts`` can age past the threshold even
+            # while the sub-agent is actively streaming stdout. Read
+            # ``scoped_tool._last_output_ts`` (updated on every stdout
+            # line) and skip the kill if it's still fresh. Without this,
+            # the watchdog killed healthy 12-minute pytest runs at the
+            # 20-minute mark.
+            #
+            # A ``None`` there means the subprocess has produced nothing
+            # at all this call. That is either a call that has only just
+            # started or a dispatch parked on a quota window — and the
+            # parked case is already gone, filtered upstream, because it
+            # is the one with no process behind it.
             scoped_tool = getattr(handle, "scoped_tool", None)
             if scoped_tool is not None:
                 last_output = getattr(scoped_tool, "_last_output_ts", None)

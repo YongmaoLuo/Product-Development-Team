@@ -1219,12 +1219,15 @@ def test_query_returns_str_from_interactive_tuple(mock_popen):
 
 @patch("coding_tool.ClaudeCodingTool._check_provider_availability")
 @patch("coding_tool.subprocess.Popen")
-def test_query_interactive_session_id_is_none(mock_popen, mock_check_provider):
-    """query() passes session_id=None (no resume) to interactive on each call.
+def test_query_interactive_pins_a_session_id_and_never_resumes(
+    mock_popen, mock_check_provider
+):
+    """A first attempt pins its own session id, and does not resume one.
 
-    query() is a one-shot call: there is no caller that needs to resume a
-    conversation across calls. Every call uses a fresh session so provider
-    failures do not pollute prior history.
+    The id has to be ours: a CLI-chosen id is never handed back on the
+    failure path, so a provider switch would have nothing to resume. What
+    must NOT appear is ``--resume`` — this is a new conversation, not a
+    re-opened one.
     """
     mock_check_provider.return_value = (
         True,
@@ -1247,12 +1250,19 @@ def test_query_interactive_session_id_is_none(mock_popen, mock_check_provider):
     tool = ClaudeCodingTool()
     tool.query("hello")
 
-    # The cmd line should NOT include --resume / --session-id (query() is
-    # a fresh session per call).
     call_args = mock_popen.call_args
     cmd = call_args[1]["args"] if "args" in call_args[1] else call_args[0][0]
     assert "--resume" not in cmd
-    assert "--session-id" not in cmd
+    assert "--session-id" in cmd, (
+        "the dispatch pins the id of the session it opens so a provider "
+        "switch has something to resume"
+    )
+    pinned = cmd[cmd.index("--session-id") + 1]
+    # ``--session-id`` rejects the undashed uuid4().hex form
+    # ("Invalid session ID"); only the 8-4-4-4-12 form is accepted.
+    assert re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", pinned
+    ), f"--session-id {pinned!r} is not the dashed uuid the CLI accepts"
 
 
 @patch("coding_tool.subprocess.Popen")
@@ -1318,13 +1328,22 @@ def test_query_with_retry_method_removed():
 
 @patch("coding_tool.ClaudeCodingTool._check_provider_availability")
 @patch("coding_tool.subprocess.Popen")
-def test_query_timeout_fallback_uses_new_session(mock_popen, mock_check_provider):
-    """On timeout, query() retries with a fresh subprocess (no session resume).
+def test_query_timeout_fallback_resumes_the_same_session(
+    mock_popen, mock_check_provider
+):
+    """On timeout, query() retries by RESUMING the session that timed out.
 
-    M1 path: the timeout-driven provider fallback spawns a new claude
-    process, NOT ``--resume`` of the previous session. This avoids
-    contaminating the new provider's conversation with whatever the
-    timed-out provider already emitted.
+    M1 path: the timeout-driven provider fallback used to spawn a new
+    claude process with a brand-new session, which re-sent the whole
+    prompt and paid for the sub-agent's work so far twice. It now re-opens
+    the session the timed-out attempt was using, so the retry continues
+    instead of restarting.
+
+    The cost is deliberate and worth stating: the resumed conversation
+    carries the previous provider's turns, so the next provider does read
+    them. That is inherent to continuing a session across a provider
+    switch, and it is what makes the work salvageable. Provider selection
+    is still re-decided for the retry — only the conversation is shared.
     """
     mock_check_provider.return_value = (False, {})
 
@@ -1367,8 +1386,19 @@ def test_query_timeout_fallback_uses_new_session(mock_popen, mock_check_provider
             result = tool.query("hello", timeout=10)
         assert result == "fallback-ok"
         assert call_count["n"] == 2
+        first_kwargs = fake_mock.call_args_list[0].kwargs
         second_kwargs = fake_mock.call_args_list[1].kwargs
-        assert not second_kwargs.get("resume", False) or second_kwargs.get("session_id") is None
+        assert first_kwargs.get("resume") is False, (
+            "the first attempt opens a session, it does not resume one"
+        )
+        assert second_kwargs.get("resume") is True, (
+            "the provider switch must re-open the session the timed-out "
+            "attempt was using, not start a new one"
+        )
+        assert second_kwargs.get("session_id") == first_kwargs.get("session_id"), (
+            "it must resume THAT session — a new --session-id restarts the "
+            "task from nothing and re-pays for the work already done"
+        )
 
 
 @patch("coding_tool.ClaudeCodingTool._check_provider_availability")
@@ -1409,8 +1439,17 @@ def test_query_api_error_fallback_uses_new_session(mock_popen, mock_check_provid
         result = tool.query("hello")
     assert result == "fallback-ok"
     assert call_count["n"] == 2
+    first_kwargs = fake_mock.call_args_list[0].kwargs
     second_kwargs = fake_mock.call_args_list[1].kwargs
-    assert not second_kwargs.get("resume", False) or second_kwargs.get("session_id") is None
+    assert second_kwargs.get("resume") is False, (
+        "a provider that errored out never ran the turn, so there is no "
+        "conversation worth continuing — unlike a timeout, this retry "
+        "starts fresh"
+    )
+    assert second_kwargs.get("session_id") != first_kwargs.get("session_id"), (
+        "the fresh attempt needs its own id; re-pinning the failed "
+        "attempt's id is not a new session"
+    )
 
 
 

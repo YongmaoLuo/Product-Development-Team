@@ -245,7 +245,7 @@ def _load_provider_info(
         CCSwitchError,
         get_provider,
     )
-    from provider_order import load_provider_5h_usage
+    from provider_order import load_provider_5h_usage, load_provider_quota_map
 
     if tracker is None:
         # Defensive fallback: a caller that omits ``tracker`` (e.g. an
@@ -257,6 +257,22 @@ def _load_provider_info(
         now = datetime.now()
 
     usage_map = load_provider_5h_usage()
+    try:
+        quota_map = load_provider_quota_map()
+    except Exception:
+        # Fail-open, like the file reader beside it: an unreadable quota
+        # source must not stop a dispatch, only stop it being *informed*
+        # by one. The refusal a genuinely empty provider returns is
+        # caught at dispatch time instead.
+        quota_map = {}
+    from dynamic_provider_concurrency import (
+        compute_dynamic_limit,
+        get_shared_cooldown,
+        provider_headroom_pct,
+        quota_allows_dispatch,
+    )
+
+    cooldown = get_shared_cooldown()
     # Walk the chain manually so a candidate with capacity but no CC
     # Switch DB row falls through to the next eligible provider. This
     # preserves the legacy "no config = skip" semantic at the
@@ -265,10 +281,21 @@ def _load_provider_info(
         # 1. ``parent`` is the caller's explicit fallback; never pick it.
         if name == "parent":
             continue
-        # 2. Dynamic capacity: a provider must have spare room under
-        #    its 5h-derived cap to be eligible.
-        remaining_pct = usage_map.get(name, 100.0)
-        from dynamic_provider_concurrency import compute_dynamic_limit
+        # 2. The live quota reading: an affirmative "no budget for this
+        #    window" disqualifies the provider however much local room
+        #    it has. A provider the reading says nothing about stays in.
+        if not quota_allows_dispatch(quota_map.get(name)):
+            continue
+        # 3. A refusal earlier in this run parks the provider; it is
+        #    reachable and configured, so nothing below would notice.
+        if cooldown.is_parked(name):
+            continue
+        # 4. Dynamic capacity: a provider must have spare room under
+        #    its quota-derived cap to be eligible. The live reading
+        #    supplies the percentage when it has one — it is the only
+        #    source that knows about the weekly window and about a
+        #    currency balance — and the legacy map covers the rest.
+        remaining_pct = provider_headroom_pct(name, usage_map, quota_map)
 
         # The cap comes from the rules in ``provider_capacity.yaml``,
         # matched case-insensitively against the name as the chain spells
