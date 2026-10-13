@@ -7122,6 +7122,38 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
             task_dict, self._TERMINAL_REPAIR_TASK_GROUP_PREFIX,
         )
 
+    def _repair_failed_vp_map(self) -> Dict[str, str]:
+        """``{task_id: failed_vp_id}`` for this plan's repair rows.
+
+        2026-10-13. Feeds :func:`refiner_structure.inherit_failed_vp` so
+        a breakdown child takes over the ``failed_vp_id`` of the repair
+        task it was split from — see that function for why the column has
+        to be fetched here rather than read off ``current_tasks``.
+
+        Scoped to the repair task group on purpose: the only consumers are
+        protected split parents, and every row in the live database that
+        carries a ``failed_vp_id`` is a ``repair-*`` row.
+
+        Best-effort, like every other read on this path: ``{}`` on any
+        failure leaves the pre-2026-10-13 behaviour (no inheritance), and
+        a database hiccup must never cost the refinement itself.
+        """
+        if not self.plan_id:
+            return {}
+        try:
+            repo = self._get_task_progress_repository()
+            out: Dict[str, str] = {}
+            for entry in repo.iter_by_task_group_prefix(
+                self.plan_id, self._TERMINAL_REPAIR_TASK_GROUP_PREFIX,
+            ):
+                vp_id = str(entry.get("failed_vp_id") or "").strip()
+                tid = entry.get("id")
+                if vp_id and tid:
+                    out[str(tid)] = vp_id
+            return out
+        except Exception:  # noqa: BLE001 — see the docstring
+            return {}
+
     def _apply_refiner_structure(
         self,
         current_tasks_dict: List[Dict[str, Any]],
@@ -7215,13 +7247,55 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 )
             return False
 
+        # 2026-10-13: a breakdown child inherits its parent's
+        # ``failed_vp_id``. The parent row is deleted a few lines below,
+        # and that column lives only in ``plan_tasks`` — ``SubTask`` has
+        # no such field and ``TaskManager._STATIC_TASK_FIELDS`` never
+        # carried one — so the fact has to be read out of the database
+        # BEFORE the plan is computed, not recovered from
+        # ``current_tasks_dict`` inside it.
+        #
+        # Why it matters: ``verification_loop._get_pending_repair_tasks``
+        # re-queues a ``failed`` repair row only while its VP is still
+        # failing this round. All 24 breakdown children in the live
+        # database read ``failed_vp_id IS NULL``, so a child that failed
+        # was stranded the same way the deleted parent was — even though
+        # the child's own description names the VP it is working on.
+        _failed_vp_by_task_id = self._repair_failed_vp_map()
+
         plan = plan_refiner_structure(
             current_tasks_dict,
             updated_tasks,
             self._TERMINAL_REPAIR_TASK_GROUP_PREFIX,
+            _failed_vp_by_task_id,
         )
         if plan.is_noop:
             return True
+
+        # Surface what the children inherited: it is the difference
+        # between "this split produced runnable children" and "it
+        # produced orphans", and it is invisible in the plan delta.
+        _added = set(plan.added_ids)
+        _inherited = {
+            str(e.get("id")): str(e.get("failed_vp_id"))
+            for e in plan.effective
+            if str(e.get("id")) in _added and e.get("failed_vp_id")
+        }
+        if _inherited and self.logger is not None:
+            try:
+                self.logger.info(
+                    "refine_breakdown_failed_vp_inherited",
+                    (
+                        f"{len(_inherited)} breakdown child task(s) "
+                        f"inherited the failed_vp_id of the repair task "
+                        f"they were split from; a child that fails is "
+                        f"re-queued while that VP still fails"
+                    ),
+                    task_id=task.id,
+                    data={"inherited": dict(list(_inherited.items())[:50])},
+                )
+            except Exception:
+                pass
 
         # 2026-10-11: surface the judge-preservation outcome up front.
         #

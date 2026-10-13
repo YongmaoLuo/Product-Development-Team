@@ -80,6 +80,9 @@ class _StubAgent:
         AutonomousAgent._TERMINAL_REPAIR_TASK_GROUP_PREFIX
     )
     _apply_refiner_structure = AutonomousAgent._apply_refiner_structure
+    # 2026-10-13: called by the writer to build the ``failed_vp_by_task_id``
+    # a breakdown child inherits. Bound so this host stays a host.
+    _repair_failed_vp_map = AutonomousAgent._repair_failed_vp_map
     _is_refiner_protected = AutonomousAgent._is_refiner_protected
     _persist_task_status = AutonomousAgent._persist_task_status
 

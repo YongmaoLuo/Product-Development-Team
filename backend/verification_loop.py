@@ -3344,12 +3344,15 @@ def _get_pending_repair_tasks(
         hand).
 
         Rows whose ``failed_vp_id`` is NULL are never revived — there is
-        no VP to test them against. That is not hypothetical: the
-        breakdown children inherit no ``failed_vp_id`` (``repair-r1-01-1``
-        in the 2026-10-12 production plan reads NULL), so
-        when a child fails it stays failed and the contract's own rule
-        strands it the same way it used to strand the parents. Called out
-        in the 2026-10-13 report rather than silently widened here.
+        no VP to test them against. The rule is unchanged by
+        ``refiner_structure.inherit_failed_vp`` (2026-10-13): a breakdown
+        child now inherits the VP of the repair task it was split from,
+        so it can be revived at all. What still reads NULL is every child
+        written before that change — all 24 of them in the live database,
+        e.g. ``repair-r1-01-1`` in
+        the 2026-10-12 production plan — and nothing
+        backfills those, so this exclusion is the load-bearing rule for
+        them, not a formality.
     """
     try:
         from state_machine.db.connection import open as _open_db

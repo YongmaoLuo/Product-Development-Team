@@ -205,8 +205,17 @@ def test_no_failure_set_disables_revival(state_db):
 
 
 def test_row_with_no_failed_vp_id_is_never_revived(state_db):
-    """Breakdown children carry no ``failed_vp_id`` — there is no VP to
-    test them against, so the rule is inert for them."""
+    """The rule stands on its own: no VP, no verdict to test against.
+
+    The docstring here used to justify itself with "breakdown children
+    carry no ``failed_vp_id``". They stopped being that on 2026-10-13 —
+    ``refiner_structure.inherit_failed_vp`` gives a breakdown child the
+    VP of the repair task it was split from — so the justification is
+    gone and the rule is unchanged. What still lands here is every row
+    written before that change: all 24 breakdown children in the live
+    database still read NULL, and nothing backfills them.
+    See ``tests/unit/test_breakdown_inherits_failed_vp.py``.
+    """
     add_repair(state_db, "repair-r1-01-1", status="failed", vp=None,
                round_n=None, failure_reason="empty_diff_no_changes")
 
