@@ -66,12 +66,21 @@ keeps its config elsewhere does not need to drop a file into the repo root:
 |---|---|
 | round budget | how many verify → repair → re-verify rounds may run |
 | per-VP timeouts | how long one verification point may take |
-| `parallelism_cap` | one method-group's own fan-out |
+| `parallelism_cap` | **fallback** width — only when nothing is derivable |
 
-`parallelism_cap` is **not** the fleet ceiling. Groups run concurrently, so
-per-group caps multiply; the real limit is a `plan_semaphore` created once
-per round and shared by every group. See
-[Verification](../architecture/verification.md).
+The width a verification round actually runs at is **derived from the
+providers**, not read from this file: the sum over the verification scene's
+own chain of each provider's declared cap (`provider_capacity.yaml`) scaled
+by how much of its 5-hour window is left, using the same quota payload the
+dispatch path is handed. It is re-read every time the gate binds, so a
+window that closes mid-round shrinks the fleet while the round runs.
+
+`parallelism_cap` applies in exactly one case: the verification scene's chain
+cannot be resolved at all. It is deliberately **not** a "nothing available →
+run N" rule — a measured `0` is a real answer from the meters and is used as
+one, so a fleet that is entirely shut admits nothing.
+
+See [Verification](../architecture/verification.md).
 
 ## Credentials
 
