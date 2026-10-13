@@ -1493,12 +1493,35 @@ _VERIFICATION_ACTIVITY_LABELS = {
     "summarizing": "📊 正在汇总本轮结果",
 }
 
+#: How much of a VP title survives into an activity label. Titles run to
+#: several clauses, and the label is rendered as one card row: an
+#: untruncated title wraps until it is no longer a scannable status
+#: line. Truncation is cosmetic — the full title is still available on
+#: the VP's own row further down the card.
+_VERIFICATION_ACTIVITY_TITLE_MAX = 60
+
+
+def _flatten_vp_title(title: Any) -> str:
+    """Collapse a VP title to a single bounded line for a label.
+
+    Plan titles are prose and may contain newlines; the label is a
+    one-line status string, so every whitespace run (including the
+    newlines) becomes a single space before truncation.
+    """
+    if not isinstance(title, str):
+        return ""
+    flat = " ".join(title.split())
+    if len(flat) <= _VERIFICATION_ACTIVITY_TITLE_MAX:
+        return flat
+    return flat[:_VERIFICATION_ACTIVITY_TITLE_MAX] + "…"
+
 
 def _verification_round_activity(
     running: set,
     activity: Dict[str, Dict[str, str]],
     judgment: Dict[str, Any],
     last_vp: Dict[str, Any],
+    vp_titles: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Describe what the verification round is doing when no VP is in flight.
 
@@ -1528,6 +1551,13 @@ def _verification_round_activity(
     about which VPs are live. ``activity`` is the caller's already-parsed
     view of the same log — re-reading it here would double the cost of
     the poll this runs inside.
+
+    ``vp_titles`` is the caller's already-loaded ``vp_id -> title`` map,
+    passed in for the same reason: naming a VP is only useful if the name
+    says WHAT is being reviewed, and a bare id (``[VP-006]``) does not.
+    Reading the plan here instead would add a disk read to every poll of
+    an endpoint that is already poll-driven. A missing entry degrades to
+    the id-only label rather than failing the payload.
     """
     if running:
         # A VP is genuinely in flight. The caller already names it via
@@ -1552,6 +1582,14 @@ def _verification_round_activity(
         vp_id = judgment.get("vp_id")
         if vp_id:
             label += f" `[{vp_id}]`"
+            # The id alone does not say what is under review. The
+            # title is appended here (rather than at the render
+            # sites) so every consumer of this label — card body,
+            # unified header, any future caller — names the same
+            # thing, and so the card can never double-append it.
+            title = _flatten_vp_title((vp_titles or {}).get(vp_id))
+            if title:
+                label += f" {title}"
         return {"kind": "judging", "label": label,
                 "vp_id": vp_id, "since": judgment["ts"]}
 
@@ -1929,6 +1967,15 @@ def _verification_progress_body(
             round_activity = _verification_round_activity(
                 running_vp_ids, _latest_activity, _latest_judgment,
                 _latest_vp_event,
+                # ``plan_index`` was read from disk earlier in this
+                # same request and already carries each VP's title
+                # (it is what ``current_vp_payload`` reads at
+                # line ~1828). Handing it over keeps the sub-step as
+                # namable as the in-flight VP without a second read.
+                {
+                    vid: (vp or {}).get("title") or ""
+                    for vid, vp in plan_index.items()
+                },
             )
         except Exception:
             _server.logger.exception(
