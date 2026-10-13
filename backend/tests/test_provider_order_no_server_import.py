@@ -1,21 +1,25 @@
-"""``provider_order._default_order_file()`` must not import ``server``.
+"""``provider_order`` must not import ``server``.
 
-Root cause of the 2026-09-14 swallowed-SIGTERM incident: the old body
-did a lazy ``from server import PROVIDER_ORDER_FILE``, and
-``provider_order`` is reached from ``server._lifespan`` →
-``load_providers()`` → ``load_fallback_order()`` on every boot. Under
-``python -m backend.server`` the server body is already running as
-``__main__``, so that import executed the whole ~10k-line module a
-*second* time under the name ``server`` — roughly a second after
-``uvicorn.run()``, i.e. after uvicorn had installed ``Server.handle_exit``
-for SIGTERM. The duplicate body's module-level
+Root cause of the 2026-09-14 swallowed-SIGTERM incident: the body did a
+lazy ``from server import ...``, and ``provider_order`` is reached from
+``server._lifespan`` → ``load_providers()`` → ``load_fallback_order()``
+on every boot. Under ``python -m backend.server`` the server body is
+already running as ``__main__``, so that import executed the whole
+~10k-line module a *second* time under the name ``server`` — roughly a
+second after ``uvicorn.run()``, i.e. after uvicorn had installed
+``Server.handle_exit`` for SIGTERM. The duplicate body's module-level
 ``signal.signal(SIGTERM, _signal_handler)`` replaced uvicorn's handler,
 so the signal stopped shutting the server down.
 
-``config_paths`` is a leaf utility that already exposes the identical
-constant (documented there as "mirroring ``server.PROVIDER_ORDER_FILE``")
-without dragging in FastAPI. ``_default_order_file`` now uses it, and
-only consults ``server`` when that module happens to already be loaded.
+``config_paths`` is a leaf utility that declares the path without
+dragging in FastAPI, and ``_default_order_file`` goes through it. There
+is no fallback to ``server`` for it to fall back *to*.
+
+The chain itself no longer touches the filesystem at all, so this is
+narrower than it was: what remains is the 5-hour quota payload's
+default path. The property still has to hold for the whole module —
+``load_fallback_order`` is on the boot path, and any import of ``server``
+from here would do the same damage whatever it was importing.
 """
 
 from __future__ import annotations
@@ -74,15 +78,3 @@ class TestProviderOrderDoesNotImportServer:
         assert proc.stdout.strip() == "0", (
             f"_default_order_file() imported server.py: {proc.stdout!r}"
         )
-
-    def test_default_order_file_prefers_an_already_loaded_server(
-        self, tmp_path, monkeypatch
-    ):
-        """Backward compatibility: callers that boot the server normally
-        — and tests that patch ``server.PROVIDER_ORDER_FILE``, e.g.
-        ``tests/test_server_providers.py`` — must keep seeing the
-        server's snapshot rather than a re-resolved one."""
-        override = tmp_path / "order.json"
-        monkeypatch.setattr(server, "PROVIDER_ORDER_FILE", override)
-
-        assert provider_order._default_order_file() == override

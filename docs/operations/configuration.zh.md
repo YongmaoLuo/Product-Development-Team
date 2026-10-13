@@ -2,13 +2,17 @@
 
 ## `backend/config.yaml` 刻意很薄
 
-三点值得知道：
+两点值得知道：
 
-- **什么都不配也能跑。** 它不带 provider order 文件、也不带子公司进程。服务照常启动、
-  工作流照常运行；依赖外部组件的功能只是没东西可读而已。
-- **`provider_order_file`** 指向一份描述 provider 回退链的 JSON 契约。没有内置链 ——
-  想要 provider failover 就把它指向任何产出该文件的东西。环境变量
-  `PROVIDER_ORDER_FILE` 覆盖配置值。
+- **什么都不配也能跑。** 它不带子公司进程。服务照常启动、工作流照常运行；
+  依赖外部组件的功能只是没东西可读而已。
+- **provider 回退链不在这里配。** 没有任何键指向它，也没有内置链。启动时后端
+  直接向 CC Switch 要这条链 —— 优先走它的 HTTP provider 列表，没有服务在跑时
+  走它的数据库 —— 所以你在 CC Switch 里看到的顺序，就是后端派发用的顺序。这里
+  刻意不提供第二个配置点：这条链以前来自一份本仓不写、也没人再更新的 JSON 文件，
+  结果是后端与 CC Switch 对链的认知可以一直不一致，直到两边有一边重启为止。
+  `PDT_PROVIDER_ORDER_API_URL` 可以覆盖 CC Switch HTTP API 的地址；数据库在
+  `~/.cc-switch/` 下。
 - **`subsidiary_processes`** 是空列表。它是一个通用机制，用于在 FastAPI lifespan
   期间拉起长期运行的辅助进程，有两条承重性质：条目**按顺序**启动；启动失败会
   **中止整个启动**，除非该条目标了 `optional: true`。
@@ -50,22 +54,45 @@ provider 集合编译进**每一次**安装。这里刻意**没有**任何"带�
 |---|---|
 | 轮次预算 | 可以跑多少轮 验证 → 修复 → 再验证 |
 | 每个 VP 的超时 | 单个验证点可以跑多久 |
-| `parallelism_cap` | **单个方法组**自己的扇出 |
+| `parallelism_cap` | **兜底**宽度 —— 只在推不出任何东西时生效 |
 
-`parallelism_cap` **不是**舰队上限。组是并发的，所以每组的上限会相乘；真正的限制是
-每轮创建一次、由所有组共享的 `plan_semaphore`。见
-[验证](../architecture/verification.md)。
+验证轮次实际跑的宽度是**从 provider 推出来的**，不是从这个文件读的：沿着验证场景自己
+那条链，把每个 provider 声明的 cap（`provider_capacity.yaml`）按它 5 小时窗口还剩
+多少缩放再求和，用的是**派发路径拿到的同一份**配额载荷。它在每次 gate 放行时重新读，
+所以轮次跑到一半关掉的窗口会当场缩小舰队。
+
+`parallelism_cap` 只在一种情况下生效：验证场景的链根本解析不出来。它刻意**不是**
+"什么都没有就跑 N 个"的规则 —— 一个测出来的 `0` 是配额给的真答案，就按真答案用，
+所以整支舰队都关着的时候，一个都不放。
+
+见[验证](../architecture/verification.md)。
 
 ## 凭据
 
-凭据来自 `backend/.env`，它是 gitignored 的。`backend/.env.ci` 放的是提交进仓的
-**占位值** —— 它是测试夹具，真密钥永远不要放进去。
+没有任何凭据来自 `.env`。provider 的 API key 由运行时那层 provider 供给 ——
+`backend/cc_switch.py` 是本仓提供的那个对接，它一行一行地读；两个通知 secret
+（飞书 app secret、Telegram bot token）从独立的 macOS 钥匙串读取，再经文件描述符
+交给需要它们的进程，从而不出现在 `ps eww` 的输出里。`.env`（gitignored，模板是提交进仓的 `.env.example`）装的是**非机密
+的那一半**：每个钥匙串条目建在哪个 `account` 下、时区、以及通知目标。
 
-两个通知 secret 也可以改为从独立的 macOS 钥匙串读取，再经文件描述符交给需要它们的
-进程，从而不出现在 `ps eew` 的输出里。这条路径**需要主动开启、默认关闭** —— 不做任何
-改动的部署完全不受影响，而没有走过迁移的安装仍然是从 `.env` 读 secret。在假定它已经
-生效之前请先看[钥匙串迁移](keychain-migration.md)；`secrets verify` 会报出每个 secret
-实际来自哪个来源。
+这条钥匙串路径**需要主动开启、默认关闭**。放着不管 —— `PDT_DISABLE_KEYCHAIN_SECRETS`
+未设置 —— 两个通知 secret 就仍然是从 `.env` 里的明文变量读的，也就是说没有走过迁移的
+安装仍然把它们明文放在磁盘上的一个文件里。在假定它已经生效之前请先看
+[钥匙串迁移](keychain-migration.md)；`secrets verify` 会报出每个 secret 实际来自哪个
+来源。
+
+当某个 secret 取不到值时，`secrets verify` 会**说明原因**，每个未解析的 secret 一行：
+开关关着、账号索引没设、钥匙串锁着、钥匙串工具根本跑不起来、或者条目根本没建。
+这五种要在五个不同的地方修，而后三种尤其值得分清楚：「锁着」还得先在解锁弹窗上白等
+最多 60 秒才说得出任何话；而「工具跑不起来」（某些沙箱和 agent session 拿
+`/usr/bin/security` 会得到 `EPERM`）跟钥匙串的状态毫无关系，让这种环境下的操作者去
+解锁点什么，是一条根本不可能奏效的建议。同样的告警也会由 provider 自己打进日志，
+所以不必只依赖那个报告自己「未配置」的通知器。**已经**解析成功的 secret 不打印任何
+内容：一个连健康项都要念一遍的命令，只会训练读者跳过真正要紧的输出。
+
+```bash
+backend/.venv/bin/python3 -m backend.cli secrets verify
+```
 
 ## 运行态
 

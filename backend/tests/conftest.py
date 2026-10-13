@@ -155,6 +155,18 @@ def _killpg_tripwire_report() -> None:
 
 def pytest_sessionfinish(session, exitstatus) -> None:
     _killpg_tripwire_report()
+    # The controller's own scratch roots. A serial run has already had both
+    # removed by ``_hermetic_state_db_dir`` by the time this fires, and
+    # ``ignore_errors=True`` makes the second attempt a no-op rather than an
+    # error. Under xdist it is the only process that mints a root nobody else
+    # will close: the controller loads this module but runs no test, so no
+    # session fixture is ever instantiated in it, and its directory would
+    # otherwise be the one directory per run that survives — which is the
+    # leak the idempotency note above exists to prevent, reintroduced by the
+    # fix for it.
+    if not _XDIST_WORKER:
+        shutil.rmtree(_TEST_STATE_DB_DIR, ignore_errors=True)
+        shutil.rmtree(_LOCK_ROOT, ignore_errors=True)
 
 
 _install_killpg_tripwire()
@@ -328,8 +340,42 @@ def capacity_from_text(tmp_path, monkeypatch):
 # teardown removes is the only one that exists. An externally-set value
 # wins, which is also what lets a caller point the suite somewhere it
 # owns.
+#
+# Under xdist that key is no longer enough on its own, because the key is
+# inherited rather than per-process. The controller loads this module during
+# ``_preparse`` — before it starts any worker — so by the time the workers
+# are execnet children that copy its ``os.environ``, the variable is already
+# set and every worker reuses the controller's one directory. N processes,
+# one ``state.db``, one plans tree. Measured on ``tests/unit -n 4``: exactly
+# one scratch directory appears for the whole run, not four.
+#
+# So the key has to carry the worker id, which is what ``PYTEST_XDIST_WORKER``
+# holds (``gw0``/``gw1``/... in a worker, absent in the controller). A worker
+# therefore scopes itself to ``<root>/<worker id>`` rather than adopting the
+# root verbatim, which keeps the two halves of the contract at once: the
+# workers stop sharing one ``state.db``, and a caller who pinned the variable
+# still owns the directory they named — it is scoped per worker, not
+# discarded. Idempotency needs one more key to tell "this is the value I
+# installed" from "this is the value I inherited":
+# ``_PDT_TEST_SESSION_ROOT_OWNER`` records which process installed it, so
+#
+#   * the dotted re-import inside one worker sees its own id and reuses;
+#   * a different worker sees a different id and scopes itself separately;
+#   * a serial run, which has no worker id, mints once and reuses, exactly
+#     as the ``if`` above it always did.
+_XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER") or ""
+_SESSION_ROOT_OWNER = "_PDT_TEST_SESSION_ROOT_OWNER"
+
 if not os.environ.get("PDT_TEST_SESSION_ROOT"):
     os.environ["PDT_TEST_SESSION_ROOT"] = tempfile.mkdtemp(prefix="ac-test-state-")
+    os.environ[_SESSION_ROOT_OWNER] = ""
+elif _XDIST_WORKER and os.environ.get(_SESSION_ROOT_OWNER) != _XDIST_WORKER:
+    _WORKER_STATE_DB_DIR = (
+        Path(os.environ["PDT_TEST_SESSION_ROOT"]) / _XDIST_WORKER
+    )
+    _WORKER_STATE_DB_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ["PDT_TEST_SESSION_ROOT"] = str(_WORKER_STATE_DB_DIR)
+    os.environ[_SESSION_ROOT_OWNER] = _XDIST_WORKER
 _TEST_STATE_DB_DIR = Path(os.environ["PDT_TEST_SESSION_ROOT"])
 os.environ["PDT_STATE_DB_PATH"] = str(_TEST_STATE_DB_DIR / "state.db")
 
@@ -460,122 +506,165 @@ def _hermetic_state_db_dir():
 
 
 # ---------------------------------------------------------------------------
-# The provider-order contract file
+# The provider chain CC Switch reports
 # ---------------------------------------------------------------------------
 #
-# 2026-09-23. ``provider_order.load_fallback_order()`` has no hard-coded
-# chain and no YAML fallback: it reads the contract file and RAISES
-# ``ProviderOrderError`` when that file is absent.
+# ``provider_order.load_fallback_order()`` asks CC Switch for the chain
+# and RAISES ``ProviderOrderError`` when CC Switch does not answer. That
+# answer is runtime state of another application — an HTTP server this
+# repository does not start — and it does not exist on a clean CI
+# checkout. A test that boots the app would then die inside the
+# lifespan — ``server._lifespan`` -> ``load_providers()`` ->
+# ``load_fallback_order()`` — for an environment reason rather than a
+# code one.
 #
-# That file is runtime state. ``.gitignore`` excludes the whole
-# ``.config/`` directory, so it exists on a machine where a producer is
-# running and does NOT exist on a fresh CI checkout. Every test that
-# boots the app then fails inside the lifespan — ``server._lifespan`` ->
-# ``load_providers()`` -> ``load_fallback_order()`` — for an environment
-# reason rather than a code one.
+# The fixture below replaces the resolver's answer with a fixed chain,
+# so the suite runs the same whether or not the developer happens to
+# have CC Switch open. It is the replacement for the contract file this
+# suite used to materialise, and it carries the same warning that did:
+# without it the whole suite depends on the host's CC Switch, so a test
+# that fails only on a machine with CC Switch running is a hermeticity
+# bug, not a finding about the code under test.
 #
-# Measured on a clean clone, with nothing else different: 1 failed + 3
-# errors in ``tests/test_state_from_db.py``, both VP-008 contract tests
-# in ``tests/integration/test_provider_order_integration.py``, and
-# ``tests/test_base_yaml_no_order.py``. All of them pass on a machine
-# that has a producer running, which is precisely why the coupling went
-# unnoticed.
+# It stubs the reader the chain resolves through — ``_chain_from_api`` —
+# and leaves ``cc_switch`` untouched. That matters: ``cc_switch`` is
+# still the reader of record for endpoint and credentials
+# (``server.load_providers`` resolves every name through
+# ``cc_switch.get_provider``), so stubbing it would stop these fixtures
+# exercising the real lookup, and the tests that *are* about the
+# resolver can put the genuine reader back with ``real_cc_switch``
+# below.
 #
-# Why the file rather than the ``PROVIDER_ORDER_FILE`` env var, which
-# ``load_fallback_order`` documents as an operator escape hatch:
-# ``_default_order_file()`` prefers an already-imported ``server``
-# module's ``PROVIDER_ORDER_FILE`` — an **import-time snapshot** taken by
-# ``config_paths`` — over the live env var. The suite imports ``server``
-# early, so an env var set by a fixture is ignored.
-#
-# Create-if-absent, never overwrite. A developer running against a live
-# optimiser keeps exercising the real artifact; this only fills the gap
-# a clean checkout has. The path is gitignored, so nothing here can be
-# committed.
+# ``fake_cc_switch_home`` below is the other half — it points
+# ``cc_switch``'s own database reads at a throwaway store, for the
+# tests that exercise those directly.
 
-#: Minimal payload ``provider_order._validate_schema`` accepts:
-#: ``version`` must match, ``order`` must be a NON-empty list of
-#: strings, and ``updated_at`` must be a parseable ISO 8601 stamp.
-#: ``["parent"]`` is the caller's own fallback sentinel — it is never a
-#: pool member (``acquire_provider_with_dynamic_capacity`` skips it), so
-#: a fixture chain built from it cannot accidentally hand a test a
-#: provider slot.
-_PROVIDER_ORDER_FIXTURE = {
-    "version": 1,
-    "order": ["parent"],
-    "providers": {},
-}
+#: The resolver as it stands before any fixture touches it. Captured at
+#: import time on purpose: ``real_cc_switch`` has to be able to put back
+#: the genuine article, and it cannot ask a session fixture that may
+#: already have replaced it.
+try:  # pragma: no cover - import shape, not behaviour
+    import provider_order as _provider_order_module
+
+    _REAL_CHAIN_FROM_API = _provider_order_module._chain_from_api
+except Exception:  # pragma: no cover - a collection error will say so
+    _REAL_CHAIN_FROM_API = None
+
+
+#: Chain the session-wide stub reports. ``["parent"]`` is the sentinel
+#: the dispatch loop never draws from (``acquire_provider_with_dynamic_
+#: capacity`` skips it), so a chain built from it cannot hand a test a
+#: provider slot by accident. ``server.load_providers`` then resolves it
+#: to nothing and logs the skip — the same empty ``STARTUP_PROVIDERS``
+#: the old contract-file fixture produced.
+_STUB_PROVIDER_CHAIN = ["parent"]
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _provider_order_contract_file():
-    """Make a clean checkout look like a machine with an optimiser.
+def _provider_chain_from_cc_switch():
+    """Make CC Switch report a chain for the whole session.
 
-    Yields the path that was in force (the pre-existing real file, the
-    one created here, or ``None`` when the location could not be
-    resolved). Nothing asserts on the value; it exists so the fixture is
-    visible in ``--fixtures`` and debuggable.
+    The resolver is answered directly rather than over HTTP, which is
+    how the app behaves when no CC Switch is listening. Nothing asserts
+    on the value; the fixture exists so the stub is visible in
+    ``--fixtures`` and so the session has a chain that did not come off
+    this machine.
     """
+    import provider_order
+
+    provider_order._chain_from_api = lambda: list(_STUB_PROVIDER_CHAIN)
+    provider_order.cache_clear()
     try:
-        from config_paths import DEFAULT_PROVIDER_ORDER_FILE
-    except Exception:  # pragma: no cover - config_paths is a leaf utility
-        yield None
-        return
-
-    target = Path(DEFAULT_PROVIDER_ORDER_FILE)
-    if target.exists():
-        # The real artifact is present — leave it alone.
-        yield target
-        return
-
-    payload = dict(_PROVIDER_ORDER_FIXTURE)
-    # Aware, fresh, and timezone-explicit: ``_staleness_minutes``
-    # subtracts this from an aware "now", so a naive stamp would raise
-    # where a stale one would merely warn.
-    payload["updated_at"] = datetime.now().astimezone().isoformat()
-
-    created_dir = not target.parent.exists()
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(payload), encoding="utf-8")
-    except OSError:  # pragma: no cover - read-only checkout
-        yield None
-        return
-
-    try:
-        yield target
+        yield _STUB_PROVIDER_CHAIN
     finally:
-        # Restore the checkout. The file is gitignored, but leaving it
-        # behind would let a *later* manual ``python server.py`` in the
-        # same clone pick up a one-provider fixture chain, which is a
-        # confusing thing to debug. Best-effort only — a failure here
-        # must not fail the session.
-        try:
-            target.unlink()
-            if created_dir:
-                target.parent.rmdir()
-        except OSError:  # pragma: no cover - defensive
-            pass
+        provider_order._chain_from_api = _REAL_CHAIN_FROM_API
+        provider_order.cache_clear()
+
+
+@pytest.fixture
+def real_cc_switch(monkeypatch):
+    """Put the real chain resolver back for one test.
+
+    The session stub answers the resolver so that booting the app works
+    without a CC Switch on the machine. A test about the resolver itself
+    needs the opposite, and this is how it says so — ``monkeypatch``
+    restores the stub when the test ends. Such a test then has to give
+    the transport an answer of its own; there is no second source for
+    the real resolver to fall back on.
+    """
+    import provider_order
+
+    monkeypatch.setattr(
+        provider_order, "_chain_from_api", _REAL_CHAIN_FROM_API
+    )
+    provider_order.cache_clear()
+    yield provider_order
+    provider_order.cache_clear()
+
+
+@pytest.fixture
+def provider_chain(monkeypatch):
+    """Install a specific chain for one test, then restore the session stub.
+
+    Returns a callable so a test can name the chain it is exercising
+    against. Use this in tests about the **consumers** of a chain; the
+    tests about where a chain comes from stub the legs directly, so a
+    change to the transport shows up there and not here.
+    """
+    import provider_order
+
+    def _install(chain):
+        monkeypatch.setattr(
+            provider_order.urllib.request,
+            "urlopen",
+            lambda *a, **k: _payload_response(list(chain)),
+        )
+        provider_order.cache_clear()
+        return list(chain)
+
+    return _install
+
+
+def _payload_response(names):
+    """Build an HTTP response object carrying a CC Switch provider list."""
+    import json as _json
+
+    class _Response:
+        status = 200
+
+        def read(self):
+            return _json.dumps(
+                {"providers": [{"name": n} for n in names]}
+            ).encode()
+
+        def getcode(self):
+            return 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    return _Response()
 
 
 @pytest.fixture
 def fake_cc_switch_home(monkeypatch, tmp_path):
     """Redirect ``$HOME`` at a minimal CC Switch database.
 
-    The second half of the same coupling. Once ``provider-order.json``
-    exists, ``load_fallback_order`` filters its chain through
-    ``cc_switch``, which reads
-    ``~/.cc-switch/cc-switch.db`` and treats a missing file as a **hard**
-    error (``ProviderOrderError: CC Switch database unavailable`` — see
-    ``provider_order._load_fallback_order_uncached``). So a test that
-    boots the app needs that DB to exist, and it is the CC Switch
-    desktop app's store: present on a developer machine, absent from any
-    clean checkout.
+    For the tests that exercise ``cc_switch``'s own reads: it resolves
+    ``~/.cc-switch/cc-switch.db``, and that file is the desktop app's
+    store — present on a developer machine, absent from any clean
+    checkout. A test pointing a read at a throwaway store needs the
+    store to exist first.
 
-    An empty but valid database is enough: ``list_provider_ids`` returns
-    ``[]`` when neither table is present, and ``server.load_providers``
-    treats an empty chain as "no providers configured" and starts
-    normally rather than raising.
+    The provider **chain** is not among them. The chain is asked of
+    CC Switch's HTTP provider list and this fixture has no say in it;
+    what a test needs for the chain is a transport stub. What lives
+    here is the roster ``cc_switch.get_provider`` /
+    ``list_provider_names`` resolve against while ``server
+    .load_providers`` turns a chain's names into configs.
 
     Opt-in rather than autouse: ``Path.home()`` is also how
     ``tests/test_edit_write_containment_guard.py`` resolves its "foreign
@@ -591,17 +680,17 @@ def fake_cc_switch_home(monkeypatch, tmp_path):
 
     conn = sqlite3.connect(str(db_path))
     try:
-        # A table, so the file is non-zero-length: ``_connect_db``
-        # rejects a zero-byte file as corrupt.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS providers ("
-            "id TEXT PRIMARY KEY, name TEXT, settings_config TEXT)"
+            "id TEXT PRIMARY KEY, app_type TEXT, name TEXT, "
+            "settings_config TEXT, created_at INTEGER, sort_index INTEGER, "
+            "is_current BOOLEAN DEFAULT 0)"
         )
         conn.commit()
     finally:
         conn.close()
 
-    # ``_resolve_db_path`` calls ``Path.home()`` on every call, so
+    # ``resolve_db_path`` calls ``Path.home()`` on every call, so
     # redirecting the env var is enough — no module constant to patch.
     monkeypatch.setenv("HOME", str(fake_home))
     return fake_home
@@ -611,66 +700,33 @@ def fake_cc_switch_home(monkeypatch, tmp_path):
 # The process environment file
 # ---------------------------------------------------------------------------
 #
-# 2026-09-23, third instance of the same cause as the two fixtures above:
-# something the code requires is **runtime state that a git checkout does
-# not carry**. `env_config.load_env()` requires ANTHROPIC_API_KEY,
-# NOTION_TOKEN and NOTION_PARENT_PAGE_ID and raises RuntimeError when any
-# is absent; they normally live in `backend/.env`, which `.gitignore`
-# excludes. Present on a developer machine, absent on a runner.
+# 2026-10-08: this section used to materialise ``backend/.env.ci`` as
+# ``backend/.env`` for the whole session, so the suite ran with the three
+# placeholder variables ``env_config.REQUIRED_VARS`` demanded. That
+# demand is gone, and so is the fixture.
 #
-# It is worth noting *why* this one survived so long: the failure it causes
-# is hidden behind the shard wedge. `tests/unit/test_agent_persist.py::test_cli_passes_tasks_file_through`
-# has been failing on every CI run, and nobody has seen it, because the
-# full `unit` shard stops before reaching it. It took staircase shard u-55
-# (run 35852698516) — the first shard small enough to finish — to surface it.
+# The history is worth one line because the failure it caused was invisible
+# for a long time. The fixture was itself the third instance of the same
+# cause as the two above it: something the code requires is **runtime
+# state that a git checkout does not carry**. ``load_env()`` raised
+# ``RuntimeError`` when a variable was absent, the variables lived in a
+# gitignored file, and so
+# ``tests/unit/test_agent_persist.py::test_cli_passes_tasks_file_through``
+# failed on every CI run while passing locally. Nobody saw it because the
+# full ``unit`` shard wedges before reaching that test; it took staircase
+# shard u-55 (run 35852698516) — the first shard small enough to finish —
+# to surface it. The fix at the time was to feed the suite placeholders.
 #
-# `backend/.env.ci` is the committed, non-secret template (see its header).
-# This materialises it as `backend/.env` when that file is absent, and
-# removes it again afterwards, so the checkout is left as found.
+# The fix now is that there is nothing to feed it. No API key is read from
+# a dotenv by this repository — the key is supplied by the provider layer
+# — the other two required names never had a reader at all, and
+# ``env_config.REQUIRED_VARS`` is empty. A fresh checkout runs the suite
+# with no environment file, which is the point.
 #
-# Failure stays loud: this fixture only supplies the three placeholders the
-# loader demands. A missing *other* variable still raises from
-# `env_config.load_env()` at the point of use — the loader does not retry,
-# sleep or degrade, which is the behaviour a missing configuration should
-# have. `tests/unit/test_env_config_fails_fast.py` pins that.
-
-_BACKEND_ROOT = Path(__file__).resolve().parents[1]
-_ENV_TEMPLATE = _BACKEND_ROOT / ".env.ci"
-_ENV_TARGET = _BACKEND_ROOT / ".env"
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _env_file_for_tests():
-    """Give the suite the same environment a developer machine has.
-
-    Yields the path in force (the real ``.env``, the materialised template,
-    or ``None`` when neither could be used). Nothing asserts on the value;
-    it exists so the fixture is visible in ``--fixtures`` and debuggable.
-    """
-    if _ENV_TARGET.exists():
-        # A developer's own credentials — never touch them.
-        yield _ENV_TARGET
-        return
-
-    if not _ENV_TEMPLATE.exists():  # pragma: no cover - template is committed
-        yield None
-        return
-
-    try:
-        _ENV_TARGET.write_text(
-            _ENV_TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8",
-        )
-    except OSError:  # pragma: no cover - read-only checkout
-        yield None
-        return
-
-    try:
-        yield _ENV_TARGET
-    finally:
-        try:
-            _ENV_TARGET.unlink()
-        except OSError:  # pragma: no cover - defensive
-            pass
+# Nothing below replaces it: the loader has no required variables, so
+# there is no configuration a missing file can withhold. If a
+# deployment-specific requirement is ever added to ``REQUIRED_VARS``,
+# the session fixture that satisfies it comes back with it.
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):

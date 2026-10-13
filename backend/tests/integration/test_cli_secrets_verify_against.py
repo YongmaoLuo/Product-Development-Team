@@ -46,7 +46,7 @@ project is trying to bound.
 
 The baseline file itself
 ------------------------
-A ``KEY=value`` file, the spelling ``backend/.env`` already uses, keyed
+A ``KEY=value`` file, the spelling ``.env`` already uses, keyed
 by the spec table's own ``fallback_env_key``. Three deliberate limits.
 No interpolation, so a value is compared as written rather than as
 whatever the shell it was written in would have produced. A line with
@@ -107,10 +107,10 @@ _CREDENTIAL_ENV_KEYS = tuple(
     for key in (spec.fallback_env_key, spec.account_env_key)
 ) + ("PDT_DISABLE_KEYCHAIN_SECRETS",)
 
-#: The three variables ``env_config.load_env()`` demands before the CLI
-#: parses anything. Placeholders — the loader only checks that they
-#: exist.
-_LOADER_PLACEHOLDERS = ("ANTHROPIC_API_KEY", "NOTION_TOKEN", "NOTION_PARENT_PAGE_ID")
+# ``env_config.load_env()`` used to demand three variables before the CLI
+# parsed anything, and these tests filled them with placeholders so the
+# subprocess would get that far. It demands nothing now (2026-10-08), so
+# there is nothing to fill in.
 
 
 def _sentinel(canary, kind, tmp_path, tag) -> str:
@@ -135,10 +135,23 @@ def scrub_credential_environment(monkeypatch, tmp_path):
     suite whose answers change with the runner cannot tell a regression
     from a platform, and this one is read on macOS and in a Linux
     container.
+
+    The platform is forced the same way, and it is not a formality:
+    ``credentials.keychain_disabled`` returns True off macOS whatever the
+    switch says, so without this line every keychain-on case below would
+    exercise its real branch on a developer's Mac and take the
+    switched-off branch in the Linux container — passing there for a
+    reason the test never intended, and reporting a row as ``missing``
+    that it had just asserted was ``keychain``.
     """
     for key in _CREDENTIAL_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("PDT_DISABLE_KEYCHAIN_SECRETS", "1")
+    # The reader override reaches this process out of the project-root
+    # ``.env`` on any machine that has migrated, and would point the read
+    # at that machine's own signed binary instead of the stand-in below.
+    monkeypatch.delenv("PDT_SECRET_READER_PATH", raising=False)
+    monkeypatch.setattr(credentials, "_is_macos", lambda: True)
     monkeypatch.setattr(credentials, "_SECURITY_BIN", str(_stub_tool(tmp_path)))
     credentials.reset_cache()
     yield
@@ -317,6 +330,65 @@ def test_neither_side_value_appears_in_output(monkeypatch, capsys, canary, tmp_p
 # ---------------------------------------------------------------------------
 
 
+def test_a_resolved_row_gets_no_reason_line_under_it(
+    monkeypatch, capsys, canary, tmp_path
+):
+    """A row that says the keychain has the secret must not be contradicted below.
+
+    The command prints a table and then, under it, a sentence for every
+    secret it could not resolve. Those two halves are read together, and
+    the failure they can fall into is describing two different states: a
+    row reading ``source=keychain`` with "the keychain holds no item"
+    printed directly beneath it. An operator who sees that goes looking
+    for a credential that is filed, and the advice is attached to a real
+    symptom, so it gets believed.
+
+    The contradiction is easy to introduce and hard to see, because the
+    two halves are derived separately: the rows from this command's own
+    read, the sentences from ``credentials.diagnose_secret``, which
+    starts from the *server's* sources — a descriptor, or the plaintext
+    variable — and on a machine whose secret lives in the keychain has
+    to go and look before it can say anything true. Two independent
+    reads are free to disagree, and a table and a note beneath it
+    disagreeing is worse than either being absent.
+
+    So the deployment here is the one that exposes it: the keychain is
+    **on**, it holds a value, and no plaintext variable is set. Both
+    secrets resolve, and nothing should be explained.
+    """
+    values = {
+        name: _sentinel(canary, "feishu_secret", tmp_path, "live")
+        for name in credentials.SECRET_SPECS
+    }
+    monkeypatch.setenv("PDT_DISABLE_KEYCHAIN_SECRETS", "0")
+    for name in credentials.SECRET_SPECS:
+        monkeypatch.delenv(
+            credentials.SECRET_SPECS[name].fallback_env_key, raising=False
+        )
+        monkeypatch.setenv(
+            credentials.SECRET_SPECS[name].account_env_key,
+            _sentinel(canary, "feishu_index", tmp_path, name),
+        )
+    monkeypatch.setattr(
+        credentials,
+        "_resolve_from_keychain",
+        lambda spec: (values[spec.logical_name], credentials.SOURCE_KEYCHAIN),
+    )
+    credentials.reset_cache()
+
+    exit_code = cli.cmd_secrets_verify()
+    out = capsys.readouterr().out
+
+    for name in credentials.SECRET_SPECS:
+        assert _row_for(out, name).endswith("source=keychain"), out
+    assert "holds no item" not in out, (
+        "the table says the keychain holds every secret and the notes below "
+        "it say the keychain holds no item — two descriptions of one "
+        "state:\n{}".format(out)
+    )
+    assert exit_code == 0, out
+
+
 def test_baseline_does_not_change_lookup_count(monkeypatch, capsys, canary, tmp_path):
     """A run with a baseline fetches exactly as many values as one without.
 
@@ -458,10 +530,10 @@ def test_real_subprocess_reads_the_baseline_and_prints_no_value(
     not exist, and no in-process test can see it.
 
     Every credential key is *set* rather than removed, for the same
-    reason the unit suite sets them: the CLI loads ``backend/.env``
-    before it parses, and a key absent from the child is exactly the
-    one that file is allowed to fill. The keychain is switched off so
-    the deployment being described is the same one on every platform.
+    reason the unit suite sets them: so that a key cannot arrive from the
+    developer's own shell to stand in for one this test meant to
+    supply. The keychain is switched off so the deployment being
+    described is the same one on every platform.
 
     The exit code is compared as "0 or 1" rather than pinned: whether
     ``/usr/bin/security`` can be executed is a property of the runner
@@ -475,8 +547,6 @@ def test_real_subprocess_reads_the_baseline_and_prints_no_value(
     child_env = dict(os.environ)
     for key in _CREDENTIAL_ENV_KEYS:
         child_env.pop(key, None)
-    for key, value in zip(_LOADER_PLACEHOLDERS, ("placeholder-a", "placeholder-b", "placeholder-c")):
-        child_env[key] = value
     child_env["PDT_DISABLE_KEYCHAIN_SECRETS"] = "1"
     for name, value in values.items():
         child_env[credentials.SECRET_SPECS[name].fallback_env_key] = value

@@ -54,13 +54,31 @@ def test_repo_level_paths_hang_off_project_root():
     # encode the layout that was deliberately replaced.
     assert config_paths.STATE_DIR == root / ".pdt"
     assert config_paths.STATE_DB == config_paths.STATE_DIR / "state.db"
+    # The dotenv moved here in 2026-10-08. It used to be ``backend/.env``
+    # in this module while ``server`` read ``<repo>/.env`` — two different
+    # files for one setting, which is the drift this assertion now pins
+    # shut. Asserting the backend path again would re-open it.
+    assert config_paths.ENV_FILE == root / ".env"
 
 
 def test_backend_level_paths_hang_off_backend_dir():
     backend = config_paths.BACKEND_DIR
     assert config_paths.CONFIGS_DIR == backend / "configs"
     assert config_paths.BACKEND_CONFIG_YAML == backend / "config.yaml"
-    assert config_paths.ENV_FILE == backend / ".env"
+
+
+def test_the_dotenv_template_sits_beside_the_dotenv():
+    """The committed example and the file it documents are one location.
+
+    A template under ``backend/`` describing a file at the repository root
+    is the same class of drift the ``ENV_FILE`` assertion above rules out,
+    one level up: it sends a reader to ``cp backend/.env.example .env``,
+    which lands the example in the wrong directory.
+    """
+    root = config_paths.PROJECT_ROOT
+    assert (root / ".env.example").is_file()
+    assert not (config_paths.BACKEND_DIR / ".env.example").exists()
+    assert not (config_paths.BACKEND_DIR / ".env.ci").exists()
 
 
 @pytest.mark.parametrize(
@@ -92,6 +110,10 @@ def test_default_provider_order_file_lives_in_config_dir():
     It sits beside the other per-deployment configuration: whichever
     producer an installation runs writes it there, and nothing has to
     exist in a clean clone for the server to start.
+
+    What this file now carries is the 5-hour quota payload, **not** the
+    fallback chain — the chain is asked of CC Switch, so there is no
+    resolver for it and no way to point the backend at a different one.
     """
     assert (
         config_paths.DEFAULT_PROVIDER_ORDER_FILE
@@ -99,47 +121,30 @@ def test_default_provider_order_file_lives_in_config_dir():
     )
 
 
-def test_resolve_provider_order_file_prefers_env_var(monkeypatch, tmp_path):
-    override = tmp_path / "custom-order.json"
-    monkeypatch.setenv("PROVIDER_ORDER_FILE", str(override))
-    assert config_paths.resolve_provider_order_file() == override
+def test_no_provider_order_file_resolver_remains():
+    """``resolve_provider_order_file`` existed to locate the chain file.
+
+    With the chain asked of CC Switch there is nothing for it to
+    resolve, so it went together with the ``PROVIDER_ORDER_FILE``
+    variable and the ``provider_order_file`` key in ``config.yaml``.
+    A surviving resolver would be a surviving way to disagree with CC
+    Switch about the chain.
+    """
+    assert not hasattr(config_paths, "resolve_provider_order_file")
+    assert not hasattr(config_paths, "PROVIDER_ORDER_FILE")
 
 
-def test_resolve_provider_order_file_resolves_relative_env_against_cwd(
-    monkeypatch, tmp_path
-):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PROVIDER_ORDER_FILE", "state/order.json")
-    resolved = config_paths.resolve_provider_order_file()
-    assert resolved.is_absolute()
-    assert resolved == (Path(os.getcwd()) / "state" / "order.json").resolve()
+def test_backend_config_yaml_declares_no_chain_source():
+    """No key in ``config.yaml`` can redirect the chain.
 
+    The chain's whole value is that there is exactly one producer, so
+    the file that configures the server must not name a second one.
+    """
+    import yaml
 
-def test_resolve_provider_order_file_falls_back_to_config_yaml(monkeypatch):
-    """With no env override the value comes from backend/config.yaml,
-    resolved against PROJECT_ROOT (not the CWD)."""
-    monkeypatch.delenv("PROVIDER_ORDER_FILE", raising=False)
-    resolved = config_paths.resolve_provider_order_file()
-    assert resolved.is_absolute()
-    assert resolved == config_paths.DEFAULT_PROVIDER_ORDER_FILE.resolve()
-
-
-def test_resolve_provider_order_file_uses_hardcoded_default_when_yaml_missing(
-    monkeypatch, tmp_path
-):
-    monkeypatch.delenv("PROVIDER_ORDER_FILE", raising=False)
-    monkeypatch.setattr(
-        config_paths, "BACKEND_CONFIG_YAML", tmp_path / "does-not-exist.yaml"
-    )
-    assert (
-        config_paths.resolve_provider_order_file()
-        == config_paths.DEFAULT_PROVIDER_ORDER_FILE
-    )
-
-
-def test_provider_order_file_constant_is_resolved_at_import():
-    assert isinstance(config_paths.PROVIDER_ORDER_FILE, Path)
-    assert config_paths.PROVIDER_ORDER_FILE.is_absolute()
+    data = yaml.safe_load(config_paths.BACKEND_CONFIG_YAML.read_text("utf-8")) or {}
+    assert "provider_order_file" not in data
+    assert "provider_priority" not in data
 
 
 # ---------------------------------------------------------------------------

@@ -15,8 +15,15 @@ Three things live on disk, and this module owns all of them:
 ``cc-switch.db``
     The SQLite store. ``providers.name`` **is** a provider's identity:
     the string ``provider_routing.yaml`` matches its regexes against and
-    ``provider-order.json`` carries. Each row's ``settings_config`` is
-    JSON whose ``env`` block holds ``ANTHROPIC_BASE_URL`` and the token.
+    the string the fallback chain dispatches on. Each row's
+    ``settings_config`` is JSON whose ``env`` block holds
+    ``ANTHROPIC_BASE_URL`` and the token. Row *order* is deliberately
+    not read here: the chain's order is the array CC Switch serves on
+    its HTTP provider-list endpoint, and re-deriving it from this
+    store's sort columns would pin this project to a private,
+    undocumented schema a CC Switch release is free to change — while
+    still being free to disagree with the array the application
+    actually serves.
 
 ``settings.json``
     CC Switch's own current-selection pointer (``currentProviderClaude``),

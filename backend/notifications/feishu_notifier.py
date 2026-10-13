@@ -334,14 +334,107 @@ def _telegram_channel_provisioned_any() -> bool:
     return any(k.startswith("TELEGRAM_CHAT_ID_") for k in os.environ)
 
 
+#: lark_md and MarkdownV2 disagree on how bold is spelled: ``**x**``
+#: against ``*x*``. ``notifications/cards.py`` writes the lark spelling
+#: throughout, so the mirror converts it rather than escaping it — an
+#: escaped ``\*\*x\*\*`` is safe but shows the operator the asterisks
+#: and flattens the headings that make the card skimmable.
+_LARK_BOLD = "**"
+
+
+def _escape_lark_text(content: str) -> str:
+    """Escape one lark_md/plain_text run for a MarkdownV2 body.
+
+    :func:`escape_markdown_v2` handles the reserved characters; two
+    constructs need to be understood before it runs:
+
+    * ``**bold**`` — converted to MarkdownV2's ``*bold*``.
+    * ``` `code` ``` — a code span in *both* dialects, and MarkdownV2
+      delimits it with **raw** backticks. Escaping the delimiters, which
+      a flat call would do, turns the span into literal backtick
+      characters; instead the delimiters stay raw and only the inner
+      ``\\`` and `` ` `` are escaped, which is the whole reserved set
+      inside a span.
+
+    An unbalanced delimiter is emitted literally rather than opened and
+    left unclosed: Telegram answers ``can't parse entities`` for an
+    unclosed entity, and a body that cannot be parsed fails identically
+    on every retry — which is a permanently frozen card, the exact
+    failure this renderer just came out of.
+    """
+    rendered: list[str] = []
+    for index, part in enumerate(str(content).split("`")):
+        if index % 2:
+            # Between two backticks. An empty one is an unpaired
+            # delimiter in the source; emitting `` `` `` would open an
+            # empty entity, so drop it instead.
+            if part:
+                inner = part.replace("\\", "\\\\").replace("`", "\\`")
+                rendered.append(f"`{inner}`")
+            continue
+        pieces = part.split(_LARK_BOLD)
+        if len(pieces) % 2 == 0:
+            rendered.append(escape_markdown_v2(part))  # odd count: unpaired
+            continue
+        for i, piece in enumerate(pieces):
+            escaped = escape_markdown_v2(piece)
+            rendered.append(f"*{escaped}*" if i % 2 else escaped)
+    return "".join(rendered)
+
+
+def _card_text_runs(card: dict) -> list:
+    """Every text run a Feishu card holds, in reading order.
+
+    Feishu cards put their content in ``elements``. Until 2026-10-11
+    this renderer read ``card["sections"]`` instead — a key nothing in
+    this repo has ever written (``notifications/cards.py`` builds
+    ``elements``; only two test fixtures ever built ``sections``). The
+    loop therefore never executed, every render was the title line and
+    nothing else, and because the title only changes when the phase
+    does, :func:`_push_to_telegram` handed Telegram the same body
+    forever: ``400 Bad Request: message is not modified`` on every push
+    and a mirror frozen at the last phase transition.
+
+    ``cards.py`` emits three element tags and no others:
+
+    * ``div`` — one ``text`` node, whose ``content`` is lark_md;
+    * ``note`` — a list of ``plain_text`` nodes (the ``🕐 刷新于``
+      stamp lives here, and it is what tells an operator the card is
+      alive);
+    * ``hr`` — a rule. Dropped: the ``div`` bodies already open with a
+      bold heading, so a rule carries no information once the sections
+      are stacked in a plain-text message.
+
+    Anything else is skipped rather than guessed at. A card that grows
+    a ``button`` or a ``column_set`` should lose that element in the
+    mirror, not render a repr of its raw dict.
+    """
+    runs: list[str] = []
+    for element in card.get("elements") or []:
+        if not isinstance(element, dict):
+            continue
+        tag = element.get("tag")
+        if tag == "div":
+            content = (element.get("text") or {}).get("content")
+            if content:
+                runs.append(str(content))
+        elif tag == "note":
+            for node in element.get("elements") or []:
+                content = (node or {}).get("content")
+                if content:
+                    runs.append(str(content))
+    return runs
+
+
 def _render_card_as_markdown(card: dict, plan_id: str) -> str:
     """Flatten a Feishu card dict into a single Markdown text block.
 
     Telegram has no concept of an interactive card — its closest
     equivalent is a ``sendMessage`` body with MarkdownV2 formatting.
     We use ``card["header"]["title"]["content"]`` as the title line
-    and join every ``elements[*].text.content`` of every section
-    into the body. Sections with no text content are skipped.
+    and join every text run of every element (see
+    :func:`_card_text_runs`) into the body. Elements with no text
+    content are skipped.
 
     This is intentionally lossy (Telegram can't render Feishu
     status colours, clickable buttons, etc.); the goal is "the
@@ -350,9 +443,10 @@ def _render_card_as_markdown(card: dict, plan_id: str) -> str:
     remains available in Feishu; Telegram is a notification mirror.
 
     The returned string is a **valid MarkdownV2 body**: every piece of
-    card content is escaped here, and the two emphasis markers this
-    function adds itself are the only unescaped ``*``/``_`` in it. The
-    transport sends the text verbatim (with ``parse_mode=MarkdownV2``)
+    card content is escaped here, and the emphasis markers this
+    function adds itself — the title's ``*``, the tag's ``_``, and the
+    ``*`` of a converted ``**bold**`` — are the only unescaped ones.
+    The transport sends the text verbatim (with ``parse_mode=MarkdownV2``)
     and cannot do this for us — it has no way to tell the emphasised
     title from a ``*`` that is content, and Telegram rejects the whole
     message with HTTP 400 on one unescaped reserved character.
@@ -366,11 +460,8 @@ def _render_card_as_markdown(card: dict, plan_id: str) -> str:
     if plan_id_tag and plan_id_tag != title:
         lines.append(f"_{escape_markdown_v2(str(plan_id_tag))}_")
 
-    for section in card.get("sections") or []:
-        text_node = (section or {}).get("text") or {}
-        body = text_node.get("content")
-        if body:
-            lines.append(escape_markdown_v2(str(body)))
+    for run in _card_text_runs(card):
+        lines.append(_escape_lark_text(run))
 
     if not lines:
         # Last-ditch: emit the plan_id so the operator sees

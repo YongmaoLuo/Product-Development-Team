@@ -225,6 +225,27 @@ jobs:
           cache: pip
           cache-dependency-path: backend/uv.lock
 
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # Keyed on the lockfile hash, which this repository now pins, so
+      # the entry stays valid across ordinary dependency bumps instead of
+      # going stale like a requirements.txt hash would have.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
       - name: Check the lockfile is current
         # Before the install, so a stale lock is reported as itself rather
         # than as whatever `uv sync --locked` happens to fail on.
@@ -353,6 +374,27 @@ jobs:
           cache: pip
           cache-dependency-path: backend/uv.lock
 
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # Keyed on the lockfile hash, which this repository now pins, so
+      # the entry stays valid across ordinary dependency bumps instead of
+      # going stale like a requirements.txt hash would have.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
       - name: Install backend dependencies
         # `uv sync` installs backend/uv.lock *and* creates
         # backend/.venv, so this one step is what the old
@@ -423,6 +465,27 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: backend/uv.lock
+
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # Keyed on the lockfile hash, which this repository now pins, so
+      # the entry stays valid across ordinary dependency bumps instead of
+      # going stale like a requirements.txt hash would have.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
 
       - name: Install backend dependencies
         # `uv sync` installs backend/uv.lock *and* creates
@@ -569,6 +632,17 @@ jobs:
       # every other lane, because "install one package by hand" was the
       # shape that put unpinned pytest into venvs in the first place —
       # and the extra packages cost this job nothing.
+      # Same reason as the install steps above: uv's cache directory is not
+      # the one setup-python restores, so without this the scanner's sync
+      # re-downloads on every run.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
       - name: Create the venv the scanner resolves
         run: |
           set -euo pipefail
@@ -664,6 +738,17 @@ jobs:
       # every other lane, because "install one package by hand" was the
       # shape that put unpinned pytest into venvs in the first place —
       # and the extra packages cost this job nothing.
+      # Same reason as the install steps above: uv's cache directory is not
+      # the one setup-python restores, so without this the scanner's sync
+      # re-downloads on every run.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
       - name: Create the venv the scanner resolves
         run: |
           set -euo pipefail
@@ -809,6 +894,27 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: backend/uv.lock
+
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # Keyed on the lockfile hash, which this repository now pins, so
+      # the entry stays valid across ordinary dependency bumps instead of
+      # going stale like a requirements.txt hash would have.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
 
       - name: Install backend dependencies
         # `uv sync` installs backend/uv.lock *and* creates
@@ -1021,6 +1127,37 @@ jobs:
           # still has room to run.
           WATCHDOG_SECONDS=900
 
+          # ``-n 8`` — this lane's pytest invocation runs across 8 workers.
+          #
+          # It is a per-invocation flag on purpose. ``addopts`` in
+          # ``backend/pytest.ini`` is global, so a ``-n`` written there would
+          # reach every lane in this workflow — including
+          # ``existing-test``, whose tests assert on WALL-CLOCK parallelism
+          # contracts ("4 VPs in flight finish in 10s, not 40s"). pytest.ini
+          # says in as many words that those must have the runner to
+          # themselves; parallelising them would make the very bound they
+          # assert unmeasurable. Only the two lanes that carry the gating
+          # marker expression get it.
+          #
+          # What it costs, and what made it safe to do at all:
+          #
+          #   * every ``parametrize`` ID has to be stable across processes.
+          #     xdist aborts a run with "Different tests were collected
+          #     between gw2 and gw14" when two workers import a module in
+          #     different seconds and a wall-clock value has become a case
+          #     ID. ``tests/unit/test_provider_quota_dispatch.py`` was one
+          #     such place and now pins its IDs.
+          #   * every worker needs its OWN scratch root. The controller sets
+          #     ``PDT_TEST_SESSION_ROOT`` while loading the conftest and its
+          #     workers inherit the value, so keying the root on the variable
+          #     alone gave every worker one ``state.db``.
+          #
+          # 8 is the measured plateau, not the biggest number that boots:
+          # ``pytest tests/unit`` is 167 s serial and 39 s at ``-n 10``, and
+          # past 8 workers the curve flattens and then reverses. Sharding
+          # across 20 runner VMs has already taken the coarse-grained
+          # parallelism, so this is about the cores *inside* one VM.
+
           # --- order independence ------------------------------------------
           # Shuffle the order this shard *executes* its files in, seeded
           # from the run so it differs every time but is reproducible from
@@ -1091,6 +1228,7 @@ jobs:
           timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
             ./.venv/bin/python3 -m pytest $EXEC_ORDER \
               -m "not e2e and not integration and not time_sensitive and not perf" \
+              -n 8 \
               --cov=. \
               --cov-report= \
               --tb=short \
@@ -1230,6 +1368,27 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: backend/uv.lock
+
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # Keyed on the lockfile hash, which this repository now pins, so
+      # the entry stays valid across ordinary dependency bumps instead of
+      # going stale like a requirements.txt hash would have.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
 
       - name: Install backend dependencies
         # `uv sync` installs backend/uv.lock *and* creates
@@ -1371,10 +1530,24 @@ jobs:
           # killing the shard; see `backend/utils/process.py`.
           WATCHDOG_SECONDS=1500
           set +e
+          # ``-n 8``, matching the ``unit-tests`` shard it bisects. That
+          # match is the whole point of the flag here: a bisect harness that
+          # runs a *different* shape from the shard it is bisecting cannot
+          # find a bug that only the shard's shape has — which is the defect
+          # ``test_the_bisect_lane_runs_the_shape_it_bisects`` was written
+          # about when the staircase ran without ``--cov=.``. Taking it from
+          # the shard it bisects rather than from a separate judgement is
+          # what keeps that gate's promise true; if the shard's worker count
+          # changes, this line is the one that has to change with it.
+          #
+          # It carries the same two preconditions the shard's does (pinned
+          # ``parametrize`` IDs, one scratch root per worker) because they
+          # are properties of the suite, not of the lane.
           COVERAGE_FILE=.coverage.staircase-${{ matrix.shard }} \
           timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
             ./.venv/bin/python3 -m pytest $TARGETS \
               -m "not e2e and not integration and not time_sensitive and not perf" \
+              -n 8 \
               --cov=. \
               --cov-report= \
               --tb=short \
@@ -1437,6 +1610,27 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: backend/uv.lock
+
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # Keyed on the lockfile hash, which this repository now pins, so
+      # the entry stays valid across ordinary dependency bumps instead of
+      # going stale like a requirements.txt hash would have.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
 
       - name: Install backend dependencies
         # `uv sync` installs backend/uv.lock *and* creates
@@ -1514,6 +1708,27 @@ jobs:
           cache: pip
           cache-dependency-path: backend/uv.lock
 
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # Keyed on the lockfile hash, which this repository now pins, so
+      # the entry stays valid across ordinary dependency bumps instead of
+      # going stale like a requirements.txt hash would have.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
       - name: Install backend dependencies
         # `uv sync` installs backend/uv.lock *and* creates
         # backend/.venv, so this one step is what the old
@@ -1588,6 +1803,27 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: backend/uv.lock
+
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # Keyed on the lockfile hash, which this repository now pins, so
+      # the entry stays valid across ordinary dependency bumps instead of
+      # going stale like a requirements.txt hash would have.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
 
       - name: Install backend dependencies
         # `uv sync` installs backend/uv.lock *and* creates
@@ -1701,6 +1937,27 @@ jobs:
           cache: pip
           cache-dependency-path: backend/uv.lock
 
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # Keyed on the lockfile hash, which this repository now pins, so
+      # the entry stays valid across ordinary dependency bumps instead of
+      # going stale like a requirements.txt hash would have.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
       - name: Install backend dependencies
         # `uv sync` installs backend/uv.lock *and* creates
         # backend/.venv, so this one step is what the old
@@ -1739,11 +1996,15 @@ jobs:
       #
       # ``test_credentials_security_lookup.py`` covers the read itself
       # (the argv, a nonzero exit for an item that is not there, a
-      # trailing newline, a tool that hangs); the cache invariants
-      # cover what happens when the same lookup is asked twice.
+      # trailing newline, a tool that hangs); ``test_secret_launcher_publish``
+      # covers what happens when the same lookup is asked twice. That
+      # second invariant used to live in ``test_credentials_cache_invariants``,
+      # which counted the processes the *server* started — and the server
+      # starts none any more, so the counter moved to the launcher, which
+      # is the process that reads.
       - name: Run the macOS keychain probes
         working-directory: backend
-        run: ./.venv/bin/python3 -m pytest tests/integration/test_credentials_security_lookup.py tests/integration/test_credentials_cache_invariants.py --tb=short --timeout=300
+        run: ./.venv/bin/python3 -m pytest tests/integration/test_credentials_security_lookup.py tests/integration/test_secret_launcher_publish.py --tb=short --timeout=300
 
       # The whole delivery, end to end, with nothing replaced. The step
       # above proves the command line this repository *believes* in reaches
@@ -1804,6 +2065,38 @@ jobs:
           PDT_REQUIRE_KEYCHAIN_E2E: "1"
         run: ./.venv/bin/python3 -m pytest tests/e2e/test_keychain_full_delivery_macos.py --tb=short --timeout=300
 
+      # The acceptance walk, on the same terms. ``e2e-on-demand`` collects
+      # this file — it declares ``pytestmark = pytest.mark.e2e`` — but it
+      # runs on ``ubuntu-latest``, where the five cases marked
+      # ``_requires_macos_keychain`` skip. A skip is not a pass: it is the
+      # same "green because nothing ran" shape the job above exists to
+      # close, one file over. These cases read a real keychain through the
+      # real tool and then check every consumer in the chain answers
+      # "configured" without the value appearing in any environment.
+      #
+      # Hermetic for the same reason the step above is: the cases build
+      # their own keychain under ``tmp_path`` with ``$HOME`` redirected at
+      # it and refuse to delete anything that is not under that root, so
+      # this job never reads or writes the runner's own keychain. Same
+      # gate as ``backend/tests/static_gates/
+      # test_real_home_touching_tests_cleanup.py`` enforces for the
+      # create-under-a-real-home cases.
+      #
+      # ``PDT_REQUIRE_CREDENTIAL_CHAIN_E2E`` is this file's own strict
+      # switch — a different name from the one above because these are two
+      # files with two gates, each closed independently. It turns "this
+      # runner cannot start /usr/bin/security" from a skip into a failure,
+      # which is the correct reading on the one lane in this workflow that
+      # *should* have a keychain. The switch name and its accepted values
+      # are read out of the test file itself by
+      # ``tests/static_gates/test_keychain_macos_job_is_a_merge_gate.py``,
+      # not copied here.
+      - name: Run the macOS credential-chain acceptance (real keychain, every consumer)
+        working-directory: backend
+        env:
+          PDT_REQUIRE_CREDENTIAL_CHAIN_E2E: "1"
+        run: ./.venv/bin/python3 -m pytest tests/e2e/test_credential_chain_acceptance.py --tb=short --timeout=300
+
       - name: Upload keychain E2E report
         if: always()
         uses: actions/upload-artifact@v4
@@ -1855,6 +2148,27 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: backend/uv.lock
+
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # Keyed on the lockfile hash, which this repository now pins, so
+      # the entry stays valid across ordinary dependency bumps instead of
+      # going stale like a requirements.txt hash would have.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
 
       - name: Install backend dependencies
         # `uv sync` installs backend/uv.lock *and* creates
@@ -1936,6 +2250,27 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: backend/uv.lock
+
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # Keyed on the lockfile hash, which this repository now pins, so
+      # the entry stays valid across ordinary dependency bumps instead of
+      # going stale like a requirements.txt hash would have.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
 
       - name: Install backend dependencies
         # `uv sync` installs backend/uv.lock *and* creates
@@ -2071,6 +2406,27 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: backend/uv.lock
+
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # Keyed on the lockfile hash, which this repository now pins, so
+      # the entry stays valid across ordinary dependency bumps instead of
+      # going stale like a requirements.txt hash would have.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
 
       - name: Install backend dependencies
         # `uv sync` installs backend/uv.lock *and* creates

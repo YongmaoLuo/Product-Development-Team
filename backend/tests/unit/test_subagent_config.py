@@ -285,13 +285,15 @@ def test_write_tmp_settings_atomic():
 
 def test_write_tmp_settings_emits_log():
     """write_tmp_settings invokes the logger with event=
-    'subagent_settings_file_written' and data={path, uuid, fields=4}.
+    'subagent_settings_file_written' and data={path, uuid, fields}.
 
-    2026-09-13: fields was 3 (BASE_URL / AUTH_TOKEN / API_KEY) after
-    model management was delegated to CC Switch. 2026-09-22: raised
-    to 4 — ANTHROPIC_MODEL is now a hard contract of every settings
-    tmpfile (the inline-review path bypasses the dispatch walk, and a
-    missing model let the CLI fall through to opus / vendor-d-pro). The logger interface is duck-typed: the function tries
+    ``fields`` is the number of ``ANTHROPIC_*`` keys in the payload as
+    written, not a contract constant: for a provider-bearing tmpfile that
+    is the endpoint + credentials, plus ANTHROPIC_MODEL when one resolves
+    (4 for this fixture, which supplies it via ``model_env``), and for a
+    hooks-only payload it is 0. Reporting the constant instead made the
+    log entry unable to answer the only question a reader of it has —
+    does this file hold a key? The logger interface is duck-typed: the function tries
     ``logger.emit(...)`` first, falling back to ``logger.log(...)`` or
     ``logger.info(...)`` if ``emit`` is not present. The MagicMock has
     all three attributes, so the first branch (``.emit``) is taken —
@@ -332,10 +334,16 @@ def test_write_tmp_settings_emits_log():
         assert data.get('path') == str(path), (
             f"data['path']={data.get('path')!r} != str(path)={str(path)!r}"
         )
-        assert data.get('fields') == 3, (
-            f"data['fields']={data.get('fields')!r} != 3 "
-            f"(_SETTINGS_ENV_FIELD_COUNT: endpoint + credentials; a model "
-            f"is stamped only when one resolves)"
+        assert data.get('fields') == 4, (
+            f"data['fields']={data.get('fields')!r} != 4 "
+            f"(endpoint + credentials + ANTHROPIC_MODEL, which this fixture "
+            f"supplies via model_env; the count is measured from the written "
+            f"payload, so a hooks-only payload reports 0)"
+        )
+        assert data.get('provider_config') is True, (
+            f"data['provider_config']={data.get('provider_config')!r} is not "
+            f"True — this payload carries ANTHROPIC_* keys and the log entry "
+            f"is the trail a reader has for knowing that"
         )
         # ``uuid`` is a 32-char lowercase hex string matching the
         # filename suffix

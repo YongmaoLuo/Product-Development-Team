@@ -128,7 +128,7 @@ it is:
 uv sync --project backend        # builds backend/.venv from backend/uv.lock
 source backend/.venv/bin/activate
 
-cp backend/.env.ci backend/.env      # non-secret placeholders
+cp .env.example .env             # optional — every setting in it is optional
 
 # From the repository root — the app is a package (`backend/`), so `-m` is
 # what puts both the root and `backend/` on `sys.path`.
@@ -218,16 +218,17 @@ is in [Contributing](docs/development/contributing.md#where-a-file-belongs).
 |---|---|
 | `.pdt/` | The state family — `state.db` (+ `-wal`/`-shm`), `pdt_server_boot_id`, `backups/`, `nightly-results.json`. **One-off and machine-local scripts belong here too, not in `scripts/`** |
 | `plans/` | One directory per plan: interview, PRD, arch, tasks, execution, verification |
-| `backend/.env` | This deployment's credentials and provider routing |
+| `.env` | This deployment's non-secret settings — the keychain *indexes*, timezone, notification targets |
 | `.config/` | Per-user tool state (provider blacklist, ordering) |
 | `tools/` | The operator fleet's subsidiary processes |
 | `site/`, `.pytest_cache/`, `ac_server_boot_id`, `CLAUDE.md` | Build output, caches, and this checkout's own operator notes |
 
 ## Configuration / 配置
 
-`backend/config.yaml` is intentionally thin — nothing is required to run.
-There is no built-in provider chain (point `provider_order_file` at
-whatever produces that contract), and `subsidiary_processes` ships empty.
+`backend/config.yaml` is intentionally thin — nothing is required to run,
+and `subsidiary_processes` ships empty. The provider fallback chain is not
+configured there at all: the backend asks CC Switch for it at startup, so
+the order you see in CC Switch is the order it dispatches in.
 
 Provider concurrency caps and provider routing are **operator-specific**.
 They ship as committed templates under `example/`; you copy them into the
@@ -250,25 +251,38 @@ elsewhere:
 | `PDT_PROVIDER_CAPACITY_FILE` | path to the capacity YAML |
 | `PDT_PROVIDER_ROUTING_FILE` | path to the routing YAML |
 
-Credentials come from `backend/.env` (gitignored). `backend/.env.ci` holds
-committed placeholders — a test fixture; **never** put a real key in it.
-Runtime state (the state database, its boot counter, its backups) lives
-under a single gitignored `<repo>/.pdt/`.
+Credentials do **not** come from a dotenv file. A provider API key is
+supplied at runtime by whatever provider layer a deployment runs —
+`backend/cc_switch.py` is the integration this codebase ships, and it
+reads one provider row at a time; the two notification secrets (Feishu
+app secret, Telegram bot token) are read from a macOS keychain. What
+`.env` (gitignored, templated by the committed `.env.example`) carries is
+the non-secret half — the `account` each keychain item is filed under,
+timezone, and the notification targets. It is entirely optional: a
+deployment that exports its configuration directly, or that has no
+notifications at all, runs without the file. Runtime state (the state
+database, its boot counter, its backups) lives under a single gitignored
+`<repo>/.pdt/`.
 
 More: **[Configuration](docs/operations/configuration.md)**.
 
 ## How to run the tests / 如何跑测试
 
 ```bash
-# from the repository root, with backend/.venv activated — the default lane
-backend/.venv/bin/python3 -m pytest backend/tests -m unit -q
+# from the repository root, with backend/.venv activated — the unit lane
+backend/.venv/bin/python3 -m pytest backend/tests/unit -q
 
 # or via the canonical wrapper, which resolves the venv for you
 scripts/run_tests.sh
 ```
 
-`-m unit` skips the `time_sensitive`, `integration`, `e2e` and `real_model` markers;
-the missing models are satisfied by stubs the conftest installs.
+The lane is the **directory** `backend/tests/unit` (4108 tests, ~167 s serial) —
+it is what CI and the verification gate run, and unlike a marker it cannot
+drift. `-m unit` selects 4193: the same tree plus a few files outside it that
+mark themselves `unit`. Add `-n 8` to run the lane in ~40 s.
+[Tests](docs/development/testing.md) has the measurements, the reason `-n auto`
+does not work yet, and the story of how `-m unit` came to select the entire
+suite for a while.
 
 Two collection rules worth knowing: `pytest.ini` is directory-sensitive
 (from `backend/` pytest reads `backend/pytest.ini`, from the root it reads

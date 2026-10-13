@@ -2,7 +2,7 @@
 
 The two real notification secrets — the Feishu app secret and the Telegram
 bot token — can be read from a dedicated macOS keychain instead of from
-`backend/.env`, and handed to the processes that need them over a file
+`.env`, and handed to the processes that need them over a file
 descriptor rather than through the environment.
 
 **This is opt-in and ships disabled.** A deployment that changes nothing
@@ -13,27 +13,28 @@ attacker on the same machine can read out of a process listing.
 
 ## What changes, and what does not
 
-The index keys stay in `backend/.env` — `FEISHU_APP_ID` and
+The index keys stay in `.env` — `FEISHU_APP_ID` and
 `TELEGRAM_CHAT_ID` are configuration, not credentials, and moving them
 would put a non-secret under credential management for no gain. Only the
 two secrets move.
 
 | | before | after |
 |---|---|---|
-| index keys | `backend/.env` | `backend/.env` (unchanged) |
-| secrets | `backend/.env` → `os.environ` | keychain → pipe → fd number in the environment |
+| index keys | `.env` | `.env` (unchanged) |
+| secrets | `.env` → `os.environ` | keychain → pipe → fd number in the environment |
 | `ps eww <pid>` shows the secret | yes | no |
 | Linux / Windows | unchanged | unchanged |
 
 The switch is `PDT_DISABLE_KEYCHAIN_SECRETS`, and the name reads
 backwards on purpose: it **disables** the keychain, so the keychain is on
-when the variable is *absent or* set to `0` or `false`. Every other
-spelling — `true`, `1`, `yes`, a typo, a stray space — leaves it off.
-Reading it the other way would mean shelling out per lookup against a
-store the deployment has not finished populating, which fails in a way
-only an operator can debug. The cost of guessing wrong the other way is a
-secret that stays in the environment a little longer, which is the state
-the installation is already in.
+only when the variable is set to `0` or `false`. Absent, empty, and every
+other spelling — `true`, `1`, `yes`, a typo, a stray space — leave it off;
+deleting the line leaves it **off**, it does not turn it on. Reading it the
+other way would mean shelling out per lookup against a store the
+deployment has not finished populating, which fails in a way only an
+operator can debug. The cost of guessing wrong the other way is a secret
+that stays in the environment a little longer, which is the state the
+installation is already in.
 
 ## Before you start
 
@@ -75,11 +76,11 @@ name. The provider locates entries by account alone and never passes a
 
 ```bash
 # read the index values out of .env without echoing them
-FEISHU_APP_ID=$(grep -m1 '^FEISHU_APP_ID=' backend/.env | cut -d= -f2-)
-TELEGRAM_CHAT_ID=$(grep -m1 '^TELEGRAM_CHAT_ID=' backend/.env | cut -d= -f2-)
+FEISHU_APP_ID=$(grep -m1 '^FEISHU_APP_ID=' .env | cut -d= -f2-)
+TELEGRAM_CHAT_ID=$(grep -m1 '^TELEGRAM_CHAT_ID=' .env | cut -d= -f2-)
 
-security add-generic-password -U -a "$FEISHU_APP_ID"   -w "$(grep -m1 '^FEISHU_APP_SECRET=' backend/.env | cut -d= -f2-)" ~/Library/Keychains/runtime-secrets.keychain-db
-security add-generic-password -U -a "$TELEGRAM_CHAT_ID" -w "$(grep -m1 '^TELEGRAM_BOT_TOKEN=' backend/.env | cut -d= -f2-)" ~/Library/Keychains/runtime-secrets.keychain-db
+security add-generic-password -U -a "$FEISHU_APP_ID"   -w "$(grep -m1 '^FEISHU_APP_SECRET=' .env | cut -d= -f2-)" ~/Library/Keychains/runtime-secrets.keychain-db
+security add-generic-password -U -a "$TELEGRAM_CHAT_ID" -w "$(grep -m1 '^TELEGRAM_BOT_TOKEN=' .env | cut -d= -f2-)" ~/Library/Keychains/runtime-secrets.keychain-db
 ```
 
 `-U` updates in place, so re-running after a credential rotation is safe.
@@ -104,10 +105,17 @@ PDT_DISABLE_KEYCHAIN_SECRETS=0 backend/.venv/bin/python3 -m backend.cli secrets 
     allow the reading application, or recreate the item with `-T` naming
     the binary that needs it.
 
+    The default entry is `/usr/bin/security` itself, because that is the
+    application that filed the item. That is exactly why the read is
+    silent for everybody: an Apple-signed binary that every process on
+    the machine may execute is already trusted. See
+    [Narrow who is trusted to read it](#5-narrow-who-is-trusted-to-read-it)
+    for the opt-in that names one binary of your own instead.
+
 ## 3. Turn it on
 
 ```bash
-echo 'PDT_DISABLE_KEYCHAIN_SECRETS=0' >> backend/.env
+echo 'PDT_DISABLE_KEYCHAIN_SECRETS=0' >> .env
 ```
 
 Then remove the two secrets from `.env`. Leaving them there is not a
@@ -117,12 +125,32 @@ already stale.
 
 ```bash
 # keep a copy outside the repo until notifications have been confirmed working
-cp backend/.env "$HOME/.pdt-env-backup"
+cp .env "$HOME/.pdt-env-backup"
 ```
 
 ## 4. Confirm
 
-Restart the server and check that a notification actually goes out. The
+**While the keychain is enabled the server is started through its
+launcher**, `backend.secret_launcher`, rather than directly:
+
+```bash
+backend/.venv/bin/python3 -m backend.secret_launcher
+```
+
+The launcher reads the keychain once, writes each value into an anonymous
+pipe, and then `exec`s the server, which keeps the launcher's PID. The
+process that serves requests therefore never runs the keychain tool at
+all; it reads a descriptor it inherited, and reports
+`source=inherited_fd` for it. A supervisor that already starts
+`backend.server` needs that one word changed and nothing else.
+
+Started directly with the switch on, the server finds no descriptor and —
+because a deployment that asked for a keychain must not be quietly
+downgraded to a plaintext variable — reports every secret as `missing`
+rather than falling back to `.env`. With the switch left off,
+`python -m backend.server` is unchanged and still correct.
+
+Restart and check that a notification actually goes out. The
 provider resolves a secret once per process and caches both hits and
 misses, so a running process keeps whatever it decided at first use —
 turning the switch on underneath a live process changes nothing until it
@@ -139,13 +167,46 @@ without printing a credential:
 curl -s -H "X-PDT-Request: 1" http://127.0.0.1:8000/api/notifications/status
 ```
 
+## 5. Narrow who is trusted to read it
+
+Everything above moves the secret out of the environment. None of it
+changes who may read it out of the keychain. An item filed by `security`
+lists `/usr/bin/security` as its trusted application, and that is an
+Apple-signed binary every process running as you may execute — so the
+read is promptless for anything that can run one command. That is the
+half of the problem this page does not fix, and the default is worth
+being explicit about rather than leaving to be discovered.
+
+`tools/pdt-secret-reader/` is the opt-in that fixes it: a small reader you
+sign yourself, plus a setup script that re-files the items so their access
+control lists name that one binary and nothing else. It is interactive —
+each item gets one dialog you have to answer — and it runs in two passes:
+
+```bash
+cd tools/pdt-secret-reader
+./setup.sh build
+./setup.sh adopt --widen     # restart the backend, confirm the notifier comes up
+./setup.sh adopt --narrow
+```
+
+`--widen` asks macOS to add the reader to each item while keeping whatever
+is already trusted, so notifications keep working while you confirm the
+handoff; `--narrow` then rewrites those lists with the reader alone. The
+second command is what removes `security`. Either way `adopt` writes
+`PDT_SECRET_READER_PATH` into `.env` for you, and the reader is invoked
+with the same argv `security` was, so nothing else about the read changes.
+
+Read `tools/pdt-secret-reader/README.md` before running it. It documents
+the procedure, the exit codes, how to widen it back, and — the section
+worth reading twice — what it does **not** protect against.
+
 ## Rolling back
 
 The keychain path is additive, so rollback is removing one line:
 
 ```bash
-sed -i '' '/^PDT_DISABLE_KEYCHAIN_SECRETS=/d' backend/.env
-cp "$HOME/.pdt-env-backup" backend/.env
+sed -i '' '/^PDT_DISABLE_KEYCHAIN_SECRETS=/d' .env
+cp "$HOME/.pdt-env-backup" .env
 ```
 
 The keychain and its items are left in place. Deleting the keychain

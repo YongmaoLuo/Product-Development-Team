@@ -33,7 +33,11 @@ if str(_BACKEND_DIR) not in sys.path:
 import coding_tool  # noqa: E402
 import provider_order  # noqa: E402
 import provider_routing  # noqa: E402
-from coding_tool import ClaudeCodingTool, EmptyResponseError  # noqa: E402
+from coding_tool import (  # noqa: E402
+    ClaudeCodingTool,
+    EmptyResponseError,
+    SceneProviderUnavailable,
+)
 from dynamic_provider_concurrency import ActiveConcurrencyTracker  # noqa: E402
 
 CHAIN = ["Vendor A Pro", "Vendor A", "Vendor A API"]
@@ -166,13 +170,33 @@ def test_each_pool_contributes_its_own_ten(tmp_path, monkeypatch, scene):
 
     for _ in range(10):
         tracker.try_acquire("Vendor A API", 10)
+
+    # 30 in flight is the whole Vendor A family, so the 31st has nowhere
+    # approved to go *this second*. That is a queue, not a failure: a
+    # slot comes back when the agent holding it finishes, and until then
+    # there is nothing to fail on. What must still hold is that the
+    # parent config — outside the scene's tier table — never answers.
     tool = _tool(tracker)
-    tool.provider_slot_wait_sec = 0.2
-    _run(tool)
-    assert tool.current_call_provider == "parent", (
-        "30 in flight is the whole Vendor A family; the 31st falls back to "
-        "the parent config instead of over-subscribing"
+    tool.provider_slot_wait_sec = 0.0
+    steps: list = []
+
+    def _sleep(seconds):
+        steps.append(seconds)
+        if len(steps) >= 3:
+            tracker.release("Vendor A API")
+
+    monkeypatch.setattr(coding_tool, "_quota_wake_sleep", _sleep)
+    result, _session, _meta = _run(tool)
+
+    assert result == "ok"
+    assert tool.current_call_provider == "Vendor A API", (
+        f"the work went to {tool.current_call_provider!r}; with every pool "
+        f"full the only rows the scene approves are its own three"
     )
+    assert tracker.current("Vendor A Pro") == 10, (
+        "the other two pools were not borrowed from"
+    )
+    assert tracker.current("Vendor A") == 10
 
 
 # ---------------------------------------------------------------------------
@@ -220,41 +244,120 @@ def test_the_slot_is_returned_when_the_provider_times_out(tmp_path, monkeypatch,
 
 
 # ---------------------------------------------------------------------------
-# Queueing, and what happens when the wait runs out
+# Queueing, and what it must NOT wait for
 # ---------------------------------------------------------------------------
 
 
-def test_all_pools_full_queues_then_falls_back_to_the_parent(tmp_path, monkeypatch, scene):
+def test_all_pools_full_queues_and_then_dispatches(tmp_path, monkeypatch, scene):
+    """Every pool full → wait, then serve. Never over-subscribe, never borrow.
+
+    **Contract change, not a relaxation.** This asserted
+    ``reason == "no_capacity"`` after a 0.2 s wait. It now asserts the
+    call waits for a slot and comes out the other side having dispatched:
+    a slot is a lease that comes back when its holder finishes, so
+    failing on it reported a failure for a queue the dispatcher itself
+    declared over. Both properties the old test protected are kept —
+    nothing extra was taken from a pool that was not freed, and the
+    parent environment (outside the scene's tier table) never answered.
+
+    The negative half lives in
+    ``test_a_pool_with_no_quota_is_not_waited_for`` below: a cap of zero
+    is a window, and a window is not queued for.
+    """
     _install_fake_claude(tmp_path, monkeypatch, OK_SCRIPT)
     tracker = ActiveConcurrencyTracker()
     for name in CHAIN:
         for _ in range(10):
             tracker.try_acquire(name, 10)
 
+    steps: list = []
+
+    def _sleep(seconds):
+        steps.append(seconds)
+        if len(steps) >= 2:
+            tracker.release(CHAIN[0])
+
+    monkeypatch.setattr(coding_tool, "_quota_wake_sleep", _sleep)
     tool = _tool(tracker)
-    tool.provider_slot_wait_sec = 0.2
-    _run(tool)
+    tool.provider_slot_wait_sec = 0.0
+    result, _session, _meta = _run(tool)
 
-    # ``"parent"`` is the walk's explicit "use the process env"
-    # sentinel — reachable only because the scene walk found no pool.
-    assert tool.current_call_provider == "parent", (
-        "with every pool full the dispatch must fall back to the parent "
-        "config rather than over-subscribing the first pool"
+    assert result == "ok"
+    assert steps == [coding_tool._slot_wake_step_sec(i) for i in range(2)]
+    assert tool.current_call_provider == CHAIN[0], (
+        f"the work went to {tool.current_call_provider!r}; the parent "
+        f"config is not a tier member and must not answer"
     )
-    assert tracker.total() == 30, "nothing extra was taken"
+    assert [tracker.current(n) for n in CHAIN[1:]] == [10, 10], (
+        "nothing extra was taken from the pools that were not freed"
+    )
 
 
-def test_a_pool_with_no_quota_is_not_waited_for(tmp_path, monkeypatch, scene):
-    """0% means out of budget — waiting cannot help, so it must not."""
+def _open_verdict(name):
+    """A reading with budget in it: a cap, and not shut."""
+    return provider_order.ProviderQuota(
+        provider=name,
+        shape=provider_order.SHAPE_ROLLING,
+        remaining_pct=96.0,
+        exhausted=False,
+    )
+
+
+def _no_reading_then(verdicts):
+    """Answer the reader once with nothing, then with ``verdicts``.
+
+    The first payload is "no reading", which is the fail-open half of
+    the reader's contract, so the legacy usage map this test sets to
+    ``0.0`` is what decides the cap — a budget with nothing left in it.
+    """
+    reads: list = []
+
+    def _load(*_a, **_kw):
+        reads.append(True)
+        return {} if len(reads) == 1 else dict(verdicts)
+
+    return _load
+
+
+def test_a_pool_with_no_quota_waits_on_the_window_and_then_dispatches(
+    tmp_path, monkeypatch, scene,
+):
+    """0% means the budget is gone — so wait for it, do not fail.
+
+    **Contract change, not a relaxation.** This asserted
+    ``reason == "no_capacity"`` with an empty ``sleeps``. Nothing about
+    the pool changed: a remaining budget with nothing in it is a window
+    that rolls, so the dispatch is handed to the same wait a shut reading
+    gets — probe, re-read, re-decide — and is served the moment a probe
+    finds the budget back. Failing closed answered "should this call
+    never run?" about a pause that had an end.
+
+    What it must still never do is *queue*: a lease wait pointed at a
+    five-hour clock does not outlast it.
+    """
     _install_fake_claude(tmp_path, monkeypatch, OK_SCRIPT)
     scene({p: 0.0 for p in CHAIN})
     tracker = ActiveConcurrencyTracker()
 
+    sleeps: list = []
+    monkeypatch.setattr(coding_tool, "_quota_wake_sleep", sleeps.append)
+    monkeypatch.setattr(
+        provider_order, "load_provider_quota_map",
+        _no_reading_then({p: _open_verdict(p) for p in CHAIN}),
+    )
     tool = _tool(tracker)
-    tool.provider_slot_wait_sec = 30.0   # would hang the test if it waited
-    _run(tool)
+    result, _session, _meta = _run(tool)
 
-    assert tool.current_call_provider == "parent"
+    assert result == "ok", (
+        "a budget with nothing left is a pause; the pause has to end in "
+        "the work rather than in a failed call"
+    )
+    assert tool.current_call_provider in CHAIN
+    assert sleeps == [coding_tool._quota_wake_probe_sec()], sleeps
+    assert sleeps[0] != coding_tool._slot_wake_step_sec(0), (
+        "a shut window is not a held slot; the queue's doubling beat is "
+        "the wrong clock for it"
+    )
     assert tracker.total() == 0
 
 
@@ -273,11 +376,17 @@ def test_a_reduced_quota_shrinks_that_pool(tmp_path, monkeypatch, scene):
     assert tool.current_call_provider == "Vendor A"
 
 
-def test_a_saturated_fleet_falls_back_to_the_parent(tmp_path, monkeypatch, scene):
-    """All three pools at cap → the parent config, not an over-subscribed pool.
+def test_a_saturated_fleet_queues_and_never_over_subscribes(
+    tmp_path, monkeypatch, scene,
+):
+    """All three pools at cap → the call queues, and takes nothing extra.
 
-    The fleet size is the three declared caps (30 here), not a constant:
-    that is what "every pool is full" means.
+    **Contract change, not a relaxation.** Was: ``reason ==
+    "no_capacity"`` and ``tracker.total() == 30``. Now: the queue is
+    entered and the call is served once a slot is released. The
+    over-subscription half is untouched and is the one worth keeping —
+    the fleet size is the three declared caps (30 here), not a constant,
+    and a queue must not be a licence to take a 31st slot.
     """
     _install_fake_claude(tmp_path, monkeypatch, OK_SCRIPT)
     tracker = ActiveConcurrencyTracker()
@@ -285,12 +394,25 @@ def test_a_saturated_fleet_falls_back_to_the_parent(tmp_path, monkeypatch, scene
         for _ in range(10):
             tracker.try_acquire(name, 10)
 
+    rounds: list = []
+
+    def _sleep(seconds):
+        rounds.append(tracker.total())
+        if len(rounds) >= 3:
+            tracker.release(CHAIN[1])
+
+    monkeypatch.setattr(coding_tool, "_quota_wake_sleep", _sleep)
     tool = _tool(tracker)
-    tool.provider_slot_wait_sec = 0.2
+    tool.provider_slot_wait_sec = 0.0
     _run(tool)
 
-    assert tool.current_call_provider == "parent"
-    assert tracker.total() == 30, "nothing extra was taken"
+    assert rounds[:3] == [30, 30, 30], (
+        f"the pool stood at {rounds} while the dispatch was queued; a "
+        f"queue is for waiting, not for over-subscribing"
+    )
+    assert tool.current_call_provider == CHAIN[1], (
+        "the row that released a slot is the row that served it"
+    )
 
 
 # ---------------------------------------------------------------------------

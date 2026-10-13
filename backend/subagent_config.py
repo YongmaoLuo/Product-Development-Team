@@ -77,6 +77,20 @@ class SubagentConfig:
                           user's existing Claude Code configuration is
                           already the answer, and anything written here
                           would outrank it. Hooks are unaffected.
+        defer_provider_config:
+                          When True, this file carries hooks (and the
+                          hook-correlation key) but no provider endpoint
+                          or credential, even though ``base_url`` /
+                          ``auth_token`` / ``api_key`` are set. For a file
+                          written BEFORE a provider is selected, that is
+                          the only correct payload: the dispatch writes a
+                          second, per-call settings file once routing has
+                          chosen, and that one is where provider
+                          configuration belongs. Writing the run-level
+                          provider here produced a file nothing ever
+                          re-reads (the redaction pass covers the
+                          effective path only), so its key stayed on disk
+                          in cleartext for the life of the tmp root.
     """
 
     provider_name: str = ''
@@ -92,6 +106,7 @@ class SubagentConfig:
     task_type: str = 'general'
     task_summary: str = ''
     inherit_env: bool = False
+    defer_provider_config: bool = False
 
     def __post_init__(self) -> None:
         # Defensive: callers may pass None for model_env; treat as an
@@ -129,12 +144,15 @@ class SubagentConfig:
 
         Boundary: the ANTHROPIC_* env field minimum (endpoint +
         credentials) is enforced with an AssertionError so a silent
-        drift from the contract surfaces immediately — **except** in
-        ``inherit_env`` mode, where emitting no ANTHROPIC_* entries is
-        the point rather than a drift.
+        drift from the contract surfaces immediately — **except** for the
+        two modes that emit no ANTHROPIC_* entries on purpose,
+        ``inherit_env`` and ``defer_provider_config``. Both return the
+        same hooks-only payload; see ``_hooks_only_payload`` for why the
+        file is allowed to be provider-free, and why the two reasons for
+        it are kept apart.
         """
-        if self.inherit_env:
-            return self._inherit_env_payload()
+        if self.inherit_env or self.defer_provider_config:
+            return self._hooks_only_payload()
 
         env: Dict[str, str] = {}
         env['ANTHROPIC_BASE_URL'] = self.base_url
@@ -202,33 +220,51 @@ class SubagentConfig:
             'hooks': self._build_hooks_payload(),
         }
 
-    def _inherit_env_payload(self) -> dict:
-        """Settings payload for inherit mode: hooks, and no provider config.
+    def _hooks_only_payload(self) -> dict:
+        """Hooks payload with no provider config — the shared shape of
+        ``inherit_env`` and ``defer_provider_config``.
 
-        Inherit mode is what runs when CC Switch is not installed. The
-        user already has a working Claude Code configuration — that is
-        the whole premise of owning Claude Code — so the job here is to
-        **not interfere** with it.
+        Two different situations, one payload:
 
-        That is why the env block is empty rather than merely reduced.
-        ``--settings`` outranks ``~/.claude/settings.json``, so *any*
+        ``inherit_env`` — CC Switch is not installed. The user already has
+        a working Claude Code configuration — that is the whole premise of
+        owning Claude Code — so the job here is to **not interfere** with
+        it. ``--settings`` outranks ``~/.claude/settings.json``, so *any*
         ``ANTHROPIC_*`` entry written here would override the user's own
         endpoint, credentials or model choice — turning "reuse your
         existing configuration" into "silently replace it". A single
         stray ``ANTHROPIC_MODEL`` is enough to do it, which is why this
         returns early rather than filtering a populated ``env``.
 
-        Hooks are still emitted, and that is deliberate. They are this
-        project's own instrumentation — the per-subagent activity log the
-        watchdog reads to tell "stuck inside an LLM call" from "a long
+        ``defer_provider_config`` — provider configuration IS known, but
+        the file is being written before routing has chosen which provider
+        serves this call. ``base_url`` / ``auth_token`` / ``api_key`` on
+        this dataclass are the run-level provider: resolved once for the
+        whole run from the optimizer's chain, which is the full CC Switch
+        list with no scene/tier filtering. Stamping it here writes a file
+        whose endpoint and key belong to a provider that may not be the
+        one this call is routed to — and the dispatch does write the real
+        per-call file (see ``ClaudeCodingTool._run_claude_interactive``),
+        so this one is never passed to ``claude --settings``. Nobody
+        re-reads it, which means nothing ever redacts it either: the
+        redaction pass covers the effective settings path. So the key
+        would simply sit in the tmp root in cleartext, describing a
+        provider that was never selected. The file keeps its hooks and
+        nothing else; the selected provider's endpoint and credentials are
+        written once, after selection, by the dispatch.
+
+        Hooks are emitted in both cases, and that is deliberate. They are
+        this project's own instrumentation — the per-subagent activity log
+        the watchdog reads to tell "stuck inside an LLM call" from "a long
         pytest run" — not provider configuration. Dropping them to make
         "we inject nothing" literally true would trade a working
         capability for a slogan.
 
         ``CLAUDE_SETTINGS_PATH`` is included for the same reason it is in
         the normal path: the hook scripts read it to identify the
-        originating settings file. It is not an ``ANTHROPIC_*`` key and
-        carries no provider configuration.
+        originating settings file, which is how two tasks dispatched close
+        together stay distinguishable in the activity log. It is not an
+        ``ANTHROPIC_*`` key and carries no provider configuration.
         """
         env: Dict[str, str] = {}
         if self.settings_file_path is not None:
@@ -294,8 +330,10 @@ class SubagentConfig:
         to JSON. The file is written atomically (write to
         ``<path>.tmp`` then ``os.replace``) so a concurrent reader
         never sees a half-written JSON, and it is written into a fresh
-        ``0700`` directory with ``0600`` on the file — the payload
-        carries the routed provider's credentials.
+        ``0700`` directory with ``0600`` on the file. The mode is the
+        floor, not the plan: a file written ``0600`` still holds a
+        cleartext key for as long as it exists, so what it contains
+        matters more than who may read it.
 
         Side effects:
           * ``self.settings_file_path`` is updated to the new path
@@ -303,22 +341,33 @@ class SubagentConfig:
             ``--settings``.
           * If ``logger`` is provided, ``logger.emit`` is called with
             ``event='subagent_settings_file_written'`` and
-            ``data={'path': str, 'uuid': str, 'fields': 7}``. The
-            7-field count is a hard contract the test pins and the
-            log entry is the only trail a debug session has for
-            correlating a settings-file path back to a tmpfile uuid.
+            ``data={'path': str, 'uuid': str, 'fields': int, 'provider_config': bool}``.
+            ``fields`` is the number of ``ANTHROPIC_*`` keys actually
+            written — not the contract minimum — because that is what
+            tells a reader reading the log whether this file carries
+            credentials at all. It is 0 for a hooks-only payload
+            (``inherit_env`` / ``defer_provider_config``). The log entry
+            is the only trail a debug session has for correlating a
+            settings-file path back to a tmpfile uuid.
 
         The tmpfile itself is NOT deleted at process exit — a child
         process may read it asynchronously after this function returns
         (``pre_tool_use.sh`` reads ``$CLAUDE_SETTINGS_PATH`` on every
         tool call), and post-mortem debugging wants the hook layout to
-        still be readable. The *credentials* in it are another matter:
-        the dispatch path redacts them with
-        :func:`utils.secret_files.redact` once the child is reaped, so
-        what survives on disk is the structure without the key. A crash
-        before that point leaves them in place, which is why the file is
-        written ``0600`` inside a ``0700`` directory rather than relying
-        on the cleanup happening.
+        still be readable.
+
+        Credentials in it are a different matter, and the reason they
+        are now opt-in (``defer_provider_config``) rather than the
+        default: the dispatch redacts the file it passes to
+        ``claude --settings`` with :func:`utils.secret_files.redact`
+        once the child is reaped, so what survives there is the
+        structure without the key. That redaction is keyed on the
+        EFFECTIVE settings path — the per-call file the dispatch writes
+        after routing has chosen a provider. A file written before that
+        choice is not the effective path, so it was never redacted,
+        never deleted, and its key stayed readable for the life of the
+        tmp root. Permission bits cannot fix that; only not writing the
+        credential can.
 
         Returns:
             The ``Path`` of the written tmpfile.
@@ -357,11 +406,19 @@ class SubagentConfig:
             payload.pop('hooks', None)
         write_private_json(path, payload)
 
+        # What the file actually carries, counted from the payload rather
+        # than from the contract minimum: the minimum is what a
+        # provider-bearing file owes, and reading it back as "this file
+        # holds a key" is wrong for a hooks-only payload.
+        _anthropic_keys = sorted(
+            k for k in (payload.get('env') or {}) if k.startswith('ANTHROPIC_')
+        )
         if logger is not None:
             data = {
                 'path': str(path),
                 'uuid': file_uuid,
-                'fields': _SETTINGS_ENV_FIELD_COUNT,
+                'fields': len(_anthropic_keys),
+                'provider_config': bool(_anthropic_keys),
             }
             if hasattr(logger, 'emit'):
                 logger.emit(

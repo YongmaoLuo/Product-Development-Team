@@ -2,15 +2,21 @@
 
 ## `backend/config.yaml` is intentionally thin
 
-Three things are worth knowing:
+Two things are worth knowing:
 
-- **Nothing is required to run.** It ships with no provider order file and
-  no subsidiary processes. The server boots and the workflow runs; features
-  that need an external component simply have nothing to read.
-- **`provider_order_file`** points at a JSON contract describing a fallback
-  provider chain. There is no built-in chain — if you want provider
-  failover, point this at whatever produces that file. The
-  `PROVIDER_ORDER_FILE` environment variable overrides the config value.
+- **Nothing is required to run.** It ships with no subsidiary processes.
+  The server boots and the workflow runs; features that need an external
+  component simply have nothing to read.
+- **The provider fallback chain is not configured here.** There is no key
+  that points at one and no built-in chain. At startup the backend asks CC
+  Switch for the chain — over its HTTP provider list, or over its database
+  when nothing is serving — so the order you see in CC Switch is the order
+  the backend dispatches in. There is deliberately no second place to
+  configure it: the chain used to come from a JSON file this repository
+  did not write and nothing wrote any more, which let the backend and CC
+  Switch disagree about it for as long as neither was restarted.
+  `PDT_PROVIDER_ORDER_API_URL` overrides the address of CC Switch's HTTP
+  API; the database is found under `~/.cc-switch/`.
 - **`subsidiary_processes`** is an empty list. It is a generic mechanism for
   bringing up long-running helper processes during the FastAPI lifespan,
   with two load-bearing properties: entries start **in order**, and a failed
@@ -60,27 +66,61 @@ keeps its config elsewhere does not need to drop a file into the repo root:
 |---|---|
 | round budget | how many verify → repair → re-verify rounds may run |
 | per-VP timeouts | how long one verification point may take |
-| `parallelism_cap` | one method-group's own fan-out |
+| `parallelism_cap` | **fallback** width — only when nothing is derivable |
 
-`parallelism_cap` is **not** the fleet ceiling. Groups run concurrently, so
-per-group caps multiply; the real limit is a `plan_semaphore` created once
-per round and shared by every group. See
-[Verification](../architecture/verification.md).
+The width a verification round actually runs at is **derived from the
+providers**, not read from this file: the sum over the verification scene's
+own chain of each provider's declared cap (`provider_capacity.yaml`) scaled
+by how much of its 5-hour window is left, using the same quota payload the
+dispatch path is handed. It is re-read every time the gate binds, so a
+window that closes mid-round shrinks the fleet while the round runs.
+
+`parallelism_cap` applies in exactly one case: the verification scene's chain
+cannot be resolved at all. It is deliberately **not** a "nothing available →
+run N" rule — a measured `0` is a real answer from the meters and is used as
+one, so a fleet that is entirely shut admits nothing.
+
+See [Verification](../architecture/verification.md).
 
 ## Credentials
 
-Credentials come from `backend/.env`, which is gitignored.
-`backend/.env.ci` holds committed **placeholders** — it is a test fixture,
-and a real key must never go into it.
+No credential comes out of `.env`. A provider API key is supplied at
+runtime by whatever provider layer a deployment runs —
+`backend/cc_switch.py` is the integration this codebase ships, and it
+reads one provider row at a time; the two notification secrets (Feishu
+app secret, Telegram bot token) are read from a dedicated macOS keychain
+and handed to the processes that need them over a file descriptor,
+keeping them out of `ps eww` output. What `.env` (gitignored, templated
+by the committed `.env.example`) carries is the non-secret half: the
+`account` each keychain item is filed under, the timezone, and the
+notification targets.
 
-The two notification secrets can instead be read from a dedicated macOS
-keychain and handed to the processes that need them over a file
-descriptor, keeping them out of `ps eww` output. That path is **opt-in and
-off by default** — a deployment that changes nothing is unaffected, and an
-installation that has not run the migration is still reading secrets out of
-`.env`. See [Keychain migration](keychain-migration.md) before assuming
-otherwise; `secrets verify` reports which source each secret is actually
-coming from.
+That keychain path is **opt-in and off by default**. Left alone,
+`PDT_DISABLE_KEYCHAIN_SECRETS` unset, both notification secrets are read
+from the plaintext variables in `.env` instead — so an installation that
+has not run the migration is still putting them in a file on disk. See
+[Keychain migration](keychain-migration.md) before assuming otherwise;
+`secrets verify` reports which source each secret is actually coming
+from.
+
+When a secret has no value, `secrets verify` prints *why*, one line per
+unresolved secret: the switch is off, the account index is not set, the
+keychain is locked, the keychain tool could not be run at all, or no
+item is filed. Those are fixed in five different places, and the last
+three are the ones worth distinguishing. A locked keychain also blocks
+for up to 60 seconds waiting on an unlock prompt before it can report
+anything. A tool that cannot be executed — some sandboxes and agent
+sessions get `EPERM` on `/usr/bin/security` — has nothing to do with the
+keychain's state, and telling that operator to unlock something is advice
+that cannot possibly work. The same warning is logged by the provider
+itself, so a notifier that reports itself unconfigured is not the only
+evidence. A secret that *is* resolved prints nothing: a command that
+narrates the healthy rows teaches the reader to skip the output that
+matters.
+
+```bash
+backend/.venv/bin/python3 -m backend.cli secrets verify
+```
 
 ## Runtime state
 

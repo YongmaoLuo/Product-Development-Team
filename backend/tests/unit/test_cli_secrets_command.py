@@ -83,16 +83,12 @@ _CREDENTIAL_ENV_KEYS = tuple(
     for key in (spec.fallback_env_key, spec.account_env_key)
 ) + ("PDT_DISABLE_KEYCHAIN_SECRETS",)
 
-#: The three variables ``env_config.load_env()`` demands before the CLI
-#: parses anything. They are placeholders: the loader only checks that
-#: they exist, and a subprocess that reached the parser with these
-#: filled in behaves exactly as one that reached it from a developer's
-#: own ``.env``.
-_LOADER_PLACEHOLDERS = (
-    "ANTHROPIC_API_KEY",
-    "NOTION_TOKEN",
-    "NOTION_PARENT_PAGE_ID",
-)
+# ``env_config.load_env()`` used to demand three variables before the CLI
+# parsed anything, and these tests filled them with placeholders so the
+# subprocess would get that far. It demands nothing now (2026-10-08), so
+# there is nothing to fill in: a child process started with a bare
+# environment reaches the parser exactly as one started from a
+# developer's own ``.env`` used to.
 
 
 @pytest.fixture(autouse=True)
@@ -413,9 +409,9 @@ def test_module_and_script_entrypoints_agree(tmp_path):
 
     The environment is built here rather than inherited, so the child's
     output is this test's and not the developer's shell. Every
-    credential key is *set* rather than merely removed: the CLI loads
-    ``backend/.env`` before it parses, and a variable that is absent
-    from the child is exactly the one that file is allowed to fill.
+    credential key is *set* rather than merely removed, so a key cannot
+    arrive from the developer's own shell to stand in for one this test
+    meant to supply.
 
     The exit code is compared rather than pinned to 0, because it is a
     property of the machine and not of the spelling — and this machine
@@ -435,8 +431,6 @@ def test_module_and_script_entrypoints_agree(tmp_path):
     child_env = dict(os.environ)
     for key in _CREDENTIAL_ENV_KEYS:
         child_env.pop(key, None)
-    for key, value in zip(_LOADER_PLACEHOLDERS, ("placeholder-a", "placeholder-b", "placeholder-c")):
-        child_env[key] = value
     child_env["PDT_DISABLE_KEYCHAIN_SECRETS"] = "1"
     for index, name in enumerate(credentials.SECRET_SPECS):
         spec = credentials.SECRET_SPECS[name]
@@ -463,3 +457,89 @@ def test_module_and_script_entrypoints_agree(tmp_path):
     # through a captured exception: the requirement is that a platform
     # the command cannot serve is answered in a sentence.
     assert b"Traceback" not in module_form.stderr
+
+# ---------------------------------------------------------------------------
+# verify: saying *why* a secret is missing
+# ---------------------------------------------------------------------------
+
+
+def test_verify_explains_a_missing_secret_rather_than_only_reporting_it(
+    monkeypatch, capsys, tmp_path
+):
+    """``source=missing`` is one word for at least four situations.
+
+    The operator who reads it has no way to tell which one they have,
+    and they are fixed in four different places. The switch being off is
+    the most common by far and the least alarming; a locked keychain is
+    the one that also cost a minute of blocking first, and sending
+    someone to look for a credential that was never set up because the
+    message said "missing" is the failure this line removes.
+    """
+    # The autouse fixture leaves the switch at "1" and both credential
+    # keys unset, which is exactly "switched off, nothing in the
+    # environment".
+    assert cli.cmd_secrets_verify() == 1
+    out = capsys.readouterr().out
+
+    assert "source=missing" in out
+    assert credentials._SWITCH_ENV_KEY in out
+    assert "feishu_app_secret" in out
+
+
+def test_verify_names_the_missing_index_when_the_keychain_is_on(
+    monkeypatch, capsys, tmp_path
+):
+    """A different cause with a different fix: the lookup was never
+    attempted, so an item cannot be what is missing."""
+    monkeypatch.setenv(credentials._SWITCH_ENV_KEY, "0")
+    monkeypatch.setattr(credentials, "_is_macos", lambda: True)
+    # No FEISHU_APP_ID, so there is no account to look anything up by.
+    monkeypatch.delenv("FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+    assert cli.cmd_secrets_verify() == 1
+    out = capsys.readouterr().out
+
+    assert "FEISHU_APP_ID" in out
+    assert "is locked" not in out
+
+
+def test_verify_says_nothing_extra_when_every_secret_resolves(
+    monkeypatch, capsys, tmp_path
+):
+    """A command that narrates the healthy rows trains the reader to skip
+    the output that matters."""
+    monkeypatch.setenv(
+        credentials.SECRET_SPECS["feishu_app_secret"].fallback_env_key, "s"
+    )
+    monkeypatch.setenv(
+        credentials.SECRET_SPECS["telegram_bot_token"].fallback_env_key, "t"
+    )
+
+    assert cli.cmd_secrets_verify() == 0
+    out = capsys.readouterr().out
+
+    assert "source=os.environ" in out
+    assert "missing" not in out
+
+
+def test_the_explanation_never_prints_a_secret(
+    monkeypatch, capsys, canary, tmp_path
+):
+    """The line exists to be read by a person pasting output into an
+    issue. A diagnostic that carried the credential would make it the
+    worst possible thing to paste."""
+    secret = canary("feishu_secret", tmp_path)
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_abc")
+    monkeypatch.setenv(
+        credentials.SECRET_SPECS["feishu_app_secret"].fallback_env_key, secret
+    )
+    monkeypatch.delenv(
+        credentials.SECRET_SPECS["telegram_bot_token"].fallback_env_key,
+        raising=False,
+    )
+
+    cli.cmd_secrets_verify()
+    out = capsys.readouterr().out
+
+    assert secret not in out

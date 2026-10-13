@@ -44,10 +44,18 @@ class ExecutionProfileGenerator:
         self,
         plan: Union[Mapping[str, Any], List[Mapping[str, Any]], None] = None,
         timeout_policy: Optional[TimeoutPolicy] = None,
+        vp_capacity: Optional[int] = None,
     ) -> None:
         if timeout_policy is None:
             timeout_policy = TimeoutPolicy.defaults()
         self._timeout_policy = timeout_policy
+        # The width actually in force, when the caller knows it. ``None``
+        # is the honest default for a pure value object: the real number
+        # comes from the provider pool at dispatch time, and reading it
+        # here would make every profile build a CC Switch round-trip.
+        self._vp_capacity: Optional[int] = (
+            None if vp_capacity is None else max(0, int(vp_capacity))
+        )
         self._verification_points: List[Dict[str, Any]] = self._extract_points(plan)
         self._subtask_splits: List[Dict[str, Any]] = []
         self._total_duration_sec: int = 0
@@ -109,7 +117,22 @@ class ExecutionProfileGenerator:
           started; updated at runtime by the orchestrator.
         - ``subtask_splits`` (``list``)
         - ``per_method_timeouts`` (``dict``)
-        - ``parallelism_cap`` (``int``)
+        - ``parallelism_cap`` (``int``) — **the fallback width**, not the
+          width a run actually used. The group gate sizes itself from
+          the verification scene's providers (how many VPs the fleet can
+          serve this second, scaling with what is left of their 5-hour
+          budget) and consults this only when the scene's chain cannot be
+          resolved, so a reader taking ``parallelism_cap`` as "how many
+          verification points ran at once" would be reading the number
+          that was *not* used.
+        - ``vp_capacity_source`` (``str``) — which of the two was in
+          force: ``"provider_pool"`` or ``"parallelism_cap_fallback"``.
+          Reported so the fallback cannot pass for the real thing.
+        - ``vp_capacity`` (``int`` or ``None``) — the width in force,
+          when the caller knows it. ``None`` here means the caller did not
+          supply one, which is the normal case: this class is a pure
+          value calculator and reading the live provider pool would mean
+          a CC Switch round-trip on every profile build.
         """
         group_list = [dict(g) for g in self._group_profiles]
         return {
@@ -120,6 +143,12 @@ class ExecutionProfileGenerator:
             "subtask_splits": [dict(s) for s in self._subtask_splits],
             "per_method_timeouts": dict(self._effective_per_method_timeouts()),
             "parallelism_cap": int(self._timeout_policy.parallelism_cap),
+            "vp_capacity_source": (
+                "provider_pool"
+                if self._vp_capacity is not None
+                else "parallelism_cap_fallback"
+            ),
+            "vp_capacity": self._vp_capacity,
         }
 
     # ------------------------------------------------------------------

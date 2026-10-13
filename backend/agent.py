@@ -34,6 +34,8 @@ from git_manager import GitManager
 from refiner import TaskRefiner
 from task import SubTask, UNKNOWN_MODIFICATIONS_SENTINEL, NO_FILE_CHANGES_SENTINEL
 from test_command_quality import inspect_command as inspect_test_command
+from test_command_quality import find_vacuous_pass as _find_vacuous_pass
+from test_command_quality import check_falsifiable as _check_falsifiable
 from config import AgentConfig
 from config_registry import ConfigRegistry
 from retry_manager import RetryManager
@@ -243,7 +245,7 @@ def _load_provider_info(
         CCSwitchError,
         get_provider,
     )
-    from provider_order import load_provider_5h_usage
+    from provider_order import load_provider_5h_usage, load_provider_quota_map
 
     if tracker is None:
         # Defensive fallback: a caller that omits ``tracker`` (e.g. an
@@ -255,6 +257,22 @@ def _load_provider_info(
         now = datetime.now()
 
     usage_map = load_provider_5h_usage()
+    try:
+        quota_map = load_provider_quota_map()
+    except Exception:
+        # Fail-open, like the file reader beside it: an unreadable quota
+        # source must not stop a dispatch, only stop it being *informed*
+        # by one. The refusal a genuinely empty provider returns is
+        # caught at dispatch time instead.
+        quota_map = {}
+    from dynamic_provider_concurrency import (
+        compute_dynamic_limit,
+        get_shared_cooldown,
+        provider_headroom_pct,
+        quota_allows_dispatch,
+    )
+
+    cooldown = get_shared_cooldown()
     # Walk the chain manually so a candidate with capacity but no CC
     # Switch DB row falls through to the next eligible provider. This
     # preserves the legacy "no config = skip" semantic at the
@@ -263,10 +281,21 @@ def _load_provider_info(
         # 1. ``parent`` is the caller's explicit fallback; never pick it.
         if name == "parent":
             continue
-        # 2. Dynamic capacity: a provider must have spare room under
-        #    its 5h-derived cap to be eligible.
-        remaining_pct = usage_map.get(name, 100.0)
-        from dynamic_provider_concurrency import compute_dynamic_limit
+        # 2. The live quota reading: an affirmative "no budget for this
+        #    window" disqualifies the provider however much local room
+        #    it has. A provider the reading says nothing about stays in.
+        if not quota_allows_dispatch(quota_map.get(name)):
+            continue
+        # 3. A refusal earlier in this run parks the provider; it is
+        #    reachable and configured, so nothing below would notice.
+        if cooldown.is_parked(name):
+            continue
+        # 4. Dynamic capacity: a provider must have spare room under
+        #    its quota-derived cap to be eligible. The live reading
+        #    supplies the percentage when it has one — it is the only
+        #    source that knows about the weekly window and about a
+        #    currency balance — and the legacy map covers the rest.
+        remaining_pct = provider_headroom_pct(name, usage_map, quota_map)
 
         # The cap comes from the rules in ``provider_capacity.yaml``,
         # matched case-insensitively against the name as the chain spells
@@ -641,6 +670,13 @@ def _is_plan_failed(tasks: list) -> bool:
 # is unlikely to help and human inspection is required. See
 # :meth:`AutonomousAgent._breakdown_task` for the enforcement site.
 EXECUTOR_BREAKDOWN_MAX = 5
+
+# How many times one execution run may let the refiner restructure the
+# plan before it stops asking. See ``AutonomousAgent._refinement_count``
+# for why the bound is a count rather than a shape rule, and
+# the 2026-10-10 plan (eleven refinements, 31 → 55 tasks)
+# for the run that motivated it.
+EXECUTOR_MAX_REFINEMENTS = 8
 
 
 def _filter_terminal_tasks(tasks: list[SubTask]) -> tuple[list[SubTask], int]:
@@ -1619,6 +1655,31 @@ class AutonomousAgent:
         self.retry_manager = RetryManager()
         self.rollback_manager = RollbackManager(str(project_dir))
         self.refiner = TaskRefiner(self.coding_tool, self.config, logger=logger)
+
+        # 2026-10-11 (丁): session-local budget on how many times the
+        # refiner may restructure this plan.
+        #
+        # ``_refine_after_failure`` runs whenever a task fails, and the
+        # refiner's usual answer is "split the failed task in three". In
+        # the eleven failures of the 2026-10-10 plan turned
+        # into a task list that grew 31 → 55, every round logged as
+        # ``+3 added, -1 removed``. The failures were environmental
+        # (``cargo`` missing from the executor's PATH), which from inside
+        # the refiner looked exactly like a defective command — so it
+        # kept minting work instead of fixing anything, and nothing
+        # bounded it. ``EXECUTOR_BREAKDOWN_MAX`` above is dead code: its
+        # enforcement site (``_breakdown_task``) was removed when the
+        # split path moved to the refiner, and no cap travelled with it.
+        #
+        # The bound is deliberately a count rather than a shape rule.
+        # Shape rules — split depth, net growth per round — are always
+        # expressible in terms the refiner can satisfy while still
+        # thrashing, and that is not hypothetical: this run never split
+        # deeper than ``12-6-4``, it simply did it eleven times. When the
+        # budget runs out the failed task stays failed and the plan
+        # surfaces, which is the right trade — an unbounded tail of
+        # invented tasks is strictly worse than a plan that stops.
+        self._refinement_count = 0
 
         # Architecture decision points 1 & 2 — the dispatcher
         # only modifies runtime state fields, and writes go through
@@ -2672,6 +2733,110 @@ class AutonomousAgent:
                 },
             )
         return corrected
+
+    #: Set ``PDT_DISABLE_FALSIFIABILITY_PROBE=1`` to skip executing a new
+    #: sub-task's command during refinement. Same variable (and the same
+    #: reason) ``RepairTaskGenerator`` honours: the gate runs the command
+    #: as a subprocess, so an operator debugging refinement in an
+    #: environment where the project cannot execute — missing toolchain,
+    #: offline — needs a way out that is not "edit the code".
+    FALSIFIABILITY_PROBE_ENV = "PDT_DISABLE_FALSIFIABILITY_PROBE"
+
+    #: Wall-clock ceiling for that probe. Shorter than the generation-time
+    #: default (``DEFAULT_FALSIFIABILITY_TIMEOUT_S``) because this runs on
+    #: the failure path, where several new sub-tasks may be probed back to
+    #: back while the rest of the plan waits.
+    NEW_SUBTASK_PROBE_TIMEOUT_S = 120
+
+    def _enforce_new_subtask_test_command(self, new_task: dict) -> None:
+        """Gate the command the refiner just wrote for a task it created.
+
+        A refinement legitimately **authors** the ``test_command`` of the
+        tasks it creates. A split child is a *different* task with a
+        smaller scope, so it needs its own judge; reusing the parent's
+        would grade it against work it was never asked to do. That is the
+        opposite of the rule for tasks that already existed, which are
+        frozen by :func:`refiner_structure.plan_refiner_structure` (it
+        reports ``judge_rewritten_ids`` when the refiner tries).
+
+        Authoring the first version is not the same as authoring *any*
+        version, though, and the second half is where this plan went
+        wrong: ``_refine_after_failure`` ran neither the shape inspector
+        nor the falsifiability probe over the refiner's output, while the
+        generation path runs both. So the refiner could answer a failure
+        with a command that proves nothing and nothing objected. In the
+        2026-10-10 plan that is exactly what happened —
+        eleven refinements, 25 commands rewritten to carry a
+        ``PATH="$HOME/.cargo/bin:$PATH"`` prefix, none of them ever able
+        to go green.
+
+        A command that fails the gate is **discarded, not shipped** — the
+        same trade ``RepairTaskGenerator._resolve_repair_test_command``
+        already makes, and for the same reason: a command that cannot
+        report failure guarantees a false verdict every time, whereas no
+        command degrades to the audit second pass, which can still decide.
+        """
+        commands: List[str] = []
+        for raw in new_task.get("test_commands") or []:
+            text = str(raw or "").strip()
+            if text and text not in commands:
+                commands.append(text)
+        single = str(new_task.get("test_command") or "").strip()
+        if single and single not in commands:
+            commands.append(single)
+        if not commands:
+            return
+
+        project_dir = new_task.get("project_dir") or str(self.project_dir)
+        probe_disabled = (
+            os.environ.get(self.FALSIFIABILITY_PROBE_ENV) not in (None, "", "0")
+        )
+
+        rejected: List[Tuple[str, str]] = []
+        for command in commands:
+            issues = inspect_test_command(command)
+            if issues:
+                rejected.append((command, f"{issues[0].code}: {issues[0].detail}"))
+                continue
+            if probe_disabled:
+                continue
+            ok, detail = _check_falsifiable(
+                command,
+                cwd=str(project_dir),
+                timeout=self.NEW_SUBTASK_PROBE_TIMEOUT_S,
+            )
+            if not ok:
+                rejected.append((command, detail))
+        if not rejected:
+            return
+
+        bad = {command for command, _ in rejected}
+        new_task["test_commands"] = [
+            c for c in (new_task.get("test_commands") or [])
+            if str(c or "").strip() not in bad
+        ]
+        if str(new_task.get("test_command") or "").strip() in bad:
+            new_task.pop("test_command", None)
+
+        if self.logger is not None:
+            try:
+                self.logger.warning(
+                    "refine_new_command_discarded",
+                    (
+                        f"Discarded {len(rejected)} refiner-authored "
+                        f"test_command(s) on new sub-task "
+                        f"[{new_task.get('id', '?')}]: {rejected[0][1][:200]}"
+                    ),
+                    task_id=str(new_task.get("id", "?")),
+                    data={
+                        "rejected": [
+                            {"test_command": c[:400], "why": why[:400]}
+                            for c, why in rejected
+                        ],
+                    },
+                )
+            except Exception:  # pragma: no cover - logger is best-effort
+                pass
 
     # ------------------------------------------------------------------
     # Architecture decision point 7: dispatcher files_to_modify
@@ -4114,14 +4279,23 @@ class AutonomousAgent:
         """
         # Per-task SubagentConfig tmpfile regeneration (decisions 2/3 + 4).
         # Each task in the run() loop gets a fresh
-        # ``subagent_settings_<uuid>.json`` under its own private dir
-        # so the Claude subprocess launched for THIS task is wired with
-        # its own ``--settings`` tmpfile (env block + hooks payload) and
-        # ``CLAUDE_SETTINGS_PATH`` env var for hook correlation. Without
-        # this, every task in a run would share one tmpfile, breaking
-        # cross-process correlation in execution.log when two tasks run
-        # close together. ``write_tmp_settings`` is idempotent in
-        # producing a new path each call (uuid4).
+        # ``subagent_settings_<uuid>.json`` under its own private dir, and
+        # the Claude subprocess launched for THIS task is wired with its
+        # own ``--settings`` tmpfile. What makes the per-task write load-
+        # bearing is the correlation key, not the provider config:
+        # ``pre_tool_use.sh`` reads ``$CLAUDE_SETTINGS_PATH`` on every tool
+        # call and logs it, so a shared tmpfile would make two tasks
+        # dispatched close together indistinguishable in the activity log.
+        # The file therefore has to be per-task even though it no longer
+        # carries anything task-specific beyond its own path.
+        #
+        # It carries NO provider endpoint or credential
+        # (``defer_provider_config``): this write happens before routing
+        # has chosen a provider, so the only provider available to it is
+        # the run-level one, which is not necessarily the one this call is
+        # routed to. The dispatch writes the file that actually reaches
+        # ``claude --settings`` once routing has chosen. ``write_tmp_settings``
+        # is idempotent in producing a new path each call (uuid4).
         if getattr(self, "subagent_cfg", None) is not None:
             try:
                 new_settings_path = self.subagent_cfg.write_tmp_settings(
@@ -5208,7 +5382,47 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
             )
         except (subprocess.TimeoutExpired, OSError):
             return None
-        return proc.returncode == 0
+        if proc.returncode != 0:
+            return False
+
+        # 2026-10-11: exit 0 is not by itself proof that the work is on
+        # disk.
+        #
+        # A module-wide runner filter naming something that does not
+        # exist exits 0 with ``running 0 tests``. The pre-flight read
+        # that as "already done", marked the task completed WITHOUT
+        # spawning a subagent, and the work was never done — tasks
+        # 1-1-2 / 1-1-3 / 5-3 / 6-3 in the 2026-10-10 plan
+        # plan were all skipped this way. Same remedy as the
+        # unusable-command branch above, and for the same reason: the
+        # exit code is the only signal the pre-flight has, so when it is
+        # meaningless the answer is ``None`` (fall through to the real
+        # subagent path), never ``True``.
+        _vacuous = _find_vacuous_pass(
+            (proc.stdout or "") + "\n" + (proc.stderr or "")
+        )
+        if _vacuous is not None:
+            if self.logger:
+                try:
+                    self.logger.warning(
+                        "task_preflight_skip_refused_vacuous_command",
+                        f"Task [{task.id}] not skipped by pre-flight: its "
+                        f"test_command exits 0 without running any test "
+                        f"({_vacuous.code})",
+                        task_id=task.id,
+                        data={
+                            "code": _vacuous.code,
+                            "detail": _vacuous.detail,
+                            "test_command": clean_cmd[:500],
+                            "output_tail": (
+                                (proc.stdout or "") + (proc.stderr or "")
+                            )[-800:],
+                        },
+                    )
+                except Exception:  # pragma: no cover - logger is best-effort
+                    pass
+            return None
+        return True
 
     # 2026-09-17: a subagent's final answer used to live only in the
     # executor's memory. When an attempt failed, the conclusion — often
@@ -5549,6 +5763,13 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         # Run every test command. All must pass for the verdict to be PASSED.
         aggregate_exit = 0
         failure_tail = ""
+        # Output of the legs that *did* pass. The vacuity gate below has
+        # to read the runner's own summary line, and that line is only
+        # produced by a leg that exited 0 — the failing branch keeps
+        # ``failure_tail`` instead. Head + tail, because cargo prints
+        # ``running N tests`` first and ``test result: …`` last, and a
+        # full `cargo test` transcript is far larger than either.
+        passing_output = ""
         for cmd in test_cmds:
             try:
                 proc = run_bounded(
@@ -5571,9 +5792,48 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 tail = (proc.stdout or "")[-1000:] + (proc.stderr or "")[-500:]
                 failure_tail = f"[exit {proc.returncode}] {cmd}\n{tail}"
                 break
+            _leg = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            passing_output += _leg[:4000] + "\n…\n" + _leg[-2000:] + "\n"
 
         # Decision table
         if aggregate_exit == 0:
+            # 2026-10-11: exit 0 is only a PASSED verdict if the run
+            # actually executed a test.
+            #
+            # `cargo test --lib no_such_mod` exits 0 printing
+            # ``running 0 tests``. Four tasks in the
+            # the 2026-10-10 plan plan were recorded
+            # ``completed`` on exactly that — with zero commits and the
+            # module they were supposed to create never written — because
+            # exit 0 was taken as the whole story. In that case the
+            # command half of the dual-criterion rule is vacuous, which
+            # is the single-signal mode the rule exists to prevent. So
+            # the verdict is FAILED, with its own event name: the refiner
+            # must be told "this command proved nothing" (its own defect)
+            # rather than "the code is broken" (which invites it to
+            # rewrite the command instead of the code).
+            _vacuous = _find_vacuous_pass(passing_output)
+            if _vacuous is not None:
+                reason = (
+                    f"test_command exited 0 but ran no tests "
+                    f"({_vacuous.code}): {_vacuous.detail} Treating as "
+                    f"FAILED — a command that executes nothing cannot "
+                    f"certify this task."
+                )
+                if self.logger:
+                    self.logger.error(
+                        "test_cross_verify_vacuous_pass",
+                        "Subagent's test_command exited 0 with zero tests run",
+                        task_id=task.id,
+                        data={
+                            "code": _vacuous.code,
+                            "detail": _vacuous.detail,
+                            "ai_claimed_passed": ai_claimed_passed,
+                            "test_commands": [c[:300] for c in test_cmds],
+                            "output_tail": passing_output[-1200:],
+                        },
+                    )
+                return False, reason
             if not ai_claimed_passed:
                 # Disagreement: AI said FAILED, pytest said 0. Trust pytest
                 # but record the disagreement so the AI's reasoning is
@@ -6544,6 +6804,26 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 the refiner is invoked with ``file_context=""``.
             exit_code: Exit code from test command
         """
+        if self._refinement_count >= EXECUTOR_MAX_REFINEMENTS:
+            if self.logger:
+                self.logger.error(
+                    "refine_budget_exhausted",
+                    (
+                        f"Task [{task.id}] failed, but this run has already "
+                        f"refined the plan {self._refinement_count} times "
+                        f"(cap {EXECUTOR_MAX_REFINEMENTS}); not refining "
+                        f"again. The task stays failed."
+                    ),
+                    task_id=task.id,
+                    data={
+                        "refinements": self._refinement_count,
+                        "cap": EXECUTOR_MAX_REFINEMENTS,
+                        "task_count": len(self.task_manager.tasks),
+                    },
+                )
+            return
+        self._refinement_count += 1
+
         print("Refining task list...")
         if self.logger:
             self.logger.info("refine_started", f"Refining tasks after [{task.id}] failure",
@@ -6617,6 +6897,10 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     corrected = self._enforce_subtask_workspace(ut, task)
                     ut.clear()
                     ut.update(corrected)
+                    # Authoring a new task's judge is the refiner's job;
+                    # authoring one that cannot do its job is not. See
+                    # ``_enforce_new_subtask_test_command``.
+                    self._enforce_new_subtask_test_command(ut)
 
             # 2026-09-16 (D1): ONE decision, TWO stores.
             #
@@ -6816,6 +7100,30 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         )
         if plan.is_noop:
             return True
+
+        # 2026-10-11: surface the judge-preservation outcome up front.
+        #
+        # Neither list is an error on its own — the refiner is allowed to
+        # try, we simply do not let it win — but an operator has to see
+        # it, because a refiner that keeps rewriting the test which
+        # grades a task has stopped repairing and started negotiating
+        # with the verdict. This is the signal that would have made the
+        # the 2026-10-10 runaway legible on iteration one
+        # instead of iteration eleven.
+        if plan.judge_rewritten_ids:
+            if self.logger:
+                self.logger.warning(
+                    "refine_judge_command_preserved",
+                    (
+                        f"Refiner tried to change the test_command of "
+                        f"{len(plan.judge_rewritten_ids)} existing task(s); "
+                        f"the original commands were kept"
+                    ),
+                    task_id=task.id,
+                    data={
+                        "judge_rewritten_ids": list(plan.judge_rewritten_ids),
+                    },
+                )
 
         # Snapshot the live SubTask objects (not a model_dump) so the
         # rollback below can restore them — including the
@@ -7201,6 +7509,23 @@ def autonomous_coding(
             # empty values would *replace* the user's working Claude Code
             # configuration rather than leave it alone.
             inherit_env=inherit_env,
+            # This file is written BEFORE any provider is selected, so it
+            # gets no provider config. ``provider_name`` / ``base_url`` /
+            # ``api_key`` above are the run-level provider, resolved once
+            # for the whole run from the optimizer's chain — the full CC
+            # Switch list, with no scene/tier filtering — so they are not
+            # necessarily a provider the tier table approves for this
+            # call. Writing them here produced a file that nothing ever
+            # re-reads: the dispatch writes its own per-call settings file
+            # once routing has chosen, and passes THAT to
+            # ``claude --settings``. The redaction pass is keyed on the
+            # effective settings path, so this pre-selection file was
+            # never redacted and never deleted — its key just accumulated
+            # in the tmp root, describing a provider that was never the one
+            # serving the call. Hooks and the correlation path still go in
+            # here, because the dispatch reads this file as the template
+            # for the per-call one.
+            defer_provider_config=True,
         )
 
         try:
@@ -7215,6 +7540,26 @@ def autonomous_coding(
             "task_summary": subagent_cfg.task_summary,
         }
 
+        # ``settings=`` is the TEMPLATE, and the template is what makes the
+        # dispatch able to build the real settings file: ClaudeCodingTool
+        # reads this file for its hooks block, adds the guard hook and the
+        # ``PDT_*`` env (file-lock broker, subagent uuid, task id), copies
+        # in the ANTHROPIC_* values of whichever provider routing actually
+        # selected, and writes that per-call file itself. Passing a path
+        # that does not exist would skip all of it — see the
+        # ``settings is not None`` arm in ``_run_claude_interactive``.
+        #
+        # Passing ``None`` is therefore not an option, and would not be a
+        # smaller file: it would mean no ``--settings`` at all, so no
+        # project hooks, no guard hook, no file-lock broker env, and no
+        # per-call settings file to carry the selected provider's
+        # endpoint. Hence a real, current path — one that holds hooks and
+        # the correlation key, and no credentials.
+        #
+        # ``base_url`` / ``auth_token`` below stay: they are the documented
+        # fallback for calls that run with NO scene, where there is no tier
+        # table to be approved against. A scene-routed call that resolves
+        # no provider fails instead of using them.
         coding_tool = ClaudeCodingTool(
             cwd=str(project_path),
             logger=logger,

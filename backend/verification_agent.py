@@ -22,9 +22,15 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Callable, Optional, List, Dict, Any
 
-from coding_tool import ClaudeCodingTool, CodingTool, ApiError, HardTimeoutError
+from coding_tool import (
+    ClaudeCodingTool,
+    CodingTool,
+    ApiError,
+    HardTimeoutError,
+    ProviderSlotWaitExpired,
+)
 from config_paths import resolve_plans_dir
 import provider_capacity
 from verification_config import TimeoutPolicy
@@ -121,72 +127,277 @@ class ApiTestSchemaViolation(RuntimeError):
 # speaks the JSON-coding-tool surface for plan/report generation.
 
 
+#: The scene every verification sub-agent dispatches through. Read from
+#: one place so the width this module derives and the chain the
+#: sub-agent walks are the same chain, and so a future scene change
+#: cannot move one without the other.
+VERIFICATION_SCENE = "verification"
+
+
+def _verification_vp_capacity(
+    scene: str = VERIFICATION_SCENE,
+) -> Optional[int]:
+    """How many VPs the verification scene's providers can serve right now.
+
+    Derived, never written down. It is the sum of what each provider in
+    ``scene``'s own chain can take — the operator's declared cap for that
+    provider, scaled by the 5-hour budget it has left — which is the same
+    arithmetic execution uses for its own pools and is read from the same
+    ``quota_map`` (:func:`dynamic_provider_concurrency.fleet_capacity`).
+
+    So it tracks the fleet. One provider declaring ten yields ten; two
+    yielding ten each yield twenty; one down to 40% of its window yields
+    four; one that has been shut loses its share rather than keeping a
+    reservation, and when the whole chain is shut the answer is ``0`` —
+    not the old figure, because ``0`` is what the meters say and any
+    other number here would be the framework overruling them.
+
+    ``None`` means *no bound is derivable*, which is a different fact
+    from ``0``: it says the scene's chain could not be resolved at all —
+    CC Switch unreachable, no tier matching, no live provider rows. That
+    is a configuration failure the dispatch path already reports loudly
+    (``SceneProviderUnavailable``), so it must not also be turned into a
+    gate that admits nobody: a misrouted scene then hangs the plan
+    silently instead of failing with the reason. The caller's own
+    ``parallelism_cap`` applies in that case, as it always did.
+
+    Every read degrades rather than raises — an unreadable quota payload
+    leaves every provider selectable (fail-open, the dispatch path's own
+    rule), and an unresolvable chain yields ``None``.
+    """
+    try:
+        from provider_routing import resolve_provider_chain
+        chain = list(resolve_provider_chain(scene) or [])
+    except Exception:
+        chain = []
+    if not chain:
+        return None
+
+    from dynamic_provider_concurrency import (
+        fleet_capacity,
+        get_shared_cooldown,
+    )
+    from provider_order import load_provider_5h_usage, load_provider_quota_map
+
+    try:
+        quota_map = load_provider_quota_map()
+    except Exception:
+        quota_map = {}
+    try:
+        usage_map = load_provider_5h_usage()
+    except Exception:
+        usage_map = {}
+
+    try:
+        return fleet_capacity(
+            chain, usage_map, quota_map, cooldown=get_shared_cooldown()
+        ).total
+    except Exception:
+        # A derivation that raises is not a width of zero, and must not
+        # become one: it means "no bound derivable", i.e. the fallback.
+        return None
+
+
+class _VpCapacityGate:
+    """A bound whose width is read from somewhere live, every time it binds.
+
+    ``asyncio.Semaphore`` takes its width once, at construction, and
+    holds it for the life of the run. That is the right shape for a
+    number an operator typed and the wrong shape for a number that
+    describes what the providers are serving this second: a window that
+    closes mid-round shrinks the fleet, and a window that opens grows
+    it, and neither can be seen by an object that stopped asking.
+
+    The queueing is the same as a semaphore's — one waiter admitted per
+    release — with one addition. A waiter that is not released within
+    ``recheck`` goes and asks the one process-wide quota watchdog for a
+    fresh reading, because there is a kind of "full" no release will fix:
+    every provider shut. That ask is single-flighted, so N verification
+    points queued on the same closed window cost one request between
+    them, the same way N dispatches do.
+
+    ``width`` returning ``None`` means "nothing derivable" and the
+    ``fallback`` decides; ``fallback`` returning ``None`` means no bound
+    at all, which is how the plan-wide layer is optional.
+    """
+
+    def __init__(
+        self,
+        width: Callable[[], Optional[int]],
+        fallback: Optional[Callable[[], Optional[int]]] = None,
+        *,
+        recheck_sec: Optional[float] = None,
+    ) -> None:
+        self._width = width
+        self._fallback = fallback
+        self._recheck_sec = recheck_sec
+        self._in_flight = 0
+        self._waiting = 0
+        self._changed: Optional[asyncio.Event] = None
+
+    # ----- the width --------------------------------------------------
+
+    def capacity(self) -> Optional[int]:
+        """The width right now; ``None`` means unbounded."""
+        for reader in (self._width, self._fallback):
+            if reader is None:
+                continue
+            try:
+                value = reader()
+            except Exception:
+                continue
+            if value is not None:
+                return max(0, int(value))
+        return None
+
+    def _recheck_interval(self) -> float:
+        if self._recheck_sec is not None:
+            return self._recheck_sec
+        from quota_watchdog import probe_interval_sec
+
+        return probe_interval_sec()
+
+    # ----- the queue --------------------------------------------------
+
+    def _event(self) -> asyncio.Event:
+        if self._changed is None:
+            self._changed = asyncio.Event()
+        return self._changed
+
+    async def acquire(self) -> None:
+        while True:
+            event = self._event()
+            # Cleared *before* the width is read, never after. A release
+            # landing between the read and the clear would be erased by
+            # the clear, and the waiter would sit out a full recheck on a
+            # slot that had already come free.
+            event.clear()
+            width = self.capacity()
+            if width is None or self._in_flight < width:
+                self._in_flight += 1
+                return
+
+            self._waiting += 1
+            try:
+                try:
+                    await asyncio.wait_for(
+                        event.wait(), timeout=self._recheck_interval()
+                    )
+                    # A slot came back. Go round and take it; re-reading
+                    # the width is what tells a wider fleet from a freed
+                    # slot, and the two are the same case to a waiter.
+                    continue
+                except asyncio.TimeoutError:
+                    pass
+                # Nothing was released for the whole interval and there
+                # is still no room, so the answer is not going to arrive
+                # from a release: the fleet itself has nothing to give.
+                # Ask the one watchdog — shared, so the whole queue asks
+                # once between them.
+                await self._refresh()
+            finally:
+                self._waiting -= 1
+
+    def release(self) -> None:
+        if self._in_flight > 0:
+            self._in_flight -= 1
+        if self._waiting:
+            # One wake-up per release, like a semaphore: the waiter that
+            # takes it re-reads the width itself, so waking more than one
+            # would only repeat that read.
+            self._event().set()
+
+    async def _refresh(self) -> None:
+        """Go and read the fleet again, on a worker thread.
+
+        The read is a blocking HTTP call — ``urlopen`` — so asking for it
+        inline would stall every other coroutine in the round for the
+        length of the request: the other verification points, the
+        orchestrator, the whole loop. Worse, it would stall them out of
+        reaching the watchdog at the same moment, which is precisely the
+        overlap the merge needs to collapse N asks into one. Handed to a
+        thread, the ask joins whatever the dispatch workers are already
+        doing against the same single reader.
+
+        Never raises. A watchdog that cannot be reached costs this
+        waiter one interval and nothing else.
+        """
+        try:
+            from quota_watchdog import get_shared_quota_watchdog
+
+            await asyncio.to_thread(get_shared_quota_watchdog().probe)
+        except Exception:
+            # Nothing to do but try again on the next interval; a
+            # watchdog that cannot be reached must not take the queue
+            # down with it.
+            pass
+
+    # ----- introspection ----------------------------------------------
+
+    @property
+    def in_flight(self) -> int:
+        return self._in_flight
+
+    @property
+    def waiting(self) -> int:
+        return self._waiting
+
+
 def _plan_wide_vp_cap() -> Optional[int]:
-    """Plan-wide ceiling on concurrently-running VPs, or ``None``.
+    """Declared fleet ceiling on concurrently-running VPs, or ``None``.
 
-    An ADDITIONAL bound layered over the existing per-group
-    ``parallelism_cap``, not a replacement for it.
+    The plan-wide bound, read from what the operator *declared*: the sum
+    of the per-provider caps in ``provider_capacity.yaml``
+    (:func:`provider_capacity.configured_capacity_ceiling`).
 
-    Why it is needed at all: ``_execute_group`` applies
-    ``parallelism_cap`` per group, and ``execute_verification_plan_async``
-    gathers every group at once, so the plan-wide fan-out is
-    ``parallelism_cap × group_count``. Four method-groups at cap 4 is 16,
-    and a fifth and sixth group would make it 24 — nothing in the
-    per-group throttle bounds that, and each in-flight VP is a ``claude``
-    subprocess competing for the same provider slots.
+    Its role changed when the per-group bound stopped being a written
+    number. It used to be the only derived bound in the system, and it
+    sat *under* a per-group ``parallelism_cap`` of four — so on a machine
+    with one provider declaring twenty slots, the plan could run twenty
+    verification points at once and the bound said nothing about it,
+    while the per-group figure held the whole plan to four. That is the
+    bottleneck this order was asked to remove, and leaving it in place
+    would have rebuilt it one layer up: a declared ceiling is a sum over
+    *rules*, which over-counts when two rules match one provider and
+    under-counts a provider nobody wrote a rule for, so it is not the
+    fleet the dispatch path will actually use.
 
-    The bound is **derived from configuration**, not asserted here: it is
-    the sum of the per-provider caps declared in
-    ``provider_capacity.yaml`` (see
-    :func:`provider_capacity.configured_capacity_ceiling`), which is the
-    most this installation can usefully have in flight. Every VP beyond
-    that would only queue on a provider slot.
+    So it is now the fallback, and only that. While a bound is derivable
+    from the live scene (:func:`_verification_vp_capacity`) that number
+    is both the plan's width and each group's — the same figure at two
+    layers, which is what keeps the plan bound from becoming the new
+    ceiling the per-group one just stopped being. This function answers
+    for the case where nothing is derivable: the chain could not be
+    resolved, so the declared capacity is the only fleet size on record.
 
-    ``None`` when no capacity is configured. Then there is no declared
-    fleet size to derive a bound from, and inventing one would put the
-    same kind of hand-written number back — the operator's own
+    ``None`` when no capacity is configured either. Then there is no
+    declared fleet size at all, and inventing one would put the same
+    kind of hand-written number back — the operator's own
     ``parallelism_cap`` is the only throttle that exists, and it applies.
 
-    Keeping the per-group cap means an operator who sets
-    ``parallelism_cap`` still gets exactly the throttle they asked for
-    (that behaviour is pinned by
-    ``test_orchestrator_respects_parallelism_cap_2``).
+    An operator who sets ``parallelism_cap`` still gets exactly the
+    throttle they asked for in that case (pinned by
+    ``test_orchestrator_respects_parallelism_cap_2``); what they no
+    longer get is a fleet smaller than their providers can serve.
     """
     ceiling = provider_capacity.configured_capacity_ceiling()
     return ceiling if ceiling > 0 else None
 
 
-class _NoPlanBound:
-    """Reentrant no-op stand-in for the plan-wide semaphore.
+def _plan_wide_bound(width: Optional[Callable[[], Optional[int]]] = None):
+    """The plan-wide bound, as a gate that re-reads its width.
 
-    A class rather than ``@contextlib.asynccontextmanager`` because ONE
-    instance is shared by every VP in the group, and a generator-based
-    context manager can only be entered once — the second ``async with``
-    would raise, or (worse) silently serialise the group.
+    A gate sized by the live scene (:func:`_verification_vp_capacity`)
+    whenever the scene can be resolved, and by the declared ceiling
+    (:func:`_plan_wide_vp_cap`) when it cannot. A width of ``None``
+    everywhere means no plan-wide bound at all — the gate then admits
+    every VP, which is the same as the shared no-op it replaced and needs
+    no special case at the call site.
     """
-
-    async def __aenter__(self):
-        return None
-
-    async def __aexit__(self, *_exc_info) -> bool:
-        return False
-
-
-_NO_PLAN_BOUND = _NoPlanBound()
-
-
-def _plan_wide_bound():
-    """The plan-wide bound as an async context manager.
-
-    A semaphore when :func:`_plan_wide_vp_cap` found a configured
-    ceiling, a shared no-op otherwise. Handing both cases back in the
-    same shape keeps the two call sites readable — neither has to branch
-    on whether capacity was configured.
-    """
-    ceiling = _plan_wide_vp_cap()
-    if ceiling is None:
-        return _NO_PLAN_BOUND
-    return asyncio.Semaphore(ceiling)
+    return _VpCapacityGate(
+        width or _verification_vp_capacity,
+        _plan_wide_vp_cap,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +426,73 @@ def _log_phase_distribution(context: str, summary: dict) -> None:
               "（按计划顺序执行）")
 
 
+# 2026-10-11: cap on evidence handed to the Phase 3 judgment LLM.
+# VP-016 round 4 shipped 7141 chars of evidence and the old 500-char
+# cap cut it mid-sentence right before the conclusion the reporter
+# needed. 8000 comfortably covers the observed worst case; anything
+# beyond it is clipped — but *declared*, see ``_truncate_annotated``.
+_MAX_PROMPT_EVIDENCE_CHARS = 8000
+
+
+def _truncate_annotated(text: str, limit: int, label: str = "evidence") -> str:
+    """Clip ``text`` to ``limit`` chars, declaring the cut when one happens.
+
+    The point of the declaration is that a silent slice is
+    indistinguishable from the whole thing: the reader cannot tell
+    "that is all there was" from "that is the first N chars", so an
+    LLM downstream reasons about a truncated fragment as if it were a
+    complete argument and reports "I could not verify the FAILED
+    conclusion because the text was cut" — which is precisely what
+    10 of 31 failed rounds did before this was fixed. Losing the
+    tail is acceptable; losing the *fact* that the tail is missing is
+    not, so the annotation states the original length too.
+    """
+    if len(text) <= limit:
+        return text
+    notice = (
+        f"…[{label} 已截断，原长 {len(text)} 字符，"
+        f"此处保留前 {limit}]"
+    )
+    return text[:limit] + notice
+
+
+def _render_evidence_for_prompt(
+    evidence: Any, limit: int = _MAX_PROMPT_EVIDENCE_CHARS
+) -> str:
+    """Render a VP ``evidence`` value as readable prompt text, bounded.
+
+    ``evidence`` arrives in two shapes:
+
+    * ``str`` — the legacy / executor path, already flattened;
+    * ``dict`` — the sub-agent path, ``{"details": str, "raw": list[str]}``
+      (see :meth:`Orchestrator._verdict_to_result`).
+
+    ``str(dict)`` on the second shape renders a Python repr — escaped
+    quotes, a leading ``{``, a trailing ``}'`` glued to the end of the
+    text — which reads badly and is easy for a reporter to mis-parse.
+    Here ``raw`` is listed one entry per line (those entries are the
+    actual observations), falling back to ``details`` when ``raw`` is
+    absent or empty. A ``list`` is joined the same way.
+
+    The result is then passed through :func:`_truncate_annotated`, so
+    the bound applies *after* rendering and the annotation reports the
+    post-render length — the number the reader actually has to reason
+    about.
+    """
+    rendered: str
+    if isinstance(evidence, dict):
+        raw = evidence.get("raw")
+        if isinstance(raw, (list, tuple)) and raw:
+            rendered = "\n".join(str(e) for e in raw)
+        else:
+            rendered = str(evidence.get("details") or "")
+    elif isinstance(evidence, (list, tuple)):
+        rendered = "\n".join(str(e) for e in evidence) if evidence else ""
+    else:
+        rendered = str(evidence or "")
+    return _truncate_annotated(rendered, limit)
+
+
 #
 # Refactor note (Phase C7 → Orchestrator): the historical class name
 # ``VerificationAgent`` is kept as a backward-compatibility alias of the
@@ -238,7 +516,8 @@ class Orchestrator:
     def __init__(self, plan_dir: Path, project_dir: Path,
                  coding_tool: Optional[CodingTool] = None,
                  max_parallel: int = 1,
-                 verif_repo: Optional[Any] = None):
+                 verif_repo: Optional[Any] = None,
+                 vp_capacity_resolver: Optional[Callable[[], Optional[int]]] = None):
         """
         Initialize verification agent.
 
@@ -252,11 +531,29 @@ class Orchestrator:
                 ``verif_repo.append_verdict`` (single BEGIN IMMEDIATE +
                 COMMIT) and produces zero ``verification_*_state.json``
                 files.  ``None`` keeps the legacy JSON persistence path.
+            vp_capacity_resolver: Returns how many VPs the verification
+                scene's providers can serve right now, or ``None`` when
+                nothing is derivable. Defaults to
+                :func:`_verification_vp_capacity`, which reads the live
+                provider set and what is left of their 5-hour budget.
+                Injectable because a test that wants to pin a *width*
+                should not have to stand up a CC Switch database to do
+                it — and because "no bound is derivable" is a real
+                answer, which the fallback path has to be exercised
+                against.
         """
         self.plan_dir = Path(plan_dir)
         self.project_dir = Path(project_dir)
         self.coding_tool = coding_tool or ClaudeCodingTool()
         self.max_parallel = max_parallel
+        self.vp_capacity_resolver = (
+            vp_capacity_resolver or _verification_vp_capacity
+        )
+        # The width a gate in this round actually bound at. ``None`` until
+        # one does, and the report paths use it rather than re-deriving,
+        # so a report cannot claim the fallback was in force for a round
+        # that ran on the fleet.
+        self._last_vp_capacity: Optional[int] = None
         # Task-11 subagent callback chain: when set, the executor's
         # verdict recording path writes via VerificationRepository
         # instead of ``atomic_write_json`` to a per-plan JSON file.
@@ -373,6 +670,49 @@ class Orchestrator:
         #: 阶段归一化摘要（Phase 1/2 计数 + 被兜底提升的 VP），由
         #: :meth:`generate_verification_plan` 填充，供审计/展示读取。
         self._last_phase_summary: Dict[str, Any] = {}
+
+    def _live_vp_capacity(self) -> Optional[int]:
+        """The width a run would actually use, or ``None`` if unknowable.
+
+        Read through the injected resolver rather than from
+        :mod:`dynamic_provider_concurrency` directly so a test can pin
+        the declared/fallback path without touching the machine's real
+        provider pool — see
+        ``tests/unit/test_verification_derived_vp_capacity.py``.
+
+        The read is guarded because this is called from report-building
+        paths that must never fail on a provider-surface problem: the
+        question is "what will the group gate use", and an unanswerable
+        question already has an answer (``None``) that the profile knows
+        how to report as ``parallelism_cap_fallback``.
+        """
+        try:
+            return self.vp_capacity_resolver()
+        except Exception:  # noqa: BLE001 — reporting must not break a run
+            return None
+
+    def _note_vp_capacity(self, width: Optional[int]) -> None:
+        """Record the width a gate bound at, for the report to quote.
+
+        Kept rather than re-derived. A report built after the round has
+        finished asking the live provider pool would (a) cost a CC Switch
+        read to describe a run that is already over and (b) answer a
+        *different* question — what the fleet looks like now — while
+        claiming to describe what the run did. The number the gate
+        actually bound is the one the profile is for.
+
+        ``None`` is never recorded: "nothing was derivable" and "nothing
+        has bound yet" are the same answer to every reader here, and
+        neither is a width.
+        """
+        if width is not None:
+            self._last_vp_capacity = int(width)
+
+    def _report_vp_capacity(self) -> Optional[int]:
+        """The width to publish: what bound, or the live one if none did."""
+        if self._last_vp_capacity is not None:
+            return self._last_vp_capacity
+        return self._live_vp_capacity()
 
     def _normalize_service_declarations(self, plan_data: dict) -> dict:
         """Parse + validate the plan's ``services`` block and annotate
@@ -1274,7 +1614,17 @@ class Orchestrator:
 
         # Build a vp_id → group_index map by walking the profile's
         # group_profiles (which preserves first-seen method order).
-        profile = ExecutionProfileGenerator(plan_data, timeout_policy=self.timeout_policy).build()
+        #
+        # The live width rides along so the profile does not report
+        # ``parallelism_cap`` as if it were the number that ran. This is
+        # the only place the value object is allowed to see it — it is
+        # otherwise pure, and the round-trip belongs to the caller that
+        # is about to dispatch.
+        profile = ExecutionProfileGenerator(
+            plan_data,
+            timeout_policy=self.timeout_policy,
+            vp_capacity=self._live_vp_capacity(),
+        ).build()
         vp_to_group_index: Dict[str, int] = {}
         for group_index, group in enumerate(profile.get("group_profiles", []) or []):
             for vp_id in group.get("vp_ids", []) or []:
@@ -1580,12 +1930,16 @@ class Orchestrator:
         2. :meth:`_partition_vps_by_method` buckets VPs by their
            ``verification_method`` field, preserving first-seen order.
         3. ``manual_check`` groups short-circuit to ``SKIPPED`` and
-           never enter the gather / semaphore path.
+           never enter the gather / gate path.
         4. Each remaining group is dispatched via
            :func:`asyncio.gather` so multiple groups run in parallel,
-           and inside each group an :class:`asyncio.Semaphore`
-           (``TimeoutPolicy.parallelism_cap``) rate-limits the
-           in-flight VPs to the configured cap.
+           and the in-flight VPs are rate-limited by two bounds, both
+           re-read every time either binds: the plan-wide one and each
+           group's own. Both come from the verification scene's
+           providers — how many VPs the fleet can actually serve this
+           second — and both fall back to the configured
+           ``parallelism_cap`` only when that scene cannot be resolved at
+           all (:func:`_verification_vp_capacity`).
         5. :meth:`_execute_group` emits a ``group_started`` and
            ``group_completed`` event on the persistence log so
            downstream observers (the JSONL log parser, the
@@ -1635,23 +1989,31 @@ class Orchestrator:
         ]
 
         if non_manual_groups:
-            # 2026-09-17 — ONE plan-wide semaphore, shared by every
-            # group, layered over each group's own ``parallelism_cap``
-            # semaphore.
+            # ONE plan-wide bound, shared by every group, layered over
+            # each group's own bound.
             #
-            # The per-group cap alone does not bound the plan: it is
+            # The per-group bound alone does not bound the plan: it is
             # applied once per group and the groups are gathered
-            # together, so the real fan-out is ``parallelism_cap ×
-            # group_count``. Four groups at cap 4 gives 16, and a fifth
-            # and sixth group would give 24 — each in-flight VP is a
+            # together, so the real fan-out is ``group_cap ×
+            # group_count``. Four groups at 4 gives 16, and a fifth and
+            # sixth group would give 24 — each in-flight VP is a
             # ``claude`` subprocess competing for the same provider slots.
             #
-            # ``parallelism_cap`` keeps its meaning (see
-            # ``_plan_wide_vp_cap``); this only fires above the ceiling
-            # the configured per-provider caps add up to.
-            plan_semaphore = _plan_wide_bound()
+            # Both bounds are the *same live number* while the scene can
+            # be resolved (:func:`_verification_vp_capacity`), read
+            # again each time either one binds. That is deliberate: two
+            # layers reading different figures is how the plan bound
+            # becomes the new ceiling — the per-group bound used to hold
+            # a machine with twenty provider slots to four, and a
+            # declared ceiling underneath it would have held it to
+            # whatever the operator happened to have written in
+            # ``provider_capacity.yaml`` instead. When the scene cannot
+            # be resolved, both fall back: the plan to the declared
+            # ceiling and each group to ``parallelism_cap``, as before.
+            plan_gate = _plan_wide_bound(self.vp_capacity_resolver)
+            self._note_vp_capacity(plan_gate.capacity())
             coros = [
-                self._execute_group(method, vps, plan_semaphore)
+                self._execute_group(method, vps, plan_gate)
                 for method, vps in non_manual_groups
             ]
             group_results = await asyncio.gather(*coros, return_exceptions=True)
@@ -1970,22 +2332,34 @@ class Orchestrator:
         self,
         method: str,
         vps: List[Dict[str, Any]],
-        plan_semaphore: Optional[asyncio.Semaphore] = None,
+        plan_gate: Optional["_VpCapacityGate"] = None,
     ) -> List[Dict[str, Any]]:
         """Run all VPs in a single method-group in parallel.
 
         Two bounds apply, nested:
 
-        * ``TimeoutPolicy.parallelism_cap`` — this group's own throttle,
-          unchanged since it was introduced.
-        * ``plan_semaphore`` — the plan-wide fleet ceiling, created once
-          in :meth:`execute_verification_plan_async` and shared by every
+        * ``plan_gate`` — the plan-wide fleet ceiling, built once in
+          :meth:`execute_verification_plan_async` and shared by every
           group. Without it the per-group caps multiply (cap × groups).
+        * this group's own gate — the same live number as the plan's
+          while the verification scene resolves, so the plan bound can
+          never become the tighter of the two.
 
-        ``plan_semaphore`` is passed in rather than constructed here,
-        but still defaulted: a caller driving a single group directly
-        (tests, ad-hoc repros) gets a correctly-sized one instead of an
-        unbounded gather. For a single group the two coincide anyway.
+        Both are :class:`_VpCapacityGate`, which re-reads its width each
+        time it binds rather than fixing it at construction. That is the
+        point: a group used to be held to a number typed into
+        ``verification.yaml``, and four was far below what one provider
+        declaring ten can serve — so four verification points could be
+        in flight while doing nothing at all, each asleep on a closed
+        quota window, and the fifth would never get a turn. The width now
+        tracks the fleet: what the scene's providers can serve this
+        second, scaling with their remaining 5-hour budget and losing a
+        provider's share entirely the moment that provider is shut.
+
+        ``plan_gate`` is passed in rather than constructed here, but still
+        defaulted: a caller driving a single group directly (tests,
+        ad-hoc repros) gets a correctly-sized one instead of an unbounded
+        gather. For a single group the two coincide anyway.
 
         Two persistence events bracket the run:
 
@@ -2030,22 +2404,85 @@ class Orchestrator:
         except OSError:
             pass
 
-        if plan_semaphore is None:
-            plan_semaphore = _plan_wide_bound()
+        if plan_gate is None:
+            plan_gate = _plan_wide_bound(self.vp_capacity_resolver)
 
-        # Two bounds, and they mean different things. The group
-        # semaphore is the operator's ``parallelism_cap`` throttle and is
-        # unchanged. The plan bound is the fleet ceiling: a running VP is
-        # mostly a ``claude`` subprocess, so letting the per-group caps
-        # multiply past it just parks coroutines in the provider slot
-        # wait. It is a no-op when no capacity is configured.
-        cap = max(1, int(self.timeout_policy.parallelism_cap))
-        semaphore = asyncio.Semaphore(cap)
+        # Two bounds, and they say the same thing whenever the scene can
+        # be resolved. The group's own is the one an operator used to be
+        # typing into ``parallelism_cap``; it is now the *fallback*, used
+        # only when the verification scene's chain cannot be resolved and
+        # so nothing is derivable. The plan bound is the fleet ceiling:
+        # a running VP is mostly a ``claude`` subprocess, so letting the
+        # per-group caps multiply past it just parks coroutines in the
+        # provider slot wait.
+        group_gate = _VpCapacityGate(
+            self.vp_capacity_resolver,
+            lambda: max(1, int(self.timeout_policy.parallelism_cap)),
+        )
+        self._note_vp_capacity(group_gate.capacity())
 
         async def _run_with_semaphore(vp: Dict[str, Any]) -> Dict[str, Any]:
-            async with semaphore:
-                async with plan_semaphore:
-                    return await self._run_single_vp_async(vp)
+            # The semantic this loop exists to establish: a gate slot means
+            # "a verification point is WORKING", not "a verification point
+            # is in flight". It used to mean the latter, and the two come
+            # apart the moment a point is asleep in the provider slot queue
+            # — which it is, for as long as the tier stays saturated, while
+            # both of its gates stay taken. A round whose points are all
+            # queued reads from the outside as a fully-busy fleet and
+            # produces nothing, so the gate was spending its width on points
+            # that were not doing anything with it.
+            #
+            # ``ProviderSlotWaitExpired`` is the signal that separates the
+            # two, and it can only be raised while a point is waiting: the
+            # dispatch raises it inside the queue loop, which is reached
+            # only before a provider is chosen, and the loop is left behind
+            # the moment one is. Nothing that is running can raise it. So
+            # re-queueing on it costs at most the wait that already
+            # happened, and it can never interrupt a working point — which
+            # is exactly the property an ``asyncio.wait_for`` around the
+            # whole VP could not have.
+            #
+            # The two ``finally`` arms do the hand-back; the ``except`` arm
+            # only decides what happens next, and re-queueing is a decision,
+            # not a verdict: no result is written, no FAILED is recorded, and
+            # the same ``vp`` goes round again. The point that cannot get a
+            # slot is not a point that did the work badly.
+            #
+            # The flag, rather than a bare ``continue`` in the ``except``
+            # arm, is load-bearing. The hand-back lives in the ``finally``
+            # arms, and a ``finally`` runs *after* the ``except`` body: a
+            # yield point written inside the ``except`` arm would therefore
+            # resume while this point still holds the group gate, so the
+            # waiter it yielded to would bounce off a gate that was about to
+            # open, and the yield would achieve the opposite of what it is
+            # there for. Deciding here and yielding after the block means
+            # both gates are already back before anything else runs.
+            while True:
+                requeue = False
+                await group_gate.acquire()
+                try:
+                    await plan_gate.acquire()
+                    try:
+                        return await self._run_single_vp_async(vp)
+                    finally:
+                        plan_gate.release()
+                except ProviderSlotWaitExpired:
+                    requeue = True
+                finally:
+                    group_gate.release()
+
+                # Back of the queue, not straight back to the front.
+                # ``acquire`` hands the slot straight back when the gate has
+                # room, and the arm above returns into it without a yield
+                # point -- so a point that re-queued without this would take
+                # its own gate again immediately and starve whichever point
+                # was already queued behind it, repeating that for as long as
+                # it kept missing a slot. Yielding once puts this point
+                # behind every waiter that a release has already woken, which
+                # is what re-queued means. The alternative -- a fairness
+                # counter on the gate -- would change the gate for every
+                # caller, including the ones that never re-queue.
+                await asyncio.sleep(0)
 
         started_at = datetime.now()
         try:
@@ -2564,6 +3001,15 @@ class Orchestrator:
             # ``VerificationSubAgent._execute_attempt`` fired — that
             # layer catches it and routes to the summarizer fallback,
             # not here.
+            except ProviderSlotWaitExpired:
+                # The verification point never reached a provider: its
+                # scene's tier was saturated past the slot wait, so the
+                # dispatch gave the wait back rather than sleep on it.
+                # The arm below would record that as FAILED, which would be
+                # a claim about the work that nothing observed. Re-raise to
+                # the gate wrapper, which hands the capacity gates back and
+                # puts the point on the queue again.
+                raise
             except Exception as e:
                 # Defensive catch — surface as FAILED so a buggy
                 # method doesn't take the whole batch down.
@@ -2718,20 +3164,42 @@ class Orchestrator:
 
         * ``verdict.verdict`` → ``status`` (already coerced —
           SKIPPED never reaches here).
-        * ``verdict.reasons`` (first entry) → ``actual_result``.
+        * ``verdict.reasons`` (**all entries, newline-joined**) →
+          ``actual_result``.
         * ``verdict.evidence`` (joined) → ``evidence``.
         * Provider metadata is dropped at this layer; it is
           surfaced in the persistence log via
           ``sub_agent_completed`` for auditability, not in the
           per-VP result dict.
+
+        2026-10-11: ``actual_result`` used to be ``reasons[0]``
+        only. That is systematically wrong: the sub-agent emits
+        one reason per acceptance criterion, **satisfied criteria
+        first, the failing one last** (confirmed on VP-016 round
+        4: ``reasons[0]`` was criterion ① passing at 246 chars,
+        while the real failure — criterion ④'s second half — sat
+        at ``reasons[4]``, 623 chars). Taking index 0 therefore
+        throws away the failure reason and hands the report writer
+        / repair-task generator a VP that "passed" every check
+        while the verdict says FAILED. Across 34 FAILED verdicts
+        ``reasons[0]`` carried only ~25% (median) of the reason
+        text, and in 41% of cases mentioned the failure not at all.
+        Joining all reasons — the same thing
+        :meth:`_build_execution_results_from_executor` already did
+        on the executor path — makes the failure reason survive to
+        the downstream consumers.
         """
         status = str(verdict.verdict) if verdict.verdict else "FAILED"
-        # ``actual_result`` is a short human-readable summary; the
-        # first reason is usually the most informative. If no
-        # reasons were provided, fall back to a generic message
-        # so the downstream report always has *something* to show.
+        # Keep every reason, in order. The failing criterion is the
+        # LAST one, so truncating to a prefix (or keeping only
+        # reasons[0]) is exactly how the failure reason got lost.
+        # The "satisfied criteria first" convention is what makes
+        # this a prefix-vs-suffix problem rather than a "pick the
+        # best line" one. If no reasons were provided at all, fall
+        # back to a generic message so the downstream report always
+        # has *something* to show.
         if verdict.reasons:
-            actual_result = str(verdict.reasons[0])
+            actual_result = "\n".join(str(r) for r in verdict.reasons)
         else:
             actual_result = f"verdict={status}"
         evidence = " | ".join(str(e) for e in verdict.evidence) if verdict.evidence else ""
@@ -3293,7 +3761,8 @@ class Orchestrator:
                 # emitted report and the profile agree on the same
                 # set of verification points.
                 report_data["execution_profile"] = ExecutionProfileGenerator(
-                    execution_results
+                    execution_results,
+                    vp_capacity=self._report_vp_capacity(),
                 ).build()
 
                 # Save report using persistence manager
@@ -3365,7 +3834,9 @@ class Orchestrator:
 
             parts.append(f"### {vp_id}: {status}")
             parts.append(f"- 实际结果: {actual}")
-            parts.append(f"- 判定依据: {str(evidence)[:500]}")
+            parts.append(
+                f"- 判定依据: {_render_evidence_for_prompt(evidence)}"
+            )
             parts.append("")
 
         return "\n".join(parts)
@@ -3554,7 +4025,9 @@ class Orchestrator:
             "summary": f"自动生成报告: {status_counts['PASSED']} 通过, {status_counts['FAILED']} 失败, {status_counts['SKIPPED']} 跳过, {status_counts['PARTIAL']} 部分",
             "verification_results": execution_results_list,
             "requirement_deviations": [],
-            "execution_profile": ExecutionProfileGenerator(execution_results).build(),
+            "execution_profile": ExecutionProfileGenerator(
+                execution_results, vp_capacity=self._report_vp_capacity()
+            ).build(),
             "generated_at": datetime.now().isoformat(),
             "plan_id": self.plan_dir.name,
             "project_dir": str(self.project_dir)

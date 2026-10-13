@@ -137,6 +137,16 @@ def agent_factory(tmp_path):
             verif_repo=repo,
         )
         agent.timeout_policy.parallelism_cap = cap
+        # These tests are about the *declared* bounds, so the provider
+        # pool is pinned out of the picture rather than left to whatever
+        # CC Switch database happens to be on the machine: a width read
+        # from live providers would make every number below a statement
+        # about the developer's laptop. ``None`` is the honest answer for
+        # "no bound derivable", which is exactly the branch the declared
+        # ceiling and ``parallelism_cap`` are the fallbacks for. The
+        # derived path has its own tests, in
+        # ``test_verification_provider_derived_cap.py``.
+        agent.vp_capacity_resolver = lambda: None
         # ``_execute_group`` brackets its run with persistence events.
         agent.persistence.start_round(1)
         return agent

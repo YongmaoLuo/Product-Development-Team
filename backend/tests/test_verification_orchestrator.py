@@ -149,25 +149,6 @@ def _read_state(plan_dir):
     return PlanState._sqlite_row_to_state(row)
 
 
-def _make_orchestrator(plan_dir, project_dir, coding_tool):
-    """Create orchestrator with patched VerificationAgent & RepairTaskGenerator."""
-    with patch("verification.orchestrator.VerificationAgent") as MockVA, \
-         patch("verification.orchestrator.RepairTaskGenerator") as MockRG:
-        orch = VerificationOrchestrator(
-            plan_dir=plan_dir,
-            project_dir=project_dir,
-            coding_tool=coding_tool,
-        )
-        # Default mock behaviours — tests override as needed
-        orch.verification_agent.run_full_verification.return_value = {
-            "overall_status": "PASSED",
-            "verification_results": [],
-            "requirement_deviations": [],
-        }
-        orch.repair_generator.generate_and_append_tasks.return_value = []
-        yield orch
-
-
 # =============================================================================
 # State Transitions — All Scenarios
 # =============================================================================
@@ -192,11 +173,10 @@ class TestStateTransitions:
                 temp_plan_dir, temp_project_dir, mock_coding_tool
             )
             orch.verification_agent.run_full_verification.return_value = report
-            # Repair tasks now come from the 2026-09-07 single-call flow
-            # (``extract_failed_vps_from_report`` → ``generate_repair_contents``
-            # → ``RepairTaskAssembler``), not from the legacy
-            # ``generate_verification_tasks`` chain. Mock the two collaborators
-            # the flow actually consults.
+            # Repair tasks come from the single-call flow
+            # (``extract_failed_vps_with_paths`` → ``generate_repair_contents``
+            # → ``RepairTaskAssembler``). Mock the two collaborators that
+            # flow actually consults.
             MockExtract.return_value = [
                 {"id": "VP-1", "title": "Fix login flow", "priority": "high"},
             ]
@@ -279,11 +259,6 @@ class TestStateTransitions:
                 temp_plan_dir, temp_project_dir, mock_coding_tool
             )
             orch.verification_agent.run_full_verification.return_value = report
-            tasks_file = temp_project_dir / "verification_tasks_round_2.json"
-            tasks_file.write_text(json.dumps({
-                "tasks": [{"id": "1-2", "title": "Fix login again"}]
-            }))
-            orch.repair_generator.generate_repair_tasks.return_value = tasks_file
             orch.repair_generator.generate_repair_contents.return_value = []
 
             MockExtract.return_value = [
@@ -334,10 +309,6 @@ class TestStateTransitions:
                 temp_plan_dir, temp_project_dir, mock_coding_tool
             )
             orch.verification_agent.run_full_verification.return_value = report
-            # Mock generate_verification_tasks - returns empty tasks (max_rounds soft limit)
-            tasks_file = temp_plan_dir / "verification_tasks_round_3.json"
-            tasks_file.write_text(json.dumps({"tasks": []}))
-            orch.repair_generator.generate_verification_tasks.return_value = (tasks_file, 0)
 
             orch.start_verification_cycle(round_number=3)
             result = orch.check_cycle_conditions(report)
@@ -371,9 +342,6 @@ class TestStateTransitions:
             orch = VerificationOrchestrator(
                 temp_plan_dir, temp_project_dir, mock_coding_tool
             )
-            tasks_file = temp_project_dir / "verification_tasks_round_1.json"
-            tasks_file.write_text(json.dumps({"tasks": []}))
-            orch.repair_generator.generate_repair_tasks.return_value = tasks_file
             orch.repair_generator.generate_repair_contents.return_value = []
 
             MockExtract.return_value = [
@@ -471,9 +439,6 @@ class TestStateTransitions:
             orch = VerificationOrchestrator(
                 temp_plan_dir, temp_project_dir, mock_coding_tool
             )
-            tasks_file = temp_project_dir / "verification_tasks.json"
-            tasks_file.write_text(json.dumps({"tasks": []}))
-            orch.repair_generator.generate_repair_tasks.return_value = tasks_file
             orch.repair_generator.generate_repair_contents.return_value = []
 
             MockAssembler.return_value.assemble.return_value = [
@@ -637,16 +602,6 @@ class TestBoundaryConditions:
             orch = VerificationOrchestrator(
                 temp_plan_dir, temp_project_dir, mock_coding_tool
             )
-            # Mock generate_verification_tasks for each round
-            tasks_file_1 = temp_plan_dir / "verification_tasks_round_1.json"
-            tasks_file_1.write_text(json.dumps({"tasks": [{"id": "1-1", "title": "Fix"}]}))
-            tasks_file_2 = temp_plan_dir / "verification_tasks_round_2.json"
-            tasks_file_2.write_text(json.dumps({"tasks": [{"id": "1-2", "title": "Fix 2"}]}))
-            tasks_file_3 = temp_plan_dir / "verification_tasks_round_3.json"
-            tasks_file_3.write_text(json.dumps({"tasks": [{"id": "1-3", "title": "Fix 3"}]}))
-            orch.repair_generator.generate_verification_tasks.side_effect = [
-                (tasks_file_1, 1), (tasks_file_2, 1), (tasks_file_3, 1)
-            ]
 
             failed_report = {
                 "overall_status": "FAILED",
@@ -720,10 +675,6 @@ class TestBoundaryConditions:
             orch = VerificationOrchestrator(
                 temp_plan_dir, temp_project_dir, mock_coding_tool
             )
-            # Mock generate_verification_tasks
-            tasks_file = temp_plan_dir / "verification_tasks_round_3.json"
-            tasks_file.write_text(json.dumps({"tasks": [{"id": "1-3", "title": "Fix"}]}))
-            orch.repair_generator.generate_verification_tasks.return_value = (tasks_file, 1)
 
             failed_report = {
                 "overall_status": "FAILED",
@@ -753,10 +704,6 @@ class TestBoundaryConditions:
             orch = VerificationOrchestrator(
                 temp_plan_dir, temp_project_dir, mock_coding_tool
             )
-            # Mock generate_verification_tasks
-            tasks_file = temp_plan_dir / "verification_tasks_round_1.json"
-            tasks_file.write_text(json.dumps({"tasks": [{"id": "1-1", "title": "Fix"}]}))
-            orch.repair_generator.generate_verification_tasks.return_value = (tasks_file, 1)
 
             failed_report = {
                 "overall_status": "FAILED",
@@ -846,10 +793,6 @@ class TestPersistence:
             orch = VerificationOrchestrator(
                 temp_plan_dir, temp_project_dir, mock_coding_tool
             )
-            # Mock generate_verification_tasks
-            tasks_file = temp_plan_dir / "verification_tasks_round_3.json"
-            tasks_file.write_text(json.dumps({"tasks": []}))
-            orch.repair_generator.generate_verification_tasks.return_value = (tasks_file, 0)
 
             failed_report = {
                 "overall_status": "FAILED",
@@ -887,9 +830,6 @@ class TestPersistence:
             orch = VerificationOrchestrator(
                 temp_plan_dir, temp_project_dir, mock_coding_tool
             )
-            tasks_file = temp_plan_dir / "verification_tasks_round_2.json"
-            tasks_file.write_text(json.dumps({"tasks": [{"id": "1-1", "title": "Fix"}]}))
-            orch.repair_generator.generate_repair_tasks.return_value = tasks_file
             orch.repair_generator.generate_repair_contents.return_value = []
 
             MockExtract.return_value = [
@@ -1204,13 +1144,19 @@ class TestGroupParallelExecution:
     ):
         """cap=2 + 6 ui VPs at 3s each → wall time ∈ [8, 10]s.
 
-        The semaphore (``parallelism_cap=2``) throttles in-flight
-        VPs to two at a time, so 6 VPs complete in three sequential
-        rounds of two, each 3s long. Total ≈ 9s. The [8, 10]s band
-        absorbs asyncio scheduling / ``asyncio.run`` overhead.
-        Without the semaphore the same 6 VPs would finish in a
-        single round of 6 (~3s) — that's the negative control
+        The group gate throttles in-flight VPs to two at a time, so 6 VPs
+        complete in three sequential rounds of two, each 3s long. Total
+        ≈ 9s. The [8, 10]s band absorbs asyncio scheduling /
+        ``asyncio.run`` overhead. Without the gate the same 6 VPs would
+        finish in a single round of 6 (~3s) — that's the negative control
         this test guards against.
+
+        ``parallelism_cap`` is the *fallback* width now, used when the
+        verification scene's provider chain cannot be resolved, so this
+        test pins that resolver to ``None`` to be standing on the branch
+        it is about. The number under test has not changed; where it
+        comes from is covered in
+        ``tests/unit/test_verification_provider_derived_cap.py``.
         """
         from verification_config import TimeoutPolicy
 
@@ -1220,13 +1166,14 @@ class TestGroupParallelExecution:
             coding_tool=mock_coding_tool,
         )
         # Cap in-flight VPs at 2; raise per-method timeout well above
-        # the 3s sleep so the semaphore — not the timeout — is the
+        # the 3s sleep so the gate — not the timeout — is the
         # rate-limiting mechanism.
         agent.timeout_policy = TimeoutPolicy(
             per_method_timeout_seconds={"ui_validation": 60},
             global_default_timeout_seconds=60,
             parallelism_cap=2,
         )
+        agent.vp_capacity_resolver = lambda: None
         agent.start_verification_round(1)
 
         vps = self._make_vps_by_method({"ui_validation": 6})

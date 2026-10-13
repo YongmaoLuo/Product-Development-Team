@@ -58,6 +58,30 @@ _SCHEMA_VERSION = 1
 #: 无上限会让长跑计划的 prompt 线性膨胀。
 MAX_ENTRIES_PER_VP = 5
 
+#: 单条历史里 ``actual_result`` / ``evidence`` 的字符上限。
+#: 2026-10-11: 原为 600 / 400。``actual_result`` 现在会带上子 agent
+#: 的全部 verdict 判据（失败的那条排在最后），600 的切片恰好切掉
+#: "哪条判据没达标"这一段，修复 agent 读到的是一份"全部判据都通过"
+#: 的历史。8000 与 ``verification_agent`` / ``repair_generator`` 对齐。
+MAX_HISTORY_TEXT_CHARS = 8000
+
+
+def _clamp_history_text(text: str, label: str) -> str:
+    """截断时**声明**截断，而不是静默丢弃。
+
+    静默切片和"原文就这么多"在读者眼里没有区别：修复 agent 会把一段
+    残缺当成完整来推理，然后照着残缺去修。丢掉尾巴可以接受，丢掉
+    "尾巴被丢了"这个事实不行，所以声明里带上原长。
+    """
+    rendered = str(text or "")
+    if len(rendered) <= MAX_HISTORY_TEXT_CHARS:
+        return rendered
+    notice = (
+        f"…[{label} 已截断，原长 {len(rendered)} 字符，"
+        f"此处保留前 {MAX_HISTORY_TEXT_CHARS}]"
+    )
+    return rendered[:MAX_HISTORY_TEXT_CHARS] + notice
+
 
 def history_path(plan_dir: Path) -> Path:
     return Path(plan_dir) / HISTORY_FILENAME
@@ -266,7 +290,9 @@ def load_repair_outcomes(
             "repair_task_title": str(task.get("title") or "")[:200],
             "repair_test_command": str(task.get("test_command") or "")[:300],
             "repair_status": str(task.get("status") or ""),
-            "repair_failure_reason": str(task.get("failure_reason") or "")[:400],
+            "repair_failure_reason": _clamp_history_text(
+                str(task.get("failure_reason") or ""), "repair_failure_reason"
+            ),
             "repair_attempt": task.get("attempt"),
         }
     for outcome in outcomes.values():
@@ -311,8 +337,12 @@ def seed_from_verdicts(
             entries.append({
                 "round": None,
                 "label": f"既往失败 #{index}",
-                "actual_result": failure["reason"][:600],
-                "evidence": failure["evidence"][:400],
+                "actual_result": _clamp_history_text(
+                    failure["reason"], "actual_result"
+                ),
+                "evidence": _clamp_history_text(
+                    failure["evidence"], "evidence"
+                ),
             })
         history[vp_id] = entries
     return history
