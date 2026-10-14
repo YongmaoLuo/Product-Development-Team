@@ -688,7 +688,7 @@ def test_failed_vps_render_titles_even_when_vps_index_empty():
 # 2026-09-12: the operator-guidance block said \"stuck at
 # failed\" without explaining that round 1 had already
 # finished and recorded failed; without the diagnostic context the
-# operator could not tell whether the chain was still running.
+# card could not tell the reader whether the chain was still running.
 # ---------------------------------------------------------------------------
 
 

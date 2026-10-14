@@ -1,4 +1,4 @@
-"""2026-10-14 (operator contract): a round parked on a closed quota
+"""2026-10-14: a round parked on a closed quota
 window must not be read as a dead one, and the hard ceiling is 1 hour.
 
 Production evidence — a 2026-10-12 plan,

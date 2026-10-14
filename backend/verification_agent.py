@@ -1310,8 +1310,8 @@ class Orchestrator:
             delta = parse_delta_payload(raw, plan_data)
             summary = apply_delta(plan_data, delta, round_number)
 
-            # 新增的 VP 必须和初次生成时一样过护栏。用户 2026-09-18：
-            # "考虑到会生成新的 VP，所以每一轮跑之前都应该去跑护栏"。
+            # 新增的 VP 必须和初次生成时一样过护栏（2026-09-18 定下）：
+            # 每轮跑之前都要先过护栏，因为这一轮会生成新的 VP。
             #
             # 护栏的内容随方法收敛而变：VP 不再有 test_command，所以查的是
             # **method 的契约** —— 不支持的 method，以及 api_test 的

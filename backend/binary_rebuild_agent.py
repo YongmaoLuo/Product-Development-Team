@@ -25,7 +25,7 @@ the rebuild to a **tool-restricted LLM sub-agent** that *reads* the project
 (build manifest, venv layout, available toolchains) and picks the right
 command. That is what makes the mechanism generic across projects.
 
-Safety model (A + C, user-approved):
+Safety model (A + C, agreed before this module shipped):
   * **A — hard tool restriction.** The spawned ``claude`` CLI is invoked with
     ``--allowedTools Bash,Read,Grep,Glob`` so the agent *cannot* Edit/Write.
   * **C — prompt restriction + audit.** The system prompt explicitly forbids

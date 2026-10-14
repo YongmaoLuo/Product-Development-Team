@@ -466,9 +466,9 @@ class VerificationOrchestrator:
         # the chain on the first repeat. Real bugs (e.g. VP-006
         # needs an actual code change to remove VP-013 instrumentation;
         # VP-023 needs docker compose setup; VP-027 needs coverage work)
-        # can't be fixed in one round. The user explicitly demanded:
-        # "make the chain run — if VP fails, generate repair tasks,
-        # route to executor, keep iterating".
+        # can't be fixed in one round. The chain is meant to run: if a VP
+        # fails, generate repair tasks, route to executor, keep
+        # iterating.
         #
         # Old behaviour: same failures on two consecutive rounds →
         # return empty repair_tasks → auto-loop records

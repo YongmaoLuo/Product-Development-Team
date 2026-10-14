@@ -104,8 +104,8 @@ def _state_db() -> Path:
 # Only sweep plans whose ``current_phase`` is one of these two values.
 # Other phases either have no card content yet (interview, prd_*) or
 # are work the notifier should not amplify. See the docstring on
-# ``list_active_plan_ids`` for the user-feedback context
-# (2026-09-06: "过期卡片就不应该弹出来消息了").
+# ``list_active_plan_ids`` for the 2026-09-06 decision behind this
+# filter.
 _ACTIVE_PHASES: tuple[str, ...] = ("executing", "verification_running")
 
 # Plans not touched in this many days are skipped — they're either
@@ -228,9 +228,8 @@ def list_active_plan_ids() -> list[str]:
     prd_generation / arch_* / test_* / task_generation plans have
     not yet emitted any task or VP events, so refreshing their
     cards produces a blank progress card with no useful
-    information — exactly the kind of "spammy historical
-    notification" the user explicitly rejected ("过期卡片就不应该
-    弹出来消息了").
+    information — the spammy historical notification this filter
+    exists to prevent (2026-09-06).
 
     Additionally, plans not updated in the last
     ``STARTUP_SWEEP_MAX_AGE_DAYS`` days are skipped. This catches

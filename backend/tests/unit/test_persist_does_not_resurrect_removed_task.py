@@ -15,7 +15,7 @@ The resurrected row had ``title`` / ``description`` / ``test_command``
 all NULL — only ``status``, ``end_ts``, ``_repo_version`` and
 ``updated_at`` were set. It is inert for scheduling (the next
 ``_load_tasks`` Phase 2 sees a terminal orphan and supersedes it), but
-the operator's instruction was that a split parent is *deleted*, and it
+the contract is that a split parent is *deleted*, and it
 was — for 29 milliseconds.
 
 The two ``TaskManager`` mirrors already refused to record a task the plan

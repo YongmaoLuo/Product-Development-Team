@@ -3466,7 +3466,7 @@ class AutonomousAgent:
                         # the loop detector fires every iteration.
                         if t.id in self._dispatcher_blocked:
                             continue
-                        # Principle 3 (user audit 2026-08-19): hard-gate on
+                        # Principle 3 (2026-08-19 audit): hard-gate on
                         # depends_on. ``is_dependency_ready`` returns
                         # ``(False, reason)`` for any non-success upstream
                         # status (pending / in_progress / failed). Without
@@ -3544,7 +3544,7 @@ class AutonomousAgent:
                     #     ``record_task_failure`` path so the loop
                     #     still terminates.
                     current_status = getattr(t, "status", None)
-                    # Principle 1 (user audit 2026-08-19): the in-memory
+                    # Principle 1 (2026-08-19 audit): the in-memory
                     # ``SubTask.status`` may not be ``"completed"`` even
                     # though the session counter says the executor DID
                     # commit successfully — observed in an earlier run
