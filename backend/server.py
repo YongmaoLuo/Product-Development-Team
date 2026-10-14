@@ -337,14 +337,40 @@ VERIFICATION_WATCHDOG_STALENESS_SECONDS = float(
 # IMPORTANT — this cap must EXCEED ``VERIFICATION_WATCHDOG_STALENESS_SECONDS``,
 # otherwise the "hold" branch is dead code and the first stale trip
 # becomes an immediate kill+cleanup. That is exactly what happened on
-# first deploy: ``.env`` sets the staleness threshold to 3600s while an
-# absolute 2700s default made every trip terminal at once. The default
-# is therefore DERIVED (threshold + 30 min of patience) rather than
-# absolute; ``VERIFICATION_HARD_STALE_SECONDS`` can still override it.
+# first deploy: an operator-set threshold of 3600s in the dotenv met an
+# absolute 2700s default, and every trip became terminal at once. The
+# default is therefore DERIVED (threshold + 30 min of patience) rather
+# than absolute; ``VERIFICATION_HARD_STALE_SECONDS`` can still override it.
+#
+# 2026-10-14 (operator contract): the hard ceiling is 1 HOUR, raised
+# from the 45 min this default used to produce. Production, a
+# 2026-10-12 plan, round 1: a healthy round
+# was killed 7 min before it finished, purely because the gap in its
+# round log had not closed yet.
+#
+# The 1 h is a FLOOR on the derived figure rather than a replacement for
+# it, which is what keeps the invariant above true for every threshold
+# rather than only the default one:
+#
+#   * ``max(threshold + 1800, 3600) > threshold`` holds for EVERY
+#     threshold — if the threshold is below 3600 the 3600 floor wins and
+#     is still above it; if it is at or above 3600 the derived term wins
+#     and is above it by construction. An absolute 3600 could NOT say
+#     that: raise the threshold to 3600 or above and the hold branch
+#     dies again, which is the original bug.
+#   * A lowered threshold (short threshold, impatient operator) can no
+#     longer drag the ceiling below the hour the contract asks for.
+#
+# Note the *specific* 3600s-in-``.env`` figure quoted above is the
+# first-deploy anecdote and is not asserted about any current file: the
+# dotenv is per-deployment and untracked (``config_paths.ENV_FILE`` ->
+# ``<repo>/.env``), so what it holds is a fact about a deployment and
+# not something this comment can keep true. The invariant is the part
+# that has to hold, and it is stated in terms of the threshold.
 VERIFICATION_HARD_STALE_SECONDS = float(
     os.environ.get(
         "VERIFICATION_HARD_STALE_SECONDS",
-        str(VERIFICATION_WATCHDOG_STALENESS_SECONDS + 1800.0),
+        str(max(VERIFICATION_WATCHDOG_STALENESS_SECONDS + 1800.0, 3600.0)),
     )
 )
 
