@@ -144,6 +144,33 @@ def _nul_prefixed(text: str) -> bytes:
     return b"\0" + text.encode("utf-8")
 
 
+def _cjk_line() -> str:
+    """A source line carrying the Chinese measurement shape and a date.
+
+    The Chinese measurement verb followed by a date is the shape
+    ``MEASUREMENT_SHAPES`` matches and a latin-1 file cannot express, so it
+    is the line whose visibility the encoding changes.
+
+    Written with ``\\u`` escapes rather than literal characters, and for a
+    reason beyond tidiness: ``test_source_comments_carry_no_local_measurements``
+    walks every first-party source *including this directory*, so spelling
+    the shape out here would be this file tripping the rule it exists to
+    test -- exactly the self-reference that file's own convention of
+    assembling forbidden strings from pieces exists to avoid.
+    """
+    return "# " + "\u5b9e\u6d4b\uff082026-01-02\uff09\n"
+
+
+def _latin1_cjk_line() -> bytes:
+    """The same line in gb2312 -- a non-ASCII encoding of those characters.
+
+    gb2312 rather than latin-1 because the characters here are not
+    representable in latin-1 at all; the point is only that the bytes are
+    not valid UTF-8.
+    """
+    return _cjk_line().encode("gb2312")
+
+
 # ---------------------------------------------------------------------------
 # Harness B -- a scratch repository, for the git plumbing
 # ---------------------------------------------------------------------------
@@ -498,6 +525,66 @@ def test_an_empty_index_is_still_refused(tmp_path: Path) -> None:
 
     got = _run_gate(env)
     assert got.returncode == 2, f"expected exit 2:\n{got.stdout}\n{got.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# A staged blob that is not UTF-8
+# ---------------------------------------------------------------------------
+#
+# The staged rule set is ASCII-only today, so unlike the range scan there is
+# no live needle here to lose: what this pins is the *shape*, because
+# STAGED_RULES is a table and the next non-ASCII rule added to it would be
+# silently blind the moment a latin-1 file was staged beside it -- at the
+# one surface of the four that can still stop the commit.
+#
+# The blob body is built from an escaped literal rather than a CJK string
+# literal so this file stays pure ASCII on disk. That is not tidiness: a
+# non-UTF-8 source file in the tree would make ``commit_range_scan`` refuse
+# to read its own repository.
+
+
+def test_a_non_utf8_staged_blob_is_refused_not_reported_clean(tmp_path: Path) -> None:
+    """A blob this scan cannot decode is one it did not read.
+
+    Before: decoded with ``errors="replace"``, so every undecodable byte
+    became ``U+FFFD``, a rule whose pattern holds a non-ASCII character
+    could never match, and the run still printed ``OK ... 0 violations``.
+    """
+    env = _staged_env(tmp_path)
+    _stage_bytes(env, "backend/probe.py", _latin1_cjk_line())
+    _stage(env, "backend/innocent.py", _CLEAN_SOURCE)
+
+    got = _run_gate(env)
+    combined = got.stdout + got.stderr
+    assert got.returncode == 2, (
+        "a staged blob that is not valid UTF-8 must report 'did not run' "
+        f"(exit 2), not a clean scan (exit 0):\n{combined}"
+    )
+    assert "probe.py" in combined, f"the unreadable path must be named:\n{combined}"
+    assert "UTF-8" in combined, (
+        f"the refusal must say what is wrong with the blob:\n{combined}"
+    )
+    assert "binary content" not in combined, (
+        "the refusal borrowed the skipped-binary wording. A latin-1 text "
+        f"file is not binary, and that sentence would mislabel it:\n{combined}"
+    )
+
+
+def test_a_utf8_blob_with_the_same_text_still_passes(tmp_path: Path) -> None:
+    """The control. Only the encoding differs, and it must still be read.
+
+    Without this the refusal could pass for a gate that simply stopped
+    reading source files.
+    """
+    env = _staged_env(tmp_path)
+    _stage_bytes(env, "backend/probe.py", _cjk_line().encode("utf-8"))
+    _stage(env, "backend/innocent.py", _CLEAN_SOURCE)
+
+    got = _run_gate(env)
+    assert got.returncode == 0, (
+        f"the same text as UTF-8 was refused too:\n{got.stdout}\n{got.stderr}"
+    )
+    assert "scanned 2 staged file(s)" in got.stdout, got.stdout
 
 
 # ---------------------------------------------------------------------------
