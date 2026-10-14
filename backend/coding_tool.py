@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
+from contextlib import contextmanager
 
 from utils.process import kill_process_group
 from utils.secret_files import private_dir, redact_all, write_private_json
@@ -1036,6 +1037,118 @@ class WorkClock:
         return max(0.0, self._budget - spent)
 
 
+#: Longest a bounded side sits in one wait before it looks at its clock
+#: again. One second: short enough that a budget's deadline lands within
+#: a second of the truth even when the dispatch was asleep for part of
+#: the slice, long enough that an hours-long wait costs one wakeup a
+#: second rather than one per millisecond.
+LAYER2_SLICE_SEC: float = 1.0
+
+
+def _result_under_work_clock(future, clock) -> Any:
+    """``future.result(timeout=…)`` bounded by the clock's *work* time.
+
+    The synchronous twin of :func:`verification_subagent._await_under_work_clock`,
+    and it exists for the same reason. ``Future.result(timeout=N)`` spends
+    N on wall time, which is the wrong unit here: the dispatch on the other
+    side can park itself on a provider's closed quota window and stay there
+    for as long as that window says, and the whole wait was being charged
+    to the caller's own budget. That is what the parking in
+    :meth:`_run_claude_interactive` stops, but it only stops it for the
+    readers that ask the clock — and ``future.result`` is a number, so it
+    asked nothing. The dispatch came off the wait at 11:22, did the work,
+    and the timeout that had expired at 10:47 took the answer with it.
+
+    The number is therefore replaced by a question asked again each pass,
+    and the question is not "has this slice ended" but "has the *budget*
+    ended". The two come apart whenever the dispatch parks in the middle
+    of a slice: the slice is wall time, the budget is not, and a wait
+    that stopped halfway through the second one left most of the first
+    one unspent. Asking the budget is what makes a parked wait free
+    instead of merely slow — and asking it again is what stops the
+    opposite error, where the same fixed slice gets mistaken for the
+    deadline and kills a dispatch a tenth of a second after its window
+    reopened.
+
+    Slicing rather than one long wait is forced by the API: a blocking
+    ``Future.result`` cannot be woken on two things at once the way
+    :func:`asyncio.wait` can, so the only way to notice a resume is to
+    come back and look. A dispatch that never parks behaves exactly as
+    it did before — same budget, same deadline, same ``TimeoutError`` —
+    and pays one wakeup per second for the privilege of being able to
+    tell those two cases apart.
+
+    The wait is deliberately unbounded: a parked clock reports its
+    frozen remainder, which is never zero on entry, so the loop keeps
+    going for as long as the window stays shut. Only
+    ``FuturesTimeoutError`` is handled here. ``HardTimeoutError`` is a
+    subclass of it and must reach the caller untouched for auto-split
+    routing; it arrives from ``future.result`` already wrapped, which is
+    the same thing ``future.result(timeout=…)`` always delivered.
+    """
+    while True:
+        remaining = clock.remaining()
+        if remaining <= 0.0:
+            # Nothing left to spend. A parked clock is frozen, so a zero
+            # that arrives while parked is permanent — there is no slice
+            # left to wait on, and looping on zero would spin.
+            raise FuturesTimeoutError("work budget exhausted")
+        try:
+            return future.result(timeout=min(remaining, LAYER2_SLICE_SEC))
+        except FuturesTimeoutError:
+            left = clock.remaining()
+            if left <= 0.0:
+                # The budget, not the slice, is what ended this. That is
+                # the timeout the caller has always been told about.
+                raise
+            if future.done():
+                # Finished inside the slice and the expiry won the race
+                # for the lock. The answer is there; take it rather than
+                # reporting a timeout for work that completed.
+                return future.result()
+            # The slice ended with budget in hand. Either the dispatch is
+            # parked — and the frozen remainder means this wait is free
+            # and has no ceiling — or it resumed part-way through the
+            # slice and this slice's tail was parked. Both say the same
+            # thing: wait again on what is left.
+            continue
+
+
+@contextmanager
+def _dispatch_work_clock(tool, budget_seconds: float):
+    """The clock this dispatch's own budget is spent on.
+
+    ``_run_claude_interactive`` parks ``self._work_clock`` and nothing
+    else, so for :func:`_result_under_work_clock` to see a park there has
+    to BE a clock on the tool. One usually is: the verification sub-agent
+    hands its sub-agents a ``WorkClock`` covering the hard cap, and that
+    is the budget the wait is correctly parked against. Everything else
+    — the rebuild agent, every plain ``query(..., timeout=N)`` — arrives
+    with nothing, which is why a ``timeout=300`` dispatch could be killed
+    at 300s by a clock that had been stopped for most of it.
+
+    An absent clock is therefore adopted for the length of the call, on
+    the caller's own figure, and put back afterwards. Adoption is
+    one-way: an existing clock wins, because whoever handed it over
+    declared the budget for this dispatch and their declaration is the
+    one that should be spent.
+    """
+    existing = getattr(tool, "_work_clock", None)
+    if existing is not None:
+        yield existing
+        return
+    clock = WorkClock(budget_seconds)
+    tool._work_clock = clock
+    try:
+        yield clock
+    finally:
+        # Exactly what was there before, which is ``None``. Left set,
+        # this clock would go on answering ``is_parked`` for a dispatch
+        # that has finished — and the heartbeat sweep asks that question
+        # of every handle it holds.
+        tool._work_clock = None
+
+
 def _quota_wake_sleep(seconds: float) -> None:
     """Wait before re-probing a quota-blocked dispatch.
 
@@ -1756,14 +1869,26 @@ class ClaudeCodingTool(CodingTool):
             resume: True → --resume; False → --session-id (new session).
             idle_timeout: Seconds of stdout inactivity before killing
                 the read loop. Defaults to ``DEFAULT_IDLE_TIMEOUT``.
-            total_timeout: 2026-09-06 — wall-clock cap on the entire
-                call. Defaults to ``DEFAULT_TOTAL_TIMEOUT`` (15 min).
-                Even if the LLM is actively streaming, this watcher
-                thread forces a SIGTERM after the cap so a wedged
-                provider cannot block the verification iteration loop
-                indefinitely. The previous behaviour had no total cap,
-                so a sync-blocked ``query_json`` could keep the auto-loop
-                thread in Phase 2 forever.
+            total_timeout: **Not** a wall-clock cap on the call.
+                Defaults to ``DEFAULT_TOTAL_TIMEOUT`` (15 min). Since
+                2026-09-08 this watcher measures SILENCE, not elapsed
+                time: it SIGTERMs only after ``total_timeout`` seconds
+                with no stdout line (``silence_baseline =
+                max(last_line_time[0], started_at)``), so a call that
+                keeps emitting stdout — thinking deltas, tool events,
+                pytest progress — **never trips it**, however long it
+                runs. "Alive and printing" is not killed by design. The
+                absolute ceiling is the layer above
+                (``HARD_WALL_CLOCK_TIMEOUT_SECONDS``).
+
+                This entry previously read "Even if the LLM is actively
+                streaming, this watcher thread forces a SIGTERM after
+                the cap". That had been **false since 2026-09-08**, and
+                it misled operators into treating layer 1 as a wall-clock
+                ceiling. The authoritative history is the
+                ``2026-09-15 CORRECTION`` comment on ``_total_timer``
+                below — read that, not this summary, if the two ever
+                disagree.
             excluded_providers: Skip providers on this call (provider
                 fallback semantics, same as ``_run_claude_interactive``).
             scene: Optional per-call workflow scene override. When set,
@@ -4205,9 +4330,12 @@ class ClaudeCodingTool(CodingTool):
                 #    ``_run_claude_interactive`` closes the subprocess
                 #    stdout / SIGTERM after `timeout` seconds, unblocking
                 #    the sync ``for line in process.stdout:`` read loop.
-                # 2. ``future.result(timeout=timeout)`` → ThreadPoolExecutor
+                # 2. ``_result_under_work_clock`` → ThreadPoolExecutor
                 #    surface the result (now that the inner function
-                #    returned thanks to layer 1).
+                #    returned thanks to layer 1). 2026-10-14: this was
+                #    ``future.result(timeout=timeout)`` — a wall-clock
+                #    figure, which also charged the quota window this
+                #    dispatch may be parked on.
                 # Without layer 1, layer 2 raises FuturesTimeoutError but
                 # the inner call keeps running forever holding the GIL.
                 # Usage-registry attribution (2026-09-21): propagate the
@@ -4216,13 +4344,20 @@ class ClaudeCodingTool(CodingTool):
                 # by default, which would silently drop attribution for
                 # every call made through this timeout wrapper.
                 _ctx = contextvars.copy_context()
-                with ThreadPoolExecutor(max_workers=1) as executor:
+                with (
+                    _dispatch_work_clock(self, timeout) as _budget,
+                    ThreadPoolExecutor(max_workers=1) as executor,
+                ):
                     future = executor.submit(
                         _ctx.run, _call, excluded_providers, timeout,
                         resume_session is not None,
                     )
                     try:
-                        result = future.result(timeout=timeout)
+                        # 2026-10-14 — same clock as ``_query_json_internal``:
+                        # layer 2 spends work time, so a quota window this
+                        # dispatch is parked on cannot eat the caller's own
+                        # budget. See ``_result_under_work_clock``.
+                        result = _result_under_work_clock(future, _budget)
                     except HardTimeoutError:
                         # 2026-09-08: HardTimeoutError (subclass of
                         # TimeoutError) must propagate for auto-split
@@ -4270,11 +4405,27 @@ class ClaudeCodingTool(CodingTool):
                 if proc is not None:
                     kill_process_group(proc)
                 if self.logger:
+                    # 2026-10-14 — this message used to hard-code
+                    # ``idle={DEFAULT_IDLE_TIMEOUT}`` (1800s) in both the
+                    # text and the payload. That is a guess, not the
+                    # triggering timeout, and it names the wrong culprit:
+                    # in the rebuild incident the layer-2 budget was what
+                    # actually expired, and the log said "idle=1800"
+                    # twice. This arm is a generic ``except TimeoutError``
+                    # — it can be reached from the layer-2 budget, from
+                    # the read loop's idle timeout, or from the
+                    # total-timeout watcher's refusal path — so the text
+                    # cannot name one of them. Report the exception that
+                    # actually arrived instead, and carry the layer-2
+                    # budget separately, labelled as a budget rather than
+                    # as the cause. Mirrors ``provider_timeout_fallback_json``.
                     self.logger.warning(
                         "provider_timeout_fallback",
-                        f"[{next_retry}/{self.MAX_TIMEOUT_RETRIES}] {self.current_call_provider} timed out (idle={self.DEFAULT_IDLE_TIMEOUT}s), retrying with next provider",
+                        f"[{next_retry}/{self.MAX_TIMEOUT_RETRIES}] {self.current_call_provider} timed out, retrying with next provider",
                         data={"from_provider": self.current_call_provider, "retry": next_retry,
-                              "max_retries": self.MAX_TIMEOUT_RETRIES, "idle_sec": self.DEFAULT_IDLE_TIMEOUT,
+                              "max_retries": self.MAX_TIMEOUT_RETRIES,
+                              "timeout_error": str(exc),
+                              "layer2_budget_sec": timeout,
                               "resume_session": pinned_session_id},
                     )
                 # Hand the retry the session that just timed out. It is
@@ -4292,8 +4443,14 @@ class ClaudeCodingTool(CodingTool):
                 providers_tried.append(self.current_call_provider)
             raise TimeoutError(
                 f"All providers failed after {retry_count} timeout retries (max={self.MAX_TIMEOUT_RETRIES}). "
-                f"Idle timeout: {self.DEFAULT_IDLE_TIMEOUT}s. "
                 f"Providers attempted: {providers_tried or 'unknown'}. "
+                # 2026-10-14 — the ``Idle timeout: 1800s`` clause that used
+                # to sit here was a constant, not the cause: this arm is a
+                # generic ``except TimeoutError`` and can be reached from the
+                # layer-2 budget, the read loop's idle timeout, or the
+                # total-timeout watcher. ``exc`` on the next line is the
+                # timeout that actually arrived, so it is the only thing
+                # this message should have named.
                 f"Original error: {exc}"
             )
         except ApiError as exc:
@@ -4594,18 +4751,29 @@ class ClaudeCodingTool(CodingTool):
                 # ``_query_internal_m1``: layer 1 (total_timeout watcher
                 # inside ``_run_claude_interactive``) closes the
                 # subprocess so the read loop unblocks; layer 2
-                # (``future.result``) is the public surface that
-                # returns the now-completed inner call.
+                # (``_result_under_work_clock``) is the public surface that
+                # returns the now-completed inner call. 2026-10-14: layer 2
+                # spends the clock's *work* time, so a closed quota window
+                # this dispatch is parked on is not charged to the budget.
                 # Usage-registry attribution: propagate contextvars into
                 # the worker thread (see _query_internal_m1).
                 _ctx = contextvars.copy_context()
-                with ThreadPoolExecutor(max_workers=1) as executor:
+                with (
+                    _dispatch_work_clock(self, timeout) as _budget,
+                    ThreadPoolExecutor(max_workers=1) as executor,
+                ):
                     future = executor.submit(
                         _ctx.run, _query_json_internal, excluded_providers,
                         timeout, entry_resume,
                     )
                     try:
-                        result = future.result(timeout=timeout)
+                        # 2026-10-14 — spent on the clock's work time, not
+                        # on wall time. The wait this wraps can be parked on
+                        # a closed quota window for hours, and the park is
+                        # already honoured everywhere else; charging it here
+                        # is what threw away the dispatch that the window
+                        # eventually let through.
+                        result = _result_under_work_clock(future, _budget)
                     except HardTimeoutError:
                         # 2026-09-08: HardTimeoutError must propagate
                         # for auto-split routing. Note that
@@ -4618,7 +4786,22 @@ class ClaudeCodingTool(CodingTool):
                         # the generic arm.
                         raise
                     except FuturesTimeoutError:
-                        future.cancel()
+                        # 2026-10-14 — deliberately NO ``future.cancel()``
+                        # here (there was one; it was dead code). A
+                        # ``Future`` only cancels while PENDING; once the
+                        # worker is running it, ``cancel()`` returns False
+                        # and does nothing. By this point the future is
+                        # necessarily RUNNING — ``result(timeout)`` only
+                        # raises once it has waited out the full budget.
+                        # Calling it only suggested that a timeout could
+                        # stop the worker, which it cannot. The two lines
+                        # below are the real remedy: drop the handle and
+                        # SIGKILL the process group. Note the ordering
+                        # matters — the ``raise`` leaves this ``with
+                        # ThreadPoolExecutor`` block, whose ``__exit__``
+                        # runs ``shutdown(wait=True)``, so without the
+                        # kill the exception would not surface until the
+                        # LLM call finished on its own.
                         with self._process_lock:
                             proc = self._current_process
                             self._current_process = None
@@ -4658,11 +4841,27 @@ class ClaudeCodingTool(CodingTool):
                     with self._process_lock:
                         self._current_process = None
                 if self.logger:
+                    # 2026-10-14 — this message used to hard-code
+                    # ``idle={DEFAULT_IDLE_TIMEOUT}`` (1800s). That is a
+                    # guess, not the triggering timeout, and it named the
+                    # wrong culprit during the incident that prompted the
+                    # change: layer 2's 300s ``future.result`` budget was
+                    # what actually expired (403s / 2120s late), yet the
+                    # log twice said "idle=1800". This arm is a generic
+                    # ``except TimeoutError`` — it can be reached from the
+                    # layer-2 budget, from the read loop's idle timeout,
+                    # or from the total-timeout watcher's refusal path —
+                    # so the text cannot name one of them. Report the
+                    # exception that actually arrived instead, and carry
+                    # the layer-2 budget separately, labelled as a budget
+                    # rather than as the cause.
                     self.logger.warning(
                         "provider_timeout_fallback_json",
-                        f"[{next_retry}/{self.MAX_TIMEOUT_RETRIES}] {self.current_call_provider} timed out (idle={self.DEFAULT_IDLE_TIMEOUT}s), retrying with next provider",
+                        f"[{next_retry}/{self.MAX_TIMEOUT_RETRIES}] {self.current_call_provider} timed out, retrying with next provider",
                         data={"from_provider": self.current_call_provider, "retry": next_retry,
-                              "max_retries": self.MAX_TIMEOUT_RETRIES, "idle_sec": self.DEFAULT_IDLE_TIMEOUT,
+                              "max_retries": self.MAX_TIMEOUT_RETRIES,
+                              "timeout_error": str(exc),
+                              "layer2_budget_sec": timeout,
                               "resume_session": pinned[0]},
                     )
                 # Same contract as ``_query_internal_m1``: the retry
@@ -4680,8 +4879,13 @@ class ClaudeCodingTool(CodingTool):
                 providers_tried.append(self.current_call_provider)
             raise TimeoutError(
                 f"All providers failed after {retry_count} timeout retries (max={self.MAX_TIMEOUT_RETRIES}). "
-                f"Idle timeout: {self.DEFAULT_IDLE_TIMEOUT}s. "
                 f"Providers attempted: {providers_tried or 'unknown'}. "
+                # 2026-10-14 — the ``Idle timeout: 1800s`` clause that used
+                # to sit here was the same constant quoted in
+                # ``_query_internal_m1``, and the same lie: this arm is a
+                # generic ``except TimeoutError``, so the clause could name
+                # a timeout that never fired. ``exc`` below is the one that
+                # did.
                 f"Original error: {exc}"
             )
         except ApiError as exc:
@@ -4777,7 +4981,29 @@ class VendorCCodingTool(CodingTool):
                 # the generic TimeoutError arm can wrap it.
                 raise
             except FuturesTimeoutError:
-                future.cancel()
+                # 2026-10-14 — the ``future.cancel()`` that used to sit
+                # here was dead code, and its return value is the wrong
+                # thing to reason about: a ``Future`` only cancels while
+                # PENDING, and there it returns True, so "cancel() is
+                # always False" would be false and would be knocked over
+                # by the first counter-example someone constructs. The
+                # criterion is the state, not the return: by the time
+                # ``result(timeout)`` raises, it has waited out the whole
+                # budget, and the worker picked the work item up before
+                # it started waiting — so the future is necessarily
+                # RUNNING or FINISHED, and ``cancel()`` on either returns
+                # False and does nothing.
+                #
+                # PENDING is reachable on this path only before the
+                # submit, never after it. There is nothing to stop here:
+                # no kill follows either, only the ``raise`` — and the
+                # ``with`` block's ``__exit__`` runs
+                # ``shutdown(wait=True)``, so the timeout surfaces as
+                # soon as the worker returns regardless of what the
+                # timeout did or did not do to it. The four sites in
+                # this file (VendorCCodingTool ×2, OpenCodeCodingTool ×2)
+                # are all this same shape; the Claude sites are the
+                # argument spelled out at :4779.
                 raise TimeoutError(f"Query timed out after {timeout} seconds")
 
     def query_json(self, prompt: str, system_instruction: Optional[str] = None,
@@ -4805,7 +5031,9 @@ class VendorCCodingTool(CodingTool):
                 # 2026-09-08: re-raise before the generic arm.
                 raise
             except FuturesTimeoutError:
-                future.cancel()
+                # 2026-10-14 — dead ``future.cancel()`` removed; the future
+                # is necessarily RUNNING by this point. Criterion and the
+                # PENDING boundary are argued at the ``query`` arm above.
                 raise TimeoutError(f"Query timed out after {timeout} seconds")
 
 
@@ -4853,7 +5081,9 @@ class OpenCodeCodingTool(CodingTool):
                 # 2026-09-08: see ClaudeCodingTool.
                 raise
             except FuturesTimeoutError:
-                future.cancel()
+                # 2026-10-14 — dead ``future.cancel()`` removed; the future
+                # is necessarily RUNNING by this point. Criterion and the
+                # PENDING boundary are argued at ``VendorCCodingTool.query``.
                 raise TimeoutError(f"Query timed out after {timeout} seconds")
 
     def query_json(self, prompt: str, system_instruction: Optional[str] = None,
@@ -4887,7 +5117,9 @@ class OpenCodeCodingTool(CodingTool):
                 # 2026-09-08: re-raise before the generic arm.
                 raise
             except FuturesTimeoutError:
-                future.cancel()
+                # 2026-10-14 — dead ``future.cancel()`` removed; the future
+                # is necessarily RUNNING by this point. Criterion and the
+                # PENDING boundary are argued at ``VendorCCodingTool.query``.
                 raise TimeoutError(f"Query timed out after {timeout} seconds")
 
 

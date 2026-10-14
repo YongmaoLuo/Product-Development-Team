@@ -421,11 +421,16 @@ def provider_headroom_pct(
     """The percentage used to scale ``provider``'s concurrency cap.
 
     The live reading wins when it carries a number, because it is the
-    one that accounts for the weekly window and for a currency balance —
-    neither of which the legacy ``{provider: pct}`` file can express. The
-    legacy map is the fallback for callers that still pass it and for
-    providers the live reading does not cover, and 100 is the last
-    resort, because an unknown budget is not a zero budget.
+    one that accounts for the 5-hour burst window and for a currency
+    balance — neither of which the legacy ``{provider: pct}`` file can
+    express. What that number deliberately does *not* carry is the
+    weekly window: the week is an independent budget that decides
+    eligibility (:attr:`ProviderQuota.exhausted`, checked by
+    :func:`quota_allows_dispatch`), and scaling the cap by it as well
+    would hold a provider down twice for the same seven days. The legacy
+    map is the fallback for callers that still pass it and for providers
+    the live reading does not cover, and 100 is the last resort, because
+    an unknown budget is not a zero budget.
     """
     if quota_map is not None:
         live = quota_remaining_pct(quota_map.get(provider))
