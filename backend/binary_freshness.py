@@ -37,11 +37,14 @@ Design constraints
 * **No new config knobs.** Rebuild commands are inferred from
   ``pyproject.toml`` (maturin) / ``Cargo.toml`` ([lib] section) /
   ``.py`` (compileall). Operators don't configure anything.
-* **Cache-friendly.** The per-VP check is wrapped by a per-round
-  cache so two VPs in the same round with the same
-  ``(binary_path, binary_mtime, source_mtime)`` tuple skip the second
-  mtime syscalls (mtime is monotonic-ish; the tuple is enough to
-  detect "nothing changed").
+* **Cache-friendly.** Each per-VP check is *recorded* in a per-round
+  :class:`FreshnessCache` (``put`` only). Recording is free, but it
+  is not a memo: nothing reads it back, so a second VP in the same
+  round re-runs the whole check and pays the mtime syscalls again.
+  The reason a read path cannot be added is spelled out above
+  :meth:`FreshnessCache.put` — the natural key
+  ``(kind, binary_path, binary_mtime, source_mtime)`` can only be
+  computed by doing the work it would skip.
 
 Out of scope
 -------------
@@ -166,11 +169,26 @@ class FreshnessReport:
 
 
 class FreshnessCache:
-    """Per-verification-round memoisation for the freshness check.
+    """Per-verification-round record of freshness reports.
 
-    Cache key: ``(kind, binary_path, binary_mtime, source_mtime)``.
-    A second call with the same tuple returns the cached
-    :class:`FreshnessReport` without re-stat'ing.
+    What this actually does: ``check_binary_freshness`` calls
+    :meth:`put` on every check, and nothing ever calls back. It is
+    write-only. There is no read path, so it saves no syscalls and no
+    time — every check re-runs the full mtime sweep.
+
+    It used to also expose a ``get()`` whose docstring claimed "a
+    second call with the same tuple returns the cached report without
+    re-stat'ing". That was never true: the key is
+    ``(kind, binary_path, binary_mtime, source_mtime)``, and every one
+    of those four values is *itself produced by* the stat sweep the
+    key was supposed to avoid, so ``get()`` had no caller and no
+    possible saving. It was removed on 2026-10-14; see the comment
+    above :meth:`put`.
+
+    The remaining writes are cheap (one dict insert per check) and
+    ``_store`` is small, so keeping them is harmless — but nothing
+    should read them as a memo. If you want duplicate work collapsed,
+    do it at the level where the key is cheap to compute.
 
     Lifetime, stated as of 2026-10-14 because it was previously
     mis-stated: the instance is created once in
@@ -181,21 +199,35 @@ class FreshnessCache:
     ``clear()`` had no caller in the codebase at all, so last round's
     stale verdict could be carried into the next one.
 
-    This memoises the CHECK only. It has nothing to say about the
-    rebuild that may follow, and it cannot: a rebuild that fails leaves
-    the binary's mtime untouched, so the key is unchanged and N
-    verification points all receive the same cached "stale" verdict.
-    Collapsing that fan-out is the job of
+    Note that two verification points in a round judging the same
+    binary stale do so because the check is deterministic, not because
+    this cache told them so. Collapsing that fan-out — and the
+    duplicate rebuilds it causes — is the job of
     ``verification_agent._BinaryRebuildCoordinator``.
     """
 
     def __init__(self) -> None:
         self._store: Dict[Tuple[str, str, float, float], FreshnessReport] = {}
 
-    def get(
-        self, kind: str, binary_path: str, binary_mtime: float, source_mtime: float,
-    ) -> Optional[FreshnessReport]:
-        return self._store.get((kind, binary_path, binary_mtime, source_mtime))
+    # There is deliberately NO ``get()``. It was removed on 2026-10-14.
+    #
+    # It had no caller anywhere in the codebase: ``check_binary_freshness``
+    # only ever called ``put``. Worse, the key it was declared to take —
+    # ``(kind, binary_path, binary_mtime, source_mtime)`` — cannot be built
+    # without running the very work the cache was supposed to skip:
+    # ``kind`` needs ``detect_project_kind`` (rglob Cargo.toml + *.rs),
+    # ``binary_mtime``/``binary_path`` need the target/ and site-packages
+    # glob plus a stat of every candidate artefact, and ``source_mtime``
+    # needs a stat of every ``.rs`` file. Measured on a 200-file crate,
+    # building the key costs 234/234 of the check's ``Path.stat`` calls,
+    # 5/5 rglobs and 4/4 globs — a hit would have saved three float
+    # comparisons. So wiring ``get()`` up would have been a net loss.
+    #
+    # Don't add it back without first changing the key to something
+    # computable *without* the stat sweep (e.g. a cheap
+    # ``(project_dir, kind, round_number)``), and note that the check's
+    # real cost — collapsing duplicate rebuilds — is already owned by
+    # ``verification_agent._BinaryRebuildCoordinator``.
 
     def put(self, report: FreshnessReport) -> None:
         if (
@@ -503,9 +535,11 @@ def check_binary_freshness(
 ) -> FreshnessReport:
     """One-shot freshness check, dispatching by project kind.
 
-    ``cache`` (optional) lets the caller memoize results within one
-    verification round so two VPs that hit the same project state
-    don't pay for two mtime syscalls.
+    ``cache`` (optional) is *recorded into* — ``put`` only. It does
+    not short-circuit this function: every call performs the full
+    check, mtime syscalls included, whether or not a cache is passed.
+    Passing one only builds a per-round record; see
+    :class:`FreshnessCache`.
 
     Always returns a :class:`FreshnessReport`. Never raises — IO
     errors are converted to ``status="SKIPPED"`` with the error
