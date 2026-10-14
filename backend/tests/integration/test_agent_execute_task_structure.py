@@ -97,10 +97,13 @@ TARGET_FILE = _BACKEND_TESTS_INTEGRATION_DIR / "test_agent_execute_task.py"
 EXPECTED_TEST_NAMES: Set[str] = {
     "test_execute_single_task_passes_settings_to_coding_tool",
     "test_execute_single_task_settings_file_exists",
-    # 2026-09-14: renamed in the target file (has_7_env_fields →
-    # has_endpoint_and_credentials) when env-field pinning moved to
-    # CC Switch (model management left this repository entirely, commit 9717073).
-    "test_execute_single_task_settings_has_endpoint_and_credentials",
+    # Renamed in the target file from
+    # `..._has_endpoint_and_credentials` to `..._carries_no_provider_config`
+    # when the pre-selection settings file stopped carrying provider
+    # config: the endpoint and credentials belong to the file the
+    # dispatch writes AFTER routing has picked a provider, so asserting
+    # them on the template asserted the defect.
+    "test_execute_single_task_settings_carries_no_provider_config",
     "test_execute_single_task_passes_hook_stdin",
     "test_execute_single_task_completes_on_test_pass",
     "test_execute_single_task_writes_tmpfile_unique_per_task",

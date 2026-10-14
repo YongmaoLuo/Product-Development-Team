@@ -12,15 +12,12 @@ share one well-typed handle:
    shape the executor's :func:`from_dict` / :meth:`to_dict`
    round-trip contract depends on.
 
-2. **Dependency-injection handle** — the four orthogonal
+2. **Dependency-injection handle** — the three orthogonal
    collaborators the FastAPI lifespan constructs and exposes on
    ``app.state.runtime_state``:
 
      * :attr:`config` — the parsed ``backend/config.yaml`` dict
        (server-wide config consumed by providers and the executor).
-     * :attr:`provider_order_file` — absolute :class:`pathlib.Path`
-       to ``provider-order.json``, resolved through
-       :func:`config_paths.resolve_provider_order_file`.
      * :attr:`in_flight_guard` — :class:`scheduling.guard.InFlightFileGuard`
        instance owned by the lifespan.
      * :attr:`dynamic_tracker` — :class:`dynamic_provider_concurrency.ActiveConcurrencyTracker`
@@ -59,7 +56,6 @@ Public surface
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 __all__ = ["RuntimeState", "RUNTIME_STATE_VERSION"]
@@ -97,13 +93,6 @@ class RuntimeState:
             during startup so request handlers can read it from
             ``app.state.runtime_state.config`` without re-importing
             the loader.
-        provider_order_file: Absolute :class:`pathlib.Path` to
-            ``provider-order.json``, resolved through
-            :func:`config_paths.resolve_provider_order_file`.
-            Defaults to ``None``; the lifespan populates it so
-            ``agent.AutonomousAgent`` can pick up the resolved
-            path without going through the module-level
-            ``server.PROVIDER_ORDER_FILE`` singleton.
         in_flight_guard: :class:`scheduling.guard.InFlightFileGuard`
             instance owned by the FastAPI lifespan. Downstream
             collaborators reach the guard through
@@ -118,7 +107,7 @@ class RuntimeState:
 
     Construction defaults to an empty ``pending_vps`` list (matching
     the executor's fallback when the JSON column lacks the key) and
-    an empty ``extra`` dict. The four DI fields default to ``None``
+    an empty ``extra`` dict. The three DI fields default to ``None``
     so test fixtures can build a ``RuntimeState()`` without the
     FastAPI lifespan running first.
     """
@@ -127,7 +116,6 @@ class RuntimeState:
     extra: Dict[str, Any] = field(default_factory=dict)
     # Dependency-injection fields — populated by the FastAPI lifespan.
     config: Optional[Dict[str, Any]] = None
-    provider_order_file: Optional[Path] = None
     in_flight_guard: Optional[Any] = None
     dynamic_tracker: Optional[Any] = None
 
@@ -164,8 +152,8 @@ class RuntimeState:
           * Unknown keys → preserved in ``extra`` for forward
             compatibility (the next :meth:`to_dict` writes them
             back verbatim).
-          * DI fields (``config`` / ``provider_order_file`` /
-            ``in_flight_guard`` / ``dynamic_tracker``) are NOT
+          * DI fields (``config`` / ``in_flight_guard`` /
+            ``dynamic_tracker``) are NOT
             round-tripped through ``to_dict`` / :func:`from_dict` —
             they live on the FastAPI lifespan's in-memory handle,
             not in the persisted JSON column, so they default to

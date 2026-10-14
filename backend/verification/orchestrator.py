@@ -52,17 +52,20 @@ class VerificationOrchestrator:
         plan_dir: Path,
         project_dir: Path,
         coding_tool: Optional[CodingTool] = None,
-        max_parallel: int = 1,
         verif_repo: Optional[Any] = None,
     ):
         self.plan_dir = Path(plan_dir)
         self.project_dir = Path(project_dir)
         self.plan_state = PlanState(self.plan_dir)
         self.coding_tool = coding_tool or ClaudeCodingTool()
-        self.max_parallel = max_parallel
+        # No ``max_parallel``. The round has no width to pass: the
+        # provider slot pool decides how many verification points run at
+        # once, per dispatch, so every orchestrator — including the fresh
+        # one the post-repair callback builds in ``verification_loop`` —
+        # runs the same way by construction rather than by remembering
+        # what to pass.
         self.verification_agent = VerificationAgent(
             self.plan_dir, self.project_dir, self.coding_tool,
-            max_parallel=max_parallel,
             verif_repo=verif_repo,
         )
         self.repair_generator = RepairTaskGenerator(
@@ -774,6 +777,40 @@ class VerificationOrchestrator:
             seq_base=seq_base,
         ).assemble(repair_contents)
         self._current_repair_tasks = repair_tasks
+
+        # 2026-10-11 (W5): retire earlier rounds' duplicate repair rows
+        # for the VPs this round just re-queued. Without this, the
+        # executor's queue (``_get_pending_repair_tasks``) carries both
+        # the stale row and its replacement and runs the same fix twice.
+        # Best-effort and non-fatal — the round must proceed even if the
+        # bookkeeping fails; a missed supersede costs one duplicated
+        # repair, whereas a raised exception here would cost the whole
+        # round. Deferred import: ``verification_loop`` reaches this
+        # module through ``server``, so importing it at module scope
+        # here would be circular.
+        if repair_tasks:
+            try:
+                from verification_loop import (
+                    _supersede_prior_round_repairs,
+                )
+                _retired = _supersede_prior_round_repairs(
+                    self.plan_dir.name,
+                    round_number,
+                    [rt.get("failed_vp_id") for rt in repair_tasks],
+                )
+                if _retired:
+                    print(
+                        f"[Repair] round {round_number}: retired "
+                        f"{len(_retired)} pending repair task(s) from "
+                        f"earlier rounds as superseded: "
+                        f"{', '.join(sorted(_retired))}"
+                    )
+            except Exception as supersede_exc:  # noqa: BLE001
+                print(
+                    f"[Repair] round {round_number}: supersede check "
+                    f"skipped ({supersede_exc})"
+                )
+
         # 2026-09-08: single-writer refactor (mirrors the refiner
         # cleanup in agent.py). Previously the auto-loop wrote a
         # ``verification_tasks_round_N.json`` snapshot and the executor

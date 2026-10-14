@@ -136,7 +136,23 @@ def agent_factory(tmp_path):
             coding_tool=None,
             verif_repo=repo,
         )
-        agent.timeout_policy.parallelism_cap = cap
+        # NOTE: this used to write ``timeout_policy.parallelism_cap``.
+        # That attribute no longer exists, and assigning it created a new
+        # one that nothing read -- a test fixture that looks like it is
+        # configuring the subject while configuring nothing. ``cap`` is
+        # still taken because the plan-wide-bound tests below describe
+        # scenarios in terms of a per-group figure; the group is bounded by
+        # the resolver instead, which each of those tests now pins.
+        # These tests are about the *declared* bounds, so the provider
+        # pool is pinned out of the picture rather than left to whatever
+        # CC Switch database happens to be on the machine: a width read
+        # from live providers would make every number below a statement
+        # about the developer's laptop. ``None`` is the honest answer for
+        # "no bound derivable", which is exactly the branch the declared
+        # ceiling and ``parallelism_cap`` are the fallbacks for. The
+        # derived path has its own tests, in
+        # ``test_verification_provider_derived_cap.py``.
+        agent.vp_capacity_resolver = lambda: None
         # ``_execute_group`` brackets its run with persistence events.
         agent.persistence.start_round(1)
         return agent
@@ -213,18 +229,60 @@ def test_an_unconfigured_installation_has_no_plan_bound(agent_factory):
 # ---------------------------------------------------------------------------
 
 
-def test_the_per_group_throttle_still_applies(agent_factory):
-    """cap 2 → a single 6-VP group still runs 2 at a time.
+def test_the_per_group_bound_comes_from_the_resolver_not_a_typed_number(
+    agent_factory,
+):
+    """cap 2 -> a single 6-VP group still runs 2 at a time.
 
-    This is the contract `test_orchestrator_respects_parallelism_cap_2`
-    pins, restated here so a future change to the plan-wide bound cannot
-    quietly absorb it.
+    Previously this drove the group with ``timeout_policy.parallelism_cap
+    = 2``. That attribute is gone, so the test as written could not pin
+    anything: writing the field onto the policy created a new attribute
+    that no production code read, which is the quietest possible way for a
+    contract test to stop being a contract test.
+
+    The claim underneath it -- *the group is bounded, and the bound is not
+    a constant somebody typed* -- is intact on this path, because
+    ``_execute_group`` builds its gate from ``vp_capacity_resolver`` via
+    :func:`_plan_wide_bound`. So the same number (2) is now supplied by
+    the resolver instead of the config object, and the same peak (2) is
+    asserted.
+
+    This is the legacy path, not the live round: ``run_full_verification``
+    builds no gate at all. It survives because
+    ``execute_verification_plan_async`` and ``execute_phase2_parallel``
+    still call ``_execute_group``, and removing that path is not this
+    change's business.
     """
     agent = agent_factory(2)
+    agent.vp_capacity_resolver = lambda: 2
 
     asyncio.run(agent._execute_group("code_review", _vps("A", 6)))
 
     assert agent._peak == 2
+
+
+def test_the_declared_cap_cannot_bound_a_group_anymore(agent_factory):
+    """The inverse, and the reason the test above had to change.
+
+    ``agent_factory`` pins the resolver to ``None`` and the fallback below
+    it is the declared plan ceiling. Under the old model a group could be
+    held to ``parallelism_cap`` even when the resolver said nothing;
+    under this one the only numbers that reach a group are the resolver's
+    own reading and the declared ceiling behind it. Nothing reads
+    ``parallelism_cap`` any more, so writing it onto the policy changes
+    nothing at all -- which is what this asserts, rather than leaving it to
+    be discovered by the test above quietly pinning a different field.
+    """
+    agent = agent_factory(2)
+    agent.timeout_policy.parallelism_cap = 2
+    agent.vp_capacity_resolver = lambda: 2
+
+    asyncio.run(agent._execute_group("code_review", _vps("A", 6)))
+
+    assert agent._peak == 2, (
+        "the group moved when a field nothing reads was written onto the "
+        "policy: the legacy path is reading the resolver, not the config"
+    )
 
 
 def test_a_lone_group_directly_driven_gets_the_configured_bound(

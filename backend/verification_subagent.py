@@ -43,8 +43,72 @@ from typing import Any, Dict, List, Optional, Tuple
 # the inner adaptive timer SIGKILLs a silent subprocess. The
 # subagent must re-raise (NOT swallow into a FAILED verdict) so
 # the verification_agent layer can route to _split_vp_on_timeout.
-from coding_tool import HardTimeoutError
+#
+# ProviderSlotWaitExpired is raised by the same module when a
+# saturated provider pool was queued for longer than the slot wait.
+# It is a signal, not a verdict, for the same reason: nothing was
+# dispatched, nothing failed, and the two generic ``except Exception``
+# arms below would each turn it into a FAILED verdict / a retry. The
+# verification layer above turns it into a re-queue instead.
+from coding_tool import (
+    HardTimeoutError,
+    ProviderSlotWaitExpired,
+    WorkClock,
+)
 from utils.secret_files import private_dir, write_private_json
+
+
+async def _await_under_work_clock(awaitable: Any, clock: WorkClock) -> Any:
+    """Await ``awaitable``, bounded by the clock's *work* time only.
+
+    :func:`asyncio.wait_for` takes one number and spends it on wall
+    time, which is the wrong unit here: the thing being bounded can
+    park itself for as long as a provider's quota window says, and that
+    parked stretch is not work and must not be charged to the budget
+    that bounds the work. So the deadline is re-read every pass rather
+    than set once, and a timer alone is not enough to notice the budget
+    growing again — the caller is asleep until either the work finishes
+    or the budget runs out, so the clock is given a way back in to say
+    "the work started, the budget is running again". Without that the
+    loop would sit on a timer computed before the park and would not
+    return until the work had been over for a while.
+
+    The timeout is raised as :class:`asyncio.TimeoutError`, which is
+    what the caller already handles, so "the outer cap fired" arrives
+    through the same arm it always did. As before, the underlying worker
+    thread is abandoned rather than killed: cancelling the wrapper does
+    not reach into a thread that is already running.
+    """
+    task = asyncio.ensure_future(awaitable)
+    resumed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _signal() -> None:
+        # Raised on the worker thread, so it has to be handed to the
+        # loop's own thread rather than set directly.
+        loop.call_soon_threadsafe(resumed.set)
+
+    clock.bind_resume(_signal)
+    try:
+        while True:
+            remaining = clock.remaining()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            resumed.clear()
+            waiter = asyncio.ensure_future(resumed.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    {task, waiter},
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                waiter.cancel()
+            if task in done:
+                return task.result()
+    finally:
+        clock.bind_resume(None)
+        task.cancel()
 
 
 # The verification methods a plan may use as of 2026-09-18.
@@ -838,6 +902,16 @@ class VerificationSubAgent:
                 # Propagate to the outer handler in run() so the
                 # structured BLOCKED verdict is constructed there.
                 raise
+            except ProviderSlotWaitExpired:
+                # Not a malfunction of this attempt — the provider pool was
+                # saturated past the slot wait and the dispatch gave its
+                # wait back. Spending a retry on it would report a verdict
+                # the verifier never reached for, and burning the retry
+                # budget on it would leave nothing for a genuine
+                # malfunction. Let it reach run(), which lets it reach the
+                # verification layer, which re-queues the verification
+                # point instead of failing it.
+                raise
             except VerdictParseError as e:
                 # L2 (json-parse retry): the sub-agent's response
                 # could not be parsed as the Verdict JSON contract.
@@ -1109,7 +1183,25 @@ class VerificationSubAgent:
                 #     We pass ``timeout=None`` so that default applies;
                 #     a legacy plan's per-VP ``timeout_seconds: 120``
                 #     (VP-023) can no longer shrink either layer.
-                outer_timeout = self.HARD_WALL_CLOCK_CAP_SECONDS
+                #
+                # The outer cap measures *work*. A dispatch parked on a
+                # provider's closed quota window is not working, and
+                # charging its wait to this budget was wrong twice over:
+                # the wait ran long enough to blow the cap on its own,
+                # and when it did the answer was not a statement about
+                # what happened but a second, tool-less call asked to
+                # infer it from the logs. So the cap is a
+                # :class:`coding_tool.WorkClock` the coding tool parks
+                # while it waits, and the budget below asks it how much
+                # work time is left rather than assuming wall time.
+                work_clock = WorkClock(self.HARD_WALL_CLOCK_CAP_SECONDS)
+                try:
+                    scoped_tool._work_clock = work_clock
+                except Exception:
+                    # A stand-in tool that does not accept the attribute
+                    # simply does not get a budget, which is the
+                    # behaviour it had before there was one to hand out.
+                    pass
                 # 2026-09-14 (user insight — "对于一个活着的pytest，即使它
                 # 的执行时长很长…它其实也会有一些stdout，比如说它的进度
                 # 条"): a healthy long-running tool call streams stdout
@@ -1136,19 +1228,27 @@ class VerificationSubAgent:
                     # the watchdog's second-chance checks still cover it.
                     _pump_thread = None
                 try:
-                    response_dict = await asyncio.wait_for(
+                    response_dict = await _await_under_work_clock(
                         asyncio.to_thread(
                             scoped_tool.query_json,
                             prompt=prompt,
                             system_instruction=self.template,
                             timeout=None,
                         ),
-                        timeout=outer_timeout,
+                        work_clock,
                     )
                 finally:
                     _pump_stop.set()
             except BlockedPathError:
                 # Let the security-net signal bubble up to run().
+                raise
+            except ProviderSlotWaitExpired:
+                # The slot wait ran out before a provider slot was free. The
+                # ``except Exception`` arm below would record this as a
+                # transport error, self-heal on it, and — if the budget ran
+                # out — synthesise a FAILED verdict for a verification point
+                # that never got to be dispatched. Re-raise so it reaches
+                # the re-queue above.
                 raise
             except HardTimeoutError as hte:
                 # 2026-09-08: the inner coding_tool SIGKILL fired
@@ -1164,12 +1264,11 @@ class VerificationSubAgent:
                 )
                 raise
             except asyncio.TimeoutError:
-                # 2026-09-08: the OUTER asyncio.wait_for fired
-                # — the flat 1-hour cap elapsed without a verdict.
-                # Route to the **stuck-agent
-                # summarizer** (a fresh LLM call with no tools that
-                # reads /tmp/vp_<id>_progress.log and returns
-                # verdict JSON) instead of bouncing up to the
+                # 2026-09-08: the OUTER cap fired — the flat 1-hour
+                # budget elapsed without a verdict. Route to the
+                # **stuck-agent summarizer** (a fresh LLM call with no
+                # tools that reads /tmp/vp_<id>_progress.log and
+                # returns verdict JSON) instead of bouncing up to the
                 # generic HardTimeoutError → split path. Splitting a
                 # test_command that's already COMPLETE in its log
                 # file is wasteful; summarization reads the existing
@@ -1181,16 +1280,21 @@ class VerificationSubAgent:
                 # sub-agent to use. Empty string means pytest never
                 # ran — summarizer degrades to FAILED with that note.
                 output_file = f"/tmp/vp_{vp_id_log}_progress.log"
+                # The budget is the work this call was allowed, not the
+                # wall time it happened to span: a call that sat on a
+                # closed quota window for a week still only ever gets an
+                # hour of work, and that is the number this reports.
+                outer_cap = float(self.HARD_WALL_CLOCK_CAP_SECONDS)
                 self.logger.warning(
-                    "[STUCK SUB-AGENT] vp_id=%s outer_cap=%ds "
+                    "[STUCK SUB-AGENT] vp_id=%s outer_cap=%.0fs "
                     "(HARD_WALL_CLOCK_CAP_SECONDS=%d) "
                     "— routing to summarizer (will Read %s)",
-                    vp_id_log, outer_timeout,
+                    vp_id_log, outer_cap,
                     self.HARD_WALL_CLOCK_CAP_SECONDS, output_file,
                 )
                 raise StuckAgentError(
-                    elapsed=float(outer_timeout),
-                    threshold=float(outer_timeout),
+                    elapsed=outer_cap,
+                    threshold=outer_cap,
                     vp_id=vp_id_log,
                     output_file=output_file,
                 )

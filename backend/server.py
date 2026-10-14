@@ -111,7 +111,6 @@ from config_paths import (
     ENV_FILE,
     STATE_DB,
     STATE_DB_ENV,
-    resolve_provider_order_file,
     resolve_server_host,
     resolve_state_db_path,
 )
@@ -256,9 +255,9 @@ def _is_renderable_plan_id(plan_id: object) -> bool:
         return False
 
 # Project root, resolved once at import time. Used to anchor paths
-# declared in backend/config.yaml as project-relative (e.g. the
-# ``provider_order_file`` field) without depending on the current
-# working directory the server happens to launch from.
+# declared in backend/config.yaml as project-relative without
+# depending on the current working directory the server happens to
+# launch from.
 _PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 #: ``backend/`` itself — the directory this application's code lives in.
 #: Defined here, and only here: a module extracted out of this file cannot
@@ -571,18 +570,12 @@ def invalidate_files_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
-# provider_order_file resolution
+# Backend ancillary config
 # ---------------------------------------------------------------------------
 #
-# An external provider-order producer writes a contract file that the
-# backend reads when starting a sub-agent to determine the fallback
-# chain. The path is declared in ``backend/config.yaml`` under
-# ``provider_order_file`` and may be overridden at runtime by setting
-# ``PROVIDER_ORDER_FILE``. With neither set the chain is simply empty —
-# nothing has to exist for the server to run.
-#
-# The precedence lives in :func:`config_paths.resolve_provider_order_file`;
-# this module only takes the import-time snapshot below.
+# The provider chain is not configured from here. It is asked of CC
+# Switch at startup by :func:`load_providers`, which is where the
+# inherit-mode check below also lives.
 
 
 def _load_backend_config_yaml() -> dict:
@@ -603,25 +596,6 @@ def _load_backend_config_yaml() -> dict:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
-
-
-def _resolve_provider_order_file() -> Path:
-    """Return the absolute path to ``provider-order.json``.
-
-    Delegates to :func:`config_paths.resolve_provider_order_file`, which
-    owns the precedence: ``PROVIDER_ORDER_FILE`` → ``provider_order_file``
-    in ``backend/config.yaml`` → ``<config dir>/provider-order.json``.
-
-    This module used to carry a second, hand-copied resolution of that
-    same precedence. The copies drifted, and the one here named a
-    directory the repository does not ship — so a default that no clone
-    could satisfy. Kept as a named function because the suite and the
-    lifespan both refer to it; the logic is not duplicated any more.
-    """
-    return resolve_provider_order_file()
-
-
-PROVIDER_ORDER_FILE: Path = _resolve_provider_order_file()
 
 
 # Provider startup: drive both the chain and per-provider config from the
@@ -653,6 +627,16 @@ DEFAULT_MAX_VERIFICATION_ROUNDS = 4
 
 def _resolve_max_parallel(coding_tool) -> int:
     """Return the VP concurrency cap based on the plan's primary provider.
+
+    DEPRECATED — no production caller remains. The verification round has
+    no width to resolve: how many verification points run at once is
+    decided per dispatch by the provider slot pool
+    (``acquire_provider_with_dynamic_capacity``), which sums what every
+    provider in the scene's own chain can serve right now rather than
+    what the *first* provider's static cap says. Kept, with its tests,
+    because it still answers a true question ("what does the primary
+    provider declare?") and deleting it would be a wider change than
+    retiring it from the width decision.
 
     Resolution order:
       1. ``coding_tool.provider_priority[0]`` — the first provider in
@@ -690,20 +674,19 @@ STARTUP_PROVIDERS: List[ProviderConfig] = []
 def load_providers() -> List[ProviderConfig]:
     """Initialise the provider chain at startup via the consumer layer.
 
-    The chain comes from the optimizer contract file via
-    :func:`provider_order.load_fallback_order`. Each entry in the chain
-    is a CC Switch **display name** (post-5561e2c contract — the
-    upstream ``provider-order.json`` carries display names verbatim),
-    so resolution goes through
-    :func:`cc_switch.get_provider`. The
-    resolved configs are stored in :data:`STARTUP_PROVIDERS` for
-    inspection.
+    The chain is asked of CC Switch via
+    :func:`provider_order.load_fallback_order`, so every entry already
+    is a CC Switch **display name** and resolution goes through
+    :func:`cc_switch.get_provider`. The resolved configs are stored in
+    :data:`STARTUP_PROVIDERS` for inspection.
 
     Boundary conditions:
 
-    * **Optimizer file missing/invalid** — propagates
-      :class:`provider_order.ProviderOrderError`. Startup MUST fail
-      explicitly; there is no silent YAML ``provider_priority`` fallback.
+    * **Chain unresolvable** — propagates
+      :class:`provider_order.ProviderOrderError`, raised when CC Switch
+      cannot be asked for its provider list over HTTP. Startup MUST
+      fail explicitly; there is no silent YAML ``provider_priority``
+      fallback and no second source to answer instead.
     * **DB unreadable** — propagates
       :class:`cc_switch.CCSwitchError`. Startup
       MUST fail explicitly rather than silently degrading to an empty
@@ -711,7 +694,7 @@ def load_providers() -> List[ProviderConfig]:
     * **Empty chain** — logs a warning and returns ``[]`` so the rest of
       the process can still come up (explicit degradation).
     * **Unknown display name in DB** — the entry is skipped and a
-      warning is logged, so an optimiser/DB drift no longer crashes
+      warning is logged, so a chain/DB drift no longer crashes
       startup.
 
     Returns:
@@ -719,8 +702,8 @@ def load_providers() -> List[ProviderConfig]:
         in chain order.
 
     Raises:
-        ProviderOrderError: when the optimizer contract file is missing
-            or fails schema validation.
+        ProviderOrderError: when CC Switch could not be asked for its
+            provider list over HTTP.
         CCSwitchError: when the CC Switch database is missing or
             unreadable.
     """
@@ -746,27 +729,13 @@ def load_providers() -> List[ProviderConfig]:
     try:
         chain = load_fallback_order()
     except ProviderOrderError:
-        # A fresh checkout has no optimizer, so the contract file is
-        # simply absent — that is a supported state, not a
-        # misconfiguration. A file that EXISTS but fails to load (bad
-        # schema, unreadable, wrong shape) is a real problem and must
-        # still stop startup, so the two are separated here rather
-        # than both being swallowed.
-        contract = resolve_provider_order_file()
-        if contract.exists():
-            raise
-        logger.warning(
-            "No provider-order contract file at %s — starting with no "
-            "provider fallback chain (single-provider mode). Point "
-            "PROVIDER_ORDER_FILE, or backend/config.yaml:"
-            "provider_order_file, at a producer to enable failover.",
-            contract,
-        )
-        STARTUP_PROVIDERS = []
-        return STARTUP_PROVIDERS
+        # Already names the endpoint that was asked and the evidence
+        # behind the failure. Re-wrapping would bury that under a
+        # second message naming a step that no longer exists.
+        raise
     except Exception as exc:
         raise ProviderOrderError(
-            f"failed to load provider fallback order: {exc}"
+            f"failed to resolve the provider chain from CC Switch: {exc}"
         ) from exc
 
     if not chain:
@@ -930,20 +899,18 @@ async def _lifespan(app):
     execution subprocesses.
     """
     # 2026-09-06: TC-006 dependency-injection refactor — the lifespan
-    # is the canonical constructor for ``RuntimeState``. The four
-    # orthogonal collaborators (``config``, ``provider_order_file``,
-    # ``in_flight_guard``, ``dynamic_tracker``) are owned here and
+    # is the canonical constructor for ``RuntimeState``. The three
+    # orthogonal collaborators (``config``, ``in_flight_guard``,
+    # ``dynamic_tracker``) are owned here and
     # injected onto ``app.state.runtime_state`` so request handlers
     # can read / mutate the handle without re-importing the loader
     # modules or threading through global singletons. A previous
     # revision exposed a module-level ``RUNTIME_STATE`` singleton;
     # that singleton was removed by the refactor — the only handle
     # on the live state is now ``app.state.runtime_state``.
-    resolved_provider_order_file = resolve_provider_order_file()
     backend_config = _load_backend_config_yaml()
     runtime_state = RuntimeState(
         config=backend_config,
-        provider_order_file=resolved_provider_order_file,
         in_flight_guard=InFlightFileGuard(),
         dynamic_tracker=ActiveConcurrencyTracker(),
     )
@@ -1464,7 +1431,23 @@ class StartVerificationRequest(BaseModel):
     auto_fix: Optional[bool] = True
     tool: Optional[str] = None
     force: Optional[bool] = False  # If True, re-run verification even if report exists
-    max_parallel: Optional[int] = 1  # VP-level concurrency (1=serial, 0=unlimited)
+    #: DEPRECATED — accepted, ignored, and on its way out.
+    #:
+    #: This field used to set how many verification points a round ran
+    #: at once. It no longer does: nothing does. The verification round
+    #: has no framework-level width, and how many verification points
+    #: run together is decided per dispatch by the provider slot pool
+    #: (``acquire_provider_with_dynamic_capacity``), so there is nothing
+    #: left for a request body to pin. A body that still sends it keeps
+    #: being accepted rather than 422-ing, because a stored curl/script
+    #: from before the change should not break a running plan — but the
+    #: value is not read.
+    #:
+    #: No producer existed in this repo even when it *was* read (no
+    #: frontend, script, or test sends it), so dropping it is a
+    #: compatibility question about operators outside the repo, not
+    #: about callers inside it.
+    max_parallel: Optional[int] = 1
 
 
 class TaskDeltaRequest(BaseModel):
@@ -2230,11 +2213,10 @@ def _install_signal_handlers() -> None:
 
     Why "once per process" is load-bearing: ``server.py`` can be
     executed more than once inside a single process. ``python -m
-    backend.server`` runs the body as ``__main__``, and
-    ``provider_order._default_order_file()`` used to do a lazy ``from
-    server import PROVIDER_ORDER_FILE`` *during lifespan startup* — a
-    second, independent execution of the body under the name
-    ``server``.
+    backend.server`` runs the body as ``__main__``, and the provider
+    chain reader used to do a lazy ``from server import
+    PROVIDER_ORDER_FILE`` *during lifespan startup* — a second,
+    independent execution of the body under the name ``server``.
 
     That second execution can land *after* ``uvicorn.run()`` has
     installed ``Server.handle_exit``, at which point the module-level
@@ -2716,6 +2698,7 @@ from verification_loop import (  # noqa: E402,F401
     _kill_sub_agent_process,
     _handle_stuck_sub_agent,
     _count_unfinished_tasks,
+    _verification_event_logger,
     _are_all_unfinished_blocked_by_failed_upstream,
     _mark_task_skipped,
     _mark_verification_round_running,

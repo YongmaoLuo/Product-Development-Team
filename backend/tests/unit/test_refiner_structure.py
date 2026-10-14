@@ -122,6 +122,11 @@ class _StubAgent:
         AutonomousAgent._TERMINAL_REPAIR_TASK_GROUP_PREFIX
     )
     _apply_refiner_structure = AutonomousAgent._apply_refiner_structure
+    # 2026-10-13: the writer reads the plan's repair rows for the
+    # ``failed_vp_by_task_id`` a breakdown child inherits, so the host has
+    # to carry the method too. Bound, not reimplemented — the tests below
+    # still exercise the production writer.
+    _repair_failed_vp_map = AutonomousAgent._repair_failed_vp_map
     _is_refiner_protected = AutonomousAgent._is_refiner_protected
 
     def __init__(self, task_manager, repo, logger=None, plan_id=PLAN_ID):

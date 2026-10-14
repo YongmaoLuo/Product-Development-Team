@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from verification_config import (
     DEFAULT_GLOBAL_TIMEOUT_SECONDS,
-    DEFAULT_PARALLELISM_CAP,
     DEFAULT_PER_METHOD_TIMEOUT_SECONDS,
     TimeoutPolicy,
 )
@@ -48,7 +47,6 @@ class TestTimeoutPolicyFromYamlDefaults:
         # Sanity: the method map was populated from hard-coded defaults.
         assert policy.per_method() == dict(DEFAULT_PER_METHOD_TIMEOUT_SECONDS)
         assert policy.global_default() == DEFAULT_GLOBAL_TIMEOUT_SECONDS
-        assert policy.parallelism_cap == DEFAULT_PARALLELISM_CAP
 
         # Spec assertion: per-method resolve still works.
         assert policy.resolve("ui_validation") == 3600
@@ -70,11 +68,19 @@ class TestTimeoutPolicyFromYamlLoadsReal:
 
         # The numbers declared in verification.yaml.
         # 2026-09-13: per-VP override deleted — flat 1-hour cap only.
+        # 2026-10-13: parallelism_cap deleted with every other pre-agreed
+        # round width; the provider slot pool decides it per dispatch.
         assert policy.resolve("ui_validation") == 3600
         assert policy.resolve("code_review") == 3600
         assert policy.resolve("automated_test") == 3600
         assert policy.resolve("api_test") == 3600
-        assert policy.parallelism_cap == 4
+        assert not hasattr(policy, "parallelism_cap"), (
+            "parallelism_cap came back on TimeoutPolicy. It was deleted "
+            "2026-10-13 because the verification round no longer carries a "
+            "configured width at all — a restored one is a number that "
+            "describes a constraint the provider pool, not this module, "
+            "enforces."
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -187,8 +193,15 @@ class TestConfigRegistryVerification:
                 f"got {sorted(per_method.keys())}"
             )
 
-        # And parallelism_cap should also be present.
-        assert "parallelism_cap" in execution
+        # 2026-10-13: parallelism_cap is no longer declared here — the
+        # round has no configured width. Its absence is the contract, so
+        # it is asserted rather than left unmentioned: a yaml that starts
+        # carrying the key again is a width nothing reads.
+        assert "parallelism_cap" not in execution, (
+            "verification.yaml declares parallelism_cap again. Nothing "
+            "reads it — TimeoutPolicy no longer has the attribute — so it "
+            "is a number an operator can change without any effect."
+        )
 
     def test_config_registry_verification_resolves_to_expected_timeouts(self):
         """End-to-end: registry → TimeoutPolicy.from_dict → resolve."""
@@ -200,8 +213,8 @@ class TestConfigRegistryVerification:
         # Same expectations as test_from_yaml_uses_values_from_file,
         # but driven via the registry rather than the on-disk path.
         # 2026-09-13: per-VP override deleted — flat 1-hour cap only.
+        # 2026-10-13: parallelism_cap deleted (see above).
         assert policy.resolve("ui_validation") == 3600
         assert policy.resolve("code_review") == 3600
         assert policy.resolve("automated_test") == 3600
         assert policy.resolve("api_test") == 3600
-        assert policy.parallelism_cap == 4
