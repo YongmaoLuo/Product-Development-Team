@@ -573,3 +573,87 @@ def test_validate_vp_rejects_unknown_subject():
     assert any("has no subject" in i.detail for i in issues), [
         i.detail for i in issues
     ]
+
+
+# ---------------------------------------------------------------------------
+# Replaying a VP the plan itself marked obsolete
+# ---------------------------------------------------------------------------
+
+def _write_plan(plan_dir: Path, points) -> Path:
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    (plan_dir / "verification_plan.json").write_text(
+        json.dumps({"services": [], "verification_points": points},
+                   ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return plan_dir
+
+
+def test_replay_of_an_obsolete_vp_is_not_applicable_not_failed(
+    tmp_path: Path, capsys,
+) -> None:
+    """A VP the plan retired must stop producing FAILED when replayed.
+
+    2026-10-14 (VP-009 retirement): ``verification_executor._build_items_from_plan``
+    already drops ``obsolete`` / ``superseded_by`` VPs — a round does not run
+    them because "running them would manufacture failures for something the
+    plan no longer requires" (see the 2026-09-16 note there). The replay CLI is
+    the other half of the same contract and did not honour it: it looks the VP
+    up by id and replays it anyway, so a criterion the plan had already retired
+    kept emitting failures. That asymmetry is what burned five repair rounds.
+
+    The URL here is deliberately unroutable: reaching the network at all would
+    mean the short-circuit is missing.
+    """
+    from verification_api_runner import main
+
+    plan_dir = _write_plan(tmp_path, [{
+        "id": "VP-009",
+        "title": "窗口内无信号返回 200 + 空集合",
+        "verification_method": "api_test",
+        "verification_phase": 1,
+        "obsolete": True,
+        "obsolete_reason": "前提失效：该 URL 是 (symbol, period, window) 的纯函数",
+        "obsoleted_round": 4,
+        "request": {"method": "GET", "url": "http://127.0.0.1:1/never-reached"},
+        "assertions": [{"name": "响应体是空数组", "json_path": "$",
+                        "length_equals": 0}],
+    }])
+
+    exit_code = main(["--plan", str(plan_dir), "--vp", "VP-009"])
+
+    out = capsys.readouterr()
+    assert exit_code == 0, (
+        "replaying a VP the plan marked obsolete returned "
+        f"exit_code={exit_code}; a retired criterion is not applicable, it "
+        f"cannot fail. stdout={out.out!r} stderr={out.err!r}"
+    )
+    assert "obsolete" in out.out and "VP-009" in out.out, (
+        f"the run must say out loud *why* nothing was executed: {out.out!r}"
+    )
+
+
+def test_replay_of_a_missing_vp_still_exits_two(
+    tmp_path: Path, capsys,
+) -> None:
+    """``exit 2`` stays reserved for "no such id" — a typo must be loud.
+
+    Making obsolete exit 0 must not turn "you named a VP that does not exist"
+    into a silent success; that is the one failure an operator must see.
+    """
+    from verification_api_runner import main
+
+    plan_dir = _write_plan(tmp_path, [{
+        "id": "VP-009",
+        "title": "t",
+        "verification_method": "api_test",
+        "verification_phase": 1,
+        "obsolete": True,
+    }])
+
+    exit_code = main(["--plan", str(plan_dir), "--vp", "VP-999"])
+
+    assert exit_code == 2, (
+        f"an unknown VP id must exit 2, got {exit_code}"
+    )
+    assert "not found" in capsys.readouterr().err

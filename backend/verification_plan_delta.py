@@ -45,6 +45,26 @@ ADDED_ROUND_FIELD = "added_round"
 
 _ID_RE = re.compile(r"^VP-(\d+)$")
 
+#: 增量新增的条目里，**原样**搬进新 VP 的可选字段（骨架之外的判据载荷）。
+#:
+#: 2026-10-14（VP-009 退休）：add 分支曾经只搬 id/title/related_prd_criteria/
+#: verification_method/priority/expected_result/verification_phase 与审计三件套，
+#: ``request`` / ``assertions`` / ``target_url`` / ``timeout_seconds`` /
+#: ``execution_group`` 从不被读取 —— 落地即消失。于是新增的 ``api_test`` VP 因缺
+#: ``request`` 被 :func:`verification_api_runner.validate_vp` 判为不可运行，又被
+#: ``verification_agent._maybe_evaluate_plan_delta`` 的护栏**整条丢弃**。
+#: 后果不是「少一条 VP」，而是「作废旧 VP + 新增一条表达正确的」这条路在框架层
+#: 根本不存在 —— 只能眼看着旧判据继续失败。
+#:
+#: 只在 delta 条目**确实写了**该键时才搬，不给每条新增 VP 凭空塞五个键。
+ADD_THROUGH_FIELDS: Tuple[str, ...] = (
+    "request",
+    "assertions",
+    "target_url",
+    "timeout_seconds",
+    "execution_group",
+)
+
 
 # ---------------------------------------------------------------------------
 # 输入采集
@@ -383,6 +403,10 @@ def apply_delta(
             ADDED_REASON_FIELD: str(item.get("reason", "")),
             ADDED_ROUND_FIELD: round_number,
         }
+        # 2026-10-14: 判据载荷原样透传。见 ADD_THROUGH_FIELDS。
+        for key in ADD_THROUGH_FIELDS:
+            if key in item:
+                vp[key] = item[key]
         points.append(vp)
         summary["added"].append(
             {"id": new_id, "title": vp["title"], "reason": vp[ADDED_REASON_FIELD]}
