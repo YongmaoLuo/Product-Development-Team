@@ -122,6 +122,11 @@ class _StubAgent:
         AutonomousAgent._TERMINAL_REPAIR_TASK_GROUP_PREFIX
     )
     _apply_refiner_structure = AutonomousAgent._apply_refiner_structure
+    # 2026-10-13: the writer reads the plan's repair rows for the
+    # ``failed_vp_by_task_id`` a breakdown child inherits, so the host has
+    # to carry the method too. Bound, not reimplemented — the tests below
+    # still exercise the production writer.
+    _repair_failed_vp_map = AutonomousAgent._repair_failed_vp_map
     _is_refiner_protected = AutonomousAgent._is_refiner_protected
 
     def __init__(self, task_manager, repo, logger=None, plan_id=PLAN_ID):
@@ -742,3 +747,147 @@ def test_sibling_prefix_is_not_mistaken_for_a_split():
     assert plan.removed_ids == ()
     assert plan.reinstated_ids == ("repair-r2-03",)
     assert "repair-r2-03" in [t["id"] for t in plan.effective]
+
+
+
+# ---------------------------------------------------------------------------
+# The judging command is write-once, not never-written (2026-10-11).
+#
+# Someone has to author a test_command the first time — the generator, or
+# the refiner when it splits a failed task into children. A child is a
+# *different task* with a smaller scope, so reusing the parent's command
+# would grade it against work it was never asked to do.
+#
+# What must not happen is the SECOND write. With a build tool missing from
+# the executor's PATH every failure looks like a defective command, so the
+# refiner "fixes" the command instead — growing the task list every round
+# while the commands it writes carry a ``PATH="$HOME/.cargo/bin:$PATH"``
+# prefix that can never go green. Nothing stopped it: the protection
+# above only covers ``task_group.startswith("repair")``, which matches
+# nothing when every task has ``task_group = None``.
+#
+# The quality of a *first* write is a separate question, and it lives in
+# the agent (``_enforce_new_subtask_test_command``) because judging it
+# means running the command.
+# ---------------------------------------------------------------------------
+
+
+def test_non_protected_task_cannot_rewrite_its_own_judge():
+    """The core rule: a task outside the repair group gets no exemption.
+
+    The refiner may still refine everything that *describes* the work.
+    Only the command that decides whether the work is done is frozen.
+    """
+    original = _task("13", title="\u539f\u9898", test_command="cargo test --lib remote::e2e::x")
+    tampered = dict(
+        original,
+        title="\u66f4\u51c6\u786e\u7684\u9898",
+        test_command='PATH="$HOME/.cargo/bin:$PATH" cargo test --lib remote::e2e::x',
+    )
+
+    plan = plan_refiner_structure([original], [tampered])
+
+    assert plan.judge_rewritten_ids == ("13",)
+    kept = next(t for t in plan.effective if t["id"] == "13")
+    assert kept["test_command"] == "cargo test --lib remote::e2e::x", (
+        "the pre-refinement command must win for every task, not just "
+        "the repair group"
+    )
+    assert kept["title"] == "\u66f4\u51c6\u786e\u7684\u9898", (
+        "a legitimate descriptive refinement must survive — only the "
+        "judge fields are frozen"
+    )
+    assert plan.reverted_ids == (), (
+        "reverted_ids means 'the LLM tried to edit a REPAIR task'; a "
+        "judge rewrite is a different event and must not be folded in"
+    )
+
+
+def test_judge_rewrite_is_reported_even_when_nothing_else_changed():
+    """It must not be swallowed by the ``is_noop`` short-circuit.
+
+    If ``is_noop`` were true here the corrected list would never be
+    written to either store, and the rewritten command would survive on
+    disk — the exact outcome this rule exists to prevent.
+    """
+    original = _task("7", test_command="cargo test --lib example::auth::secret")
+    tampered = dict(original, test_command="cargo test --lib no_such_module")
+
+    plan = plan_refiner_structure([original], [tampered])
+
+    assert not plan.is_noop
+    assert plan.added_ids == () and plan.removed_ids == ()
+    assert next(
+        t for t in plan.effective if t["id"] == "7"
+    )["test_command"] == "cargo test --lib example::auth::secret"
+
+
+def test_switching_between_the_two_command_shapes_is_not_a_rewrite():
+    """``test_commands: []`` and an absent ``test_commands`` mean the same
+    thing; an LLM that echoes the other shape has not changed the judge."""
+    original = _task("3", test_command="pytest -q")
+    echoed = dict(original, test_commands=[])
+
+    plan = plan_refiner_structure([original], [echoed])
+
+    assert plan.judge_rewritten_ids == ()
+    assert plan.is_noop
+
+
+def test_a_split_child_authors_its_own_judge():
+    """The half that must NOT be frozen.
+
+    A split child is a different task with a smaller scope; its command
+    is the refiner's to write, and must come through untouched.
+    """
+    parent = _task("1", test_command="cargo test --test gate")
+    children = [
+        _task("1-1", test_command="cargo test --lib example::auth::secret"),
+        _task("1-2", test_command="cargo test --test auth_token_gate"),
+        _task("1-3"),  # the refiner chose to write no command at all
+    ]
+
+    plan = plan_refiner_structure([parent], children)
+
+    assert plan.judge_rewritten_ids == ()
+    assert plan.removed_ids == ("1",)
+    by_id = {t["id"]: t for t in plan.effective}
+    assert by_id["1-1"]["test_command"] == "cargo test --lib example::auth::secret"
+    assert by_id["1-2"]["test_command"] == "cargo test --test auth_token_gate"
+    assert by_id["1-3"]["test_command"] == "pytest -q"  # _task default, untouched
+
+
+def test_a_brand_new_task_authors_its_own_judge():
+    """A gap the refiner spotted is a new task, not a rewrite."""
+    plan = plan_refiner_structure(
+        [_task("9")], [_task("9"), _task("99", test_command="pytest -k gap")]
+    )
+
+    assert plan.judge_rewritten_ids == ()
+    assert plan.added_ids == ("99",)
+    assert next(
+        t for t in plan.effective if t["id"] == "99"
+    )["test_command"] == "pytest -k gap"
+
+
+def test_a_pre_existing_child_shaped_id_is_still_frozen():
+    """``1-2`` may be an authored id rather than a child of ``1``.
+
+    Whatever its name looks like, it existed before the refinement, so
+    the write-once rule governs it — not the new-task exemption.
+    """
+    parent = _task("1", test_command="cargo test --test a")
+    sibling = _task("1-2", test_command="cargo test --test b")
+
+    plan = plan_refiner_structure(
+        [parent, sibling],
+        [
+            _task("1", test_command="cargo test --test a"),
+            _task("1-2", test_command="cargo test --test CHANGED"),
+        ],
+    )
+
+    assert plan.judge_rewritten_ids == ("1-2",)
+    assert next(
+        t for t in plan.effective if t["id"] == "1-2"
+    )["test_command"] == "cargo test --test b"

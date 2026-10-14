@@ -29,13 +29,19 @@ findings. Four surfaces, one definition of "a violation".
 What this cannot do
 -------------------
 It cannot tell that a branch name *refers to another project*. The
-identifiers that would make that decidable are the leak: writing
-``a private project`` into this repository to blacklist it publishes the
-private project name inside the blacklist, which is the exact shape the
-rule exists to prevent. So a branch named after an unrelated project is
-caught by a human reading the pull request -- which is why the check
-belongs **before** the merge rather than after it, where it is no longer
-actionable at any price.
+identifiers that would make that decidable are the leak: writing a
+private project name into this repository in order to blacklist it
+publishes that name inside the blacklist, which is the exact shape the
+rule exists to prevent.
+
+That objection was correct and it has been answered rather than argued
+away. ``test_no_private_names_in_source`` now carries the names, and the
+one already published in this very file -- written here as the worked
+example of the mistake -- is why ``origin/main`` is scanned by the same
+rule as any other ref. The residual gap is unchanged: a branch named
+after an unrelated project is caught by a human reading the pull
+request, which is why that check belongs **before** the merge rather
+than after it, where it is no longer actionable at any price.
 
 Failure is loud
 ---------------

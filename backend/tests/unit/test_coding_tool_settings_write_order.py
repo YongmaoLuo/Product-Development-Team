@@ -232,3 +232,200 @@ class TestSettingsFileWriteOrder:
         )
         assert file_env.get("ANTHROPIC_API_KEY") == "sk-explicit"
         assert file_env.get("ANTHROPIC_AUTH_TOKEN") == "sk-explicit"
+
+
+# ---------------------------------------------------------------------------
+# No settings file may carry a provider that was not selected
+#
+# ``SubagentConfig.write_tmp_settings`` is called twice per task — once
+# when the coding tool is constructed, once before each task — and both
+# calls happen BEFORE routing has chosen a provider. The only provider
+# they can name is the run-level one (the optimizer's chain, i.e. the
+# whole CC Switch list with no scene/tier filtering), which is not
+# necessarily the provider that ends up serving the call.
+#
+# Those files were not merely redundant: the dispatch writes its own
+# per-call settings file once routing has chosen and passes THAT to
+# ``claude --settings``, and the post-mortem redaction pass is keyed on
+# the effective path. So a pre-selection file was never the file the CLI
+# read, never redacted, and never deleted — its key stayed in cleartext in
+# the tmp root, describing a provider that was never selected. The
+# permission bits (0700 dir / 0600 file) were correct throughout; the
+# defect was in the lifecycle, which no mode bit can fix.
+#
+# The contract: a file written before selection carries hooks and the
+# correlation key, and nothing else. These tests assert it against a
+# PRIVATE tmp root (``PDT_SECRET_TEMP_ROOT``), never the operator's real
+# scratch directory — a test that inspects ``~/.pdt-scratch`` would both
+# read unrelated production residue and write into it.
+# ---------------------------------------------------------------------------
+
+
+class TestNoCredentialInAPreselectionSettingsFile:
+    @pytest.fixture(autouse=True)
+    def _private_root(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        monkeypatch.setenv("PDT_SECRET_TEMP_ROOT", str(tmp_path / "scratch"))
+
+    def test_deferred_write_puts_no_provider_config_on_disk(
+        self, tmp_path
+    ) -> None:
+        """The file the run writes before selection has no endpoint, no key.
+
+        Every field the dataclass does carry is asserted absent from the
+        serialized file, not just the two credential keys: a settings
+        file with a ``ANTHROPIC_BASE_URL`` and no key is still pointing
+        the CLI at a provider this call did not select, and ``--settings``
+        outranks the process env, so it would win.
+        """
+        cfg = SubagentConfig(
+            provider_name="vendor-a-pro",
+            base_url=_PROXY_BASE_URL,
+            api_key="sk-run-level-key",
+            auth_token="sk-run-level-token",
+            model_env={"ANTHROPIC_MODEL": "run-level-model"},
+            hook_scripts=[Path("/abs/pre_tool_use.sh")],
+            defer_provider_config=True,
+        )
+        path = cfg.write_tmp_settings()
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        file_env = payload.get("env", {})
+        for key in (
+            "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_MODEL",
+        ):
+            assert key not in file_env, (
+                f"{key}={file_env[key]!r} is in a settings file written "
+                f"before any provider was selected — that file is never the "
+                f"one handed to claude, and never the one redacted"
+            )
+        on_disk = path.read_text(encoding="utf-8")
+        assert "sk-run-level-key" not in on_disk
+        assert "sk-run-level-token" not in on_disk
+        assert _PROXY_BASE_URL not in on_disk
+
+    def test_deferred_write_keeps_the_hook_correlation_intact(
+        self, tmp_path
+    ) -> None:
+        """Credentials go; the two things the file is FOR stay.
+
+        ``CLAUDE_SETTINGS_PATH`` is what ``pre_tool_use.sh`` reads on every
+        tool call to log which settings file the call came from, and the
+        hooks block is what makes the sub-agent's tool calls observable at
+        all. Dropping the payload to fix the credential leak would trade a
+        working capability for a slogan.
+        """
+        cfg = SubagentConfig(
+            provider_name="vendor-a-pro",
+            base_url=_PROXY_BASE_URL,
+            api_key="sk-run-level-key",
+            auth_token="sk-run-level-token",
+            hook_scripts=[
+                Path("/abs/pre_tool_use.sh"), Path("/abs/post_tool_use.sh"),
+            ],
+            task_type="coding",
+            defer_provider_config=True,
+        )
+        path = cfg.write_tmp_settings()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+        assert payload["env"]["CLAUDE_SETTINGS_PATH"] == str(path), (
+            "the correlation key must point at this file — it is how two "
+            "tasks dispatched close together stay distinguishable"
+        )
+        matchers = {e["matcher"] for e in payload["hooks"]["PreToolUse"]}
+        assert matchers, f"no PreToolUse hook wired: {payload['hooks']!r}"
+        cmds = [
+            h["command"]
+            for entry in payload["hooks"]["PreToolUse"] + payload["hooks"]["PostToolUse"]
+            for h in entry["hooks"]
+        ]
+        assert any("pre_tool_use" in c for c in cmds), cmds
+        assert any("post_tool_use" in c for c in cmds), cmds
+
+    def test_per_task_rewrites_still_produce_a_distinct_correlation_key(
+        self, tmp_path
+    ) -> None:
+        """Two tasks, two files — the property the per-task write exists for.
+
+        ``_execute_task_with_retry`` rewrites the tmpfile before every
+        task so ``CLAUDE_SETTINGS_PATH`` differs between tasks; sharing one
+        path would make two sub-agents running close together
+        indistinguishable in the activity log. Deferring the provider
+        config must not have collapsed that back to one file.
+        """
+        cfg = SubagentConfig(
+            base_url=_PROXY_BASE_URL, api_key="k", auth_token="t",
+            hook_scripts=[Path("/abs/pre_tool_use.sh")],
+            defer_provider_config=True,
+        )
+        first = cfg.write_tmp_settings()
+        second = cfg.write_tmp_settings()
+        assert first != second, "the per-task rewrite must produce a new path"
+        for path in (first, second):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            assert payload["env"]["CLAUDE_SETTINGS_PATH"] == str(path)
+            assert "ANTHROPIC_BASE_URL" not in payload.get("env", {})
+
+    def test_the_selected_provider_still_reaches_the_file_that_is_used(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """Deferring must not cost the dispatch its provider config.
+
+        The end-to-end shape: the pre-selection template is empty of
+        provider keys, and the per-call file the CLI actually reads still
+        carries the scene-routed endpoint, key and model. Both halves are
+        asserted, because fixing the first by breaking the second is the
+        obvious way to get this wrong.
+        """
+        _install_scene_routing(monkeypatch)
+        template = SubagentConfig(
+            provider_name="vendor-a-pro",
+            base_url=_PROXY_BASE_URL,
+            api_key="sk-run-level-key",
+            auth_token="sk-run-level-token",
+            hook_scripts=[Path("/abs/pre_tool_use.sh")],
+            defer_provider_config=True,
+        )
+        template_path = template.write_tmp_settings()
+        assert "ANTHROPIC_BASE_URL" not in json.loads(
+            template_path.read_text(encoding="utf-8")
+        ).get("env", {}), "precondition: the template is provider-free"
+
+        monkeypatch.setattr("coding_tool.redact_all", lambda *a, **k: 0)
+        with patch("coding_tool.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = _make_mock_process()
+            tool = ClaudeCodingTool(
+                provider_priority=[],
+                settings=template_path,
+                scene="execution",
+            )
+            tool.query("test prompt")
+
+        file_env = _settings_payload(mock_popen).get("env", {})
+        assert file_env.get("ANTHROPIC_BASE_URL") == _ROUTED_BASE_URL
+        assert file_env.get("ANTHROPIC_API_KEY") == "sk-scene-routed-key"
+        assert file_env.get("ANTHROPIC_AUTH_TOKEN") == "sk-scene-routed-key"
+        assert file_env.get("ANTHROPIC_MODEL") == "scene-default-model"
+
+    def test_the_non_deferred_writer_is_unchanged(self, tmp_path) -> None:
+        """A caller that really is the provider keeps writing it.
+
+        ``defer_provider_config`` is opt-in. Without it the payload is
+        unchanged — endpoint + credentials + a model when one resolves —
+        so the inline paths that bypass the dispatch walk (and hand this
+        file straight to ``claude --settings``) still get provider config.
+        A blanket change would have broken them silently.
+        """
+        cfg = SubagentConfig(
+            provider_name="vendor-a-pro",
+            base_url=_PROXY_BASE_URL,
+            api_key="sk-run-level-key",
+            auth_token="sk-run-level-token",
+        )
+        file_env = json.loads(
+            cfg.write_tmp_settings().read_text(encoding="utf-8")
+        )["env"]
+        assert file_env["ANTHROPIC_BASE_URL"] == _PROXY_BASE_URL
+        assert file_env["ANTHROPIC_API_KEY"] == "sk-run-level-key"
+        assert file_env["ANTHROPIC_AUTH_TOKEN"] == "sk-run-level-token"

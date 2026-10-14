@@ -1,99 +1,112 @@
 """
-Repair Task Generator — Requirement-Driven Repair Task Generation
-================================================================
+Repair Task Generator — one LLM call for content, local code for schema
+======================================================================
 
-Generates repair tasks based on verification failures using a three-step
-requirement-driven process:
-1. Requirement Understanding — Extract acceptance criteria, constraints, verification strategies
-2. Evidence Collection — Map technical failures to requirement deviations
-3. Task Generation — Generate repair tasks referencing original PRD criteria
+What lives here
+---------------
+:meth:`RepairTaskGenerator.generate_repair_contents` asks the model for
+the *content* of a repair — ``title``, ``description``,
+``acceptance_criteria``, ``files_to_modify`` and the ``failed_vp_id`` it
+addresses — in a single call. :class:`RepairTaskAssembler` then stamps
+everything the state machine has to be able to rely on (``id``,
+``priority``, ``depends_on``, ``execution_group``) with local code. The
+model never sees a task id, so a model that misbehaves still yields
+tasks the state machine can recognise.
 
-Single-call content-only flow (2026-09-07)
-------------------------------------------
-:meth:`RepairTaskGenerator.generate_repair_contents` and
-:class:`RepairTaskAssembler` together replace the 3-step LLM chain
-with a cleaner LLM-only-for-content / local-code-for-tags split:
+A second, bounded LLM call fills a missing acceptance command
+(:meth:`RepairTaskGenerator._fill_missing_test_commands`); it runs only
+for rows the derived sources cannot answer for, and the assembler never
+calls a model at all.
 
-  * ``generate_repair_contents(failed_vps, round_number)`` — single
-    LLM call that returns one content dict per failed VP
-    (``title``, ``description``, ``acceptance_criteria``,
-    ``failed_vp_id``). The LLM never sees a task_id / priority /
-    execution_group / depends_on field; those are stamped by local
-    code in :class:`RepairTaskAssembler`. This separation makes the
-    state machine able to rely on locally-stamped task IDs even when
-    the LLM misbehaves.
-
-The legacy 3-step chain (``understand_requirements``,
-``collect_failure_evidence``, ``_generate_repair_tasks``,
-``generate_verification_tasks``) is preserved unchanged because it
-is exercised by ``tests/test_blocked_verdict_handling.py``,
-``tests/test_repair_generator_deterministic.py``, and
-``tests/test_verification_orchestrator.py``. Those tests would need
-to be updated as a separate, dedicated refactor — out of scope for
-the 2026-09-07 fix that closes the stuck-verification-loop bug.
+What does not live here, and why
+--------------------------------
+This module grew a requirement-driven chain first: understand the
+requirements, collect the failure evidence, map every failure back to a
+criterion, then generate tasks that cite it. It is gone. Its evidence
+step asked the model to re-derive a failure that
+``verification_report.json`` already stated, and any plan whose evidence
+did not line up with the PRD's own wording came back with zero tasks —
+which the auto-loop read as "no repair needed" and stopped on, leaving
+the plan in ``verification_failed`` with no path forward. The content
+call reads the report through
+:func:`verification.verification_report_reader.extract_failed_vps_with_paths`
+and lets local code supply what the chain used to ask for.
 """
 
 import json
 import re
 import os
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
-from coding_tool import CodingTool
-from config_paths import resolve_plans_dir
+from coding_tool import CodingTool, JsonSession, query_json_in_session
 from test_command_quality import check_falsifiable, inspect_command
 from verification_persistence import VerificationPersistenceManager
 
 
-REPAIR_SYSTEM_PROMPT = """你是一位资深技术架构师。你的任务是基于验证失败证据，生成需求导向的修复任务。
+# 2026-10-11: cap on failure text handed to the repair-task LLM.
+# Kept local to this module rather than imported from
+# ``verification_agent`` to avoid pulling that module (and its prompt
+# stack) into every importer of the repair generator.
+_MAX_REPAIR_PROMPT_CHARS = 8000
 
-**核心原则：不要针对pytest错误修复，必须回到原始PRD验收标准理解需求偏离**
-**重要约束：只生成修复目标项目代码的任务，不要生成修复执行框架、后端基础设施、API路由、状态机等任务。**
 
-修复任务必须：
-1. 引用原始PRD验收标准（而非技术错误描述）
-2. 说明需求偏离点（如"并发登录响应时间超过PRD要求的2秒"而非"pytest超时"）
-3. 提供符合架构约束的修复建议
-4. 包含TDD规格（test_xxx: 条件 → 预期）
-5. **只修改目标项目代码，不修改执行框架代码**
+#: One resumable session per plan, shared by that plan's repair-content
+#: calls. Keyed by plan directory rather than held on a
+#: :class:`RepairTaskGenerator`, because a generator does **not** outlive
+#: a round: :class:`~verification.orchestrator.VerificationOrchestrator`
+#: builds one in ``__init__``, and the repair-complete callback enters
+#: the next round through a *new* orchestrator. A handle on either
+#: object would therefore be a handle that is empty again on every round
+#: after the first, which is the same shape as having no handle at all —
+#: it reads as reuse and pays for a fresh session each round.
+#:
+#: Round N+1 of a plan's repair is round N plus the evidence round N's
+#: tasks failed to clear, and the content prompt names the files to read
+#: rather than inlining them, so a fresh session per round re-reads all
+#: of them every round.
+#:
+#: Entries are one small handle per plan directory this process has
+#: generated repairs for, and live until the process ends.
+_REPAIR_CONTENT_SESSIONS: Dict[str, JsonSession] = {}
 
-输出格式（纯 JSON）：
-{
-  "tasks": [
-    {
-      "id": "1-1",
-      "title": "修复标题（指向需求偏离点）",
-      "description": "完整描述，包含：\\n\\n**原始PRD验收标准：**\\n...\\n\\n**架构约束：**\\n...\\n\\n**需求偏离证据：**\\n...\\n\\n**修复建议：**\\n...\\n\\n**TDD规格：**\\n- test_xxx: 条件 → 预期\\n- test_yyy: 条件 → 预期",
-      "vp_id": "这条任务对应的失败验证点 id（如 VP-013）",
-      "test_command": "复现需求偏离的验证命令。必填且必须是一条**可执行、且修复正确时 exit code 为 0** 的命令。不要写 cd ~/... 这类硬编码 home 路径；不要写只有 ls/grep 的探测链。"
-    }
-  ]
-}
 
-只输出 JSON，不要 markdown 代码块标记。"""
+def repair_content_session(plan_dir: Path) -> JsonSession:
+    """The resumable session for ``plan_dir``'s repair-content calls.
 
-REQUIREMENT_UNDERSTANDING_PROMPT = """你是一位资深需求分析师。请分析提供的PRD、架构设计和测试设计文档，提取以下结构化信息：
+    Created on first use. The handle comes back carrying whichever
+    session the dispatch actually answered in — including one a provider
+    fallback switched to — so the next round resumes a session that
+    exists rather than one the caller guessed at.
+    """
+    key = str(Path(plan_dir).resolve())
+    session = _REPAIR_CONTENT_SESSIONS.get(key)
+    if session is None:
+        session = JsonSession()
+        _REPAIR_CONTENT_SESSIONS[key] = session
+    return session
 
-1. acceptance_criteria: 从PRD中提取的验收标准列表，每个包含 id, description, category, priority
-2. technical_constraints: 从架构设计文档中提取的技术约束列表，每个包含 id, description, category
-3. verification_strategies: 从测试设计文档中提取的验证策略列表，每个包含 id, description, method
 
-输出格式（纯JSON）：
-{
-  "acceptance_criteria": [
-    {"id": "AC-001", "description": "...", "category": "performance|security|usability|functionality", "priority": "high|medium|low"}
-  ],
-  "technical_constraints": [
-    {"id": "TC-001", "description": "...", "category": "performance|security|architecture"}
-  ],
-  "verification_strategies": [
-    {"id": "VS-001", "description": "...", "method": "api_test|code_review|ui_validation"}
-  ]
-}
+def _clamp_for_prompt(text: Any, limit: int = _MAX_REPAIR_PROMPT_CHARS,
+                      label: str = "text") -> str:
+    """Clip ``text`` to ``limit`` chars, declaring the cut when one happens.
 
-只输出JSON，不要markdown代码块标记。"""
+    The repair agent repairs against this text, so a silent slice does
+    not merely lose detail — it makes the agent repair against a
+    fragment it cannot tell is a fragment, which is how four rounds
+    went off-target on VP-016. Losing the tail is acceptable; losing
+    the *fact* that the tail is missing is not, so the annotation
+    states the original length too.
+    """
+    rendered = str(text or "")
+    if len(rendered) <= limit:
+        return rendered
+    notice = (
+        f"…[{label} 已截断，原长 {len(rendered)} 字符，"
+        f"此处保留前 {limit}]"
+    )
+    return rendered[:limit] + notice
 
 
 class RepairGenerationError(RuntimeError):
@@ -164,407 +177,25 @@ class RepairTaskGenerator:
         # Persistence manager for reading verification reports
         self.persistence = VerificationPersistenceManager(self.plan_dir)
 
-    def _get_verification_tasks_file(self, round_number: int) -> Path:
-        """Get the path for verification tasks file for a given round."""
-        return self.project_dir / f"verification_tasks_round_{round_number}.json"
-
-    @property
-    def tasks_file(self) -> Path:
-        """Legacy ``project_dir / tasks.json`` mirror of the round file from ``_get_verification_tasks_file``; the round file is the source of truth (written by ``generate_verification_tasks``) and this mirror is written only by ``generate_and_append_tasks`` for TaskManager / older tests."""
-        return self.project_dir / "tasks.json"
-
-    def _append_to_tasks_json(self, repair_tasks: List[Dict[str, Any]]) -> None:
-        """Append ``repair_tasks`` to ``project_dir / tasks.json``.
-
-        Loads the existing file (if any), preserves its task list, and
-        writes the union back. Missing fields are initialised to safe
-        defaults. This is the test-facing legacy path used by callers
-        that drive the three-step workflow manually and want the
-        ``tasks.json`` (TaskManager-readable) side-effect that
-        :meth:`generate_and_append_tasks` also produces.
-
-        Args:
-            repair_tasks: New repair task dicts to append.
-        """
-        existing: Dict[str, Any] = {"tasks": []}
-        try:
-            if self.tasks_file.exists():
-                with open(self.tasks_file, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            # Corrupt or missing file: start from a clean slate rather
-            # than propagate the read error.
-            existing = {"tasks": []}
-
-        existing_tasks = existing.get("tasks", [])
-        if not isinstance(existing_tasks, list):
-            existing_tasks = []
-
-        existing_tasks.extend(repair_tasks)
-        existing["tasks"] = existing_tasks
-
-        self.tasks_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.tasks_file, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2, ensure_ascii=False)
-
-    # -----------------------------------------------------------------------
-    # Step 1: Requirement Understanding
-    # -----------------------------------------------------------------------
-
-    def understand_requirements(self) -> Dict[str, Any]:
-        """
-        Step 1: Analyze PRD/architecture/test documents to extract requirement context.
-        Uses LLM to read documents via file paths and extract structured data.
-        Caches result to requirement_context.json to avoid repeated calls.
-        On LLM failure, returns empty structure and logs warning.
-
-        Returns:
-            Dictionary containing acceptance criteria, technical constraints, and verification strategies
-        """
-        cache_file = self.plan_dir / "requirement_context.json"
-
-        # Check cache first
-        if cache_file.exists():
-            try:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass  # Cache corrupt, continue to regenerate
-
-        print("[Repair] Step 1: Understanding requirements (via file paths)...")
-
-        # Build prompt that points to files instead of embedding content
-        prompt = self._build_requirement_prompt()
-
-        # 2026-09-15: no explicit ``timeout`` on any LLM
-        # call in this module. The previous values (1800 here and below,
-        # 600 for repair-content generation) REPLACED the coding tool's
-        # unified windows — 900s adaptive silence / 1800s idle pipe / the
-        # layer's ceiling — instead of nesting inside them. Omit the kwarg
-        # to inherit; see tests/unit/test_llm_calls_inherit_unified_timeout.py.
-        try:
-            result = self.coding_tool.query_json(
-                prompt=prompt,
-                system_instruction=REQUIREMENT_UNDERSTANDING_PROMPT,
-            )
-
-            requirement_context = {
-                "acceptance_criteria": result.get("acceptance_criteria", []),
-                "technical_constraints": result.get("technical_constraints", []),
-                "verification_strategies": result.get("verification_strategies", [])
-            }
-
-            # Save cache to avoid repeated LLM calls
-            self.plan_dir.mkdir(parents=True, exist_ok=True)
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(requirement_context, f, indent=2, ensure_ascii=False)
-
-            print(f"[Repair] Extracted {len(requirement_context['acceptance_criteria'])} acceptance criteria, "
-                  f"{len(requirement_context['technical_constraints'])} constraints, "
-                  f"{len(requirement_context['verification_strategies'])} verification strategies")
-
-            return requirement_context
-
-        except Exception as e:
-            print(f"[Repair] Warning: LLM requirement understanding failed: {e}")
-            return {
-                "acceptance_criteria": [],
-                "technical_constraints": [],
-                "verification_strategies": []
-            }
-
-    def _build_requirement_prompt(self) -> str:
-        """Build prompt that instructs LLM to read documents via file paths."""
-        parts = []
-
-        parts.append("请使用 Read 工具读取以下文档，提取验收标准、技术约束和验证策略：")
-        parts.append("")
-
-        if self.prd_file.exists():
-            parts.append(f"- PRD文档: {self.prd_file}")
-        elif self.prd_md_file.exists():
-            parts.append(f"- PRD文档: {self.prd_md_file}")
-
-        if self.arch_file.exists():
-            parts.append(f"- 架构设计文档: {self.arch_file}")
-
-        if self.test_file.exists():
-            parts.append(f"- 测试设计文档: {self.test_file}")
-
-        parts.append("")
-        parts.append("读取后，提取以下结构化信息并输出JSON：")
-        parts.append("1. acceptance_criteria (验收标准): 验收标准列表（从PRD提取）")
-        parts.append("   每个包含 id, description, category, priority")
-        parts.append("2. technical_constraints (技术约束): 技术约束列表（从架构设计提取）")
-        parts.append("   每个包含 id, description, category")
-        parts.append("3. verification_strategies (验证策略): 验证策略列表（从测试设计提取）")
-        parts.append("   每个包含 id, description, method")
-
-        return "\n".join(parts)
-
-    # -----------------------------------------------------------------------
-    # Step 2: Evidence Collection
-    # -----------------------------------------------------------------------
-
-    def collect_failure_evidence(self, requirement_context: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Step 2: Collect verification failure evidence from verification report.
-
-        Reads verification_report.json via persistence manager, extracts verification points
-        with status=FAILED, and builds technical failure evidence for each failed point.
-        Can also read detailed logs for additional context.
-
-        Args:
-            requirement_context: Requirement context from Step 1 (unused but kept for API consistency)
-
-        Returns:
-            List of failure evidence items with keys: vp_id, actual_result, evidence, test_command
-        """
-        print("[Repair] Step 2: Collecting failure evidence...")
-
-        # Load verification report via persistence manager
-        verification_report = self.persistence.load_report()
-        if not verification_report:
-            print("[Repair] No verification report found, skipping evidence collection")
-            return []
-
-        # Load verification plan to get test_command for each verification point
-        test_commands = {}
-        plan_file = self.plan_dir / "verification_plan.json"
-        if plan_file.exists():
-            try:
-                with open(plan_file, "r", encoding="utf-8") as f:
-                    plan_data = json.load(f)
-                for vp in plan_data.get("verification_points", []):
-                    vp_id = vp.get("id")
-                    if vp_id:
-                        test_commands[vp_id] = vp.get("test_command", "")
-            except Exception:
-                pass
-
-        evidence_items = []
-
-        # Extract failed verification results
-        # 2026-09-07: include BLOCKED alongside FAILED so the
-        # binary-stale pre-flight surface is reflected as repair-task
-        # evidence. Without this branch, ``_build_deterministic_repair_tasks``
-        # below cannot emit a ``cargo build`` / ``maturin develop``
-        # task and the LLM-driven path keeps hallucinating pytest
-        # fixes that aren't applicable.
-        for result in verification_report.get("verification_results", []):
-            if result.get("status") in ("FAILED", "BLOCKED"):
-                vp_id = result.get("id", "unknown")
-
-                # Get detailed logs for this verification point if available
-                detailed_logs = self.persistence.get_verification_point_logs(vp_id)
-                log_context = ""
-                if detailed_logs:
-                    # Extract relevant log entries
-                    for log_entry in detailed_logs[-5:]:  # Last 5 log entries
-                        if log_entry.get("event_type") in ("pytest_output", "code_review", "test_error"):
-                            log_context += f"\n[{log_entry.get('event_type')}]\n"
-                            log_context += str(log_entry.get("data", {}))[:500]
-
-                evidence_items.append({
-                    "vp_id": vp_id,
-                    "actual_result": result.get("actual_result", ""),
-                    "evidence": result.get("evidence", "") + log_context,
-                    "test_command": test_commands.get(vp_id, "")
-                })
-
-        print(f"[Repair] Collected {len(evidence_items)} failure evidence items")
-        return evidence_items
-
-    def _find_related_criteria(self, vp_id: str, requirement_context: Dict[str, Any]) -> List[str]:
-        """Find PRD acceptance criteria related to a verification point."""
-        # Try to load verification plan to get verification point details
-        plan_file = self.plan_dir / "verification_plan.json"
-        if plan_file.exists():
-            try:
-                with open(plan_file, "r", encoding="utf-8") as f:
-                    plan_data = json.load(f)
-                for vp in plan_data.get("verification_points", []):
-                    if vp.get("id") == vp_id:
-                        # Extract related PRD criteria from verification point
-                        criteria = vp.get("related_prd_criteria", "")
-                        if criteria:
-                            return [criteria]
-            except Exception:
-                pass
-
-        # Fallback: return all acceptance criteria descriptions
-        criteria = requirement_context.get("acceptance_criteria", [])
-        result = []
-        for c in criteria:
-            if isinstance(c, dict):
-                result.append(c.get("description", str(c)))
-            else:
-                result.append(str(c))
-        return result
-
-    def _format_requirement_deviation(
-        self,
-        deviation: Dict[str, Any],
-        requirement_context: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        """Format requirement deviation from verification report."""
-        vp_id = deviation.get("verification_point_id", "unknown")
-        deviation_type = deviation.get("type", "unknown")
-        description = deviation.get("description", "")
-        severity = deviation.get("severity", "medium")
-
-        # Find related criteria
-        related_criteria = self._find_related_criteria(vp_id, requirement_context)
-
-        return {
-            "verification_point_id": vp_id,
-            "technical_failure": f"需求偏离类型: {deviation_type}",
-            "requirement_deviation": description,
-            "related_prd_criteria": related_criteria[0] if related_criteria else "未知",
-            "severity": severity
-        }
-
-    def map_to_requirement_deviations(
-        self,
-        requirement_context: Dict[str, Any],
-        failure_evidence: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """
-        Map technical failures to requirement deviation descriptions.
-
-        Uses LLM to map each technical failure to a requirement deviation,
-        referencing original PRD acceptance criteria.
-
-        Args:
-            requirement_context: Requirement context with acceptance_criteria
-            failure_evidence: List of failure evidence items from collect_failure_evidence
-
-        Returns:
-            List of deviation mappings with keys:
-            - deviation_description: How the failure violates PRD acceptance criteria
-            - related_acceptance_criteria: Related acceptance criteria from PRD
-            - severity: high/medium/low
-        """
-        deviations = []
-
-        for evidence in failure_evidence:
-            vp_id = evidence.get("vp_id", "unknown")
-            actual_result = evidence.get("actual_result", "")
-
-            # Find related acceptance criteria
-            related_criteria = self._find_related_criteria(vp_id, requirement_context)
-            criteria_text = related_criteria[0] if related_criteria else "未知"
-
-            # Build prompt for LLM (file-path based, no embedded content)
-            prompt = self._build_deviation_mapping_prompt(evidence)
-
-            system_message = (
-                "你是一位资深QA工程师，擅长分析技术失败并映射到需求偏离。"
-                "不要针对pytest错误修复，必须回到原始PRD验收标准理解需求偏离。"
-                "你可以使用 Read 工具读取文件获取完整上下文。"
-            )
-
-            try:
-                result = self.coding_tool.query_json(
-                    prompt=prompt,
-                    system_instruction=system_message,
-                )
-
-                deviation = {
-                    "deviation_description": result.get(
-                        "deviation_description",
-                        result.get("requirement_deviation", f"验证失败：{actual_result[:100]}")
-                    ),
-                    "related_acceptance_criteria": result.get(
-                        "related_acceptance_criteria",
-                        result.get("related_prd_criteria", criteria_text)
-                    ),
-                    "severity": result.get("severity", "medium")
-                }
-                deviations.append(deviation)
-
-            except Exception as e:
-                print(f"[Repair] Error mapping failure for {vp_id}: {e}")
-                deviations.append({
-                    "deviation_description": f"验证失败：{actual_result[:100]}",
-                    "related_acceptance_criteria": criteria_text,
-                    "severity": "medium"
-                })
-
-        return deviations
-
-    def _build_deviation_mapping_prompt(self, evidence: Dict[str, Any]) -> str:
-        """Build prompt instructing LLM to read files and map failures to deviations.
-
-        Instead of embedding full document content, provides file paths so the LLM
-        can use Read/Grep tools to fetch only the relevant sections.
-        """
-        parts = []
-
-        parts.append("请使用 Read 工具读取以下文件来分析需求偏离：")
-        parts.append("")
-
-        # Point to verification report for full failure context
-        if self.verification_report_file.exists():
-            parts.append(f"- 验证报告: {self.verification_report_file}")
-
-        # Point to PRD for acceptance criteria
-        if self.prd_file.exists():
-            parts.append(f"- PRD文档: {self.prd_file}")
-        elif self.prd_md_file.exists():
-            parts.append(f"- PRD文档: {self.prd_md_file}")
-
-        # Point to cached requirement context for quick reference
-        cache_file = self.plan_dir / "requirement_context.json"
-        if cache_file.exists():
-            parts.append(f"- 已提取的需求上下文: {cache_file}")
-
-        parts.append("")
-        parts.append("聚焦以下验证失败：")
-        parts.append(f"- 验证点ID: {evidence.get('vp_id', 'unknown')}")
-        parts.append(f"- 技术失败描述: {evidence.get('actual_result', '')[:300]}")
-        parts.append(f"- 严重程度: {evidence.get('severity', 'medium')}")
-        parts.append("")
-        parts.append("任务：读取PRD中的相关验收标准，将上述技术失败映射为需求偏离描述。")
-        parts.append("")
-        parts.append("请输出JSON格式：")
-        parts.append("{")
-        parts.append('  "deviation_description": "需求偏离描述（引用PRD验收标准）",')
-        parts.append('  "related_acceptance_criteria": "最相关的PRD验收标准原文",')
-        parts.append('  "severity": "high|medium|low"')
-        parts.append("}")
-        parts.append("")
-        parts.append("只输出 JSON，不要 markdown 代码块标记。")
-
-        return "\n".join(parts)
-
-    # -----------------------------------------------------------------------
-    # Step 3: Task Generation
-    # -----------------------------------------------------------------------
-
-    def generate_repair_tasks(
-        self,
-        requirement_context: Dict[str, Any],
-        evidence_items: List[Dict[str, Any]],
-        round_number: int = 1,
-    ) -> List[Dict[str, Any]]:
-        """Public alias for :meth:`_generate_repair_tasks`.
-
-        Kept for backwards-compat with test code and external callers
-        that drive the three-step workflow manually (skipping the
-        round-filed orchestration in :meth:`generate_verification_tasks`).
-        Internally delegates to the private method.
-        """
-        return self._generate_repair_tasks(
-            requirement_context, evidence_items, round_number
-        )
-
-    #: Where a repair task's ``test_command`` came from. Recorded on the
-    #: task as ``test_command_source`` so an operator reading
-    #: ``tasks.json`` (or the execution log) can tell an LLM-authored
-    #: command apart from a derived one — the two carry different
-    #: confidence.
-    TEST_COMMAND_SOURCES = ("llm", "vp", "single_evidence", "missing")
+    #: How many **extra** model rounds a verification point gets to
+    #: produce an acceptance command when none of the three derivation
+    #: paths in :meth:`_resolve_repair_test_command` yields one. So the
+    #: worst case is this plus the original content call.
+    #:
+    #: The name is deliberately *not* ``MAX_FILES_FILL_ATTEMPTS``: that
+    #: loop lived in the dispatcher's ``files_to_modify`` self-heal and
+    #: was deleted outright, and
+    #: ``tests/contract/test_no_prerun_gate.py`` asserts the attribute
+    #: does not come back. This is the same idea — a bounded re-ask
+    #: rather than an unbounded hang — for a different field.
+    #:
+    #: Why 2: the second round is where the "here is why your last
+    #: answer was unusable" feedback actually changes the answer, and a
+    #: third round buys very little for a real cost on a round that may
+    #: have a dozen command-less verification points. The fill loop asks
+    #: for **every** outstanding point in one call per round, so this is
+    #: at most two extra calls per round, not per task.
+    MAX_TEST_COMMAND_FILL_ATTEMPTS = 2
 
     def _resolve_repair_test_command(
         self,
@@ -596,12 +227,24 @@ class RepairTaskGenerator:
            empty command plus an explicit source rather than silently
            substituting ``""``, so the caller can surface it.
 
-        A model-authored command that ``test_command_quality`` flags is
-        treated as absent rather than shipped. A structurally-broken
-        command is worse than none: it guarantees a FALSE failure every
-        time (the chain exits non-zero even when the fix is correct),
-        whereas no command degrades to the audit second pass, which can
-        actually pass.
+        A structurally-broken command is treated as absent rather than
+        shipped, whichever source proposed it. This is worse than none:
+        it guarantees a FALSE failure every time (the chain exits
+        non-zero even when the fix is correct), whereas no command
+        degrades to the audit second pass, which can actually pass.
+
+        That rule covers sources (2) and (3) as much as (1). Those two
+        hand back a command the plan author wrote into
+        ``verification_plan.json``, and the author is a human being with
+        a shell — an ``ls`` chained ahead of the real runner exits
+        non-zero when the path is absent, and the whole chain then
+        reports failure for a repair that worked. The assembler takes a
+        declared command as already vetted, so without a check here
+        that shape reached the completion gate verbatim and failed every
+        round it was issued in. A rejected derivation is **not** a
+        third outcome: it reads as "no command from this source" and
+        resolution continues to the next path, ending at ``missing`` and
+        the assembler's own ``audit_style`` / ``missing`` labelling.
 
         The model-authored candidate additionally has to survive the
         pre-repair probe (:meth:`_passes_falsifiability`): a command the
@@ -611,7 +254,13 @@ class RepairTaskGenerator:
         derived fallbacks come from the verification point's own
         command, and a vacuous command *there* means the verification
         point itself is broken, which is a different defect that should
-        surface rather than be silently routed around.
+        surface rather than be silently routed around. Probing them would
+        also be close to pure cost: the command belongs to a verification
+        point that has just failed, so its probe is nearly certain to
+        answer "fails as it should" without running anything the repair
+        needs. The structural check is different on both counts — it
+        executes nothing, and the false-failure argument above holds just
+        as well for an author-declared command.
         """
         command = str(task.get("test_command") or "").strip()
         if command:
@@ -636,14 +285,309 @@ class RepairTaskGenerator:
         }
 
         vp_id = str(task.get("vp_id") or "").strip()
-        if vp_id and by_vp.get(vp_id):
-            return by_vp[vp_id], "vp"
+        if vp_id:
+            derived = self._structurally_runnable(
+                by_vp.get(vp_id, ""), f"vp {vp_id}",
+            )
+            if derived:
+                return derived, "vp"
 
         usable = [c for c in by_vp.values() if c]
         if len(usable) == 1:
-            return usable[0], "single_evidence"
+            derived = self._structurally_runnable(
+                usable[0], "the round's only evidence command",
+            )
+            if derived:
+                return derived, "single_evidence"
 
         return "", "missing"
+
+    @staticmethod
+    def _structurally_runnable(command: str, origin: str) -> str:
+        """``command`` when :func:`inspect_command` accepts it, else ``""``.
+
+        The one rule every derivation in :meth:`_resolve_repair_test_command`
+        runs its candidate through, so "structurally broken" means the
+        same thing on the ``vp`` path as on the LLM path rather than
+        being re-implemented per site.
+
+        A rejection is deliberately *silent about the row*: the caller
+        treats ``""`` as "this source had nothing to offer" and carries
+        on to the next derivation, so a broken author-declared command
+        ends up labelled ``audit_style`` / ``missing`` by the assembler
+        instead of being shipped as a false-failure generator. The log
+        line names the origin so an operator can tell a plan whose
+        commands are all unusable from one that simply has none.
+
+        Only the shape is judged. The RED probe stays on the LLM path
+        alone — see :meth:`_resolve_repair_test_command`.
+        """
+        command = str(command or "").strip()
+        if not command:
+            return ""
+        issues = inspect_command(command)
+        if not issues:
+            return command
+        print(
+            f"[Repair] Discarding structurally-broken test_command "
+            f"derived for {origin} ({issues[0].code}): {command[:120]}"
+        )
+        return ""
+
+    # ------------------------------------------------------------------
+    # Path A — bounded re-ask for an acceptance command
+    # ------------------------------------------------------------------
+
+    def _fill_missing_test_commands(
+        self,
+        contents: List[Dict[str, Any]],
+        failed_vps: List[Dict[str, Any]],
+        round_number: int,
+    ) -> Dict[str, str]:
+        """Re-ask the model for a ``test_command`` on rows that have none.
+
+        Mutates ``contents`` in place, stamping ``test_command`` and
+        ``test_command_source`` onto every row this loop rescues.
+        Returns ``{vp_id: command}`` for what it added.
+
+        Rows that arrive *with* a command are vetted here before the
+        loop starts, and a row whose command does not survive is cleared
+        so the loop picks it up like any other outstanding point. That
+        is deliberate: a command the model volunteered on the content
+        call is still the model's, and
+        :meth:`RepairTaskAssembler._resolve_test_command` takes a declared
+        command as already vetted, so the two checks that decide whether
+        a model-authored command is worth shipping
+        (:func:`test_command_quality.inspect_command`, then the RED
+        invariant in :meth:`_passes_falsifiability`) have to run on it
+        somewhere. This is that somewhere, and it is reached through
+        :meth:`_resolve_repair_test_command` — the same call the re-ask
+        path makes — so there is one rule rather than two that can drift
+        apart. Clearing rather than re-judging keeps the outcome on the
+        existing bounded-retry contract instead of introducing a second
+        way for a row to lose its command.
+
+        Why this runs here rather than in the assembler: only the
+        generator holds a ``coding_tool``. The assembler is local-code
+        by construction, and keeping the LLM call on this side preserves
+        that split — the assembler still stamps schema fields
+        deterministically and never talks to a model.
+
+        What makes a round's worth of retries affordable: every
+        outstanding point is asked about in **one** call per attempt, so
+        the cap is
+        :data:`MAX_TEST_COMMAND_FILL_ATTEMPTS` extra calls for the round
+        regardless of how many points are outstanding.
+
+        The loop stops as soon as a row is filled, so a round where the
+        model gets it right on the first re-ask costs one call. A row it
+        cannot rescue keeps ``test_command`` absent, and the assembler
+        labels it ``audit_style`` or ``missing`` — the loop is an
+        improvement, never a precondition for emitting the repair.
+        """
+        evidence_items = _evidence_items_from_failed_vps(failed_vps)
+        vp_by_id = {
+            str(vp.get("id")): vp for vp in failed_vps if vp.get("id")
+        }
+        plan_vps = self._verification_plan_points()
+
+        #: ``{vp_id: why the last answer was unusable}`` — fed back into
+        #: the next attempt so a retry is a correction, not a reroll.
+        reasons: Dict[str, str] = {}
+        filled: Dict[str, str] = {}
+
+        # Vet the commands that arrived on the content call, before any
+        # attempt is spent. A model that volunteers ``test_command``
+        # despite rule 5 of the content prompt gets it carried through
+        # verbatim by the parser, and the pending filter below skips any
+        # row that already has one — so without this pass such a command
+        # would reach the assembler, which takes a declared command as
+        # vetted, without either check having run on it.
+        #
+        # The verdict comes from ``_resolve_repair_test_command``, the same
+        # call the filter makes: ``"llm"`` means it passed the structural
+        # check and the pre-repair probe. Anything else means it did not,
+        # and the row is put back into the state a command-less row is in.
+        #
+        # A reason is recorded only for a row the loop will actually
+        # re-ask, and the loop's own pending filter is what decides
+        # that: a row the resolver still answers from a derived path is
+        # skipped there and the assembler picks that command up on its
+        # own. Recording a reason for such a row is not merely noise —
+        # the end-of-loop summary counts ``len(reasons)`` as "points we
+        # could not get a command for", so a point that *was* answered
+        # by a derivation and labelled normally by the assembler would
+        # be reported as a point that was not.
+        #
+        # Only ``single_evidence`` is reachable from here. The resolver's
+        # other derivation reads ``task["vp_id"]``, which a content row
+        # does not carry — it carries ``failed_vp_id`` — so a content
+        # row can only ever land on ``single_evidence``, ``llm`` or
+        # ``missing``. The VP's own command is resolved later and
+        # elsewhere, by
+        # :meth:`RepairTaskAssembler._resolve_test_command`, from
+        # ``vp_test_commands``.
+        for content in contents:
+            if not str(content.get("test_command") or "").strip():
+                continue
+            if self._resolve_repair_test_command(content, evidence_items)[1] == "llm":
+                continue
+            content["test_command"] = ""
+            content["test_command_source"] = ""
+            vp_id = str(content.get("failed_vp_id", "") or "")
+            print(
+                f"[Repair] Discarding the test_command the content call "
+                f"supplied for {vp_id or 'an unnamed VP'} — it did not "
+                f"survive the command-quality / falsifiability checks"
+            )
+            # The pending filter below re-resolves each command-less row,
+            # so that is the question to ask here rather than a
+            # look-alike: a row the filter will skip gets no reason,
+            # because the loop will never show it one.
+            will_be_asked = (
+                bool(vp_id)
+                and self._resolve_repair_test_command(
+                    content, evidence_items,
+                )[1] == "missing"
+            )
+            if vp_id and will_be_asked:
+                reasons[vp_id] = (
+                    "内容调用直接给出的命令未通过质量检查或修复前的可证伪性检查"
+                    "（结构检查不通过，或命令在修复之前就已经退出 0），已作废"
+                )
+
+        # One resumable session for this fill loop. Every attempt asks
+        # the same question — "give these outstanding points an
+        # acceptance command" — and the second attempt's prompt is the
+        # first one's plus the reason the last answer was unusable, so
+        # the model is correcting its own answer rather than re-rolling
+        # it. That holds for the batch, not per point: the call covers
+        # every outstanding point at once, and the loop is what repeats.
+        session = JsonSession()
+
+        for attempt in range(1, self.MAX_TEST_COMMAND_FILL_ATTEMPTS + 1):
+            pending: List[Dict[str, Any]] = []
+            for content in contents:
+                vp_id = str(content.get("failed_vp_id", "") or "")
+                if not vp_id or vp_id in filled:
+                    continue
+                if str(content.get("test_command") or "").strip():
+                    continue
+                if self._resolve_repair_test_command(
+                    content, evidence_items,
+                )[1] != "missing":
+                    # One of the derived paths already has an answer
+                    # (the VP's own command, or a single usable one
+                    # across the batch). The assembler picks those up on
+                    # its own; re-asking the model would only invite it
+                    # to contradict a command the plan already declares.
+                    continue
+                pending.append(content)
+            if not pending:
+                break
+
+            outstanding = [str(c.get("failed_vp_id")) for c in pending]
+            prompt = _build_test_command_fill_prompt(
+                [vp_by_id.get(vp_id, {}) for vp_id in outstanding],
+                plan_vps,
+                reasons,
+                attempt=attempt,
+                max_attempts=self.MAX_TEST_COMMAND_FILL_ATTEMPTS,
+                plan_dir=self.plan_dir,
+                project_dir=self.project_dir,
+            )
+            try:
+                response = query_json_in_session(
+                    self.coding_tool, session,
+                    prompt=prompt,
+                    system_instruction=TEST_COMMAND_FILL_SYSTEM_PROMPT,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A failed re-ask is not a failed repair. The rows keep
+                # whatever they had (nothing) and the assembler labels
+                # them; losing the fill loop is strictly better than
+                # losing the round.
+                print(
+                    f"[Repair] test_command fill attempt "
+                    f"{attempt}/{self.MAX_TEST_COMMAND_FILL_ATTEMPTS} "
+                    f"failed for {outstanding}: {exc}"
+                )
+                break
+
+            for content in pending:
+                vp_id = str(content.get("failed_vp_id"))
+                candidate = _extract_filled_test_command(response, vp_id)
+                if not candidate:
+                    reasons[vp_id] = "上轮没有为该验证点给出任何命令"
+                    continue
+                issues = inspect_command(candidate)
+                if issues:
+                    reasons[vp_id] = (
+                        f"命令未通过质量检查（{issues[0].code}）："
+                        f"{issues[0].detail}"
+                    )
+                    print(
+                        f"[Repair] Fill rejected a test_command for "
+                        f"{vp_id} ({issues[0].code}): {candidate[:120]}"
+                    )
+                    continue
+                if not self._passes_falsifiability(candidate):
+                    reasons[vp_id] = (
+                        "命令在修复之前就已经退出 0，无法区分「修好了」和"
+                        "「什么都没改」"
+                    )
+                    print(
+                        f"[Repair] Fill rejected a vacuous test_command "
+                        f"for {vp_id}: {candidate[:120]}"
+                    )
+                    continue
+                content["test_command"] = candidate
+                content["test_command_source"] = "llm_retry"
+                filled[vp_id] = candidate
+
+            if filled:
+                print(
+                    f"[Repair] test_command fill attempt "
+                    f"{attempt}/{self.MAX_TEST_COMMAND_FILL_ATTEMPTS} "
+                    f"rescued {len(filled)} VP(s): "
+                    f"{', '.join(sorted(filled))}"
+                )
+
+        if reasons and not filled:
+            print(
+                f"[Repair] no acceptance command obtained after "
+                f"{self.MAX_TEST_COMMAND_FILL_ATTEMPTS} fill attempt(s) "
+                f"for {len(reasons)} VP(s); the assembler will label them "
+                f"by category"
+            )
+        return filled
+
+    def _verification_plan_points(self) -> Dict[str, Dict[str, Any]]:
+        """``{vp_id: verification point}`` from the plan, or ``{}``.
+
+        Read only on the fill path, and only when a command is actually
+        missing — the content prompt deliberately does not inline plan
+        bodies, and this keeps that property.
+
+        The full declaration matters here because the method field is
+        the shape of the whole point: ``request`` + ``assertions`` tell
+        the model what the API contract *is*, which is the input a
+        runnable check can be written from. A retry prompt that omitted
+        them would just re-roll the same answer.
+        """
+        plan_file = self.plan_dir / "verification_plan.json"
+        try:
+            raw = json.loads(plan_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        points = raw.get("verification_points") if isinstance(raw, dict) else None
+        if not isinstance(points, list):
+            return {}
+        return {
+            str(p.get("id")): p
+            for p in points
+            if isinstance(p, dict) and p.get("id")
+        }
 
     #: Set ``PDT_DISABLE_FALSIFIABILITY_PROBE=1`` to skip the pre-repair
     #: probe. It runs each distinct candidate command as a subprocess, so
@@ -684,272 +628,6 @@ class RepairTaskGenerator:
         if not ok:
             print(f"[Repair] Falsifiability probe rejected a command: {detail}")
         return ok
-
-    def _generate_repair_tasks(
-        self,
-        requirement_context: Dict[str, Any],
-        evidence_items: List[Dict[str, Any]],
-        round_number: int
-    ) -> List[Dict[str, Any]]:
-        """
-        Step 3: Generate repair tasks based on requirement context and evidence.
-
-        Args:
-            requirement_context: Requirement context from Step 1
-            evidence_items: Requirement deviation evidence from Step 2
-            round_number: Current verification round number
-
-        Returns:
-            List of repair tasks
-        """
-        print("[Repair] Step 3: Generating repair tasks...")
-
-        if not evidence_items:
-            print("[Repair] No requirement deviations found, no repair tasks generated")
-            return []
-
-        # Heuristic pass: detect specific test_command failure patterns and
-        # emit deterministic repair tasks that bypass the LLM's "add more
-        # tests" bias. The LLM repeatedly misidentified "pytest collected 0
-        # items" as a missing-test problem and produced tasks that added or
-        # renamed tests instead of fixing the verification_plan.json -k filter.
-        deterministic_tasks = self._build_deterministic_repair_tasks(
-            evidence_items, round_number
-        )
-        if deterministic_tasks:
-            print(
-                f"[Repair] Generated {len(deterministic_tasks)} deterministic "
-                f"repair task(s) from heuristics"
-            )
-            return deterministic_tasks
-
-        # Get next task ID prefix for this round
-        next_id_prefix = self._get_next_repair_task_id(round_number)
-
-        # Build prompt for task generation (file-path based, no embedded content)
-        prompt = self._build_repair_task_prompt(evidence_items, next_id_prefix)
-
-        try:
-            result = self.coding_tool.query_json(
-                prompt=prompt,
-                system_instruction=REPAIR_SYSTEM_PROMPT,
-            )
-
-            tasks = result.get("tasks", [])
-
-            tasks = [t for t in tasks if isinstance(t, dict)]
-
-            # Ensure tasks have required fields and project_dir, and force the
-            # R{round}- prefix so the ID matches the current verification round
-            # regardless of what the LLM produced.
-            #
-            # 2026-09-16: ``test_command`` used to be filled
-            # with ``setdefault(..., "")``, so an LLM that omitted the field
-            # produced a task with no command at all — silently disabling the
-            # command-line half of the dual-signal completion rule. Such
-            # tasks ship with
-            # ``test_command = NULL``; the ones that "complete" do so on the
-            # subagent's self-report alone (``test_cross_verify_unverified``),
-            # which is exactly the single-signal mode the rule exists to
-            # prevent. See ``_resolve_repair_test_command`` for the fallbacks.
-            unverifiable: list[str] = []
-            derived: list[str] = []
-            for i, task in enumerate(tasks, 1):
-                task["id"] = f"{next_id_prefix}-{i}"
-                task.setdefault("status", "pending")
-                task.setdefault("updated_time", None)
-                task.setdefault("failure_reason", None)
-                task.setdefault("project_dir", str(self.project_dir))
-                command, source = self._resolve_repair_test_command(
-                    task, evidence_items,
-                )
-                task["test_command"] = command
-                # NOTE: the source is deliberately NOT written onto the task
-                # dict. ``PlanTaskRepository.add_task`` rejects any key outside
-                # ``ALLOWED_STATIC_TASK_FIELDS`` (there is no
-                # ``test_command_source`` column), so persisting it would break
-                # the single-writer path. It goes to the log instead.
-                if source == "missing":
-                    unverifiable.append(str(task["id"]))
-                elif source != "llm":
-                    derived.append(f"{task['id']}:{source}")
-
-            if derived:
-                print(
-                    f"[Repair] {len(derived)} repair task(s) got a derived "
-                    f"test_command (not LLM-authored): {derived}"
-                )
-
-            if unverifiable:
-                # Not fatal: the repair still needs to happen, and a task
-                # with no command degrades to the audit second pass rather
-                # than failing outright. But it must be visible — the
-                # previous behaviour was silent, which is why four tasks
-                # reached the executor unverifiable without anyone noticing.
-                print(
-                    f"[Repair] WARNING: {len(unverifiable)} repair task(s) "
-                    f"have no derivable test_command: {unverifiable}. "
-                    f"Completion will rely on the audit second pass."
-                )
-
-            print(f"[Repair] Generated {len(tasks)} repair tasks")
-            return tasks
-
-        except Exception as e:
-            print(f"[Repair] Error generating repair tasks: {e}")
-            # Fallback: generate simplified repair tasks directly from evidence
-            return self._generate_fallback_repair_tasks(evidence_items, next_id_prefix)
-
-    def _generate_fallback_repair_tasks(
-        self, evidence_items: List[Dict[str, Any]], id_prefix: str
-    ) -> List[Dict[str, Any]]:
-        """Generate simplified repair tasks directly from evidence when LLM fails."""
-        tasks = []
-        for i, evidence in enumerate(evidence_items, 1):
-            vp_id = evidence.get("vp_id", f"VP-{i}")
-            title = f"修复 {vp_id}: {evidence.get('actual_result', '验证失败')[:60]}"
-            tasks.append({
-                "id": f"{id_prefix}-{i}" if "-" not in id_prefix else f"{id_prefix.rsplit('-', 1)[0]}-{i}",
-                "title": title,
-                "description": (
-                    f"验证点 {vp_id} 失败。\n\n"
-                    f"**实际结果：** {evidence.get('actual_result', '未知')}\n\n"
-                    f"**证据：** {evidence.get('evidence', '无')}\n\n"
-                    f"请根据上述验证失败信息修复代码，确保验证点通过。"
-                ),
-                # 2026-09-16: ``.get(key, "pytest")`` returns ``""`` when the
-                # evidence item carries an EMPTY command (which happens
-                # whenever the verification point has none) — the default
-                # only fires when the key is absent. ``or`` is what the
-                # intent requires.
-                "test_command": evidence.get("test_command") or "pytest",
-                "status": "pending",
-                "updated_time": None,
-                "failure_reason": None,
-            })
-        if tasks:
-            print(f"[Repair] Fallback: generated {len(tasks)} simplified repair tasks")
-        return tasks
-
-    def _build_deterministic_repair_tasks(
-        self,
-        evidence_items: List[Dict[str, Any]],
-        round_number: int
-    ) -> List[Dict[str, Any]]:
-        """Pattern-match evidence to emit precise, LLM-free repair tasks.
-
-        The LLM agent has a strong bias toward "add/rename tests" when it sees
-        "0 tests selected". This pass catches the most common classes of
-        non-code failures up front so the loop doesn't waste tokens on a bad
-        repair suggestion.
-
-        Returns a list of repair tasks (possibly empty). When non-empty, the
-        caller short-circuits the LLM-driven path and uses these directly.
-        """
-        tasks: List[Dict[str, Any]] = []
-        next_id_prefix = self._get_next_repair_task_id(round_number)
-        idx = 0
-
-        import re as _re
-
-        for evidence in evidence_items:
-            vp_id = evidence.get("vp_id", "")
-            actual_result = evidence.get("actual_result", "") or ""
-            actual_evidence = evidence.get("evidence", "") or ""
-            original_cmd = evidence.get("test_command", "")
-            combined = (actual_result + "\n" + actual_evidence).lower()
-
-            idx += 1
-            task_id = (
-                f"{next_id_prefix}-{idx}" if "-" not in next_id_prefix
-                else f"{next_id_prefix.rsplit('-', 1)[0]}-{idx}"
-            )
-
-            # 2026-09-18：Pattern 1 / Pattern 2 已删除。它们分别让修复 agent
-            # 去改 `verification_plan.json` 里某条 VP 的 `-k` 关键字和
-            # shell 占位符 —— 也就是**改写验收判据本身**。
-            #
-            # 那次重构已经确认这是错的，有三层理由：
-            #   1. 违反 2026-09-18 的不可变原则：VP 的声明字段不许被改，
-            #      要变只能作废 + 新增（`verification_plan_delta` 里早就写着
-            #      "绝不修改已有验证点——标题、断言、test_command 都不许改"，
-            #      只有 repair 这一侧没遵守）；
-            #   2. 交付物是 this repository `plans/` 下的文件，在 `project_dir` 之外，
-            #      修复生成器给不出 project 相对路径 → `files_to_modify: []`
-            #      → 空 diff 门禁必然失败 → 强制拆分，而拆分又只能靠发明
-            #      项目侧产物来满足门禁（that plan
-            #      `tools/verify_vp_rust_case.py` 被"新建"了四次）；
-            #   3. VP 现在根本没有 test_command 了 —— 判定依据是 method 自己
-            #      的产物（api_test 的 request+assertions / code_review 的
-            #      citations / ui_validation 的 checkpoints）。
-            #
-            # 验收判据坏掉时的正确处理是：作废该 VP 并新增一条表达正确的，
-            # 而不是让被判分的对象去改判据。
-
-
-            # Pattern 3: binary stale (BLOCKED verdict). Detect via the
-            # ``binary stale`` keyword that ``FreshnessReport.detail`` and
-            # the BLOCKED verdict's ``actual_result`` both carry. Pull
-            # the rebuild command out of the evidence block so the
-            # suggested fix is concrete (cargo build vs maturin develop
-            # vs pytest refresh fixture).
-            #
-            # 2026-09-07: without this branch the deterministic
-            # repair-task generator emits 0 tasks for binary-stale VPs,
-            # the orchestrator hits ``no_repair_tasks`` and terminates
-            # the round as failed — leaving the operator with no
-            # actionable hint on how to fix the BLOCKED state.
-            is_binary_stale = (
-                "binary stale" in combined
-                or "binary_stale" in combined
-                or "binary_freshness" in actual_evidence.lower()
-            )
-            if is_binary_stale:
-                # Try to extract the rebuild command from the evidence
-                # JSON. The freshness payload embeds ``rebuild_command``
-                # for downstream automation.
-                rebuild_match = _re.search(
-                    r"rebuild[_\"']?\s*:?\s*?[\"']?([^\"'\n]{4,200})",
-                    actual_evidence + "\n" + actual_result,
-                    flags=_re.IGNORECASE,
-                )
-                suggested_rebuild = (
-                    rebuild_match.group(1).strip().rstrip(",}")
-                    if rebuild_match
-                    else "<run the project's documented rebuild command>"
-                )
-                tasks.append({
-                    "id": task_id,
-                    "title": f"修复 {vp_id} 的 binary stale 状态：重新编译/刷新 binary",
-                    "description": (
-                        f"## 背景\n"
-                        f"`{vp_id}` 触发了 binary_freshness 预检失败（BLOCKED verdict），binary 的 mtime 早于源码 mtime 或根本没编译。\n\n"
-                        f"**证据摘录 (actual_result):**\n```\n{actual_result[:600]}\n```\n\n"
-                        f"**底层类型:** `{evidence.get('vp_id', '')}`\n\n"
-                        f"## 目标\n"
-                        f"在 `{self.project_dir}` 项目根里运行 fresh rebuild，让 binary mtime ≥ source mtime，让 binary_freshness 预检 PASSED。\n\n"
-                        f"## 修复建议\n"
-                        f"运行（按 FreshnessReport 提供的命令，截断到第一行）：\n```\n{suggested_rebuild.splitlines()[0]}\n```\n\n"
-                        f"## TDD 规格\n"
-                        f"- rebuild 后 `stat -f '%Sm %N' <binary_path>` 的 mtime 必须在最新 source 文件 mtime 之后\n"
-                        f"- 同一 `{vp_id}` 在新一轮 verification 必须收到 `binary_freshness_pass` 而非 `binary_freshness_blocked`\n"
-                        f"- 不要修改 test_command — 这是 binary 层面的问题，不是测试命令的问题"
-                    ),
-                    "test_command": (
-                        f"cd {self.project_dir} && {suggested_rebuild.splitlines()[0]}"
-                    ),
-                    "status": "pending",
-                    "updated_time": None,
-                    "failure_reason": None,
-                    "project_dir": str(self.project_dir),
-                    "test_commands": [
-                        f"cd {self.project_dir} && {suggested_rebuild.splitlines()[0]}",
-                    ],
-                    "model_type": "small",
-                })
-                continue
-
-        return tasks
 
     def _get_next_repair_task_id(self, round_number: int) -> str:
         """Determine the next repair task ID prefix for a verification round."""
@@ -998,244 +676,23 @@ class RepairTaskGenerator:
 
         return tasks_file
 
-    def _build_repair_task_prompt(
-        self,
-        evidence_items: List[Dict[str, Any]],
-        next_id_prefix: str
-    ) -> str:
-        """Build prompt for repair task generation using file paths instead of embedded content.
-
-        The LLM uses Read/Grep tools to fetch only the relevant sections from
-        PRD, architecture, and verification documents.
-        """
-        parts = []
-
-        parts.append("请使用 Read 工具读取以下文件获取完整上下文：")
-        parts.append("")
-
-        if self.prd_file.exists():
-            parts.append(f"- PRD文档: {self.prd_file}")
-        elif self.prd_md_file.exists():
-            parts.append(f"- PRD文档: {self.prd_md_file}")
-
-        if self.arch_file.exists():
-            parts.append(f"- 架构设计文档: {self.arch_file}")
-
-        if self.test_file.exists():
-            parts.append(f"- 测试设计文档: {self.test_file}")
-
-        cache_file = self.plan_dir / "requirement_context.json"
-        if cache_file.exists():
-            parts.append(f"- 已提取的验收标准缓存: {cache_file}")
-
-        if self.verification_report_file.exists():
-            parts.append(f"- 验证报告: {self.verification_report_file}")
-
-        parts.append("")
-        parts.append("## 需求偏离摘要")
-        parts.append(f"共 {len(evidence_items)} 个需求偏离需要修复：")
-        parts.append("")
-
-        # Load requirement_deviations from verification report to get proper deviation descriptions
-        deviation_map = {}
-        try:
-            report = self.persistence.load_report()
-            if report:
-                for d in report.get("requirement_deviations", []):
-                    vp_id = d.get("verification_point_id", "")
-                    deviation_map[vp_id] = d
-        except Exception:
-            pass
-
-        for i, evidence in enumerate(evidence_items, 1):
-            vp_id = evidence.get('vp_id', 'unknown')
-            # Prefer requirement_deviations from verification report
-            deviation_info = deviation_map.get(vp_id, {})
-            deviation = deviation_info.get('description', evidence.get('actual_result', '未知偏离'))
-            severity = deviation_info.get('severity', 'medium')
-            parts.append(f"{i}. VP {vp_id} ({severity}): {str(deviation)[:200]}")
-
-        parts.append("")
-        parts.append("## 任务生成要求")
-        parts.append("")
-        parts.append(f"目标项目目录: {self.project_dir}")
-        parts.append(f"项目名称: {self.project_dir.name}")
-        parts.append("")
-        parts.append(f"起始任务ID: {next_id_prefix}")
-        parts.append("")
-        parts.append("请读取PRD和验证报告文件后，为每个需求偏离生成一个修复任务。")
-        parts.append("任务必须：")
-        parts.append("1. title 指向需求偏离点（而非技术错误）")
-        parts.append("2. description 包含完整的PRD验收标准引用、偏离证据、修复建议、TDD规格")
-        parts.append("3. test_command 能复现该需求偏离")
-        parts.append("4. **只修改目标项目代码，不要修改执行框架代码**")
-        parts.append("5. **test_command 应直接在项目目录下运行，不要包含 cd backend 等切换目录的前缀**")
-        parts.append("")
-        parts.append("## 重要：失败类型的修复目标选择")
-        parts.append("")
-        parts.append("请根据 evidence 中的 `actual_result` 字段判断失败类型，选择正确的修复目标：")
-        parts.append("- **代码逻辑失败**（如 assertion 失败、TypeError、空指针等）→ 修改 `project_dir` 下的源代码或测试代码")
-        parts.append("- **验收判据本身写错了**（如期望值填错、断言不成立）→ 这是 **VP 的问题，不是源码的问题**。修复任务应该改源码让断言成立；如果确实是判据写错了，正确做法是**作废该 VP 并新增一条**，而不是原地改写（2026-09-18：VP 的声明字段不可变）")
-        parts.append("- **配置缺失**（如缺失依赖、缺环境变量、缺 fixture）→ 修改项目配置文件或新增 fixture")
-        parts.append("- **需求描述不清**（PRD 写得不具体导致实现偏离）→ 修改 `prd.json` 中的对应验收标准")
-        parts.append("")
-        parts.append("判断依据：`evidence` / `assertions_failed` 里会直接给出**期望值与实际值**。照着它去改源码，不要去改判据。")
-
-        return "\n".join(parts)
-
-    # -----------------------------------------------------------------------
-    # Full Workflow
-    # -----------------------------------------------------------------------
-
-    def generate_verification_tasks(self, round_number: int) -> Tuple[Path, int]:
-        """
-        Run complete three-step repair task generation workflow and save to a
-        dedicated verification tasks file.
-
-        Args:
-            round_number: Current verification round number (used in filename).
-
-        Returns:
-            (file_path, number_of_tasks_generated)
-        """
-        print(f"[Repair] Starting requirement-driven repair task generation for round {round_number}...")
-
-        # Step 1: Understand requirements
-        requirement_context = self.understand_requirements()
-
-        # Step 2: Collect failure evidence
-        evidence_items = self.collect_failure_evidence(requirement_context)
-
-        # Step 3: Generate repair tasks
-        repair_tasks = self._generate_repair_tasks(requirement_context, evidence_items, round_number)
-
-        if not repair_tasks:
-            print("[Repair] No repair tasks generated")
-            return self._get_verification_tasks_file(round_number), 0
-
-        # Save to dedicated verification tasks file
-        tasks_file = self._save_verification_tasks(repair_tasks, round_number)
-
-        print(f"[Repair] Successfully saved {len(repair_tasks)} repair tasks to {tasks_file.name}")
-        return tasks_file, len(repair_tasks)
-
-    def _save_verification_tasks(self, repair_tasks: List[Dict[str, Any]], round_number: int) -> Path:
-        """Save repair tasks to a dedicated verification tasks file."""
-        tasks_file = self._get_verification_tasks_file(round_number)
-        tasks_data = {
-            "requirement": f"Verification repair tasks - Round {round_number}",
-            "verification_round": round_number,
-            "generated_at": datetime.now().isoformat(),
-            "tasks": repair_tasks
-        }
-        with open(tasks_file, "w", encoding="utf-8") as f:
-            json.dump(tasks_data, f, indent=2, ensure_ascii=False)
-        return tasks_file
-
-    def generate_and_append_tasks(self, round_number: int = 1) -> int:
-        """Convenience wrapper used by tests: returns just the task count.
-
-        Performs the same three-step workflow as
-        :meth:`generate_verification_tasks` and additionally writes a
-        mirror copy of the result to ``project_dir / tasks.json`` (the
-        legacy path that older test code and external tooling still
-        reads). The mirror is APPENDED to any existing tasks (the
-        executor's TaskManager keeps a long-lived tasks.json that
-        pre-existing implementation tasks live in) — never overwrites
-        them. Returns the number of repair tasks generated.
-
-        The orchestrator-facing path is :meth:`generate_verification_tasks`,
-        which returns ``(tasks_file, count)``; this wrapper collapses to
-        just the count for tests that only care about the integer.
-
-        Args:
-            round_number: Verification round number. Defaults to 1.
-
-        Returns:
-            The number of repair tasks generated (0 if none).
-        """
-        tasks_file, task_count = self.generate_verification_tasks(round_number)
-
-        if task_count > 0:
-            # Read back the just-written round file, then APPEND its
-            # repair tasks to the legacy tasks.json (TaskManager-readable).
-            try:
-                with open(tasks_file, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                repair_tasks = payload.get("tasks", [])
-                self._append_to_tasks_json(repair_tasks)
-            except Exception:
-                # Mirror is best-effort: a failure here must not mask
-                # the round-file write, which is the source of truth.
-                pass
-
-        return task_count
-
 
 # ---------------------------------------------------------------------------
-# Convenience Functions
-# ---------------------------------------------------------------------------
-
-def generate_repair_tasks(
-    plan_id: str,
-    project_dir: str,
-    plan_base_dir: Optional[str] = None,
-    coding_tool: Optional[CodingTool] = None,
-    round_number: int = 1
-) -> Tuple[Path, int]:
-    """
-    Convenience function to generate repair tasks for a plan.
-
-    Args:
-        plan_id: Plan identifier
-        project_dir: Project directory
-        plan_base_dir: Base directory for plans (defaults to ../plans)
-        coding_tool: Optional coding tool (defaults to ClaudeCodingTool)
-        round_number: Current verification round number
-
-    Returns:
-        (file_path, number_of_tasks_generated)
-    """
-    if plan_base_dir is None:
-        # 2026-09-13: ``PDT_PLANS_DIR``-aware (see
-        # ``config_paths.resolve_plans_dir``) so a test that generates
-        # repair tasks for a fixture plan_id does not create directories
-        # in the operator's live plans tree.
-        plan_base_dir = resolve_plans_dir()
-    else:
-        plan_base_dir = Path(plan_base_dir)
-
-    plan_dir = plan_base_dir / plan_id
-
-    if coding_tool is None:
-        from coding_tool import ClaudeCodingTool
-        # 2026-09-13 provider routing: repair-task generation is a
-        # high-stakes replanning step — route via the strong tier.
-        coding_tool = ClaudeCodingTool(scene="repair_generation")
-
-    generator = RepairTaskGenerator(coding_tool, plan_dir, Path(project_dir))
-    return generator.generate_verification_tasks(round_number)
-
-
-# ---------------------------------------------------------------------------
-# Single-call content flow (2026-09-07 plan)
+# Single-call content flow
 # ---------------------------------------------------------------------------
 #
 # Why this block exists
 # ----------------------
-# The legacy :meth:`RepairTaskGenerator.generate_verification_tasks` runs
-# three independent LLM calls — understand_requirements, then
-# collect_failure_evidence, then _generate_repair_tasks — and the
-# middle step asks the LLM to *re-derive* the failure from PRD context
-# rather than reading the on-disk ``verification_report.json`` directly.
-# The net effect was that ``repair_tasks`` came back empty for any plan
-# whose evidence chain didn't perfectly line up with PRD criteria, and
-# the orchestrator's ``no_repair_tasks`` branch then terminated the
-# auto-loop as failed — leaving the plan stuck in
+# The requirement-driven chain this module grew out of asked the model to
+# re-derive each failure from PRD context instead of reading the on-disk
+# ``verification_report.json``. ``repair_tasks`` then came back empty for
+# any plan whose evidence chain did not line up with the PRD's own
+# wording, and the orchestrator's ``no_repair_tasks`` branch terminated
+# the auto-loop as failed — leaving the plan stuck in
 # ``verification_failed`` with no path forward.
 #
-# This block replaces that flow with a single LLM call that produces
-# *content* only (``title``, ``description``, ``acceptance_criteria``,
+# This flow replaces it with a single LLM call that produces *content*
+# only (``title``, ``description``, ``acceptance_criteria``,
 # ``failed_vp_id``), while :class:`RepairTaskAssembler` stamps the
 # schema-stable tags locally (``id``, ``task_group``, ``priority``,
 # ``depends_on``, ``status``). The state machine can therefore trust
@@ -1265,6 +722,48 @@ REPAIR_CONTENT_SYSTEM_PROMPT = """你是一位资深技术架构师，专注于�
 4. **不要去改验收判据。** VP 的 `request` / `assertions` / `target_url` 等声明字段是不可变的 —— 它们是"被测对象"，不是"可调参数"。修复任务的职责永远是改**源码**去满足判据。判据确实写错时，正确做法是作废该 VP 并新增一条表达正确的（见 `verification_plan_delta` 的"绝不修改已有验证点"）。
 5. `files_to_modify` 必须是**相对项目根目录**的路径（不要绝对路径、不要 `..`）。修复任务的验收命令由系统自动带上，你不需要产出 test_command。路径拿不准时给出你最可能改动的那个文件，不要编造不存在的深层目录。
 6. 只输出 JSON，不要 markdown 代码块标记。
+"""
+
+
+#: System prompt for the bounded fill loop
+#: (:meth:`RepairTaskGenerator._fill_missing_test_commands`).
+#:
+#: It is a *different question* from :data:`REPAIR_CONTENT_SYSTEM_PROMPT`
+#: on purpose. That prompt asks for narrative about a failure and
+#: explicitly disclaims ``test_command`` (rule 5), because a command for
+#: the repair belongs to the plan. This one asks only for the command,
+#: and is only sent for verification points that turned out to have no
+#: command the framework could reuse — the case the disclaimer above
+#: leaves uncovered.
+TEST_COMMAND_FILL_SYSTEM_PROMPT = """你是一位资深工程师，为**已经写好的修复任务**补一条验收命令。
+
+背景：修复任务的内容（title / description / acceptance_criteria / files_to_modify）
+已经生成完毕，现在只缺一条验收命令。
+
+**严格输出 JSON**：
+{
+  "commands": [
+    {"failed_vp_id": "VP-009", "test_command": "pytest -q tests/test_x.py::test_y"}
+  ]
+}
+
+**这条命令的语义**：修复**正确**时它必须退出 0；修复**没做**时它必须非 0。
+它不是复现失败用的，是**验收**用的 —— 所以它要指向修复后的行为，
+而不是"当前是坏的"这个状态本身。
+
+**硬性要求**：
+1. 每个 `failed_vp_id` 必须出现，且**只出现一次**。
+2. 在**项目根目录**下直接运行；不要 `cd backend`、`cd ~/...` 这类前缀。
+3. 不要写只有 `ls` / `cat` / `grep` 的探测链 —— 它对修复与否都退出 0，验不出任何东西。
+4. 不要写打印常量、比较字面量、或任何恒真的断言。
+5. 命令必须**现在就会失败**。如果它在当前（尚未修复的）代码上已经退出 0，
+   它证明不了修复是否生效，会被框架拒绝。
+6. `api_test` 类验证点：如果该 API 有对应测试就调用那条测试；没有就写一条
+   能打到该契约的真实请求（例如 curl 打到该服务并断言关键字段）。
+7. 如果某条验证点**本质上不可能**有可执行命令（例如它的交付物是一份
+   citations.json 审查结论），就**不要为它编一条命令**—— 宁可少给一条，
+   也不要给一条恒真的假命令。恒真的假命令会把"修好了"显示成"没修也过"。
+8. 只输出 JSON，不要 markdown 代码块标记。
 """
 
 
@@ -1379,6 +878,45 @@ def cross_store_task_conflicts(
     return conflicts
 
 
+#: The ``verification_method`` values whose **declared deliverable is an
+#: evidence artifact** — a findings document the framework then checks —
+#: rather than a command that can be replayed or a code diff.
+#:
+#: This is the criterion :meth:`RepairTaskAssembler._is_audit_style_repair`
+#: uses, and it is read straight off the plan's own method table
+#: (``prompts``' verification-perspective table): ``api_test`` is judged
+#: from ``request`` + ``assertions``, which the framework executes
+#: deterministically; ``code_review`` is judged from a ``citations.json``
+#: (file / line / verbatim text) and ``ui_validation`` from a
+#: ``checkpoints.json`` (selector / expected / actual). The last two are
+#: findings someone reads. No shell command reproduces them, which is
+#: exactly why :meth:`RepairTaskAssembler._api_replay_command` returns
+#: ``""`` for them and no other method can fill the gap.
+#:
+#: Deliberately a **positive** whitelist. A method this list does not
+#: name is "we do not know what this deliverable is", which is a
+#: different statement from "this task needs no command", and the two
+#: must not be merged — see the two-sentinel rationale in
+#: ``backend/task.py``. Anything unrecognised lands on the
+#: ``"missing"`` source, which is still emitted, so the cost of guessing
+#: wrong is a mislabelled row and never a silent completion.
+#:
+#: Note what is deliberately *not* used here: the keyword list
+#: ``agent._AUDIT_TASK_KEYWORDS``. It cannot work on this input —
+#: ``agent._looks_like_audit_task`` short-circuits to ``False`` for any
+#: repair task (its own post-mortem records why: the keywords 定位 / 复跑 /
+#: 不变量 occur naturally in a repair brief), so a copy of that list
+#: would classify nothing while appearing to classify something.
+AUDIT_STYLE_VERIFICATION_METHODS = frozenset({"code_review", "ui_validation"})
+
+#: Distinguishes "the plan has not been read yet" from "the plan holds no
+#: verification points", which are different answers — the second is a
+#: real, cacheable result. A plain ``None`` default cannot express that,
+#: and re-reading the plan once per row would turn a batch into
+#: filesystem traffic.
+_UNSET: Any = object()
+
+
 class RepairTaskAssembler:
     """Local-code task object assembler.
 
@@ -1420,6 +958,37 @@ class RepairTaskAssembler:
         That is deliberate: the number is an identity, not a label.
     """
 
+    #: Where an assembled task's ``test_command`` came from. Recorded in
+    #: :attr:`test_command_sources` and echoed to the log, because the
+    #: sources carry different confidence and an operator reading a run
+    #: needs to tell them apart.
+    #:
+    #: The first four are *commands*: the row was resolved to something
+    #: runnable. The last two are *absences*, and the pair is
+    #: deliberately kept apart rather than merged — see below.
+    #:
+    #:   ``llm``         — the content dict carried a model-authored command
+    #:   ``llm_retry``   — ...produced by the bounded fill loop
+    #:                     (:data:`RepairTaskGenerator.MAX_TEST_COMMAND_FILL_ATTEMPTS`)
+    #:   ``vp``          — the VP's own ``evidence_command``
+    #:   ``api_replay``  — derived: replays the VP's request + assertions
+    #:   ``audit_style`` — **no command, and this class of task needs none**
+    #:                     (see :data:`AUDIT_STYLE_VERIFICATION_METHODS`)
+    #:   ``missing``     — **no command, and we do not know that none is
+    #:                     needed** — the fill loop ran out of attempts
+    #:
+    #: The last two are the same two-value split ``backend/task.py``
+    #: makes with ``NO_FILE_CHANGES_SENTINEL`` and
+    #: ``UNKNOWN_MODIFICATIONS_SENTINEL``: a task that declared itself
+    #: read-only is not a task whose file list nobody filled in, and the
+    #: framework keeps them distinguishable for exactly the reason that
+    #: post-mortem gives — conflating "declared" with "unknown" is what
+    #: turns one into a silent failure of the other.
+    #:
+    ASSEMBLER_TEST_COMMAND_SOURCES = (
+        "llm", "llm_retry", "vp", "api_replay", "audit_style", "missing",
+    )
+
     def __init__(
         self,
         round_number: int,
@@ -1446,13 +1015,95 @@ class RepairTaskAssembler:
         # assembler receives only carry a *bounded summary* of the command
         # plus a JSON-pointer path, neither of which is runnable — so the
         # orchestrator hands the raw map in separately.
+        #
+        # 2026-10-11: the values come from the plan's ``evidence_command``
+        # key (legacy alias ``test_command``), not from a key named
+        # ``test_command`` — see
+        # ``verification.verification_report_reader._vp_runnable_command``.
         self.vp_test_commands: Dict[str, str] = dict(vp_test_commands or {})
+        # Generation-time counters. Each one is bumped by
+        # :meth:`assemble` next to a single greppable log event, so
+        # "this round repaired nothing" / "this round repaired things it
+        # cannot check" is a number an operator can read instead of an
+        # inference.
+        #
+        #   ``dropped_empty_files_to_modify`` → ``repair_task_dropped_empty_files_to_modify``
+        #   ``unverifiable_no_test_command``   → ``repair_task_unverifiable_no_test_command``
+        #
+        # The second is a *count of degraded tasks*, not of refusals: a
+        # row with no command is still emitted. See :meth:`assemble`.
+        self.dropped_empty_files_to_modify: int = 0
+        self.unverifiable_no_test_command: int = 0
+        #: How many times the bounded fill loop re-asked the model for an
+        #: acceptance command before this assembler gave up on the row.
+        #: Read back by operators from the per-round log line to tell
+        #: "the model never produced one" from "we only asked once".
+        self.test_command_fill_attempts: int = 0
+        #: ``{task_id: source}`` for the tasks this batch emitted,
+        #: using :data:`ASSEMBLER_TEST_COMMAND_SOURCES` as the vocabulary
+        #: — the assembler's counterpart to the generator's
+        #: ``test_command_source``. It lives on the assembler rather than
+        #: on the task dict because ``PlanTaskRepository.add_task``
+        #: rejects any key outside ``ALLOWED_STATIC_TASK_FIELDS``.
+        self.test_command_sources: Dict[str, str] = {}
         # Used only to build the "was the plan entry actually changed?"
         # guard command for repairs whose target is the plan file itself.
         self.plan_path: str = str(plan_path or "")
+        #: Lazy cache for :meth:`_plan_points`. ``_UNSET`` until first read.
+        self._plan_points_cache: Any = _UNSET
 
     def assemble(self, contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Stamps schema-stable fields onto each content dict.
+
+        One generation-time gate runs here, after
+        :meth:`_resolve_files_to_modify` / :meth:`_resolve_test_command`
+        have had their say and before anything is handed back:
+
+        * ``files_to_modify`` resolves to ``[]`` → the task is **dropped**
+          (``repair_task_dropped_empty_files_to_modify``).
+
+        An empty ``test_command`` is **not** a gate; see the block at
+        the decision point below for why, and for the two ways out
+        (regenerate, then accept-by-category).
+
+        Why refuse rather than warn there: an empty ``files_to_modify``
+        is read as "touch nothing" by
+        ``agent._declared_modification_files``, so the task has no
+        declared blast radius at all. A whole batch can carry exactly
+        that shape and still be dispatched task by task, so nothing
+        upstream would have caught it.
+
+        ``files_to_modify`` being mandatory is also what makes the
+        within-batch parallelism safe now that
+        :meth:`_infer_depends_on` no longer chains the batch:
+        ``agent._build_micro_layers`` derives its conflict graph from
+        ``files_to_modify``, so two repairs touching the same file get
+        serialised into different micro layers — but only if that field
+        is populated. A ``[]`` reads as "no declared files" and gives the
+        conflict graph nothing to work with.
+
+        ``test_command`` resolving to ``""`` is **not** a gate. It used
+        to be, and the refusal turned out to be structural rather than
+        situational: a verification point written as a declarative API
+        test (``verification_method: api_test`` plus ``request`` /
+        ``assertions``) carries no ``test_command`` string anywhere, so
+        *every* repair task derived from such a VP was refused — the
+        round repaired nothing while the generation step reported a
+        plausible-looking count of refused rows. A verification point is
+        not a shell command, and lacking one is not evidence against
+        repairing the failure it describes. Such a task is emitted with
+        ``test_command=""``, counted in
+        ``unverifiable_no_test_command`` and logged as
+        ``repair_task_unverifiable_no_test_command``: the risk is real
+        (the completion rule degrades to "believe the sub-agent",
+        ``agent._cross_verify`` → ``test_cross_verify_unverified``), so
+        it stays visible — but a weaker check beats no repair.
+
+        This gate does not paper over the loss of coverage — a rejected
+        task means that VP gets no repair this round. That consequence is
+        booked and surfaced by the caller
+        (``verification_loop`` refuses to start another verification
+        round over an undrained repair queue) rather than absorbed.
 
         Args:
             contents: Output of
@@ -1467,7 +1118,11 @@ class RepairTaskAssembler:
             ``round``, ``status``, ``test_command``,
             ``files_to_modify``).
 
-            Empty list if ``contents`` is empty.
+            Empty list if ``contents`` is empty, or if every row was
+            refused by the ``files_to_modify`` gate (see
+            ``dropped_empty_files_to_modify``). A row with no
+            ``test_command`` is *not* on that path — it is emitted and
+            counted in ``unverifiable_no_test_command``.
         """
         if not contents:
             return []
@@ -1508,16 +1163,99 @@ class RepairTaskAssembler:
                 exec_group = int(content.get("execution_group_hint", 0) or 0)
             except (TypeError, ValueError):
                 exec_group = 0
-            emitted_seq += 1
             acceptance_criteria = str(
                 content.get("acceptance_criteria", "") or ""
             ).strip()
-            test_command = self._resolve_test_command(
-                failed_vp_id, description, acceptance_criteria,
+            test_command, test_command_source = self._resolve_test_command(
+                failed_vp_id, content,
             )
             files_to_modify = self._resolve_files_to_modify(content)
+
+            # --------------------------------------------------------------
+            # 2026-10-11 generation-time gates. Both run BEFORE ``emitted_seq``
+            # is bumped, so a refused row consumes no id and the returned
+            # list's ids stay contiguous over the tasks actually emitted
+            # (a gap would read as "a task vanished", which is the exact
+            # failure mode these gates exist to stop repeating silently).
+            # --------------------------------------------------------------
+            if not files_to_modify:
+                self.dropped_empty_files_to_modify += 1
+                self._log_dropped(
+                    "repair_task_dropped_empty_files_to_modify",
+                    failed_vp_id, title,
+                    reason=(
+                        "no files_to_modify resolved — the task would be "
+                        "dispatched with no declared blast radius"
+                    ),
+                )
+                continue
+            # ``test_command`` is NOT a gate. It was one, and the refusal
+            # turned out to be structural rather than situational: a plan
+            # whose verification points are declarative API tests carries
+            # no ``test_command`` string on any VP, so the model is never
+            # asked for one, the VP path has nothing to return and the
+            # single-evidence path has zero usable commands rather than
+            # one. Every derived task then died here, the round repaired
+            # nothing, and the generation step reported a plausible
+            # count of refusals rather than an error.
+            #
+            # The two ways out are tried in order, and neither is
+            # "discard":
+            #
+            #   A. Regenerate. :meth:`RepairTaskGenerator.generate_repair_contents`
+            #      already re-asked the model, up to
+            #      :data:`MAX_TEST_COMMAND_FILL_ATTEMPTS` times, carrying the
+            #      reason the previous attempt was unusable. A command
+            #      found that way arrives on the content dict and is
+            #      picked up above as the ``llm_retry`` source.
+            #   B. Accept by category. What remains is a task whose
+            #      deliverable is a findings document rather than a
+            #      replayable command — see
+            #      :meth:`_is_audit_style_repair`. It is labelled and
+            #      emitted, not discarded.
+            #
+            # What this costs, stated plainly: a task that reaches the
+            # executor with no command has no second *objective* signal,
+            # so its verdict is the sub-agent's claim plus an independent
+            # adversarial review. That is a weaker check, and it is why
+            # the degradation is counted (``unverifiable_no_test_command``)
+            # and logged rather than absorbed. It is not, however, the
+            # single-signal mode the dual-criterion rule exists to
+            # prevent: ``agent._audit_task_second_pass`` routes every task
+            # without a runnable command through a fresh adversarial
+            # ``claude -p`` review, and that review can veto the
+            # completion. A repair round that emits nothing cannot
+            # converge at all.
+            if not test_command:
+                self.unverifiable_no_test_command += 1
+                self._log_emitted(
+                    "repair_task_unverifiable_no_test_command",
+                    failed_vp_id, title,
+                    reason=(
+                        "no test_command resolved and the fill loop is "
+                        "exhausted; emitting the repair with an empty "
+                        "command, judged by cross_verify + the adversarial "
+                        "second pass"
+                        if test_command_source == "missing"
+                        else
+                        "no test_command resolved; this verification "
+                        "method's deliverable is an evidence artifact, so "
+                        "the task is emitted as audit-style and judged by "
+                        "cross_verify + the adversarial second pass"
+                    ),
+                    source=test_command_source,
+                )
+
+            emitted_seq += 1
+            task_id = f"repair-r{self.round}-{emitted_seq:02d}"
+            # The source is booked on the assembler rather than on the task
+            # dict: ``PlanTaskRepository.add_task`` rejects any key outside
+            # ``ALLOWED_STATIC_TASK_FIELDS`` and there is no
+            # ``test_command_source`` column. Same reason the generator
+            # keeps its sources out of the task dict.
+            self.test_command_sources[task_id] = test_command_source
             tasks.append({
-                "id": f"repair-r{self.round}-{emitted_seq:02d}",
+                "id": task_id,
                 "task_group": f"repair-round-{self.round}",
                 "execution_group": exec_group,
                 "priority": priority,
@@ -1531,6 +1269,10 @@ class RepairTaskAssembler:
                 # command at all — which made the dual-criterion completion
                 # rule silently degrade to "trust the AI claim" (see
                 # ``agent._cross_verify`` → ``test_cross_verify_unverified``).
+                # ``files_to_modify`` is still a hard gate above. An empty
+                # ``test_command`` is emitted and labelled instead, because
+                # a verification point is not a shell command and lacking one
+                # is no evidence against repairing the failure it describes.
                 "test_command": test_command,
                 "files_to_modify": files_to_modify,
                 "failed_vp_id": failed_vp_id,
@@ -1538,6 +1280,149 @@ class RepairTaskAssembler:
                 "status": "pending",
             })
         return tasks
+
+    def _plan_points(self) -> Dict[str, Dict[str, Any]]:
+        """``{vp_id: verification point}`` from the plan, or ``{}``.
+
+        Loaded once per assembler, lazily, and only from code paths that
+        actually need a plan-side field.
+
+        Why this exists at all: the ``failed_vps`` dicts this assembler
+        is handed come from the verification *report* side, and those
+        entries carry ``id`` / ``title`` / ``priority`` /
+        ``actual_result`` / ``evidence`` plus — when the plan had one —
+        ``test_command`` and ``expected_result``. They do **not** carry
+        ``verification_method``. So a classifier reading
+        ``verification_method`` off a failed-VP dict classifies nothing
+        and says so with total confidence: every point reads as
+        "unrecognised method". That is the same shape as the
+        ``evidence_command`` / ``test_command`` split this module's
+        comments keep returning to — a reader that checks one key name
+        and concludes the field is absent.
+
+        The plan is the authority for what a verification point *is*, so
+        it is read from there. A missing or unreadable plan yields
+        ``{}`` and both callers fall back to their "unknown" answers,
+        which is the safe direction for each.
+        """
+        if self._plan_points_cache is not _UNSET:
+            return self._plan_points_cache
+        points: Dict[str, Dict[str, Any]] = {}
+        if self.plan_path:
+            try:
+                raw = json.loads(
+                    Path(self.plan_path).read_text(encoding="utf-8"),
+                )
+            except (OSError, ValueError):
+                raw = None
+            listed = (
+                raw.get("verification_points") if isinstance(raw, dict) else None
+            )
+            if isinstance(listed, list):
+                points = {
+                    str(p.get("id")): p
+                    for p in listed
+                    if isinstance(p, dict) and p.get("id")
+                }
+        self._plan_points_cache = points
+        return points
+
+    def _vp_verification_method(self, failed_vp_id: str) -> str:
+        """The VP's declared ``verification_method``, lowercased, or ``""``.
+
+        Report-side entry first (a caller that *does* pass the field
+        wins), then the plan. The two-key lookup mirrors the
+        report-side reader's own ``verification_method`` / ``method``
+        alias pair, so a point written either way classifies the same.
+        """
+        entry = self.failed_vps.get(str(failed_vp_id)) or {}
+        method = str(
+            entry.get("verification_method") or entry.get("method") or "",
+        ).strip().lower()
+        if method:
+            return method
+        point = self._plan_points().get(str(failed_vp_id)) or {}
+        return str(
+            point.get("verification_method") or point.get("method") or "",
+        ).strip().lower()
+
+    def _is_audit_style_repair(self, failed_vp_id: str) -> bool:
+        """True when this VP's declared deliverable is a findings document.
+
+        The question this answers is narrow on purpose: *does this class
+        of task have an acceptance command at all?* It is not "is this
+        repair difficult" and not "is the task worth doing".
+
+        The basis is the VP's own ``verification_method`` — the plan
+        author's declaration of what the deliverable is — against the
+        positive whitelist in :data:`AUDIT_STYLE_VERIFICATION_METHODS`.
+        Two reasons for that axis and not another:
+
+        * It is **author-declared**, so it does not depend on parsing
+          prose. Anything inferred from the title or description can be
+          wrong in a way that is invisible after the fact, and a wrong
+          "this needs no command" is the one guess that silently
+          weakens a completion check.
+        * It is the **same axis** :meth:`_api_replay_command` already
+          branches on, so the two halves of this class agree by
+          construction: ``api_test`` gets a replay command and is never
+          audit-style; the artifact methods get neither, and say so.
+
+        Returns ``False`` for every unrecognised method. That is the
+        conservative direction the caller needs: a false negative costs
+        one retry round (the fill loop has already run, so it costs one
+        extra LLM call), whereas a false positive files a task that
+        could have been verified under the label "needs no command".
+        Either way the row is still emitted — this method chooses the
+        *label*, never whether the task exists.
+        """
+        return self._vp_verification_method(failed_vp_id) in (
+            AUDIT_STYLE_VERIFICATION_METHODS
+        )
+
+    def _log_dropped(
+        self, event: str, failed_vp_id: str, title: str, reason: str,
+    ) -> None:
+        """Emit one greppable, per-round-countable refusal record.
+
+        The event name is the grep anchor (``repair_task_dropped_*``); the
+        line carries the round so refusals can be tallied per round, and
+        the offending ``failed_vp_id`` + title so an operator can go read
+        that VP's evidence and decide whether to re-run the round by hand.
+
+        Uses ``print`` rather than a module logger because
+        ``repair_generator`` is imported by the orchestrator in contexts
+        that do not set one up — the existing round/id diagnostics at the
+        assembly site already do the same.
+        """
+        print(
+            f"[Repair] {event} round={self.round} "
+            f"failed_vp_id={failed_vp_id} title={title!r} reason={reason}"
+        )
+
+    def _log_emitted(
+        self, event: str, failed_vp_id: str, title: str, reason: str,
+        source: str = "",
+    ) -> None:
+        """Emit one greppable record for a task that went out unchecked.
+
+        The counterpart to :meth:`_log_dropped`, and the distinction is
+        the whole point: ``repair_task_dropped_*`` means a row never
+        reached the executor, ``repair_task_unverifiable_*`` means one
+        did and its completion rests on a weaker pair of signals. Both
+        are countable per round, so "this round repaired nothing" and
+        "this round repaired things it cannot objectively check" read as
+        two different numbers instead of the same silence.
+
+        ``source`` carries the value from
+        :data:`ASSEMBLER_TEST_COMMAND_SOURCES`, so a tally can also be
+        broken down by how the row came to have no command.
+        """
+        print(
+            f"[Repair] {event} round={self.round} "
+            f"failed_vp_id={failed_vp_id} title={title!r} "
+            f"source={source} reason={reason}"
+        )
 
     # ------------------------------------------------------------------
     # Command + file-scope resolution (2026-09-14)
@@ -1549,30 +1434,86 @@ class RepairTaskAssembler:
     # the legacy deterministic builder.
 
     def _resolve_test_command(
-        self, failed_vp_id: str, description: str, acceptance_criteria: str,
-    ) -> str:
-        """The command that must exit 0 for this repair to count as done.
+        self, failed_vp_id: str, content: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """``(command, source)`` for this repair — ``""`` is a legal answer.
 
-        Three cases, in order:
+        The command that must exit 0 for this repair to count as done,
+        plus which of :data:`ASSEMBLER_TEST_COMMAND_SOURCES` produced it.
+        A command that does not resolve is no longer a refusal; the two
+        *absences* it can be are reported as distinct sources
+        (``audit_style`` vs ``missing``) and handled by
+        :meth:`assemble`.
 
-        1. **No command for this VP** — nothing to run. The task still
-           gets an empty command rather than a fabricated one; F3's
-           executor-side warning (``test_cross_verify_unverified``) is
-           what stops that from silently counting as a verified pass.
-        2. **The VP's own command is the thing being repaired** — the
-           repair rewrites ``verification_plan.json``, so re-running the
-           *old* string would fail even on a correct repair. Emit a guard
-           that re-reads the VP's command at run time and exits 0 only
-           once it differs from the broken one.
-        3. **Ordinary repair** — the VP's command verbatim. Re-running it
-           is exactly the proof that the deviation is gone.
+        Four cases, in order:
+
+        1. **The content dict carries a command** — the model produced one
+           and it survived :meth:`RepairTaskGenerator._resolve_repair_test_command`'s
+           quality and falsifiability checks, either on the first
+           content call or in the bounded fill loop. Source ``llm`` /
+           ``llm_retry``.
+        2. **The VP has a command** — return it verbatim. Re-running it is
+           exactly the proof that the deviation is gone. "The VP's
+           command" means its ``evidence_command`` (with ``test_command``
+           as the legacy alias) as resolved by
+           :func:`~verification.verification_report_reader.extract_vp_test_commands`.
+           It is still a *declared* command, so it is held to
+           :func:`test_command_quality.inspect_command` before it is
+           returned; a rejection falls through to case (3) rather than
+           shipping a chain that can only exit non-zero.
+        3. **The method yields one** — :meth:`_api_replay_command`
+           replays an ``api_test`` VP's own request + assertions. Source
+           ``api_replay``. Same shape check, for the same reason: both
+           cases (2) and (3) reach the completion gate as a command the
+           plan — not this module — wrote.
+        4. **Nothing runnable exists.** Return ``""`` with the label that
+           says *why*: ``audit_style`` when the VP's declared deliverable
+           is an evidence artifact, ``missing`` when it is not and the
+           fill loop has run out of attempts.
+
+        A fifth case used to exist here — "the VP's own command is the
+        thing being repaired", which emitted a guard command for repairs
+        that rewrote ``verification_plan.json``. That code path was
+        deleted on 2026-09-18 along with the two repair patterns that
+        edited the acceptance criterion itself; repair tasks must not
+        edit what judges them.
         """
+        declared = str(content.get("test_command") or "").strip()
+        if declared:
+            source = str(content.get("test_command_source") or "").strip()
+            if source not in self.ASSEMBLER_TEST_COMMAND_SOURCES:
+                source = "llm"
+            return declared, source
+
         command = (self.vp_test_commands.get(failed_vp_id) or "").strip()
         if command:
-            return command
-        # 2026-09-18: a VP no longer carries a ``test_command``, so a repair
-        # task's acceptance command is derived from the *method's* judging
-        # basis instead:
+            runnable = inspect_command(command)
+            if not runnable:
+                return command, "vp"
+            print(
+                f"[Repair] Discarding structurally-broken VP command "
+                f"for {failed_vp_id} ({runnable[0].code}): {command[:120]}"
+            )
+        # 2026-10-11 — semantics of the map this reads.
+        #
+        # ``self.vp_test_commands`` is populated by
+        # :func:`verification.verification_report_reader.extract_vp_test_commands`,
+        # which resolves each VP's ``evidence_command`` first and falls
+        # back to the legacy ``test_command`` spelling. On the verification
+        # side ``evidence_command`` means "the command that produces this
+        # VP's evidence" (``verification_ci_runner.py``,
+        # ``prompts.py``); that meaning is untouched and nothing here
+        # rewrites it.
+        #
+        # This method reuses it as the repair round's **objective**
+        # acceptance criterion, on purpose. What it replaces is not a
+        # working command — it is an empty one. A repair task whose
+        # ``test_command`` resolves to ``""`` has no objective signal at
+        # all, and the closest thing the plan has on disk is the command
+        # that exercises the VP's subject.
+        #
+        # 2026-09-18: when no command resolves, the acceptance command is
+        # derived from the *method's* judging basis instead:
         #
         #  * ``api_test`` — replay the VP's own request + assertions. This
         #    is the ideal shape for a repair's gate: the criterion comes
@@ -1580,16 +1521,37 @@ class RepairTaskAssembler:
         #    framework executes it deterministically.
         #  * ``ui_validation`` / ``code_review`` — no command. Their basis
         #    is the evidence artifact (checkpoints / citations), which a
-        #    command cannot reproduce; the task runs with an empty command
-        #    rather than a fabricated one, and the executor's
-        #    ``test_cross_verify_unverified`` warning is what stops that
-        #    from silently counting as a verified pass.
+        #    command cannot reproduce. That is the ``audit_style`` case,
+        #    and it is emitted rather than discarded.
         #
         # What is gone for good is case 2 of the old behaviour: "the VP's
         # own command is the thing being repaired". Repair tasks must not
         # edit the acceptance criterion — see the module docstring of
         # ``verification_plan_delta`` and the C8 commit message.
-        return self._api_replay_command(failed_vp_id)
+        replay = self._api_replay_command(failed_vp_id)
+        if replay:
+            # Derived like source (2), so it is held to the same shape
+            # rule — see
+            # :meth:`RepairTaskGenerator._resolve_repair_test_command`.
+            # :meth:`_api_replay_command` quotes every interpolated path
+            # and its own literals contain no inspection verb, so the
+            # command it builds passes the check; the check is here so
+            # that stays a property rather than an accident of today's
+            # plan paths. A VP whose ``request`` or ``assertions`` are
+            # themselves malformed can otherwise put a chain on the
+            # completion gate that can only ever exit non-zero.
+            runnable = inspect_command(replay)
+            if not runnable:
+                return replay, "api_replay"
+            print(
+                f"[Repair] Discarding structurally-broken api_replay "
+                f"command for {failed_vp_id} "
+                f"({runnable[0].code}): {replay[:120]}"
+            )
+
+        if self._is_audit_style_repair(failed_vp_id):
+            return "", "audit_style"
+        return "", "missing"
 
     def _api_replay_command(self, failed_vp_id: str) -> str:
         """A runnable command that replays an ``api_test`` VP's assertions.
@@ -1597,9 +1559,18 @@ class RepairTaskAssembler:
         Exits 0 only if every assertion still holds, which is exactly the
         question a repair has to answer. Returns "" for VPs of any other
         method.
+
+        The method is read through :meth:`_vp_verification_method` rather
+        than straight off the failed-VP dict, and that indirection is
+        load-bearing: the report-side entry does not carry
+        ``verification_method`` (see :meth:`_plan_points`), so reading it
+        from there made this branch return ``""`` for *every* VP — the
+        one case it exists to serve included. The method check therefore
+        silently never fired, and an ``api_test`` point with no command
+        of its own was labelled the same as a method nothing can
+        reproduce.
         """
-        vp = self.failed_vps.get(str(failed_vp_id)) or {}
-        if str(vp.get("verification_method") or vp.get("method") or "") != "api_test":
+        if self._vp_verification_method(failed_vp_id) != "api_test":
             return ""
         if not self.plan_path:
             return ""
@@ -1679,39 +1650,214 @@ class RepairTaskAssembler:
     def _infer_depends_on(self, seq: int) -> List[str]:
         """Return the list of task IDs this task must wait for.
 
-        Tasks within the same round depend on the previous task in the
-        same round (sequential chain). This protects against racing two
-        repair tasks against the same ``verification_plan.json`` write.
+        Always ``[]``: one repair batch is a forest of roots.
 
-        2026-09-16: the cross-round edge is gone. Round
-        N's first task used to depend on a ``repair-r{round - 1}-99``
-        sentinel standing for "the last task of the previous round".
-        That id is never assigned by any code path — same-round ids are
-        ``repair-r{round}-{seq:02d}`` starting at ``01`` — so the edge
-        never resolved, and ``Agent._validate_dependencies`` hard-rejects
-        the entire DAG (``"Task X depends on missing task Y"``) before a
-        single task runs. Every plan with a ≥2 repair round died at load
-        (an earlier plan, round 3).
+        ``seq`` is accepted (and ignored) so the signature stays stable
+        for the existing callers and tests.
 
-        The intent it encoded — "do not start round N until round N-1's
-        executor subprocess has exited" — cannot be expressed as a
-        ``depends_on`` edge in the first place: repair rounds are
-        generated by the verification orchestrator *after* the previous
-        execution run ended, and a same-DAG edge cannot order against a
-        subprocess that no longer exists. Ordering against a ``pending``
-        task left behind by a killed run is a real concern, but the fix
-        for that would be a *real* id, not a sentinel.
+        History — why this used to return ``[f"repair-r{round}-{seq-1:02d}"]``
+        ----------------------------------------------------------------
+        2026-09-16 (cross-round sentinel, already removed). Round N's
+        first task depended on a ``repair-r{round - 1}-99`` sentinel.
+        No code path ever assigns that id, so
+        ``Agent._validate_dependencies`` rejected the whole DAG at load
+        time and every plan with a ≥2 repair round died before running
+        a task.
 
-        2026-09-20: the edge is scoped to the batch. With ``seq_base``
-        above 1 the previous id (``seq - 1``) belongs to an *earlier*
-        batch, so linking to it would make this task wait on an
-        unrelated, already-finished repair from days ago. Only ids this
-        batch itself emitted are valid predecessors.
+        2026-09-20 (same-round chain — **this is the edge removed on
+        2026-10-11**). The within-batch chain
+        ``repair-r{round}-{seq-1:02d}`` was justified in this function's
+        own docstring by exactly one reason: *"This protects against
+        racing two repair tasks against the same
+        ``verification_plan.json`` write."*
+
+        That reason stopped being true on 2026-09-18, when the two
+        code paths that let a repair agent write
+        ``verification_plan.json`` were deleted outright — see the
+        ``_resolve_test_command`` note ("Repair tasks must not edit
+        the acceptance criterion"). The only two remaining writers of
+        that file are ``verification_agent.py`` (bare ``open(...,"w")``)
+        and ``vp_split.py`` (``mkstemp`` + ``replace``); both run
+        in-process, single-threaded, inside a verification round, and
+        are separated from the repair executor's subprocess by a
+        process boundary. There is nothing left to race against.
+
+        What the fake edge actually cost: a whole batch of repair tasks,
+        serialised into one chain, so only the chain head ever ran. The
+        executor's first micro-layer built exactly one schedulable task,
+        the head, and when the head failed every later task inherited a
+        ``failed`` upstream and was never schedulable — the round ends
+        in ``No schedulable micro-layer found`` with the rest of the
+        batch left permanently ``pending``.
+
+        Real intra-batch conflicts are still possible (two repairs can
+        touch the same source file) and are handled by the mechanism
+        that actually models them, not by a fake edge:
+        :func:`agent._build_micro_layers` builds a conflict graph from
+        ``files_to_modify`` and serialises tasks that share a file into
+        separate micro layers. That graph is only meaningful because
+        ``files_to_modify`` is populated, which is the whole reason
+        :meth:`assemble` now refuses to emit a task without one.
+
+        The dependency contract itself is untouched and stays strict:
+        ``agent.is_dependency_ready`` still treats
+        ``{"completed", "skipped"}`` as success and ``failed`` /
+        ``pending`` / ``in_progress`` as blocking. This function stops
+        *manufacturing* edges that were never real; it does not weaken
+        the ones that are.
         """
-        deps: List[str] = []
-        if seq > self.seq_base:
-            deps.append(f"repair-r{self.round}-{seq - 1:02d}")
-        return deps
+        return []
+
+
+def _evidence_items_from_failed_vps(
+    failed_vps: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Adapt failed-VP dicts to the shape :meth:`_resolve_repair_test_command` reads.
+
+    That method predates the split into contents + assembler and takes
+    ``evidence_items`` (``{vp_id, test_command, actual_result,
+    evidence}``). The live pipeline hands it
+    :meth:`~repair_generator.RepairTaskGenerator.generate_repair_contents`'s
+    ``failed_vps`` instead, whose command lands under the same
+    ``test_command`` key but whose evidence fields are named
+    ``evidence`` / ``actual_result`` — so the mapping is nearly the
+    identity and is kept explicit rather than assumed.
+
+    Doing it here (instead of loosening the resolver's expectations) is
+    what lets the fill loop reuse the resolver verbatim: the three
+    derivation paths, their order and their rejection rules stay exactly
+    as they were, and the retry is judged against the same bar as the
+    first answer.
+    """
+    items: List[Dict[str, Any]] = []
+    for vp in failed_vps:
+        if not isinstance(vp, dict) or not vp.get("id"):
+            continue
+        items.append({
+            "vp_id": str(vp.get("id")),
+            "test_command": str(vp.get("test_command") or "").strip(),
+            "actual_result": str(vp.get("actual_result") or ""),
+            "evidence": str(vp.get("evidence") or ""),
+        })
+    return items
+
+
+def _extract_filled_test_command(response: Any, vp_id: str) -> str:
+    """Pull ``vp_id``'s command out of a fill response, or ``""``.
+
+    Tolerant on the envelope because the model has been observed writing
+    each of these shapes: ``{"commands": [{"failed_vp_id", ...}]}`` as
+    asked, a bare list, and a flat ``{vp_id: command}`` map. A response
+    that matches none of them yields ``""``, which the caller records as
+    a reason and retries — the loop treats an unreadable answer exactly
+    like an unusable one, because from the assembler's point of view
+    they are the same event.
+    """
+    if isinstance(response, str):
+        return response.strip()
+    if isinstance(response, list):
+        return _extract_filled_test_command({"commands": response}, vp_id)
+    if not isinstance(response, dict):
+        return ""
+    commands = response.get("commands")
+    if isinstance(commands, list):
+        for entry in commands:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("failed_vp_id") or "").strip() != vp_id:
+                continue
+            command = str(entry.get("test_command") or "").strip()
+            if command:
+                return command
+        return ""
+    # Flat map, or the command carried at top level for a single VP.
+    for key in (vp_id, "test_command", "command"):
+        value = response.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _build_test_command_fill_prompt(
+    failed_vps: List[Dict[str, Any]],
+    plan_vps: Dict[str, Dict[str, Any]],
+    reasons: Dict[str, str],
+    *,
+    attempt: int,
+    max_attempts: int,
+    plan_dir: Path,
+    project_dir: Path,
+) -> str:
+    """Build the retry prompt for :meth:`_fill_missing_test_commands`.
+
+    Carries the three things a first answer lacked, which is what makes
+    a retry a correction rather than a reroll:
+
+    * **the whole verification point** — ``verification_method``,
+      ``request``, ``assertions``, ``expected_result``. For an
+      ``api_test`` these *are* the contract, so they are what a runnable
+      check can be written from. Read from
+      ``verification_plan.json`` because the report-side failed-VP dict
+      does not carry them.
+    * **why the previous attempt was unusable** — a quality-check code,
+      a vacuous-command verdict, or silence. Fed back per VP, so a model
+      that produced a ``grep`` probe is told *that specific* probe was
+      rejected rather than being asked again in the same terms.
+    * **how the point actually failed** — ``actual_result`` and the
+      evidence pointers, so the command targets the failure rather than
+      the module.
+
+    ``plan_dir`` / ``project_dir`` are stated the way the content prompt
+    states them, so "relative to the project root" has an unambiguous
+    referent in both prompts.
+    """
+    parts = [
+        f"为下面 {len(failed_vps)} 个验证点补验收命令"
+        f"（第 {attempt}/{max_attempts} 次尝试）。",
+        "",
+        f"Plan directory: {plan_dir}",
+        f"Project directory: {project_dir}",
+        "",
+        "每条命令必须在**修复正确**时退出 0、在**未修复**时非 0。",
+        "",
+    ]
+    for vp in failed_vps:
+        vp_id = str(vp.get("id", "") or "")
+        plan_point = plan_vps.get(vp_id) or {}
+        parts.append(f"--- {vp_id} ---")
+        parts.append(f"title: {vp.get('title', '') or plan_point.get('title', '')}")
+        method = str(
+            plan_point.get("verification_method") or plan_point.get("method") or "",
+        ).strip()
+        if method:
+            parts.append(f"verification_method: {method}")
+        if plan_point.get("expected_result"):
+            parts.append(
+                f"expected_result: "
+                f"{_clamp_for_prompt(plan_point['expected_result'])}"
+            )
+        if plan_point.get("request"):
+            parts.append(
+                f"request: {_clamp_for_prompt(plan_point['request'])}"
+            )
+        if plan_point.get("assertions"):
+            parts.append(
+                f"assertions: {_clamp_for_prompt(plan_point['assertions'])}"
+            )
+        if vp.get("actual_result"):
+            parts.append(
+                f"actual_result: {_clamp_for_prompt(vp.get('actual_result'))}"
+            )
+        for path in (vp.get("evidence_paths") or []):
+            parts.append(f"evidence_path: {path}")
+        if vp_id in reasons:
+            parts.append(f"上一次为什么不可用: {reasons[vp_id]}")
+        parts.append("")
+    parts.append(
+        "如果某个验证点本质上没有可执行命令（交付物是一份审查结论 / "
+        "检查点记录），不要为它编一条恒真的命令 —— 宁可不给。"
+    )
+    return "\n".join(parts)
 
 
 def _build_repair_contents_prompt(
@@ -1776,14 +1922,22 @@ def _build_repair_contents_prompt(
                     # column has none) — they use an ordinal ``label``
                     # ("既往失败 #2") instead of a fabricated round.
                     heading = h.get("label") or f"Round {h.get('round', '?')}"
+                    # 2026-10-11: these two were ``[:600]``. With
+                    # ``actual_result`` now carrying every verdict
+                    # reason (see
+                    # ``Orchestrator._verdict_to_result``) the 600-char
+                    # slice removed exactly the tail that states which
+                    # criterion failed, so the repair agent could see a
+                    # history entry in which every criterion passed.
+                    # 8000 + an explicit truncation marker instead.
                     parts.append(
                         f"- **{heading}** "
                         f"actual_result: "
-                        f"{(h.get('actual_result') or '')[:600]}"
+                        f"{_clamp_for_prompt(h.get('actual_result'), label='actual_result')}"
                     )
                     parts.append(
                         f"  evidence: "
-                        f"{(h.get('evidence') or '')[:600]}"
+                        f"{_clamp_for_prompt(h.get('evidence'), label='evidence')}"
                     )
                 parts.append("")
     parts.append(f"共 {len(failed_vps)} 个失败 VP：")
@@ -1826,8 +1980,14 @@ def _build_repair_contents_prompt(
             # Legacy inlined shape — still supported so an older
             # ``verification_report.json`` reader (or a caller that has
             # not migrated yet) keeps producing a usable prompt.
-            parts.append(f"actual_result: {vp.get('actual_result', '')[:1000]}")
-            parts.append(f"evidence: {vp.get('evidence', '')[:1000]}")
+            parts.append(
+                f"actual_result: "
+                f"{_clamp_for_prompt(vp.get('actual_result'), label='actual_result')}"
+            )
+            parts.append(
+                f"evidence: "
+                f"{_clamp_for_prompt(vp.get('evidence'), label='evidence')}"
+            )
             if vp.get("test_command"):
                 parts.append(f"test_command (from plan): {vp.get('test_command')[:500]}")
             if vp.get("expected_result"):
@@ -1920,6 +2080,17 @@ class _RepairContentGeneratorMixin:
             * ``title`` — short label of the fix
             * ``description`` — full failure → fix narrative
             * ``acceptance_criteria`` — TDD-style acceptance spec
+            * ``files_to_modify`` — the LLM's declared edit scope,
+              carried through verbatim from the response. 2026-10-11:
+              this key was silently dropped by
+              :func:`_parse_repair_contents_response`, which rebuilt
+              each row from a fixed key set that did not include it —
+              so ``_resolve_files_to_modify`` always saw ``None`` and
+              every repair task was stamped ``files_to_modify=[]``
+              no matter what the LLM returned.
+              :meth:`RepairTaskAssembler.assemble` now refuses a task
+              with an empty scope outright, so the field has to survive
+              the parser for that gate to be passable at all.
             * ``priority_hint`` — optional hint, the assembler
               reconciles with the plan-side ``priority``
             * ``execution_group_hint`` — optional integer, the
@@ -1944,6 +2115,7 @@ class _RepairContentGeneratorMixin:
         failed_vp_ids = [
             str(vp.get("id")) for vp in failed_vps if vp.get("id")
         ]
+
         prompt = _build_repair_contents_prompt(
             failed_vps,
             round_number,
@@ -1953,7 +2125,9 @@ class _RepairContentGeneratorMixin:
             repair_outcomes=repair_outcomes,
         )
         try:
-            response = self.coding_tool.query_json(
+            response = query_json_in_session(
+                self.coding_tool,
+                repair_content_session(self.plan_dir),
                 prompt=prompt,
                 system_instruction=REPAIR_CONTENT_SYSTEM_PROMPT,
             )
@@ -1974,14 +2148,26 @@ class _RepairContentGeneratorMixin:
             # task. With >=1 failed VP in hand that is a generation
             # failure, not convergence: ``{"tasks": []}`` / a malformed
             # envelope here would otherwise strand the failures.
+            #
+            # A failure that left nothing behind while the deterministic
+            # rows survived is still a failure to report — the caller
+            # parks the plan rather than recording "no repair needed"
+            # over verification points that have no repair.
             raise RepairGenerationError(
                 f"repair-content LLM returned no usable task for "
                 f"{len(failed_vps)} failed VP(s) "
-                f"({', '.join(failed_vp_ids) or 'no ids'}) in round "
-                f"{round_number}",
+                f"({', '.join(str(vp.get('id')) for vp in failed_vps) or 'no ids'}) "
+                f"in round {round_number}",
                 round_number=round_number,
                 failed_vp_ids=failed_vp_ids,
             )
+        # Path A: a verification point that is not a shell command has no
+        # command to copy, so the content prompt — which never asks for
+        # one — cannot produce one either. Re-ask for it explicitly
+        # before the assembler has to fall back to a label.
+        self._fill_missing_test_commands(
+            contents, failed_vps, round_number,
+        )
         return contents
 
 
@@ -2039,6 +2225,16 @@ def _parse_repair_contents_response(
             "title": title,
             "description": description,
             "acceptance_criteria": criteria,
+            "files_to_modify": item.get("files_to_modify"),
+            # Carried verbatim for the same reason as ``files_to_modify``:
+            # the bounded fill loop (:meth:`_fill_missing_test_commands`)
+            # stamps its answer onto the content dict, and a parser that
+            # rebuilds each row from a fixed key set would drop it again
+            # on the way out. The content prompt itself never asks for
+            # one, so an absent key here is the normal case and simply
+            # means "nothing rescued this row".
+            "test_command": item.get("test_command"),
+            "test_command_source": str(item.get("test_command_source", "") or ""),
             "priority_hint": str(item.get("priority_hint", "") or ""),
             "execution_group_hint": item.get("execution_group_hint", 0),
         })

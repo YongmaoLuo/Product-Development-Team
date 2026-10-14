@@ -30,6 +30,16 @@ the `unit` layer. It is also hermetic — the stand-in is a script in
 redirected `$HOME` — so it needs no keychain and touches no real secret.
 It belongs to the integration layer for the subprocess, not for the keychain.
 
+Which entry point this exercises
+--------------------------------
+`read_secret_from_keychain` — the **launcher's** call, and the only one
+that starts a process any more. The server's `read_secret` resolves from
+a descriptor a parent handed down and never reaches this code at all;
+the provider-side half of the handoff is covered by the fd suites. The
+function is named explicitly in every assertion below, which is what
+keeps this suite honest: written against `read_secret`, these would be
+asserting the command line of a lookup the provider no longer performs.
+
 What is pinned
 --------------
 * **The command line.** The item is located by account and by nothing
@@ -71,6 +81,19 @@ _DOUBLE_ENV = (
     "PDT_TEST_PAYLOAD_FILE",
     "PDT_TEST_EXIT_CODE",
     "PDT_TEST_HANG",
+)
+
+#: Variables that describe *this deployment* rather than the stand-in, and
+#: that therefore have to be cleared for the suite to be hermetic.
+#: ``PDT_SECRET_READER_PATH`` is read out of the project-root ``.env``
+#: before any test runs, so a workstation that has narrowed its keychain
+#: ACL with ``setup.sh adopt`` has it set — and the module would start the
+#: operator's own signed reader instead of the stand-in this file just
+#: built, with the stand-in's argv log left empty and the read returning
+#: nothing. CI has no ``.env``, which is the whole problem: the suite would
+#: be green there and red on the machine that actually migrated.
+_DEPLOYMENT_ENV = (
+    "PDT_SECRET_READER_PATH",
 )
 
 #: The keychain this project opens, spelled out here rather than read
@@ -122,6 +145,13 @@ class KeychainDouble:
         self._monkeypatch = monkeypatch
         self.home = home
         self.argv_log = argv_log
+        #: The path this deployment configured as its reader, which is the
+        #: same stand-in binary ``credentials._SECURITY_BIN`` is pointed
+        #: at. Read from here rather than from either constant, so an
+        #: argv assertion compares the recorded command line against the
+        #: fixture's own choice instead of against whatever the module
+        #: happens to think the binary is.
+        self.reader = argv_log.parent / "security"
 
     @property
     def keychain_file(self) -> str:
@@ -201,16 +231,26 @@ class KeychainDouble:
 def keychain_double(tmp_path, monkeypatch):
     """Point the module at a real executable standing in for ``security``.
 
-    The three things the production code reads from the environment are
+    The four things the production code reads from the environment are
     all redirected here: the platform (so the keychain is not off
     because the suite happens to run elsewhere), the switch (so the
-    keychain is on), and ``$HOME`` (so the keychain path the module
-    builds is a path inside ``tmp_path`` rather than a real login
-    keychain). The module's own constant for the binary is pointed at
-    the stand-in, and the timeout is pulled down to half a second so the
-    hanging test costs half a second rather than the production value.
+    keychain is on), ``$HOME`` (so the keychain path the module builds
+    is a path inside ``tmp_path`` rather than a real login keychain),
+    and ``PDT_SECRET_READER_PATH`` — cleared first, so whatever reader
+    this deployment's ``.env`` names cannot answer, then **set** to the
+    stand-in, because there is no fallback any more and a deployment
+    with no reader configured issues no read at all. That last half is
+    the change that broke this fixture when the fallback went away, and
+    it is the fixture doing the right thing: the stand-in now plays the
+    *reader*, which is the role a real deployment gives it.
+
+    The module's own constant for the binary is pointed at the same file,
+    so the lock probe (``show-keychain-info``, which keeps
+    ``_SECURITY_BIN`` and must) is answered by the same stand-in. The
+    timeout is pulled down to half a second so the hanging test costs half
+    a second rather than the production value.
     """
-    for key in _DOUBLE_ENV:
+    for key in _DOUBLE_ENV + _DEPLOYMENT_ENV:
         monkeypatch.delenv(key, raising=False)
 
     home = tmp_path / "home"
@@ -222,6 +262,7 @@ def keychain_double(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PDT_DISABLE_KEYCHAIN_SECRETS", "0")
+    monkeypatch.setenv("PDT_SECRET_READER_PATH", str(binary))
     monkeypatch.setattr(credentials, "_is_macos", lambda: True)
     monkeypatch.setattr(credentials, "_SECURITY_BIN", str(binary))
     # A second, not the production five: long enough that a loaded
@@ -284,7 +325,7 @@ def test_argv_carries_account_and_path_but_no_service(keychain_double, tmp_path)
     keychain_double.write_payload(tmp_path, b"the-secret")
     keychain_double.set_index("feishu_app_secret", "cli_sentinel_a1")
 
-    assert credentials.read_secret("feishu_app_secret") == "the-secret"
+    assert credentials.read_secret_from_keychain("feishu_app_secret") == "the-secret"
 
     argv = keychain_double.argv()
     assert argv, "no subprocess was started, so there is no argv to check"
@@ -319,13 +360,13 @@ def test_the_recorded_command_line_names_the_dedicated_keychain(
     keychain_double.write_payload(tmp_path, b"the-secret")
     keychain_double.set_index("feishu_app_secret", "cli_sentinel_a1")
 
-    assert credentials.read_secret("feishu_app_secret") == "the-secret"
+    assert credentials.read_secret_from_keychain("feishu_app_secret") == "the-secret"
 
     argv = keychain_double.argv()
     assert argv, "no subprocess was started, so there is no argv to check"
 
     assert argv == [
-        str(credentials._SECURITY_BIN),
+        str(keychain_double.reader),
         "find-generic-password",
         "-a",
         "cli_sentinel_a1",
@@ -357,7 +398,7 @@ def test_account_value_equals_env_index_value(keychain_double, tmp_path):
     account = "cli_MiXeD-Case_42.x"
     keychain_double.set_index("feishu_app_secret", account)
 
-    assert credentials.read_secret("feishu_app_secret") == "the-secret"
+    assert credentials.read_secret_from_keychain("feishu_app_secret") == "the-secret"
 
     argv = keychain_double.argv()
     assert argv[argv.index("-a") + 1] == account
@@ -379,8 +420,7 @@ def test_missing_index_key_makes_zero_subprocess_calls(keychain_double, tmp_path
     keychain_double.clear_index("feishu_app_secret")
     keychain_double.set_fallback("feishu_app_secret", "the-plaintext-secret")
 
-    assert credentials.secret_source("feishu_app_secret") == "missing"
-    assert credentials.read_secret("feishu_app_secret") is None
+    assert credentials.read_secret_from_keychain("feishu_app_secret") is None
     assert keychain_double.invocations() == 0
     assert not keychain_double.argv_log.exists()
 
@@ -409,9 +449,7 @@ def test_not_found_falls_back_without_raising(keychain_double, tmp_path):
     keychain_double.set_fallback("feishu_app_secret", "the-plaintext-secret")
     keychain_double.exit_code(44)
 
-    assert credentials.secret_source("feishu_app_secret") == "missing"
-    assert credentials.read_secret("feishu_app_secret") is None
-    assert credentials.secret_available("feishu_app_secret") is False
+    assert credentials.read_secret_from_keychain("feishu_app_secret") is None
     assert keychain_double.invocations() > 0, "the lookup never ran"
 
 
@@ -455,9 +493,8 @@ def test_non_utf8_and_trailing_newline_payloads(keychain_double, tmp_path):
         keychain_double.write_payload(tmp_path, payload)
         keychain_double.set_index("feishu_app_secret", "cli_sentinel_a1")
 
-        value = credentials.read_secret("feishu_app_secret")
+        value = credentials.read_secret_from_keychain("feishu_app_secret")
 
-        assert credentials.secret_source("feishu_app_secret") == "keychain"
         assert value is not None, f"{payload!r} resolved to no value at all"
         assert value.encode("utf-8", errors="surrogateescape") == expected, (
             f"{payload!r} did not survive the read"
@@ -481,8 +518,7 @@ def test_timeout_falls_back_quietly(keychain_double, tmp_path):
     keychain_double.set_index("feishu_app_secret", "cli_sentinel_a1")
     keychain_double.hang()
 
-    assert credentials.secret_source("feishu_app_secret") == "missing"
-    assert credentials.read_secret("feishu_app_secret") is None
+    assert credentials.read_secret_from_keychain("feishu_app_secret") is None
     assert keychain_double.invocations() > 0, "the lookup never ran"
 
 
@@ -491,23 +527,20 @@ def test_timeout_falls_back_quietly(keychain_double, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_successful_lookup_reports_the_keychain_as_the_source(
-    keychain_double, tmp_path
-):
-    """The end-to-end answer: a value from the keychain, labelled as such.
+def test_successful_lookup_returns_the_value(keychain_double, tmp_path):
+    """A good item, read end to end through a real subprocess.
 
-    This is the whole contract in one assertion pair. A caller asks
-    "where did this come from" and gets `"keychain"`, and asks "what is
-    it" and gets the value the item held — the two questions answered
-    from one resolution, so a caller that asks both cannot be told two
-    different things.
+    The *label* is deliberately not asserted beside the value, because
+    no single function answers both questions any more. The launcher
+    reads the keychain and logs which source it used; the server
+    resolves from the descriptor it was handed and reports
+    ``"inherited_fd"``. A label asserted here would be a label for one
+    of those processes, written as though it were the other's.
     """
     keychain_double.write_payload(tmp_path, b"the-secret\n")
     keychain_double.set_index("feishu_app_secret", "cli_sentinel_a1")
 
-    assert credentials.read_secret("feishu_app_secret") == "the-secret"
-    assert credentials.secret_source("feishu_app_secret") == "keychain"
-    assert credentials.secret_available("feishu_app_secret") is True
+    assert credentials.read_secret_from_keychain("feishu_app_secret") == "the-secret"
 
 
 def test_standin_would_fail_the_test_if_the_module_never_ran_it(

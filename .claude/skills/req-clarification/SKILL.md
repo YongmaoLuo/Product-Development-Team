@@ -163,7 +163,7 @@ SCOPE_PRECHECK_VALID_FORMS = frozenset({"SOFTWARE", "SKILL", "AGENT", "WORKFLOW"
 
 ```json
 {
-  "plan_id": "20260707-task-app",
+  "plan_id": "task-app",
   "created_at": "2026-07-07T10:00:00Z",
   "status": "in_progress",
   "product_form": {
@@ -249,7 +249,7 @@ When all dimensions are complete, produce `interview.json`:
 
 ```json
 {
-  "plan_id": "20260424-task-app",
+  "plan_id": "task-app",
   "created_at": "2026-04-24T10:00:00Z",
   "status": "complete",
   "product_form": {

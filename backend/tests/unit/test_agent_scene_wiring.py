@@ -11,9 +11,6 @@ Contract (2026-09-13 provider-routing feature):
   * Task execution queries forward the task's scene: ``execution`` for
     plain tasks. (``model_type`` stays as inert metadata per the project's
     Q3=A decision.)
-  * Verification repair-task generation entry
-    (``repair_generator.generate_repair_tasks``) builds its default tool
-    with ``scene="repair_generation"``.
 """
 
 import sys
@@ -115,19 +112,6 @@ class TestAuditSecondPassScene:
         )
         assert 'model_type="haiku"' not in src, (
             "the dead model_type='haiku' hint must be removed"
-        )
-
-
-@pytest.mark.unit
-class TestRepairGenerationScene:
-    def test_generate_repair_tasks_default_tool_has_scene(self):
-        import inspect
-        import repair_generator
-
-        src = inspect.getsource(repair_generator.generate_repair_tasks)
-        assert 'scene="repair_generation"' in src, (
-            "generate_repair_tasks' default coding tool must be built "
-            "with scene='repair_generation'"
         )
 
 

@@ -5,10 +5,11 @@ Task Refiner
 Analyzes task execution results and refines the task list.
 """
 
+import copy
 import json
 from typing import List, Dict, Optional
 
-from coding_tool import CodingTool
+from coding_tool import CodingTool, JsonSession, query_json_in_session
 from config import AgentConfig
 from config_registry import ConfigRegistry
 from task import SubTask
@@ -127,6 +128,17 @@ class TaskRefiner:
         current_context = base_context
         final_report = None
 
+        # One resumable session for the whole refinement of this task
+        # list. Both loops below re-ask the same question rather than a
+        # new one: a round-N+1 prompt is round N plus the validator's
+        # objection, and a re-ask after an unparseable reply is the
+        # original ask with a format nudge appended. The context prompt
+        # names the files to read instead of inlining them, so a fresh
+        # session per attempt pays for that reading every time. The
+        # handle is per ``refine()`` call on purpose: a different task is
+        # a different subject, and starts a different session.
+        session = JsonSession()
+
         try:
             for round_idx in range(MAX_REFINER_ROUNDS):
                 if self.logger:
@@ -143,8 +155,9 @@ class TaskRefiner:
                 round_context = current_context
                 for json_retry in range(MAX_REFINER_JSON_RETRIES + 1):
                     try:
-                        response = self.coding_tool.query_json(
-                            round_context, system_instruction=refiner_prompt,
+                        response = query_json_in_session(
+                            self.coding_tool, session, round_context,
+                            system_instruction=refiner_prompt,
                             scene="refiner",
                         )
                         break
@@ -187,6 +200,8 @@ class TaskRefiner:
                         task_id=last_task_id,
                         data={"new_task_count": len(new_tasks), "round": round_idx + 1},
                     )
+
+                new_tasks = self._merge_refiner_delta(tasks, new_tasks, last_task_id)
 
                 new_tasks = self._finalize_candidate(tasks, new_tasks, last_task_id)
 
@@ -273,12 +288,33 @@ class TaskRefiner:
             attempt + last test result + current task list. No
             codebase snapshot, no ``Current codebase (truncated)``
             section.
+
+        Send-only-what-you-refine contract. The task list used to go out
+        verbatim as ``json.dumps(tasks, indent=2)``, which on a repair
+        round of that size is nearly the whole context — and all of it
+        had to be copied back verbatim because the old system prompt
+        said "include ALL tasks ... NEVER drop
+        tasks unrelated to the failure". The refiner was being handed
+        a 52-row table it was forbidden to edit, so every one of those
+        rows was a chance to silently corrupt an unrelated task.
+        :meth:`_project_tasks_for_refiner` now sends the failed task in
+        full — it is the subject of this refinement — plus a four-field
+        index row for everything else, and :meth:`_merge_refiner_delta`
+        folds the reply back. The framework, not the model, is what
+        guarantees an untouched task stays untouched.
         """
         refine_context = f"Requirement: {requirement}\n"
         refine_context += f"Last Task ID: {last_task_id or 'N/A'}\n"
         refine_context += f"Last Task Implementation Attempt:\n{last_coder_response}\n"
         refine_context += f"Last Task Result: {last_result}\n"
-        refine_context += f"Current Tasks: {json.dumps(tasks, indent=2)}\n"
+        projected = self._project_tasks_for_refiner(tasks, last_task_id)
+        refine_context += (
+            "Current Tasks (the task to refine is given in full; every other "
+            "task is an index row of id/title/status/depends_on only — the "
+            "framework preserves every task you do not mention, so you only "
+            "need to return the tasks you change or add): "
+            f"{json.dumps(projected, indent=2)}\n"
+        )
         # file_context intentionally NOT included.
         refine_context += "Use Read/Grep/Glob tools to explore the codebase if needed.\n"
         refine_context += "Do NOT inject full file contents into your response."
@@ -289,6 +325,195 @@ class TaskRefiner:
                 refine_context += f"\n\nThe failed task ID is '{last_task_id}'. When breaking it down into subtasks, use hierarchical IDs like '{last_task_id}-1', '{last_task_id}-2', etc."
 
         return refine_context
+
+    #: Fields of a NON-focus task that reach the refiner. ``description``
+    #: is deliberately absent: it is the bulk of the payload (thousands of
+    #: characters on a single task) and the refiner has no use for the
+    #: task it is forbidden to change. ``test_command`` /
+    #: ``files_to_modify`` are excluded for the same reason.
+    _REFINER_INDEX_FIELDS = ("id", "title", "status", "depends_on")
+
+    @staticmethod
+    def _task_id_of(task) -> Optional[str]:
+        """String id of a task row, or ``None`` when it has none."""
+        if not isinstance(task, dict):
+            return None
+        tid = task.get("id")
+        return None if tid is None else str(tid)
+
+    def _project_tasks_for_refiner(
+        self,
+        tasks: List[Dict],
+        last_task_id: Optional[str],
+    ) -> List[Dict]:
+        """Reduce the task list to what this refinement is actually about.
+
+        The task named by ``last_task_id`` goes out in full — it is the
+        subject. Every other task becomes an index row carrying only
+        :attr:`_REFINER_INDEX_FIELDS`, which is enough for the model to
+        avoid colliding with an id that already exists and to read the
+        dependency edges, and small enough that 52 of them cost ~4k
+        chars instead of ~299k.
+
+        Order is preserved. A ``last_task_id`` that is not in ``tasks``
+        (already removed upstream) simply means every row is an index
+        row — the projection never invents or drops a task.
+        """
+        if not tasks:
+            return []
+
+        focus = str(last_task_id) if last_task_id is not None else None
+        projected: List[Dict] = []
+        for task in tasks:
+            tid = self._task_id_of(task)
+            if focus is not None and tid == focus:
+                projected.append(task)
+                continue
+            if not isinstance(task, dict):
+                # A row that is not a dict cannot be indexed. Pass it
+                # through unchanged rather than inventing an empty row:
+                # dropping it here would silently lose a task.
+                projected.append(task)
+                continue
+            row = {f: task[f] for f in self._REFINER_INDEX_FIELDS if f in task}
+            if "id" in task:
+                row["id"] = task["id"]
+            projected.append(row)
+        return projected
+
+    def _merge_refiner_delta(
+        self,
+        old_tasks: List[Dict],
+        returned: List[Dict],
+        last_task_id: Optional[str],
+    ) -> List[Dict]:
+        """Fold a refiner reply back into the full task list.
+
+        The reply may be either shape, and both must keep working:
+
+        * **Full table** — every id we sent came back, or came back
+          split into its own children. Handed through verbatim, in the
+          model's order, duplicates and all. That is the pre-2026-10-14
+          behaviour byte for byte, so an old prompt, an older provider,
+          or a test double that echoes the whole list is unaffected.
+        * **Delta** — only the changed/added tasks. An id that already
+          exists replaces it in place; an id that does not is inserted;
+          anything the reply does not mention is preserved.
+
+        Splitting is the case that needs a decision rather than a
+        lookup: when the reply carries ``X-1``/``X-2`` and omits ``X``,
+        ``X`` was replaced by its children and must not survive beside
+        them. The children take the parent's position so the list order
+        stays readable. A reply that omits ``X`` *without* offering
+        children is treated as "said nothing about it" and ``X`` is
+        kept — losing a task to an incomplete answer is worse than
+        keeping one the model would have removed.
+
+        Preserved rows are deep-copied. ``_finalize_candidate`` →
+        ``mutate_structure`` rewrites ``depends_on``/``description`` in
+        place, and without the copy those writes would land on the
+        caller's own ``current_tasks`` dicts — which
+        ``plan_refiner_structure`` reads as the PRE-refinement list.
+        """
+        if not returned:
+            # An explicit empty ``tasks`` list was honoured verbatim
+            # before this change too; keep that rather than silently
+            # turning a wipe into a no-op.
+            return returned
+
+        old_ids = {t for t in (self._task_id_of(x) for x in old_tasks) if t is not None}
+        returned_ids = {
+            t for t in (self._task_id_of(x) for x in returned) if t is not None
+        }
+
+        # A full-table echo that also splits X omits X from its own reply --
+        # that is what "replace X with X-1/X-2" looks like when the whole
+        # list comes back. It is still a full table, and it was the
+        # shape every pre-2026-10-14 split took, so it must be taken
+        # verbatim. An old id is accounted for either by being echoed or
+        # by having one of its own children in the reply.
+        superseded = {
+            oid for oid in (old_ids - returned_ids)
+            if any(cid.startswith(f"{oid}-") for cid in returned_ids)
+        }
+        if old_ids and (old_ids - superseded) <= returned_ids:
+            return list(returned)
+
+        focus = str(last_task_id) if last_task_id is not None else None
+        split_children = (
+            sorted(
+                cid for cid in returned_ids
+                if focus is not None and cid != focus and cid.startswith(f"{focus}-")
+            )
+            if focus is not None
+            else []
+        )
+        drop_focus = bool(
+            split_children and focus not in returned_ids
+        )
+
+        # First occurrence wins for a repeated id — the same rule
+        # ``plan_refiner_structure`` documents, so a delta that names a
+        # new task twice cannot write it twice.
+        replacement_by_id: Dict[str, Dict] = {}
+        new_entries: List[Dict] = []
+        for entry in returned:
+            eid = self._task_id_of(entry)
+            if eid is None:
+                new_entries.append(entry)
+                continue
+            if eid in replacement_by_id:
+                continue
+            replacement_by_id[eid] = entry
+            if eid not in old_ids:
+                new_entries.append(entry)
+
+        focus_index: Optional[int] = None
+        if drop_focus:
+            for idx, task in enumerate(old_tasks):
+                if self._task_id_of(task) == focus:
+                    focus_index = idx
+                    break
+
+        merged: List[Dict] = []
+        for task in old_tasks:
+            tid = self._task_id_of(task)
+            if tid is not None and tid in replacement_by_id:
+                merged.append(replacement_by_id[tid])
+                continue
+            if drop_focus and tid == focus:
+                continue
+            merged.append(copy.deepcopy(task))
+
+        if new_entries:
+            if focus_index is None:
+                merged.extend(new_entries)
+            else:
+                # The parent was skipped above, so indices before
+                # ``focus_index`` are untouched: the children land
+                # exactly where the parent stood.
+                merged[focus_index:focus_index] = new_entries
+
+        if self.logger and (split_children or new_entries):
+            try:
+                self.logger.debug(
+                    "refiner_delta_merged",
+                    f"Refiner reply folded back into the full task list: "
+                    f"{len(replacement_by_id)} returned, {len(new_entries)} new, "
+                    f"{len(merged)} effective",
+                    task_id=last_task_id,
+                    data={
+                        "returned_count": len(returned),
+                        "effective_count": len(merged),
+                        "new_ids": [self._task_id_of(e) for e in new_entries],
+                        "split_children": split_children,
+                        "dropped_split_parent": focus if drop_focus else None,
+                    },
+                )
+            except Exception:
+                pass
+
+        return merged
 
     def _finalize_candidate(
         self,

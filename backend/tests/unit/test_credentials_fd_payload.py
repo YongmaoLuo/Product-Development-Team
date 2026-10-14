@@ -110,6 +110,23 @@ def _isolated_credentials_state(monkeypatch):
     monkeypatch.setattr(credentials, "_is_macos", lambda: True)
     credentials.reset_cache()
 
+    # ``publish_secret_fd`` reads the keychain **directly** — that is the
+    # launcher's read, and the server's resolver no longer performs one.
+    # So a test that wants a value on a pipe has to supply a keychain, not
+    # an environment variable. This stand-in answers with whatever the test
+    # put in the fallback variable, which keeps every assertion below
+    # written in the same terms it was written in before, with the read
+    # that actually happens in production now in between.
+    def _keychain_holding_what_the_test_exported(spec):
+        value = os.environ.get(spec.fallback_env_key)
+        if value:
+            return (value, credentials.SOURCE_KEYCHAIN)
+        return (None, credentials.SOURCE_MISSING)
+
+    monkeypatch.setattr(
+        credentials, "_resolve_from_keychain", _keychain_holding_what_the_test_exported
+    )
+
     _PUBLISHED_FDS.clear()
     real_pipe = os.pipe
 
@@ -298,6 +315,37 @@ def test_publish_leaves_no_write_end_behind(monkeypatch, published_fds):
 
     assert credentials.read_secret_fd(fd) == {LOGICAL_NAME: "the-secret"}
     assert _is_open(read_fd) is False
+
+
+def test_published_fd_is_inheritable(monkeypatch):
+    """The descriptor has to survive an ``exec``, not only a ``Popen``.
+
+    PEP 446 made every descriptor this process opens non-inheritable by
+    default. That is the right default, and it is a trap for the one
+    caller that hands a secret on with ``os.execv``:
+    :mod:`backend.secret_launcher` publishes, names the descriptors in
+    the environment, and then replaces itself with the server. ``execv``
+    honours the inheritable flag rather than repairing it, so a
+    descriptor left non-inheritable is closed at that moment — and the
+    server reports a closed pipe as ``"missing"``, not as an error. The
+    symptom is a silently unconfigured notifier, which is the failure
+    this whole design exists to make impossible.
+
+    ``subprocess`` with ``pass_fds`` hides the difference: it re-marks
+    every descriptor it is handed, so a supervisor that spawns its child
+    would work either way and the gap would only open on the launcher.
+    That is why it is pinned at the publish, where the flag is set, and
+    not at whichever caller happens to be exercised.
+    """
+    monkeypatch.setenv(ENV_KEY, "the-secret")
+
+    fd = credentials.publish_secret_fd(LOGICAL_NAME)
+    assert fd is not None
+
+    assert os.get_inheritable(fd) is True, (
+        "fd {} is not inheritable, so the launcher's `execv` would close "
+        "it and the server would report the secret as missing".format(fd)
+    )
 
 
 def test_missing_secret_publish_returns_none(monkeypatch, published_fds):

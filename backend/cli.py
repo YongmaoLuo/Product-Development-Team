@@ -9,7 +9,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Optional, Tuple
 
 from agent import autonomous_coding
 import credentials
@@ -425,8 +425,8 @@ def _load_baseline(path: str) -> Optional[Dict[str, str]]:
     return values
 
 
-def _compare_against_baseline(name: str, baseline: Dict[str, str]) -> str:
-    """Return the comparison verdict for one secret.
+def _verdict(name: str, actual: Optional[str], baseline: Dict[str, str]) -> str:
+    """Return the comparison verdict for one secret, already read.
 
     The comparison happens here, in the command, and not in
     ``credentials`` — the provider is not told a baseline exists. That
@@ -434,12 +434,14 @@ def _compare_against_baseline(name: str, baseline: Dict[str, str]) -> str:
     every caller an answer to "what is this file for", and the only
     caller that would have a use for the answer is this one.
 
-    ``read_secret`` is called at most once per secret and only after the
-    baseline has been asked, so a key the file does not carry costs no
-    lookup the command was not going to make anyway. The value it
-    returns is a memo hit on the read ``secret_source`` already made
-    this loop, which is what keeps a comparison from doubling the cost
-    the provider memoises in order not to pay it twice.
+    ``actual`` is handed in rather than read here, and that is load
+    bearing. The value compared has to be the value the ``source``
+    column beside it was read from — see :func:`_direct_read` — and a
+    verdict that fetched its own would be free to compare against a
+    source the row does not name.
+
+    The baseline is asked before anything else, so a key the file does
+    not carry costs no lookup the command was not going to make anyway.
 
     A live secret with no value is 不相等 rather than a fourth state:
     the baseline carries something and this machine does not, which is
@@ -455,11 +457,50 @@ def _compare_against_baseline(name: str, baseline: Dict[str, str]) -> str:
     if expected is None:
         return COMPARE_BASELINE_ABSENT
 
-    actual = credentials.read_secret(name)
     if actual is None:
         return COMPARE_DIFFERENT
 
     return COMPARE_EQUAL if actual == expected else COMPARE_DIFFERENT
+
+
+def _direct_read(name: str) -> Tuple[str, Optional[str]]:
+    """Return ``(source, value)`` for a **direct** read of ``name``.
+
+    Not ``credentials.secret_source``. That one answers for a process
+    launched by ``backend.secret_launcher``: it reports
+    ``"inherited_fd"``, ``"os.environ"`` or ``"missing"``, and in *this*
+    process — which no launcher started, so no descriptor was handed
+    down — it would report ``"missing"`` for everything and tell the
+    operator nothing they could act on.
+
+    The question ``secrets`` exists to answer is "does this machine hold
+    the credential", so it asks the machine. That is a different
+    question from "will the server resolve it", and the two answers
+    differ in exactly the way an operator needs to see: a keychain that
+    is configured here can still miss the server if the launcher failed
+    to publish.
+
+    Both halves come out of one call, which is the point of the pair
+    rather than a small helper per question. The source column and the
+    comparison are two readings of the same fact, and the defect they
+    can fall into is disagreeing with each other — a row reading
+    ``source=keychain`` beside a verdict computed from the environment.
+    Handing both out together makes that disagreement unrepresentable,
+    and it keeps the command at one read per secret: a second helper
+    would be a second ``security`` process, which is the cost moving
+    the server's read into a launcher exists to stop paying.
+
+    On a platform with no keychain the environment is the only source
+    there is, and the ordinary labels are the honest ones — the same
+    answer the server gives there.
+    """
+    if credentials.keychain_disabled():
+        return credentials.secret_source(name), credentials.read_secret(name)
+
+    value = credentials.read_secret_from_keychain(name)
+    if value is None:
+        return credentials.SOURCE_MISSING, None
+    return credentials.SOURCE_KEYCHAIN, value
 
 
 def _print_rows(rows) -> None:
@@ -500,6 +541,17 @@ def cmd_secrets_verify(verify_against: Optional[str] = None) -> int:
     the provider's own, so a deployment cannot read as configured here
     and unconfigured at the far end of a notification send.
 
+    **This reads the keychain directly, and says so.** Since the server
+    moved to a launcher that publishes the secrets over pipes
+    (:mod:`backend.secret_launcher`), ``credentials.secret_source``
+    answers a question about *that process* — and in this one, which no
+    launcher started, it would answer ``"missing"`` for everything. The
+    labels printed here are therefore about **this machine's keychain**
+    (see :func:`_direct_read`), which is the thing an operator can
+    fix. A row reading ``source=keychain`` means the keychain is
+    configured; it does not by itself prove the server received it, and
+    the server's own startup log is where that second fact appears.
+
     ``verify_against`` adds a third column: the file named there is a
     ``KEY=value`` baseline, and each secret is compared with the value
     it holds there. Both values are in this process to be compared and
@@ -526,16 +578,23 @@ def cmd_secrets_verify(verify_against: Optional[str] = None) -> int:
     names = list(credentials.SECRET_SPECS)
 
     if verify_against is None:
+        # Read once per name, and the value is discarded: each read is a
+        # `security` process, and asking twice would buy a second one
+        # rather than a memo hit — the memo belongs to the server's
+        # resolver, which this command deliberately does not go through.
+        sources = {name: _direct_read(name)[0] for name in names}
         _print_rows([
-            (name, "source={}".format(credentials.secret_source(name)))
+            (name, "source={}".format(sources[name]))
             for name in names
         ])
-        _print_missing_reasons(names)
+        _print_missing_reasons(sources)
         note = _unsupported_keychain_note()
         if note is not None:
             print(note)
             return 1
-        return 0 if all(credentials.secret_available(name) for name in names) else 1
+        return 0 if all(
+            source != credentials.SOURCE_MISSING for source in sources.values()
+        ) else 1
 
     baseline = _load_baseline(verify_against)
     if baseline is None:
@@ -543,26 +602,29 @@ def cmd_secrets_verify(verify_against: Optional[str] = None) -> int:
         # operator who named a file that is not there still wants to
         # know where their secrets come from, and a sentence above the
         # table reads as belonging to the table.
+        sources = {name: _direct_read(name)[0] for name in names}
         _print_rows([
-            (name, "source={}".format(credentials.secret_source(name)))
+            (name, "source={}".format(sources[name]))
             for name in names
         ])
-        _print_missing_reasons(names)
+        _print_missing_reasons(sources)
         print(BASELINE_UNREADABLE_NOTE)
         return 1
 
-    # Each verdict is computed once and used twice — printed, then
-    # folded into the exit code. Asking a second time would be a memo
-    # hit rather than a second lookup, so it would not show up in the
-    # fetch count, and a command that has to be counted to be believed
-    # should not contain work it does not need.
+    # One read per name, and both columns come out of it. Reading the
+    # source and the verdict separately would be two `security` processes
+    # where one will do, and — worse — would let the verdict be computed
+    # from a value the source column does not name. The comparison is the
+    # expensive path, so a run with a baseline must fetch exactly as many
+    # values as a run without one.
+    readings = {name: _direct_read(name) for name in names}
     verdicts = {
-        name: _compare_against_baseline(name, baseline) for name in names
+        name: _verdict(name, readings[name][1], baseline) for name in names
     }
     _print_rows([
-        (name, credentials.secret_source(name), verdicts[name]) for name in names
+        (name, readings[name][0], verdicts[name]) for name in names
     ])
-    _print_missing_reasons(names)
+    _print_missing_reasons({name: source for name, (source, _value) in readings.items()})
 
     note = _unsupported_keychain_note()
     if note is not None:
@@ -574,7 +636,7 @@ def cmd_secrets_verify(verify_against: Optional[str] = None) -> int:
     ) else 1
 
 
-def _print_missing_reasons(names: Iterable[str]) -> None:
+def _print_missing_reasons(sources: Dict[str, str]) -> None:
     """Print why each unresolved secret has no value.
 
     ``source=missing`` is one word standing for at least four different
@@ -587,11 +649,28 @@ def _print_missing_reasons(names: Iterable[str]) -> None:
     Only unresolved secrets produce a line. A resolved one has nothing to
     explain, and a command that narrates the healthy rows teaches the
     reader to skip the output that matters.
+
+    This takes the caller's own readings rather than the spec table, and
+    that is load bearing rather than a convenience.
+    :func:`credentials.diagnose_secret` re-derives a resolution for the
+    name it is handed, and on a machine with a keychain its last branch
+    reads the keychain to rule out the item being filed. Asked about a
+    secret this command has just resolved, it would pay a second
+    ``security`` process to re-answer a question the table above has
+    already answered — and the answer would have to agree with the row,
+    which is a property two independent reads are free to lose. Handing
+    over the readings is what keeps the table and the notes below it
+    derived from one read.
     """
+    unresolved = [
+        name
+        for name, source in sources.items()
+        if source == credentials.SOURCE_MISSING
+    ]
     reasons = [
         reason
         for reason in (
-            credentials.diagnose_secret(name) for name in names
+            credentials.diagnose_secret(name) for name in unresolved
         )
         if reason is not None
     ]

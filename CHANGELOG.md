@@ -8,6 +8,50 @@ and this project adheres to
 
 [中文版](CHANGELOG.zh.md)
 
+## [Unreleased]
+
+**The keychain read left the process that serves requests.** The two
+notification secrets are now resolved once at startup by a launcher that
+publishes them onto anonymous pipes and then `exec`s the server, so the
+process answering HTTP never runs the keychain tool at all. Beside it, an
+opt-in reader that narrows an item's access control list to a binary you
+signed yourself — so `/usr/bin/security`, which every process on the
+machine may execute, stops being what grants the read.
+
+### Added
+
+- **`backend.secret_launcher` reads the keychain once, then becomes the
+  server.** It resolves each notification secret, writes the values onto
+  anonymous pipes, names the descriptors in the environment, and `exec`s
+  `backend.server` — the same PID, so a supervisor's view of the service
+  does not change. The server then reads the descriptors it inherited, so
+  `credentials.read_secret` reports `"inherited_fd"` and has no keychain
+  branch left to take. A deployment that leaves the keychain switched off
+  is unaffected and still starts with `python -m backend.server`. See
+  [Keychain migration](docs/operations/keychain-migration.md).
+
+- **`tools/pdt-secret-reader/` — a reader you sign, and the rewrite that
+  trusts it.** An item filed by `security` names `/usr/bin/security` as
+  its trusted application, and that is an Apple-signed binary every
+  process on the machine may execute; the default list therefore hands the
+  secret to anything that can run one command, and does it silently.
+  `setup.sh build` issues a self-signed certificate and a signed reader,
+  `adopt --widen` adds that reader to each item's list while keeping what
+  is already trusted there, and `adopt --narrow` rewrites those lists with
+  the reader alone. Reads go through `PDT_SECRET_READER_PATH` when it is
+  set, with the same argv `security` was given, so nothing else about the
+  read changes. The procedure, its exit codes, and what it does **not**
+  protect against are in its README.
+
+### Changed
+
+- **`secrets verify` now asks the machine, not the process.** The command
+  reads the keychain directly, because that is the question an operator
+  can act on: a server started without the launcher would report `missing`
+  for everything and explain nothing. It still prints `source=keychain`,
+  which now means "this machine's keychain holds it" rather than "the
+  server will resolve it".
+
 ## [0.1.2] - 2026-10-07
 
 **What a run may touch, and what a green report proves.** Three capabilities

@@ -67,6 +67,37 @@ _PROTECTED_COMPARE_FIELDS: Tuple[str, ...] = (
     "project_dir",
 )
 
+#: The fields that make up a task's **judging command** — the objective
+#: half of the dual-criterion completion rule.
+#:
+#: Deliberately separate from ``_PROTECTED_COMPARE_FIELDS``, because the
+#: rule they carry is universal rather than group-scoped. A task that can
+#: rewrite its own judge is grading its own homework whether or not it
+#: belongs to the repair group, and the fields the refiner may
+#: legitimately refine (``title``, ``description``, ``depends_on``,
+#: ``files_to_modify``) are exactly the ones that must NOT be frozen.
+_JUDGE_FIELDS: Tuple[str, ...] = ("test_command", "test_commands")
+
+
+def _judge_commands(task: Any) -> Tuple[Tuple[str, ...], str]:
+    """Normalised ``(list_form, single_form)`` view of a task's judge.
+
+    Normalised because the two shapes are interchangeable and an LLM
+    echoes them inconsistently: ``test_commands: []`` and an absent
+    ``test_commands`` mean the same thing, and so do ``""`` and a missing
+    ``test_command``. Comparing raw values would report a rewrite every
+    time the model switched shape without changing the command.
+    """
+    try:
+        raw_list = task.get("test_commands") or []
+        raw_single = task.get("test_command") or ""
+    except AttributeError:
+        return (), ""
+    commands = tuple(
+        str(item).strip() for item in raw_list if str(item or "").strip()
+    )
+    return commands, str(raw_single).strip()
+
 
 def is_protected(
     task: Any,
@@ -86,6 +117,63 @@ def _content_of(task: Any) -> Dict[str, Any]:
         return {f: task.get(f) for f in _PROTECTED_COMPARE_FIELDS}
     except AttributeError:
         return {}
+
+
+def inherit_failed_vp(
+    parent_id: str,
+    effective_by_id: Dict[str, Dict[str, Any]],
+    failed_vp_by_task_id: Any,
+) -> List[str]:
+    """Copy a split parent's ``failed_vp_id`` onto each of its children.
+
+    2026-10-13. The breakdown children of a repair task were born with no
+    ``failed_vp_id``: the refiner authors their content, and the field is
+    stamped by the orchestrator when it *generates* a repair task. Every
+    such row already written reads NULL, and
+    ``verification_loop._get_pending_repair_tasks`` revives a ``failed``
+    row only when its VP is in this round's failure set — so a child that
+    failed was stranded exactly the way the deleted parent used to be.
+
+    A child is the parent's work continuing — its own description says so,
+    naming the parent task whose verdict it addresses — so the VP it was
+    written for is the parent's. Only ``failed_vp_id`` is
+    copied. ``round`` is deliberately NOT: a NULL round is what keeps the
+    child out of ``_supersede_prior_round_repairs``, which retires rows
+    from a *strictly earlier* round for the same VP
+    (``row_round is None → continue``) and would otherwise cancel the
+    revival on the very next round.
+
+    ``failed_vp_by_task_id`` is supplied by the caller because
+    ``failed_vp_id`` lives only in ``plan_tasks`` — ``SubTask`` has no
+    such field and ``TaskManager._STATIC_TASK_FIELDS`` never carried it,
+    so ``current_tasks`` cannot know it. See
+    ``AutonomousAgent._repair_failed_vp_map``.
+
+    Mutates ``effective_by_id`` in place (the dicts
+    :attr:`RefinerStructurePlan.effective` is built from) and returns the
+    ids it stamped.
+    """
+    if not failed_vp_by_task_id:
+        return []
+    try:
+        vp_id = str(failed_vp_by_task_id.get(parent_id) or "").strip()
+    except AttributeError:
+        return []
+    if not vp_id:
+        return []
+    stamped: List[str] = []
+    prefix = f"{parent_id}-"
+    for cid, child in effective_by_id.items():
+        if not isinstance(cid, str) or not cid.startswith(prefix):
+            continue
+        try:
+            if str(child.get("failed_vp_id") or "").strip():
+                continue  # the refiner declared one; do not clobber it
+        except AttributeError:
+            continue
+        child["failed_vp_id"] = vp_id
+        stamped.append(cid)
+    return sorted(stamped)
 
 
 def unconstructable_entries(
@@ -154,10 +242,24 @@ class RefinerStructurePlan:
     #: about the repair round" vs "the LLM tried to edit it").
     reverted_ids: Tuple[str, ...]
 
+    #: **Any** task — protected or not — whose judging command the
+    #: refiner tried to change. The original command was restored and the
+    #: rest of the refiner's edit kept. Distinct from
+    #: :attr:`reverted_ids` on purpose: that one means "the LLM tried to
+    #: edit a repair task", this one means "the LLM tried to rewrite the
+    #: test that grades a task". An operator needs to tell those apart —
+    #: the second is the signature of a refiner that has decided the
+    #: cheapest way to pass is to change the judge.
+    #:
+    #: Only tasks that already existed when the refinement started can
+    #: appear here. A task the refiner *creates* has no first version to
+    #: protect: authoring its command is exactly what the refiner is for.
+    judge_rewritten_ids: Tuple[str, ...] = ()
+
     @property
     def is_noop(self) -> bool:
         return not (self.removed_ids or self.added_ids or self.reinstated_ids
-                    or self.reverted_ids)
+                    or self.reverted_ids or self.judge_rewritten_ids)
 
     def to_dict(self) -> Dict[str, Any]:
         """Log payload. Lists, not sets, so the JSON is stable."""
@@ -166,6 +268,7 @@ class RefinerStructurePlan:
             "removed_ids": list(self.removed_ids),
             "reinstated_ids": list(self.reinstated_ids),
             "reverted_ids": list(self.reverted_ids),
+            "judge_rewritten_ids": list(self.judge_rewritten_ids),
             "effective_count": len(self.effective),
         }
 
@@ -174,6 +277,7 @@ def plan_refiner_structure(
     current_tasks: Sequence[Dict[str, Any]],
     updated_tasks: Sequence[Dict[str, Any]],
     protected_prefix: str = DEFAULT_PROTECTED_TASK_GROUP_PREFIX,
+    failed_vp_by_task_id: Any = None,
 ) -> RefinerStructurePlan:
     """Decide the one task list both stores end up with.
 
@@ -186,6 +290,16 @@ def plan_refiner_structure(
         The refiner's returned list, verbatim.
     protected_prefix:
         ``task_group`` prefix the refiner may not add to, edit or drop.
+    failed_vp_by_task_id:
+        ``{task_id: failed_vp_id}`` for the rows that carry one — read
+        from ``plan_tasks`` by the caller, because that column is not on
+        :class:`task.SubTask` and so cannot arrive via ``current_tasks``.
+        When a protected task is split into ``{tid}-1``/``{tid}-2``/…,
+        each child inherits its parent's VP through
+        :func:`inherit_failed_vp`, so a child that fails is re-queued by
+        ``verification_loop._get_pending_repair_tasks`` exactly like any
+        other failed repair task. Omitted / empty → no inheritance, which
+        is the pre-2026-10-13 behaviour.
 
     Returns
     -------
@@ -226,6 +340,31 @@ def plan_refiner_structure(
         order.append(tid)
         refiner_by_id[tid] = task
 
+    # ------------------------------------------------------------------
+    # The judging command is write-once, not never-written.
+    #
+    # 2026-10-11. Someone has to author a test_command the first time:
+    # either the task generator, or the refiner when it splits a failed
+    # task into children. A child is a *different task* with a smaller
+    # scope, so it needs its own judge — freezing the parent's onto it
+    # would grade the child against work it was never asked to do.
+    #
+    # What must not happen is the *second* write. A command that grades
+    # a task and can be edited by the same loop that is being graded is
+    # not a judge. The way that shows up: with a build tool missing from
+    # the executor's PATH every failure looks like a defective command,
+    # so the refiner "fixes" the command — prefixing it with a PATH that
+    # names the missing binary — while the task list grows every round.
+    #
+    # So: a NEW task's command is the refiner's to write (it is graded
+    # on its quality by the caller — see
+    # ``AutonomousAgent._enforce_new_subtask_test_command``), and an
+    # EXISTING task's command is frozen. ``is_protected`` below only
+    # guards ``task_group.startswith("repair")``, and every task in that
+    # plan had ``task_group = None``, so it fired zero times; the rule
+    # below is what covers the rest.
+    # ------------------------------------------------------------------
+
     reinstated: List[str] = []
     reverted: List[str] = []
     effective_by_id: Dict[str, Dict[str, Any]] = dict(refiner_by_id)
@@ -245,6 +384,18 @@ def plan_refiner_structure(
         # ``failed`` beside children that had all completed.
         # 2026-10-05: four repair parents were stranded this way.
         if any(cid.startswith(f"{tid}-") for cid in refiner_by_id):
+            # 2026-10-13: the parent is about to be deleted, and the
+            # ``failed_vp_id`` it carries dies with it unless the
+            # children — which ARE its work, continuing — take it over.
+            # Stamped on the dicts ``RefinerStructurePlan.effective`` is
+            # built from, so the writer that follows hands the same
+            # answer to both stores: ``plan_tasks`` picks it up through
+            # ``ALLOWED_STATIC_TASK_FIELDS`` (it is an allow-listed
+            # static column), and ``tasks.json`` drops it the way it
+            # drops ``breakdown_count`` — ``SubTask`` declares neither,
+            # and this column has never been read off disk. See
+            # ``inherit_failed_vp``.
+            inherit_failed_vp(tid, effective_by_id, failed_vp_by_task_id)
             effective_by_id.pop(tid, None)
             continue
         replacement = refiner_by_id.get(tid)
@@ -254,6 +405,35 @@ def plan_refiner_structure(
             reverted.append(tid)
         # Protected: the pre-refinement dict wins unconditionally.
         effective_by_id[tid] = original
+
+    # The judging command is write-once for EVERY task that already
+    # exists, not just the protected ones.
+    #
+    # This runs after the protected loop so it cannot disturb that
+    # loop's ``reverted`` verdict, which compares whole content and must
+    # keep seeing the refiner's raw entry. For a non-protected task the
+    # refiner is free to refine everything that describes the work — its
+    # title, its description, its dependencies, which files it touches —
+    # but not the command that decides whether the work is done. Only
+    # the judge fields are restored; everything else the refiner wrote
+    # stands, so a legitimate refinement is not thrown away.
+    judge_rewritten: List[str] = []
+    for tid, original in current_by_id.items():
+        if is_protected(original, protected_prefix):
+            continue  # handled above: the whole original dict already won
+        replacement = effective_by_id.get(tid)
+        if not isinstance(replacement, dict):
+            continue
+        if _judge_commands(replacement) == _judge_commands(original):
+            continue
+        patched = dict(replacement)
+        for field in _JUDGE_FIELDS:
+            if field in original:
+                patched[field] = original[field]
+            else:
+                patched.pop(field, None)
+        effective_by_id[tid] = patched
+        judge_rewritten.append(tid)
 
     effective: List[Dict[str, Any]] = [
         effective_by_id[tid] for tid in order if tid in effective_by_id
@@ -268,4 +448,7 @@ def plan_refiner_structure(
         added_ids=tuple(sorted(effective_ids - set(current_by_id))),
         reinstated_ids=tuple(sorted(reinstated)),
         reverted_ids=tuple(sorted(reverted)),
+        judge_rewritten_ids=tuple(
+            sorted(i for i in judge_rewritten if i in effective_ids)
+        ),
     )

@@ -22,6 +22,7 @@ generator is a pure function over its inputs.
 import pytest
 
 
+import inspect
 import sys
 from pathlib import Path
 
@@ -30,7 +31,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from verification_profile import ExecutionProfileGenerator  # noqa: E402
 from verification_config import (  # noqa: E402
     DEFAULT_GLOBAL_TIMEOUT_SECONDS,
-    DEFAULT_PARALLELISM_CAP,
     DEFAULT_PER_METHOD_TIMEOUT_SECONDS,
     TimeoutPolicy,
 )
@@ -62,7 +62,13 @@ class TestExecutionProfileFieldShape:
         - ``group_profiles`` (``list``)
         - ``subtask_splits`` (``list``)
         - ``per_method_timeouts`` (``dict``)
-        - ``parallelism_cap`` (``int``)
+        - ``vp_capacity_source`` (``str``)
+        - ``vp_capacity_observed`` (``int`` or ``None``)
+
+        2026-10-13: ``parallelism_cap`` is no longer among them. A round
+        has no configured width left — the provider slot pool decides it
+        per dispatch — so the payload states where the width came from
+        (``vp_capacity_source``) rather than publishing a number.
         """
         plan = _make_plan(
             [
@@ -83,19 +89,28 @@ class TestExecutionProfileFieldShape:
             "group_profiles",
             "subtask_splits",
             "per_method_timeouts",
-            "parallelism_cap",
+            "vp_capacity_source",
+            "vp_capacity_observed",
         }
+
+        # And the retired key stays retired: it is the one an operator
+        # would find and try to tune, with nothing reading it.
+        assert "parallelism_cap" not in profile, (
+            "the profile publishes parallelism_cap again. Nothing reads it "
+            "— the round width is decided by the provider slot pool at "
+            "dispatch time — so it is a number that can be edited to no "
+            "effect."
+        )
 
         # Type contract
         assert isinstance(profile["total_duration_sec"], int)
         assert isinstance(profile["group_profiles"], list)
         assert isinstance(profile["subtask_splits"], list)
         assert isinstance(profile["per_method_timeouts"], dict)
-        assert isinstance(profile["parallelism_cap"], int)
+        assert isinstance(profile["vp_capacity_source"], str)
 
-        # Sanity: at least one group, parallelism is a positive int
+        # Sanity: at least one group
         assert len(profile["group_profiles"]) >= 1
-        assert profile["parallelism_cap"] > 0
 
     def test_execution_profile_empty_plan_returns_zero_duration(self):
         """An empty plan should not crash and should report zero duration.
@@ -116,20 +131,36 @@ class TestExecutionProfileFieldShape:
 
         assert profile["total_duration_sec"] == 0
         assert profile["subtask_splits"] == []
-        assert profile["parallelism_cap"] == DEFAULT_PARALLELISM_CAP
+        assert profile["vp_capacity_observed"] is None
 
-    def test_execution_profile_uses_timeout_policy_parallelism_cap(self):
-        """A custom TimeoutPolicy's parallelism cap is surfaced as-is."""
+    def test_execution_profile_never_consults_the_policy_for_a_width(self):
+        """No TimeoutPolicy can put a width back into the payload.
+
+        2026-10-13: ``TimeoutPolicy`` lost ``parallelism_cap`` along with
+        every other pre-agreed round width. A policy that still took one
+        would make the width configurable again, which is the thing that
+        was removed; and a profile that published it would carry a number
+        no enforcement point reads.
+        """
+        assert "parallelism_cap" not in inspect.signature(
+            TimeoutPolicy.__init__
+        ).parameters, (
+            "TimeoutPolicy takes a parallelism_cap again. The verification "
+            "round's width is the provider slot pool's to give at dispatch "
+            "time; a configured one reintroduces the second source of "
+            "truth that 2026-10-13 deleted."
+        )
+
         custom = TimeoutPolicy(
             per_method_timeout_seconds=dict(DEFAULT_PER_METHOD_TIMEOUT_SECONDS),
             global_default_timeout_seconds=DEFAULT_GLOBAL_TIMEOUT_SECONDS,
-            parallelism_cap=8,
         )
+        profile = ExecutionProfileGenerator(
+            _make_plan([]), timeout_policy=custom
+        ).build()
 
-        gen = ExecutionProfileGenerator(_make_plan([]), timeout_policy=custom)
-        profile = gen.build()
-
-        assert profile["parallelism_cap"] == 8
+        assert "parallelism_cap" not in profile
+        assert profile["vp_capacity_source"] == "provider_pool"
 
 
 # -----------------------------------------------------------------------------

@@ -77,8 +77,9 @@ _HOME_PATH_RE = re.compile(
 #: a real example in the existing source tree, and an entry here is
 #: a deliberate exemption: ``me`` is how a per-tenant command example
 #: names its user's home, ``someone`` is the standard indefinite
-#: pronoun in API docs, and so on. Adding a name here means
-#: "this string is a placeholder everywhere in the codebase".
+#: pronoun in API docs, and ``you`` is how the sandbox profile template
+#: addresses whoever is reading it (``/Users/you/.ssh``). Adding a name
+#: here means "this string is a placeholder everywhere in the codebase".
 #: ``...`` (three dots) is the standard ellipsis convention used in
 #: docstrings to abbreviate an arbitrary path component — ``/Users/.../plans``
 #: reads as "wherever the operator's plans directory happens to live"
@@ -92,6 +93,7 @@ PLACEHOLDER_SEGMENTS: frozenset[str] = frozenset({
     "me",
     "user",
     "username",
+    "you",
     "someone",
     "whoami",
     "name",

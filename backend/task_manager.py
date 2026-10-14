@@ -113,7 +113,7 @@ def derive_plan_id_from_tasks_file(tasks_file) -> str:
         raise ValueError(
             f"Refusing to derive plan_id={name!r}: name too short "
             f"(<4 chars). Use a descriptive id like "
-            f"`20260101-my-feature`."
+            f"`my-descriptive-feature`."
         )
     # 2026-09-09 (unicode letters fix): the previous ASCII-only allowlist
     # (``[A-Za-z0-9._-]``) was correct for English-only plan_ids but

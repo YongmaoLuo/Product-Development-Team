@@ -1,0 +1,5 @@
+# Build output and, more importantly, the signing identity's private key.
+# `build/identity/key.pem` is the key that signs the helper; the keychain
+# ACL is pinned to the designated requirement derived from it, so leaking
+# it would let someone else produce a binary that the ACL accepts.
+build/

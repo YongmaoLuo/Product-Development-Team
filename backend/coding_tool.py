@@ -5,6 +5,7 @@ Coding Tool Interface
 Abstract base class for AI coding tools and implementations.
 """
 
+import copy
 import json
 import logging
 import os
@@ -19,9 +20,9 @@ import uuid
 import contextvars
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from utils.process import kill_process_group
 from utils.secret_files import private_dir, redact_all, write_private_json
@@ -33,6 +34,7 @@ import claude_sandbox
 # risk — unlike ``provider_routing`` / ``provider_order``, which pull in
 # the SQLite consumer layer and stay lazily imported at the call site.
 from dynamic_provider_concurrency import get_shared_tracker
+from quota_watchdog import get_shared_quota_watchdog as _shared_quota_watchdog
 # Per-plan LLM-call attribution registry (2026-09-21). Pure logging side
 # channel — record failures must never break a dispatch, so the registry
 # swallows its own errors and we never let them propagate either.
@@ -41,6 +43,77 @@ from usage_registry import record_llm_call as _record_usage_entry
 from file_lock_protocol import socket_path
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Reusable sessions for iteration loops
+# ---------------------------------------------------------------------------
+# An iteration loop — "that answer was unusable, ask again", "here is the
+# validator's objection, fix the list" — is one question asked more than
+# once. Answered in a fresh session each time, the sub-agent re-reads
+# every file the prompt names, and these prompts name files by path
+# rather than inlining their bodies, so that work is paid for again on
+# every round. Re-opening the previous session keeps it in the
+# transcript instead.
+#
+# The opt-in rides on a context variable rather than on a new keyword
+# argument. Every ``query_json`` implementation, and every call site that
+# does not want a reused session, stays byte-identical; a caller opts in
+# only by routing its loop through :func:`query_json_in_session`. A tool
+# with no sessions to re-open — a vendor CLI without a transcript, or a
+# test double — simply never reads the variable, so it keeps behaving
+# exactly as it does today.
+#
+# The handle is also what solves the chicken-and-egg a bare session id
+# cannot: on the first round the caller has no id to pass, and the id the
+# CLI actually used is picked inside the dispatch. The tool writes that
+# id back into the handle and the next round reads it out, so a caller
+# never has to guess which id is live.
+
+
+class JsonSession:
+    """A resumable JSON-call session, owned by the caller's loop.
+
+    One per loop rather than one per call: the loop's second question is
+    the first question again, and this is what makes it so.
+    """
+
+    __slots__ = ("session_id",)
+
+    def __init__(self, session_id: Optional[str] = None):
+        self.session_id = session_id
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"JsonSession(session_id={self.session_id!r})"
+
+
+#: The session the call in flight should re-open, when its caller asked
+#: for one. ``None`` means "fresh session", which is what every existing
+#: caller gets and what stays the default.
+_JSON_SESSION: "contextvars.ContextVar[Optional[JsonSession]]" = (
+    contextvars.ContextVar("coding_json_session", default=None)
+)
+
+
+def query_json_in_session(tool, session: Optional[JsonSession], /, *args, **kwargs) -> dict:
+    """``tool.query_json(*args, **kwargs)`` with ``session`` bound for that call.
+
+    Entering with an empty handle opens a fresh session under an id the
+    tool pins. Leaving, the handle carries whichever session actually
+    produced the reply — including one a provider fallback had to switch
+    to, and including a reply that failed to parse, since that session
+    exists and re-asking inside it is the point of the loop.
+
+    Arguments are forwarded exactly as written, positionally or by
+    keyword, so ``tool`` cannot tell this from a direct call — and a
+    ``query_json`` that takes neither ``scene`` nor ``allowed_tools``
+    keeps working.
+    """
+    token = _JSON_SESSION.set(session)
+    try:
+        return tool.query_json(*args, **kwargs)
+    finally:
+        _JSON_SESSION.reset(token)
 
 
 class ApiError(Exception):
@@ -114,6 +187,418 @@ class EmptyResponseError(RuntimeError):
             "stdout_len": self.stdout_len,
             "message": str(self),
         }
+
+
+# The user turn sent when a provider switch re-opens a session the previous
+# attempt left unfinished.
+#
+# ``--resume`` restores the *conversation*; this string is the only new user
+# turn that comes with it. Re-sending the original prompt would put the same
+# instructions into the session twice — paying for every token of a long task
+# prompt a second time and leaving the model to work out which copy is
+# current — so the prompt is deliberately absent here and replaced by a
+# continuation cue.
+#
+# The session is normally killed *mid-flight*, so "where you stopped" is a
+# real question rather than a courtesy: a tool call may have been issued and
+# its effect (a file written, a test run started, a process spawned) is
+# invisible to the model. "Check before redoing" is what keeps a resumed agent
+# from duplicating side effects it cannot see.
+RESUME_CONTINUATION_PROMPT = (
+    "Your previous turn in this session was cut off before you finished — "
+    "the process running you was terminated mid-task, so the last action you "
+    "started may or may not have completed.\n"
+    "Continue the task from where you stopped. Do not restart it and do not "
+    "redo steps you already completed: for any step whose result is not "
+    "visible in this conversation, check its actual current state before "
+    "deciding whether it needs to be done again. Then finish the task and "
+    "report the outcome."
+)
+
+#: Prepended to a re-ask that runs in the session the same caller just
+#: used. It is deliberately not the cue above: that one describes a turn
+#: cut off mid-task and asks the model to pick the task back up, which is
+#: what a provider switch is. A re-ask is a *new* ask about the same
+#: subject, carrying whatever changed since — a validator's objection,
+#: the reason the last answer was rejected — and that has to travel with
+#: the turn or the model re-answers the question it was just asked.
+#:
+#: The caller's prompt is re-sent here on purpose. What the restored
+#: transcript saves is the reading, the greps and the test runs behind
+#: that prompt, not the question itself, and those are the expensive part.
+RESUME_REASK_PROMPT = (
+    "This is a follow-up in the session you have just answered. The files "
+    "you read, the commands you ran and their output are all still in this "
+    "conversation — build on them rather than starting over.\n\n"
+    "Here is the new request:\n\n"
+)
+
+# Appended to every JSON-path prompt so a reply stays machine-parseable.
+# A resumed turn needs it as much as a first turn does: the restored
+# context ends on the previous attempt's own output, so the format
+# instruction is not redundant just because the task prompt is.
+JSON_ONLY_SUFFIX = (
+    "\n\nIMPORTANT: Return ONLY the JSON object requested, no markdown fencing."
+)
+
+
+class SceneProviderUnavailable(RuntimeError):
+    """A scene-routed call had no provider the scene's tier table approves.
+
+    Why this exists
+    ---------------
+    A scene (e.g. ``execution``) names a tier, a tier names regexes over
+    CC Switch provider display names, and the tier table is an
+    *allowlist*: a provider that no tier names is not approved to serve
+    that scene. The scene chain is therefore the exclusive candidate set
+    while a scene is in effect.
+
+    The hole this closes: when the chain resolved to nothing usable the
+    dispatch used to continue anyway — into ``provider_priority`` (which
+    is the whole optimizer chain with no tier filtering), then into the
+    constructor's run-level ``base_url`` / ``auth_token``, then into the
+    parent process env. Every one of those is a provider the scene never
+    approved, and the outcome was invisible: ``current_call_provider``
+    was stamped ``"parent"``, so the usage ledger recorded a call whose
+    endpoint no ledger column described. A tier table that does not cover
+    a provider is a configuration fact, and silently serving the call
+    from outside the table turns that fact into an invisible one.
+
+    So the call fails instead, and says why. The attributes exist so a
+    caller can distinguish the three ways a chain comes up empty without
+    parsing prose:
+
+      * ``reason`` — ``"chain_unresolved"`` (resolution raised),
+        ``"no_tier_match"`` (no CC Switch name matches any pattern in the
+        scene's tier), ``"all_candidates_skipped"`` (every name was
+        excluded, parked in quota cooldown, or unavailable),
+        ``"no_capacity"`` (every reachable candidate's local pool has no
+        width left at all — shut, parked, or scaled to zero by its
+        remaining budget). Note what ``"no_capacity"`` does **not** mean:
+        a pool that is merely FULL is queued for rather than failed on,
+        because a slot is a lease that comes back on the holder's own
+        timeline, so the word covers "nobody here can serve at all" and
+        not "everybody here is busy".
+      * ``tier`` / ``chains`` — the tiers the scene resolves to.
+      * ``candidates`` — what the chain offered, before filtering.
+
+    It is a distinct type rather than a reused ``ApiError`` because no
+    HTTP request was ever made: ``ApiError`` means "a provider answered
+    and refused", which drives the provider-fallback retry that excludes
+    the failed provider and walks to the next one. There is no next
+    provider here — the whole candidate set was empty — so that retry
+    policy would be answering a question that was never asked. Reusing it
+    would also let the dispatch record the failure as a provider error,
+    which is precisely the misattribution being removed.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        scene: str,
+        reason: str,
+        tier: Optional[str] = None,
+        chains: Optional[List[List[str]]] = None,
+        candidates: Optional[List[str]] = None,
+    ):
+        super().__init__(message)
+        self.scene = scene
+        self.reason = reason
+        self.tier = tier
+        self.chains = chains or []
+        self.candidates = candidates or []
+
+    def to_dict(self) -> dict:
+        return {
+            "type": "scene_provider_unavailable",
+            "scene": self.scene,
+            "reason": self.reason,
+            "tier": self.tier,
+            "chains": self.chains,
+            "candidates": self.candidates,
+            "message": str(self),
+        }
+
+
+def _scene_chain_unavailable(
+    scene: str,
+    diag: dict,
+    event_logger: Optional[object] = None,
+) -> SceneProviderUnavailable:
+    """Build (and log) the fail-closed error for a scene that approved nobody.
+
+    Returns the exception rather than raising it, so the ``raise`` stays
+    visible at the call site — the reader of the dispatch path sees where
+    the call dies, not just a helper called three blocks earlier.
+
+    Logging goes to both sinks on purpose. The module logger is always
+    present, and the structured ``event_logger`` is what the plan's
+    execution log and the operator dashboard read; a failure that only
+    reaches one of them is invisible to whoever has to act on it. Both
+    records carry the same scene / reason / candidates so the two can be
+    joined.
+    """
+    reason = diag.get("reason") or "chain_unresolved"
+    tier = diag.get("tier")
+    chains = diag.get("chains") or []
+    chain = diag.get("chain") or []
+    candidates = diag.get("candidates") or []
+    tier_txt = f" (tier {tier!r})" if tier else ""
+
+    if reason == "no_tier_match":
+        detail = (
+            f"no CC Switch provider name matches any pattern in the scene's "
+            f"own tier{tier_txt} — the chain is empty by configuration, so "
+            f"every provider on this machine is unapproved for this scene"
+        )
+    elif reason == "all_candidates_skipped":
+        detail = (
+            f"the scene's chain offered {chain or '[]'} but every candidate "
+            f"was excluded, parked in quota cooldown, or unavailable"
+        )
+    elif reason == "no_capacity":
+        detail = (
+            f"every reachable candidate {candidates} has no local width "
+            f"left at all — shut, parked, or scaled to zero by its "
+            f"remaining budget "
+            f"({diag.get('waited_sec')}s). A pool that is merely full is "
+            f"not this: that is queued for, because a slot comes back "
+            f"when the agent holding it finishes"
+        )
+    elif reason == "chain_unresolved":
+        detail = (
+            f"resolving the chain raised: {diag.get('error')!r}"
+        )
+    else:
+        detail = f"chain resolution ended as {reason!r}"
+
+    message = (
+        f"Scene {scene!r} has no dispatchable provider{tier_txt}: {detail}. "
+        f"Not dispatching: with a scene in effect the provider must be one "
+        f"the scene's tier table approves, and neither the priority chain, "
+        f"nor the run-level provider, nor the parent process environment is "
+        f"on that list. Fix the scene/tier mapping in provider_routing.yaml, "
+        f"or run this phase without a scene."
+    )
+    exc = SceneProviderUnavailable(
+        message,
+        scene=scene,
+        reason=reason,
+        tier=tier,
+        chains=chains,
+        candidates=candidates or chain,
+    )
+    payload = exc.to_dict()
+    logger.error("[SCENE PROVIDER UNAVAILABLE] %s", message)
+    if event_logger is not None:
+        event_logger.error("provider_scene_chain_empty", message, data=payload)
+    return exc
+
+
+class ProviderSlotWaitExpired(RuntimeError):
+    """A saturated pool was queued for longer than the slot wait, and the wait ran out.
+
+    What this is NOT
+    ----------------
+    It is not a failed dispatch, and no caller may record one from it. The
+    call never reached a provider: nothing was sent, nothing was refused,
+    and no evidence exists that anything is wrong with the work. What
+    happened is that every provider this scene approves was at its local
+    concurrency cap for longer than ``PROVIDER_SLOT_WAIT_SEC``, and the
+    caller would rather have its slot back than keep holding whatever it
+    was holding while it sleeps.
+
+    Why a distinct type
+    -------------------
+    Because the layers above have to treat it as a *signal* rather than a
+    verdict, and the only way to guarantee that is for the signal to be
+    something they cannot catch by accident. Every generic
+    ``except Exception`` between here and the verification gate would
+    otherwise turn this into a ``FAILED`` verdict — the one thing this
+    ticket exists to prevent. It is a sibling of :class:`RuntimeError`, not
+    of :class:`ApiError`, so the provider-fallback machinery does not
+    exclude a provider and walk to the next one: no provider failed, and
+    excluding the whole tier would make the next attempt no better off.
+
+    Who catches it
+    --------------
+    The verification fan-out. It releases both capacity gates (the
+    ``finally`` already there does it) and puts the verification point back
+    on the queue, so a point that could not get a slot is re-queued rather
+    than failed. A caller with no such concept sees the exception like any
+    other dispatch error, which is strictly better than the unbounded wait
+    it replaces.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        scene: str,
+        waited_sec: float,
+        rounds: int,
+        bound_sec: float,
+        candidates: Optional[List[str]] = None,
+        requested_sec: Optional[float] = None,
+    ):
+        super().__init__(message)
+        self.scene = scene
+        #: How long the point was actually asleep holding its gates — the
+        #: elapsed time the bound is measured on.
+        self.waited_sec = float(waited_sec)
+        self.rounds = int(rounds)
+        self.bound_sec = float(bound_sec)
+        self.candidates = list(candidates or [])
+        #: How long the queue asked to wait, which is a different number and
+        #: is not what expired. Kept because it is the one that explains the
+        #: round count, and because the two diverge whenever a step was cut
+        #: short by a wake.
+        self.requested_sec = (
+            float(requested_sec) if requested_sec is not None else None
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "type": "provider_slot_wait_expired",
+            "scene": self.scene,
+            "waited_sec": round(self.waited_sec, 1),
+            "requested_sec": (
+                round(self.requested_sec, 1)
+                if self.requested_sec is not None else None
+            ),
+            "rounds": self.rounds,
+            "bound_sec": self.bound_sec,
+            "candidates": self.candidates,
+            "message": str(self),
+        }
+
+
+class SettingsTemplateMissing(RuntimeError):
+    """The ``--settings`` template is gone AND this instance never read one.
+
+    What happened (observed once)
+    ------------------------------
+    ``SubagentConfig.write_tmp_settings`` puts the template in a fresh
+    ``private_dir()`` (``~/.pdt-scratch/pdt-subagent-*/``). Anything
+    that sweeps that root — a boot-time cleaner, another run's TTL, an
+    operator's ``rm`` — takes the template with it. The dispatch then
+    forwarded the now-dangling path verbatim::
+
+        claude ... --settings /Users/…/pdt-subagent-vw_xtnmf/subagent_settings_<uuid>.json
+
+    The CLI validates ``--settings`` *before* any model call, so it
+    died in 0.2s with ``Error: Settings file not found`` on stderr and
+    no assistant text — which the read loop could only report as
+    ``Claude sub-process exited without assistant text``. That message
+    points at the provider and at the model; the fault is a local file
+    that was swept. One task died, and four downstream tasks stalled
+    behind it.
+
+    Why the raise, rather than "just run without ``--settings``"
+    -----------------------------------------------------------------
+    Because the template carries the sub-agent's guardrails: the
+    ``PreToolUse``/``PostToolUse`` hooks and the ``PDT_*`` env block
+    that ``file_lock_broker`` and the Edit/Write containment guard read.
+    Starting without it is a sub-agent with no hook and no lock broker,
+    running normally — the exact failure this repo already names as the
+    worse outcome in ``claude_sandbox.py`` ("a sandbox that quietly
+    disables itself is the worse outcome"). A loud error beats an
+    invisible, permanent hole in the guardrail, so the missing template
+    is reported as an error that names the path it could not find.
+
+    Why ``RuntimeError``, and not ``ApiError`` (this is load-bearing)
+    -----------------------------------------------------------------
+    The provider-fallback handler in ``_query_internal_m1`` is an
+    ``except ApiError``, and on a hit it does three things: excludes the
+    provider, calls ``_park_provider_after_error`` to sideline it for a
+    cooldown, and re-dispatches with ``_call(excluded=...)``. For this
+    fault that is wrong three times over:
+
+      1. The next provider dies identically. The template is gone for
+         the whole process, not per provider, so the fallback converts
+         one 0.2s corpse into one per provider in the scene chain.
+      2. It parks a *healthy* provider. A swept local file is evidence
+         of nothing about the endpoint, so the cooldown is a lie that
+         outlives the run and pushes later work off a working provider.
+      3. It hides the cause. Each hop re-reads as "provider N failed",
+         and the one true line — which path was missing — never reaches
+         the log the operator is reading.
+
+    So it is a sibling of :class:`RuntimeError`, the same deliberate
+    choice as :class:`ProviderSlotWaitExpired`: it must fall through to
+    the ``except Exception`` arm that logs and re-raises, with the
+    missing path in the message, instead of being converted into a
+    provider rotation. ``_run_interactive_resilient`` retries only
+    :class:`EmptyResponseError`, so this propagates on the first raise
+    rather than being retried.
+
+    Who catches it
+    --------------
+    The task layer, as a named failure that says which file to look at.
+    When the template *was* readable at least once on this instance the
+    cached copy in ``self._settings_template_cache`` heals the dispatch
+    and this never fires; it is the no-cache fallback for an instance
+    whose very first read came up empty.
+    """
+
+    def __init__(self, message: str, *, path: str):
+        super().__init__(message)
+        #: The dangling template path, verbatim, so the caller can act on
+        #: it without parsing the message.
+        self.path = path
+
+
+def _slot_wait_expired(
+    scene: str,
+    waited_sec: float,
+    rounds: int,
+    bound_sec: float,
+    candidates: Optional[List[str]] = None,
+    event_logger: Optional[object] = None,
+    requested_sec: Optional[float] = None,
+) -> ProviderSlotWaitExpired:
+    """Build (and log) the give-up signal for a queue that outlived its bound.
+
+    Returns the exception rather than raising it, so the ``raise`` stays
+    visible at the call site inside the queue loop — the reader of that loop
+    sees exactly where a VP gives its slot wait up, which is the one place
+    the difference between "waiting" and "working" is unambiguous.
+
+    Logged to both sinks for the same reason as
+    :func:`_scene_chain_unavailable`: the module logger is always present,
+    and the structured ``event_logger`` is what the plan's execution log and
+    the operator dashboard read. Before the verification call sites started
+    passing a logger, the second one did not exist on this path at all.
+    """
+    listed = list(candidates or [])
+    # ``:g`` rather than ``:.0f``: the figure is configurable, so a bound of
+    # 0.2s must not read as "0s" in the one message that exists to say which
+    # bound fired.
+    message = (
+        f"Scene {scene!r} held its slot wait for {waited_sec:g}s over "
+        f"{rounds} rounds for "
+        f"a free provider slot and none of {listed} handed one back; the "
+        f"bound is {bound_sec:g}s (PROVIDER_SLOT_WAIT_SEC). Handing the "
+        f"slot wait back rather than holding a capacity slot while asleep — "
+        f"this is not a failed dispatch and must not be recorded as one."
+    )
+    exc = ProviderSlotWaitExpired(
+        message,
+        scene=scene,
+        waited_sec=waited_sec,
+        rounds=rounds,
+        bound_sec=bound_sec,
+        candidates=listed,
+        requested_sec=requested_sec,
+    )
+    payload = exc.to_dict()
+    logger.warning("[PROVIDER SLOT WAIT EXPIRED] %s", message)
+    if event_logger is not None:
+        event_logger.warning(
+            "provider_slot_wait_expired", message, data=payload,
+        )
+    return exc
 
 
 # Project-specific guardrails: a sub-agent may only Edit/Write inside its own
@@ -368,8 +853,308 @@ def is_capacity_error(exc: BaseException) -> bool:
     return looks_like_quota_exhaustion(str(exc))
 
 
-def _cooldown_seconds_for(exc: BaseException) -> float:
-    """Park duration for ``exc``; env-overridable for operators/tests."""
+def _quota_reset_seconds_for(provider: str, fallback: float) -> float:
+    """Seconds until the window that emptied ``provider`` comes back.
+
+    A quota cooldown is only ever worth as long as the window it is
+    waiting on, and ``resets_at`` is the one field in the reading that
+    says when that is. So the parked length stops being a constant and
+    becomes a countdown: a window twelve minutes out is parked for
+    twelve minutes, rather than for the half hour the fixed number has
+    to be because it has to cover the worst window — and a provider is
+    almost never parked at the worst moment.
+
+    Every way of failing to answer falls back to ``fallback`` rather
+    than raising or returning a small number:
+
+      * no reading for this provider, or no reading at all (CC Switch
+        unreachable, provider absent from the map);
+      * the reading shows no budget but names no tier — the refusal was
+        real and the meter did not corroborate it;
+      * ``resets_at`` absent, unparseable, or **already in the past**.
+
+    That last one is the boundary worth naming. A ``resets_at`` in the
+    past is also what the reader treats as "this window has already
+    rolled", so the tier's percentage is discarded as stale — which
+    means a past stamp cannot be paired with a conviction from the same
+    tier. When it happens anyway, returning the remaining time would
+    return a non-positive number, and :meth:`ProviderCooldown.park` is
+    documented to ignore those: the provider would be neither parked
+    nor dispatched around, and the next dispatch would re-select the
+    provider that just refused. So a past stamp falls back instead.
+    """
+    if not provider:
+        return fallback
+    try:
+        from provider_order import load_provider_quota_map
+    except Exception:  # pragma: no cover - import cycle guard
+        return fallback
+    try:
+        quota = load_provider_quota_map().get(provider)
+    except Exception:
+        return fallback
+    if quota is None or not getattr(quota, "exhausted", False):
+        # The reading does not corroborate a refusal. Park for the
+        # fallback rather than for a window nobody named.
+        return fallback
+    resets_at = getattr(quota, "exhausted_resets_at", None)
+    if resets_at is None:
+        return fallback
+    now = datetime.now(resets_at.tzinfo) if resets_at.tzinfo else datetime.now()
+    seconds = (resets_at - now).total_seconds()
+    if seconds <= 0:
+        return fallback
+    return seconds
+
+
+def _quota_wake_probe_sec() -> float:
+    """Seconds between two probes of a closed quota window.
+
+    One figure, and it is deliberately *not* a countdown to the
+    ``resets_at`` the reading carries. A countdown is the right answer
+    only for a window that reopens on a schedule, and the schedule is
+    exactly what a plan upgrade does not follow: buying capacity makes
+    the budget come back at a moment no ``resets_at`` was ever going to
+    name, so a wake that had parked itself on that stamp would keep
+    waiting through a window that had already opened. The one thing
+    that covers it is looking again on a fixed beat.
+
+    So the probe does not consult the reading at all. Five minutes is
+    the existing short cooldown — reused rather than redeclared so the
+    probe cadence and the park length cannot drift apart — and it buys
+    the same thing either way: at most one missed probe of delay after
+    a window reopens, against a wake that is still watching a week
+    later.
+
+    The price is real and it is paid off the wire. Each probe is one
+    forced read of the quota payload, and that payload is fetched from
+    an endpoint that fans out to every provider at once rather than
+    asking one. The figure below is therefore a network cost paid per
+    five minutes, per process (the payload is behind a single in-flight
+    barrier), for as long as the window stays shut.
+    """
+    try:
+        from dynamic_provider_concurrency import DEFAULT_COOLDOWN_SEC
+    except Exception:  # pragma: no cover - import cycle guard
+        return 300.0
+    return float(DEFAULT_COOLDOWN_SEC)
+
+
+class WorkClock:
+    """A budget that stops spending while its holder is parked.
+
+    A dispatch that is waiting for a provider's quota window to reopen
+    is not working, but it is also not free — it holds a thread and a
+    coroutine while it waits. If the budget that bounds the work is
+    kept running across that wait, the wait spends it: a caller that
+    waits out a week-long window would have blown an hour-long cap long
+    before the window did, and the time-out would be answered by a
+    second, tool-less caller asked to guess the outcome from the logs.
+
+    The budget is therefore split in two — work time and parked time —
+    and only the first is ever charged to it. Parking stops the
+    countdown; resuming starts it again from where it stopped rather
+    than from where it would have been. :meth:`remaining` is the only
+    question the bounded side asks, and it is answered in the same
+    units either way.
+
+    Thread-safe, because the pause and the resume are raised from the
+    worker thread that is doing the waiting while the budget is read
+    from the event loop that owns the deadline. Both are idempotent:
+    a second park before a resume does not bank the segment twice.
+    """
+    def __init__(
+        self,
+        budget_seconds: float,
+        monotonic: Optional[Callable[[], float]] = None,
+    ) -> None:
+        self._budget = float(budget_seconds)
+        self._monotonic = monotonic or time.monotonic
+        self._lock = threading.Lock()
+        self._spent = 0.0
+        self._segment_start = self._monotonic()
+        self._parked_at: Optional[float] = None
+        self._on_resume: Optional[Callable[[], None]] = None
+
+    def park(self) -> None:
+        """Stop spending the budget until :meth:`resume`."""
+        with self._lock:
+            if self._parked_at is not None:
+                return
+            now = self._monotonic()
+            self._spent += now - self._segment_start
+            self._parked_at = now
+
+    def resume(self) -> None:
+        """Start spending again from the amount already banked."""
+        with self._lock:
+            if self._parked_at is None:
+                return
+            self._parked_at = None
+            self._segment_start = self._monotonic()
+        callback = self._on_resume
+        if callback is not None:
+            # Raised on a thread that is not the one waiting on the
+            # budget, so whoever bound this must be prepared for that.
+            callback()
+
+    @property
+    def is_parked(self) -> bool:
+        """True while the holder is asleep rather than working.
+
+        This is the only question anything outside this class needs to
+        ask about a parked budget, and it is asked by something that has
+        to tell "waiting for a provider's window" apart from "hung": a
+        dispatch parked here is not spending the budget and has no
+        subprocess to kill, so a staleness sweep that treated it like a
+        hung call would discard the handle that protects the *real* stall
+        — the one that is genuinely stuck once the window reopens. The
+        answer is a plain bool rather than duck-typed so a stand-in tool
+        whose ``_work_clock`` is a test double cannot answer it by
+        accident.
+        """
+        with self._lock:
+            return self._parked_at is not None
+
+    def bind_resume(self, callback: Optional[Callable[[], None]]) -> None:
+        """Register what to do when the budget starts running again.
+
+        The bounded side is asleep on a timer until the work finishes
+        or the budget runs out, and a resume that happened in between
+        would otherwise go unnoticed until that timer expired. This is
+        how it gets a prompt answer instead of the whole wait.
+        """
+        self._on_resume = callback
+
+    def remaining(self) -> float:
+        """Seconds of work still available; never negative."""
+        with self._lock:
+            if self._parked_at is not None:
+                spent = self._spent
+            else:
+                spent = self._spent + (self._monotonic() - self._segment_start)
+        return max(0.0, self._budget - spent)
+
+
+def _quota_wake_sleep(seconds: float) -> None:
+    """Wait before re-probing a quota-blocked dispatch.
+
+    Its own function so the wait can be replaced rather than served.
+    The numbers this path deals in are minutes, so a test that let them
+    through would test nothing but the patience of the suite; a test
+    that wants the decision instead patches this name and reads back
+    what was asked for.
+
+    Every wait on the closed-window path goes through here, the probe
+    interval included, so a test drives the cadence of a multi-round
+    wait without serving a single second of it. The park wait and the
+    saturated-pool queue share the seam for the same reason — all three
+    waits are uninterruptible and all three run for minutes at a time, so
+    all three are substitutable.
+
+    The production body is the ordinary blocking sleep and there is no
+    flag, mode or keyword that makes it behave differently, so the
+    substitution cannot leak into a run: the seam is the module-level
+    name, resolved at call time, and replacing it is something a test
+    does on purpose.
+    """
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+#: Shortest and longest single step of the "wait for this tier to come
+#: back" loop.
+#:
+#: The floor is what keeps the wait from turning into a spin: a park can
+#: have a couple of seconds left, or none at all by the time the figure is
+#: read, and a step of zero would re-derive the same empty answer as fast
+#: as the clock allows. The ceiling is what keeps it from turning into one
+#: uninterruptible sleep: a quota refusal parks for half an hour, and a
+#: thread parked for half an hour cannot notice that another dispatch
+#: already re-parked the provider, that the caller gave up, or that the
+#: chain on disk changed underneath it.
+PARK_WAKE_MIN_STEP_SEC: float = 1.0
+PARK_WAKE_MAX_STEP_SEC: float = 30.0
+
+
+def _park_wake_step_sec(cooldown, providers) -> float:
+    """Seconds to wait before re-deriving a scene's candidates.
+
+    The SOONEST park in the tier, because that is the soonest moment the
+    pool can serve again; waiting out the longest would hold a dispatch
+    behind a row that came back minutes ago. Bounded by the floor and the
+    ceiling above.
+
+    The quota reading is not consulted, and that is the whole difference
+    between this and the closed-window wake. A park is a deadline this
+    process wrote itself, on the timescale of that deadline, so the
+    deadline is the answer. A closed window belongs to somebody else's
+    account and reopens on no schedule the dispatcher was told about,
+    which is why that path probes on a fixed beat instead. Two waits,
+    two clocks, one per kind of thing being waited on.
+    """
+    soonest = 0.0
+    for provider in providers:
+        remaining = cooldown.remaining(provider)
+        if remaining > 0.0 and (soonest == 0.0 or remaining < soonest):
+            soonest = remaining
+    return max(PARK_WAKE_MIN_STEP_SEC, min(soonest, PARK_WAKE_MAX_STEP_SEC))
+
+
+#: Shortest and longest single step of the "wait for this pool to hand a
+#: slot back" loop.
+#:
+#: The floor is the same shape of argument as the park wake's floor and is
+#: worth as much: a slot can be free the instant the check that said it was
+#: full ran, so a step of zero would re-ask the tracker as fast as the
+#: clock allows and never move a single agent. The ceiling is what keeps a
+#: saturated pool from becoming one uninterruptible sleep — a thread asleep
+#: for half a minute cannot notice that the holder finished, that the chain
+#: on disk changed, or that the caller underneath it gave up.
+SLOT_WAKE_MIN_STEP_SEC: float = 1.0
+SLOT_WAKE_MAX_STEP_SEC: float = 30.0
+
+
+def _slot_wake_step_sec(round_index: int) -> float:
+    """Seconds to wait before asking a saturated pool again for a slot.
+
+    A third clock, and the only one of the three that reads *nothing*.
+
+    The park wake asks the cooldown how long its longest remaining park is,
+    because that deadline is the answer and the process wrote it itself. The
+    closed-window wake probes on a fixed beat, because that window belongs
+    to somebody else's account and reopens on no schedule anybody here was
+    told about. A slot is neither: it is a lease held inside this process by
+    an agent that finishes when it finishes, so there is no deadline to read
+    and no stamp to count down to — the only honest input is how long the
+    wait has already been running, and what a longer one implies.
+
+    So the step doubles per round and is then held flat: a pool that has
+    been saturated for four rounds is held by agents that are still running,
+    and the odds of a slot appearing within the next second are worse than
+    they were at round zero. Doubling buys the check back the moment it is
+    cheap — a slot freed while the loop slept is noticed within one step — and
+    the ceiling stops the tail from becoming a thirty-second poll against a
+    table that is obviously not moving.
+    """
+    rounds = max(0, int(round_index))
+    # The exponent is clamped so the shift itself cannot grow without
+    # bound on a caller that hands in a large round number; the ceiling
+    # already fixes the answer long before that would matter.
+    scaled = SLOT_WAKE_MIN_STEP_SEC * (2 ** min(rounds, 16))
+    return max(SLOT_WAKE_MIN_STEP_SEC, min(scaled, SLOT_WAKE_MAX_STEP_SEC))
+
+
+def _cooldown_seconds_for(exc: BaseException, provider: str = "") -> float:
+    """Park duration for ``exc``; env-overridable for operators/tests.
+
+    A rate-limit refusal keeps its fixed short park — a transient limit
+    is expected to clear in minutes and nothing about the exception says
+    otherwise. A quota refusal is a statement about a *window*, so it is
+    parked until that window returns
+    (:func:`_quota_reset_seconds_for`), with the half-hour default as
+    the answer whenever the reading cannot name the moment.
+    """
     try:
         from dynamic_provider_concurrency import (
             DEFAULT_COOLDOWN_SEC,
@@ -390,7 +1175,9 @@ def _cooldown_seconds_for(exc: BaseException) -> float:
             return max(0.0, float(raw))
         except (TypeError, ValueError):
             pass
-    return default
+    if default is not DEFAULT_QUOTA_COOLDOWN_SEC:
+        return default
+    return _quota_reset_seconds_for(provider, default)
 
 
 def _park_provider_after_error(provider: str, exc: BaseException) -> float:
@@ -401,7 +1188,7 @@ def _park_provider_after_error(provider: str, exc: BaseException) -> float:
     """
     if not provider or not is_capacity_error(exc):
         return 0.0
-    seconds = _cooldown_seconds_for(exc)
+    seconds = _cooldown_seconds_for(exc, provider)
     if seconds <= 0:
         return 0.0
     try:
@@ -441,9 +1228,18 @@ class ClaudeCodingTool(CodingTool):
     # momentary connection failure) without accumulating a long delay.
     MAX_EMPTY_RESPONSE_RETRIES = 2
     EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 2.0
-    # How long a scene-routed dispatch waits for a free provider slot
-    # before giving up and falling back to the parent process config
-    # (2026-09-17). Overridable per-process with PDT_PROVIDER_SLOT_WAIT_SEC.
+    # How long ONE attempt at taking a provider slot polls for it before
+    # the dispatch re-decides. Overridable per-process with
+    # PDT_PROVIDER_SLOT_WAIT_SEC.
+    #
+    # It is no longer a bound on the queue: a saturated tier is waited out
+    # for as long as it takes (see ``_slot_wake_step_sec``), because a
+    # slot is a lease inside this process that the agent holding it will
+    # hand back when it finishes. What this bounds is a single attempt's
+    # own polling, so a dispatch hands a long queue over to its parked
+    # step-by-step wait quickly enough to be responsive and slowly enough
+    # not to re-check a free slot in a loop. Setting it to 0 makes every
+    # attempt a single look.
     PROVIDER_SLOT_WAIT_SEC = 300.0
     GRACEFUL_STOP_TIMEOUT = 120  # seconds to wait after stdin close
 
@@ -548,6 +1344,25 @@ class ClaudeCodingTool(CodingTool):
         # overrides and PostToolUse hook scripts without polluting
         # ~/.claude/settings.json.
         self.settings = settings
+        # _settings_template_cache: the template payload exactly as read
+        # off disk, before this module stamps PDT_* keys or appends the
+        # guard hook onto it.
+        #
+        # Why the tool keeps a copy of a file it does not own: the
+        # template lives in a ``private_dir()`` that anything sweeping
+        # ``~/.pdt-scratch`` can take away mid-run. Once gone it cannot
+        # be rebuilt — the hooks and the ``defer_provider_config``
+        # payload only exist in that file, and ``self.settings`` is a
+        # path string, not the content. Caching the pristine payload at
+        # read time is the only copy that survives the sweep, and it is
+        # what lets a later dispatch on THIS instance self-heal instead
+        # of handing the CLI a dangling path.
+        #
+        # Instance-level on purpose: the empty-output retry loop calls
+        # ``_run_claude_interactive`` again on the same ``self``, so a
+        # template that vanished between two attempts of one task is
+        # still recoverable.
+        self._settings_template_cache: Optional[dict] = None
         # hook_stdin: pass-through payload (decision 4) forwarded to
         # PostToolUse hooks (e.g. task_type, task_summary). Stored on
         # the instance so the subprocess invoker can append it to the
@@ -621,6 +1436,12 @@ class ClaudeCodingTool(CodingTool):
         # (still making progress, do not kill). None means no subprocess
         # has produced output yet this call.
         self._last_output_ts: Optional[float] = None
+        # The budget bounding this call, when something upstream owns one
+        # and wants parked time excluded from it. None is the ordinary
+        # case — a caller with no budget of its own — and every use
+        # below is guarded, so an unset clock simply means nothing here
+        # is accounted to anyone. See WorkClock.
+        self._work_clock: Optional["WorkClock"] = None
         # 2026-09-14 (user insight): the LAST stdout line itself, so
         # callers can surface real progress (pytest's progress bar, tool
         # names) instead of only knowing "something arrived". The
@@ -1039,46 +1860,96 @@ class ClaudeCodingTool(CodingTool):
             if original_settings.exists():
                 with open(original_settings, "r", encoding="utf-8") as f:
                     settings_data = json.load(f)
-                settings_data.setdefault("env", {})
-                settings_data["env"]["PDT_SUBAGENT_UUID"] = subagent_uuid
-                settings_data["env"]["PDT_SUBAGENT_LOG_FILE"] = subagent_log_file
-                if self.cwd:
-                    settings_data["env"]["PDT_PROJECT_DIR"] = str(Path(self.cwd).resolve())
-                    # File-lock broker (see ``file_lock_broker``): the socket
-                    # path is derived from the project dir, so the executor
-                    # and every sub-agent compute the same one. The CLI path
-                    # is absolute so the hook can run it under whatever
-                    # ``python3`` it has — ``file_lock_cli`` is stdlib-only
-                    # for exactly that reason.
-                    settings_data["env"]["PDT_LOCK_BROKER"] = str(
-                        socket_path(self.cwd)
-                    )
-                    settings_data["env"]["PDT_LOCK_CLI"] = str(
-                        _THIS_DIR / "file_lock_cli.py"
-                    )
-                    lock_task_id = current_task_id()
-                    if lock_task_id:
-                        # Lock ownership is keyed by task id, so the executor
-                        # can release everything the task acquired — including
-                        # files it only decided to touch mid-task. Without it
-                        # the hook has no identity to acquire under, and the
-                        # ambient sub-agent uuid would not match the key the
-                        # executor releases with.
-                        settings_data["env"]["PDT_LOCK_TASK_ID"] = str(lock_task_id)
-                settings_data["env"]["PDT_FORMAL_REPO_PATH"] = str(_FORMAL_REPO_PATH)
-                settings_data["env"]["PDT_PLANS_DIR"] = str(_PLANS_DIR)
-                settings_data.setdefault("hooks", {})
-                settings_data["hooks"].setdefault("PreToolUse", [])
-                guard_hook = _build_guard_hook()
-                for entry in settings_data["hooks"]["PreToolUse"]:
-                    if entry.get("matcher") == "Edit|Write":
-                        entry.setdefault("hooks", []).append(guard_hook)
-                        break
-                else:
-                    settings_data["hooks"]["PreToolUse"].append({
-                        "matcher": "Edit|Write",
-                        "hooks": [guard_hook],
-                    })
+                # Cache the PRISTINE template: taken after ``json.load``
+                # but before any mutation below, so what is stored is what
+                # SubagentConfig wrote and nothing this module adds. The
+                # ``deepcopy`` matters because every line below writes into
+                # this same dict — a shallow copy would hand the cache an
+                # ``env`` sub-dict that the next dispatch overwrites, and
+                # the cache would silently accumulate per-subagent keys.
+                self._settings_template_cache = copy.deepcopy(settings_data)
+            elif self._settings_template_cache is not None:
+                # SELF-HEAL. The template was readable earlier on this
+                # instance and is gone now (a sweep of the private root
+                # took it), so fall back to the cached payload and let the
+                # shared stamping below produce a normal settings file.
+                # The file this dispatch ultimately writes lands in a
+                # brand-new ``private_dir()``, so unlike the swept
+                # template this one is always writable.
+                settings_data = copy.deepcopy(self._settings_template_cache)
+            else:
+                # Nothing to fall back on: this instance's FIRST read came
+                # up empty. There is no template on disk and no cached copy,
+                # so any ``--settings`` value we could pass is either
+                # dangling (0.2s CLI death, reported as "exited without
+                # assistant text" — the failure this replaces) or absent
+                # (no hooks, no lock broker — the worse outcome). Say which
+                # path is missing instead. See SettingsTemplateMissing for
+                # why this must not be an ApiError.
+                raise SettingsTemplateMissing(
+                    f"settings template missing and no cached copy: "
+                    f"{original_settings}",
+                    path=str(original_settings),
+                )
+            if settings_data is None:
+                # ``json.load`` succeeded but produced no object — a file
+                # whose whole content is ``null``. Treated as "not a
+                # template" rather than as "no settings": it carries
+                # neither hooks nor env, so passing it on would launch a
+                # sub-agent with its guardrails silently off, which is the
+                # outcome this branch exists to prevent. Enforced HERE, at
+                # the read site, because it is the one place where the
+                # invariant "settings set ⟹ settings_data non-None" is
+                # established; the ``--settings`` fallback that depends on
+                # it sits inside a ``try`` whose ``finally`` would mask any
+                # error raised there.
+                raise SettingsTemplateMissing(
+                    f"settings template is not a JSON object "
+                    f"(and no cached copy): {original_settings}",
+                    path=str(original_settings),
+                )
+
+        if settings_data is not None:
+            settings_data.setdefault("env", {})
+            settings_data["env"]["PDT_SUBAGENT_UUID"] = subagent_uuid
+            settings_data["env"]["PDT_SUBAGENT_LOG_FILE"] = subagent_log_file
+            if self.cwd:
+                settings_data["env"]["PDT_PROJECT_DIR"] = str(Path(self.cwd).resolve())
+                # File-lock broker (see ``file_lock_broker``): the socket
+                # path is derived from the project dir, so the executor
+                # and every sub-agent compute the same one. The CLI path
+                # is absolute so the hook can run it under whatever
+                # ``python3`` it has — ``file_lock_cli`` is stdlib-only
+                # for exactly that reason.
+                settings_data["env"]["PDT_LOCK_BROKER"] = str(
+                    socket_path(self.cwd)
+                )
+                settings_data["env"]["PDT_LOCK_CLI"] = str(
+                    _THIS_DIR / "file_lock_cli.py"
+                )
+                lock_task_id = current_task_id()
+                if lock_task_id:
+                    # Lock ownership is keyed by task id, so the executor
+                    # can release everything the task acquired — including
+                    # files it only decided to touch mid-task. Without it
+                    # the hook has no identity to acquire under, and the
+                    # ambient sub-agent uuid would not match the key the
+                    # executor releases with.
+                    settings_data["env"]["PDT_LOCK_TASK_ID"] = str(lock_task_id)
+            settings_data["env"]["PDT_FORMAL_REPO_PATH"] = str(_FORMAL_REPO_PATH)
+            settings_data["env"]["PDT_PLANS_DIR"] = str(_PLANS_DIR)
+            settings_data.setdefault("hooks", {})
+            settings_data["hooks"].setdefault("PreToolUse", [])
+            guard_hook = _build_guard_hook()
+            for entry in settings_data["hooks"]["PreToolUse"]:
+                if entry.get("matcher") == "Edit|Write":
+                    entry.setdefault("hooks", []).append(guard_hook)
+                    break
+            else:
+                settings_data["hooks"]["PreToolUse"].append({
+                    "matcher": "Edit|Write",
+                    "hooks": [guard_hook],
+                })
 
         # Provider selection — single source of truth (only _run_claude_interactive
         # remains in this codebase). Kept inline rather than extracted because
@@ -1128,82 +1999,77 @@ class ClaudeCodingTool(CodingTool):
             _slot_released = True
             self._concurrency_tracker.release(slot_provider)
 
-        # Scene routing (2026-09-13): when a scene is active, resolve its
-        # provider chain (scene → tier → regex over CC Switch names) on
-        # EVERY call and prefer its candidates. When the scene chain is
-        # empty or yields nothing available, the provider_priority walk
-        # below runs (documented fallback).
+        # Scene routing: when a scene is active, resolve its provider chain
+        # (scene → tier → regex over CC Switch names) on EVERY call and use
+        # its candidates EXCLUSIVELY. The tier table is an allowlist, so a
+        # chain that selects nothing does not hand the call to the
+        # provider_priority walk below: the call fails, via
+        # ``_scene_chain_unavailable``. With no scene there is no allowlist
+        # to violate, and the walk (and the parent fallback after it) runs
+        # as it always has.
         effective_scene = scene if scene is not None else self.scene
         scene_chain: List[str] = []
         # Skipped entirely in inherit mode: both branches below read CC
         # Switch display names, so with no database they can only return
         # an empty chain while logging "CC Switch database unavailable" —
         # a warning about a component that is not supposed to be there.
+        #
+        # ``_scene_diag`` records WHY the chain ended up empty (or which
+        # candidates it offered) so the fail-closed raise below can say
+        # so in a message, rather than only as a log line nobody reads
+        # when a task dies. Defaults describe "resolution never ran",
+        # which only happens for the no-scene / inherit paths that do
+        # not reach the gate at all.
+        _scene_diag: dict = {
+            "reason": "chain_unresolved",
+            "tier": None,
+            "chains": [],
+            "chain": [],
+            "candidates": [],
+            "waited_sec": None,
+        }
         if effective_scene and not self.inherit_providers:
             try:
-                from dynamic_provider_concurrency import (
-                    get_shared_cooldown,
-                )
-                from provider_routing import resolve_fallback_chains
-                # 2026-09-22 — cross-tier widening, used ONLY when the
-                # scene's own tier has no usable provider left.
+                from provider_routing import resolve_provider_chain
+                # The scene's OWN tier, and the whole of it.
                 #
-                # Before this the walk could only see the scene's tier,
-                # and ``provider_routing.yaml`` declares
-                # ``medium: ["^Vendor A"]`` — two CC Switch rows. So
-                # "every provider in the tier failed" was two 429s away,
-                # after which the only remaining move was the parent
-                # process env (not a tier member at all), and when that
-                # also 429'd the task died with it:
+                # A tier is a pool: while this pool has room the walk
+                # moves between its own providers, which is the one
+                # degradation the table allows. Reaching the end of it
+                # ends the candidate search — the answer is then either
+                # "wait for this pool" (see the park wake below) or
+                # "this scene has nothing approved", never "serve it
+                # from the next tier along".
                 #
-                #   provider_fallback vendor-a-pro failed (429)
-                #   provider_parent_fallback No provider in
-                #            priority list available
-                #   task_api_error [429] 已达到 Token Plan 用量上限
-                #
-                # Widening is the ESCAPE HATCH, not the default. A tier
-                # whose providers are merely BUSY still queues on its own
-                # local semaphore — downgrade is driven by local slot
-                # exhaustion, not by reachability. Spilling to another
-                # tier whenever a pool filled would quietly change which
-                # semaphores govern the fleet. Only "every provider here
-                # is excluded or parked" widens.
-                _chains = resolve_fallback_chains(effective_scene)
-                primary = _chains[0] if _chains else []
-                _cooldown = get_shared_cooldown()
-                usable_here = [
-                    name for name in primary
-                    if name not in excluded and not _cooldown.is_parked(name)
-                ]
-                if usable_here or len(_chains) <= 1:
-                    scene_chain = list(primary)
-                else:
-                    scene_chain = []
-                    for _chain in _chains:
-                        for _name in _chain:
-                            if _name not in scene_chain:
-                                scene_chain.append(_name)
-                    if self.logger:
-                        self.logger.warning(
-                            "provider_scene_chain_widened",
-                            (
-                                f"Every provider in scene "
-                                f"{effective_scene!r}'s own tier is "
-                                f"unusable ({primary}); widening to "
-                                f"{len(_chains)} tiers ({len(scene_chain)} "
-                                f"providers) instead of dropping to the "
-                                f"parent config"
-                            ),
-                            data={
-                                "scene": effective_scene,
-                                "primary_chain": primary,
-                                "excluded": list(excluded),
-                                "parked": _cooldown.snapshot(),
-                                "chains": _chains,
-                                "flattened": scene_chain,
-                            },
-                        )
+                # The escape hatch that used to sit here widened into
+                # other tiers once every provider here was unusable, and
+                # it is gone because the failure it answered now has
+                # another way out: the park below waits out a refusal
+                # instead of crossing a border nobody approved. A tier
+                # whose providers are all out of budget is a statement
+                # about that tier's accounts, and borrowing a pricier
+                # one to cover it spends money the table did not budget
+                # while the pool itself recovers on its own schedule.
+                primary = resolve_provider_chain(effective_scene)
+                # Tier label for the failure message. Pure config read
+                # (mtime-cached, no DB), and independently guarded: the
+                # label is diagnostic sugar, so a config read that fails
+                # here must not change what the chain resolves to.
+                try:
+                    from provider_routing import resolve_scene_tier
+                    _scene_diag["tier"] = resolve_scene_tier(effective_scene)
+                except Exception:
+                    _scene_diag["tier"] = None
+                # One tier answers with one chain, so this list holds
+                # exactly one element. The key stays because it is part
+                # of the failure payload's shape.
+                _scene_diag["chains"] = [list(primary)]
+                if not primary:
+                    _scene_diag["reason"] = "no_tier_match"
+                scene_chain = list(primary)
             except Exception as exc:
+                _scene_diag["reason"] = "chain_unresolved"
+                _scene_diag["error"] = str(exc)
                 if self.logger:
                     self.logger.warning(
                         "provider_scene_chain_error",
@@ -1224,59 +2090,190 @@ class ClaudeCodingTool(CodingTool):
             # concurrent agent onto one row drains that row's quota. So
             # build the reachable candidate set first, then take the
             # first one with a free local slot — and when every pool is
-            # full, QUEUE (acquire_provider_with_dynamic_capacity polls)
-            # instead of piling more work onto the first entry.
+            # full, QUEUE for one of them to come back rather than
+            # piling more work onto the first entry.
+            #
+            # The queue is for held slots, and nothing else waits inside
+            # it. A provider whose window is empty, or that a refusal
+            # earlier in this run parked, is dropped before the queue is
+            # entered — so neither of them is ever handed the work to be
+            # refused again. What happens to the scene once they are all
+            # gone is decided further down, by which of the three things
+            # the tier is short of: a park expires on its own and the
+            # scene waits for it, a closed window has to be looked up and
+            # is looked up, a full pool has to be waited for and is, and
+            # anything left over is a scene that has nothing approved and
+            # says so.
             scene_candidates: List[str] = []
             scene_configs: dict = {}
             from dynamic_provider_concurrency import get_shared_cooldown
             _cooldown = get_shared_cooldown()
-            for display_name in scene_chain:
-                if display_name in excluded:
-                    continue
-                # 2026-09-22 — a provider that recently answered
-                # "quota exhausted" is reachable and correctly
-                # configured, so every probe below says yes and the walk
-                # picks it again. The 0921 run re-selected
-                # Vendor A Pro twelve times that way, ~3 minutes of
-                # stuck agent each time. Skip it until its park expires.
-                if _cooldown.is_parked(display_name):
+
+            def _collect_scene_candidates() -> None:
+                """Rebuild the candidate set from the chain, from scratch.
+
+                Rebuilt rather than adjusted because the park wait calls
+                this again, and the second answer has to come out of the
+                same rules as the first — same chain, same exclusion
+                set, same park state read fresh. Patching a candidate
+                back into the list that came up empty would let the wait
+                decide the answer the filters are there to give.
+                """
+                nonlocal scene_candidates, scene_configs
+                scene_candidates = []
+                scene_configs = {}
+                for display_name in scene_chain:
+                    if display_name in excluded:
+                        continue
+                    # A provider that recently answered "quota
+                    # exhausted" is reachable and correctly configured,
+                    # so every probe below says yes and the walk picks
+                    # it again. Skip it until its park expires.
+                    if _cooldown.is_parked(display_name):
+                        if self.logger:
+                            self.logger.info(
+                                "provider_scene_candidate_parked",
+                                f"Scene chain candidate {display_name!r} is in "
+                                f"quota cooldown for another "
+                                f"{_cooldown.remaining(display_name):.0f}s; "
+                                f"trying next",
+                                data={
+                                    "scene": effective_scene,
+                                    "provider": display_name,
+                                    "cooldown_sec": round(
+                                        _cooldown.remaining(display_name), 1,
+                                    ),
+                                    "park_reason": _cooldown.reason(display_name),
+                                },
+                            )
+                        continue
+                    available, provider_config = (
+                        ClaudeCodingTool._check_provider_availability(display_name)
+                    )
+                    if not (available and provider_config):
+                        if self.logger:
+                            self.logger.info(
+                                "provider_scene_candidate_unavailable",
+                                f"Scene chain candidate {display_name!r} unavailable; trying next",
+                                data={"scene": effective_scene, "provider": display_name},
+                            )
+                        continue
+                    scene_candidates.append(display_name)
+                    scene_configs[display_name] = provider_config
+
+            def _tier_awaiting_park() -> List[str]:
+                """Chain members this call must wait for, else ``[]``.
+
+                Non-empty only when *every* provider the call was willing
+                to consider is sitting in a park. A chain member that is
+                merely missing its configuration is not coming back on a
+                timer, and a member the caller excluded has been told
+                not to be used — so neither is a reason to wait, and both
+                still fail closed below.
+                """
+                eligible = [n for n in scene_chain if n not in excluded]
+                if not eligible:
+                    return []
+                parked = [n for n in eligible if _cooldown.is_parked(n)]
+                return parked if len(parked) == len(eligible) else []
+
+            _collect_scene_candidates()
+
+            # What the chain offered, before the per-candidate filters
+            # above dropped any of it. The fail-closed message needs this
+            # to separate "the tier named nothing" from "the tier named
+            # rows and every one of them was filtered out".
+            _scene_diag["chain"] = list(scene_chain)
+            _scene_diag["candidates"] = list(scene_candidates)
+            if not scene_candidates:
+                _scene_diag["reason"] = "all_candidates_skipped"
+
+            # ---- An empty pool waits for the pool; it does not go
+            # shopping.
+            #
+            # The filter above drops a parked provider, so a tier that
+            # has just been refused by every one of its rows arrives here
+            # with nothing and used to fail closed straight away. That is
+            # the case this block exists for: the tier named rows, the
+            # rows answered "no budget", and the answer is on a clock
+            # (a park expires by itself) rather than a permanent one.
+            # Failing closed here answered a question nobody asked —
+            # "should this call never run?" — about a condition that
+            # resolves itself in minutes.
+            #
+            # So the wait is entered, and it waits for THIS pool to come
+            # back. Not for another tier's: the pools are independent and
+            # a provider outside this scene's table is not an answer to
+            # anything this block asks.
+            #
+            # It is the same shape as the closed-window wake further
+            # down and deliberately not the same clock. That one watches
+            # somebody else's meter on a fixed beat, because a plan
+            # upgrade brings budget back at a moment no stamp names. This
+            # one waits for a deadline this process wrote itself, and
+            # reads the deadline rather than guessing at a cadence.
+            # Merging them would put the two on one clock and lose the
+            # difference that makes each correct.
+            _park_rounds = 0
+            _park_waited = 0.0
+            _park_parked = False
+            _park_work_clock = getattr(self, "_work_clock", None)
+            try:
+                while not scene_candidates:
+                    _waiting_on = _tier_awaiting_park()
+                    if not _waiting_on:
+                        break
+                    # Waiting is not working, exactly as on the
+                    # closed-window path: the budget that bounds this
+                    # call must not be spent on the wait.
+                    if not _park_parked:
+                        _park_parked = True
+                        if _park_work_clock is not None:
+                            _park_work_clock.park()
+                    delay = _park_wake_step_sec(_cooldown, _waiting_on)
+                    _park_rounds += 1
                     if self.logger:
                         self.logger.info(
-                            "provider_scene_candidate_parked",
-                            f"Scene chain candidate {display_name!r} is in "
-                            f"quota cooldown for another "
-                            f"{_cooldown.remaining(display_name):.0f}s; "
-                            f"trying next",
+                            "provider_scene_park_wait",
+                            f"Every provider in scene {effective_scene!r}'s "
+                            f"tier is in quota cooldown; waiting up to "
+                            f"{delay:.0f}s for the tier to come back",
                             data={
                                 "scene": effective_scene,
-                                "provider": display_name,
-                                "cooldown_sec": round(
-                                    _cooldown.remaining(display_name), 1,
-                                ),
-                                "park_reason": _cooldown.reason(display_name),
+                                "parked": list(_waiting_on),
+                                "wait_sec": delay,
+                                "park_rounds": _park_rounds,
                             },
                         )
-                    continue
-                available, provider_config = (
-                    ClaudeCodingTool._check_provider_availability(display_name)
-                )
-                if not (available and provider_config):
-                    if self.logger:
-                        self.logger.info(
-                            "provider_scene_candidate_unavailable",
-                            f"Scene chain candidate {display_name!r} unavailable; trying next",
-                            data={"scene": effective_scene, "provider": display_name},
-                        )
-                    continue
-                scene_candidates.append(display_name)
-                scene_configs[display_name] = provider_config
+                    _quota_wake_sleep(delay)
+                    _park_waited += delay
+                    _collect_scene_candidates()
+                    _scene_diag["candidates"] = list(scene_candidates)
+                    _scene_diag["park_wait_rounds"] = _park_rounds
+                    _scene_diag["park_waited_sec"] = round(_park_waited, 1)
+            finally:
+                if _park_parked and _park_work_clock is not None:
+                    _park_work_clock.resume()
 
             if scene_candidates:
                 from dynamic_provider_concurrency import (
                     acquire_provider_with_dynamic_capacity,
+                    fleet_capacity,
                 )
-                from provider_order import load_provider_5h_usage
+                from provider_order import (
+                    load_provider_5h_usage,
+                    load_provider_quota_map,
+                )
 
+                # The live reading decides whether these candidates may
+                # be dispatched to at all; the legacy percentage map is
+                # still read for the ones the live reading does not
+                # cover, and a failure of either leaves every provider
+                # selectable rather than failing the dispatch.
+                try:
+                    quota_map = load_provider_quota_map()
+                except Exception:
+                    quota_map = {}
                 try:
                     usage_map = load_provider_5h_usage()
                 except Exception:
@@ -1285,29 +2282,491 @@ class ClaudeCodingTool(CodingTool):
                     usage_map = {}
 
                 wait_sec = self.provider_slot_wait_sec
-                chosen = acquire_provider_with_dynamic_capacity(
-                    scene_candidates,
-                    self._concurrency_tracker,
-                    usage_map,
-                    timeout=wait_sec,
-                )
 
-                if chosen is None:
-                    if self.logger:
-                        self.logger.warning(
-                            "provider_scene_all_pools_exhausted",
-                            f"Every scene candidate for {effective_scene!r} is "
-                            f"out of local capacity after waiting "
-                            f"{wait_sec:.0f}s ({scene_candidates}); falling back "
-                            f"to the parent process config",
-                            data={
-                                "scene": effective_scene,
-                                "candidates": scene_candidates,
-                                "wait_sec": wait_sec,
-                                "tracker": self._concurrency_tracker.snapshot(),
-                            },
+                # The wake layer lives under the "nothing to dispatch
+                # to" answer and nowhere else. It covers the two reasons
+                # a scene can be unable to dispatch, which differ by
+                # three orders of magnitude in how long they last — a
+                # held slot is released in seconds, a closed window
+                # reopens on the provider's own schedule — so each keeps
+                # its own clock instead of being unified into one wait.
+                _wake_rounds = 0
+                _slot_rounds = 0
+                _slot_waited = 0.0
+                # The wall clock the queue's bound is measured on, and how
+                # much of it the queue has spent inside its own steps.
+                #
+                # ``_slot_waited`` accumulates the durations the queue
+                # *asked* for: the right number for a diagnostic, the wrong
+                # number for a bound, because a step the queue was woken out
+                # of early is not waiting that happened. ``_slot_held`` is
+                # the elapsed time inside those steps and is what the bound
+                # compares.
+                #
+                # Only the queue's own steps, and not the poll the selection
+                # does between them: that poll is already bounded, by the
+                # same figure, once per attempt — and a bound that counted
+                # it as well would be met by a single poll and would take
+                # the queue's second step away from it, which is the whole
+                # thing the queue is for. What repeats without end is this
+                # loop, so this loop is what the bound is on.
+                #
+                # Injectable for the same reason :class:`WorkClock` takes
+                # one, so a test can drive a five-minute bound in a
+                # millisecond.
+                _slot_clock = getattr(
+                    self, "_slot_wait_clock", None) or time.monotonic
+                _slot_held = 0.0
+                _parked = False
+                _quota_waiting = False
+                _work_clock = getattr(self, "_work_clock", None)
+                # Parked across the whole selection-and-wait region, and
+                # before the FIRST attempt rather than after it, because
+                # the first attempt is itself a wait: with the pool full
+                # the poller inside it blocks for ``wait_sec``. Parking
+                # only once the loop had decided to wait would leave the
+                # single longest stretch of queueing still charged to the
+                # caller's budget, which is the defect the budget exists
+                # to catch.
+                #
+                # On a pool with room the cost of that is the rotation
+                # walk — a handful of tracker lookups, measured in
+                # microseconds — so the clock is very slightly
+                # under-charged rather than the wait being charged. That
+                # is the direction this can err in: under-charging a
+                # budget loses nothing, and over-charging it is what
+                # turns a queue into a wall-clock timeout.
+                if _work_clock is not None:
+                    _work_clock.park()
+                    _parked = True
+                # ONE watchdog for the whole process, not one per waiting
+                # dispatch. Quota is a global fact — usable when it is
+                # usable, unusable when it is not — so every caller here
+                # is asking the same question about the same door, and
+                # the payload answers it by fanning out to every provider
+                # at once. Letting each of them probe on its own cadence
+                # spends one request per waiting dispatch per interval to
+                # learn one thing; the reader's in-flight barrier cannot
+                # fix that, because it serializes the requests without
+                # sharing anything and ``force=True`` skips its second
+                # cache check. The merge has to be in front of the reader,
+                # merging results rather than requests.
+                _quota_watchdog = _shared_quota_watchdog()
+                try:
+                    chosen = acquire_provider_with_dynamic_capacity(
+                        scene_candidates,
+                        self._concurrency_tracker,
+                        usage_map,
+                        timeout=wait_sec,
+                        quota_map=quota_map,
+                    )
+                    while chosen is None:
+                        # Nothing to dispatch to, right now. Which of the
+                        # two reasons it was is in the diagnostic, because
+                        # the two are waited on differently: a window that
+                        # is empty comes back on the provider's own
+                        # schedule and has to be looked up, while a held
+                        # slot comes back when the agent holding it
+                        # finishes and has to be waited for.
+                        _quota_blocked = sorted(
+                            name for name in scene_candidates
+                            if name in quota_map and quota_map[name].exhausted
                         )
-                else:
+                        _scene_diag["reason"] = (
+                            "quota_exhausted" if _quota_blocked
+                            else "no_capacity"
+                        )
+                        _scene_diag["quota_exhausted"] = _quota_blocked
+                        _scene_diag["waited_sec"] = round(
+                            _slot_waited, 1,
+                        )
+                        if self.logger:
+                            self.logger.warning(
+                                "provider_scene_all_pools_exhausted",
+                                f"Every scene candidate for {effective_scene!r} is "
+                                f"unavailable: "
+                                f"{_quota_blocked or 'no free slot'} "
+                                f"({scene_candidates})",
+                                data={
+                                    "scene": effective_scene,
+                                    "candidates": scene_candidates,
+                                    "quota_exhausted": _quota_blocked,
+                                    "wait_sec": wait_sec,
+                                    "slot_wait_rounds": _slot_rounds,
+                                    "slot_waited_sec": round(_slot_waited, 1),
+                                    "tracker": self._concurrency_tracker.snapshot(),
+                                },
+                            )
+
+                        # Which of the two waits this is, asked with the
+                        # same arithmetic the poller applied. A pool with
+                        # any width left is full rather than shut and is
+                        # queued for below; a pool with no width left at
+                        # all is shut — and *shut is a window*, not a
+                        # verdict, so it is not queued for and is not
+                        # failed on either.
+                        #
+                        # Nothing else can produce that second case.
+                        # Parked rows and rows without a configuration
+                        # were filtered out before the candidates were
+                        # collected, and a reading that called a provider
+                        # shut would have made ``_quota_blocked``
+                        # non-empty and carried the decision to the window
+                        # path already. What is left are caps that a
+                        # remaining budget scaled to zero, and that budget
+                        # is a meter on somebody else's clock: it comes
+                        # back when the provider's window rolls, whether
+                        # or not a plan upgrade is what brought it back.
+                        #
+                        # So a cap of zero is a window measured in hours,
+                        # and the wait for it belongs to the probe path
+                        # below rather than to the queue — a lease wait
+                        # pointed at that clock would never outlast it.
+                        # Failing here, which is what this branch used to
+                        # do, turned a pause into a failed task for a
+                        # budget that was on its way back, and it did it
+                        # on the premise that no width at all means no
+                        # width ever: the one reading a rolling window
+                        # never supports.
+                        _capacity = fleet_capacity(
+                            scene_candidates,
+                            usage_map,
+                            quota_map,
+                            cooldown=_cooldown,
+                        )
+                        # Who the window wait below is waiting on.
+                        # Normally the providers the reading calls shut;
+                        # when the reading calls none of them shut and it
+                        # is the caps that ran out, the rows with no width
+                        # left are the same fact under its other name, and
+                        # a wait that names nobody is a wait an operator
+                        # cannot read.
+                        _window_blocked = _quota_blocked or list(
+                            _capacity.blocked
+                        )
+
+                        if not _quota_blocked and _capacity.total > 0:
+                            # ---- A saturated pool: queue for this pool.
+                            #
+                            # The queue has a bound, and the bound is
+                            # ``wait_sec`` — the same figure the poll window
+                            # above already reads, overridable through the
+                            # same ``PDT_PROVIDER_SLOT_WAIT_SEC``. A second
+                            # knob for "how long may I queue" would be a
+                            # second answer to that question, and an operator
+                            # would have no way to tell which one was live.
+                            #
+                            # What the bound buys is a *holder* going back.
+                            # On the verification path a queue is not a
+                            # thread on its own: the verification point that
+                            # asked for the slot is holding a capacity gate on
+                            # both sides of that wait, and a gate held by a VP
+                            # that is asleep is a gate no working VP can take.
+                            # With every VP of a round queued at once the
+                            # whole fleet reads as busy and nothing is
+                            # running — the round produces nothing for as
+                            # long as the saturation lasts, which is a window
+                            # with no far end in it. So the wait ends, and
+                            # what it ends with is a slot wait *handed back*
+                            # rather than a call marked failed.
+                            #
+                            # It is deliberately measured on the queue alone.
+                            # Everything below this line is either waiting or
+                            # about to dispatch; the dispatch itself runs
+                            # outside the loop, so a call that waited and was
+                            # then admitted is never near this branch again.
+                            # That is what keeps the bound off a working call:
+                            # a long Claude run is not a queue.
+                            #
+                            # And it is measured on elapsed time, not on the
+                            # sum of the steps the queue asked for, and only
+                            # on the queue's own steps. The sum overstates: a
+                            # step the queue was woken out of early is not
+                            # waiting that happened. Elapsed is also the
+                            # figure the rest of this change is about — how
+                            # long a gate has been held by something asleep
+                            # in it — and the per-attempt poll between the
+                            # steps has its own window already, so counting
+                            # it here would spend the bound before the queue
+                            # had taken a second step.
+                            #
+                            # ``wait_sec`` of zero (or below) means the queue
+                            # is unbounded — the same figure that turns the
+                            # per-attempt poll window off turns this off, so
+                            # the two can never disagree about being set.
+                            if wait_sec > 0.0 and _slot_held >= wait_sec:
+                                raise _slot_wait_expired(
+                                    effective_scene,
+                                    _slot_held,
+                                    _slot_rounds,
+                                    wait_sec,
+                                    candidates=scene_candidates,
+                                    event_logger=self.logger,
+                                    requested_sec=_slot_waited,
+                                )
+                            #
+                            # Every candidate is reachable, inside its
+                            # window, and merely out of local slots. This
+                            # used to break straight out to the fail-closed
+                            # answer on the argument that a slot comes back
+                            # in seconds and the poller had already spent
+                            # the whole of ``wait_sec`` on it.
+                            #
+                            # That argument was wrong about what a slot is.
+                            # A quota window is somebody else's meter on
+                            # their clock and a park is a deadline this
+                            # process wrote itself; a slot is neither. It
+                            # is a counter in this process, held by an
+                            # agent that is running right now and released
+                            # when that agent finishes. So it has its own
+                            # timeline, one measured in the length of a
+                            # task, and waiting on it is waiting for
+                            # something that is genuinely on its way —
+                            # unlike a window with no reopening time, which
+                            # is exactly the case worth failing on.
+                            #
+                            # So the queue is entered, and it waits for THIS
+                            # pool. Not for another tier's, for the same
+                            # reason the park wait above does not shop
+                            # around: the pools are independent and a
+                            # provider outside this scene's table is not an
+                            # answer to anything this block asks. And the
+                            # step is bounded and growing, because the slot
+                            # this dispatch wants is very likely the one
+                            # another VP is about to hand back.
+                            #
+                            # The quota reading is deliberately not
+                            # re-read here. A slot wait is seconds long
+                            # and a window is hours long, so the stale
+                            # verdict cannot be the thing that is wrong
+                            # during it — and the closed-window wake
+                            # re-reads on its own account, on the only
+                            # clock that can see a reopen.
+                            #
+                            # There is no round budget, for the same reason
+                            # the window wake has none: the limit on a busy
+                            # pool belongs to the agents in it and not to
+                            # the dispatcher, and a caller that gives up on
+                            # its own schedule does not get a slot back — it
+                            # reports a failure for a queue it declared
+                            # over on a figure it made up. The budget is
+                            # parked alongside the wait rather than spent
+                            # on it.
+                            delay = _slot_wake_step_sec(_slot_rounds)
+                            _slot_rounds += 1
+                            _held_from = _slot_clock()
+                            if self.logger:
+                                self.logger.info(
+                                    "provider_scene_slot_wait",
+                                    f"Every provider in scene "
+                                    f"{effective_scene!r}'s tier is at its "
+                                    f"local concurrency cap; queued for up "
+                                    f"to {delay:.0f}s for one to be "
+                                    f"released",
+                                    data={
+                                        "scene": effective_scene,
+                                        "candidates": scene_candidates,
+                                        "wait_sec": delay,
+                                        "slot_rounds": _slot_rounds,
+                                        "slot_waited_sec": round(
+                                            _slot_waited, 1,
+                                        ),
+                                    },
+                                )
+                            _quota_wake_sleep(delay)
+                            _slot_waited += delay
+                            _slot_held += _slot_clock() - _held_from
+                            _scene_diag["slot_wait_rounds"] = _slot_rounds
+                            _scene_diag["slot_waited_sec"] = round(
+                                _slot_waited, 1,
+                            )
+                            chosen = acquire_provider_with_dynamic_capacity(
+                                scene_candidates,
+                                self._concurrency_tracker,
+                                usage_map,
+                                timeout=wait_sec,
+                                quota_map=quota_map,
+                            )
+                            continue
+
+                        # ---- A closed window: probe until it may reopen, then
+                        # decide again from a fresh reading.
+                        #
+                        # Two things arrive here, and they are the same
+                        # wait: a reading that calls the window shut, and
+                        # caps that a remaining budget scaled to zero.
+                        # Neither comes back on a lease, so neither is
+                        # queued for — both are watched, on this clock.
+                        #
+                        # The refresh that reopens a window happens inside
+                        # CC Switch, and nothing on this side notices it: the
+                        # quota payload is only re-read when something asks
+                        # for it. So "stop dispatching" meant "stay stopped
+                        # until an unrelated dispatch happened to arrive" —
+                        # and for a scene with nothing to dispatch to, that
+                        # is no arrival at all. The fleet sits idle for the
+                        # rest of the window even though the budget behind it
+                        # came back an hour into the wait.
+                        #
+                        # There is no round budget here, because the limit
+                        # on a closed window belongs to the provider and not
+                        # to the dispatcher: how long a tier stays shut is a
+                        # fact about someone else's account, and a caller
+                        # that gives up on its own schedule does not get the
+                        # window back — it just reports a failure for a wait
+                        # it declared over on a figure it made up. So this
+                        # probes until the reading changes. What used to
+                        # bound it (three rounds) only ever bought a failing
+                        # answer, and bought it *late*: the seconds spent
+                        # waiting were seconds the caller's own budget was
+                        # being charged for, so a wait long enough to matter
+                        # was already over the wall-clock cap by the time it
+                        # ended. The budget is now parked alongside the wait
+                        # rather than spent on it.
+                        #
+                        # The cost of an unbounded wait is a forced read of
+                        # the quota payload every probe interval, for as long
+                        # as the window stays shut, and that read goes to an
+                        # endpoint which fans out to every provider at once.
+                        # It is the price of being right about the case no
+                        # timestamp can describe — a plan upgrade, which
+                        # makes the budget come back at a moment no
+                        # ``resets_at`` was ever going to name. What bounds
+                        # that price is the single watchdog every waiting
+                        # dispatch goes through: one read per interval for
+                        # the process, not one per waiter, however many
+                        # verification points are asleep on the same window.
+                        #
+                        # Entering the wait is itself an event worth a
+                        # record. Nothing about a parked dispatch is visible
+                        # from outside — it is asleep, it writes nothing, and
+                        # its budget is deliberately not running down — so a
+                        # wait that emits no start line is
+                        # indistinguishable from a fleet that went quiet for
+                        # a reason nobody can name. The line carries the
+                        # providers that are shut and the soonest moment any
+                        # of their windows comes back, which is the two
+                        # facts an operator needs to tell "quota" from
+                        # "broken".
+                        # The budget is already parked — it is parked for
+                        # the whole selection-and-wait region, before the
+                        # first attempt, so that the attempt itself
+                        # cannot charge it either. There is deliberately no
+                        # second park here to fall out of step with that
+                        # one: two places that park the same clock is how
+                        # an exception path ends up leaving it parked, or
+                        # resumed twice, and the window wake is reached
+                        # from a loop whose sibling branch already holds
+                        # it.
+                        if not _quota_waiting:
+                            _quota_waiting = True
+                            _quota_watchdog.wait_entered(
+                                scene=effective_scene,
+                                blocked=_window_blocked,
+                                quota_map=quota_map,
+                                logger=self.logger,
+                            )
+
+                        delay = _quota_wake_probe_sec()
+                        _wake_rounds = _quota_watchdog.wait_round()
+                        if self.logger:
+                            self.logger.info(
+                                "provider_quota_window_wait",
+                                f"Probing {delay:.0f}s for a quota window to "
+                                f"reopen before re-deciding {effective_scene!r}",
+                                data={
+                                    "scene": effective_scene,
+                                    "quota_exhausted": _window_blocked,
+                                    "wait_sec": delay,
+                                    "wake_rounds": _wake_rounds,
+                                    "waiting_dispatches": (
+                                        _quota_watchdog.waiting_dispatches
+                                    ),
+                                },
+                            )
+                        _quota_wake_sleep(delay)
+
+                        # Re-read, then re-decide from scratch — same
+                        # candidates, same eligibility rules, same answer
+                        # shape. It is deliberately not a shortcut that
+                        # bypasses the selection: the reading this wakes on
+                        # is the only thing that has changed, and trusting
+                        # it is the whole point.
+                        #
+                        # The read is **forced**. A cache entry is stamped
+                        # when it was fetched, so a wake that slept less
+                        # than the quota TTL would otherwise be handed the
+                        # verdict it already had — read before the sleep, and
+                        # therefore incapable of reporting a window that
+                        # reopened during it. For the common case of a window
+                        # about to close that is not a staleness question but
+                        # the whole feature failing: the wake would wake,
+                        # see the same "full", and stop having learned
+                        # nothing. The TTL exists to keep a dispatch from
+                        # asking CC Switch once per dispatch, and a wake is
+                        # not a dispatch — it asks precisely because what it
+                        # needs to know is what happened while it was not
+                        # looking.
+                        #
+                        # It is asked of the shared watchdog rather than of
+                        # the reader directly, which is what turns N wakes on
+                        # one tick into one request: a wake that arrives while
+                        # the payload is being fetched waits for that fetch
+                        # and takes its answer instead of starting another.
+                        #
+                        # Even a fresh read may hand back the same verdict: a
+                        # provider's meters do not update in the same instant
+                        # its window rolls. That is an ordinary outcome and
+                        # not a terminal one — the round counts, the next
+                        # stamp is read, and the next round tries again. It is
+                        # also the case the cadence is sized for: a window
+                        # that opens at some moment no probe can predict is
+                        # still a window that the next probe finds open.
+                        quota_map = _quota_watchdog.probe(
+                            blocked=_window_blocked,
+                            scene=effective_scene,
+                            logger=self.logger,
+                        )
+                        _scene_diag["wake_rounds"] = _wake_rounds
+                        chosen = acquire_provider_with_dynamic_capacity(
+                            scene_candidates,
+                            self._concurrency_tracker,
+                            usage_map,
+                            timeout=wait_sec,
+                            quota_map=quota_map,
+                        )
+
+                finally:
+                    # The wait's end is logged with its start, because a
+                    # window that was shut when this dispatch gave up and
+                    # open by the time the next one looks is a different
+                    # story from one that was shut the whole way through,
+                    # and only the pair says which happened.
+                    if _quota_waiting:
+                        _quota_watchdog.wait_left(
+                            scene=effective_scene,
+                            rounds=_wake_rounds,
+                            logger=self.logger,
+                        )
+                    # The budget starts running again the moment the
+                    # wait ends, whether it ended because a slot came
+                    # back, because a window opened, or because the
+                    # selection raised — in the last case the call is
+                    # over, but leaving the budget parked would be a lie
+                    # told to whoever is still reading it. That is why
+                    # the resume lives here and not at the bottom of the
+                    # loop: an exception on any of the three waits leaves
+                    # the same debt, and a clock nobody resumes is a clock
+                    # that stops being read while the thing it bounds is
+                    # still running.
+                    if _parked and _work_clock is not None:
+                        _work_clock.resume()
+
+                _scene_diag["wake_rounds"] = _wake_rounds
+                _scene_diag["slot_wait_rounds"] = _slot_rounds
+                _scene_diag["slot_waited_sec"] = round(_slot_waited, 1)
+
+                if chosen is not None:
                     provider_config = scene_configs[chosen]
                     provider_selected = True
                     self.current_call_provider = chosen
@@ -1332,6 +2791,52 @@ class ClaudeCodingTool(CodingTool):
                                   "in_flight": self._concurrency_tracker.current(chosen),
                                   "fleet_in_flight": self._concurrency_tracker.total()},
                         )
+
+        # ---- Fail closed: a scene that approved nothing serves nothing.
+        #
+        # ``provider_routing.yaml`` is an ALLOWLIST — a tier declares which
+        # CC Switch provider names the scene may use, and a name no tier
+        # names is not approved for that scene. So while a scene is in
+        # effect its chain is the whole candidate set, and "the chain
+        # produced nothing" is a fact about configuration, not an
+        # invitation to serve the call from elsewhere.
+        #
+        # Everything reachable from here on is outside the table: the
+        # ``provider_priority`` walk is the optimizer chain (built by
+        # ``load_fallback_order`` over the whole CC Switch list, with no
+        # tier filtering), the constructor's ``base_url`` / ``auth_token``
+        # are the run-level provider resolved once for the whole run, and
+        # the parent process env is whatever the shell exported. Any of
+        # them can answer, so a tier table that does not cover a provider
+        # degrades into "that provider serves every scene anyway" — and
+        # invisibly, because the ledger column that would have said so
+        # (``current_call_provider``) was stamped ``"parent"`` two blocks
+        # below, naming a source rather than the endpoint actually used.
+        #
+        # Raised HERE, before the CC Switch shortcut and the priority walk
+        # below, because their own contract already says the scene chain is
+        # exclusive: "Scene routing active: the chain is the exclusive
+        # candidate set (no cross-tier fallback into the priority walk)".
+        # The empty chain was the one case that broke it.
+        #
+        # The gate is deliberately narrow: it needs a scene AND an
+        # unselected provider. A call with no scene has no tier table to
+        # violate, so the CC Switch shortcut, the priority walk and the
+        # parent fallback below all keep their current behaviour —
+        # including when they leave nothing in ``env`` and Claude Code
+        # resolves its own configuration. Inherit mode never reaches
+        # here: it marks ``provider_selected`` at the top of this function,
+        # which is the correct answer to the walk.
+        #
+        # ``current_call_provider`` is left unset (reset at the top of
+        # this call) rather than labelled. The usage registry reads that
+        # attribute when it records the attempt, so the ledger row for a
+        # failed call says "no provider was selected" instead of claiming
+        # the parent environment served it.
+        if effective_scene and not provider_selected:
+            raise _scene_chain_unavailable(
+                effective_scene, _scene_diag, self.logger
+            )
 
         # CC Switch's ACTUAL current provider — asked first (2026-09-21).
         #
@@ -1393,9 +2898,12 @@ class ClaudeCodingTool(CodingTool):
             if provider_selected or scene_chain:
                 # Scene routing active: the chain is the exclusive
                 # candidate set (no cross-tier fallback into the priority
-                # walk). When every scene candidate was unavailable we
-                # fall through to the parent fallback below, NOT to
-                # out-of-tier providers.
+                # walk). If it selected nothing the call has already
+                # failed above — a scene-active call never reaches the
+                # parent fallback below, because neither this walk nor
+                # the parent environment is on the scene's allowlist.
+                # So this break only ends the loop for a healthy scene
+                # call that already has its provider.
                 break
             if prov_name in excluded:
                 continue
@@ -1431,6 +2939,11 @@ class ClaudeCodingTool(CodingTool):
             break
 
         if not provider_selected:
+            # Reachable only when NO scene is in effect: a scene-active
+            # call that selected nothing has already raised. So this is
+            # the answer to "no tier table applies to this call", not a
+            # degradation of one.
+            #
             # NOTE: an exhausted chain is NOT an exception. There used to
             # be a ``raise NoProviderAvailable("vendor-b-pro is currently
             # degraded due to peak-hour load …")`` branch here; it was
@@ -1444,6 +2957,13 @@ class ClaudeCodingTool(CodingTool):
             # the call. The peak-hour policy itself lives in the
             # optimizer's rule engine, and a rule-avoided provider is
             # simply skipped during the walk above.
+            #
+            # What this branch must never do is answer for a scene. The
+            # scene-active equivalent is the fail-closed raise above,
+            # because here the ledger column recording which endpoint
+            # served the call would say "parent" — a description of where
+            # the configuration came from, not of who answered — while the
+            # process env behind it is whatever the shell exported.
             self.current_call_provider = "parent"
             if self.logger:
                 # 2026-09-13: include the intended provider and the full
@@ -1489,6 +3009,14 @@ class ClaudeCodingTool(CodingTool):
         # the wrong provider by the ``provider_fallback`` log, because
         # that reports ``current_call_provider``, not the endpoint
         # actually used. (2026-09-14, the 2026-09-04 plan.)
+        #
+        # Which calls reach here: only the ones with no scene. A
+        # scene-active call that resolved no provider has already raised,
+        # so the run-level provider — which is resolved once per run from
+        # the unfiltered optimizer chain and is therefore on no scene's
+        # allowlist — can no longer answer a scene-routed call. For a
+        # call with no scene this block is the documented behaviour: the
+        # run-level provider is exactly the answer the caller configured.
         if not provider_selected:
             if self.model:
                 cmd += ["--model", self.model]
@@ -1581,8 +3109,25 @@ class ClaudeCodingTool(CodingTool):
 
             if effective_settings_path is not None:
                 cmd += ["--settings", str(effective_settings_path)]
-            elif self.settings is not None:
-                cmd += ["--settings", str(self.settings)]
+            # No ``elif self.settings is not None`` fallback, deliberately.
+            # It used to forward the raw template path to the CLI, which
+            # handed a path that may no longer exist: the CLI validates
+            # ``--settings`` before any model call, so the subprocess died
+            # in ~0.2s and the read loop could only report "exited without
+            # assistant text" — a provider-shaped message for a swept local
+            # file. That arm is now unreachable: ``settings_data`` is
+            # non-None whenever ``self.settings`` is set (enforced at the
+            # template read, and a template that yields no object at all is
+            # rejected there too), the write block above runs whenever
+            # ``settings_data`` is non-None, and ``effective_settings_path``
+            # is assigned unconditionally inside it — so reaching the ``elif``
+            # would require ``self.settings is None``, a contradiction.
+            #
+            # The invariant is asserted at the read site rather than here
+            # because a raise from inside the ``try`` above would be masked:
+            # its ``finally`` calls ``_graceful_shutdown(process)`` with
+            # ``process`` still ``None``, and the resulting ``AttributeError``
+            # would replace the real message with a shutdown failure.
 
             # 2026-10-06: confine the sub-agent when the operator
             # configured a sandbox. `bypassPermissions` removes the
@@ -2497,10 +4042,99 @@ class ClaudeCodingTool(CodingTool):
                 )
                 raise
 
+    def _resume_or_fresh_session(
+        self,
+        *,
+        prev_session_id: str,
+        resume_prompt: str,
+        fresh_prompt: str,
+        system_instruction: Optional[str],
+        excluded_providers: Optional[list],
+        total_timeout: Optional[int],
+        allowed_tools: Optional[list],
+        scene: Optional[str],
+    ) -> tuple:
+        """Re-open ``prev_session_id`` where the previous attempt left off.
+
+        This is the provider-switch path: the last attempt died on one
+        provider and the retry runs on another. The conversation is
+        worth keeping — the sub-agent may be minutes into reading
+        files, running a test suite or editing files, and restarting
+        the task from nothing pays for all of that work twice — so the
+        retry resumes rather than re-sends.
+
+        ``--resume`` is best-effort and has no guarantee: the session
+        may never have been created (a provider that stalls before its
+        first token writes no transcript at all), may have been pruned,
+        or may be malformed. The CLI separates those cheaply — a
+        session that produced output re-opens and the model picks the
+        task back up, while a session that produced none fails at once
+        — but neither outcome is allowed to take the dispatch down. A
+        resume that cannot be honoured degrades to the fresh-session
+        call it replaces, which is what would have happened anyway, and
+        says so in the log so the degradation is visible rather than
+        silent.
+
+        Returns the same ``(text, session_id)`` pair as
+        ``_run_interactive_resilient``. On the fallback path the id is
+        the NEW session, so a caller that goes on to retry keeps
+        pointing at a session that actually exists.
+        """
+        try:
+            return self._run_interactive_resilient(
+                resume_prompt,
+                system_instruction,
+                session_id=prev_session_id,
+                resume=True,
+                excluded_providers=excluded_providers,
+                total_timeout=total_timeout,
+                allowed_tools=allowed_tools,
+                scene=scene,
+            )
+        except HardTimeoutError:
+            # The resumed session is fine; the provider is slow. That is
+            # the caller's existing timeout routing (auto-split, next
+            # provider), not a resume failure — do not mask it as one.
+            raise
+        except Exception as exc:
+            if self.logger:
+                self.logger.warning(
+                    "coding_resume_fallback",
+                    f"could not resume session {prev_session_id} on "
+                    f"{self.current_call_provider} ({type(exc).__name__}); "
+                    f"retrying the same work in a fresh session",
+                    data={
+                        "session_id": prev_session_id,
+                        "resume": True,
+                        "error": type(exc).__name__,
+                        "error_detail": str(exc)[:500],
+                        "provider": getattr(self, "current_call_provider", None),
+                        "excluded_providers": list(excluded_providers or []),
+                        "scene": scene,
+                        "fallback": "fresh_session",
+                    },
+                )
+            logger.warning(
+                "[RESUME FALLBACK] session=%s provider=%s error=%s: %s — "
+                "continuing in a fresh session",
+                prev_session_id, getattr(self, "current_call_provider", None),
+                type(exc).__name__, str(exc)[:200],
+            )
+            return self._run_interactive_resilient(
+                fresh_prompt,
+                system_instruction,
+                session_id=str(uuid.uuid4()),
+                resume=False,
+                excluded_providers=excluded_providers,
+                total_timeout=total_timeout,
+                allowed_tools=allowed_tools,
+                scene=scene,
+            )
+
     def _query_internal_m1(self, prompt, system_instruction, timeout,
                            *, start_time, prompt_len,
                            retry_count=0, excluded_providers=None,
-                           scene=None):
+                           scene=None, resume_session=None):
         compacted_prompt = self._compact_prompt(prompt, system_instruction)
         if compacted_prompt != prompt and self.logger:
             self.logger.info(
@@ -2515,10 +4149,39 @@ class ClaudeCodingTool(CodingTool):
                               data={"tool": "claude", "prompt_len": prompt_len, "timeout": timeout,
                                     "model": self.model, "model_type": self.model_type, "mode": "interactive"})
 
-        def _call(excluded=None, total_timeout=None):
+        def _call(excluded=None, total_timeout=None, resume=False):
+            """One dispatch of this prompt; returns the assistant text.
+
+            ``resume=False`` opens a fresh session under a pinned id;
+            ``resume=True`` re-opens the session the previous attempt
+            was using. Either way ``pinned_session_id`` names the
+            session this dispatch ran in, because the timeout handler
+            below can only resume a session whose id it has.
+            """
+            nonlocal pinned_session_id
+            if resume:
+                text, used_sid = self._resume_or_fresh_session(
+                    prev_session_id=pinned_session_id,
+                    resume_prompt=RESUME_CONTINUATION_PROMPT,
+                    fresh_prompt=compacted_prompt,
+                    system_instruction=system_instruction,
+                    excluded_providers=excluded,
+                    total_timeout=total_timeout,
+                    allowed_tools=None,
+                    scene=scene,
+                )
+                if used_sid:
+                    # A resume that fell back to a fresh session
+                    # reports the new id — keep pointing at the
+                    # session that exists rather than the dead one.
+                    pinned_session_id = used_sid
+                return text
+            # ``str(uuid4())``: ``--session-id`` rejects the 32-char
+            # undashed ``uuid4().hex`` form with "Invalid session ID".
+            pinned_session_id = str(uuid.uuid4())
             text, _sid = self._run_interactive_resilient(
                 compacted_prompt, system_instruction,
-                session_id=None, resume=False,
+                session_id=pinned_session_id, resume=False,
                 excluded_providers=excluded,
                 total_timeout=total_timeout,
                 allowed_tools=None,
@@ -2526,9 +4189,16 @@ class ClaudeCodingTool(CodingTool):
             )
             return text
 
+        # The session this call will dispatch into. Pinning the id here
+        # is what makes a provider switch resumable at all: without it
+        # the CLI picks the id, the id is never returned on the failure
+        # path, and the retry has nothing to resume.
+        pinned_session_id = resume_session or str(uuid.uuid4())
+
         try:
             if timeout is None:
-                result = _call(excluded=excluded_providers)
+                result = _call(excluded=excluded_providers,
+                               resume=resume_session is not None)
             else:
                 # 2026-09-06 — BOTH layers of timeout cap are active:
                 # 1. ``total_timeout=timeout`` → daemon watcher inside
@@ -2548,7 +4218,8 @@ class ClaudeCodingTool(CodingTool):
                 _ctx = contextvars.copy_context()
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(
-                        _ctx.run, _call, excluded_providers, timeout
+                        _ctx.run, _call, excluded_providers, timeout,
+                        resume_session is not None,
                     )
                     try:
                         result = future.result(timeout=timeout)
@@ -2603,13 +4274,18 @@ class ClaudeCodingTool(CodingTool):
                         "provider_timeout_fallback",
                         f"[{next_retry}/{self.MAX_TIMEOUT_RETRIES}] {self.current_call_provider} timed out (idle={self.DEFAULT_IDLE_TIMEOUT}s), retrying with next provider",
                         data={"from_provider": self.current_call_provider, "retry": next_retry,
-                              "max_retries": self.MAX_TIMEOUT_RETRIES, "idle_sec": self.DEFAULT_IDLE_TIMEOUT},
+                              "max_retries": self.MAX_TIMEOUT_RETRIES, "idle_sec": self.DEFAULT_IDLE_TIMEOUT,
+                              "resume_session": pinned_session_id},
                     )
+                # Hand the retry the session that just timed out. It is
+                # resumed on the next provider instead of restarted:
+                # the work done so far stays done.
                 return self._query_internal_m1(
                     prompt, system_instruction, timeout,
                     start_time=start_time, prompt_len=prompt_len,
                     retry_count=next_retry, excluded_providers=new_excluded,
                     scene=scene,
+                    resume_session=pinned_session_id,
                 )
             providers_tried = list(excluded_providers or [])
             if self.current_call_provider and self.current_call_provider not in providers_tried:
@@ -2733,7 +4409,32 @@ class ClaudeCodingTool(CodingTool):
         # (forwarded below) is the per-call routing lever.
         return self._query_json_internal(prompt, system_instruction, timeout, retry_count=0, allowed_tools=allowed_tools, scene=scene)
 
-    def _query_json_internal(self, prompt, system_instruction, timeout, retry_count=0, excluded_providers=None, allowed_tools=None, scene=None):
+    def _query_json_internal(self, prompt, system_instruction, timeout, retry_count=0, excluded_providers=None, allowed_tools=None, scene=None, resume_session=None):
+        # Resolve a caller's reusable-session opt-in here, once, at the
+        # entry. An explicit ``resume_session`` is the provider-fallback
+        # recursion below, and it wins outright: that path is switching
+        # providers mid-answer and must re-open the session that timed
+        # out, not whatever session the caller's loop is holding. The
+        # handle stays bound on that path too, so the loop is handed the
+        # session that actually produced the answer rather than the one
+        # that died.
+        session_handle = _JSON_SESSION.get()
+        entry_resume = resume_session
+        from_handle = entry_resume is None and session_handle is not None
+        if entry_resume is None and session_handle is not None:
+            entry_resume = session_handle.session_id
+
+        def _remember(sid: Optional[str]) -> None:
+            """Hand the live session id back to the caller's loop.
+
+            Written at every dispatch rather than once at the end, so a
+            loop whose answer failed to parse still has an id worth
+            re-asking in — that session exists, and the loop exists
+            precisely because the answer was no good.
+            """
+            if session_handle is not None and sid:
+                session_handle.session_id = sid
+
         start_time = time.monotonic()
         self._log_query_context(prompt, system_instruction, phase="query_json")
 
@@ -2750,9 +4451,16 @@ class ClaudeCodingTool(CodingTool):
             self.logger.debug("coding_query_json_started",
                               f"Claude query_json started (prompt={len(compacted_prompt)} chars, interactive mode)",
                               data={"tool": "claude", "prompt_len": len(compacted_prompt), "mode": "interactive"})
-        json_prompt = compacted_prompt + "\n\nIMPORTANT: Return ONLY the JSON object requested, no markdown fencing."
+        json_prompt = compacted_prompt + JSON_ONLY_SUFFIX
 
-        def _query_json_internal(excluded=None, total_timeout=None):
+        # The session id of the dispatch currently in flight. The
+        # timeout handler below lives outside the closure that owns the
+        # id, so it reads it back from here to resume the same session
+        # on the next provider.
+        pinned: List[Optional[str]] = [None]
+
+        def _query_json_internal(excluded=None, total_timeout=None,
+                                 resume_session=None):
             # Try the first call. If the reply is unparseable (LLM
             # returned empty / plain prose / truncated JSON), retry
             # once with a follow-up hint that surfaces the actual
@@ -2776,17 +4484,58 @@ class ClaudeCodingTool(CodingTool):
             # 32 hex chars WITHOUT dashes and is rejected with
             # ``Error: Invalid session ID``. str(uuid.uuid4()) is
             # the canonical dashed form.
-            session_id = str(uuid.uuid4())
-            response_text, _ = self._run_interactive_resilient(
-                json_prompt,
-                system_instruction,
-                session_id=session_id,
-                resume=False,
-                excluded_providers=excluded,
-                total_timeout=total_timeout,
-                allowed_tools=allowed_tools,
-                scene=scene,
-            )
+            session_id = resume_session or str(uuid.uuid4())
+            pinned[0] = session_id
+            _remember(session_id)
+            if resume_session:
+                if from_handle:
+                    # Re-ask: the previous round of a caller-owned loop
+                    # ran here and the prompt has moved on since (the
+                    # validator's objection, the reason the last answer
+                    # was rejected). Send the new ask alongside the
+                    # restored conversation; the cut-off cue would both
+                    # misdescribe the turn and drop what changed.
+                    resume_prompt = RESUME_REASK_PROMPT + json_prompt
+                else:
+                    # Provider switch: the previous attempt died partway
+                    # through producing this JSON, so resume its session
+                    # rather than paying for the whole prompt again. The
+                    # continuation cue carries the JSON-only instruction
+                    # with it because the restored context ends on the
+                    # previous attempt's own turn, not on the original ask.
+                    resume_prompt = RESUME_CONTINUATION_PROMPT + JSON_ONLY_SUFFIX
+                response_text, used_sid = self._resume_or_fresh_session(
+                    prev_session_id=session_id,
+                    resume_prompt=resume_prompt,
+                    fresh_prompt=json_prompt,
+                    system_instruction=system_instruction,
+                    excluded_providers=excluded,
+                    total_timeout=total_timeout,
+                    allowed_tools=allowed_tools,
+                    scene=scene,
+                )
+                if used_sid:
+                    session_id = used_sid
+                    pinned[0] = used_sid
+                _remember(used_sid)
+            else:
+                response_text, resolved_sid = self._run_interactive_resilient(
+                    json_prompt,
+                    system_instruction,
+                    session_id=session_id,
+                    resume=False,
+                    excluded_providers=excluded,
+                    total_timeout=total_timeout,
+                    allowed_tools=allowed_tools,
+                    scene=scene,
+                )
+                # The CLI may report an id other than the one pinned
+                # above. Only the reusable-session handle is told —
+                # ``pinned`` and ``session_id`` keep their existing
+                # meaning for the provider-fallback and format-retry
+                # paths, which are shared with callers that never opted
+                # into reuse.
+                _remember(resolved_sid)
             try:
                 return parse_llm_json(response_text)
             except json.JSONDecodeError as exc:
@@ -2838,7 +4587,8 @@ class ClaudeCodingTool(CodingTool):
 
         try:
             if timeout is None:
-                result = _query_json_internal(excluded=excluded_providers)
+                result = _query_json_internal(excluded=excluded_providers,
+                                              resume_session=entry_resume)
             else:
                 # 2026-09-06 — same dual-timeout pattern as
                 # ``_query_internal_m1``: layer 1 (total_timeout watcher
@@ -2851,7 +4601,8 @@ class ClaudeCodingTool(CodingTool):
                 _ctx = contextvars.copy_context()
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(
-                        _ctx.run, _query_json_internal, excluded_providers, timeout
+                        _ctx.run, _query_json_internal, excluded_providers,
+                        timeout, entry_resume,
                     )
                     try:
                         result = future.result(timeout=timeout)
@@ -2911,12 +4662,17 @@ class ClaudeCodingTool(CodingTool):
                         "provider_timeout_fallback_json",
                         f"[{next_retry}/{self.MAX_TIMEOUT_RETRIES}] {self.current_call_provider} timed out (idle={self.DEFAULT_IDLE_TIMEOUT}s), retrying with next provider",
                         data={"from_provider": self.current_call_provider, "retry": next_retry,
-                              "max_retries": self.MAX_TIMEOUT_RETRIES, "idle_sec": self.DEFAULT_IDLE_TIMEOUT},
+                              "max_retries": self.MAX_TIMEOUT_RETRIES, "idle_sec": self.DEFAULT_IDLE_TIMEOUT,
+                              "resume_session": pinned[0]},
                     )
+                # Same contract as ``_query_internal_m1``: the retry
+                # resumes the session that timed out instead of paying
+                # for the whole prompt again from the top.
                 return self._query_json_internal(
                     prompt, system_instruction, timeout, retry_count=next_retry,
                     excluded_providers=new_excluded,
                     scene=scene,
+                    resume_session=pinned[0],
                 )
             # Max retries exceeded — raise with detailed error
             providers_tried = list(excluded_providers or [])

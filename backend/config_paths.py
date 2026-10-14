@@ -158,16 +158,17 @@ BACKEND_CONFIG_YAML: Path = BACKEND_DIR / "config.yaml"
 # provider-order contract state
 # ---------------------------------------------------------------------------
 
-#: Fallback-chain file, used when neither the env var nor
-#: ``backend/config.yaml`` overrides it.
+#: Per-provider 5-hour quota payload, the one file the provider layer
+#: still reads from disk. The **fallback chain is not read from here** —
+#: it is asked of CC Switch (see :mod:`provider_order`); this constant
+#: survives for the quota reader and its writer.
 #:
 #: This is a runtime artifact of whichever producer an installation runs,
 #: so it lives beside the other per-deployment configuration rather than
 #: at a path this repository invents. ``.config/`` is already the
 #: documented, gitignored home for exactly that — see :data:`CONFIG_DIR`.
-#: Nothing is required to exist here; a missing file means no producer is
-#: running, which ``load_fallback_order``'s caller reports rather than
-#: treating as an error.
+#: Nothing is required to exist here: a missing file means no quota data,
+#: which the concurrency layer reads as "fully available".
 DEFAULT_PROVIDER_ORDER_FILE: Path = CONFIG_DIR / "provider-order.json"
 
 
@@ -354,48 +355,6 @@ def resolve_sandbox_profile_file() -> Optional[Path]:
         return candidate
     bundled = resolve_config_dir() / "sandbox_profile.sb"
     return bundled if bundled.is_file() else None
-
-
-def resolve_provider_order_file() -> Path:
-    """Return the absolute path to ``provider-order.json``.
-
-    Precedence (first hit wins):
-
-    1. ``PROVIDER_ORDER_FILE`` environment variable — operator escape
-       hatch for tests and one-off overrides. Relative values are
-       resolved against :func:`Path.cwd`.
-    2. ``provider_order_file`` in ``backend/config.yaml`` — relative
-       values are resolved against :data:`PROJECT_ROOT`, so the path
-       stays valid no matter where the process was launched from.
-    3. ``<config dir>/provider-order.json`` — same shape as
-       :func:`resolve_provider_routing_file` and
-       :func:`resolve_provider_capacity_file`, including the deliberate
-       absence of a bundled copy.
-
-    Resolution is re-run on every call so a test (or an operator
-    flipping the env var) sees the current value; import-time callers
-    can use the :data:`PROVIDER_ORDER_FILE` constant below instead.
-    """
-    env_value = os.environ.get("PROVIDER_ORDER_FILE")
-    if env_value:
-        candidate = Path(env_value).expanduser()
-        if not candidate.is_absolute():
-            candidate = (Path.cwd() / candidate).resolve()
-        return candidate
-
-    cfg_value = _load_backend_config_yaml().get("provider_order_file")
-    if cfg_value:
-        candidate = Path(str(cfg_value)).expanduser()
-        if not candidate.is_absolute():
-            candidate = (PROJECT_ROOT / candidate).resolve()
-        return candidate
-
-    return resolve_config_dir() / "provider-order.json"
-
-
-#: Import-time snapshot, mirroring ``server.PROVIDER_ORDER_FILE``.
-PROVIDER_ORDER_FILE: Path = resolve_provider_order_file()
-
 
 #: Interface the HTTP server binds to when ``PDT_HOST`` is unset.
 #: Loopback on purpose — see :func:`resolve_server_host`.

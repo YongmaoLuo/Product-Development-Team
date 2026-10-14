@@ -177,9 +177,19 @@ def _seed_failed_vps_report(plan_dir: Path, vps: list[str]) -> None:
     )
     # ``verification_plan.json`` uses ``verification_points`` (not
     # ``vps``) — see verification_report_reader.py:111.
+    #
+    # 2026-10-11 (W2): each VP carries an ``evidence_command``, which is
+    # the field the reader actually resolves. Without one,
+    # ``extract_vp_test_commands`` returns ``{}`` and the assembler now
+    # refuses every task (``repair_task_dropped_empty_test_command``).
     vp_plan = {
         "verification_points": [
-            {"id": vp_id, "title": f"VP {vp_id}"} for vp_id in vps
+            {
+                "id": vp_id,
+                "title": f"VP {vp_id}",
+                "evidence_command": f"pytest -q tests/test_{vp_id}.py",
+            }
+            for vp_id in vps
         ],
     }
     (plan_dir / "verification_plan.json").write_text(
@@ -192,6 +202,11 @@ def _stub_repair_contents(vps: list[str], round_n: int) -> list[dict]:
     ``RepairGenerator.generate_repair_contents`` would return for
     those VPs. The orchestrator's ``check_cycle_conditions`` passes
     these to ``RepairTaskAssembler.assemble``.
+
+    2026-10-11 (W3): ``files_to_modify`` is required — the assembler
+    refuses a task whose declared scope resolves to empty, so a stub
+    without it would produce a round of zero tasks and these tests
+    would be asserting on an accident.
     """
     return [
         {
@@ -199,6 +214,7 @@ def _stub_repair_contents(vps: list[str], round_n: int) -> list[dict]:
             "title": f"Fix {vp}",
             "description": f"Remediation for {vp}",
             "acceptance_criteria": f"{vp} passes",
+            "files_to_modify": [f"src/{vp.lower()}.py"],
         }
         for vp in vps
     ]

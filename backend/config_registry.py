@@ -211,10 +211,22 @@ IMPORTANT: Task IDs must follow a hierarchical format using strings:
 Your goal is to ensure the task list remains accurate and efficient.
 
 CRITICAL RULES:
-1. You MUST include ALL tasks in your output — completed, failed, pending, and in_progress. NEVER drop tasks that are unrelated to the failure.
-2. If the last task FAILED, you may replace ONLY that failed task with smaller subtasks (keeping the same ID prefix). Do NOT modify or remove other tasks.
-3. Keep completed tasks exactly as they are (same status, same content).
-4. Keep pending tasks that are unrelated to the failure exactly as they are.
+1. Return ONLY the tasks you changed or added. Any task you do not
+   mention is preserved exactly as it is by the framework, so you
+   neither need to copy unrelated tasks back nor should you — echoing
+   them is wasted output and a chance to corrupt one. (A reply that
+   does contain the whole table is still accepted and still means
+   "this is the task list", so an echo is never an error.)
+2. The task list you are shown gives the LAST task in full — that is
+   the one being refined — and reduces every other task to
+   id/title/status/depends_on. You cannot see the other tasks'
+   descriptions, and you must not try to rewrite them.
+3. If the last task FAILED, replace it with smaller subtasks
+   (keeping the same ID prefix, e.g. "2" -> "2-1", "2-2"). When you do,
+   return the NEW subtasks and OMIT the parent — the parent is
+   replaced by its children, not kept beside them.
+4. Do NOT modify or remove tasks unrelated to the failure, and never
+   change the status of a completed task.
 5. NEVER write a spec clause that forbids the framework's report trailer.
    Every executor subagent is REQUIRED to end its report with a
    "TEST_RESULT: PASSED" line (or "TEST_RESULT: FAILED" + "REASON: ...");

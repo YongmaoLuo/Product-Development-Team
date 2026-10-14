@@ -52,22 +52,10 @@ class _FixedRepairTaskGenerator:
         self.verification_report_file = plan_dir / "verification_report.json"
 
         # Bind methods under test.
-        self._generate_repair_tasks = (
-            RepairTaskGenerator._generate_repair_tasks.__get__(self)
-        )
         self._get_next_repair_task_id = (
             RepairTaskGenerator._get_next_repair_task_id.__get__(self)
         )
         self.append_to_tasks = RepairTaskGenerator.append_to_tasks.__get__(self)
-        self._build_deterministic_repair_tasks = (
-            RepairTaskGenerator._build_deterministic_repair_tasks.__get__(self)
-        )
-        self._build_repair_task_prompt = (
-            RepairTaskGenerator._build_repair_task_prompt.__get__(self)
-        )
-        self._generate_fallback_repair_tasks = (
-            RepairTaskGenerator._generate_fallback_repair_tasks.__get__(self)
-        )
 
 
 @pytest.fixture
@@ -86,43 +74,6 @@ def _evidence(vp_id: str, test_command: str = "pytest tests/test_x.py") -> dict:
         "evidence": "code returned wrong value",
         "test_command": test_command,
     }
-
-
-def test_repair_task_generation(tmp_plan):
-    """Each failed VP produces exactly one repair task with concrete test_command."""
-    plan_dir, project_dir = tmp_plan
-    gen = _FixedRepairTaskGenerator(plan_dir, project_dir)
-
-    # Three different VPs failed → expect three distinct repair tasks.
-    evidence = [
-        _evidence("VP-001"),
-        _evidence("VP-002"),
-        _evidence("VP-003"),
-    ]
-    requirement_context = {"acceptance_criteria": [], "technical_constraints": []}
-
-    tasks = gen._generate_repair_tasks(requirement_context, evidence, round_number=2)
-
-    assert len(tasks) == 3, (
-        f"Expected exactly one repair task per failed VP (3 VPs → 3 tasks), got {len(tasks)}"
-    )
-
-    # Each task must have a concrete (non-empty) test_command.
-    for t in tasks:
-        assert t.get("test_command"), f"Repair task missing test_command: {t}"
-        assert isinstance(t["test_command"], str) and t["test_command"].strip(), (
-            "test_command must be a non-empty string"
-        )
-
-    # Round-2 repair tasks tagged with prefix R2-
-    for t in tasks:
-        assert t["id"].startswith("R2-"), (
-            f"Round-2 repair task should have id starting with 'R2-', got {t['id']}"
-        )
-
-    # IDs must be unique per VP (no collisions)
-    ids = [t["id"] for t in tasks]
-    assert len(set(ids)) == len(ids), f"Duplicate repair task ids: {ids}"
 
 
 def test_append_to_tasks(tmp_plan):

@@ -65,11 +65,17 @@ class _Tool:
                 "split_hint": "by_directory", "reason": "整树 22 分钟",
             }]}
         # repair-content generation (only VP-006 should reach here)
+        #
+        # 2026-10-11 (W3): ``files_to_modify`` is now mandatory. Without
+        # it ``RepairTaskAssembler.assemble`` refuses the task
+        # (``repair_task_dropped_empty_files_to_modify``) and this test
+        # would see zero repair tasks — a refusal, not a split bug.
         return {"tasks": [{
             "failed_vp_id": "VP-006",
             "title": "修 VP-006 的 diff",
             "description": "恢复 9/2 行为冻结",
             "acceptance_criteria": "git diff 为空",
+            "files_to_modify": ["backend/agent.py"],
         }]}
 
 
