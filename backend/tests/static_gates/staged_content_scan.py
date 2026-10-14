@@ -21,10 +21,25 @@ a file can be edited back to clean after being staged, and the commit will
 still carry what was staged. Scanning ``HEAD`` or the working directory
 would read the tidied version and report a clean commit that is not clean.
 
-The rules are the same pure functions the other three surfaces use --
-:func:`find_plan_ids_in_non_test_source` and :func:`find_private_names` --
-so there is one definition of a violation per surface and no drift between
-them. No rule is restated here.
+The rule here is the same pure function the tree gate and the range scan
+use -- :func:`find_plan_ids_in_non_test_source` -- so there is one
+definition of a violation and no drift between surfaces. No rule is
+restated.
+
+What it deliberately does not check
+-----------------------------------
+Private proper names. That check used to be the second entry in
+:data:`STAGED_RULES`, calling ``find_private_names`` from a pytest gate --
+which meant the names themselves were committed to this repository, and the
+check only ran wherever pytest ran. Both halves of that were wrong: a
+blacklist that is checked in publishes the names, and a check that runs in
+CI cannot run at commit time.
+
+It now lives in ``scripts/scanners/scan_forbidden_names.py``, reading the
+operator's local ``.config/forbidden-names``, and it runs here as its own
+step of ``scripts/pre_commit_gate.sh``. That step is not in
+:data:`STAGED_RULES` because its needles are not in this repository and so
+cannot be a pure function here.
 
 What it deliberately does not check
 -----------------------------------
@@ -63,9 +78,6 @@ import source_scan  # noqa: E402  (path set above)
 from test_no_plan_ids_in_non_test_source import (  # noqa: E402
     find_plan_ids_in_non_test_source,
 )
-from test_no_private_names_in_source import (  # noqa: E402
-    find_private_names,
-)
 
 #: Repository root -- this file lives at
 #: ``backend/tests/static_gates/staged_content_scan.py``.
@@ -73,16 +85,17 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 #: ``(label, pure_rule)`` pairs, same table shape as ``RANGE_RULES``.
 #:
-#: Both rules are here rather than the home-path/attribution/measurement
-#: ones: those already run over the whole working tree at the ``pre-commit``
-#: stage via ``scripts/grep_guard.sh``'s sibling, and a file can be staged
-#: without ever having been walked. Only the two rules added after the
-#: 2026-09-29 publication are index-scoped here; the older three keep
-#: their existing mount points rather than gaining a second one whose
-#: divergence nobody would notice.
+#: This rule is here rather than only in the home-path/attribution/
+#: measurement gates: those already run over the whole working tree at the
+#: ``pre-commit`` stage via ``scripts/grep_guard.sh``'s sibling, and a file
+#: can be staged without ever having been walked.
+#:
+#: The private-name rule is *not* here and never can be. Its needles are
+#: operator-owned and untracked, so there is no pure function over them to
+#: put in this table; it is a separate step of the hook. See the module
+#: docstring.
 STAGED_RULES: tuple[tuple[str, object], ...] = (
     ("plan id in source", find_plan_ids_in_non_test_source),
-    ("private name", find_private_names),
 )
 
 
@@ -132,9 +145,8 @@ def staged_paths(repo: Path = REPO_ROOT) -> list[str]:
     would silently split one file into two halves -- one of which may scan
     clean.
 
-    Nothing is filtered by extension here: ``find_private_names`` has no
-    test exemption and no suffix list, so a private name in a ``.yaml`` or
-    a ``.md`` is as published as one in a ``.py``.
+    Nothing is filtered by extension here: a plan-id shape in a ``.yaml``
+    or a ``.md`` in non-test source is as published as one in a ``.py``.
     """
     out = _git(
         repo,

@@ -78,9 +78,6 @@ from test_no_plan_ids_in_metadata import (  # noqa: E402
 from test_no_plan_ids_in_non_test_source import (  # noqa: E402
     find_plan_ids_in_non_test_source,
 )
-from test_no_private_names_in_source import (  # noqa: E402
-    find_private_names,
-)
 from test_source_comments_carry_no_local_measurements import (  # noqa: E402
     find_local_measurements,
 )
@@ -93,16 +90,25 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 #: ``(path: Path, text: str) -> list[tuple[Path, int, str]]``, which is why
 #: this is data and not code. Adding a rule here is the whole change; there
 #: is no second place to teach about it.
+#:
+#: The private-name rule used to be the fifth entry, and what it cost is
+#: worth recording. Its needles were literals in
+#: ``test_no_private_names_in_source.py`` -- a *tracked* file -- so the rule
+#: could only be enforced by committing the names it was meant to keep out.
+#: It has moved to ``scripts/scanners/scan_forbidden_names.py``, which reads
+#: the operator's untracked ``.config/forbidden-names``; ``scan_commit_range.sh``
+#: runs it as a separate step of the pre-push hook, and it deliberately does
+#: not run in ``--ci`` mode, because a CI runner has no local list and could
+#: only ever report "the check did not run".
 RANGE_RULES: tuple[tuple[str, object], ...] = (
     ("home path", find_home_paths),
     ("operator attribution", find_attribution),
     ("local measurement", find_local_measurements),
-    # Added after the 2026-09-29 publication. Both were structurally
-    # absent: feeding the five real leaked strings to the three rules
-    # above returns zero findings, because a plan id and a private
-    # project name are neither a path, an attribution, nor a measurement.
+    # Added after the 2026-09-29 publication. Structurally absent from the
+    # three rules above: feeding the real leaked plan-id strings to them
+    # returns zero findings, because a plan id is neither a path, an
+    # attribution, nor a measurement.
     ("plan id in source", find_plan_ids_in_non_test_source),
-    ("private name", find_private_names),
 )
 
 #: ``(label, pure_rule)`` pairs applied to each commit's *message*, not to
