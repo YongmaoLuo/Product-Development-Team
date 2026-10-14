@@ -1565,11 +1565,59 @@ def _lazy_check_verification(plan_id: str) -> None:
             # Without the vp_attempts glob a healthy retry was
             # indistinguishable from a hung orchestrator, and the watchdog
             # killed the round with ``verification_log_stale``.
+            #
+            # 2026-10-14: third glob, ``execution.log``, for the same
+            # reason and the same class of bug — a phase that is busy
+            # but does not write the file this watchdog reads.
+            #
+            # Production, the 2026-10-12 production plan
+            # round 1: the round log went silent for 52 min and the
+            # watchdog killed a healthy round with ``verification_log_stale``
+            # at the 45-min hard ceiling, 7 min before the round actually
+            # finished. What it was doing during those 52 min is on
+            # record in ``execution.log`` and nowhere else — every 300s
+            # ``provider_quota_window_wait`` probe, a line the
+            # ``_quota_wake_probe_sec`` cadence emits while a dispatch is
+            # parked on a closed quota window:
+            #
+            #   10:30:19  last round-log line (binary_rebuild_attempted)
+            #   10:42:03  provider_quota_window_wait_entered  <- execution.log
+            #   10:47 / 10:52 / ... / 11:17   one probe line each
+            #   11:15:18  watchdog: verification_log_stale, age 2700s = hard cap
+            #   11:22:07  provider_quota_window_wait_ended    <- execution.log
+            #   11:22:xx  round log resumes (judgment_heartbeat x6)
+            #
+            # So the round was alive for the whole window and the watchdog
+            # was structurally unable to see it: the wait writes
+            # ``execution.log`` (``ExecutionLogger._log_file``,
+            # ``execution_logger.py``), and this set read neither that nor
+            # anything the wait touched. Busy, read as dead — the identical
+            # failure the vp_attempts glob fixed one release earlier, one
+            # file over.
+            #
+            # Reading ``execution.log`` rather than special-casing "is this
+            # round parked on quota?" is deliberate. The wait ALREADY emits
+            # a periodic line; the watchdog simply was not looking at the
+            # file it lands in, so there is nothing to invent and no new
+            # plumbing to thread in. And it stays honest under a deadlock in
+            # a way a "currently waiting" predicate cannot: a predicate
+            # would have to be answered by the very thing being supervised
+            # (a process-global in ``quota_watchdog``, which has no notion
+            # of a plan at all — see ``waiting_dispatches``), so a waiter
+            # wedged mid-wait would still report itself as waiting. Here the
+            # evidence is a write that stops when the work stops: nothing
+            # writes ``execution.log`` while a round is wedged, so a real
+            # stall still goes quiet and is still caught — at the 1h hard
+            # ceiling instead of the 15-min threshold.
             plan_dir = _server._plan_dir(plan_id)
             stale_latest: Optional[float] = None
             for glob_pattern, reason in (
                 (
-                    ("logs/verification_*.log", "logs/vp_attempts/*.log"),
+                    (
+                        "logs/verification_*.log",
+                        "logs/vp_attempts/*.log",
+                        "execution.log",
+                    ),
                     "verification_log_stale",
                 ),
                 ("verification_execution_results.json", "verification_results_stale"),
