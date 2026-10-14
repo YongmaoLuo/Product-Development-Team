@@ -51,9 +51,10 @@ apart is what lets each run at the stage where it can still stop something.
 Binary content
 --------------
 Git calls a blob binary when it holds a NUL byte in the first kilobyte,
-and the other three surfaces decode every blob with ``errors="replace"``
-rather than skipping: :mod:`commit_range_scan` reads whole trees that
-carry images, and it reads them as text.
+and the other three surfaces do not skip on that basis:
+:mod:`commit_range_scan` narrows to ``SOURCE_EXTENSIONS`` under the scan
+roots, so it never reaches an image at all, and this module's sibling
+rules read whatever the extension filter lets through.
 
 This module used to skip such a blob instead, on the reasoning that "a
 private name is text, and no encoding turns one into a NUL". That
@@ -86,12 +87,40 @@ exits 2 even when it found nothing -- one skipped blob means an unknown
 number of unexamined bytes, and "no violations in what I read" is not the
 same claim as "no violations in the commit".
 
+Content that is not UTF-8
+-------------------------
+Staged blobs were decoded with ``errors="replace"``, which decides what a
+blob holds without looking at it: an undecodable byte becomes ``U+FFFD``.
+A rule whose pattern holds a non-ASCII character can then never match, and
+the run still printed ``OK ... 0 violations``. ASCII rules were unaffected
+-- ``errors="replace"`` only rewrites bytes outside ASCII -- which is why
+the hole hid behind files that happened to be UTF-8.
+
+:class:`~staged_content_scan.StagedScanError` is raised instead, naming
+the blob, for the same reason :mod:`commit_range_scan` raises rather than
+substitutes. No alternative decoder recovers these rules: ``surrogateescape``
+keeps the bytes but not their identity, and none of the non-ASCII
+characters in these rules' patterns is representable in latin-1 or
+cp1252, so every alternative returned the same verdict in measurement.
+The staged rule set today is ASCII-only, so this is a guard rather than a
+live hole -- but ``STAGED_RULES`` is a table, the next non-ASCII rule
+added to it would be silently blind the moment a latin-1 file was staged
+beside it, and the pre-commit stage is the one surface of the four that
+can still stop the commit. Refusing costs a re-save; guessing costs a leak.
+
+Unlike a skipped binary this is a hard error rather than an entry on
+``skipped``: a latin-1 text file is not "binary content, and its extension
+is not one this scan treats as source", and printing that sentence about
+it would mislabel the refusal in the one place a reader is deciding what to
+do next.
+
 Exit contract
 -------------
   * 0 -- scan ran, read everything staged, zero violations
   * 1 -- scan ran, read everything staged, at least one violation
   * 2 -- the scan could not run, or did not read everything staged
-        (usage error, unreadable index, a skipped blob)
+        (usage error, unreadable index, a skipped blob, a blob that is not
+        valid UTF-8)
 """
 
 from __future__ import annotations
@@ -326,6 +355,34 @@ def is_scannable(rel: Path, content: bytes) -> bool:
     return b"\0" not in content[:_BINARY_PROBE_BYTES]
 
 
+def _undecodable_message(path: str, exc: UnicodeDecodeError) -> str:
+    """The refusal text for a staged blob that is not valid UTF-8.
+
+    Deliberately *not* a line on the ``skipped`` list. That list's entries
+    say "binary content, and its extension is not one this scan treats as
+    source", and a latin-1 ``.txt`` is neither binary nor unrecognised --
+    printing that sentence about it would be the same wrong-label failure
+    the exit codes exist to prevent, one layer up.
+
+    The wording is shared verbatim with
+    :mod:`commit_range_scan._undecodable_message`, for the reason the two
+    modules already share the binary rule: a reader who has seen one has
+    seen both.
+    """
+    return (
+        f"{path} is not valid UTF-8 and this scan cannot read it: {exc}\n"
+        f"The privacy rules are patterns over text, and running them over a "
+        f"blob whose encoding this scan would have to guess is not reading "
+        f"it. It used to be decoded with errors=\"replace\", which rewrites "
+        f"every byte it cannot decode into U+FFFD -- and a rule whose shape "
+        f"holds a non-ASCII character (the Chinese measurement and "
+        f"attribution shapes do) can then never match, while the run still "
+        f"reported a clean result over bytes it had not examined.\n"
+        f"Re-save the file as UTF-8, `git add` it again, and commit again. "
+        f"Nothing has been scanned and nothing has been cleared."
+    )
+
+
 def scan_staged(repo: Path = REPO_ROOT) -> StagedScan:
     """Apply :data:`STAGED_RULES` to every staged file.
 
@@ -355,7 +412,10 @@ def scan_staged(repo: Path = REPO_ROOT) -> StagedScan:
         if not is_scannable(rel, content):
             skipped.append(path)
             continue
-        text = content.decode("utf-8", "replace")
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise StagedScanError(_undecodable_message(path, exc)) from exc
         scanned += 1
         for label, rule in STAGED_RULES:
             for _, lineno, snippet in rule(rel, text):  # type: ignore[operator]
