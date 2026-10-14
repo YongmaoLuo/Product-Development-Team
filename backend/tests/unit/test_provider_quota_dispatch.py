@@ -207,6 +207,38 @@ class TestRollingWindow:
         assert quota["Example A"].exhausted is True
         assert quota["Example A"].exhausted_tier == "weekly_limit"
 
+    def test_the_weekly_window_does_not_shrink_the_cap(self):
+        """5h at 20% and the week at 80%: the cap is the burst window's.
+
+        Both are real budgets, but only one of them is a rate question.
+        The week gates the dispatch and the burst window sizes it, so
+        the answer here is 80% rather than the 20% that taking the worse
+        of the two would give. The counterweight is the test above: at a
+        weekly 100% this same row is still not dispatchable at all, so
+        the week has not stopped mattering — it has stopped being a
+        second opinion about *how fast*.
+        """
+        quota = _quota(_rolling("Example A", 20.0, weekly_used=80.0))
+        assert quota["Example A"].exhausted is False
+        assert quota["Example A"].remaining_pct == 80.0
+
+    def test_a_week_with_no_burst_window_beside_it_says_nothing(self):
+        """The week's own number is not an answer about the burst window.
+
+        A row that carries only ``weekly_limit`` gates on it as before
+        and reads as rolling as before, but it has no statement about the
+        window the cap is scaled by, so it reports no headroom at all.
+        Substituting 50% here would be a number about the right shape
+        and the wrong question, and the caller cannot tell it from a real
+        burst reading.
+        """
+        row = _rolling("Example A", 20.0, weekly_used=50.0)
+        row["tiers"] = [t for t in row["tiers"] if t["name"] != "five_hour"]
+        quota = _quota(row)
+        assert quota["Example A"].exhausted is False
+        assert quota["Example A"].shape == provider_order.SHAPE_ROLLING
+        assert quota["Example A"].remaining_pct is None
+
     def test_a_window_that_has_already_closed_reads_as_empty(self):
         """``resets_at`` in the past means the number is last window's.
 

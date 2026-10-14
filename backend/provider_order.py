@@ -865,6 +865,15 @@ def load_provider_5h_usage(
 #: other one keeps it ineligible on its own regardless.
 GATED_TIERS: Tuple[str, ...] = ("five_hour", "weekly_limit")
 
+#: The one window that scales the concurrency cap. Kept apart from
+#: :data:`GATED_TIERS` because the two answer different questions: both
+#: gated tiers decide *whether* a provider may be dispatched to, but
+#: only this one says *how much room* there is, and the week is measured
+#: in days — letting it into the cap would shrink a provider's slots all
+#: week for a budget that only has to be watched, not scaled. The week
+#: still gates on its own above; it just does not also drag the number.
+_HEADROOM_TIER: str = "five_hour"
+
 #: How long a *readable* quota reading is trusted before it is asked
 #: for again. One number, not a knob: CC Switch answers this endpoint by
 #: asking every provider's own API, so a request here is a fan-out
@@ -903,9 +912,16 @@ class ProviderQuota:
             than re-derived, so a log line can say *why* a verdict was
             reached.
         remaining_pct: Headroom in ``[0, 100]``, or ``None`` when the
-            reading says nothing. For a balance provider this is
-            ``100.0`` while a positive balance remains and ``0.0``
-            otherwise, because a currency amount has no percentage.
+            reading says nothing. For a window provider this is the
+            burst window's own headroom and nothing else: the week
+            gates a dispatch on its own (:attr:`exhausted`) but does not
+            scale the cap, so a provider 20% through the burst window
+            and 80% through the week is capped at 80% of its slots
+            rather than 20%. A row whose burst window carries no usable
+            number is ``None``, not a number borrowed from the week.
+            For a balance provider this is ``100.0`` while a positive
+            balance remains and ``0.0`` otherwise, because a currency
+            amount has no percentage.
         exhausted: True only when the reading affirmatively shows the
             provider has no budget. ``False`` covers both "there is
             budget" and "there is no reading" — those are different
@@ -1020,6 +1036,12 @@ def _quota_from_record(
 ) -> ProviderQuota:
     """Classify one ``/api/usage`` row into a :class:`ProviderQuota`.
 
+    Two verdicts are produced from two different windows on purpose:
+    ``exhausted`` is the worse of both gated tiers (either budget empty
+    means no dispatch), while ``remaining_pct`` is the burst window
+    alone (:data:`_HEADROOM_TIER`). They are not two views of one
+    number and neither is derived from the other.
+
     Never raises. A row this reader cannot make sense of is an *absent*
     reading, which admits the provider — the same verdict a successful
     fetch of a meter-less provider produces, reached by a different
@@ -1056,8 +1078,12 @@ def _quota_from_record(
     # (1) The rolling windows. Both gated tiers are read: the burst
     #     window and the account's remaining week are independent
     #     budgets, and a provider with either one empty cannot be
-    #     dispatched to.
+    #     dispatched to. ``worst`` is the *gate's* number and is the
+    #     worse of the two, unchanged; ``burst_used`` is the *cap's*
+    #     number and is the burst window alone, so the two can disagree
+    #     without either of them having to be recomputed from the other.
     worst: Optional[float] = None
+    burst_used: Optional[float] = None
     window_exhausted_tier: Optional[str] = None
     window_resets_at: Optional[datetime] = None
     for name in GATED_TIERS:
@@ -1067,6 +1093,8 @@ def _quota_from_record(
         used = tier_used_percent(tier, now)
         if used is None:
             continue
+        if name == _HEADROOM_TIER:
+            burst_used = used
         worst = used if worst is None else max(worst, used)
         if used >= 100.0 and window_exhausted_tier is None:
             window_exhausted_tier = name
@@ -1107,17 +1135,33 @@ def _quota_from_record(
     # has no moment attached to it.
     shape = SHAPE_ROLLING if worst is not None else SHAPE_BALANCE
 
+    # (3) The cap's headroom, which is the burst window's alone. The
+    #     week is deliberately not in it: it has already had its say in
+    #     ``exhausted``, and a provider that is out of week is not
+    #     dispatched to at all rather than dispatched to slowly, so
+    #     scaling its cap by the week as well would cost it throughput it
+    #     is never going to use. A row whose burst window says nothing
+    #     reports no headroom rather than borrowing the week's number —
+    #     the week's number is not a statement about the burst window,
+    #     and the caller can say something better with ``None`` than
+    #     with a plausible number for a different question.
+    headroom: Optional[float]
     if worst is None:
         headroom = 100.0 if balance_funded else 0.0
     elif balance_funded is False:
         headroom = 0.0
+    elif burst_used is None:
+        headroom = None
     else:
-        headroom = 100.0 - worst
+        headroom = 100.0 - burst_used
 
     return ProviderQuota(
         provider=provider,
         shape=shape,
-        remaining_pct=max(0.0, min(100.0, headroom)),
+        remaining_pct=(
+            None if headroom is None
+            else max(0.0, min(100.0, headroom))
+        ),
         exhausted=exhausted,
         # A window is preferred over a balance as the thing to name,
         # because a window is the one with a moment attached: a balance
