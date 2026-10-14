@@ -192,9 +192,15 @@ class TestTheRulesAreTheOnesTheOtherGatesUse:
                 f"that will drift from the first"
             )
 
-    def test_the_rule_set_is_exactly_the_three_existing_ones(self) -> None:
+    def test_the_rule_set_is_exactly_the_five_existing_ones(self) -> None:
         labels = [label for label, _ in pr_metadata_scan.METADATA_RULES]
-        assert labels == ["home path", "operator attribution", "local measurement"], (
+        assert labels == [
+            "home path",
+            "operator attribution",
+            "local measurement",
+            "private name",
+            "plan id in metadata",
+        ], (
             f"the metadata rules changed to {labels}; commit_range_scan "
             f"deliberately mirrors this list, so a change belongs in both"
         )

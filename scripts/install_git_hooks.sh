@@ -65,9 +65,20 @@ fi
 MARKER="# installed by scripts/install_git_hooks.sh"
 
 # hook-name<TAB>relative-script<TAB>one-line description
+#
+# ``pre-commit`` points at ``scripts/pre_commit_gate.sh`` rather than
+# directly at ``scripts/grep_guard.sh`` because a git hook is one
+# executable and the stage now runs two gates: the forbidden-filename
+# sweep, and the staged-content privacy scan added after the 2026-09-29
+# publication. The dispatcher keeps each gate in its own wrapper with its
+# own exit contract, so neither is reimplemented and both stay runnable
+# from a shell.
+#
+# ``commit-msg`` keeps pointing at the same script it always did; that
+# script grew the plan-id rule, so the hook entry did not have to change.
 HOOKS=(
-    "commit-msg	scripts/check_commit_msg.py	rejects AI attribution trailers"
-    "pre-commit	scripts/grep_guard.sh	forbidden-filename sweep"
+    "commit-msg	scripts/check_commit_msg.py	rejects AI attribution trailers and plan ids in the message"
+    "pre-commit	scripts/pre_commit_gate.sh	forbidden-filename sweep, then the staged-content privacy scan"
     "pre-push	scripts/scan_commit_range.sh	scans the commits being pushed for private info"
 )
 

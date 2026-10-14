@@ -30,6 +30,24 @@ attribution claim:
 A human co-author's trailer passes. So does a message that merely says
 "wire the Claude Code CLI".
 
+The privacy rule, added 2026-10-14
+----------------------------------
+This is also the entry point for the second commit-msg rule: a plan-id
+shape anywhere in the message. That is the rule the 2026-09-29 incident
+would have needed, and it is here rather than in the tree gates because
+this hook runs *before the commit exists* — the only point at which
+refusing costs nothing.
+
+The shape is not restated here. ``find_plan_ids_in_metadata`` is imported
+from ``backend/tests/static_gates/test_no_plan_ids_in_metadata.py``, the
+same function the commit-range scan and the pull-request metadata scan use,
+so the four surfaces cannot drift apart.
+
+Why the import does not pull in pytest: the hook is invoked as
+``python3 scripts/check_commit_msg.py`` — a bare interpreter, no venv — so
+this script adds the gate directory to ``sys.path`` and relies on that
+module being stdlib-only.
+
 Where it runs
 -------------
 One implementation, three entry points, so there is no second copy of the
@@ -63,6 +81,26 @@ import argparse
 import re
 import sys
 from pathlib import Path
+
+# One definition of "a plan id", shared with the tree gate, the commit-range
+# scan and the pull-request metadata scan. Imported rather than restated:
+# this file runs under a bare ``python3`` from the commit-msg hook, with no
+# venv and no third-party packages, which is why the module it reaches for
+# is stdlib-only (no ``import pytest``).
+_GATES_DIR = Path(__file__).resolve().parent.parent / "backend/tests/static_gates"
+if not _GATES_DIR.is_dir():  # pragma: no cover - broken checkout
+    print(f"error: static gates directory not found: {_GATES_DIR}", file=sys.stderr)
+    raise SystemExit(2)
+sys.path.insert(0, str(_GATES_DIR))
+
+try:
+    from test_no_plan_ids_in_metadata import (  # noqa: E402
+        COMMIT_MESSAGE_LABEL,
+        find_plan_ids_in_metadata,
+    )
+except ImportError as exc:  # pragma: no cover - broken checkout
+    print(f"error: cannot import the plan-id rule from {_GATES_DIR}: {exc}", file=sys.stderr)
+    raise SystemExit(2)
 
 # ---------------------------------------------------------------------------
 # What counts as an attribution claim
@@ -98,6 +136,20 @@ _AI_TOKENS: tuple[str, ...] = (
     "sonnet",
     "haiku",
     "gpt",
+)
+
+#: Shown when a plan id is found. A commit message is the one surface where
+#: there is no excuse: nothing under ``tests/`` is reachable from one, so
+#: every date-prefixed id here was typed by hand. There is no placeholder
+#: exemption — the repository's own neutral date placeholder matches the shape
+#: too, and allowing it would make "no false positives by construction"
+#: untrue. A placeholder in a commit message is still a quoted identifier.
+_PLAN_ID_FIX_HINT = (
+    "Rewrite the id, don't quote it. A plan id in a commit message lands in "
+    "permanent public history through GitHub's merge commit, where a "
+    "force-push cannot remove it — deleting a ref does not delete objects. "
+    "Describe the work instead: the plan's date and name are private, the "
+    "behaviour change is not."
 )
 
 #: Shown on failure. The point is to make the fix obvious without a
@@ -141,6 +193,11 @@ def find_violations(message: str) -> list[Violation]:
     editor. Blank lines and comments (``#``) are skipped — git strips them
     from the final message anyway, and a commented-out example in a
     template should not trip the gate.
+
+    Unlike the trailer rule, the plan-id rule reads **every** line: git's
+    comment-stripping only applies to the template scaffolding, and a
+    quoted plan id in the body is exactly as permanent as one in the
+    subject.
     """
     found: list[Violation] = []
     for lineno, line in enumerate(message.splitlines(), start=1):
@@ -163,7 +220,27 @@ def find_violations(message: str) -> list[Violation]:
                 found.append(
                     Violation(lineno, stripped, f"'generated with' line names an AI system ({token!r})")
                 )
+
+    for _, lineno, plan_id in find_plan_ids_in_metadata(COMMIT_MESSAGE_LABEL, message):
+        found.append(
+            Violation(
+                lineno,
+                _line_at(message, lineno).strip(),
+                f"commit message carries a plan id ({plan_id!r})",
+            )
+        )
     return found
+
+
+def _line_at(message: str, lineno: int) -> str:
+    """Return the 1-based *lineno* line of *message*, or ``""``.
+
+    The shared rule reports a line number so the message can be pasted into
+    an editor; the line text is re-read here so the failure output quotes it
+    rather than the id alone.
+    """
+    lines = message.splitlines()
+    return lines[lineno - 1] if 1 <= lineno <= len(lines) else ""
 
 
 # ---------------------------------------------------------------------------
@@ -206,11 +283,23 @@ def main(argv: list[str] | None = None) -> int:
     if not violations:
         return 0
 
-    print("commit message carries an AI attribution trailer:\n", file=sys.stderr)
-    for v in violations:
-        print(f"  line {v.lineno}: {v.reason}", file=sys.stderr)
-        print(f"    {v.line}", file=sys.stderr)
-    print(f"\n{_FIX_HINT}", file=sys.stderr)
+    attribution = [v for v in violations if "plan id" not in v.reason]
+    plan_ids = [v for v in violations if "plan id" in v.reason]
+
+    if attribution:
+        print("commit message carries an AI attribution trailer:\n", file=sys.stderr)
+        for v in attribution:
+            print(f"  line {v.lineno}: {v.reason}", file=sys.stderr)
+            print(f"    {v.line}", file=sys.stderr)
+        print(f"\n{_FIX_HINT}", file=sys.stderr)
+
+    if plan_ids:
+        print("commit message carries a plan id:\n", file=sys.stderr)
+        for v in plan_ids:
+            print(f"  line {v.lineno}: {v.reason}", file=sys.stderr)
+            print(f"    {v.line}", file=sys.stderr)
+        print(f"\n{_PLAN_ID_FIX_HINT}", file=sys.stderr)
+
     return 1
 
 

@@ -72,6 +72,15 @@ from test_no_local_home_path_in_first_party import (  # noqa: E402
 from test_no_operator_attribution_in_source import (  # noqa: E402
     find_attribution,
 )
+from test_no_plan_ids_in_metadata import (  # noqa: E402
+    find_plan_ids_in_metadata,
+)
+from test_no_plan_ids_in_non_test_source import (  # noqa: E402
+    find_plan_ids_in_non_test_source,
+)
+from test_no_private_names_in_source import (  # noqa: E402
+    find_private_names,
+)
 from test_source_comments_carry_no_local_measurements import (  # noqa: E402
     find_local_measurements,
 )
@@ -88,7 +97,31 @@ RANGE_RULES: tuple[tuple[str, object], ...] = (
     ("home path", find_home_paths),
     ("operator attribution", find_attribution),
     ("local measurement", find_local_measurements),
+    # Added after the 2026-09-29 publication. Both were structurally
+    # absent: feeding the five real leaked strings to the three rules
+    # above returns zero findings, because a plan id and a private
+    # project name are neither a path, an attribution, nor a measurement.
+    ("plan id in source", find_plan_ids_in_non_test_source),
+    ("private name", find_private_names),
 )
+
+#: ``(label, pure_rule)`` pairs applied to each commit's *message*, not to
+#: its tree. Separate from :data:`RANGE_RULES` on purpose: the plan-id
+#: shape is checked in source files only where the file is not a test,
+#: because a date-prefixed id in a test is a fixture. On a commit message
+#: there are no fixtures -- nothing under ``tests/`` is reachable from
+#: one -- so the rule applies with no exemptions at all, and is a different
+#: function with the same ``(path, text)`` signature. Rule 3 therefore
+#: cannot simply be appended to :data:`RANGE_RULES`: doing so would flag
+#: every synthetic fixture in the tree.
+MESSAGE_RULES: tuple[tuple[str, object], ...] = (
+    ("plan id in commit message", find_plan_ids_in_metadata),
+)
+
+#: The synthetic path recorded for a message finding. A message has no file
+#: behind it; naming the surface is what lets a reader tell a message
+#: violation from a tree violation in the same report.
+COMMIT_MESSAGE_PATH = Path("commit message")
 
 
 class RangeScanError(RuntimeError):
@@ -293,6 +326,31 @@ def scan_commit(repo: Path, sha: str, subject: str = "") -> list[Finding]:
     return findings
 
 
+def scan_commit_message(
+    repo: Path, sha: str, message: str, subject: str = ""
+) -> list[Finding]:
+    """Apply every rule in :data:`MESSAGE_RULES` to one commit message.
+
+    The message is a separate surface from the tree and is scanned
+    separately: it survives into ``main`` verbatim through GitHub's merge
+    commit, and no tree rule reads it.
+    """
+    findings: list[Finding] = []
+    for label, rule in MESSAGE_RULES:
+        for _, lineno, snippet in rule(COMMIT_MESSAGE_PATH, message):  # type: ignore[operator]
+            findings.append(
+                Finding(
+                    commit=sha,
+                    subject=subject,
+                    label=label,
+                    path=COMMIT_MESSAGE_PATH.as_posix(),
+                    lineno=lineno,
+                    snippet=snippet,
+                )
+            )
+    return findings
+
+
 def commit_subjects(repo: Path, shas: Iterable[str]) -> dict[str, str]:
     """Map each SHA to its one-line subject, for readable failure output."""
     subjects: dict[str, str] = {}
@@ -300,6 +358,20 @@ def commit_subjects(repo: Path, shas: Iterable[str]) -> dict[str, str]:
         out = _git(repo, ["log", "-1", "--format=%s", sha])
         subjects[sha] = out.strip()
     return subjects
+
+
+def commit_messages(repo: Path, shas: Iterable[str]) -> dict[str, str]:
+    """Map each SHA to its whole message, subject and body.
+
+    ``%B`` rather than ``%s``: a plan id quoted in the body is as permanent
+    as one in the subject, and the body is where a long incident note ends
+    up. ``commit_subjects`` reads ``%s`` for display only.
+    """
+    messages: dict[str, str] = {}
+    for sha in shas:
+        out = _git(repo, ["log", "-1", "--format=%B", sha])
+        messages[sha] = out
+    return messages
 
 
 def scan_ranges(
@@ -332,9 +404,12 @@ def scan_ranges(
                 ordered.append(sha)
 
     subjects = commit_subjects(repo, ordered)
+    messages = commit_messages(repo, ordered)
     findings: list[Finding] = []
     for sha in ordered:
-        findings.extend(scan_commit(repo, sha, subjects.get(sha, "")))
+        subject = subjects.get(sha, "")
+        findings.extend(scan_commit(repo, sha, subject))
+        findings.extend(scan_commit_message(repo, sha, messages.get(sha, ""), subject))
     return ordered, findings
 
 
