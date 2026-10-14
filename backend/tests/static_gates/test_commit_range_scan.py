@@ -323,11 +323,31 @@ def test_every_rule_has_the_shared_signature() -> None:
             assert isinstance(snippet, str)
 
 
-def test_the_registry_covers_the_three_privacy_rules() -> None:
-    """A rule silently dropped from the registry is a rule not enforced."""
+def test_the_registry_covers_every_privacy_rule() -> None:
+    """A rule silently dropped from the registry is a rule not enforced.
+
+    The set grew from three to five on 2026-10-14, when the plan-id and
+    private-name rules were added after the 2026-09-29 publication. The
+    assertion is still an equality, so a sixth rule still has to be added
+    here deliberately rather than appearing in one scan and not the other.
+    """
     labels = {label for label, _ in commit_range_scan.RANGE_RULES}
     assert labels == {
         "home path",
         "operator attribution",
         "local measurement",
+        "plan id in source",
+        "private name",
     }, f"the registry no longer covers every privacy rule: {sorted(labels)}"
+
+
+def test_the_message_registry_is_not_empty() -> None:
+    """Commit messages are scanned, and by a rule of their own.
+
+    A message has no ``tests/`` under it, so the plan-id rule applies there
+    with no test exemption. It cannot live in ``RANGE_RULES`` -- that table
+    is walked over file contents, where the same rule *does* exempt tests.
+    """
+    assert commit_range_scan.MESSAGE_RULES, "commit messages are not scanned at all"
+    labels = {label for label, _ in commit_range_scan.MESSAGE_RULES}
+    assert "plan id in commit message" in labels, sorted(labels)

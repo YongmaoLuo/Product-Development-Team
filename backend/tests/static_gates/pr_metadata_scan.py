@@ -69,6 +69,12 @@ from test_no_local_home_path_in_first_party import (  # noqa: E402
 from test_no_operator_attribution_in_source import (  # noqa: E402
     find_attribution,
 )
+from test_no_plan_ids_in_metadata import (  # noqa: E402
+    find_plan_ids_in_metadata,
+)
+from test_no_private_names_in_source import (  # noqa: E402
+    find_private_names,
+)
 from test_source_comments_carry_no_local_measurements import (  # noqa: E402
     find_local_measurements,
 )
@@ -88,6 +94,12 @@ METADATA_RULES: tuple[tuple[str, object], ...] = (
     ("home path", find_home_paths),
     ("operator attribution", find_attribution),
     ("local measurement", find_local_measurements),
+    # The two rules that close the gap described in "What this cannot do"
+    # above. ``find_private_names`` is the one that makes the objection in
+    # that paragraph answerable: a branch named after a private project can
+    # now be rejected mechanically, without a human reading it.
+    ("private name", find_private_names),
+    ("plan id in metadata", find_plan_ids_in_metadata),
 )
 
 
