@@ -19,11 +19,24 @@ The selection contract is decoupled from the slot bookkeeping:
   * :func:`compute_dynamic_limit` — pure function: provider + 5h pct → int.
   * :class:`ActiveConcurrencyTracker` — thread-safe per-provider count of
     in-flight subagents.
+  * :func:`provider_is_eligible` — the single "may this be dispatched
+    to right now" predicate every walk shares: live quota verdict, park
+    list, local capacity.
   * :func:`select_provider_with_dynamic_capacity` — walks the fallback
     chain and returns the first provider with spare capacity, or ``None``.
   * :func:`acquired_provider_slot` — context manager that increments the
     tracker on enter and decrements on exit (even when the inner block
     raises).
+
+Two kinds of "not now", kept apart
+-----------------------------------
+A provider can be unavailable because its **window** is empty or because
+its **slots** are held. The first is measured in hours and the second in
+seconds, so collapsing them is not a simplification — it is a wrong
+answer delivered slowly. :func:`acquire_provider_with_dynamic_capacity`
+filters everything that cannot serve *at all* before it waits for
+anything, and returns ``None`` immediately when nothing survives;
+waiting is reserved for held slots, which come back on their own.
 
 Why this lives in its own module
 --------------------------------
@@ -69,9 +82,11 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Dict, Iterator, List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import provider_capacity
+from provider_order import ProviderQuota
 
 
 #: Re-exported so the default has one definition. A provider no rule in
@@ -344,30 +359,255 @@ class ActiveConcurrencyTracker:
             return start
 
 
+# ---------------------------------------------------------------------------
+# Eligibility — the one predicate every dispatch walk shares
+# ---------------------------------------------------------------------------
+#
+# "Can this provider serve the call right now" is one question with four
+# independent filters behind it, and each of the three walks that answer
+# it — the reporting one, the slot-taking one, and the subagent-config
+# one — used to answer it slightly differently. A provider that was
+# reachable, within quota and inside its park under one walk could be
+# invisible under another, so the fleet's real capacity was whichever
+# walk the dispatcher happened to use. They share this predicate instead.
+#
+#   1. quota verdict      — the live reading says there is no budget
+#   2. park               — a refusal during this run put it on hold
+#   3. local capacity     — it is below its (quota-scaled) cap
+#
+# The order is a cost order, cheapest and most decisive first, and it is
+# not a preference order: all three must hold. Nothing here ranks.
+
+
+def quota_allows_dispatch(quota: Optional[ProviderQuota]) -> bool:
+    """True unless the reading *affirmatively* shows no budget left.
+
+    ``None`` — no reading for this provider — is allowed. That is the
+    fail-open half of the contract, and it is a deliberate asymmetry:
+    the two ways of knowing nothing are not the same thing. A reading
+    of "5-hour window at 100%" is evidence. A reading that does not
+    exist is not, and CC Switch cannot meter some providers at all while
+    those providers serve traffic perfectly well. A provider that is
+    genuinely uncallable is caught by its own refusal at dispatch time,
+    which is an observation rather than an inference from a gap in a
+    payload.
+    """
+    if quota is None:
+        return True
+    return not getattr(quota, "exhausted", False)
+
+
+def quota_remaining_pct(quota: Optional[ProviderQuota]) -> Optional[float]:
+    """The reading's own headroom in ``[0, 100]``, or ``None`` if it has none.
+
+    ``None`` is not "100%": it is "this reading does not say", and the
+    caller decides what to do without it. Keeping the two apart is what
+    stops a meter-less provider from being scaled to a full cap by
+    accident while still being eligible.
+    """
+    if quota is None:
+        return None
+    pct = getattr(quota, "remaining_pct", None)
+    if pct is None or isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        return None
+    return max(0.0, min(100.0, float(pct)))
+
+
+def provider_headroom_pct(
+    provider: str,
+    usage_map: Mapping[str, float],
+    quota_map: Optional[Mapping[str, ProviderQuota]] = None,
+) -> float:
+    """The percentage used to scale ``provider``'s concurrency cap.
+
+    The live reading wins when it carries a number, because it is the
+    one that accounts for the weekly window and for a currency balance —
+    neither of which the legacy ``{provider: pct}`` file can express. The
+    legacy map is the fallback for callers that still pass it and for
+    providers the live reading does not cover, and 100 is the last
+    resort, because an unknown budget is not a zero budget.
+    """
+    if quota_map is not None:
+        live = quota_remaining_pct(quota_map.get(provider))
+        if live is not None:
+            return live
+    try:
+        legacy = usage_map.get(provider, 100.0)
+    except AttributeError:  # pragma: no cover - defensive
+        legacy = 100.0
+    if isinstance(legacy, bool) or not isinstance(legacy, (int, float)):
+        return 100.0
+    return max(0.0, min(100.0, float(legacy)))
+
+
+def provider_is_eligible(
+    provider: str,
+    tracker: ActiveConcurrencyTracker,
+    usage_map: Mapping[str, float],
+    quota_map: Optional[Mapping[str, ProviderQuota]] = None,
+    *,
+    cooldown: Optional["ProviderCooldown"] = None,
+) -> bool:
+    """True when ``provider`` may be dispatched to *right now*.
+
+    Args:
+        provider: Provider reference, any spelling. ``"parent"`` is
+            never eligible — it is the caller's explicit fallback, not a
+            member of the pool.
+        tracker: The shared slot counter.
+        usage_map: Legacy ``{provider: remaining pct}``. Used for the
+            cap only when the live reading has no number.
+        quota_map: The live reading from
+            :func:`provider_order.load_provider_quota_map`. ``None`` or
+            an absent entry means "no reading", which is fail-open.
+        cooldown: The park list. ``None`` consults the shared instance.
+
+    Returns:
+        ``False`` for anything this process has observed to be out of
+        budget, in cooldown, or at its local cap; ``True`` otherwise.
+        There is no third answer and no ranking — callers take the first
+        eligible entry *in the order they were given*, and an empty
+        result means "dispatch to none of these", never "dispatch to the
+        least bad one".
+    """
+    if not provider or provider == "parent":
+        return False
+    quota = quota_map.get(provider) if quota_map is not None else None
+    if not quota_allows_dispatch(quota):
+        return False
+    park = cooldown if cooldown is not None else get_shared_cooldown()
+    if park.is_parked(provider):
+        return False
+    limit = compute_dynamic_limit(
+        provider, provider_headroom_pct(provider, usage_map, quota_map)
+    )
+    return tracker.current(provider) < limit
+
+
+@dataclass(frozen=True)
+class FleetCapacity:
+    """How much concurrent work a set of providers can serve right now.
+
+    ``total`` is the sum of ``per_provider``, and ``per_provider`` holds
+    only the providers that contribute — a provider that is shut, parked,
+    or scaled to zero is in ``blocked`` instead, because "this pool is
+    not serving anyone right now" and "this pool serves ten" are answers
+    an operator needs separately. Keeping both is what lets a caller say
+    *why* a number went down rather than only that it did.
+    """
+
+    total: int
+    per_provider: Dict[str, int]
+    blocked: Tuple[str, ...]
+
+
+def fleet_capacity(
+    providers: Sequence[str],
+    usage_map: Mapping[str, float],
+    quota_map: Optional[Mapping[str, ProviderQuota]] = None,
+    *,
+    cooldown: Optional["ProviderCooldown"] = None,
+) -> FleetCapacity:
+    """Sum what ``providers`` can serve concurrently, at this moment.
+
+    This is the same arithmetic :func:`provider_is_eligible` performs,
+    summed over the whole set instead of applied to one name — same
+    ``quota_map``, same park list, same
+    :func:`provider_headroom_pct` and the same
+    :func:`compute_dynamic_limit` that scales a provider's declared cap by
+    its remaining 5-hour budget. It answers a different question from
+    eligibility, though, and the difference is load-bearing:
+
+    Eligibility asks whether *this dispatch, right now* may take a slot,
+    and so it also compares the pool's in-flight count against its cap.
+    A fleet width must not: it is the cap itself, and a width computed
+    from in-flight counts would shrink below the count it is bounding the
+    moment it started being used — a fleet that serves ten would admit
+    ten, then read its own ten as "full", admit nobody, and never wake
+    up. So the in-flight comparison is left to the caller that already
+    holds the tracker, and everything upstream of it is identical.
+
+    Args:
+        providers: Provider references, in any spelling, duplicates
+            allowed. Duplicates that name the same pool collapse to one
+            entry, because a pool counted twice would claim a capacity
+            it cannot serve; two *different* rows stay two, since two
+            rows are two quota pools with two credentials.
+        usage_map: Legacy ``{provider: remaining pct}``. Consulted only
+            for the providers the live reading does not cover, exactly
+            as it is for eligibility.
+        quota_map: The live reading. ``None`` or an absent entry is
+            fail-open, as it is everywhere else.
+        cooldown: The park list. ``None`` uses the shared instance.
+
+    Returns:
+        A :class:`FleetCapacity`. ``total == 0`` is a real answer — every
+        provider the caller named is shut, parked or scaled to zero —
+        and callers must pass it on rather than substituting a number of
+        their own. A width invented here is a width that contradicts
+        the meters.
+    """
+    park = cooldown if cooldown is not None else get_shared_cooldown()
+    per_provider: Dict[str, int] = {}
+    blocked: List[str] = []
+    seen: set = set()
+
+    for name in providers or ():
+        if not name or name == "parent":
+            # The caller's explicit fallback, never a member of the pool.
+            continue
+        key = canonical_capacity_key(name)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if park.is_parked(name):
+            blocked.append(name)
+            continue
+        if not quota_allows_dispatch(
+            quota_map.get(name) if quota_map is not None else None
+        ):
+            blocked.append(name)
+            continue
+        limit = compute_dynamic_limit(
+            name, provider_headroom_pct(name, usage_map, quota_map)
+        )
+        if limit <= 0:
+            blocked.append(name)
+            continue
+        per_provider[name] = limit
+
+    return FleetCapacity(
+        total=sum(per_provider.values()),
+        per_provider=per_provider,
+        blocked=tuple(sorted(blocked)),
+    )
+
+
 def select_provider_with_dynamic_capacity(
     provider_priority: List[str],
     tracker: ActiveConcurrencyTracker,
     usage_map: Dict[str, float],
     now: Optional[datetime] = None,
+    quota_map: Optional[Mapping[str, ProviderQuota]] = None,
+    *,
+    cooldown: Optional["ProviderCooldown"] = None,
 ) -> Optional[str]:
     """Return the first provider in ``provider_priority`` with capacity.
 
-    Walks ``provider_priority`` in order. A provider is *eligible* when:
+    Walks ``provider_priority`` in order and returns the first entry
+    :func:`provider_is_eligible` admits. **The order is the policy and
+    this function does not reorder it**: the chain already carries the
+    operator's ranking, and re-scoring it here could only disagree with
+    the application that published it. So a provider ranked fifth is
+    used before a ranked second is skipped, exactly as ranked.
 
-      1. It is not the literal ``"parent"`` entry (parent is the
-         caller's explicit fallback, not this strategy's choice).
-      2. It is in the order it was handed — the optimizer's chain, whose
-         rule engine already applied any peak-hour demotion.
-      3. ``tracker.current(provider)`` is strictly less than
-         :func:`compute_dynamic_limit` for the provider's current
-         5-hour remaining percentage.
-
-    If no entry satisfies all three, the function returns ``None``.
-    The caller is then expected to fall back to the parent process's
-    CC Switch proxy config — that fallback is NOT this function's
-    responsibility (it would conflate "no provider has capacity" with
-    "subagent should inherit parent proxy", which are deliberately
-    separate decisions).
+    If no entry is eligible the function returns ``None``. That is the
+    whole answer, and it is deliberately not "the least bad entry": a
+    provider with no budget for the next five hours is not a provider
+    that serves the call slowly, it is a provider that fails it, and
+    picking it converts a clean "not now" into a round-trip that is
+    guaranteed to end in a refusal.
 
     Args:
         provider_priority: Ordered list of logical provider IDs from
@@ -375,12 +615,15 @@ def select_provider_with_dynamic_capacity(
             ``"parent"`` sentinel at the end.
         tracker: An :class:`ActiveConcurrencyTracker` recording the
             current active count per provider.
-        usage_map: Per-provider 5-hour remaining percentage. Missing
-            entries default to 100% (the provider is treated as having
-            full quota).
+        usage_map: Per-provider 5-hour remaining percentage, used for
+            the cap when the live reading has no number. Missing entries
+            default to 100%.
         now: Current datetime. ``None`` defers to
-            :func:`datetime.datetime.now`. Timezone-aware or naive; also
-            used to expire stale rule verdicts.
+            :func:`datetime.datetime.now`.
+        quota_map: The live reading. ``None`` keeps this function's
+            historical behaviour exactly (quota and park are not
+            consulted), which is what the legacy call sites pass.
+        cooldown: The park list. ``None`` consults the shared instance.
 
     Returns:
         The selected provider id, or ``None`` when the chain has no
@@ -393,14 +636,9 @@ def select_provider_with_dynamic_capacity(
         now = datetime.now()
 
     for provider in provider_priority:
-        # 1. ``parent`` is never picked by the dynamic strategy.
-        if provider == "parent":
-            continue
-
-        # 2. Dynamic capacity check.
-        remaining_pct = usage_map.get(provider, 100.0)
-        limit = compute_dynamic_limit(provider, remaining_pct)
-        if tracker.current(provider) < limit:
+        if provider_is_eligible(
+            provider, tracker, usage_map, quota_map, cooldown=cooldown
+        ):
             return provider
 
     return None
@@ -413,16 +651,34 @@ def acquire_provider_with_dynamic_capacity(
     *,
     timeout: float = 300.0,
     poll_interval: float = 0.5,
+    quota_map: Optional[Mapping[str, ProviderQuota]] = None,
+    cooldown: Optional["ProviderCooldown"] = None,
 ) -> Optional[str]:
     """Block until one of ``providers`` has a free slot; return its name.
 
-    Delegation is driven by *local slot exhaustion*, not by reaching a
-    provider and failing. Being able to call a provider is not the same
-    as being allowed to pile more work onto it: once a provider is at
-    its cap, the pressure of adding another concurrent agent is felt by
-    that provider's quota, not by the caller. So when every candidate is
-    full the caller waits here instead of stacking more onto the first
-    entry.
+    Two different reasons to have nothing to dispatch to, and they are
+    answered differently on purpose
+    --------------------------------
+    The candidate set is filtered **before** anything waits, so "no
+    candidate survives" and "every candidate is momentarily full" never
+    reach the same code:
+
+      * **Nothing survives the filter** — every provider is parked or out
+        of budget for this run. There is no lease to wait for and no
+        counter that a sleep would move, so this returns ``None``
+        immediately. Sleeping here would be the worst of both: the
+        caller blocks for its whole timeout and then finds out exactly
+        what it already knew. Whether to come back later, and when, is
+        the caller's decision and is answered by the park each provider
+        carries — a park lasts as long as the window that caused it.
+      * **Candidates survive but are momentarily full** — they are
+        within quota and serve fine; their slots are simply held by
+        agents that are still running. Those return in seconds, so this
+        polls for them until ``timeout``.
+
+    Collapsing the two is not a simplification, it is a wrong answer
+    delivered slowly: a window that does not open for hours cannot be
+    waited out by a poll whose unit is half a second.
 
     Round-robin across the EFFECTIVE candidates
     -------------------------------------------
@@ -455,8 +711,9 @@ def acquire_provider_with_dynamic_capacity(
             release the same slot). ``"parent"`` is skipped — it is the
             caller's explicit fallback, not a pool.
         tracker: The shared :class:`ActiveConcurrencyTracker`.
-        usage_map: Per-provider 5-hour remaining percentage. Missing
-            entries default to 100%.
+        usage_map: Per-provider 5-hour remaining percentage, used for
+            the cap when the live reading has no number. Missing entries
+            default to 100%.
         timeout: Seconds to keep polling before giving up. The default
             (300 s) is well inside the 1800 s executor task timeout and
             the 900 s default total timeout, so queueing cannot by
@@ -464,19 +721,23 @@ def acquire_provider_with_dynamic_capacity(
         poll_interval: Seconds between walks. A full fleet is usually
             waiting on an LLM call that takes tens of seconds, so a
             sub-second poll just burns CPU.
+        quota_map: The live reading. ``None`` keeps this function's
+            historical behaviour for the cap.
+        cooldown: The park list. ``None`` uses the shared instance.
 
     Returns:
         The name from ``providers`` whose slot was taken, or ``None``
         when the chain had no *eligible* provider at all (every entry
-        exhausted its 5h quota, or the list was empty) or the wait timed
-        out. ``None`` is not an error: the caller falls back to its
-        documented parent-process behaviour.
+        out of budget or parked, or the list was empty) or the wait timed
+        out. ``None`` is not an error: it is the explicit "do not
+        dispatch to any of these", which the caller turns into whatever
+        its own contract says — a refusal, or a documented fallback.
     """
     if not providers:
         return None
 
     deadline = time.monotonic() + max(0.0, timeout)
-    cooldown = get_shared_cooldown()
+    park = cooldown if cooldown is not None else get_shared_cooldown()
 
     while True:
         # 1. The EFFECTIVE candidate set — what can actually be called.
@@ -484,28 +745,45 @@ def acquire_provider_with_dynamic_capacity(
         #    what makes the rotation divide work by the number of usable
         #    providers: a chain of three with one dead provider rotates
         #    over two, with no empty slot in the cycle.
+        #
+        #    Every reason a provider cannot serve *at all* is applied
+        #    here, ahead of anything that waits: a refusal earlier in
+        #    this run parked it, or the live reading shows the window is
+        #    empty. Neither is a slot that will free up, so neither
+        #    belongs in a wait loop.
         candidates: List[str] = []
         for name in providers:
             if name == "parent":
                 # ``parent`` is the caller's explicit fallback, not a
                 # pool, and it must never occupy a rotation slot.
                 continue
-            if cooldown.is_parked(name):
-                # 2026-09-22: recently answered "quota exhausted". It is
-                # reachable and configured — that is exactly why every
-                # availability probe says yes and why the run kept
-                # re-selecting it twelve times. Skip until the park
-                # expires; it is not a "wait for a slot" case.
+            if park.is_parked(name):
+                # Answered "quota exhausted" earlier in this run. It is
+                # reachable and configured — which is exactly why every
+                # availability probe says yes and why the run would keep
+                # re-selecting it. Skip until the park expires; it is not
+                # a "wait for a slot" case.
                 continue
-            if compute_dynamic_limit(name, usage_map.get(name, 100.0)) <= 0:
-                # Out of budget for the 5h window. Also not a
-                # "wait for a slot" case.
+            if not quota_allows_dispatch(
+                quota_map.get(name) if quota_map is not None else None
+            ):
+                # The reading says the budget is gone for this window.
+                # Also not a "wait for a slot" case: the thing being
+                # waited for is a window, not a lease.
+                continue
+            if compute_dynamic_limit(
+                name, provider_headroom_pct(name, usage_map, quota_map)
+            ) <= 0:
+                # Out of budget by the legacy percentage map.
                 continue
             candidates.append(name)
 
         if not candidates:
-            # Nothing to wait for: waiting here would spin until the
-            # timeout for providers that cannot serve us either way.
+            # Nothing to wait for. Spinning until the timeout would burn
+            # the caller's whole budget to arrive at an answer the
+            # candidate filter already gave, and — worse for the ones
+            # whose window is hours out — would hide it behind a delay
+            # nobody can shorten. This is the "do not dispatch" answer.
             return None
 
         # 2. Start the walk at this dispatch's rotation slot and fall
@@ -514,10 +792,15 @@ def acquire_provider_with_dynamic_capacity(
         start = tracker.next_rotation_index(len(candidates))
         for offset in range(len(candidates)):
             name = candidates[(start + offset) % len(candidates)]
-            limit = compute_dynamic_limit(name, usage_map.get(name, 100.0))
+            limit = compute_dynamic_limit(
+                name, provider_headroom_pct(name, usage_map, quota_map)
+            )
             if tracker.try_acquire(name, limit):
                 return name
 
+        # 3. Candidates remain, and every one of them is at its cap. A
+        #    held slot comes back when its agent finishes, so this is the
+        #    one case that is genuinely worth waiting on.
         if time.monotonic() >= deadline:
             return None
         time.sleep(poll_interval)
@@ -791,6 +1074,10 @@ __all__ = [
     "get_shared_cooldown",
     "get_shared_tracker",
     "looks_like_quota_exhaustion",
+    "provider_headroom_pct",
+    "provider_is_eligible",
+    "quota_allows_dispatch",
+    "quota_remaining_pct",
     "round_half_up",
     "select_provider_with_dynamic_capacity",
     "set_shared_cooldown",

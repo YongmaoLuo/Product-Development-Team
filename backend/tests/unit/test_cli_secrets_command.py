@@ -143,9 +143,21 @@ def _enable_keychain(monkeypatch, binary: str) -> None:
     which is the same triple ``tests/integration``'s stand-in builds:
     without all three, ``keychain_disabled()`` answers for the machine
     the suite happens to run on rather than for the case under test.
+
+    ``binary`` is set in **both** places the read can be issued through.
+    ``_SECURITY_BIN`` alone stopped being enough when the fallback to it
+    was deleted along with the server-side read: the provider now reads
+    through the binary named by ``PDT_SECRET_READER_PATH``, and with that
+    name absent it issues no read at all and reports the deployment
+    unconfigured. So a case that wanted a readable keychain and only
+    redirected ``_SECURITY_BIN`` stopped testing the read — and it
+    stopped testing it *quietly*, passing wherever a developer's ``.env``
+    happened to supply a reader and failing on every CI runner, which has
+    none.
     """
     monkeypatch.setattr(credentials, "_is_macos", lambda: True)
     monkeypatch.setattr(credentials, "_SECURITY_BIN", binary)
+    monkeypatch.setenv(credentials._SECRET_READER_ENV_KEY, binary)
     monkeypatch.setenv("PDT_DISABLE_KEYCHAIN_SECRETS", "0")
     credentials.reset_cache()
 

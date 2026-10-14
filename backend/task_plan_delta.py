@@ -400,8 +400,7 @@ def apply_task_delta(
 def _append_tasks_json(tasks_file: Path, new_tasks: List[Dict[str, Any]]) -> None:
     """把新任务追加进 ``tasks.json``（读不到就从空表开始）。
 
-    与 ``repair_generator._append_to_tasks_json`` 同样的契约：保留已有
-    任务，写并集。这里额外做了原子替换，避免写一半崩溃留下截断的文件
+    契约：保留已有任务，写并集。这里额外做了原子替换，避免写一半崩溃留下截断的文件
     —— 那份文件是 dispatcher 的启动输入。
 
     临时名必须 **唯一**：早期这里手写了一个固定的

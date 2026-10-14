@@ -9,9 +9,12 @@ dataclass gives callers attribute access instead of
 
 2026-09-06 TC-006 dependency-injection refactor: the FastAPI
 lifespan is now the canonical constructor for ``RuntimeState``. It
-builds a fresh instance (carrying the four DI collaborators —
-``config``, ``provider_order_file``, ``in_flight_guard``,
-``dynamic_tracker``) and attaches it to ``app.state.runtime_state``.
+builds a fresh instance (carrying the three DI collaborators —
+``config``, ``in_flight_guard``, ``dynamic_tracker``) and attaches it to
+``app.state.runtime_state``. A fourth collaborator used to carry the
+resolved provider-order file path; there is no such path any more,
+because the provider chain is asked of CC Switch rather than read from
+disk, so nothing about it is resolved at startup.
 A previous revision exposed a module-level ``RUNTIME_STATE``
 singleton; the refactor removed it, so the ONLY handle on the live
 state is ``app.state.runtime_state``. These tests pin the new
@@ -30,8 +33,7 @@ Pinned contracts:
      a NEW instance — two consecutive startups must not share the
      object (no hidden global state leaking across restarts).
   4. **DI collaborators populated.** The injected instance carries
-     the parsed ``config.yaml`` dict, the resolved
-     ``provider_order_file`` Path, and live ``in_flight_guard`` /
+     the parsed ``config.yaml`` dict and live ``in_flight_guard`` /
      ``dynamic_tracker`` instances.
   5. **Default / round-trip ``pending_vps``.** A fresh
      ``RuntimeState`` defaults to ``pending_vps == []`` and the
@@ -180,13 +182,16 @@ def test_lifespan_constructs_fresh_instance_per_startup(
 def test_lifespan_injected_state_carries_di_collaborators(
     server_module, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The injected RuntimeState carries the four DI collaborators.
+    """The injected RuntimeState carries the three DI collaborators.
 
     * ``config`` — the parsed ``backend/config.yaml`` dict (``{}``
       when the file is absent is acceptable; the loader never raises).
-    * ``provider_order_file`` — an absolute :class:`~pathlib.Path`.
     * ``in_flight_guard`` — a live ``InFlightFileGuard`` instance.
     * ``dynamic_tracker`` — a live ``ActiveConcurrencyTracker``.
+
+    ``provider_order_file`` is asserted *absent* below: a
+    ``RuntimeState`` field for a chain file would be a way to carry a
+    chain that disagrees with CC Switch.
     """
     injected = _drive_lifespan(server_module, monkeypatch)
 
@@ -194,9 +199,10 @@ def test_lifespan_injected_state_carries_di_collaborators(
         f"config must be the parsed config.yaml dict, got "
         f"{type(injected.config).__name__}"
     )
-    assert isinstance(injected.provider_order_file, Path), (
-        f"provider_order_file must be a resolved Path, got "
-        f"{type(injected.provider_order_file).__name__}"
+    assert not hasattr(injected, "provider_order_file"), (
+        "RuntimeState still carries a provider_order_file; the chain is "
+        "asked of CC Switch, so there is no file to resolve and a field "
+        "for one would be a route back to a second source of truth"
     )
     assert isinstance(injected.in_flight_guard, server_module.InFlightFileGuard), (
         f"in_flight_guard must be an InFlightFileGuard, got "

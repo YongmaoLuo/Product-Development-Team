@@ -211,7 +211,6 @@ class TestTimeoutPolicyWiring:
         agent.timeout_policy = TimeoutPolicy(
             per_method_timeout_seconds={"ui_validation": 1800},
             global_default_timeout_seconds=1800,
-            parallelism_cap=4,
         )
         agent.start_verification_round(1)
 
@@ -256,7 +255,6 @@ class TestTimeoutPolicyWiring:
         agent.timeout_policy = TimeoutPolicy(
             per_method_timeout_seconds={"ui_validation": 1800},
             global_default_timeout_seconds=1800,
-            parallelism_cap=4,
         )
         agent.start_verification_round(1)
 
@@ -352,13 +350,19 @@ class TestOrchestratorParallelism:
     ):
         """cap=2 + 6 ui VPs at 3s each → wall time ∈ [6, 8]s.
 
-        The semaphore (``parallelism_cap=2``) throttles in-flight
-        VPs to two at a time, so 6 VPs complete in three sequential
-        rounds of two, each 3s long. Total ≈ 6s (per the TDD spec
-        range). The [6, 8]s band absorbs asyncio scheduling /
-        ``asyncio.run`` overhead. Without the semaphore the same
-        6 VPs would finish in a single round of 6 (~3s) — that's
-        the negative control this test guards against.
+        The group gate throttles in-flight VPs to two at a time, so 6 VPs
+        complete in three sequential rounds of two, each 3s long. Total
+        ≈ 6s (per the TDD spec range). The [6, 8]s band absorbs asyncio
+        scheduling / ``asyncio.run`` overhead. Without the gate the same
+        6 VPs would finish in a single round of 6 (~3s) — that's the
+        negative control this test guards against.
+
+        ``vp_capacity_resolver`` is the only width source left: 2026-10-13
+        removed ``TimeoutPolicy.parallelism_cap`` along with every other
+        pre-agreed round width, so the width under test is handed in
+        through the resolver the provider pool answers through, rather
+        than configured on the policy. The number is unchanged (2) and so
+        is the band; only the door it arrives by moved.
         """
         agent = VerificationAgent(
             plan_dir=temp_plan_dir,
@@ -366,13 +370,13 @@ class TestOrchestratorParallelism:
             coding_tool=mock_coding_tool,
         )
         # Cap in-flight VPs at 2; raise per-method timeout well
-        # above the 3s sleep so the semaphore — not the timeout —
+        # above the 3s sleep so the gate — not the timeout —
         # is the rate-limiting mechanism.
         agent.timeout_policy = TimeoutPolicy(
             per_method_timeout_seconds={"ui_validation": 60},
             global_default_timeout_seconds=60,
-            parallelism_cap=2,
         )
+        agent.vp_capacity_resolver = lambda: 2
         agent.start_verification_round(1)
 
         vps = _make_vps_by_method({"ui_validation": 6})

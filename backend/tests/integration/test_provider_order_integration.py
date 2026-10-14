@@ -3,12 +3,11 @@
 This test pins the contract that the backend's sub-agent bootstrap
 path no longer carries a hard-coded provider fallback chain. Instead,
 ``agent.autonomous_coding`` resolves the chain through
-``provider_order.load_fallback_order()`` which reads the live
-the contract file and filters
-the ``order`` list through the CC Switch SQLite consumer layer
-(:func:`cc_switch.list_provider_ids`). There is no
-hard-coded fallback and no YAML ``provider_priority`` fallback — a
-missing or invalid contract file raises :class:`ProviderOrderError`.
+``provider_order.load_fallback_order()``, which asks CC Switch's HTTP
+provider list and returns the array order it served. There is no
+hard-coded fallback, no YAML ``provider_priority`` fallback, and no
+second source behind CC Switch's — a failure to be answered raises
+:class:`ProviderOrderError` rather than being answered from elsewhere.
 
 The acceptance bullets (one-to-one with VP-008):
 
@@ -27,11 +26,9 @@ The acceptance bullets (one-to-one with VP-008):
           "using provider-order.json" or "fallback to config.yaml"
           — operator-greppable markers so oncall can see which
           tier served the chain.
-  * test_integration_consumes_optimizer
-        — End-to-end: a freshly written ``provider-order.json``
-          feeds ``load_fallback_order`` and the returned chain
-          matches the JSON ``order`` filtered through the CC Switch
-          consumer layer (kebab-case IDs only, DB-present only).
+  * test_integration_consumes_cc_switch
+        — End-to-end: ``load_fallback_order`` returns CC Switch's served
+          order verbatim, and raises when there is nothing serving.
 
 Test isolation
 --------------
@@ -39,7 +36,9 @@ Test isolation
     ``~/.cc-switch/cc-switch.db`` so the agent's
     ``_load_provider_info`` call resolves successfully (otherwise
     the sub-agent bootstrap would fail before reaching
-    ``load_fallback_order``).
+    ``load_fallback_order``). This is the roster
+    ``cc_switch.get_provider`` resolves against, not a source of the
+    chain — the chain reader never opens it.
   * ``tmp_path`` is the project_dir; we run real ``git init`` so
     ``GitManager(search_parent_directories=True)`` finds a repo
     at the leaf — not a sibling checkout's ancestor.
@@ -186,14 +185,13 @@ def _install_fake_cc_switch_db(
     conn.close()
     monkeypatch.setenv("HOME", str(fake_home))
 
-    # ``load_fallback_order`` memoises on the RESOLVED FILE PATH, but the
-    # value it caches also depends on ``$HOME`` — the chain is filtered
-    # through ``~/.cc-switch/cc-switch.db``. Redirecting HOME does not
-    # invalidate that cache, so an earlier test in the same session (any
-    # test that boots the app while the real CC Switch DB is absent) can
-    # leave an empty chain cached at this path and make the assertions
-    # below fail with a non-empty expectation against someone else's DB.
-    # ``cache_clear`` is the documented way to force a re-read.
+    # ``load_fallback_order`` caches once per process, and what the
+    # caller does with the names — resolving them through
+    # ``cc_switch.get_provider`` — depends on ``$HOME``. Redirecting HOME
+    # does not invalidate that cache, so an earlier test in the same
+    # session can leave a chain cached that was resolved against a
+    # different store. ``cache_clear`` is the documented way to force a
+    # re-read.
     import provider_order
 
     provider_order.cache_clear()
@@ -558,53 +556,66 @@ def test_agent_fallback_logs_resolution_keyword(
 
 
 # ---------------------------------------------------------------------------
-# 5. test_integration_consumes_optimizer
+# 5. test_integration_consumes_cc_switch
 # ---------------------------------------------------------------------------
 
 
-def test_integration_consumes_optimizer(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_integration_consumes_cc_switch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    real_cc_switch,
 ) -> None:
-    """``load_fallback_order`` consumes a live ``provider-order.json``
-    and filters it through the CC Switch consumer layer.
+    """``load_fallback_order`` consumes what CC Switch reports, in order.
 
-    A freshly-written optimizer file lists four providers, but only
-    two of them exist in the fake CC Switch DB.  The returned chain
-    must contain exactly the DB-present names in the JSON order, and
-    the ``agent`` logger must emit the resolution keyword so an
-    operator can see that the optimizer file was used.
+    The end-to-end shape: a CC Switch holding four providers, answered
+    over HTTP in its own order. The chain is those four names in that
+    order — no re-sort, no local-store filter, and nothing else to
+    answer from when the request cannot be made, which is what the
+    second half pins: that it fails loudly instead.
     """
+    import sqlite3
+
     caplog.set_level(logging.INFO, logger="agent")
 
-    # 1. Install a fake CC Switch DB with a subset of the JSON providers.
+    # 1. Install a fake CC Switch DB with the production schema. The
+    #    chain does not read it — ``cc_switch.get_provider`` does, as
+    #    ``server.load_providers`` resolves each name it is handed — so
+    #    this is the roster the chain is checked against, not a
+    #    fallback for it.
+    names = ["Vendor A Pro", "Vendor B Pro", "Vendor C App", "Vendor D"]
     fake_home = tmp_path / "home"
     cc_dir = fake_home / ".cc-switch"
     cc_dir.mkdir(parents=True, exist_ok=True)
     db_path = cc_dir / "cc-switch.db"
-    import sqlite3
 
     conn = sqlite3.connect(str(db_path))
     try:
-        # Production CC Switch schema: the row's ``name`` is what the
-        # optimizer chain carries and what the consumer keys on.
         conn.execute(
             "CREATE TABLE providers ("
-            "id TEXT PRIMARY KEY, name TEXT, settings_config TEXT"
-            ")"
+            "id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL, "
+            "settings_config TEXT NOT NULL, created_at INTEGER, "
+            "sort_index INTEGER, is_current BOOLEAN NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (id, app_type))"
         )
-        for i, provider_name in enumerate(("Vendor A Pro", "Vendor B Pro")):
+        for i, provider_name in enumerate(names):
             conn.execute(
-                "INSERT INTO providers (id, name, settings_config) "
-                "VALUES (?, ?, ?)",
+                "INSERT INTO providers (id, app_type, name, settings_config, "
+                "created_at, sort_index) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     f"row-{i}",
+                    "claude",
                     provider_name,
-                    json.dumps({
-                        "env": {
-                            "ANTHROPIC_BASE_URL": "https://example.com/v1",
-                            "ANTHROPIC_AUTH_TOKEN": f"fake-{provider_name}-key",
+                    json.dumps(
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": "https://example.com/v1",
+                                "ANTHROPIC_AUTH_TOKEN": f"fake-{provider_name}-key",
+                            }
                         }
-                    }),
+                    ),
+                    i,
+                    i,
                 ),
             )
         conn.commit()
@@ -612,36 +623,59 @@ def test_integration_consumes_optimizer(
         conn.close()
     monkeypatch.setenv("HOME", str(fake_home))
 
-    # 2. Write a fresh provider-order.json under a temp project path.
-    project_dir = tmp_path / "project"
-    project_dir.mkdir(parents=True, exist_ok=True)
-    order_file = project_dir / "provider-order.json"
-    order_file.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "source": "producer",
-                "order": [
-                    "Vendor A Pro",
-                    "Vendor B Pro",
-                    "Vendor C App",  # not in DB
-                    "parent",                 # not a DB provider name
-                ],
-                "providers": {},
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+    from provider_order import (
+        REASON_API_UNREACHABLE,
+        ProviderOrderError,
+        cache_clear,
+        load_fallback_order,
     )
 
-    # 3. Drive the real loader directly.
-    from provider_order import load_fallback_order
+    body = json.dumps(
+        {"providers": [{"id": f"id-{i}", "name": n} for i, n in enumerate(names)]}
+    ).encode()
 
-    result = load_fallback_order(order_file)
+    class _Resp:
+        status = 200
 
-    # 4. The chain is filtered through the consumer layer; both sides
-    #    speak CC Switch provider names, so membership is a plain set test.
-    assert result == ["Vendor A Pro", "Vendor B Pro"], (
-        f"expected JSON order filtered to DB-present display names, got {result!r}"
+        def read(self):
+            return body
+
+        def getcode(self):
+            return 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    import provider_order
+
+    # 2. CC Switch answers with its own order, and that is the chain.
+    monkeypatch.setattr(
+        provider_order.urllib.request, "urlopen", lambda *a, **k: _Resp()
+    )
+    cache_clear()
+    assert load_fallback_order() == names
+
+    # 3. With nothing serving there is no second answer: the chain is
+    #    unavailable, and says which way it failed.
+    monkeypatch.setattr(
+        provider_order.urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(ConnectionRefusedError("closed")),
+    )
+    cache_clear()
+    with pytest.raises(ProviderOrderError) as excinfo:
+        load_fallback_order()
+
+    assert excinfo.value.reason == REASON_API_UNREACHABLE
+
+    # 4. The failure was visible in the log, with its reason on it.
+    logs = " ".join(
+        rec.getMessage() for rec in caplog.records
+        if rec.name == "provider_order"
+    )
+    assert REASON_API_UNREACHABLE in logs, (
+        f"the failure must be logged with its reason; got {logs!r}"
     )

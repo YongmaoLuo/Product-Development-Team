@@ -33,18 +33,21 @@ execution:
     e2e: 3600                # 1-hour cap
     full_ci: 3600            # 1-hour cap
 
-  # Maximum number of verification points evaluated in parallel.
+  # 2026-10-13: ``parallelism_cap`` is REMOVED, and this is the hole it
+  # left.
   #
-  # Two bounds nest here, and only one of them is this knob:
-  #   * per group — this cap throttles one method-group's own fan-out;
-  #   * plan-wide — ``plan_semaphore``, created once per round and shared
-  #     by every group, is the real fleet ceiling.
-  # Without the second one the per-group caps multiply (cap × groups) and
-  # quietly exceed the number an operator thinks they configured. See
-  # ``verification_agent._execute_group``.
+  # It was the throttle for a while, then the "fallback width" for a
+  # verification scene whose chain could not be resolved. Both roles were
+  # a number nobody could measure: the round's real concurrency is decided
+  # per dispatch by ``acquire_provider_with_dynamic_capacity``, which
+  # hands out a provider slot or does not, from the fleet as it stands at
+  # that moment — before the ``claude`` subprocess is spawned, so the pool
+  # bounds the LLM calls and the subprocesses together.
   #
-  # (2026-09-28: this comment used to say verification "currently runs
-  # points sequentially" and that the knob was for a future concurrent
-  # implementation. That had been false for a while — groups and the VPs
-  # inside them both run under ``asyncio.gather`` today.)
-  parallelism_cap: 4
+  # There is consequently nothing left here to configure, and a stale
+  # ``parallelism_cap`` in this file would be read by nobody and believed
+  # by whoever opens it next.
+  #
+  # To change how many verification points run at once, change the
+  # provider capacity the dispatch path reads — per-provider caps and
+  # remaining 5-hour budget — not this file.

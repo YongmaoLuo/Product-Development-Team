@@ -1,25 +1,37 @@
-"""
-Every generated repair task must ship with a usable ``test_command``.
+"""The pre-repair falsifiability probe, on the live repair path.
 
-Background
---------------------------------------
-``_generate_repair_tasks`` used to finish with
-``task.setdefault("test_command", "")`` — a no-op safety net, because the
-key was absent and ``setdefault`` happily supplied the empty string. All
-four ``repair-r4-*`` tasks in that plan reached the executor with
-``test_command = NULL``. The two that "completed" did so on the
-subagent's self-report alone (``test_cross_verify_unverified``), which is
-precisely the single-signal mode the dual-criterion completion rule
-exists to prevent.
+Why this file shrank to three tests
+-----------------------------------
+It used to pin the whole ``test_command`` resolution order — LLM-authored,
+derived from the named VP, derived from a single failed point, missing —
+driven through ``_generate_repair_tasks``. That was the requirement-driven
+chain's own post-processing step, and the chain is gone. On the live path
+the resolution order belongs to :class:`RepairTaskAssembler`, which owns
+it in ``tests/test_repair_task_assembler.py`` and
+``tests/unit/test_repair_no_test_command_paths.py``.
 
-These tests pin the resolution order and, importantly, that a command the
-quality checker rejects is NOT shipped: a structurally-broken command
-guarantees a false failure on every attempt, whereas no command degrades
-to the audit second pass — which can actually pass.
+What belongs to :class:`RepairTaskGenerator` and is pinned here is the
+probe that decides whether a command is worth shipping at all.
+:meth:`_passes_falsifiability` runs a candidate acceptance command
+against the current, *pre-repair* tree and rejects one that already exits
+0. ``inspect_command`` cannot see that — the shape is legal, only the
+outcome is vacuous — and a command that cannot tell a correct fix from no
+change at all makes the task's completion verdict meaningless. The live
+path reaches the probe through
+:meth:`RepairTaskGenerator._fill_missing_test_commands`, which runs it on
+every command it re-asks for.
+
+Three properties, each easy to lose and none of them observable from the
+assembler's tests: the probe is memoised per command (repair rounds emit
+many tasks sharing one command shape, and the probe starts a
+subprocess); a vacuous command the model offers *is* rejected on the live
+path; and the probe has an escape hatch for a project whose toolchain
+cannot execute the command at all.
 """
 
 import sys
 from pathlib import Path
+from typing import Any, Dict, List
 
 import pytest
 
@@ -27,30 +39,77 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+import repair_generator as rg  # noqa: E402
 from repair_generator import RepairTaskGenerator  # noqa: E402
 
 
-PROBE_CHAIN = (
-    "cd ~/Documents/x && grep -n 'TODO' src/types.rs && "
-    "ls -la target/lib.dylib 2>/dev/null && "
-    "ls -la venv/lib/*.so 2>/dev/null && "
-    "source venv/bin/activate && python3 -c \"import x\""
-)
+#: Well-formed, and already true — the shape the probe exists to catch.
+#: ``inspect_command`` accepts it; only running it reveals the problem.
+VACUOUS = 'python3 -c "import sys; sys.exit(0)"'
+
+
+def _is_fill_prompt(prompt: str) -> bool:
+    """Identify the fill loop's prompt by its own subject line.
+
+    Dispatching on prompt content rather than on call index keeps the
+    test readable about *which* call is which, and makes it fail loudly
+    if the loop stops asking rather than quietly passing on an index
+    shift.
+    """
+    return "补验收命令" in prompt
 
 
 class _ScriptedTool:
-    """``coding_tool`` double returning a fixed ``{"tasks": [...]}`` reply."""
+    """``coding_tool`` double: a content reply, then scripted fill replies."""
 
-    def __init__(self, tasks):
-        self.calls = 0
-        self._tasks = tasks
+    def __init__(self, fill_responses: List[Dict[str, Any]]):
+        self.prompts: List[str] = []
+        self._fill_responses = list(fill_responses)
 
-    def query_json(self, **kwargs):
-        self.calls += 1
-        return {"tasks": list(self._tasks)}
+    def query_json(self, prompt: str, system_instruction: str = "") -> Any:
+        self.prompts.append(prompt)
+        if _is_fill_prompt(prompt):
+            # Exhausting the script is itself an answer the loop must
+            # survive: it retries, then gives up and labels the row.
+            return self._fill_responses.pop(0) if self._fill_responses \
+                else {"commands": []}
+        return {
+            "tasks": [{
+                "failed_vp_id": "VP-013",
+                "title": "修复 VP-013",
+                "description": "让失败点真实成立",
+                "acceptance_criteria": "断言失败消失",
+                "files_to_modify": ["app/core.py"],
+            }],
+        }
+
+    @property
+    def fill_prompt_count(self) -> int:
+        return sum(1 for p in self.prompts if _is_fill_prompt(p))
 
 
-def _evidence(vp_id="VP-013", test_command="cargo test --test x"):
+def _failed_vp() -> Dict[str, Any]:
+    return {
+        "id": "VP-013",
+        "title": "输入校验失败",
+        "priority": "medium",
+        "actual_result": "AssertionError: expected 1 == 2",
+        "evidence": "assertion failure",
+    }
+
+
+def _generator(tmp_path: Path, tool: Any) -> RepairTaskGenerator:
+    plan_dir = tmp_path / "plans" / "P-1"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    (plan_dir / "verification_plan.json").write_text(
+        '{"verification_points": []}', encoding="utf-8",
+    )
+    return RepairTaskGenerator(
+        coding_tool=tool, plan_dir=plan_dir, project_dir=tmp_path,
+    )
+
+
+def _evidence(vp_id: str = "VP-013", test_command: str = "cargo test --test x"):
     return [{
         "vp_id": vp_id,
         "actual_result": "assert 0 == 1",
@@ -59,175 +118,9 @@ def _evidence(vp_id="VP-013", test_command="cargo test --test x"):
     }]
 
 
-def _generator(tmp_path: Path, tool) -> RepairTaskGenerator:
-    plan_dir = tmp_path / "plan"
-    plan_dir.mkdir()
-    project_dir = tmp_path / "project"
-    project_dir.mkdir()
-    return RepairTaskGenerator(tool, plan_dir, project_dir)
-
-
-def _generate(tmp_path, tasks, evidence=None):
-    gen = _generator(tmp_path, _ScriptedTool(tasks))
-    return gen._generate_repair_tasks(
-        requirement_context={},
-        evidence_items=evidence if evidence is not None else _evidence(),
-        round_number=4,
-    )
-
-
 # ---------------------------------------------------------------------------
-# The contract
+# The probe
 # ---------------------------------------------------------------------------
-
-
-def test_llm_authored_command_is_kept(tmp_path):
-    tasks = _generate(tmp_path, [{
-        "title": "fix it",
-        "description": "d",
-        "test_command": "cargo test --test signal_classification",
-    }])
-    assert tasks[0]["test_command"] == (
-        "cargo test --test signal_classification"
-    )
-
-
-def test_missing_command_is_recovered_from_the_named_vp(tmp_path):
-    tasks = _generate(tmp_path, [{
-        "title": "fix it",
-        "description": "d",
-        "vp_id": "VP-013",
-    }])
-    assert tasks[0]["test_command"] == "cargo test --test x", (
-        "the vp_id was available and the VP has a command; the task "
-        "must not ship unverifiable"
-    )
-
-
-def test_missing_command_with_a_single_failed_vp_is_recovered(tmp_path):
-    """One failed VP makes the task unambiguously about that VP."""
-    tasks = _generate(tmp_path, [{
-        "title": "fix it",
-        "description": "d",
-    }])
-    assert tasks[0]["test_command"] == "cargo test --test x"
-
-
-def test_missing_command_with_ambiguous_evidence_stays_empty(tmp_path):
-    """Two failed VPs and no ``vp_id`` — guessing would be worse.
-
-    The task still ships (the repair has to happen); it is surfaced as
-    unverifiable rather than given an arbitrary command.
-    """
-    evidence = [
-        {"vp_id": "VP-001", "actual_result": "a", "evidence": "e",
-         "test_command": "pytest tests/a.py"},
-        {"vp_id": "VP-002", "actual_result": "b", "evidence": "e",
-         "test_command": "pytest tests/b.py"},
-    ]
-    tasks = _generate(tmp_path, [{
-        "title": "fix it", "description": "d",
-    }], evidence=evidence)
-    assert tasks[0]["test_command"] == ""
-
-
-def test_an_unusable_llm_command_is_dropped_not_shipped(tmp_path):
-    """A probe chain guarantees a false failure; empty does not.
-
-    Shipping ``PROBE_CHAIN`` would have the gate score every honest
-    ``TEST_RESULT: PASSED`` as a lie — the probe-chain trap.
-    """
-    tasks = _generate(tmp_path, [{
-        "title": "fix it",
-        "description": "d",
-        "test_command": PROBE_CHAIN,
-    }])
-    assert tasks[0]["test_command"] != PROBE_CHAIN
-    # Falls through to the single-evidence derivation.
-    assert tasks[0]["test_command"] == "cargo test --test x"
-
-
-def test_an_unusable_llm_command_with_no_fallback_becomes_empty(tmp_path):
-    evidence = [
-        {"vp_id": "VP-001", "actual_result": "a", "evidence": "e",
-         "test_command": "pytest tests/a.py"},
-        {"vp_id": "VP-002", "actual_result": "b", "evidence": "e",
-         "test_command": "pytest tests/b.py"},
-    ]
-    tasks = _generate(tmp_path, [{
-        "title": "fix it", "description": "d", "test_command": PROBE_CHAIN,
-    }], evidence=evidence)
-    assert tasks[0]["test_command"] == ""
-
-
-def test_whitespace_only_command_counts_as_missing(tmp_path):
-    tasks = _generate(tmp_path, [{
-        "title": "fix it", "description": "d", "test_command": "   ",
-    }])
-    assert tasks[0]["test_command"] == "cargo test --test x"
-
-
-def test_source_is_not_written_onto_the_task_dict(tmp_path):
-    """``add_task`` rejects keys outside its allow-list.
-
-    ``test_command_source`` has no column, so persisting it would raise
-    ``TaskProgressValidationError`` and break the single-writer path.
-    """
-    from state_machine.repositories.plan_task_repository import (
-        ALLOWED_STATIC_TASK_FIELDS,
-    )
-
-    tasks = _generate(tmp_path, [{"title": "fix it", "description": "d"}])
-    extra = set(tasks[0]) - ALLOWED_STATIC_TASK_FIELDS - {
-        "status", "updated_time", "failure_reason",
-    }
-    assert not extra, (
-        f"generated repair task carries fields add_task would reject: "
-        f"{sorted(extra)}"
-    )
-
-
-def test_every_generated_task_has_the_key_present(tmp_path):
-    """The key must exist even when its value is empty.
-
-    ``setdefault(..., "")`` was the old bug: it made an absent field look
-    handled. The contract is now explicit — the key is always set, and
-    emptiness means "nothing derivable", which the caller reports.
-    """
-    tasks = _generate(tmp_path, [
-        {"title": "a", "description": "d", "vp_id": "VP-013"},
-        {"title": "b", "description": "d", "vp_id": "VP-013"},
-    ])
-    assert all("test_command" in t for t in tasks)
-    assert all(t["test_command"] for t in tasks)
-
-
-# ---------------------------------------------------------------------------
-# The pre-repair probe
-# ---------------------------------------------------------------------------
-#
-# ``inspect_command`` reads the command's *shape* and cannot see whether it
-# discriminates. A well-formed command that already exits 0 before any
-# repair runs makes the exit-code half of the completion verdict carry no
-# information at all. The probe closes that gap by running the candidate
-# against the current tree.
-
-#: Well-formed, and already true — the shape the probe exists to catch.
-VACUOUS = 'python3 -c "import sys; sys.exit(0)"'
-
-
-def test_a_vacuous_llm_command_is_dropped_not_shipped(tmp_path):
-    """It passes the static check; only running it reveals the problem."""
-    tasks = _generate(tmp_path, [{
-        "title": "fix it",
-        "description": "d",
-        "test_command": VACUOUS,
-    }])
-    assert tasks[0]["test_command"] != VACUOUS, (
-        "a command that already exits 0 cannot certify the repair"
-    )
-    # Falls through to the single-evidence derivation.
-    assert tasks[0]["test_command"] == "cargo test --test x"
 
 
 def test_the_probe_is_memoised_per_command(tmp_path, monkeypatch):
@@ -236,8 +129,6 @@ def test_the_probe_is_memoised_per_command(tmp_path, monkeypatch):
     The probe starts a subprocess, so re-running it per task would add
     minutes to every round for no information.
     """
-    import repair_generator as rg
-
     calls = []
     real = rg.check_falsifiable
 
@@ -256,17 +147,46 @@ def test_the_probe_is_memoised_per_command(tmp_path, monkeypatch):
     assert len(calls) == 1, f"probe ran {len(calls)} times, expected 1"
 
 
+def test_a_vacuous_command_is_not_adopted_on_the_live_path(tmp_path, monkeypatch):
+    """The content call never asks for a command, so the fill loop is
+    where a model-authored one enters — and the probe has to be able to
+    refuse it there.
+
+    Without this the loop would stamp a command that exits 0 before any
+    repair ran, and the task would be judged done by a change that was
+    never made.
+    """
+    tool = _ScriptedTool([{"commands": [{"failed_vp_id": "VP-013",
+                                         "test_command": VACUOUS}]}])
+    gen = _generator(tmp_path, tool)
+
+    contents = gen.generate_repair_contents([_failed_vp()], round_number=2)
+
+    assert tool.fill_prompt_count >= 1, (
+        "a command-less row must be re-asked before it can be judged"
+    )
+    assert contents[0].get("test_command") != VACUOUS, (
+        "a command that already exits 0 cannot certify the repair"
+    )
+    assert not contents[0].get("test_command"), (
+        "an unusable command is left absent so the assembler labels the "
+        "row by category rather than inheriting a vacuous one"
+    )
+
+
 def test_the_probe_can_be_disabled(tmp_path, monkeypatch):
     """An operator whose project cannot execute needs a way out.
 
-    Without this, a missing toolchain would make every LLM-authored
+    Without this, a missing toolchain would make every honest
     command look vacuous and silently downgrade the whole round to
     unverifiable tasks.
     """
-    monkeypatch.setenv("PDT_DISABLE_FALSIFIABILITY_PROBE", "1")
-    tasks = _generate(tmp_path, [{
-        "title": "fix it",
-        "description": "d",
-        "test_command": VACUOUS,
-    }])
-    assert tasks[0]["test_command"] == VACUOUS
+    monkeypatch.setenv(rg.RepairTaskGenerator.FALSIFIABILITY_PROBE_ENV, "1")
+    tool = _ScriptedTool([{"commands": [{"failed_vp_id": "VP-013",
+                                         "test_command": VACUOUS}]}])
+    gen = _generator(tmp_path, tool)
+
+    contents = gen.generate_repair_contents([_failed_vp()], round_number=2)
+
+    assert contents[0]["test_command"] == VACUOUS
+    assert contents[0]["test_command_source"] == "llm_retry"

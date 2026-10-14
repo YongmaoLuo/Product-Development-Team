@@ -321,8 +321,13 @@ def test_perf_wall_time_under_15s(
             "api_test": 1800,
         },
         global_default_timeout_seconds=1800,
-        parallelism_cap=4,
     )
+    # The width is 4, handed in through the resolver the provider pool
+    # answers through. ``TimeoutPolicy.parallelism_cap`` was deleted with
+    # every other pre-agreed round width (2026-10-13), so the same number
+    # now arrives through the one door that is left; the width under test
+    # and the band it is measured against are both unchanged.
+    agent.vp_capacity_resolver = lambda: 4
     agent.start_verification_round(1)
 
     vps = _make_vps_by_method(
@@ -415,8 +420,13 @@ def test_perf_parallelism_observed_via_timestamps(
     agent.timeout_policy = TimeoutPolicy(
         per_method_timeout_seconds={"ui_validation": 60, "api_test": 60},
         global_default_timeout_seconds=60,
-        parallelism_cap=4,
     )
+    # The width is 4, handed in through the resolver the provider pool
+    # answers through. ``TimeoutPolicy.parallelism_cap`` was deleted with
+    # every other pre-agreed round width (2026-10-13), so the same number
+    # now arrives through the one door that is left; the width under test
+    # and the band it is measured against are both unchanged.
+    agent.vp_capacity_resolver = lambda: 4
     agent.start_verification_round(1)
 
     vps = _make_vps_by_method(
@@ -568,8 +578,13 @@ def test_perf_no_memory_leak_3_rounds(
     agent.timeout_policy = TimeoutPolicy(
         per_method_timeout_seconds={"automated_test": 1800},
         global_default_timeout_seconds=1800,
-        parallelism_cap=4,
     )
+    # The width is 4, handed in through the resolver the provider pool
+    # answers through. ``TimeoutPolicy.parallelism_cap`` was deleted with
+    # every other pre-agreed round width (2026-10-13), so the same number
+    # now arrives through the one door that is left; the width under test
+    # and the band it is measured against are both unchanged.
+    agent.vp_capacity_resolver = lambda: 4
 
     vps = _make_vps_by_method(
         {

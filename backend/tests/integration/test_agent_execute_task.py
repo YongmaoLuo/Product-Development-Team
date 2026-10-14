@@ -24,8 +24,9 @@ The 6 TDD acceptance bullets (one-to-one with the spec):
   * test_execute_single_task_settings_file_exists
         — the file at that path exists on disk (not just in
           memory).
-  * test_execute_single_task_settings_has_endpoint_and_credentials
-        — parse the JSON, ``len(env) == 7`` ANTHROPIC_* keys.
+  * test_execute_single_task_settings_carries_no_provider_config
+        — parse the JSON: a pre-selection file carries the correlation key
+          and no ``ANTHROPIC_*`` keys at all.
   * test_execute_single_task_passes_hook_stdin
         — ClaudeCodingTool.__init__ kwargs include ``hook_stdin``
           as a dict with ``task_type`` and ``task_summary``.
@@ -468,22 +469,21 @@ def test_execute_single_task_settings_file_exists(
         _cleanup_tmp_files(result)
 
 
-def test_execute_single_task_settings_has_endpoint_and_credentials(
+def test_execute_single_task_settings_carries_no_provider_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Parse the on-disk settings file; the env block carries the core keys.
+    """Parse the on-disk settings file; it carries hooks and no credentials.
 
-    2026-09-13 contract: model management is delegated ENTIRELY to CC
-    Switch — the tiered 4-role model env block was removed. The
-    mandatory core is now:
+    This file is written per task, before routing has chosen a provider.
+    The only provider available at that moment is the run-level one
+    (``load_fallback_order()`` over the whole CC Switch list, no
+    scene/tier filtering), so stamping it here would point the file at a
+    provider this call may not be routed to — and the file is not the one
+    ``claude --settings`` reads: the dispatch writes that one itself once
+    routing has chosen, and post-mortem redaction is keyed on that path.
+    A credential written here was therefore never read and never redacted.
 
-        1. ANTHROPIC_BASE_URL
-        2. ANTHROPIC_AUTH_TOKEN
-        3. ANTHROPIC_API_KEY
-
-    Model keys arrive via the flat ``model_env`` passthrough from the
-    CC Switch provider row (this test's fake DB supplies none, so the
-    file may legitimately contain exactly the 3 core keys).
+    What the file must still carry is the correlation key the hooks read.
     """
     result: Dict[str, Any] = {}
     try:
@@ -498,15 +498,21 @@ def test_execute_single_task_settings_has_endpoint_and_credentials(
         assert isinstance(env, dict), (
             f"env block must be a dict, got {type(env).__name__}: {env!r}"
         )
-        for required in (
-            "ANTHROPIC_BASE_URL",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-        ):
-            assert required in env, (
-                f"settings file env block missing required key {required!r}; "
-                f"got env: {env}"
-            )
+        anthropic_keys = [k for k in env if k.startswith("ANTHROPIC_")]
+        assert anthropic_keys == [], (
+            f"a pre-selection settings file must carry no ANTHROPIC_* keys; "
+            f"got {anthropic_keys}"
+        )
+        on_disk = settings.read_text(encoding="utf-8")
+        assert "sk-cp-test-fake-key" not in on_disk, (
+            "the run-level key is on disk in a file no redaction pass "
+            "covers and no dispatch reads"
+        )
+        assert env.get("CLAUDE_SETTINGS_PATH") == str(settings), (
+            f"the per-task file must name itself so two tasks dispatched "
+            f"close together stay distinguishable in the activity log; got "
+            f"{env.get('CLAUDE_SETTINGS_PATH')!r}"
+        )
     finally:
         _cleanup_tmp_files(result)
 

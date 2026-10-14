@@ -21,10 +21,11 @@ secret。
 | Linux / Windows | 不变 | 不变 |
 
 开关是 `PDT_DISABLE_KEYCHAIN_SECRETS`，名字是**故意反着**的：它是「禁用」钥匙串的，
-所以变量**不存在**或取 `0` / `false` 时钥匙串才生效。其他任何写法 —— `true`、`1`、
-`yes`、拼错、多一个空格 —— 都保持关闭。反过来读会导致每次查找都去 shell 出去问一个
-部署还没填好的凭据库，失败方式只有运维自己能排查；而猜错方向的代价不过是 secret 在
-环境变量里多待一会儿，那本来就是安装当前的既有状态。
+所以**只有**取 `0` / `false` 时钥匙串才生效；变量不存在、为空，以及其他任何写法
+—— `true`、`1`、`yes`、拼错、多一个空格 —— 一律关闭。**删掉这一行是把它关掉，
+不是打开。** 反过来读会导致每次查找都去 shell 出去问一个部署还没填好的凭据库，
+失败方式只有运维自己能排查；而猜错方向的代价不过是 secret 在环境变量里多待一会儿，
+那本来就是安装当前的既有状态。
 
 ## 开始之前
 
@@ -85,6 +86,11 @@ PDT_DISABLE_KEYCHAIN_SECRETS=0 backend/.venv/bin/python3 -m backend.cli secrets 
     查条目的访问控制（`security dump-keychain <path>` 会列出它），放宽到允许读取的
     应用，或者用 `-T` 指明需要的二进制重新创建该条目。
 
+    默认的那一条就是 `/usr/bin/security` 本身 —— 因为条目就是它建的。这恰恰是读取
+    对所有人都静默的原因：一个机器上任何进程都能执行的 Apple 签名二进制，本来就
+    已经被信任了。想让访问控制只认你自己签的那一个，见
+    [收窄谁能读它](#5-收窄谁能读它)。
+
 ## 3. 打开开关
 
 ```bash
@@ -101,7 +107,22 @@ cp .env "$HOME/.pdt-env-backup"
 
 ## 4. 确认
 
-重启服务，然后确认通知真的发出去了。provider 每个进程只解析一次 secret，成功和失败
+**钥匙串启用期间，服务要经由启动器启动**，也就是 `backend.secret_launcher`，而不是直接起：
+
+```bash
+backend/.venv/bin/python3 -m backend.secret_launcher
+```
+
+启动器把钥匙串读一次、把每个值写进匿名管道，然后 `exec` 出服务端（沿用启动器的
+PID）。因此真正处理请求的进程**完全不碰钥匙串工具**：它读的是一个继承来的描述符，
+并把它报成 `source=inherited_fd`。如果 supervisor 现在起的是 `backend.server`，
+只需要改这一个词。
+
+开着开关却直接起服务，进程找不到描述符；而因为「要了钥匙串的部署不允许被悄悄降级成
+明文变量」，它会**把每个 secret 都报成 `missing`**，而不是回退去读 `.env`。开关关着
+时，`python -m backend.server` 行为完全不变，仍然正确。
+
+重启，然后确认通知真的发出去了。provider 每个进程只解析一次 secret，成功和失败
 都进缓存，所以在跑着的进程会一直沿用它第一次的判断 —— 在活进程底下打开开关，在重启
 之前不会有任何变化。
 
@@ -114,6 +135,32 @@ backend/.venv/bin/python3 -m backend.cli secrets verify   # 两行都是 source=
 ```bash
 curl -s -H "X-PDT-Request: 1" http://127.0.0.1:8000/api/notifications/status
 ```
+
+## 5. 收窄谁能读它
+
+以上全部做的是把 secret 搬离环境变量。它们**没有**改变谁能从钥匙串里把它读出来。
+`security` 建的条目，访问控制名单里写的是 `/usr/bin/security` —— 一个以你的身份运行的
+任何进程都能执行的 Apple 签名二进制。所以只要能跑一条命令，读取就是无提示的。这是
+本页**没有**解决的那一半，默认值值得挑明，而不是留给人自己去发现。
+
+`tools/pdt-secret-reader/` 就是解决它的可选方案：一个你自己签名的读取器，外加一个
+setup 脚本，把条目的访问控制名单改写成只认这一个二进制。它需要交互 —— 每个条目会弹
+一个框要你应答 —— 分两趟跑：
+
+```bash
+cd tools/pdt-secret-reader
+./setup.sh build
+./setup.sh adopt --widen     # 重启后端，确认通知能起来
+./setup.sh adopt --narrow
+```
+
+`--widen` 请 macOS 把读取器加进每个条目，同时保留已经信任的那些，于是你在确认交接的
+过程中通知仍然能发；`--narrow` 再把这些名单改写成只有读取器一个。**摘掉 `security`
+的是第二条命令。** 两趟里 `adopt` 都会替你把这行写进 `.env`，而读取器是用和
+`security` 完全相同的 argv 调用的，所以读取本身没有任何别的变化。
+
+跑之前先读 `tools/pdt-secret-reader/README.md`。里面写了流程、退出码、怎么放宽回去，
+以及 —— 值得读两遍的那一节 —— 它**防不住**什么。
 
 ## 回滚
 

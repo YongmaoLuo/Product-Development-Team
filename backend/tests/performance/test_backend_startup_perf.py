@@ -16,15 +16,18 @@ upgrade:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -79,11 +82,76 @@ def _make_order_file(tmp_path: Path) -> Path:
     return order_file
 
 
-def _measure_startup(project_root: Path, endpoint: str, order_file: Path | None = None, home_dir: Path | None = None) -> float:
-    """Start ``backend/server.py`` and measure time until ``endpoint`` returns 200."""
+@contextlib.contextmanager
+def _cc_switch_serving(names: list[str]):
+    """Run a real HTTP endpoint answering ``GET /api/providers``.
+
+    The chain has one source and it is CC Switch's HTTP provider list,
+    so a test that boots the server has to give that source something
+    to answer with. A stand-in on an ephemeral loopback port keeps the
+    measurement independent of whether the developer happens to have CC
+    Switch open, while still exercising the real socket path the server
+    takes at startup.
+
+    Yields the base URL to put in ``PDT_PROVIDER_ORDER_API_URL``.
+    """
+    payload = json.dumps(
+        {"providers": [
+            {"id": f"id-{i}", "name": n} for i, n in enumerate(names)
+        ]}
+    ).encode()
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_GET(self):  # noqa: N802 — name fixed by BaseHTTPRequestHandler
+            if self.path != "/api/providers":
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):  # noqa: A003 — silence the test log
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+def _measure_startup(
+    project_root: Path,
+    endpoint: str,
+    order_file: Path | None = None,
+    home_dir: Path | None = None,
+    cc_switch_base: str = "http://127.0.0.1:1",
+) -> float:
+    """Time ``endpoint`` returning 200.
+
+    ``order_file`` is accepted and ignored: it was how a chain was
+    planted in the environment, and the chain no longer comes from a
+    file. It stays in the signature so the callers read unchanged;
+    ``home_dir`` and ``cc_switch_base`` are what now decide the chain.
+
+    Start ``backend/server.py`` and measure time until ``endpoint``
+    returns 200.
+    """
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-    if order_file is not None:
-        env["PROVIDER_ORDER_FILE"] = str(order_file)
+    # The chain is asked of CC Switch's HTTP provider list. Point at
+    # whatever that is, so the measurement does not depend on whether
+    # the developer happens to have CC Switch running on the machine
+    # and so both the current tree and the git-archive baseline ask the
+    # same question.
+    env["PDT_PROVIDER_ORDER_API_URL"] = cc_switch_base
     if home_dir is not None:
         env["HOME"] = str(home_dir)
         # 2026-09-13: point BOTH current and baseline servers at an
@@ -199,44 +267,57 @@ def test_backend_startup_latency_within_10ms(tmp_path: Path) -> None:
     # load_providers() can resolve provider IDs without a real DB.
     _install_fake_cc_switch_db(tmp_path, ["vendor-a-pro", "vendor-b", "vendor-c-app"])
 
-    current_times = [
-        _measure_startup(_PROJECT_ROOT, "/health", order_file, home_dir=tmp_path)
-        for _ in range(3)
-    ]
-    current_median = _median(current_times)
+    chain = ["vendor-a-pro", "vendor-b", "vendor-c-app"]
 
-    baseline_dir = tmp_path / "baseline"
-    baseline_dir.mkdir(parents=True, exist_ok=True)
-
-    archive = subprocess.run(
-        ["git", "archive", "HEAD"],
-        cwd=_PROJECT_ROOT,
-        capture_output=True,
-        check=True,
-    )
-    with tarfile.open(fileobj=BytesIO(archive.stdout), mode="r:*") as tar:
-        tar.extractall(path=baseline_dir)
-
-    # No order file has to be planted inside the baseline copy:
-    # ``_measure_startup`` exports ``PROVIDER_ORDER_FILE`` pointing at
-    # ``order_file``, which wins precedence for both processes.
-
-    # Baseline is extracted from ``git archive HEAD``. On a feature
-    # branch with uncommitted fixes, HEAD may be temporarily broken
-    # (e.g. the provider-config consumer bug that prevents the server
-    # from starting). In that case there is no valid baseline to compare
-    # against, so we degrade gracefully instead of failing the perf test.
-    try:
-        baseline_times = [
-            _measure_startup(baseline_dir, "/api/plans", order_file, home_dir=tmp_path)
+    # One stand-in CC Switch serves both processes: the current tree and
+    # the git-archive baseline have to be asking the same question, or
+    # the comparison measures which copy could reach an answer.
+    with _cc_switch_serving(chain) as cc_switch_base:
+        current_times = [
+            _measure_startup(
+                _PROJECT_ROOT, "/health", order_file,
+                home_dir=tmp_path, cc_switch_base=cc_switch_base,
+            )
             for _ in range(3)
         ]
-        baseline_median = _median(baseline_times)
-    except RuntimeError as exc:
-        pytest.skip(
-            f"HEAD baseline server failed to start ({exc}); "
-            "cannot measure regression against a broken baseline"
+        current_median = _median(current_times)
+
+        baseline_dir = tmp_path / "baseline"
+        baseline_dir.mkdir(parents=True, exist_ok=True)
+
+        archive = subprocess.run(
+            ["git", "archive", "HEAD"],
+            cwd=_PROJECT_ROOT,
+            capture_output=True,
+            check=True,
         )
+        with tarfile.open(fileobj=BytesIO(archive.stdout), mode="r:*") as tar:
+            tar.extractall(path=baseline_dir)
+
+        # No order file has to be planted inside the baseline copy: both
+        # processes ask the same stand-in CC Switch, so the comparison is
+        # not measuring which copy found a file.
+
+        # Baseline is extracted from ``git archive HEAD``. On a feature
+        # branch with uncommitted fixes, HEAD may be temporarily broken
+        # (e.g. the provider-config consumer bug that prevents the server
+        # from starting). In that case there is no valid baseline to
+        # compare against, so we degrade gracefully instead of failing
+        # the perf test.
+        try:
+            baseline_times = [
+                _measure_startup(
+                    baseline_dir, "/api/plans", order_file,
+                    home_dir=tmp_path, cc_switch_base=cc_switch_base,
+                )
+                for _ in range(3)
+            ]
+            baseline_median = _median(baseline_times)
+        except RuntimeError as exc:
+            pytest.skip(
+                f"HEAD baseline server failed to start ({exc}); "
+                "cannot measure regression against a broken baseline"
+            )
 
     # The contract is that the upgrade does not *slow* startup by more
     # than 10 ms. Being faster is acceptable (and expected here because
@@ -252,55 +333,110 @@ def test_backend_startup_latency_within_10ms(tmp_path: Path) -> None:
     )
 
 
-def _install_fake_cc_switch_db(home_dir: Path, provider_ids: list[str]) -> None:
-    """Create a fake ``~/.cc-switch/cc-switch.db`` with *provider_ids*."""
+def _install_fake_cc_switch_db(home_dir: Path, provider_names: list[str]) -> None:
+    """Create a fake ``~/.cc-switch/cc-switch.db`` with *provider_names*.
+
+    Production ``providers`` schema, including ``app_type`` and the
+    ordering columns: the chain reader filters on the app type and sorts
+    by them, so the legacy ``provider_configs`` shape would not answer
+    the query that is actually run at startup.
+    """
     cc_dir = home_dir / ".cc-switch"
     cc_dir.mkdir(parents=True, exist_ok=True)
     db_path = cc_dir / "cc-switch.db"
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute(
-            "CREATE TABLE provider_configs ("
-            "id TEXT PRIMARY KEY, url TEXT, model TEXT, extra_params TEXT"
-            ")"
+            "CREATE TABLE providers ("
+            "id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL, "
+            "settings_config TEXT NOT NULL, created_at INTEGER, "
+            "sort_index INTEGER, is_current BOOLEAN NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (id, app_type))"
         )
-        for pid in provider_ids:
+        for i, name in enumerate(provider_names):
             conn.execute(
-                "INSERT INTO provider_configs (id, url, model, extra_params) "
-                "VALUES (?, ?, ?, ?)",
-                (pid, "https://example.com/v1", "fake-model", "{}"),
+                "INSERT INTO providers (id, app_type, name, settings_config, "
+                "created_at, sort_index) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    f"row-{i}",
+                    "claude",
+                    name,
+                    json.dumps({
+                        "env": {
+                            "ANTHROPIC_BASE_URL": f"https://example.com/p{i}/v1",
+                            "ANTHROPIC_AUTH_TOKEN": f"sk-fake-{i}",
+                            "ANTHROPIC_MODEL": f"fake-model-{i}",
+                        }
+                    }),
+                    i,
+                    i,
+                ),
             )
         conn.commit()
     finally:
         conn.close()
 
 
-def test_load_fallback_order_opens_provider_order_once(tmp_path: Path, monkeypatch) -> None:
-    """The provider-order cache must read the JSON file exactly once."""
-    order_file = _make_order_file(tmp_path)
+def test_the_chain_is_asked_once_per_process(
+    tmp_path: Path, monkeypatch, real_cc_switch
+) -> None:
+    """The chain is asked of CC Switch exactly once, however often it is read.
+
+    The cache used to be about not re-reading a JSON file. It is now
+    about not turning a dispatch storm into a request storm against the
+    desktop app — and the count that matters is the number of questions,
+    since a backend that asked on every dispatch would be firing an
+    HTTP request at a UI application once per task.
+    """
     cache_clear()
-    # Provide a fake CC Switch DB so the consumer-layer filter can resolve.
-    _install_fake_cc_switch_db(tmp_path, ["vendor-a-pro", "vendor-b-pro", "vendor-c-app"])
+    names = ["vendor-a-pro", "vendor-b-pro", "vendor-c-app"]
+    _install_fake_cc_switch_db(tmp_path, names)
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    open_calls: list[str] = []
-    original_path_open = Path.open
+    calls: list[str] = []
 
-    def counting_path_open(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        try:
-            if str(self.resolve()) == str(order_file.resolve()):
-                open_calls.append(str(self))
-        except Exception:
-            pass
-        return original_path_open(self, *args, **kwargs)
+    def _counting_urlopen(request, timeout=None):  # type: ignore[no-untyped-def]
+        calls.append(request.full_url)
 
-    with patch.object(Path, "open", counting_path_open):
-        result1 = load_fallback_order(str(order_file))
-        result2 = load_fallback_order(str(order_file))
+        class _Resp:
+            status = 200
 
-    assert result1 == result2
-    assert len(open_calls) == 1, (
-        f"expected provider-order.json opened exactly once, got {len(open_calls)}"
+            def read(self):
+                return json.dumps(
+                    {"providers": [
+                        {"id": f"id-{i}", "name": n}
+                        for i, n in enumerate(names)
+                    ]}
+                ).encode()
+
+            def getcode(self):
+                return 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Resp()
+
+    import provider_order
+
+    with patch.object(provider_order.urllib.request, "urlopen", _counting_urlopen):
+        result1 = load_fallback_order()
+        result2 = load_fallback_order()
+        result3 = load_fallback_order()
+
+    assert result1 == result2 == result3 == names
+    assert len(calls) == 1, (
+        f"expected CC Switch to be asked exactly once, got {len(calls)}"
+    )
+
+    cache_clear()
+    with patch.object(provider_order.urllib.request, "urlopen", _counting_urlopen):
+        load_fallback_order()
+    assert len(calls) == 2, (
+        "cache_clear() must make the next read ask again"
     )
 
 

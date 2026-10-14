@@ -5,8 +5,8 @@ it is set only while a VP is executing. A round spends most of its
 wall-clock time elsewhere, and in those windows the card fell through
 to a bare "🔄 验证中" that named nothing.
 
-Two consequences were measured on a real plan
-(``a private plan``, round 1):
+Two consequences were measured on a real plan during its first
+verification round:
 
   * two of seven verification pushes were nameless — one at round
     start before the first ``vp_start``, one at round close after the

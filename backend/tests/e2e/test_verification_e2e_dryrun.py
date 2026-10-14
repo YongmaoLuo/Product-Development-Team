@@ -346,8 +346,13 @@ def test_e2e_dryrun_9vp_full_round_passes(
             "api_test": 1800,
         },
         global_default_timeout_seconds=1800,
-        parallelism_cap=4,
     )
+    # The width is 4, handed in through the resolver the provider pool
+    # answers through. ``TimeoutPolicy.parallelism_cap`` was deleted with
+    # every other pre-agreed round width (2026-10-13), so the same number
+    # now arrives through the one door that is left; the width under test
+    # and the band it is measured against are both unchanged.
+    agent.vp_capacity_resolver = lambda: 4
     agent.start_verification_round(1)
 
     vps = _make_vps_by_method(
@@ -454,8 +459,13 @@ def test_e2e_dryrun_parallel_speedup(
     agent.timeout_policy = TimeoutPolicy(
         per_method_timeout_seconds={"ui_validation": 60},
         global_default_timeout_seconds=60,
-        parallelism_cap=4,
     )
+    # The width is 4, handed in through the resolver the provider pool
+    # answers through. ``TimeoutPolicy.parallelism_cap`` was deleted with
+    # every other pre-agreed round width (2026-10-13), so the same number
+    # now arrives through the one door that is left; the width under test
+    # and the band it is measured against are both unchanged.
+    agent.vp_capacity_resolver = lambda: 4
     agent.start_verification_round(1)
 
     vps = _make_vps_by_method({"ui_validation": 4})
@@ -512,8 +522,13 @@ def test_e2e_dryrun_timeout_triggers_split(
     agent.timeout_policy = TimeoutPolicy(
         per_method_timeout_seconds={"ui_validation": 5},
         global_default_timeout_seconds=5,
-        parallelism_cap=4,
     )
+    # The width is 4, handed in through the resolver the provider pool
+    # answers through. ``TimeoutPolicy.parallelism_cap`` was deleted with
+    # every other pre-agreed round width (2026-10-13), so the same number
+    # now arrives through the one door that is left; the width under test
+    # and the band it is measured against are both unchanged.
+    agent.vp_capacity_resolver = lambda: 4
     agent.start_verification_round(1)
 
     vps: List[Dict[str, Any]] = [
@@ -795,6 +810,15 @@ def test_e2e_dryrun_state_machine_repair_loop(
                 "failed_vp_id": "VP-APITEST-0",
                 "title": "Fix api_test #0",
                 "description": "Investigate FakeVerifierBackend failure",
+                # The generation-time gates refuse a row that resolves no
+                # files to modify: a task dispatched with an empty blast
+                # radius is a task the executor cannot scope. The gate is
+                # real and runs inside the assembler, so the stub has to
+                # supply the field the real generator would — without it
+                # every derived row is dropped and the round repairs
+                # nothing, which is the failure the gate exists to make
+                # visible rather than to hide behind a plausible count.
+                "files_to_modify": ["tests/test_dryrun.py"],
             }
         ]
 

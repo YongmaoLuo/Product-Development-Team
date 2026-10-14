@@ -443,80 +443,76 @@ def test_provider_routing_error_exists():
 
 
 # ---------------------------------------------------------------------------
-# resolve_fallback_chains — cross-tier widening (2026-09-22)
+# One tier is one pool — a scene never answers with another tier's chain
 # ---------------------------------------------------------------------------
 #
-# The shipped config declares ``medium: ["^Vendor A"]``, which matches
-# exactly two CC Switch rows. On 2026-09-22 both answered 429 and the
-# dispatch had nowhere left to go inside the tier; it fell to the parent
-# process env (not a tier member) and the task died there. The user's
-# rule: the chain only terminates once every provider has been tried.
+# The widening walk this file used to pin has been removed, and the
+# behaviour it pinned with it: a scene whose own tier had nothing usable
+# left used to be answered with another tier's providers. That was an
+# escape hatch for a dispatch that had nowhere to go, and it was wrong
+# for a reason no failure mode repairs: the tiers are INDEPENDENT POOLS,
+# and spending a stronger pool's budget is a decision the table did not
+# authorize.
 #
-# ``resolve_provider_chain`` itself is unchanged — it still answers "the
-# scene's tier". The widening lives in ``resolve_fallback_chains`` so a
-# caller that wants more can ask for it.
+# The failure it answered has another answer now — a tier that has just
+# been refused by every one of its rows is WAITED OUT rather than
+# widened past (pinned in ``test_provider_quota_wake``). So these tests
+# assert the absence rather than the presence: what must not exist any
+# more, and what must still hold for the one resolver that is left.
 
 
-class TestResolveFallbackChains:
-    def test_the_scene_tier_comes_first(self, routing_yaml):
-        from provider_routing import resolve_fallback_chains
+@pytest.mark.unit
+class TestATierIsOnePool:
+    def test_the_module_no_longer_exports_a_cross_tier_resolver(self):
+        """The name is gone from the module and from ``__all__``.
 
-        cfg = routing_yaml(STANDARD_YAML)
-        chains = resolve_fallback_chains("execution", config_path=cfg)
-
-        assert chains[0] == ["Vendor A Pro", "Vendor A API", "Vendor A"]
-        assert chains[0] == resolve_provider_chain("execution", config_path=cfg)
-
-    def test_the_next_tier_follows(self, routing_yaml):
-        from provider_routing import resolve_fallback_chains
-
-        cfg = routing_yaml(STANDARD_YAML)
-        chains = resolve_fallback_chains("execution", config_path=cfg)
-
-        assert ["Vendor D API", "Vendor B Pro", "Vendor C App"] in chains
-
-    def test_tiers_with_identical_chains_are_not_walked_twice(self, routing_yaml):
-        """``medium`` and ``low`` both read ``["^Vendor A"]`` in the
-        shipped config, so their chains are identical. Walking the same
-        providers a second time buys nothing."""
-        from provider_routing import resolve_fallback_chains
-
-        cfg = routing_yaml(STANDARD_YAML)
-        chains = resolve_fallback_chains("execution", config_path=cfg)
-
-        assert len(chains) == len({tuple(c) for c in chains})
-        assert len(chains) == 2
-
-    def test_a_high_scene_widens_into_medium(self, routing_yaml):
-        from provider_routing import resolve_fallback_chains
-
-        cfg = routing_yaml(STANDARD_YAML)
-        chains = resolve_fallback_chains("prd", config_path=cfg)
-
-        assert chains[0] == ["Vendor D API", "Vendor B Pro", "Vendor C App"]
-        assert ["Vendor A Pro", "Vendor A API", "Vendor A"] in chains
-
-    def test_an_unknown_scene_uses_the_default_tier(self, routing_yaml):
-        from provider_routing import resolve_fallback_chains
-
-        cfg = routing_yaml(STANDARD_YAML)
-        chains = resolve_fallback_chains("no-such-scene", config_path=cfg)
-
-        assert chains[0] == ["Vendor A Pro", "Vendor A API", "Vendor A"]
-
-    def test_a_missing_config_yields_no_chains(self, tmp_path, monkeypatch):
-        from provider_routing import resolve_fallback_chains
-
-        monkeypatch.setattr(
-            provider_routing, "_config_path",
-            lambda config_path=None: tmp_path / "absent.yaml",
+        Asserted on both, because they fail differently: the attribute
+        could have been unexported while the function stayed reachable,
+        which would leave the behaviour in the tree with one fewer
+        warning behind it.
+        """
+        assert not hasattr(provider_routing, "resolve_fallback_chains"), (
+            "the cross-tier resolver must not exist: a scene's chain is "
+            "its own tier's chain"
         )
-        clear_routing_cache()
-        assert resolve_fallback_chains("execution") == []
+        assert "resolve_fallback_chains" not in provider_routing.__all__
 
-    def test_a_tier_matching_no_live_provider_is_omitted(self, routing_yaml):
-        from provider_routing import resolve_fallback_chains
+    def test_the_widening_tables_are_gone_with_it(self):
+        """No widening table survives under another name.
 
+        A mapping of tier → widening order is only useful for crossing
+        tiers, so its absence is the same contract as the function's.
+        """
+        for gone in ("_TIER_WIDENING", "_DEFAULT_TIER_WIDENING"):
+            assert not hasattr(provider_routing, gone), gone
+
+    def test_a_scene_answers_with_its_own_tier_and_nothing_else(self, routing_yaml):
+        """The live contract, on a config where the tiers genuinely differ.
+
+        ``high`` names three rows and ``medium`` names three different
+        ones, so a resolver that reached past its own tier would show up
+        here as extra names in the chain — which is the whole failure
+        mode, stated positively.
+        """
+        cfg = routing_yaml(STANDARD_YAML)
+
+        high = resolve_provider_chain("prd", config_path=cfg)
+        medium = resolve_provider_chain("execution", config_path=cfg)
+
+        assert high == ["Vendor D API", "Vendor B Pro", "Vendor C App"]
+        assert medium == ["Vendor A Pro", "Vendor A API", "Vendor A"]
+        assert not set(high) & set(medium)
+
+    def test_an_empty_tier_does_not_borrow_a_sibling_tier_that_has_rows(
+        self, routing_yaml,
+    ):
+        """A scene pointed at an empty tier gets nothing — not a rescue.
+
+        This is the shape the widening walk refused to take even while it
+        existed, and it is now the only answer there is. Without the
+        check, a typo in a scene name silently costs a scene its entire
+        candidate set rather than naming the config mistake.
+        """
         cfg = routing_yaml("""
             version: 1
             default_tier: medium
@@ -525,14 +521,13 @@ class TestResolveFallbackChains:
               high:   ["^Nobody"]
             scenes:
               execution: medium
+              prd: high
         """)
-        chains = resolve_fallback_chains("execution", config_path=cfg)
 
-        assert chains == [["Vendor A Pro", "Vendor A API", "Vendor A"]]
-
-    def test_a_non_string_scene_still_raises(self, routing_yaml):
-        from provider_routing import resolve_fallback_chains
-
-        cfg = routing_yaml(STANDARD_YAML)
-        with pytest.raises(ProviderRoutingError):
-            resolve_fallback_chains(42, config_path=cfg)
+        assert resolve_provider_chain("prd", config_path=cfg) == []
+        assert resolve_provider_chain("execution", config_path=cfg) == [
+            "Vendor A Pro", "Vendor A API", "Vendor A",
+        ], (
+            "the sibling tier has rows and the scene's own tier has none; "
+            "the answer is still the scene's own tier"
+        )

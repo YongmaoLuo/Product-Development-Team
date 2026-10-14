@@ -336,6 +336,26 @@ def _activity_line(activity: Optional[Dict[str, Any]]) -> str:
     return line
 
 
+def _activity_label_text(activity: Any) -> str:
+    """Return a verification round's sub-step label, or ``""``.
+
+    The label is produced by the verification endpoint's round-activity
+    derivation and is rendered verbatim: it already carries its own
+    icon, wording and — where the sub-step is about a specific VP —
+    that VP's title. Re-deriving or extending it here would put the two
+    render sites out of step.
+
+    Accepts either the dict the endpoint emits or a bare string, and
+    returns ``""`` for anything empty so callers render no line at all
+    rather than an empty heading.
+    """
+    if isinstance(activity, dict):
+        return str(activity.get("label") or "").strip()
+    if isinstance(activity, str):
+        return activity.strip()
+    return ""
+
+
 def _unified_phase_section(
     phase: Optional[str],
     verification_status: Optional[str],
@@ -1170,6 +1190,22 @@ def _verification_sections(
             {"tag": "div", "text": {"tag": "lark_md", "content": cv_line}}
         )
         elements.append({"tag": "hr"})
+    else:
+        # No VP is in flight, so ``current_vp`` is None — but the round
+        # is not idle: it is planning, judging, or summarizing. The
+        # ``activity`` label says which, and names the VP under
+        # review. Without this line the section falls through to a
+        # progress bar and a verdict list, reading as though the round
+        # had stopped. Mirrors the execution section's "🔄 当前任务："
+        # block, which exists for exactly the same gap (a live
+        # executor with no in-progress task row).
+        _v_act_label = _activity_label_text(progress.get("activity"))
+        if _v_act_label:
+            elements.append(
+                {"tag": "div", "text": {"tag": "lark_md",
+                    "content": f"🔄 **正在验证：**\n- {_v_act_label}"}}
+            )
+            elements.append({"tag": "hr"})
 
     # 2026-09-14: parents the repair-phase judge split
     # into sub-VPs. Rendered ABOVE the repair-task list and even when
@@ -2011,12 +2047,8 @@ def build_card(
     for _src in (verification_progress, body_only):
         if not isinstance(_src, dict):
             continue
-        _a = _src.get("activity")
-        if isinstance(_a, dict) and _a.get("label"):
-            _v_activity = str(_a["label"])
-            break
-        if isinstance(_a, str) and _a.strip():
-            _v_activity = _a.strip()
+        _v_activity = _activity_label_text(_src.get("activity")) or None
+        if _v_activity:
             break
 
     elements: List[Dict[str, Any]] = []

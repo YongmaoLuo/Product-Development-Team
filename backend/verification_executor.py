@@ -182,9 +182,11 @@ class VerificationExecutor(BaseExecutor):
       * ``plan_dir`` — directory for the state file. The state file
         is ``plan_dir / DEFAULT_STATE_FILENAME``;
       * ``sub_agent_runner`` — async callable ``(vp_node) -> verdict_dict``.
-        The base class's run loop awaits it inside a semaphore so
-        ``max_parallel=1`` is fully serial and ``max_parallel>1`` runs
-        VPs concurrently.
+        The base class's run loop awaits it behind a concurrency gate
+        (see :meth:`run`) — a fixed-width semaphore when the caller
+        passes a positive ``max_parallel`` and no ``gate``, and no gate
+        at all when the caller passes ``max_parallel=0``, which is what
+        the production verification path does.
 
     The class is intentionally stateless across instances: every
     mutation goes through :meth:`_save_state`, so two processes
@@ -445,12 +447,12 @@ class VerificationExecutor(BaseExecutor):
     # Public async main loop
     # ------------------------------------------------------------------
 
-    async def run(self, max_parallel: int = 1) -> None:
+    async def run(self, max_parallel: int = 1, *, gate: Any = None) -> None:
         """Drive the verification plan through to completion.
 
         Delegates to :meth:`BaseExecutor.run`, which executes the
-        single-layer VP list via ``asyncio.gather`` with a
-        ``max_parallel``-sized semaphore.  The base class's
+        single-layer VP list via ``asyncio.gather`` behind one
+        concurrency gate.  The base class's
         ``_execute_one_item`` lifecycle is:
 
           1. Set ``_current_item`` (mirrored into ``_current_vp``)
@@ -464,20 +466,31 @@ class VerificationExecutor(BaseExecutor):
         Per-VP progress is reflected in-memory so the dashboard sees
         a live ``current_vp`` and updated ``completed_vps`` /
         ``failed_vps`` / ``skipped_vps`` counters even in parallel
-        mode (``max_parallel > 1``).  Progress is derived from the
-        verdict map; no separate progress state-file is written.
+        mode.  Progress is derived from the verdict map; no separate
+        progress state-file is written.
 
         Args:
-            max_parallel: Maximum number of VPs to run concurrently.
-                ``1`` (default) preserves the legacy serial lifecycle
-               — each VP is dispatched, awaited, and the next one
-                only starts after the previous one finishes, so
-                per-VP ``current_vp`` is monotonic with the
-                runner-call order.  ``> 1`` runs VPs concurrently
-                capped by the semaphore; ``current_vp`` reflects
-                whichever VP is most recently started.
+            max_parallel: Fixed width for the gather, used only when no
+                ``gate`` is supplied. **The production caller passes
+                ``0``** — unbounded — see
+                :meth:`verification_agent.Orchestrator.run_full_verification`.
+                The default of ``1`` is *serial*, not "unset", so a caller
+                that omits the argument gets a run one verification point
+                at a time. What actually bounds a verification round is
+                the provider slot pool, which hands out a slot per
+                dispatch; this argument is what that pool does *not* have
+                to fight with.
+            gate: Concurrency gate (``await acquire()`` / ``release()``)
+                whose width is re-read on every bind. The production
+                caller passes neither, so this is the generic hook rather
+                than something the round uses.
+
+        After the run, :attr:`~base_executor.BaseExecutor.peak_in_flight`
+        is the concurrency the round actually reached — measured inside
+        the executor, and the only honest width report now that no width
+        is declared.
         """
-        await super().run(max_parallel=max_parallel)
+        await super().run(max_parallel=max_parallel, gate=gate)
         # After super().run() returns, BaseExecutor has set
         # ``_current_item = None`` and saved the final progress
         # snapshot.  Mirror the historical field so the public

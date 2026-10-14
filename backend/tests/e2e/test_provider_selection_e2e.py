@@ -5,24 +5,18 @@ This suite pins the contract that the backend's provider selection
 pipeline works end-to-end without hitting a real LLM and without
 writing to the production ``~/.cc-switch/cc-switch.db``.
 
-The 5 TDD acceptance bullets (one-to-one with the spec):
+The 4 TDD acceptance bullets (one-to-one with the spec):
 
-  * test_e2e_optimizer_to_chain
-        - A freshly-written ``provider-order.json`` (the optimizer
-          output) is consumed by :func:`provider_order.
-          get_provider_order_from_optimizer` and the returned chain
-          is exactly that order filtered through the CC Switch
-          consumer layer, which speaks provider names.
   * test_e2e_chain_reads_real_db
-        - The chain's ``base_url`` comes from the real
+        - A chain entry's ``base_url`` comes from the real
           ``~/.cc-switch/cc-switch.db`` (the ``providers`` table
           schema), resolved through ``cc_switch`` — the
           reader the dispatch uses — in ``mode=ro`` URI. No mocks, no
           fake DB.
   * test_e2e_chain_order_decides_provider
-        - The optimizer's chain order IS the provider policy: the
-          selector takes the first entry with capacity, so the
-          rule-driven peak-hour demotion (which is baked into the order)
+        - The chain order CC Switch serves IS the provider policy: the
+          selector takes the first entry with capacity, so
+          rule-driven demotion (which is baked into the order)
           needs no clock or window arithmetic on this side.
   * test_e2e_dry_run_no_llm_cost
         - With ``PDT_BACKEND_DRY_RUN=1`` set and a fail-on-call mock
@@ -50,12 +44,12 @@ that introduces a real LLM call is caught immediately.
 
 Test isolation
 --------------
-  * The real DB path (``~/.cc-switch/cc-switch.db``) is the SAME
-    across all 5 tests; we hash it once before, run the suite, then
-    hash it again at the end of the no-DB-write test.
-  * Tests that need a ``provider_configs`` SQLite (the schema that
-    :mod:`provider_order` reads) build a private temp DB under
-    ``tmp_path`` so the real DB stays untouched.
+  * The real DB path (``~/.cc-switch/cc-switch.db``) is the SAME for
+    every test that reads it; we hash it once before, run the suite,
+    then hash it again at the end of the no-DB-write test.
+  * The chain is answered at the transport — CC Switch's HTTP provider
+    list — so no test here depends on which CC Switch, if any, the
+    machine running them happens to have listening.
   * ``PDT_BACKEND_DRY_RUN`` is set inside the dry-run-no-LLM test via
     ``monkeypatch.setenv``; other tests do not depend on it.
   * The conftest ``isolated_plans_dir`` and ``clean_execution_state``
@@ -69,7 +63,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -125,133 +118,47 @@ def _sha256_of_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _make_fake_cc_switch_db(
-    tmp_path: Path, provider_names: List[str]
-) -> Path:
-    """Build a private CC Switch SQLite declaring the given provider names.
+def _stub_cc_switch_provider_list(
+    monkeypatch: pytest.MonkeyPatch, names: List[str]
+) -> None:
+    """Answer CC Switch's HTTP provider list with ``names``, in order.
 
-    Uses the production ``providers`` schema: the row's ``name`` is the
-    provider's identity and the endpoint + credential live in
-    ``settings_config.env``. That is the shape
-    :mod:`cc_switch` reads. A table keyed on a local
-    kebab-case id would make every lookup miss, which is exactly how the
-    pre-2026-09-24 vocabulary differed from the live database.
-
-    The DB lives under ``tmp_path`` so the real
-    ``~/.cc-switch/cc-switch.db`` is never touched by this test.
-
-    Parameters
-    ----------
-    tmp_path:
-        Per-test scratch directory provided by pytest.
-    provider_names:
-        Names to insert, verbatim. Each gets a distinct
-        ``https://example.com/<n>`` endpoint so the round-trip is
-        inspectable in assertions.
+    The chain is read from that endpoint and nowhere else, so this is
+    the seam a test about chain resolution drives: it is a transport
+    answer, not a database, and it leaves the real
+    ``~/.cc-switch/cc-switch.db`` untouched. The payload is the shape
+    CC Switch serves — ``{"providers": [{"name": ...}, ...]}`` — and the
+    array order is the chain, which is why the assertion order matters.
     """
-    db_path = tmp_path / "fake-cc-switch.db"
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.execute(
-            "CREATE TABLE providers ("
-            "id TEXT PRIMARY KEY, name TEXT, settings_config TEXT"
-            ")"
-        )
-        for i, name in enumerate(provider_names):
-            conn.execute(
-                "INSERT INTO providers (id, name, settings_config) "
-                "VALUES (?, ?, ?)",
-                (
-                    f"row-{i}",
-                    name,
-                    json.dumps({
-                        "env": {
-                            "ANTHROPIC_BASE_URL": f"https://example.com/{i}",
-                            "ANTHROPIC_AUTH_TOKEN": f"fake-key-{i}",
-                        }
-                    }),
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return db_path
+    body = json.dumps(
+        {"providers": [{"name": n} for n in names]}
+    ).encode()
 
+    class _Response:
+        status = 200
 
-def _write_optimizer_order_file(
-    tmp_path: Path, order: List[str]
-) -> Path:
-    """Write a fresh ``provider-order.json`` with a given provider order.
+        def read(self):
+            return body
 
-    The schema is the live contract (:func:`provider_order.load_fallback_order`
-    consumes this shape). ``updated_at`` is pinned to ``utcnow()`` so
-    the file is treated as fresh.
-    """
-    payload = {
-        "version": 1,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "source": "producer",
-        "order": list(order),
-        "providers": {},
-    }
-    order_file = tmp_path / "provider-order.json"
-    order_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return order_file
+        def getcode(self):
+            return 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    import provider_order
+
+    monkeypatch.setattr(
+        provider_order.urllib.request, "urlopen", lambda *a, **k: _Response()
+    )
+    provider_order.cache_clear()
 
 
 # ---------------------------------------------------------------------------
-# 1. test_e2e_optimizer_to_chain
-# ---------------------------------------------------------------------------
-
-
-def test_e2e_optimizer_to_chain(tmp_path: Path) -> None:
-    """Optimizer ``order`` is consumed by :mod:`provider_order` and
-    filtered through the CC Switch consumer layer.
-
-    A freshly written ``provider-order.json`` lists provider names in a
-    specific order. Three of them name a row in the (temp) CC Switch DB;
-    one does not. The returned chain is the JSON order, filtered to the
-    resolvable names only, in JSON order.
-
-    This is the same contract pinned by ``test_integration_consumes_optimizer``
-    in the integration suite; restated at the E2E level so a CI
-    failure here blocks merges even when the integration suite is
-    skipped.
-    """
-    from provider_order import get_provider_order_from_optimizer
-
-    db_path = _make_fake_cc_switch_db(
-        tmp_path,
-        # The DB declares these three; "Vendor C Apple" and "parent" are
-        # deliberately absent.
-        ["Vendor A Pro", "Vendor B Pro", "Vendor D Test"],
-    )
-    optimizer_output = {
-        "version": 1,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "source": "producer",
-        "order": [
-            "Vendor A Pro",    # declared
-            "Vendor B Pro",         # declared
-            "Vendor C Apple",        # NOT declared -> dropped
-            "Vendor D Test",      # declared
-            "parent",            # never a provider -> dropped
-        ],
-        "providers": {},
-    }
-
-    chain = get_provider_order_from_optimizer(
-        optimizer_output, db_path=db_path,
-    )
-
-    assert chain == ["Vendor A Pro", "Vendor B Pro", "Vendor D Test"], (
-        f"chain must preserve JSON order, filtered to DB-declared "
-        f"provider names; got {chain!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# 2. test_e2e_chain_reads_real_db
+# 1. test_e2e_chain_reads_real_db
 # ---------------------------------------------------------------------------
 
 
@@ -264,8 +171,12 @@ def test_e2e_chain_reads_real_db() -> None:
     ``~/.cc-switch/cc-switch.db`` and return a usable endpoint. The
     provider is discovered through
     :func:`cc_switch.list_provider_names` rather
-    than named here, so a provider the optimizer renames or drops does
-    not break the suite.
+    than named here, so a provider CC Switch does not serve does not
+    break the suite.
+
+    The chain itself is asked of CC Switch over HTTP; what this pins is
+    the other half of resolution — that a name in that chain turns into
+    an endpoint here.
 
     Skip conditions: if the real DB is missing, the test is skipped
     rather than failed — a developer running this test on a machine
@@ -333,17 +244,18 @@ def test_e2e_chain_reads_real_db() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. test_e2e_vendor-b_degrade_applied
+# 2. test_e2e_chain_order_decides_provider
 # ---------------------------------------------------------------------------
 
 
 def test_e2e_chain_order_decides_provider() -> None:
-    """End-to-end: the optimizer's chain order decides which provider is used.
+    """End-to-end: the chain order decides which provider is used.
 
-    Peak-hour policy lives in the optimizer's rule engine, which expresses
-    it as a priority demotion baked into ``provider-order.json``. By the
-    time a chain reaches this layer the decision is already made, so the
-    only inputs here are the order and each provider's capacity.
+    The chain is the array order CC Switch serves, so any demotion an
+    operator or a rule engine wants is expressed there — moving a
+    provider down the list *is* the policy. By the time a chain reaches
+    this layer the decision is already made, so the only inputs here are
+    the order and each provider's capacity.
     """
     from provider_concurrency import (
         ProviderConcurrencyController,
@@ -355,7 +267,7 @@ def test_e2e_chain_order_decides_provider() -> None:
     )
     now = datetime.now(_BEIJING_TZ)
 
-    # Order the optimizer produces during B-PRO's peak window (14:00-18:00):
+    # Order served during B-PRO's peak window (14:00-18:00):
     # B-PRO demoted below the others → the walk picks Vendor A.
     peak_order = ["Vendor A Pro", "Vendor B Pro"]
     assert select_provider_with_concurrency(peak_order, controller, now) == (
@@ -381,12 +293,12 @@ def test_e2e_chain_order_decides_provider() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. test_e2e_dry_run_no_llm_cost
+# 3. test_e2e_dry_run_no_llm_cost
 # ---------------------------------------------------------------------------
 
 
 def test_e2e_dry_run_no_llm_cost(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, real_cc_switch
 ) -> None:
     """With ``PDT_BACKEND_DRY_RUN=1`` and a fail-on-call mock installed
     on ``ClaudeCodingTool.query``, the chain-resolution pipeline
@@ -396,9 +308,13 @@ def test_e2e_dry_run_no_llm_cost(
     path (e.g. asking the LLM to re-rank the chain) would surface
     here as a raised :class:`AssertionError` from the mock. The
     test does NOT call ``autonomous_coding`` end-to-end — only the
-    chain-resolution path (``load_fallback_order`` /
-    ``get_provider_order_from_optimizer``) — because the contract
-    is "chain resolution does not need an LLM".
+    chain-resolution path (``load_fallback_order``) — because the
+    contract is "chain resolution does not need an LLM".
+
+    ``real_cc_switch`` puts the real reader back past the session-wide
+    stub, and the transport is then answered in-test, so the chain
+    resolves through the path production uses and no LLM is reachable
+    from it.
     """
     monkeypatch.setenv("PDT_BACKEND_DRY_RUN", "1")
 
@@ -420,56 +336,21 @@ def test_e2e_dry_run_no_llm_cost(
     monkeypatch.setattr(ClaudeCodingTool, "query", fail_on_call)
     monkeypatch.setattr(ClaudeCodingTool, "query_json", fail_on_call)
 
-    # Drive the chain-resolution path. We use a temp DB so the chain is
-    # independent of the developer's own CC Switch roster and of any
-    # optimizer state; the test cares about *whether* the LLM is
-    # invoked, not about the real DB.
-    db_path = _make_fake_cc_switch_db(
-        tmp_path, ["Vendor A Pro", "Vendor B Pro"],
-    )
-    optimizer_output = {
-        "version": 1,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "source": "producer",
-        "order": ["Vendor A Pro", "Vendor B Pro"],
-        "providers": {},
-    }
+    # Drive the chain-resolution path against an answer of our own, so
+    # the result does not depend on which CC Switch, if any, this
+    # machine has listening.
+    _stub_cc_switch_provider_list(monkeypatch, ["Vendor A Pro", "Vendor B Pro"])
 
-    from provider_order import get_provider_order_from_optimizer
+    from provider_order import load_fallback_order
 
-    chain = get_provider_order_from_optimizer(
-        optimizer_output, db_path=db_path,
-    )
+    chain = load_fallback_order()
     assert chain == ["Vendor A Pro", "Vendor B Pro"], (
         f"chain resolution returned unexpected result: {chain!r}"
     )
 
-    # Also exercise load_fallback_order (the cached, file-based
-    # path the agent uses). The contract is the same: no LLM.
-    from provider_order import load_fallback_order
-
-    order_file = _write_optimizer_order_file(
-        tmp_path, ["Vendor A Pro", "Vendor B Pro"],
-    )
-    # load_fallback_order reads the real CC Switch DB by default; we
-    # can't easily redirect it to a fake DB without monkeypatching the
-    # consumer layer. We accept the failure mode if the real DB is
-    # unavailable — the assertion we care about is "the LLM was not
-    # called", not "the chain was resolved". We catch the DB-related
-    # exception explicitly so a missing or wrong-schema real DB does
-    # not surface as AssertionError.
-    try:
-        load_fallback_order(order_file)
-    except Exception as exc:  # noqa: BLE001 — see comment above
-        # ProviderOrderError or CCSwitchError is acceptable;
-        # the assertion we care about is the call_log, not the
-        # chain resolution outcome.
-        assert "provider" in type(exc).__name__.lower() or "DB" in str(exc) or \
-            "no such table" in str(exc) or "missing" in str(exc) or \
-            "not found" in str(exc), (
-            f"unexpected exception type from load_fallback_order: "
-            f"{type(exc).__name__}: {exc}"
-        )
+    # The cached second read is the one the dispatch loop actually does
+    # after startup, and it must be just as LLM-free.
+    assert load_fallback_order() == chain
 
     assert call_log == [], (
         f"ClaudeCodingTool.query was called {len(call_log)} time(s) in "
@@ -479,7 +360,7 @@ def test_e2e_dry_run_no_llm_cost(
 
 
 # ---------------------------------------------------------------------------
-# 5. test_e2e_no_db_write
+# 4. test_e2e_no_db_write
 # ---------------------------------------------------------------------------
 
 

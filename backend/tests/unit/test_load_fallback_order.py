@@ -10,15 +10,11 @@ This file pins two contracts the provider-config refactor relies on:
      future refactor that breaks the public API is caught in unit
      tests without needing a subprocess).
 
-  2. ``test_load_fallback_order_uses_cc_switch_db`` — the
-     ``provider_order.load_fallback_order`` chain is filtered through
-     the CC Switch SQLite consumer layer
-     (``cc_switch.list_provider_names``), so the
-     fallback chain returned to the backend dispatch layer cannot
-     include providers that are not actually configured in the CC
-     Switch database. This pins the contract introduced when
-     ``provider-order.json`` replaced the legacy
-     the legacy JSON-path table.
+  2. ``test_load_fallback_order_asks_cc_switch_over_http`` — the
+     ``provider_order.load_fallback_order`` chain is the array order
+     CC Switch serves on its HTTP provider list, taken as given. There
+     is no second source: a failure to be answered raises
+     ``ProviderOrderError`` rather than being answered from elsewhere.
 
 TDD spec
 --------
@@ -26,10 +22,9 @@ The original task spec lists two tests:
 
   * ``test_scan_no_violations`` — verify the scanner finds no
     violations on the current tree (subprocess form).
-  * ``test_load_fallback_order_uses_cc_switch_db`` — mock the CC
-    Switch DB layer (``cc_switch.list_provider_names``)
-    and verify ``load_fallback_order`` calls it and respects its
-    return value.
+  * ``test_load_fallback_order_asks_cc_switch_over_http`` — give the
+    resolver a transport and verify the question asked, the answer
+    returned, and the loudness when there is no answer.
 """
 
 from __future__ import annotations
@@ -41,7 +36,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
-from unittest import mock
 
 import pytest
 
@@ -259,184 +253,147 @@ def test_scan_no_violations_inprocess():
 
 
 # ---------------------------------------------------------------------------
-# Test 2: load_fallback_order consults the CC Switch DB
+# Test 2: load_fallback_order gets the chain from CC Switch
 # ---------------------------------------------------------------------------
 
 
-def _write_valid_order_json(path: Path, order: List[str]) -> None:
-    """Write a minimal-but-valid ``provider-order.json`` to ``path``.
+def test_load_fallback_order_asks_cc_switch_over_http(
+    tmp_path, monkeypatch, real_cc_switch
+):
+    """CC Switch's HTTP provider list is consulted, and its answer stands.
 
-    The on-disk schema (see ``backend/provider_order._validate_schema``)
-    requires: ``version == 1``, ``order`` is a non-empty list of
-    strings, ``updated_at`` is a parseable ISO 8601 timestamp. The
-    ``providers`` dict is optional — we omit it to keep the fixture
-    minimal.
-    """
-    payload = {
-        "version": 1,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "order": list(order),
-    }
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def test_load_fallback_order_uses_cc_switch_db(tmp_path):
-    """``load_fallback_order`` filters via the CC Switch DB layer.
-
-    The backend reads the live provider chain from
-    :func:`provider_order.load_fallback_order`. That function MUST
-    filter the JSON's ``order`` list through the CC Switch consumer
-    layer (``cc_switch.list_provider_names``) so only
-    providers actually declared in the database survive. This test
-    pins that contract end-to-end:
-
-      1. Mock ``cc_switch.list_provider_names`` to
-      2. Write a ``provider-order.json`` whose ``order`` contains
-         the same IDs in the same order.
-      3. Patch ``_default_order_file`` so the function reads our
-         fixture instead of the production contract file.
-      4. Drop the in-process cache (the function memoizes).
-      5. Assert the returned list equals the mocked DB chain.
-
-    If a future refactor replaces the database call with a hard-
-    coded fallback, the mock is never consulted and the assertion
-    fails.
-
-    The mock is applied to ``provider_order.cc_switch``
-    (the bound name the function actually uses) so we don't have to
-    fight Python's import-system caching: every call from
-    ``provider_order`` resolves through the patched attribute.
+    The chain is the array order CC Switch serves, and there is nowhere
+    else it could come from, so this pins both halves: the question is
+    asked over HTTP, and the answer is taken as given.
     """
     import provider_order
 
-    # into the contract file. Using a list of 3 IDs makes ordering
-    # bugs easy to spot in failure output.
-    db_chain = [
-        "Vendor B Pro",
-        "Vendor A Pro",
-        "Vendor C App",
-    ]
-    order_file = tmp_path / "provider-order.json"
-    _write_valid_order_json(order_file, db_chain)
+    served = ["Vendor B Pro", "Vendor A Pro", "Vendor C App"]
+    asked: list[str] = []
 
-    # Drop the in-process cache so the function actually reads the
-    # fixture (and so the mock's call count is unambiguous: a
-    # cache-hit would short-circuit the DB lookup entirely).
+    def _urlopen(request, timeout=None):
+        asked.append(request.full_url)
+        return _payload(served)
+
+    monkeypatch.setattr(
+        provider_order.urllib.request, "urlopen", _urlopen
+    )
     provider_order.cache_clear()
 
-    with mock.patch.object(
-        provider_order, "_default_order_file", return_value=order_file
-    ):
-        with mock.patch.object(
-            provider_order.cc_switch,
-            "list_provider_names",
-            return_value=list(db_chain),
-        ) as mock_list_ids:
-            result = provider_order.load_fallback_order()
+    result = provider_order.load_fallback_order()
 
-    # 1. The DB layer MUST be consulted. ``call_count >= 1`` (the
-    #    exact count is an implementation detail of the cache code;
-    #    we care that the call happened at all).
-    assert mock_list_ids.call_count >= 1, (
-        "load_fallback_order did not call cc_switch."
-        "list_provider_names -- the chain is no longer filtered "
-        "through the CC Switch DB layer"
+    assert result == served, (
+        f"load_fallback_order returned {result!r}; expected the served "
+        f"order {served!r}. The chain is CC Switch's array order."
+    )
+    assert asked, "CC Switch's HTTP provider list was never asked"
+    assert asked[0].endswith("/api/providers")
+    assert all(url.endswith("/api/providers") for url in asked), (
+        f"only the read-only provider list may be requested; got {asked!r}"
     )
 
-    # 2. The returned chain MUST equal the DB chain exactly. This
-    #    is the contract: the JSON's ``order`` is an optimization
-    expected = list(db_chain)
-    assert result == expected, (
-        f"load_fallback_order returned {result!r}; expected {expected!r}. "
-        "The chain must be filtered through the CC Switch DB layer."
-    )
 
-    # 3. Belt-and-braces: every returned ID is a string (the
-    #    consumer layer returns ``set[str]`` but the chain
-    #    contract is a ``list[str]``).
-    for provider_id in result:
-        assert isinstance(provider_id, str), (
-            f"load_fallback_order returned non-string id "
-            f"{provider_id!r} of type {type(provider_id).__name__}"
-        )
+def test_load_fallback_order_raises_when_cc_switch_does_not_answer(
+    tmp_path, monkeypatch, real_cc_switch
+):
+    """Nothing serving means a loud failure, not an answer from elsewhere.
 
-
-def test_load_fallback_order_drops_providers_not_in_db(tmp_path):
-    """``load_fallback_order`` drops providers missing from the DB.
-
-    A subtler contract than the happy-path filter: if the JSON
-    ``order`` contains a provider the DB does not know about, the
-    function must drop that ID (with a warning) and return only
-    the surviving ones, in their original order. A refactor that
-    removes the DB filter would expose every ID in the JSON
-    verbatim — including the unrecognized one — and this test
-    fails.
+    There is no second source for the chain, so the failure has to name
+    the reason it could not be asked and carry the evidence — and must
+    not come back as a list that looks like a fleet.
     """
     import provider_order
 
-    # JSON declares 3 IDs; the DB only knows 2 of them. The
-    # unknown one must be dropped silently (well, ``log.warning``,
-    # but the function still returns the filtered list).
-    json_order = [
-        "Vendor B Pro",
-        "unknown-provider-from-json",
-        "Vendor A Pro",
-    ]
-    db_chain = ["Vendor B Pro", "Vendor A Pro"]
-
-    order_file = tmp_path / "provider-order.json"
-    _write_valid_order_json(order_file, json_order)
+    monkeypatch.setattr(
+        provider_order.urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(
+            ConnectionRefusedError("CC Switch is not running")
+        ),
+    )
     provider_order.cache_clear()
 
-    with mock.patch.object(
-        provider_order, "_default_order_file", return_value=order_file
-    ):
-        with mock.patch.object(
-            provider_order.cc_switch,
-            "list_provider_names",
-            return_value=list(db_chain),
-        ):
-            result = provider_order.load_fallback_order()
+    with pytest.raises(provider_order.ProviderOrderError) as excinfo:
+        result = provider_order.load_fallback_order()
+        pytest.fail(f"returned {result!r} instead of raising")
 
-    # The unknown provider must be dropped; the surviving IDs
-    expected = list(db_chain)
-    assert result == expected, (
-        f"load_fallback_order returned {result!r}; expected {expected!r}. "
-        "An ID present in the JSON but missing from the CC Switch "
-        "DB must be dropped (the DB is the source of truth)."
+    assert excinfo.value.reason == provider_order.REASON_API_UNREACHABLE
+    assert "CC Switch is not running" in str(excinfo.value), (
+        f"the underlying error text is not in the message: {excinfo.value!s}"
     )
-    assert "unknown-provider-from-json" not in result, (
-        "load_fallback_order leaked a provider not in the CC Switch "
-        "DB into the returned chain"
+
+
+def test_the_chain_is_not_filtered_by_database_membership(
+    monkeypatch, real_cc_switch
+):
+    """A name CC Switch serves is in the chain, resolvable or no.
+
+    An older reader dropped entries with no matching row, which made
+    the chain a function of the local store as well as of CC Switch —
+    and dropped precisely the newest row, the one CC Switch has and the
+    consumer has not seen yet.
+    """
+    import provider_order
+
+    served = ["Vendor B Pro", "brand-new-provider"]
+    monkeypatch.setattr(
+        provider_order.urllib.request,
+        "urlopen",
+        lambda *a, **k: _payload(served),
     )
+    provider_order.cache_clear()
+
+    assert provider_order.load_fallback_order() == served
+
+
+def _payload(names):
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return json.dumps(
+                {"providers": [
+                    {"id": f"id-{i}", "name": n} for i, n in enumerate(names)
+                ]}
+            ).encode()
+
+        def getcode(self):
+            return 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    return _Resp()
 
 
 # ---------------------------------------------------------------------------
 # Test 3: lru_cache(maxsize=1) once-per-process caching mechanism
 # ---------------------------------------------------------------------------
 #
-# These tests pin VP-049: the fallback-order read is wrapped in
-# :func:`functools.lru_cache` (``maxsize=1``) so two calls in the
-# same process read the file at most once, and :func:`cache_clear`
-# exposes a public way to drop the cache (operator escape hatch
-# after a manual JSON edit).
+# These tests pin the once-per-process read: the chain is asked of CC
+# Switch at most once so a dispatch storm does not become a request
+# storm against the desktop app, and ``cache_clear`` exposes a public
+# way to drop the cache — now meaning "re-ask CC Switch", which is
+# what an operator wants after reordering there.
 
 
 def test_load_fallback_order_lru_cache_decorator_is_maxsize_one():
     """``_load_fallback_order_cached`` is wrapped in lru_cache(maxsize=1).
 
     Pins the implementation choice: the read is wrapped in stdlib
-    :func:`functools.lru_cache` with ``maxsize=1`` so the backend
-    reads ``provider-order.json`` at most once per process per
-    distinct path. We assert the wrapper exposes ``cache_info`` and
-    ``cache_clear`` (the canonical ``lru_cache`` surface) and that
-    the ``maxsize`` reported matches 1.
+    :func:`functools.lru_cache` with ``maxsize=1``. We assert the
+    wrapper exposes ``cache_info`` and ``cache_clear`` (the canonical
+    ``lru_cache`` surface), that it is still callable as a regular
+    function, and that the reported ``maxsize`` matches 1.
     """
-    import provider_order
     import functools
 
+    import provider_order
+
     cached = provider_order._load_fallback_order_cached
-    # lru_cache-decorated functions carry a ``cache_info`` method.
     assert hasattr(cached, "cache_info"), (
         "_load_fallback_order_cached is not decorated with "
         "functools.lru_cache (missing cache_info)"
@@ -445,126 +402,90 @@ def test_load_fallback_order_lru_cache_decorator_is_maxsize_one():
         "_load_fallback_order_cached is not decorated with "
         "functools.lru_cache (missing cache_clear)"
     )
-    # The function must still be callable as a regular function.
     assert callable(cached), (
         "_load_fallback_order_cached is not callable"
     )
-    # cache_info returns a CacheInfo namedtuple with a ``maxsize``
-    # field. We pin it to 1 so a future bump to ``maxsize=None``
-    # (unbounded) or a larger number is caught here.
+    assert isinstance(cached, functools._lru_cache_wrapper), (
+        "the cached reader must be the lru_cache wrapper itself, or "
+        "cache_clear() would not reach the thing holding the chain"
+    )
     info = cached.cache_info()
     assert info.maxsize == 1, (
         f"_load_fallback_order_cached has maxsize={info.maxsize}; "
-        "expected 1 (once-per-process, single-path contract)"
+        "expected 1 (once-per-process contract)"
     )
 
 
-def test_load_fallback_order_lru_cache_hits_in_same_process(tmp_path):
-    """Two ``load_fallback_order`` calls in one process = one file read.
+def test_load_fallback_order_lru_cache_hits_in_same_process(
+    monkeypatch, real_cc_switch
+):
+    """Three calls in one process are one question.
 
-    Pins the "once-per-process" contract end-to-end: the second call
-    must be served from the :func:`functools.lru_cache` instead of
-    re-reading the file and re-calling the CC Switch consumer layer.
-    We count calls to ``cc_switch.list_provider_names``
-    as the proxy for "the file was re-read" — that function is
-    consulted on every uncached read, so a cache miss bumps the
-    counter and a cache hit does not.
+    The proxy for "the chain was re-read" is now the HTTP request
+    count: a cache miss bumps it, a hit does not.
     """
     import provider_order
 
-    db_chain = [
-        "Vendor B Pro",
-        "Vendor A Pro",
-        "Vendor C App",
-    ]
-    order_file = tmp_path / "provider-order.json"
-    _write_valid_order_json(order_file, db_chain)
-    # Drop any cached state left over from earlier tests in the
-    # same process. ``lru_cache(maxsize=1)`` would otherwise evict
-    # this test's path on the second test run, but we want a
-    # deterministic miss → hit sequence.
+    db_chain = ["Vendor B Pro", "Vendor A Pro", "Vendor C App"]
+    calls: list[str] = []
+
+    def _urlopen(request, timeout=None):
+        calls.append(request.full_url)
+        return _payload(db_chain)
+
+    monkeypatch.setattr(provider_order.urllib.request, "urlopen", _urlopen)
     provider_order.cache_clear()
 
-    with mock.patch.object(
-        provider_order, "_default_order_file", return_value=order_file
-    ):
-        with mock.patch.object(
-            provider_order.cc_switch,
-            "list_provider_names",
-            return_value=list(db_chain),
-        ) as mock_list_ids:
-            first = provider_order.load_fallback_order()
-            second = provider_order.load_fallback_order()
-            third = provider_order.load_fallback_order()
+    first = provider_order.load_fallback_order()
+    second = provider_order.load_fallback_order()
+    third = provider_order.load_fallback_order()
 
-    # 1. All three calls return the same chain — the cached tuple is
-    #    converted back to a list on every call.
-    expected = list(db_chain)
-    assert first == expected, f"first call returned {first!r}"
-    assert second == expected, f"second call returned {second!r}"
-    assert third == expected, f"third call returned {third!r}"
-
-    # 2. The CC Switch DB layer is consulted exactly once across
-    #    all three calls. Calls 2 and 3 are served from the
-    #    ``lru_cache`` (maxsize=1) keyed on the resolved path.
-    assert mock_list_ids.call_count == 1, (
-        f"load_fallback_order called list_provider_names "
-        f"{mock_list_ids.call_count} times across 3 calls; "
-        "expected exactly 1 (lru_cache should serve calls 2 and 3 "
-        "from the cached tuple, not re-read the file)"
+    assert first == second == third == db_chain, (
+        "every call in the process must return the same chain"
+    )
+    assert len(calls) == 1, (
+        f"CC Switch was asked {len(calls)} times across 3 calls; "
+        "expected exactly 1 (lru_cache should serve calls 2 and 3)"
     )
 
 
-def test_load_fallback_order_cache_clear_resets_lru_cache(tmp_path):
-    """``cache_clear()`` forces the next call to re-read the file.
+def test_load_fallback_order_cache_clear_resets_lru_cache(
+    monkeypatch, real_cc_switch
+):
+    """``cache_clear()`` makes the next call ask CC Switch again.
 
-    Pins the reversibility contract: after ``cache_clear()``, the
-    next :func:`load_fallback_order` call must miss the
-    :func:`functools.lru_cache` and re-read the file (and re-call
-    the CC Switch consumer layer). This is the operator escape
-    hatch — after a manual JSON edit, the operator calls
-    ``cache_clear()`` and the next read picks up the new file.
+    This is the operator escape hatch, and after the move to CC Switch
+    it reads the way it always wanted to: after reordering providers in
+    the CC Switch UI, clear the cache and the backend picks it up.
     """
     import provider_order
 
-    db_chain = ["Vendor B Pro", "Vendor A Pro"]
-    order_file = tmp_path / "provider-order.json"
-    _write_valid_order_json(order_file, db_chain)
+    calls: list[str] = []
+    answer = ["Vendor B Pro", "Vendor A Pro"]
+
+    def _urlopen(request, timeout=None):
+        calls.append(request.full_url)
+        return _payload(answer)
+
+    monkeypatch.setattr(provider_order.urllib.request, "urlopen", _urlopen)
     provider_order.cache_clear()
 
-    with mock.patch.object(
-        provider_order, "_default_order_file", return_value=order_file
-    ):
-        with mock.patch.object(
-            provider_order.cc_switch,
-            "list_provider_names",
-            return_value=list(db_chain),
-        ) as mock_list_ids:
-            # 1st call: cache miss, file is read, list_provider_names
-            # is called once.
-            provider_order.load_fallback_order()
-            calls_after_first = mock_list_ids.call_count
-            # 2nd call: cache hit (lru_cache served the same tuple),
-            # list_provider_names is NOT called.
-            provider_order.load_fallback_order()
-            assert mock_list_ids.call_count == calls_after_first, (
-                "lru_cache did not serve the 2nd call from cache"
-            )
-            # Clear the cache — the operator's escape hatch.
-            provider_order.cache_clear()
-            # 3rd call: must miss the cache, re-read the file, and
-            # re-call list_provider_names. This is the contract under
-            # test: cache_clear() drops the lru_cache entry.
-            provider_order.load_fallback_order()
+    provider_order.load_fallback_order()
+    after_first = len(calls)
 
-    # 3rd call is the one we care about. Across the 3 calls there
-    # should be exactly 2 list_provider_names invocations: 1st (miss)
-    # and 3rd (post-clear miss). The 2nd is served from the cache.
-    assert mock_list_ids.call_count == calls_after_first + 1, (
-        f"cache_clear() did not reset the lru_cache: "
-        f"list_provider_names was called {mock_list_ids.call_count} "
-        f"times across 3 load_fallback_order calls (1 before clear, "
-        f"1 served from cache, expected 1 more after clear). "
-        f"call_count after 1st={calls_after_first}, "
-        f"after clear+3rd={mock_list_ids.call_count}"
+    provider_order.load_fallback_order()
+    assert len(calls) == after_first, "the 2nd call must be served from cache"
+
+    # Reorder in CC Switch, then clear.
+    answer = ["Vendor A Pro", "Vendor B Pro"]
+    provider_order.cache_clear()
+    result = provider_order.load_fallback_order()
+
+    assert len(calls) == after_first + 1, (
+        "cache_clear() did not reset the lru_cache: CC Switch was "
+        f"asked {len(calls)} times, expected {after_first + 1}"
+    )
+    assert result == answer, (
+        f"after cache_clear() the chain must be re-asked; got {result!r}, "
+        f"expected {answer!r}"
     )

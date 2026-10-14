@@ -56,10 +56,39 @@ def _vp(vp_id: str, priority: str = "medium") -> dict:
 
 
 def _contents(*vp_ids: str) -> list:
+    """LLM-shaped content rows for ``vp_ids``.
+
+    2026-10-11: ``files_to_modify`` is no longer optional. The assembler
+    refuses to emit a repair task whose scope resolves to ``[]``
+    (``repair_task_dropped_empty_files_to_modify``), so a row without it
+    never makes it into the returned list. The field was in the prompt's
+    JSON schema all along; these fixtures now carry it like production
+    does.
+    """
     return [
-        {"failed_vp_id": vp_id, "title": f"Fix {vp_id}", "description": "d"}
+        {
+            "failed_vp_id": vp_id,
+            "title": f"Fix {vp_id}",
+            "description": "d",
+            "files_to_modify": [f"src/{vp_id}.py"],
+        }
         for vp_id in vp_ids
     ]
+
+
+def _assembler(failed_vps: list, **kwargs) -> RepairTaskAssembler:
+    """Assembler with a runnable command for every failed VP.
+
+    2026-10-11: an empty resolved ``test_command`` is also a refusal
+    (``repair_task_dropped_empty_test_command``). Supplying the map here
+    keeps these id-numbering tests focused on ids rather than on the two
+    gates; the gates have their own tests.
+    """
+    kwargs.setdefault("vp_test_commands", {
+        str(vp.get("id")): f"pytest -q tests/test_{vp.get('id')}.py"
+        for vp in failed_vps
+    })
+    return RepairTaskAssembler(failed_vps=failed_vps, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -180,36 +209,62 @@ class TestCrossStoreTaskConflicts:
 
 class TestAssemblerSeqBase:
     def test_default_base_reproduces_the_original_numbering(self):
-        tasks = RepairTaskAssembler(
-            round_number=1, failed_vps=[_vp("VP-1"), _vp("VP-2")],
+        tasks = _assembler(
+            [_vp("VP-1"), _vp("VP-2")], round_number=1,
         ).assemble(_contents("VP-1", "VP-2"))
         assert [t["id"] for t in tasks] == ["repair-r1-01", "repair-r1-02"]
 
     def test_base_shifts_the_whole_batch(self):
-        tasks = RepairTaskAssembler(
-            round_number=1, failed_vps=[_vp("VP-1"), _vp("VP-2")],
-            seq_base=19,
+        tasks = _assembler(
+            [_vp("VP-1"), _vp("VP-2")], round_number=1, seq_base=19,
         ).assemble(_contents("VP-1", "VP-2"))
         assert [t["id"] for t in tasks] == ["repair-r1-19", "repair-r1-20"]
 
     def test_first_task_of_a_shifted_batch_has_no_dependency(self):
-        """The predecessor id belongs to an earlier batch.
+        """A shifted batch's first task has no predecessor.
 
-        Linking to it would make this task wait on an unrelated repair
-        from days ago — which the DAG validator would accept (the id
-        exists) and the executor would honour.
+        2026-10-11: it no longer *has* predecessors at all. ``seq - 1``
+        here (``repair-r1-18``) belongs to an earlier batch, so linking
+        to it would make this task wait on an unrelated repair from days
+        ago. Every task in a batch is now a root — see
+        ``test_every_task_in_a_batch_is_a_root``.
         """
-        tasks = RepairTaskAssembler(
-            round_number=1, failed_vps=[_vp("VP-1")], seq_base=19,
+        tasks = _assembler(
+            [_vp("VP-1")], round_number=1, seq_base=19,
         ).assemble(_contents("VP-1"))
         assert tasks[0]["depends_on"] == []
 
-    def test_second_task_of_a_shifted_batch_chains_within_the_batch(self):
-        tasks = RepairTaskAssembler(
-            round_number=1, failed_vps=[_vp("VP-1"), _vp("VP-2")],
-            seq_base=19,
+    def test_second_task_of_a_shifted_batch_has_no_dependency(self):
+        """2026-10-11 (W1): the intra-batch chain is gone.
+
+        It used to read ``["repair-r1-19"]``. The edge existed to stop
+        two repair agents racing on ``verification_plan.json``, and the
+        two code paths that could do that were deleted on 2026-09-18 —
+        the only remaining writers run in-process inside a verification
+        round. So the edge was pure serialisation of independent work: a
+        chained batch means only the head ever runs.
+        """
+        tasks = _assembler(
+            [_vp("VP-1"), _vp("VP-2")], round_number=1, seq_base=19,
         ).assemble(_contents("VP-1", "VP-2"))
-        assert tasks[1]["depends_on"] == ["repair-r1-19"]
+        assert tasks[1]["depends_on"] == []
+
+    def test_every_task_in_a_batch_is_a_root(self):
+        """No repair task depends on a sibling — the batch is a forest.
+
+        Real intra-batch conflicts (two repairs touching one file) are
+        handled by ``agent._build_micro_layers``, which serialises them
+        into separate micro layers from ``files_to_modify``. That only
+        works because the assembler now refuses to emit a task whose
+        ``files_to_modify`` is empty, so the conflict graph is never
+        handed a scope-less task.
+        """
+        ids = [f"VP-{i}" for i in range(1, 6)]
+        tasks = _assembler(
+            [_vp(i) for i in ids], round_number=2,
+        ).assemble(_contents(*ids))
+        assert len(tasks) == 5
+        assert all(t["depends_on"] == [] for t in tasks)
 
     def test_base_below_one_is_rejected(self):
         with pytest.raises(ValueError):
@@ -231,16 +286,16 @@ def test_a_second_batch_never_reissues_an_id():
     breakdown child — are fed back in as the existing allocation, and
     the second batch must clear all of them.
     """
-    first = RepairTaskAssembler(
-        round_number=1, failed_vps=[_vp(f"VP-{i}") for i in range(1, 4)],
+    first = _assembler(
+        [_vp(f"VP-{i}") for i in range(1, 4)], round_number=1,
     ).assemble(_contents("VP-1", "VP-2", "VP-3"))
     first_ids = {t["id"] for t in first}
     # A breakdown of the third task exists by the time the plan is reset.
     existing = first_ids | {"repair-r1-03-1", "repair-r1-03-2"}
 
-    second = RepairTaskAssembler(
+    second = _assembler(
+        [_vp("VP-9")],
         round_number=1,
-        failed_vps=[_vp("VP-9")],
         seq_base=next_repair_seq_base(existing, 1),
     ).assemble(_contents("VP-9"))
 
@@ -248,7 +303,9 @@ def test_a_second_batch_never_reissues_an_id():
         "the second batch reused an id from the first — plan_tasks would "
         "overwrite that row and orphan its breakdown children"
     )
-    # And the second batch's own dependency chain still resolves.
+    # And every dependency it does write resolves (2026-10-11: it writes
+    # none, so this is now vacuously true — kept as a guard in case a
+    # real intra-batch edge is ever reintroduced).
     emitted = {t["id"] for t in second}
     for task in second:
         for dep in task["depends_on"]:
@@ -454,6 +511,24 @@ def _run_cycle(tmp_path, disk_tasks=None):
     (plan_dir / "tasks.json").write_text(
         json.dumps({"tasks": disk_tasks}), encoding="utf-8",
     )
+    # 2026-10-11 (W2 + W3): the assembler now reads the VP's command off
+    # ``evidence_command`` and refuses a task whose scope or command is
+    # empty, so the fixture has to write a plan that actually carries
+    # one. Before this, ``extract_vp_test_commands`` looked for a
+    # ``test_command`` key no real plan has and returned ``{}``.
+    (plan_dir / "verification_plan.json").write_text(
+        json.dumps({
+            "verification_points": [
+                {
+                    "id": "VP-009",
+                    "title": "新的失败点",
+                    "verification_method": "code_review",
+                    "evidence_command": "cargo test -p app remote::e2e",
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
 
     report = {
         "overall_status": "FAILED",
@@ -479,7 +554,10 @@ def _run_cycle(tmp_path, disk_tasks=None):
         orchestrator.verification_agent.run_full_verification.return_value = report
         orchestrator.repair_generator.generate_repair_contents.return_value = [
             {"failed_vp_id": "VP-009", "title": "修复 VP-009",
-             "description": "do the thing"},
+             "description": "do the thing",
+             # 2026-10-11 (W3): required. An empty scope is a refusal,
+             # not a task with a blank field.
+             "files_to_modify": ["native/src/e2e.rs"]},
         ]
         orchestrator.start_verification_cycle(round_number=1)
         return orchestrator.check_cycle_conditions(report, round_number=1)

@@ -21,6 +21,22 @@ can then:
      ``stop_reason="sub_agent_did_not_progress"`` so the next API call
      reports truth.
 
+What the threshold is for, and what it is not for
+-------------------------------------------------
+The threshold bounds a *process that has stopped answering*. It says
+nothing about a process that has not started: a verification point
+waiting for a provider's quota window has no subprocess, no stdout, and
+no progress to report, so it ages past any threshold simply by waiting,
+and treating that as a stall spends the kill path on a ``Popen`` that
+does not exist. Worse, the handler unregisters the handle it just tried
+to kill, which is the one thing standing between the subprocess that
+*will* start when the window reopens and an unbounded hang.
+
+So :meth:`SubAgentHandle.waiting_on_quota_window` is asked first, and a
+handle that is waiting is not stale. The threshold keeps doing its real
+job: a sub-agent that has a process, has gone quiet past the window,
+and is not streaming anything back.
+
 The registry mirrors the existing module-level dict + per-key-lock
 pattern used by ``_execution_state`` / ``_verification_state`` in
 ``backend/server.py`` (server.py:600-612, L3156-3199). Holds strong
@@ -70,6 +86,34 @@ class SubAgentHandle:
     def age_from_last_progress(self) -> float:
         """Seconds since ``last_progress_ts`` was last touched."""
         return time.time() - self.last_progress_ts
+
+    def waiting_on_quota_window(self) -> bool:
+        """True when this handle's tool is asleep on a closed quota window.
+
+        Not stuck. The tool parked its work clock — the one budget that
+        does not spend while a dispatch waits for a provider — and a
+        parked dispatch has no subprocess to kill and no stdout to read,
+        so the heartbeat's second-chance liveness probe has nothing to
+        read and passes straight through to the kill path. That kill
+        finds no ``Popen`` and does nothing, and the handler then
+        unregisters the handle anyway.
+
+        Which is the part that matters. The wait is correct; dropping
+        the handle is not. It is the only thing that would have protected
+        the subprocess that eventually does start once the window
+        reopens, so a quota wait long enough to cross the stale
+        threshold silently disarmed the watchdog for the rest of that
+        verification point — and the genuinely stuck process that follows
+        would then never be killed. The question is therefore asked here,
+        of the one signal that means exactly "waiting, not working", and
+        answered so the sweep can skip the handle instead.
+
+        Compared with ``is True`` on purpose rather than truthiness: a
+        stand-in tool in a test carries a double for ``_work_clock``, and
+        a double is truthy for every question asked of it.
+        """
+        clock = getattr(self.scoped_tool, "_work_clock", None)
+        return getattr(clock, "is_parked", False) is True
 
 
 class SubAgentRegistry:
@@ -178,6 +222,16 @@ class SubAgentRegistry:
         """Return a snapshot of all handles whose
         ``time.time() - last_progress_ts > threshold_seconds``.
 
+        A handle asleep on a closed quota window is **never** in the
+        result, however long it has been asleep. That is the whole point
+        of the exception: the threshold is there to catch a subprocess
+        that has stopped answering, and a dispatch that has not started
+        one yet has nothing to catch. Returning it would spend the kill
+        path on a handle with no ``Popen`` behind it and then throw the
+        handle away — losing the protection the *next* process would
+        have needed — so the waiting handle is skipped here rather than
+        re-attached after the fact.
+
         Returns a *new list* (not internal storage) so the caller can
         iterate without holding the registry lock.
         """
@@ -186,6 +240,8 @@ class SubAgentRegistry:
         with self._lock:
             for handles in self._by_plan.values():
                 for h in handles:
+                    if h.waiting_on_quota_window():
+                        continue
                     if (now - h.last_progress_ts) > threshold_seconds:
                         stale.append(h)
         return stale

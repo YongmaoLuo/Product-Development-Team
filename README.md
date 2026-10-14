@@ -225,9 +225,10 @@ is in [Contributing](docs/development/contributing.md#where-a-file-belongs).
 
 ## Configuration / 配置
 
-`backend/config.yaml` is intentionally thin — nothing is required to run.
-There is no built-in provider chain (point `provider_order_file` at
-whatever produces that contract), and `subsidiary_processes` ships empty.
+`backend/config.yaml` is intentionally thin — nothing is required to run,
+and `subsidiary_processes` ships empty. The provider fallback chain is not
+configured there at all: the backend asks CC Switch for it at startup, so
+the order you see in CC Switch is the order it dispatches in.
 
 Provider concurrency caps and provider routing are **operator-specific**.
 They ship as committed templates under `example/`; you copy them into the
@@ -268,15 +269,20 @@ More: **[Configuration](docs/operations/configuration.md)**.
 ## How to run the tests / 如何跑测试
 
 ```bash
-# from the repository root, with backend/.venv activated — the default lane
-backend/.venv/bin/python3 -m pytest backend/tests -m unit -q
+# from the repository root, with backend/.venv activated — the unit lane
+backend/.venv/bin/python3 -m pytest backend/tests/unit -q
 
 # or via the canonical wrapper, which resolves the venv for you
 scripts/run_tests.sh
 ```
 
-`-m unit` skips the `time_sensitive`, `integration`, `e2e` and `real_model` markers;
-the missing models are satisfied by stubs the conftest installs.
+The lane is the **directory** `backend/tests/unit` — it is what CI and the
+verification gate run, and unlike a marker it cannot drift. `-m unit` selects
+a superset: the same tree plus a few files outside it that mark themselves
+`unit`. Add `-n 8` to run the lane in parallel.
+[Tests](docs/development/testing.md) has the measurements, the reason `-n auto`
+does not work yet, and the story of how `-m unit` came to select the entire
+suite for a while.
 
 Two collection rules worth knowing: `pytest.ini` is directory-sensitive
 (from `backend/` pytest reads `backend/pytest.ini`, from the root it reads
