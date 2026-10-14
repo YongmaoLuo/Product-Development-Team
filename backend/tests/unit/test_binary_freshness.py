@@ -205,8 +205,8 @@ def test_check_freshness_cache_is_write_only(tmp_path: Path) -> None:
     This pins the *real* behaviour: ``check_binary_freshness`` re-runs
     the entire mtime sweep on every call, even when handed a cache that
     already holds the byte-identical report. ``FreshnessCache.get()``
-    was removed because it had no caller and could not have saved
-    anything — the key it took,
+    was removed on 2026-10-14 because it had no caller and could not
+    have saved anything — the key it took,
     ``(kind, binary_path, binary_mtime, source_mtime)``, is itself only
     computable by doing the work it would have skipped.
 
