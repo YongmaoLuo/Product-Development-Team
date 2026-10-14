@@ -680,6 +680,17 @@ def test_repair_content_generation_resumes_across_verification_rounds(
     """
     import repair_generator as rg
 
+    # The RED probe is not what this test is about, and leaving it on made
+    # the test's answer depend on the machine it ran on. The command above
+    # is a stand-in that names ``pytest``, which exists on a developer
+    # machine and does not exist on a CI runner (CI invokes
+    # ``.venv/bin/python3 -m pytest`` and never puts ``.venv/bin`` on
+    # PATH). With no ``pytest`` the probe exits 127, the command is
+    # correctly refused as "cannot start", and the generator spends extra
+    # calls re-asking for an acceptance command it is never going to get —
+    # so the call count this test asserts on was 6 on CI and 2 here.
+    monkeypatch.setenv(rg.RepairTaskGenerator.FALSIFIABILITY_PROBE_ENV, "1")
+
     tool = _tool(monkeypatch, _ok(json.dumps({"tasks": [{
         "failed_vp_id": "VP-009",
         "title": "修复 VP-009",
@@ -726,6 +737,13 @@ def test_a_second_plan_starts_a_fresh_session(monkeypatch, tmp_path):
     """The handle is keyed by plan, so one plan's repair history is not
     another plan's context.
     """
+    import repair_generator as rg
+
+    # Same reason as the case above: the RED probe is not under test here,
+    # and its verdict on a stand-in command that names ``pytest`` depends
+    # on whether the machine running this has ``pytest`` on PATH.
+    monkeypatch.setenv(rg.RepairTaskGenerator.FALSIFIABILITY_PROBE_ENV, "1")
+
     tool = _tool(monkeypatch, _ok(json.dumps({"tasks": [{
         "failed_vp_id": "VP-009",
         "title": "修复 VP-009",

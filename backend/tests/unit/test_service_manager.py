@@ -25,6 +25,7 @@ import signal
 import socket
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -589,19 +590,44 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _spawn_http_server(port: int, *, ignore_sigterm: bool = False) -> int:
-    """Start a detached `python -m http.server` on ``port``; return its
-    pid so the test can always clean up.
+class _StubServer(NamedTuple):
+    """What :func:`_spawn_http_server` actually brought up.
+
+    ``port`` is the port the child really bound, which is **not**
+    necessarily the port that was asked for: the helper retries on a fresh
+    port when the first one is taken. Both halves are returned together so
+    a caller cannot pair the right pid with the wrong port.
+
+    ``pid`` stays a plain int so it drops straight into
+    :func:`_force_cleanup` and ``sm.ServiceRuntime(...)`` unchanged.
+    """
+
+    pid: int
+    port: int
+
+
+def _spawn_http_server(port: int, *, ignore_sigterm: bool = False) -> _StubServer:
+    """Start a detached `python -m http.server`; return a :class:`_StubServer`
+    holding **the port it actually bound** plus its pid.
 
     Retries on a bind failure. The port was chosen by :func:`_free_port`,
     which closes its probe socket before returning — so between choosing
     and binding, the port is unowned and any other test running
-    concurrently can take it. That window is why these three tests failed
+    concurrently can take it. That window is why these tests failed
     intermittently in a full unit run while passing in isolation: the
     failure has nothing to do with the service-manager code under test.
 
+    The retry used to be invisible: the helper handed back only a pid, so
+    a caller kept reasoning about the port it had *asked for*. When a
+    retry had happened, the test connected its "lingering client" to the
+    squatter, built a ``ServiceRuntime`` pointing at the squatter's port,
+    and asked ``stop_service`` to free it — so ``port_free`` came back
+    False through no fault of the code under test. Returning the port
+    alongside the pid is what closes that; the bind itself still races,
+    but the caller is now told the truth about where it landed.
+
     See :func:`_free_port` for why the window cannot be closed from that
-    side; it is closed here instead, where the bind actually happens.
+    side.
     """
     import shlex
     import subprocess
@@ -689,7 +715,7 @@ def _spawn_http_server(port: int, *, ignore_sigterm: bool = False) -> int:
     deadline = _time.monotonic() + 20
     while _time.monotonic() < deadline:
         if sm.probe_port(port).listening:
-            return proc.pid
+            return _StubServer(proc.pid, port)
         _time.sleep(0.2)
     _force_cleanup(proc.pid)
     raise AssertionError(f"stub server on {port} never came up")
@@ -709,9 +735,46 @@ def _force_cleanup(pid: int) -> None:
 
 
 @pytest.mark.timeout(120)
+def test_spawn_http_server_reports_the_port_it_actually_bound():
+    """The helper must never hand back a pid without saying where it bound.
+
+    The flake this pins: when the port the caller picked was taken in the
+    gap before the child's bind, ``_spawn_http_server`` retried on a fresh
+    port and returned only the pid. Every caller then kept the port it had
+    *asked for* — so a test would connect its client to the squatter,
+    build a ``ServiceRuntime`` aimed at the squatter's port, and assert
+    the port came free after killing a process that had never been on it.
+
+    Holding the port here makes the retry deterministic instead of leaving
+    it to the scheduler, which is what turns that flake into a test.
+    """
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    squatted = holder.getsockname()[1]
+    try:
+        stub = _spawn_http_server(squatted)
+        try:
+            assert stub.port != squatted, (
+                f"expected the retry to move off the held port {squatted}, "
+                f"but the helper reported {stub.port}"
+            )
+            probe = sm.probe_port(stub.port)
+            assert probe.listening, f"nothing is listening on {stub.port}: {probe!r}"
+            assert stub.pid in probe.pids, (
+                f"the helper reported port {stub.port}, but its own pid "
+                f"{stub.pid} is not among the listeners {probe.pids}"
+            )
+        finally:
+            _force_cleanup(stub.pid)
+    finally:
+        holder.close()
+
+
+@pytest.mark.timeout(120)
 def test_stop_service_releases_a_real_port():
-    port = _free_port()
-    pid = _spawn_http_server(port)
+    stub = _spawn_http_server(_free_port())
+    pid, port = stub.pid, stub.port
     try:
         runtime = sm.ServiceRuntime(
             name="stub", port=port, pid=pid, pgid=sm._process_group_of(pid),
@@ -726,8 +789,8 @@ def test_stop_service_releases_a_real_port():
 
 @pytest.mark.timeout(180)
 def test_stop_service_escalates_when_sigterm_is_ignored():
-    port = _free_port()
-    pid = _spawn_http_server(port, ignore_sigterm=True)
+    stub = _spawn_http_server(_free_port(), ignore_sigterm=True)
+    pid, port = stub.pid, stub.port
     try:
         runtime = sm.ServiceRuntime(
             name="stubborn", port=port, pid=pid,
@@ -1194,12 +1257,18 @@ def test_reap_end_to_end_frees_a_real_port(tmp_path: Path):
 # probe runs it is guaranteed to be in CLOSE_WAIT. That makes these
 # deterministic, which is the point: a test that only fails one run in
 # twenty cannot tell you whether a fix worked.
+#
+# Both take their port from the `_StubServer` the spawn returned rather
+# than from `_free_port()` directly. That is what keeps them deterministic
+# under contention: the port they connect to, the port they build the
+# `ServiceRuntime` from, and the port the server really bound on are the
+# same number, whichever one the spawn ended up choosing.
 
 
 def test_stop_reports_the_port_free_despite_a_lingering_client(tmp_path):
     """A connected client is not a listener (T2)."""
-    port = _free_port()
-    pid = _spawn_http_server(port)
+    stub = _spawn_http_server(_free_port())
+    pid, port = stub.pid, stub.port
     client = socket.create_connection(("127.0.0.1", port), timeout=5)
     client_port = client.getsockname()[1]
     try:
@@ -1219,8 +1288,8 @@ def test_stop_reports_the_port_free_despite_a_lingering_client(tmp_path):
 
 def test_reap_clears_the_ledger_despite_a_lingering_client(tmp_path):
     """Same shape, through the reap path (T3)."""
-    port = _free_port()
-    pid = _spawn_http_server(port)
+    stub = _spawn_http_server(_free_port())
+    pid, port = stub.pid, stub.port
     client = socket.create_connection(("127.0.0.1", port), timeout=5)
     try:
         runtime = sm.ServiceRuntime(

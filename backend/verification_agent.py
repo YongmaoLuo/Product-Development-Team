@@ -22,7 +22,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional, List, Dict, Any
+from typing import Callable, Optional, List, Dict, Any, Tuple
 
 from coding_tool import (
     ClaudeCodingTool,
@@ -526,6 +526,171 @@ def _render_evidence_for_prompt(
 # working unchanged because ``VerificationAgent = Orchestrator`` at
 # the bottom of this module resolves the symbol for them.
 
+class _RebuildOutcome:
+    """What this round's ONE rebuild attempt produced for a key.
+
+    ``result`` is the :class:`binary_rebuild_agent.RebuildResult`;
+    ``error`` is set instead when the attempt itself raised. Both are
+    recorded even on failure, because the single-flight contract is
+    "attempted at most once per round, win or lose" — a failure must
+    not turn into a retry storm.
+
+    The error travels inside the outcome rather than as the future's
+    own exception on purpose: a leader that dies with no follower
+    attached would otherwise leave an unretrieved exception on a future
+    nobody awaits, which asyncio reports at GC time as a spurious
+    error on an otherwise healthy round.
+    """
+
+    __slots__ = ("result", "error")
+
+    def __init__(self, result: Any = None, error: Optional[BaseException] = None):
+        self.result = result
+        self.error = error
+
+    def unwrap(self) -> Any:
+        """The attempt's result, or re-raise the attempt's error."""
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class _BinaryRebuildCoordinator:
+    """Per-round single-flight for binary rebuilds.
+
+    N VPs in ONE round can all judge the same native library stale, each
+    spawn its own ``BinaryRebuildAgent``, and all run ``cargo build``
+    against the same ``target/debug``. cargo's artifact-directory file
+    lock turns those into a queue as deep as the VP count; while it is
+    queued not one VP emits a log line, and the watchdog fails the round
+    by design.
+
+    The build being slow is not the root cause. The root cause is that a
+    round had no notion of "this binary has already been rebuilt":
+    :class:`binary_freshness.FreshnessCache` memoises the *check* only,
+    and when a rebuild fails the binary's mtime is unchanged, so the
+    cache key is unchanged, so concurrent VPs all get the same cached
+    "stale" verdict and all go to rebuild. The cache amplified
+    concurrency here instead of collapsing it.
+
+    Semantics (one VP per round exists purely to rebuild; once it has
+    rebuilt, the VPs after it must not):
+
+      * key = ``(str(project_dir), kind)`` — the same two quantities the
+        stale verdict was derived from;
+      * the first caller to reach a key actually runs the rebuild, in
+        ``asyncio.to_thread`` (it shells out to cargo / maturin and can
+        spawn an LLM sub-agent; a synchronous call freezes every sibling
+        VP on the round's single event loop);
+      * callers arriving while it runs await the same future and get the
+        SAME ``RebuildResult`` object;
+      * a key runs at most once per round. Once it has run — succeeded or
+        failed — later VPs trigger no new rebuild, but they still run
+        their OWN ``check_binary_freshness``: fresh passes, stale is
+        BLOCKED.
+
+    Lifecycle: one instance on :class:`Orchestrator` (built in
+    ``__init__``), ``clear()``-ed at the top of every round by
+    :meth:`Orchestrator.run_full_verification`. The clear must happen
+    BEFORE the round-start preflight, or the preflight's own rebuild
+    looks like last round's residue, gets wiped, and the VPs of this
+    round get a second build.
+
+    The preflight arm (:meth:`Orchestrator._maybe_rebuild_before_service_start`)
+    uses :meth:`run_once_sync`: it runs before the loop exists, so it stays
+    synchronous — pinned by ``test_preflight_rebuild_really_runs_with_no_event_loop``
+    in ``tests/unit/test_verification_rebuild_offloop.py``. Both arms write
+    the same table, which is the whole point: a binary the preflight rebuilt
+    is not rebuilt again by a VP.
+    """
+
+    def __init__(self) -> None:
+        # key -> the one attempt that already finished (failed ones included).
+        self._done: Dict[Tuple[str, str], _RebuildOutcome] = {}
+        # key -> the in-flight attempt's future. The leader creates it,
+        # the followers await it.
+        self._inflight: Dict[Tuple[str, str], "asyncio.Future"] = {}
+
+    @staticmethod
+    def key_for(project_dir: Path, kind: str) -> Tuple[str, str]:
+        """The single-flight key: which binary family, in which project."""
+        return (str(project_dir), kind or "")
+
+    def attempted(self, key: Tuple[str, str]) -> bool:
+        """Whether this round already ran (or is running) a rebuild."""
+        return key in self._done or key in self._inflight
+
+    def clear(self) -> None:
+        """Start a new round. Called once per round by the orchestrator."""
+        self._done.clear()
+        self._inflight.clear()
+
+    async def run_once(self, key: Tuple[str, str], factory: Callable[[], Any]) -> Any:
+        """Run ``factory`` at most once per key per round; share the result.
+
+        Awaitable. The leader runs ``factory`` via ``asyncio.to_thread``;
+        concurrent callers await the leader's future and receive the
+        leader's own ``RebuildResult`` object.
+        """
+        done = self._done.get(key)
+        if done is not None:
+            return done.unwrap()
+
+        fut = self._inflight.get(key)
+        if fut is not None:
+            # ``shield`` is load-bearing: a follower being cancelled must
+            # not cancel the shared future out from under the other
+            # followers and the leader.
+            return (await asyncio.shield(fut)).unwrap()
+
+        fut = asyncio.get_event_loop().create_future()
+        self._inflight[key] = fut
+        try:
+            result = await asyncio.to_thread(factory)
+        except BaseException as exc:  # noqa: BLE001 — recorded, then re-raised
+            outcome = _RebuildOutcome(error=exc)
+            self._done[key] = outcome
+            if not fut.done():
+                fut.set_result(outcome)
+            self._inflight.pop(key, None)
+            raise
+        outcome = _RebuildOutcome(result=result)
+        self._done[key] = outcome
+        if not fut.done():
+            fut.set_result(outcome)
+        self._inflight.pop(key, None)
+        return result
+
+    def run_once_sync(self, key: Tuple[str, str], factory: Callable[[], Any]) -> Any:
+        """Synchronous arm for the preflight — no event loop is running.
+
+        Only reachable from :meth:`Orchestrator._maybe_rebuild_before_service_start`,
+        which ``run_full_verification`` calls BEFORE handing the round to
+        the executor, so no VP can be inside :meth:`run_once` yet and there
+        is nothing to share with. The record it writes is the one the VP
+        arms read.
+        """
+        done = self._done.get(key)
+        if done is not None:
+            return done.unwrap()
+        if key in self._inflight:
+            # Unreachable today (see above). If a refactor ever moves the
+            # preflight onto the loop, "do not start a second rebuild" is
+            # the conservative reading of the contract — but a sync caller
+            # cannot await the leader, so refuse rather than build twice.
+            raise RuntimeError(
+                f"binary rebuild already in flight for {key!r}; the "
+                f"synchronous preflight arm cannot join it"
+            )
+        try:
+            result = factory()
+        except BaseException as exc:  # noqa: BLE001 — recorded, then re-raised
+            self._done[key] = _RebuildOutcome(error=exc)
+            raise
+        self._done[key] = _RebuildOutcome(result=result)
+        return result
+
+
 class Orchestrator:
     """Three-phase verification orchestrator for quality assurance.
 
@@ -669,10 +834,25 @@ class Orchestrator:
         self._current_round = 0
 
         # Per-verification-round memoisation for the binary
-        # freshness check. Cleared at the start of each round by
-        # ``run_two_phase_loop`` so stale cache from a prior round
-        # never bleeds across rebuilds.
+        # freshness check.
+        #
+        # 2026-10-14: the comment that used to sit here claimed
+        # ``run_two_phase_loop`` cleared this at the start of each
+        # round. It never did — nothing in the codebase called
+        # ``FreshnessCache.clear()``, so one cache lived from ``__init__``
+        # until the orchestrator died and last round's stale verdict was
+        # carried into the next one. ``run_full_verification`` now calls
+        # ``clear()`` at the top of each round (see there).
         self._freshness_cache = FreshnessCache()
+
+        # 2026-10-14: at most ONE rebuild per
+        # (project, kind) per round, shared by the preflight arm and
+        # every VP arm. Before this, N VPs judging the same binary stale
+        # each ran their own BinaryRebuildAgent against the same
+        # target/debug, and cargo's file lock serialised them into a
+        # queue that starved the round. See
+        # :class:`_BinaryRebuildCoordinator`.
+        self._rebuild_coordinator = _BinaryRebuildCoordinator()
 
         # 2026-09-16 service-freshness preflight ("VP0") state. The
         # round-start preflight (``_preflight_service_freshness``)
@@ -4258,6 +4438,23 @@ class Orchestrator:
 
         self.start_verification_round(round_number)
 
+        # 2026-10-14：每一轮开头重置两个「本轮」状态。
+        #
+        # ``_freshness_cache`` 的 docstring 一直声称自己由 orchestrator
+        # 在轮次之间清空，但全仓没有任何一处调用 ``clear()`` —— 它从
+        # ``__init__`` 活到 orchestrator 析构，上一轮的 stale 判决会被带进
+        # 下一轮。现在这里真的清，文档与代码才对得上。
+        #
+        # ``_rebuild_coordinator`` 是本轮「同一二进制只重建一次」的依据。
+        #
+        # 顺序是承重的：这两行必须在下面的 round-start preflight **之前**。
+        # preflight 会通过 ``_maybe_rebuild_before_service_start`` 登记本轮的
+        # 那次重建；如果先清再 preflight 就对了，但如果把 clear 放到
+        # preflight 之后，preflight 的重建会被当成上一轮的残留抹掉，本轮的
+        # VP 就会拿到第二次重建。
+        self._freshness_cache.clear()
+        self._rebuild_coordinator.clear()
+
         plan_data = self.generate_verification_plan()
 
         # 2026-09-16 service-freshness preflight ("VP0"): before the
@@ -4355,8 +4552,23 @@ class Orchestrator:
             # wrapped in try/except so an unexpected error in the
             # freshness path never blocks VP execution; the operator
             # sees the warning in stderr instead.
+            #
+            # 2026-10-14（事件循环不再被重建冻死）：the two blocking calls
+            # here — ``check_binary_freshness`` (stat/git over the whole
+            # project) and ``attempt_intelligent_rebuild`` (fast-path
+            # ``cargo build`` + an LLM rebuild sub-agent that can run for
+            # minutes) — are dispatched through ``asyncio.to_thread``.
+            # This closure runs on the round's single event loop
+            # (``run_full_verification`` → ``asyncio.run(executor.run())``
+            # → ``BaseExecutor._execute_one_item``), so a synchronous call
+            # here freezes EVERY sibling VP: one VP waiting on a rebuild
+            # stalls the whole round for as long as the build takes, and
+            # the round then emits no log line at all until the watchdog
+            # fails it. The audit logging stays on the loop so the event
+            # ordering is unchanged.
             try:
-                freshness = check_binary_freshness(
+                freshness = await asyncio.to_thread(
+                    check_binary_freshness,
                     self.project_dir, cache=self._freshness_cache,
                 )
                 if freshness.is_stale:
@@ -4380,18 +4592,44 @@ class Orchestrator:
                     # system / venv / toolchain and rebuilds generically.
                     # The orchestrator independently re-checks freshness, so
                     # ``rebuild_result.success`` is trustworthy.
+                    #
+                    # 2026-10-14 (single-flight): this call goes through
+                    # ``_BinaryRebuildCoordinator``, so the FIRST VP to
+                    # reach this key builds and every other VP that
+                    # reaches it in the same round awaits that one attempt
+                    # and receives the SAME RebuildResult. Without it, N
+                    # VPs judging one stale binary start N rebuilds
+                    # against the same target/debug and cargo's artifact
+                    # file lock serialises them into a queue that starves
+                    # the round: N builds, a long silence, and a watchdog
+                    # CAS to failed.
+                    #
+                    # Only the REBUILD is single-flighted. The freshness
+                    # check above stays per-VP — it is cheap, and it is
+                    # each VP's own evidence for deciding BLOCKED. The
+                    # coordinator still runs its work in a thread.
                     from binary_rebuild_agent import attempt_intelligent_rebuild
                     from sub_agent_registry import sub_agent_registry
-                    rebuild_result = attempt_intelligent_rebuild(
-                        self.project_dir,
-                        freshness,
-                        coding_tool=self.coding_tool,
-                        plan_id=self.plan_dir.name,
-                        vp_id=vp_id,
-                        registry=sub_agent_registry,
+
+                    def _rebuild_this_vp() -> Any:
+                        return attempt_intelligent_rebuild(
+                            self.project_dir,
+                            freshness,
+                            coding_tool=self.coding_tool,
+                            plan_id=self.plan_dir.name,
+                            vp_id=vp_id,
+                            registry=sub_agent_registry,
+                        )
+
+                    rebuild_result = await self._rebuild_coordinator.run_once(
+                        self._rebuild_coordinator.key_for(
+                            self.project_dir, freshness.kind,
+                        ),
+                        _rebuild_this_vp,
                     )
                     if rebuild_result.success:
-                        freshness = check_binary_freshness(
+                        freshness = await asyncio.to_thread(
+                            check_binary_freshness,
                             self.project_dir, cache=self._freshness_cache,
                         )
                     if freshness.is_stale:
@@ -4527,10 +4765,11 @@ class Orchestrator:
     #
     # Two related entry points on this class:
     #
-    # 1. ``_binary_freshness_pre_check`` — runs synchronously in
-    #    ``_sub_agent_runner`` (above) BEFORE every VP. Returns the
-    #    ``FreshnessReport`` so the caller can decide to BLOCK on
-    #    a stale result.
+    # 1. ``_binary_freshness_pre_check`` — runs in ``_sub_agent_runner``
+    #    (above) BEFORE every VP, with its blocking calls dispatched via
+    #    ``asyncio.to_thread`` so the round's event loop keeps serving
+    #    the sibling VPs. Returns the ``FreshnessReport`` so the caller
+    #    can decide to BLOCK on a stale result.
     #
     # 2. ``_append_binary_freshness_result`` — the TDD-contract
     #    surface that mutates an existing ``verification_report.json``
@@ -4744,6 +4983,23 @@ class Orchestrator:
         Shared by both preflight paths. Never raises — a rebuild failure
         is logged and the caller proceeds; the per-VP freshness check
         will retry it with the full rebuild agent.
+
+        2026-10-14 (single-flight): the rebuild is registered in the
+        round's ``_BinaryRebuildCoordinator`` like any VP arm would be,
+        so the VPs dispatched after this point can SEE it. That
+        visibility is the semantics the round is built on: preflight
+        rebuilds once, and the VPs after it do not rebuild again — they
+        just re-check freshness and block if it is still stale.
+
+        The call stays synchronous. ``run_full_verification`` reaches
+        this before the round's event loop exists, so there is no loop
+        to starve and nothing to await yet; that fact is pinned by
+        ``test_preflight_rebuild_really_runs_with_no_event_loop`` in
+        ``tests/unit/test_verification_rebuild_offloop.py``. (The old
+        "the per-VP freshness check will retry it" promise above no
+        longer holds after a FAILED preflight rebuild: that is the
+        single-flight contract, and it is what stops the 20-VP retry
+        storm.)
         """
         freshness = check_binary_freshness(
             self.project_dir, cache=self._freshness_cache,
@@ -4764,13 +5020,22 @@ class Orchestrator:
         )
         from binary_rebuild_agent import attempt_intelligent_rebuild
         from sub_agent_registry import sub_agent_registry
-        rebuild_result = attempt_intelligent_rebuild(
-            self.project_dir,
-            freshness,
-            coding_tool=self.coding_tool,
-            plan_id=self.plan_dir.name,
-            vp_id="__preflight__",
-            registry=sub_agent_registry,
+
+        def _rebuild_for_services() -> Any:
+            return attempt_intelligent_rebuild(
+                self.project_dir,
+                freshness,
+                coding_tool=self.coding_tool,
+                plan_id=self.plan_dir.name,
+                vp_id="__preflight__",
+                registry=sub_agent_registry,
+            )
+
+        rebuild_result = self._rebuild_coordinator.run_once_sync(
+            self._rebuild_coordinator.key_for(
+                self.project_dir, freshness.kind,
+            ),
+            _rebuild_for_services,
         )
         self._safe_log_freshness_event(
             "__preflight__", "binary_rebuild_attempted",

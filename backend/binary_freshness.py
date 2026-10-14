@@ -170,9 +170,23 @@ class FreshnessCache:
 
     Cache key: ``(kind, binary_path, binary_mtime, source_mtime)``.
     A second call with the same tuple returns the cached
-    :class:`FreshnessReport` without re-stat'ing. The cache lives
-    for one verification round and is cleared by
-    :meth:`clear` between rounds (called from the orchestrator).
+    :class:`FreshnessReport` without re-stat'ing.
+
+    Lifetime, stated as of 2026-10-14 because it was previously
+    mis-stated: the instance is created once in
+    ``Orchestrator.__init__`` and lives until that orchestrator is
+    discarded, and ``Orchestrator.run_full_verification`` calls
+    :meth:`clear` at the top of every round. An earlier version of this
+    docstring claimed the orchestrator already did that — it did not,
+    ``clear()`` had no caller in the codebase at all, so last round's
+    stale verdict could be carried into the next one.
+
+    This memoises the CHECK only. It has nothing to say about the
+    rebuild that may follow, and it cannot: a rebuild that fails leaves
+    the binary's mtime untouched, so the key is unchanged and N
+    verification points all receive the same cached "stale" verdict.
+    Collapsing that fan-out is the job of
+    ``verification_agent._BinaryRebuildCoordinator``.
     """
 
     def __init__(self) -> None:
