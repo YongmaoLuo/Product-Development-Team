@@ -1,7 +1,7 @@
 """2026-10-14 (operator contract): a round parked on a closed quota
 window must not be read as a dead one, and the hard ceiling is 1 hour.
 
-Production evidence — the 2026-10-12 production plan
+Production evidence — a 2026-10-12 plan,
 round 1, where a healthy, ultimately-successful round was killed 7 min
 before it finished:
 

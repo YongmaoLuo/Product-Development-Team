@@ -343,8 +343,8 @@ VERIFICATION_WATCHDOG_STALENESS_SECONDS = float(
 # than absolute; ``VERIFICATION_HARD_STALE_SECONDS`` can still override it.
 #
 # 2026-10-14 (operator contract): the hard ceiling is 1 HOUR, raised
-# from the 45 min this default used to produce. Production, plan
-# the 2026-10-12 production plan round 1: a healthy round
+# from the 45 min this default used to produce. Production, a
+# 2026-10-12 plan, round 1: a healthy round
 # was killed 7 min before it finished, purely because the gap in its
 # round log had not closed yet.
 #

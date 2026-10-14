@@ -291,7 +291,7 @@ class TaskRefiner:
 
         Send-only-what-you-refine contract (a 2026-10-14 production
         plan). The task list used to go out verbatim as
-        ``json.dumps(tasks, indent=2)``. On the that plan's repair round
+        ``json.dumps(tasks, indent=2)``. On that repair round
         that was 298,664 chars of a 310,182-char prompt — 96% of the
         context, and all of it had to be copied back verbatim because
         the old system prompt said "include ALL tasks ... NEVER drop

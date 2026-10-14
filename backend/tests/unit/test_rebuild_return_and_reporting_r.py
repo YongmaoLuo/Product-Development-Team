@@ -1,6 +1,6 @@
 """Rebuild: file a lost report honestly instead of as "nothing ran" (task R).
 
-2026-10-14, the 2026-10-12 production plan round 1
+2026-10-14, a 2026-10-12 production plan, round 1
 (``logs/verification_1_20261014_102843.log``)::
 
     10:34:30  the rebuild agent ran maturin

@@ -1,7 +1,7 @@
 """
 The refiner is told only what it is refining, and returns only a delta.
 
-Background (a 2026-10-14 production plan, that plan's repair round):
+Background (a 2026-10-14 production plan, its repair round):
 
   Context size: prompt=103394 sys=952 total=104346 tokens (~310182 chars)
 
@@ -44,7 +44,7 @@ from refiner import TaskRefiner  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Fixture: the plan shape, at the plan size.
+# Fixture: that plan's shape, at that plan's size.
 # ---------------------------------------------------------------------------
 
 #: Only ever present in the description of task "42", which is unrelated
@@ -74,7 +74,7 @@ def _make_task(task_id: str, **overrides) -> dict:
         "status": "pending",
         "updated_time": "2026-10-14 10:00:00",
         "failure_reason": None,
-        "project_dir": "/tmp/sample-project",
+        "project_dir": "/tmp/rebuild-plan",
         "model_type": "medium",
         "depends_on": [],
         "breakdown_count": 0,
@@ -120,7 +120,7 @@ def _build_prompt(tasks: list, last_task_id: str = FAILED_TASK_ID) -> str:
     """The exact string ``refine()`` hands to the LLM."""
     refiner = TaskRefiner(coding_tool=MagicMock())
     return refiner._build_refiner_context(
-        requirement="Build a sample analysis platform.",
+        requirement="Build an analysis platform.",
         tasks=tasks,
         last_coder_response="coder wrote 400 lines, then AssertionError",
         last_result="FAILED: 1 failed, 3 passed",
@@ -144,7 +144,7 @@ def _run_refine(tasks: list, reply, last_task_id: str = FAILED_TASK_ID) -> list:
     refiner = TaskRefiner(coding_tool=MagicMock())
     refiner.coding_tool.query_json.return_value = {"tasks": copy.deepcopy(reply)}
     return refiner.refine(
-        requirement="Build a sample analysis platform.",
+        requirement="Build an analysis platform.",
         tasks=copy.deepcopy(tasks),
         last_coder_response="coder wrote 400 lines, then AssertionError",
         last_result="FAILED: 1 failed, 3 passed",
@@ -175,7 +175,7 @@ def test_current_tasks_section_and_whole_prompt_are_small():
     prompt = _build_prompt(tasks)
     section = _current_tasks_section(prompt)
 
-    assert len(tasks) == N_TASKS, "fixture must stay at production-plan scale"
+    assert len(tasks) == N_TASKS, "fixture must stay at production scale"
     assert max(len(t["description"]) for t in tasks) >= 6_000, (
         "fixture must keep at least one description >= 6,000 chars, "
         "otherwise the projection is not measured against the thing "

@@ -1570,7 +1570,7 @@ def _lazy_check_verification(plan_id: str) -> None:
             # reason and the same class of bug — a phase that is busy
             # but does not write the file this watchdog reads.
             #
-            # Production, the 2026-10-12 production plan
+            # Production, a 2026-10-12 plan,
             # round 1: the round log went silent for 52 min and the
             # watchdog killed a healthy round with ``verification_log_stale``
             # at the 45-min hard ceiling, 7 min before the round actually
@@ -3225,8 +3225,8 @@ def _split_parent_ids(all_tasks: Dict[str, Dict[str, Any]]) -> set:
     A breakdown writes ``f"{parent}-{n}"`` children and, depending on the
     run, either deletes the parent's row (``refiner_structure`` 2026-10-05)
     or leaves it at ``failed`` beside children that already ran. Both
-    shapes are in the live database right now: plan
-    the 2026-10-12 production plan has ``repair-r1-01``
+    shapes are in the live database right now: a
+    2026-10-12 plan has ``repair-r1-01``
     removed with ``repair-r1-01-1/-2/-3`` present, while
     ``the 2026-10-04 plan`` still carries ``repair-r1-01`` at
     ``failed`` next to its own children, and
@@ -3398,7 +3398,7 @@ def _get_pending_repair_tasks(
         so it can be revived at all. What still reads NULL is every child
         written before that change — all 24 of them in the live database,
         e.g. ``repair-r1-01-1`` in
-        the 2026-10-12 production plan — and nothing
+        a 2026-10-12 production plan — and nothing
         backfills those, so this exclusion is the load-bearing rule for
         them, not a formality.
     """

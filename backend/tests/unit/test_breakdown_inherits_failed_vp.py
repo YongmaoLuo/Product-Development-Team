@@ -12,7 +12,7 @@ by the orchestrator when it *generates* a repair task
 (``repair_generator.RepairTaskAssembler``); the refiner *splits* one and
 authors only content, so all 24 breakdown children in the live database
 read NULL — including ``repair-r1-01-1/-2/-3`` in
-the 2026-10-12 production plan, whose own titles and
+a 2026-10-12 production plan, whose own titles and
 descriptions name the VP they are working on ("原 repair-r1-01 的判定被宿主
 进程状态左右…"). A child that failed was therefore stranded exactly the way
 the parent used to be, one level down.

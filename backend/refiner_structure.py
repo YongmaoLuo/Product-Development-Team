@@ -130,7 +130,7 @@ def inherit_failed_vp(
     ``failed_vp_id``: the refiner authors their content, and the field is
     stamped by the orchestrator when it *generates* a repair task. All 24
     such rows in the live database read NULL (``repair-r1-01-1`` in
-    the 2026-10-12 production plan is the worked example), and
+    a 2026-10-12 production plan is the worked example), and
     ``verification_loop._get_pending_repair_tasks`` revives a ``failed``
     row only when its VP is in this round's failure set — so a child that
     failed was stranded exactly the way the deleted parent used to be.
