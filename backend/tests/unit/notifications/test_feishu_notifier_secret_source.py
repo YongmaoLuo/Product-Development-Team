@@ -58,7 +58,7 @@ def _card() -> dict:
     return {
         "header": {"title": {"content": "验收完成"}},
         "plan_id_tag": "p1",
-        "sections": [{"text": {"content": "run 1.0 done!"}}],
+        "elements": [{"tag": "div", "text": {"content": "run 1.0 done!"}}],
     }
 
 

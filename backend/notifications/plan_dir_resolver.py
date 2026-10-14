@@ -128,7 +128,7 @@ STARTUP_SWEEP_MAX_AGE_DAYS: float = float(
 #:
 #: **刻意锚定前缀, 不用 scheduler 那种宽子串规则。** 宽子串规则
 #: (``"test" in plan_id or "vp" in plan_id``) 会连日期前缀的真实计划
-#: 日期前缀的真实计划一起扫进去。通知器侧的误判代价是"真实卡片永远不刷新",
+#: 一起扫进去。通知器侧的误判代价是"真实卡片永远不刷新",
 #: 方向比 scheduler 侧更危险, 所以窄一点。锚定后剩下的命中全是真夹具形状
 #: (``vp-*`` / ``vp001-*`` / ``resume-test-*`` / ``project_vp016-*`` …)。
 _FIXTURE_ID_RE = re.compile(

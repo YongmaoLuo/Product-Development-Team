@@ -65,6 +65,7 @@ MODULE_PATH = BACKEND_DIR / "credentials.py"
 _ENV_KEYS = (
     "PDT_DISABLE_KEYCHAIN_SECRETS",
     "PDT_KEYCHAIN_PATH",
+    "PDT_SECRET_READER_PATH",
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
     "TELEGRAM_CHAT_ID",
@@ -368,15 +369,21 @@ def test_keychain_disabled_falls_back_to_the_environment(
 def test_keychain_enabled_with_index_key_selects_the_keychain(
     monkeypatch, name, index_key
 ):
-    """The keychain is the source whenever it is enabled and the index is set.
+    """The keychain read is aimed by the index key, and not by the env.
 
     The index key is a non-secret identifier, so leaving it in the
     environment is what makes a keychain deployment possible at all.
-    When both the switch and the index are in place the secret comes
-    from the keychain and *not* from the environment variable, even
-    when that variable also happens to hold a value — otherwise the
-    keychain would be decorative on exactly the machines that
+    When both the switch and the index are in place the direct read
+    comes from the keychain and *not* from the environment variable,
+    even when that variable also happens to hold a value — otherwise
+    the keychain would be decorative on exactly the machines that
     configured it.
+
+    ``read_secret`` is deliberately not asserted here any more. The
+    server does not read the keychain — a launcher reads it once and
+    hands the value over a pipe (:mod:`backend.secret_launcher`) — so
+    the caller that still builds this command line is the direct read
+    named below, and it is the one whose argv this test is about.
 
     The read is stubbed at the process boundary, which is where the
     only part of this that belongs to a machine rather than to a
@@ -389,9 +396,17 @@ def test_keychain_enabled_with_index_key_selects_the_keychain(
     says which tool was asked, for which key, in which keychain file,
     and the value that comes back is the stub's rather than the
     ``"plaintext"`` sitting in the environment variable beside it.
+
+    A reader is configured because none is optional any more: with
+    ``PDT_SECRET_READER_PATH`` unset the module issues no read at all
+    (see ``test_no_reader_starts_no_process`` below), so a test that
+    wants a command line to record has to be a deployment that set one.
+    Which reader it set is not what this test is about — the index key
+    is — so the value is the shared literal above.
     """
     monkeypatch.setenv("PDT_DISABLE_KEYCHAIN_SECRETS", "0")
     monkeypatch.setenv(index_key, "account-value")
+    monkeypatch.setenv("PDT_SECRET_READER_PATH", CONFIGURED_READER)
     monkeypatch.setenv(
         credentials.SECRET_SPECS[name].fallback_env_key, "plaintext"
     )
@@ -404,13 +419,11 @@ def test_keychain_enabled_with_index_key_selects_the_keychain(
 
     monkeypatch.setattr(credentials, "_run_security", _recording_run_security)
 
-    assert credentials.secret_source(name) == "keychain"
-    assert credentials.secret_available(name) is True
-    assert credentials.read_secret(name) == "the-keychain-value"
+    assert credentials.read_secret_from_keychain(name) == "the-keychain-value"
 
-    # One read, and it is the one this test describes: the keychain
-    # tool, asked for the item named by the index variable, in the
-    # dedicated keychain file.
+    # One read, and it is the one this test describes: the configured
+    # keychain reader, asked for the item named by the index variable, in
+    # the dedicated keychain file.
     #
     # The last argument is spelled out rather than read back from
     # ``credentials._keychain_file()``. That call would make this the
@@ -424,7 +437,7 @@ def test_keychain_enabled_with_index_key_selects_the_keychain(
     # keychain and this line goes red.
     assert len(started) == 1, f"expected one keychain read, got {started}"
     assert started[0] == [
-        "/usr/bin/security",
+        CONFIGURED_READER,
         "find-generic-password",
         "-a",
         "account-value",
@@ -590,6 +603,16 @@ def test_module_constants_are_typed_strings():
 #: drift this file is pinned against.
 DEDICATED_KEYCHAIN_FILE = "Library/Keychains/runtime-secrets.keychain-db"
 
+#: The binary a *configured* deployment reads through, spelled out here
+#: rather than derived from anything. ``_secret_reader_bin`` returns
+#: ``None`` when nothing is configured — there is no fallback to the
+#: system tool — so a test that wants to watch a command line being
+#: built has to configure a reader first. Deriving the expected argv
+#: element from ``credentials._secret_reader_bin()`` would make the
+#: assertion compare the module's answer with itself, which is the shape
+#: of drift the two constants above exist to catch.
+CONFIGURED_READER = "/opt/pdt/tools/pdt-secret-reader/build/pdt-secret-reader"
+
 
 def test_default_keychain_is_a_dedicated_one_and_never_the_login_keychain():
     """The named keychain holds this project's secrets and nothing else.
@@ -706,11 +729,19 @@ def test_override_branch_reaches_the_command_line_as_spelled(
     somewhere else. Set must open the override, or the variable is
     decorative. A regression in either direction now moves an ``argv``,
     which is the artefact this suite is willing to call evidence.
+
+    A reader is configured here because there is no longer a default one
+    to fall back to — see ``test_no_reader_starts_no_process`` — so a
+    recorded ``argv`` is only reachable for a deployment that set one.
+    It is the same literal in every branch, which is also what keeps this
+    test about the *keychain* half of the command line rather than about
+    the binary, as it was before the fallback was removed.
     """
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PDT_DISABLE_KEYCHAIN_SECRETS", "0")
     monkeypatch.setenv("FEISHU_APP_ID", "account-value")
+    monkeypatch.setenv("PDT_SECRET_READER_PATH", CONFIGURED_READER)
 
     started = []
 
@@ -725,13 +756,13 @@ def test_override_branch_reaches_the_command_line_as_spelled(
         # a look again; without this the second read would replay the
         # first one's answer and the override would never reach a process.
         credentials.reset_cache()
-        assert credentials.read_secret("feishu_app_secret") == "the-keychain-value"
+        assert credentials.read_secret_from_keychain("feishu_app_secret") == "the-keychain-value"
         return started[-1]
 
     # Spelled here rather than read from the module, for the reason given
     # in the test above this one.
     expected_prefix = [
-        "/usr/bin/security",
+        CONFIGURED_READER,
         "find-generic-password",
         "-a",
         "account-value",
@@ -773,6 +804,214 @@ def test_override_branch_reaches_the_command_line_as_spelled(
         assert "login" not in argv[-1].lower(), (
             f"the read was pointed at the login keychain: {argv[-1]!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Which binary performs the read
+# ---------------------------------------------------------------------------
+
+
+def test_no_reader_starts_no_process(monkeypatch):
+    """No reader configured means no read is issued — through *any* binary.
+
+    This is the assertion the whole change turns on, and the load-bearing
+    half of it is the process count rather than the return value. A
+    fallback to ``/usr/bin/security`` would still report ``"missing"`` on
+    a machine where the system tool is denied, or succeed outright where
+    it is not, so a test that only checked the answer would pass against
+    the old implementation and prove nothing.
+
+    ``subprocess.run`` is stubbed as well as ``_run_security``, because
+    the lock probe calls it directly and bypasses the other one — with it
+    recorded, "nothing was started" is a fact about this call rather
+    than about the module's autouse fixture.
+
+    Everything else here is arranged to make a read *attemptable*: the
+    switch is on and the index is set. That is deliberate. The state
+    being pinned is "a deployment that turned the keychain on and never
+    configured a reader", and that is the deployment the fallback used
+    to hide — its reads went through the system tool, the answers came
+    back, and nothing said the ACL it thought it had narrowed was not the
+    thing answering.
+    """
+    monkeypatch.setenv("PDT_DISABLE_KEYCHAIN_SECRETS", "0")
+    monkeypatch.setenv("FEISHU_APP_ID", "account-value")
+
+    started = []
+
+    def _recording_run_security(argv, timeout):
+        started.append(list(argv))
+        return b"the-keychain-value\n"
+
+    monkeypatch.setattr(credentials, "_run_security", _recording_run_security)
+
+    monkeypatch.setattr(
+        credentials.subprocess,
+        "run",
+        lambda argv, *a, **kw: started.append(list(argv)),
+    )
+
+    assert credentials._secret_reader_bin() is None, (
+        "no reader is configured and the code still named a binary; the "
+        "only candidate is /usr/bin/security, which every process on this "
+        "machine may run and which reads keychain items whose access "
+        "control lists exist so that something else cannot"
+    )
+
+    # None, not "", and "missing" — a read that was refused is not a read
+    # that returned an empty secret, and a caller that asked "is this
+    # configured" has to be able to tell.
+    assert credentials.read_secret_from_keychain("feishu_app_secret") is None
+    assert credentials.publish_secret_fd("feishu_app_secret") is None
+    assert credentials.secret_source("feishu_app_secret") == "missing"
+    assert credentials.secret_available("feishu_app_secret") is False
+
+    assert started == [], f"a keychain process was started anyway: {started}"
+    for argv in started:
+        assert credentials._SECURITY_BIN not in argv, (
+            f"the read went to {_SECURITY_BIN}: {argv!r}"
+        )
+
+    # And it says so, by name, on demand — the third thing an operator
+    # needs told apart, and the one this branch used to be invisible for.
+    reason = credentials.diagnose_secret("feishu_app_secret")
+    assert reason is not None, "an unreadable secret diagnosed as configured"
+    assert "PDT_SECRET_READER_PATH" in reason
+    assert "/usr/bin/security" in reason, (
+        "the sentence must say what it refuses to fall back to, or the "
+        f"operator looks for the item instead: {reason!r}"
+    )
+
+
+def test_an_empty_reader_path_is_no_reader_either(monkeypatch):
+    """An empty value names no binary, and that now means no read.
+
+    Both wrong answers are worse than "no reader": handing ``""`` to
+    ``subprocess.run`` is a failed spawn on every lookup, and the
+    fallback this replaced was the opposite failure — a *successful* read
+    through a tool nobody chose. Both report as "this secret is not
+    configured", for a variable somebody emptied on purpose.
+    """
+    monkeypatch.setenv("PDT_SECRET_READER_PATH", "")
+
+    assert credentials._secret_reader_bin() is None
+    assert credentials.read_secret_from_keychain("feishu_app_secret") is None
+
+
+def test_a_reader_named_but_not_executable_is_reported_as_its_own_problem(
+    monkeypatch, tmp_path
+):
+    """Configured-but-broken is not the same sentence as not configured.
+
+    Two deployments, two different fixes, and both reach the same
+    ``"missing"`` — so this pins that ``diagnose_secret`` still tells them
+    apart, and names the path it could not use. The read itself still
+    goes through whatever was named (a missing binary is an ``OSError``
+    inside ``_run_security``, which reports "no value" like any other
+    failure); the check belongs to the diagnostic, because that is the
+    function whose job is to say which of the three went wrong.
+    """
+    absent = str(tmp_path / "not-built" / "pdt-secret-reader")
+    monkeypatch.setenv("PDT_DISABLE_KEYCHAIN_SECRETS", "0")
+    monkeypatch.setenv("FEISHU_APP_ID", "account-value")
+    monkeypatch.setenv("PDT_SECRET_READER_PATH", absent)
+
+    # The first of the two "configured but wrong" cases, and the one a
+    # half-finished `setup.sh build` leaves behind. The switch and the
+    # index are arranged so that this branch is reached at all: they are
+    # the two earlier sentences, and this one is only about what comes
+    # after them.
+    reason = credentials.diagnose_secret("feishu_app_secret")
+    assert reason is not None
+    assert "PDT_SECRET_READER_PATH" in reason
+    assert absent in reason, (
+        f"the sentence must name the path it could not use: {reason!r}"
+    )
+    assert "is not set" not in reason, (
+        "a configured reader reported as unset sends the operator to write "
+        f"the variable that is already written: {reason!r}"
+    )
+
+
+def test_the_reader_override_reaches_the_command_line(monkeypatch, tmp_path):
+    """The override changes the binary, and nothing else about the read.
+
+    Asserted on the whole recorded argv rather than on the helper's
+    return value, for the reason the keychain-path test above gives: a
+    command line is the only one of the three facts — constant, helper
+    return, executed argv — that can be read off a record without
+    importing anything. The point of the override is that a deployment
+    can change *which code its ACL trusts* without changing anything
+    else, and an argv assertion is what shows that nothing else moved.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PDT_DISABLE_KEYCHAIN_SECRETS", "0")
+    monkeypatch.setenv("FEISHU_APP_ID", "account-value")
+    reader = str(tmp_path / "somewhere" / "pdt-secret-reader")
+    monkeypatch.setenv("PDT_SECRET_READER_PATH", reader)
+
+    started = []
+
+    def _recording_run_security(argv, timeout):
+        started.append(list(argv))
+        return b"the-keychain-value\n"
+
+    monkeypatch.setattr(credentials, "_run_security", _recording_run_security)
+
+    credentials.reset_cache()
+    assert (
+        credentials.read_secret_from_keychain("feishu_app_secret")
+        == "the-keychain-value"
+    )
+
+    assert started == [[
+        reader,
+        "find-generic-password",
+        "-a",
+        "account-value",
+        "-w",
+        str(home / DEDICATED_KEYCHAIN_FILE),
+    ]], started
+
+
+def test_the_lock_probe_keeps_the_system_tool(monkeypatch):
+    """A narrowed ACL must not blind the probe that explains a miss.
+
+    The probe runs ``show-keychain-info`` — a question about the
+    *container*, not about an item — so no ACL entry is consulted, and
+    the system tool answers it on every deployment, including one whose
+    ACL has stopped trusting ``security`` for a read.
+
+    Redirecting it would mean a reader of ours had to reimplement
+    ``show-keychain-info`` before it was usable at all. Worse, a probe
+    that could not run reports ``KEYCHAIN_UNAVAILABLE`` — "the tool could
+    not be run" — for what is actually a locked keychain, which is the
+    one message an operator most needs to be told correctly and the one
+    that sends them somewhere they cannot fix it from.
+    """
+    monkeypatch.setenv("PDT_SECRET_READER_PATH", "/somewhere/pdt-secret-reader")
+    monkeypatch.setattr(credentials, "_is_macos", lambda: True)
+
+    started = []
+
+    class _Completed:
+        returncode = 0
+
+    def _recording_run(argv, *args, **kwargs):
+        started.append(list(argv))
+        return _Completed()
+
+    monkeypatch.setattr(credentials.subprocess, "run", _recording_run)
+
+    credentials._keychain_state()
+
+    assert started, "the lock probe started no process"
+    assert started[0][0] == credentials._SECURITY_BIN, (
+        "the lock probe followed PDT_SECRET_READER_PATH, so a deployment "
+        "whose ACL names a reader of its own would report an unrunnable "
+        "tool instead of a locked keychain"
+    )
 
 
 def test_no_subprocess_on_a_non_macos_platform(monkeypatch):

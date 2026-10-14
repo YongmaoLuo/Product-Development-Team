@@ -1,7 +1,6 @@
 """The card header and body must never contradict each other.
 
-2026-10-05, observed on a real plan (``a private plan``)
-during its round-1 repair execution:
+Observed on a real plan during its round-1 repair execution:
 
   * ``plan_routing.verification``      → ``{"status": "failed", round: 1}``
   * ``plan_verification``              → ``verification_status='running'``,

@@ -333,8 +333,29 @@ def test_the_previous_test_published_a_secret_and_left_the_read_end_open(
     because the descriptor this work derives is the one the provider
     hands out — a test of a stand-in pipe would pass while the real
     handoff leaked.
+
+    The value is made to come from a stubbed **keychain**, not from an
+    environment variable. ``publish_secret_fd`` is the launcher's read
+    and the launcher reads the keychain; setting ``FEISHU_APP_SECRET``
+    and expecting a descriptor back is the shape the provider had before
+    the handoff moved. The descriptor is what this test is about either
+    way.
     """
-    monkeypatch.setenv("FEISHU_APP_SECRET", canary("feishu_secret", tmp_path))
+    secret = canary("feishu_secret", tmp_path)
+    # The index too: a keychain read is aimed *by* the account, and with
+    # none set the provider answers "missing" without ever running the
+    # stubbed tool — which would make this test pass for the wrong
+    # reason (no descriptor leaked because none was ever opened).
+    monkeypatch.setenv(
+        credentials.SECRET_SPECS["feishu_app_secret"].account_env_key,
+        "test-account-for-the-fixture",
+    )
+    monkeypatch.setattr(
+        credentials,
+        "_run_security",
+        lambda argv, timeout: secret.encode("utf-8") + b"\n",
+    )
+    credentials.reset_cache()
 
     fd = credentials.publish_secret_fd("feishu_app_secret")
     assert fd is not None, "no secret to publish, so no descriptor to leak"

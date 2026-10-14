@@ -1914,11 +1914,15 @@ jobs:
       #
       # ``test_credentials_security_lookup.py`` covers the read itself
       # (the argv, a nonzero exit for an item that is not there, a
-      # trailing newline, a tool that hangs); the cache invariants
-      # cover what happens when the same lookup is asked twice.
+      # trailing newline, a tool that hangs); ``test_secret_launcher_publish``
+      # covers what happens when the same lookup is asked twice. That
+      # second invariant used to live in ``test_credentials_cache_invariants``,
+      # which counted the processes the *server* started — and the server
+      # starts none any more, so the counter moved to the launcher, which
+      # is the process that reads.
       - name: Run the macOS keychain probes
         working-directory: backend
-        run: ./.venv/bin/python3 -m pytest tests/integration/test_credentials_security_lookup.py tests/integration/test_credentials_cache_invariants.py --tb=short --timeout=300
+        run: ./.venv/bin/python3 -m pytest tests/integration/test_credentials_security_lookup.py tests/integration/test_secret_launcher_publish.py --tb=short --timeout=300
 
       # The whole delivery, end to end, with nothing replaced. The step
       # above proves the command line this repository *believes* in reaches
@@ -1978,6 +1982,38 @@ jobs:
         env:
           PDT_REQUIRE_KEYCHAIN_E2E: "1"
         run: ./.venv/bin/python3 -m pytest tests/e2e/test_keychain_full_delivery_macos.py --tb=short --timeout=300
+
+      # The acceptance walk, on the same terms. ``e2e-on-demand`` collects
+      # this file — it declares ``pytestmark = pytest.mark.e2e`` — but it
+      # runs on ``ubuntu-latest``, where the five cases marked
+      # ``_requires_macos_keychain`` skip. A skip is not a pass: it is the
+      # same "green because nothing ran" shape the job above exists to
+      # close, one file over. These cases read a real keychain through the
+      # real tool and then check every consumer in the chain answers
+      # "configured" without the value appearing in any environment.
+      #
+      # Hermetic for the same reason the step above is: the cases build
+      # their own keychain under ``tmp_path`` with ``$HOME`` redirected at
+      # it and refuse to delete anything that is not under that root, so
+      # this job never reads or writes the runner's own keychain. Same
+      # gate as ``backend/tests/static_gates/
+      # test_real_home_touching_tests_cleanup.py`` enforces for the
+      # create-under-a-real-home cases.
+      #
+      # ``PDT_REQUIRE_CREDENTIAL_CHAIN_E2E`` is this file's own strict
+      # switch — a different name from the one above because these are two
+      # files with two gates, each closed independently. It turns "this
+      # runner cannot start /usr/bin/security" from a skip into a failure,
+      # which is the correct reading on the one lane in this workflow that
+      # *should* have a keychain. The switch name and its accepted values
+      # are read out of the test file itself by
+      # ``tests/static_gates/test_keychain_macos_job_is_a_merge_gate.py``,
+      # not copied here.
+      - name: Run the macOS credential-chain acceptance (real keychain, every consumer)
+        working-directory: backend
+        env:
+          PDT_REQUIRE_CREDENTIAL_CHAIN_E2E: "1"
+        run: ./.venv/bin/python3 -m pytest tests/e2e/test_credential_chain_acceptance.py --tb=short --timeout=300
 
       - name: Upload keychain E2E report
         if: always()
