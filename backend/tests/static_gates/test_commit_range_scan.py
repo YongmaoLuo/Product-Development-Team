@@ -326,10 +326,12 @@ def test_every_rule_has_the_shared_signature() -> None:
 def test_the_registry_covers_every_privacy_rule() -> None:
     """A rule silently dropped from the registry is a rule not enforced.
 
-    The set grew from three to five on 2026-10-14, when the plan-id and
-    private-name rules were added after the 2026-09-29 publication. The
-    assertion is still an equality, so a sixth rule still has to be added
-    here deliberately rather than appearing in one scan and not the other.
+    The set was five from 2026-10-14, when the plan-id and private-name
+    rules were added after the 2026-09-29 publication, and went back to
+    four the same day when the private-name rule moved out of the
+    repository. The assertion is still an equality, so a fifth rule still
+    has to be added here deliberately rather than appearing in one scan and
+    not the other.
     """
     labels = {label for label, _ in commit_range_scan.RANGE_RULES}
     assert labels == {
@@ -337,8 +339,38 @@ def test_the_registry_covers_every_privacy_rule() -> None:
         "operator attribution",
         "local measurement",
         "plan id in source",
-        "private name",
     }, f"the registry no longer covers every privacy rule: {sorted(labels)}"
+
+
+def test_the_private_name_rule_is_not_in_the_registry() -> None:
+    """It moved out of the repository, and a needle cannot be imported.
+
+    The rule used to be the fifth entry here, calling ``find_private_names``
+    from ``test_no_private_names_in_source.py``. Its needles were literals
+    in a *tracked* file, so enforcing it meant committing the names it
+    exists to keep out -- and it only ran wherever pytest ran, which is
+    after the text is already in a commit.
+
+    It is now ``scripts/scanners/scan_forbidden_names.py`` over an
+    untracked ``.config/forbidden-names``, run by ``scan_commit_range.sh``
+    on the pre-push path only. So the absence here is the point, and this
+    is the assertion that stops somebody helpfully re-adding it.
+    """
+    labels = {label for label, _ in commit_range_scan.RANGE_RULES}
+    assert "private name" not in labels, (
+        "the private-name rule is back in the in-repo registry. Its needles "
+        "are literals; putting them in a tracked module publishes the names "
+        "the check exists to keep out. Use "
+        "scripts/scanners/scan_forbidden_names.py instead."
+    )
+    # And the module it used to come from must not exist at all.
+    assert not (
+        Path(__file__).resolve().parent / "test_no_private_names_in_source.py"
+    ).exists(), (
+        "test_no_private_names_in_source.py is back. If it holds needles it "
+        "is a committed blacklist; if it does not, it is a pytest gate that "
+        "checks nothing. Both were removed deliberately."
+    )
 
 
 def test_the_message_registry_is_not_empty() -> None:

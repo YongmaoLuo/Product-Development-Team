@@ -1,25 +1,44 @@
-"""No first-party source may carry operator-attribution phrases or external-checkout names.
+"""No first-party source may carry operator-attribution phrases.
 
 Why this gate exists
 --------------------
 The project rule (CLAUDE.md, "Code must not carry information unrelated to
-this project") forbids two shapes that are easy to write and hard to spot
-in review:
-
-1. Attribution markers that quote a private conversation or person into
-   source. Both English and Chinese forms are caught.
-2. External-checkout names — directory names of other repositories the
-   developer keeps alongside this one. The list is operator-specific and
-   cannot be compiled into the repo (writing it down would itself be the
-   leak), so it is read at runtime from an env var.
+this project") forbids attribution markers that quote a private
+conversation or a person into source. Both English and Chinese forms are
+caught.
 
 Why a gate (not just review)
 ----------------------------
-Both defects have shipped already. The first export from the private
+The defect has shipped already. The first export from the private
 development repo carried attribution markers in comments and docstrings
-across roughly 340 references; the path-of-least-resistance is to let
-them silently accumulate. A regex is cheap; the env-var-only contract
-for external names is the part that drifts without a gate.
+across roughly 340 references; the path of least resistance is to let
+them silently accumulate.
+
+What was removed from this gate, and why
+----------------------------------------
+Until 2026-10-14 this gate also checked for *external-checkout names* --
+directory names of other repositories the developer keeps alongside this
+one -- sourced from the ``PDT_FORBIDDEN_REPO_NAMES`` environment variable.
+That half is gone. It was not deleted for being redundant; it was deleted
+because it never ran, and looked like it did:
+
+* no tracked file in this repository ever set the variable, and no CI job
+  or shell script did either, so ``external_names()`` returned ``()`` on
+  every execution and the branch was unreachable;
+* an unset variable and a clean tree produced the same result, so the gate
+  reported a pass having checked nothing -- the "green but never ran"
+  failure mode this file's neighbours exist to prevent;
+* an env var is a channel that moves names into a process with nothing in
+  the repository showing they are there, which is a leak surface of its
+  own.
+
+The replacement is not an env var with better manners. Forbidden names now
+live in an untracked, operator-owned ``.config/forbidden-names`` and are
+read by ``scripts/scanners/scan_forbidden_names.py``, which the pre-commit
+and pre-push hooks run. The file is visible (it exists or it does not), and
+a missing one is exit 2 -- "the check did not run" -- rather than a silent
+pass. Note that removing ``import pytest`` from this module is also what
+lets ``commit_range_scan`` be imported without dragging pytest along.
 
 Scoping
 -------
@@ -39,11 +58,8 @@ literal pattern never appears whole in this file's source text.
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
-
-import pytest
 
 import source_scan
 
@@ -106,14 +122,6 @@ ATTRIBUTION_SHAPES: tuple[re.Pattern[str], ...] = (
     re.compile(r"^[ \t]*[*\-][ \t]*\d{4}-\d{2}-\d{2}[ \t]*[:：][ \t]*[\"\u201c]"),
 )
 
-#: Env var name that lists the operator's other local checkouts. The
-#: names themselves never appear in this file, in test data, or in
-#: assertions — the gate would be self-invalidating if it did. An
-#: unset or empty value disables the external-name check entirely
-#: (no violation, no assumption) rather than guessing a list.
-EXT_CHECKOUT_ENV_VAR = "PDT_FORBIDDEN_REPO_NAMES"
-
-
 def find_attribution(
     path: Path, text: str
 ) -> list[tuple[Path, int, str]]:
@@ -140,26 +148,6 @@ def find_attribution(
             if m:
                 hits.append((path, lineno, m.group(0)))
     return hits
-
-
-def external_names() -> tuple[str, ...]:
-    """Read the operator's forbidden checkout names from the env var.
-
-    Returns an empty tuple when the env var is unset, empty, or
-    whitespace-only — in which case the external-name check is a no-op.
-    When set, the value is split on commas and each segment is
-    whitespace-stripped; empty segments are dropped. Names are echoed
-    back verbatim (no case folding) so the caller can format them in
-    the operator's own spelling.
-    """
-    raw = os.environ.get(EXT_CHECKOUT_ENV_VAR, "")
-    if not raw.strip():
-        return ()
-    return tuple(
-        segment.strip()
-        for segment in raw.split(",")
-        if segment.strip()
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +273,6 @@ def test_no_operator_attribution_outside_claude_md() -> None:
                 f"itself): {path}"
             )
 
-    ext_names = external_names()
     offenders: list[str] = []
 
     for path in files:
@@ -300,69 +287,9 @@ def test_no_operator_attribution_outside_claude_md() -> None:
                 f"{path}:{lineno}: attribution phrase {phrase!r}"
             )
 
-        # External-checkout names. Match as a path-segment token to
-        # avoid false positives on substring overlaps with English
-        # words (e.g. a project literally named "to" inside "total").
-        # ``PDT_FORBIDDEN_REPO_NAMES`` unset/empty -> skip entirely.
-        if ext_names:
-            for name in ext_names:
-                if not name:
-                    continue
-                pattern = re.compile(
-                    r"(?<![A-Za-z0-9._-])"
-                    + re.escape(name)
-                    + r"(?![A-Za-z0-9._-])",
-                    re.IGNORECASE,
-                )
-                for lineno, line in enumerate(text.splitlines(), start=1):
-                    if pattern.search(line):
-                        offenders.append(
-                            f"{path}:{lineno}: "
-                            f"external-checkout name {name!r}"
-                        )
-
     assert not offenders, (
-        "First-party source contains an attribution marker or a "
-        "reference to a forbidden local checkout. Strip the phrase, "
-        "remove the name, or move the value to runtime config. The "
-        "rule body lives in CLAUDE.md.\n  "
+        "First-party source contains an attribution marker. Strip the "
+        "phrase, or move the value to runtime config. The rule body "
+        "lives in CLAUDE.md.\n  "
         + "\n  ".join(offenders)
     )
-
-
-def test_external_names_come_from_env_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The external-name list is sourced from the env var at runtime.
-
-    When ``PDT_FORBIDDEN_REPO_NAMES`` is unset or empty,
-    ``external_names()`` returns ``()`` and the external-name check is
-    skipped (no violation, no assumption). When set, the value is split
-    on commas with whitespace stripped; empty segments are dropped. The
-    fixture values here are abstract placeholders, not real checkout
-    names — adding a real name to this test would be the leak the gate
-    is built to prevent.
-    """
-    # Unset: empty tuple.
-    monkeypatch.delenv(EXT_CHECKOUT_ENV_VAR, raising=False)
-    assert external_names() == ()
-
-    # Empty string: also empty tuple.
-    monkeypatch.setenv(EXT_CHECKOUT_ENV_VAR, "")
-    assert external_names() == ()
-
-    # Whitespace-only: also empty tuple.
-    monkeypatch.setenv(EXT_CHECKOUT_ENV_VAR, "   ")
-    assert external_names() == ()
-
-    # Set: comma split + whitespace strip.
-    monkeypatch.setenv(EXT_CHECKOUT_ENV_VAR, "alpha,beta , gamma")
-    assert external_names() == ("alpha", "beta", "gamma")
-
-    # Single value: still a one-tuple.
-    monkeypatch.setenv(EXT_CHECKOUT_ENV_VAR, "delta")
-    assert external_names() == ("delta",)
-
-    # Empty segments (trailing/leading commas) are dropped.
-    monkeypatch.setenv(EXT_CHECKOUT_ENV_VAR, "epsilon,,zeta,")
-    assert external_names() == ("epsilon", "zeta")
