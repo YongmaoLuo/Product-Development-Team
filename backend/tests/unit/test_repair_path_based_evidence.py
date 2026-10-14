@@ -23,6 +23,8 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+import repair_generator as rg  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # extract_failed_vps_with_paths
@@ -216,7 +218,13 @@ def _stub_assembler(round_number, failed_vps, vp_test_commands=None,
     helper bypasses ``__init__``, so a new instance attribute added
     there is invisible to these tests until it is mirrored below
     (2026-09-14: ``vp_test_commands`` / ``plan_path``;
-    2026-09-20: ``seq_base``).
+    2026-09-20: ``seq_base``;
+    2026-10-11: the generation-time counters, now
+    ``dropped_empty_files_to_modify`` / ``unverifiable_no_test_command``
+    / ``test_command_sources``. ``dropped_empty_test_command`` is gone
+    with the empty-``test_command`` refusal it counted;
+    ``test_command_sources`` is the label ``assemble`` records per
+    emitted task, so a missing one makes every row raise.)
     """
     from repair_generator import RepairTaskAssembler
 
@@ -229,7 +237,23 @@ def _stub_assembler(round_number, failed_vps, vp_test_commands=None,
     # ``__init__`` would have set. The shifted-base behaviour is covered
     # in ``test_repair_task_id_uniqueness.py``.
     asm.seq_base = 1
+    asm.dropped_empty_files_to_modify = 0
+    asm.unverifiable_no_test_command = 0
+    asm.test_command_fill_attempts = 0
+    asm.test_command_sources = {}
+    # ``__init__`` seeds this with the module-level "not read yet"
+    # sentinel rather than ``{}``, so the plan is read at most once.
+    asm._plan_points_cache = rg._UNSET
     return asm
+
+
+#: 2026-10-11 (W3). ``assemble`` now refuses a task whose
+#: ``files_to_modify`` or ``test_command`` resolves empty, so the
+#: content rows below have to declare both or they never reach the
+#: returned list. Production gets these from the repair prompt (which
+#: asks for ``files_to_modify``) and from the VP's ``evidence_command``
+#: in ``verification_plan.json``.
+_RUNNABLE = {"VP-001": "cargo test -p app remote::e2e"}
 
 
 def test_assembler_falls_back_when_title_empty():
@@ -241,10 +265,11 @@ def test_assembler_falls_back_when_title_empty():
             "actual_result_summary": "245 failed, 2935 passed",
             "evidence_paths": ["/abs/path/verification_report.json#/verification_results/0/actual_result"],
         }
-    ])
+    ], vp_test_commands=_RUNNABLE)
 
     # Half-formed content: title missing, description missing.
-    contents = [{"failed_vp_id": "VP-001", "title": "", "description": ""}]
+    contents = [{"failed_vp_id": "VP-001", "title": "", "description": "",
+                 "files_to_modify": ["src/remote.rs"]}]
     tasks = asm.assemble(contents)
 
     assert len(tasks) == 1
@@ -267,11 +292,13 @@ def test_assembler_drops_hallucinated_vp_id():
             "actual_result_summary": "x",
             "evidence_paths": [],
         }
-    ])
+    ], vp_test_commands=_RUNNABLE)
     # LLM invented a VP-999 that was never failed.
     contents = [
-        {"failed_vp_id": "VP-001", "title": "ok", "description": "ok"},
-        {"failed_vp_id": "VP-999", "title": "ghost", "description": "ghost"},
+        {"failed_vp_id": "VP-001", "title": "ok", "description": "ok",
+         "files_to_modify": ["src/remote.rs"]},
+        {"failed_vp_id": "VP-999", "title": "ghost", "description": "ghost",
+         "files_to_modify": ["src/ghost.rs"]},
     ]
     tasks = asm.assemble(contents)
     ids = [t["failed_vp_id"] for t in tasks]
@@ -288,13 +315,14 @@ def test_assembler_preserves_explicit_title_and_description():
             "actual_result_summary": "x",
             "evidence_paths": ["/p"],
         }
-    ])
+    ], vp_test_commands=_RUNNABLE)
     contents = [
         {
             "failed_vp_id": "VP-001",
             "title": "Explicit title",
             "description": "Explicit description",
             "priority_hint": "low",
+            "files_to_modify": ["src/remote.rs"],
         }
     ]
     tasks = asm.assemble(contents)

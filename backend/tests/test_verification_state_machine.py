@@ -1150,7 +1150,6 @@ class TestSplitEventDoesNotCorruptState:
         agent.timeout_policy = TimeoutPolicy(
             per_method_timeout_seconds={"automated_test": 5},
             global_default_timeout_seconds=5,
-            parallelism_cap=4,
         )
         agent.start_verification_round(1)
 

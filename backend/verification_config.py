@@ -55,7 +55,25 @@ DEFAULT_PER_METHOD_TIMEOUT_SECONDS: Dict[str, int] = {
     "full_ci": 3600,
 }
 DEFAULT_GLOBAL_TIMEOUT_SECONDS: int = 3600
-DEFAULT_PARALLELISM_CAP: int = 4
+
+# 2026-10-13: ``DEFAULT_PARALLELISM_CAP`` is GONE, and so is every other
+# pre-agreed total for the verification round. It went through two
+# versions before it left: first it was the width itself (a typed-in 4
+# over a fleet of seventeen), then it became "the fallback width" for a
+# chain that could not be resolved. Both were a number nobody could
+# measure and everybody had to keep in sync.
+#
+# What replaced it is not another number. How many verification points
+# run at once is now decided, per verification point, at the moment it is
+# dispatched: ``acquire_provider_with_dynamic_capacity`` hands out a slot
+# or does not, from the provider pool as it stands that second. That call
+# is made before the ``claude`` subprocess is spawned
+# (``coding_tool._run_claude_interactive``), so the pool bounds the LLM
+# calls and the subprocesses together, which is what made a separate
+# framework-level ceiling redundant in the first place.
+#
+# So there is nothing for this module to configure, and a round has no
+# width to be misconfigured with.
 
 
 class TimeoutPolicy:
@@ -83,11 +101,9 @@ class TimeoutPolicy:
         self,
         per_method_timeout_seconds: Optional[Dict[str, int]] = None,
         global_default_timeout_seconds: int = DEFAULT_GLOBAL_TIMEOUT_SECONDS,
-        parallelism_cap: int = DEFAULT_PARALLELISM_CAP,
     ) -> None:
         self._per_method: Dict[str, int] = dict(per_method_timeout_seconds or {})
         self._global_default: int = int(global_default_timeout_seconds)
-        self.parallelism_cap: int = int(parallelism_cap)
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -103,7 +119,6 @@ class TimeoutPolicy:
         return cls(
             per_method_timeout_seconds=dict(DEFAULT_PER_METHOD_TIMEOUT_SECONDS),
             global_default_timeout_seconds=DEFAULT_GLOBAL_TIMEOUT_SECONDS,
-            parallelism_cap=DEFAULT_PARALLELISM_CAP,
         )
 
     @classmethod
@@ -132,16 +147,9 @@ class TimeoutPolicy:
                 # global default at resolve time.
                 continue
 
-        parallelism = execution.get("parallelism_cap", DEFAULT_PARALLELISM_CAP)
-        try:
-            parallelism_int = int(parallelism)
-        except (TypeError, ValueError):
-            parallelism_int = DEFAULT_PARALLELISM_CAP
-
         return cls(
             per_method_timeout_seconds=per_method,
             global_default_timeout_seconds=DEFAULT_GLOBAL_TIMEOUT_SECONDS,
-            parallelism_cap=parallelism_int,
         )
 
     @classmethod
@@ -156,8 +164,7 @@ class TimeoutPolicy:
           (we never raise on a missing/malformed config — the agent
           should keep running with the documented hard-coded numbers).
         - File present and well-formed → :meth:`from_dict` builds the
-          policy from ``execution.per_method_timeout_seconds`` and
-          ``execution.parallelism_cap``.
+          policy from ``execution.per_method_timeout_seconds``.
 
         The signature accepts either a string path or a :class:`Path`
         so callers don't have to coerce.

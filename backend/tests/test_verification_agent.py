@@ -4637,7 +4637,7 @@ class TestExecutionProfileInReport:
     ``execution_profile`` block at the top level. This block must
     mirror :class:`ExecutionProfileGenerator.build()`'s contract
     (total_duration_sec + group_profiles + subtask_splits +
-    per_method_timeouts + parallelism_cap).
+    per_method_timeouts + where the round's width came from).
 
     Two contracts pinned here:
 
@@ -4669,8 +4669,8 @@ class TestExecutionProfileInReport:
         contract:
 
         * keys: total_duration_sec, group_profiles, subtask_splits,
-          per_method_timeouts, parallelism_cap
-        * types: int, list, list, dict, int
+          per_method_timeouts, vp_capacity_source, vp_capacity_observed
+        * types: int, list, list, dict, str, int-or-None
         """
         execution_results = {
             "verification_points": [
@@ -4736,12 +4736,16 @@ class TestExecutionProfileInReport:
         )
 
         # Schema compliance with ExecutionProfileGenerator's output.
+        # 2026-10-13: ``parallelism_cap`` is no longer part of the
+        # contract — a verification round carries no configured width, so
+        # the block states where the width came from instead.
         required_keys = {
             "total_duration_sec",
             "group_profiles",
             "subtask_splits",
             "per_method_timeouts",
-            "parallelism_cap",
+            "vp_capacity_source",
+            "vp_capacity_observed",
         }
         missing = required_keys - set(profile.keys())
         assert not missing, (
@@ -4754,14 +4758,13 @@ class TestExecutionProfileInReport:
         assert isinstance(profile["group_profiles"], list)
         assert isinstance(profile["subtask_splits"], list)
         assert isinstance(profile["per_method_timeouts"], dict)
-        assert isinstance(profile["parallelism_cap"], int)
+        assert isinstance(profile["vp_capacity_source"], str)
 
         # Sanity: 2 VPs across 2 methods => at least 2 group_profiles
         # (or exactly 2 if no empties), and the total duration is a
         # non-negative int.
         assert len(profile["group_profiles"]) >= 1
         assert profile["total_duration_sec"] >= 0
-        assert profile["parallelism_cap"] > 0
 
         # The profile must also be persisted to disk — the on-disk
         # file is what the status endpoint reads on cold start.

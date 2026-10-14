@@ -42,7 +42,6 @@ import pytest
 import server
 from cc_switch import CCSwitchError, ProviderConfig
 from provider_order import (
-    SCHEMA_VERSION,
     ProviderOrderError,
     cache_clear as provider_order_cache_clear,
 )
@@ -137,8 +136,10 @@ def _make_fake_cc_switch_db_prod(
     try:
         conn.execute(
             "CREATE TABLE providers ("
-            "id TEXT PRIMARY KEY, name TEXT, settings_config TEXT"
-            ")"
+            "id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL, "
+            "settings_config TEXT NOT NULL, created_at INTEGER, "
+            "sort_index INTEGER, is_current BOOLEAN NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (id, app_type))"
         )
         for i, name in enumerate(display_names):
             settings = {
@@ -153,9 +154,9 @@ def _make_fake_cc_switch_db_prod(
                 else f"row-{i}"
             )
             conn.execute(
-                "INSERT INTO providers (id, name, settings_config) "
-                "VALUES (?, ?, ?)",
-                (row_id, name, json.dumps(settings)),
+                "INSERT INTO providers (id, app_type, name, settings_config, "
+                "created_at, sort_index) VALUES (?, ?, ?, ?, ?, ?)",
+                (row_id, "claude", name, json.dumps(settings), i, i),
             )
         conn.commit()
     finally:
@@ -177,8 +178,39 @@ def _install_fake_home_prod(
     return cc_dir / "cc-switch.db"
 
 
-def _write_payload(path: Path, payload) -> None:
-    path.write_text(json.dumps(payload), encoding="utf-8")
+#: An authority nothing can be listening on, so the HTTP leg fails the
+#: way it does when CC Switch is closed. Used instead of stubbing the
+#: leg, so the resolver's real connect-and-classify path runs.
+API_DOWN = "http://127.0.0.1:1"
+
+
+def _api_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PDT_PROVIDER_ORDER_API_URL", API_DOWN)
+
+
+def _api_serving(monkeypatch: pytest.MonkeyPatch, names: List[str]) -> None:
+    """Make CC Switch's HTTP provider list answer with ``names``."""
+    payload = {"providers": [{"id": f"id-{i}", "name": n}
+                             for i, n in enumerate(names)]}
+    body = json.dumps(payload).encode()
+
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    import provider_order
+
+    monkeypatch.setattr(
+        provider_order.urllib.request, "urlopen", lambda *a, **k: _Resp()
+    )
 
 
 def _collect_bare_provider_literals(source: str) -> Set[ast.AST]:
@@ -272,23 +304,20 @@ def test_server_no_hardcoded_provider_attribute():
 
 
 # ---------------------------------------------------------------------------
-# 2. Startup reads provider chain from CC Switch DB
+# 2. Startup asks CC Switch for the chain
 # ---------------------------------------------------------------------------
 
 
-def test_server_startup_reads_db(tmp_path, monkeypatch, caplog):
-    """``server.load_providers`` resolves the chain from the DB consumer.
+def test_server_startup_resolves_the_chain_cc_switch_served(
+    tmp_path, monkeypatch, caplog, real_cc_switch
+):
+    """``server.load_providers`` dispatches in the order CC Switch served.
 
-    Boundary contract: the chain comes from
-    ``provider_order.load_fallback_order`` (which already filters to
-    DB-present entries), and each surviving entry is then resolved via
-    :func:`cc_switch.get_provider`. The
-    resolved configs land in :data:`server.STARTUP_PROVIDERS` in
-    fallback order, ready for the rest of the server to consume.
-
-    Post-5561e2c the chain carries CC Switch display names, so the
-    fixture uses the production ``providers`` schema and the JSON
-    order lists display names verbatim.
+    Boundary contract: the chain is whatever ``provider_order``
+    resolved — no file, no re-sort — and each entry is then resolved to
+    a config via :func:`cc_switch.get_provider`. The resolved configs
+    land in :data:`server.STARTUP_PROVIDERS` in that same order, ready
+    for the rest of the server to consume.
     """
     caplog.set_level(logging.INFO, logger="server")
     provider_order_cache_clear()
@@ -296,17 +325,7 @@ def test_server_startup_reads_db(tmp_path, monkeypatch, caplog):
 
     display_order = ["Vendor A", "Vendor B Pro", "vendor-c-app"]
     _install_fake_home_prod(tmp_path, monkeypatch, display_order)
-
-    target = tmp_path / "provider-order.json"
-    payload = {
-        "version": SCHEMA_VERSION,
-        "updated_at": _now_iso(),
-        "source": "producer",
-        "order": display_order,
-        "providers": {},
-    }
-    _write_payload(target, payload)
-    monkeypatch.setattr(server, "PROVIDER_ORDER_FILE", target)
+    _api_serving(monkeypatch, display_order)
 
     try:
         result = server.load_providers()
@@ -318,40 +337,87 @@ def test_server_startup_reads_db(tmp_path, monkeypatch, caplog):
     # (so callers reading STARTUP_PROVIDERS see the same chain).
     assert [cfg.name for cfg in server.STARTUP_PROVIDERS] == display_order
     # Each resolved config must carry the fields the consumer layer
-    # promises — otherwise downstream callers cannot build a client.
+    # guarantees — a chain entry that resolved to an empty config would
+    # dispatch to a provider with no endpoint.
     for cfg in result:
-        assert isinstance(cfg, ProviderConfig)
         assert cfg.base_url
         assert cfg.model
-        assert cfg.env
 
 
-def test_server_startup_skips_unknown_ids(tmp_path, monkeypatch, caplog):
-    """Unknown entries in the chain are skipped with a warning, not
-    promoted to a startup failure.
+def test_server_startup_fails_loudly_when_cc_switch_is_not_serving(
+    tmp_path, monkeypatch, real_cc_switch
+):
+    """Nothing serving is a startup failure, even with a full local store.
 
-    Boundary contract: optimiser/DB drift (an entry present in the JSON
-    chain but not in the CC Switch database) MUST NOT crash startup —
-    the entry is logged and dropped, and the rest of the chain still
-    loads.
+    This is the scenario the deleted database leg used to paper over:
+    a populated ``~/.cc-switch/cc-switch.db`` next to a closed desktop
+    app, which produced a chain and hid the fact that the thing which
+    owns the fleet was not answering. It now fails, which is the only
+    outcome that tells an operator their CC Switch is down.
     """
-    caplog.set_level(logging.WARNING, logger="server")
+    provider_order_cache_clear()
+    monkeypatch.setattr(server, "STARTUP_PROVIDERS", [])
+
+    display_order = ["Vendor A", "Vendor B Pro", "vendor-c-app"]
+    _install_fake_home_prod(tmp_path, monkeypatch, display_order)
+    _api_down(monkeypatch)
+
+    try:
+        with pytest.raises(ProviderOrderError) as excinfo:
+            server.load_providers()
+    finally:
+        provider_order_cache_clear()
+
+    assert server.STARTUP_PROVIDERS == [], (
+        "a failed startup must leave no providers behind, or a later "
+        f"read would dispatch on them: {server.STARTUP_PROVIDERS!r}"
+    )
+    assert "api_unreachable" in str(excinfo.value), (
+        f"the failure does not say CC Switch could not be reached: "
+        f"{excinfo.value!s}"
+    )
+
+
+def test_server_startup_dispatches_in_the_order_cc_switch_served(
+    tmp_path, monkeypatch, real_cc_switch
+):
+    """The served order wins, not the local store's row order.
+
+    The store carries rows in whatever order it was written; the chain
+    is the array CC Switch served. Resolving in store order instead
+    would make the operator's reordering appear not to have taken
+    effect.
+    """
+    provider_order_cache_clear()
+    monkeypatch.setattr(server, "STARTUP_PROVIDERS", [])
+
+    _install_fake_home_prod(tmp_path, monkeypatch, ["Vendor A", "Vendor B Pro"])
+    _api_serving(monkeypatch, ["Vendor B Pro", "Vendor A"])
+
+    try:
+        result = server.load_providers()
+    finally:
+        provider_order_cache_clear()
+
+    assert [cfg.name for cfg in result] == ["Vendor B Pro", "Vendor A"]
+
+
+def test_server_startup_skips_unknown_ids(tmp_path, monkeypatch, caplog, real_cc_switch):
+    """A chain entry with no CC Switch row is skipped, not fatal.
+
+    CC Switch can be listing a provider whose row this backend cannot
+    resolve. Dropping the one entry keeps the rest of the chain
+    dispatchable; failing startup over it would make a single bad row
+    take the whole backend down.
+    """
+    caplog.set_level(logging.INFO, logger="server")
     provider_order_cache_clear()
     monkeypatch.setattr(server, "STARTUP_PROVIDERS", [])
 
     _install_fake_home_prod(tmp_path, monkeypatch, ["Vendor A"])
 
-    target = tmp_path / "provider-order.json"
-    payload = {
-        "version": SCHEMA_VERSION,
-        "updated_at": _now_iso(),
-        "source": "producer",
-        # "Ghost Provider" is not in the DB and must be skipped.
-        "order": ["Vendor A", "Ghost Provider"],
-        "providers": {},
-    }
-    _write_payload(target, payload)
-    monkeypatch.setattr(server, "PROVIDER_ORDER_FILE", target)
+    # "Ghost Provider" is not in the database and must be skipped.
+    _api_serving(monkeypatch, ["Vendor A", "Ghost Provider"])
 
     try:
         result = server.load_providers()
@@ -360,23 +426,21 @@ def test_server_startup_skips_unknown_ids(tmp_path, monkeypatch, caplog):
 
     # Only the known entry survives; the ghost entry is skipped.
     assert [cfg.name for cfg in result] == ["Vendor A"]
-    # A warning is logged for the unknown entry (by the provider_order
-    # filter that drops it from the chain).
+    # A warning is logged for the unknown entry.
     assert any("Ghost Provider" in rec.getMessage() for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------
-# 3. Startup fails explicitly when the DB is unreadable
+# 3. Startup fails explicitly when neither CC Switch surface answers
 # ---------------------------------------------------------------------------
 
 
-def test_server_startup_no_db_fails(tmp_path, monkeypatch):
-    """When the CC Switch DB is missing, ``load_providers`` raises
-    :class:`CCSwitchError` — startup MUST fail explicitly.
+def test_server_startup_no_db_fails(tmp_path, monkeypatch, real_cc_switch):
+    """Neither surface answering is a hard failure.
 
-    Boundary contract: a missing/unreadable database is a hard
-    failure, not a soft degradation.  The previous behaviour (warn
-    and continue) is forbidden by the Task 1 contract.
+    Boundary contract: a backend that cannot learn its chain must say
+    so at startup. The previous behaviour — warn and continue — is
+    exactly how a stale chain reached production dispatch.
     """
     provider_order_cache_clear()
     monkeypatch.setattr(server, "STARTUP_PROVIDERS", [])
@@ -385,17 +449,7 @@ def test_server_startup_no_db_fails(tmp_path, monkeypatch):
     fake_home = tmp_path / "empty-home"
     fake_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(fake_home))
-
-    target = tmp_path / "provider-order.json"
-    payload = {
-        "version": SCHEMA_VERSION,
-        "updated_at": _now_iso(),
-        "source": "producer",
-        "order": ["vendor-a-pro", "vendor-b-pro"],
-        "providers": {},
-    }
-    _write_payload(target, payload)
-    monkeypatch.setattr(server, "PROVIDER_ORDER_FILE", target)
+    _api_down(monkeypatch)
 
     try:
         with pytest.raises((CCSwitchError, ProviderOrderError)):
@@ -404,13 +458,12 @@ def test_server_startup_no_db_fails(tmp_path, monkeypatch):
         provider_order_cache_clear()
 
 
-def test_server_startup_corrupt_db_fails(tmp_path, monkeypatch):
-    """When the CC Switch DB file exists but is unreadable, startup
-    also fails explicitly.
+def test_server_startup_corrupt_db_fails(tmp_path, monkeypatch, real_cc_switch):
+    """A database that exists but cannot be read also fails explicitly.
 
     A zero-byte file at ``$HOME/.cc-switch/cc-switch.db`` is a valid
-    path but a corrupt SQLite database.  :func:`load_providers` must
-    surface the error rather than swallow it.
+    path and a corrupt store. :func:`load_providers` must surface that
+    rather than swallow it and dispatch on an empty chain.
     """
     provider_order_cache_clear()
     monkeypatch.setattr(server, "STARTUP_PROVIDERS", [])
@@ -419,17 +472,7 @@ def test_server_startup_corrupt_db_fails(tmp_path, monkeypatch):
     cc_dir.mkdir(parents=True, exist_ok=True)
     (cc_dir / "cc-switch.db").write_bytes(b"")  # not a valid SQLite file
     monkeypatch.setenv("HOME", str(tmp_path))
-
-    target = tmp_path / "provider-order.json"
-    payload = {
-        "version": SCHEMA_VERSION,
-        "updated_at": _now_iso(),
-        "source": "producer",
-        "order": ["vendor-a-pro"],
-        "providers": {},
-    }
-    _write_payload(target, payload)
-    monkeypatch.setattr(server, "PROVIDER_ORDER_FILE", target)
+    _api_down(monkeypatch)
 
     try:
         with pytest.raises((CCSwitchError, ProviderOrderError)):
@@ -439,30 +482,40 @@ def test_server_startup_corrupt_db_fails(tmp_path, monkeypatch):
 
 
 def test_server_startup_propagates_provider_order_error(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, real_cc_switch,
 ):
-    """A missing/invalid ``provider-order.json`` propagates as
-    :class:`ProviderOrderError` — startup fails explicitly.
+    """An unresolvable chain reaches the caller as
+    :class:`ProviderOrderError`, naming what failed.
 
-    Boundary contract: the optimizer contract file is the single
-    source of truth; a missing file is a hard failure, not a silent
-    fallback to ``_base.yaml`` ``provider_priority``.
+    The error is re-raised rather than re-wrapped: the message already
+    carries the reason CC Switch could not be asked and the evidence
+    behind it, and a second wrapper naming a step that no longer exists
+    would bury that.
     """
     provider_order_cache_clear()
     monkeypatch.setattr(server, "STARTUP_PROVIDERS", [])
 
+    # A populated local store, so the failure can only come from the
+    # chain being unresolvable — not from an empty install.
     _install_fake_home(tmp_path, monkeypatch, ["vendor-a-pro"])
-
-    # No provider-order.json in the path → load_fallback_order raises.
-    missing = tmp_path / "missing-provider-order.json"
-    assert not missing.exists()
-    monkeypatch.setattr(server, "PROVIDER_ORDER_FILE", missing)
+    _install_fake_home_prod(tmp_path, monkeypatch, [])
+    _api_down(monkeypatch)
 
     try:
-        with pytest.raises(ProviderOrderError):
+        with pytest.raises(ProviderOrderError) as excinfo:
             server.load_providers()
     finally:
         provider_order_cache_clear()
+
+    message = str(excinfo.value)
+    assert "api_unreachable" in message, (
+        f"the error does not say why CC Switch could not be asked: "
+        f"{message!r}"
+    )
+    assert "127.0.0.1:1" in message or "api/providers" in message, (
+        f"the error does not point at the endpoint that was tried: "
+        f"{message!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

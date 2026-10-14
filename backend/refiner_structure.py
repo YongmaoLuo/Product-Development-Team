@@ -119,6 +119,63 @@ def _content_of(task: Any) -> Dict[str, Any]:
         return {}
 
 
+def inherit_failed_vp(
+    parent_id: str,
+    effective_by_id: Dict[str, Dict[str, Any]],
+    failed_vp_by_task_id: Any,
+) -> List[str]:
+    """Copy a split parent's ``failed_vp_id`` onto each of its children.
+
+    2026-10-13. The breakdown children of a repair task were born with no
+    ``failed_vp_id``: the refiner authors their content, and the field is
+    stamped by the orchestrator when it *generates* a repair task. Every
+    such row already written reads NULL, and
+    ``verification_loop._get_pending_repair_tasks`` revives a ``failed``
+    row only when its VP is in this round's failure set — so a child that
+    failed was stranded exactly the way the deleted parent used to be.
+
+    A child is the parent's work continuing — its own description says so,
+    naming the parent task whose verdict it addresses — so the VP it was
+    written for is the parent's. Only ``failed_vp_id`` is
+    copied. ``round`` is deliberately NOT: a NULL round is what keeps the
+    child out of ``_supersede_prior_round_repairs``, which retires rows
+    from a *strictly earlier* round for the same VP
+    (``row_round is None → continue``) and would otherwise cancel the
+    revival on the very next round.
+
+    ``failed_vp_by_task_id`` is supplied by the caller because
+    ``failed_vp_id`` lives only in ``plan_tasks`` — ``SubTask`` has no
+    such field and ``TaskManager._STATIC_TASK_FIELDS`` never carried it,
+    so ``current_tasks`` cannot know it. See
+    ``AutonomousAgent._repair_failed_vp_map``.
+
+    Mutates ``effective_by_id`` in place (the dicts
+    :attr:`RefinerStructurePlan.effective` is built from) and returns the
+    ids it stamped.
+    """
+    if not failed_vp_by_task_id:
+        return []
+    try:
+        vp_id = str(failed_vp_by_task_id.get(parent_id) or "").strip()
+    except AttributeError:
+        return []
+    if not vp_id:
+        return []
+    stamped: List[str] = []
+    prefix = f"{parent_id}-"
+    for cid, child in effective_by_id.items():
+        if not isinstance(cid, str) or not cid.startswith(prefix):
+            continue
+        try:
+            if str(child.get("failed_vp_id") or "").strip():
+                continue  # the refiner declared one; do not clobber it
+        except AttributeError:
+            continue
+        child["failed_vp_id"] = vp_id
+        stamped.append(cid)
+    return sorted(stamped)
+
+
 def unconstructable_entries(
     updated_tasks: Sequence[Any],
 ) -> List[Tuple[str, str]]:
@@ -220,6 +277,7 @@ def plan_refiner_structure(
     current_tasks: Sequence[Dict[str, Any]],
     updated_tasks: Sequence[Dict[str, Any]],
     protected_prefix: str = DEFAULT_PROTECTED_TASK_GROUP_PREFIX,
+    failed_vp_by_task_id: Any = None,
 ) -> RefinerStructurePlan:
     """Decide the one task list both stores end up with.
 
@@ -232,6 +290,16 @@ def plan_refiner_structure(
         The refiner's returned list, verbatim.
     protected_prefix:
         ``task_group`` prefix the refiner may not add to, edit or drop.
+    failed_vp_by_task_id:
+        ``{task_id: failed_vp_id}`` for the rows that carry one — read
+        from ``plan_tasks`` by the caller, because that column is not on
+        :class:`task.SubTask` and so cannot arrive via ``current_tasks``.
+        When a protected task is split into ``{tid}-1``/``{tid}-2``/…,
+        each child inherits its parent's VP through
+        :func:`inherit_failed_vp`, so a child that fails is re-queued by
+        ``verification_loop._get_pending_repair_tasks`` exactly like any
+        other failed repair task. Omitted / empty → no inheritance, which
+        is the pre-2026-10-13 behaviour.
 
     Returns
     -------
@@ -316,6 +384,18 @@ def plan_refiner_structure(
         # ``failed`` beside children that had all completed.
         # 2026-10-05: four repair parents were stranded this way.
         if any(cid.startswith(f"{tid}-") for cid in refiner_by_id):
+            # 2026-10-13: the parent is about to be deleted, and the
+            # ``failed_vp_id`` it carries dies with it unless the
+            # children — which ARE its work, continuing — take it over.
+            # Stamped on the dicts ``RefinerStructurePlan.effective`` is
+            # built from, so the writer that follows hands the same
+            # answer to both stores: ``plan_tasks`` picks it up through
+            # ``ALLOWED_STATIC_TASK_FIELDS`` (it is an allow-listed
+            # static column), and ``tasks.json`` drops it the way it
+            # drops ``breakdown_count`` — ``SubTask`` declares neither,
+            # and this column has never been read off disk. See
+            # ``inherit_failed_vp``.
+            inherit_failed_vp(tid, effective_by_id, failed_vp_by_task_id)
             effective_by_id.pop(tid, None)
             continue
         replacement = refiner_by_id.get(tid)

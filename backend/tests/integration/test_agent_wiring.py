@@ -245,8 +245,10 @@ def test_agent_uses_subagent_config(
         pointing to a JSON file on disk) and ``hook_stdin=`` (a dict
         containing task_type + task_summary).
       * The settings file on disk contains the ``env`` and ``hooks``
-        keys from the SubagentConfig schema, and the env block has
-        the endpoint+credential ANTHROPIC_* entries decision 2 mandates.
+        keys from the SubagentConfig schema, but carries NO endpoint or
+        credential: it is written before routing has chosen a provider,
+        and the file the CLI reads is written after. What the pre-selection
+        file still owes is the hook-correlation key.
       * The hook entries on disk reference the pre_tool_use.sh and
         post_tool_use.sh scripts (decision 4 wiring).
     """
@@ -315,20 +317,43 @@ def test_agent_uses_subagent_config(
         assert "task_summary" in hook_stdin
         assert hook_stdin["task_summary"] == "test wiring"
 
-        # 3. Settings file on disk has env + hooks blocks.
+        # 3. Settings file on disk has env + hooks blocks, and NO provider
+        #    config. This file is written before any provider is selected:
+        #    the only provider available at that point is the run-level one
+        #    from ``load_fallback_order()`` (the whole CC Switch list, no
+        #    scene/tier filtering), which is not necessarily the provider
+        #    that serves the call. The dispatch writes the file that is
+        #    actually passed to ``claude --settings`` once routing has
+        #    chosen, and post-mortem redaction is keyed on that path — so
+        #    a credential written here was never read and never redacted.
         payload = json.loads(settings_path.read_text())
         assert "env" in payload, "settings.json missing env block"
         assert "hooks" in payload, "settings.json missing hooks block"
 
-        anthropic_keys = [k for k in payload["env"] if k.startswith("ANTHROPIC_")]
-        assert {"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}.issubset(
-            set(anthropic_keys)
-        ), (
-            f"settings.json env must carry the endpoint+credential keys, "
-            f"got {anthropic_keys}"
+        assert cfg_kwargs.get("defer_provider_config") is True, (
+            "the wiring must defer provider config: agent.py resolves a "
+            "run-level provider and writes the tmpfile before routing has "
+            f"chosen, so the tmpfile may not carry it. kwargs={cfg_kwargs!r}"
         )
-        assert payload["env"]["ANTHROPIC_BASE_URL"] == "https://api.vendor-a.example/anthropic"
-        assert payload["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-cp-test-fake-key"
+        anthropic_keys = [k for k in payload["env"] if k.startswith("ANTHROPIC_")]
+        assert anthropic_keys == [], (
+            f"a pre-selection settings file must carry no ANTHROPIC_* keys, "
+            f"got {anthropic_keys} — it names a provider that may not serve "
+            f"this call, and nothing ever redacts or removes it"
+        )
+        on_disk = settings_path.read_text()
+        assert "sk-cp-test-fake-key" not in on_disk, (
+            "the run-level key is on disk in a file no redaction pass "
+            "covers"
+        )
+        assert "https://api.vendor-a.example/anthropic" not in on_disk, (
+            "the run-level endpoint is on disk in a file the CLI never reads"
+        )
+        # The correlation key is what the file is still FOR.
+        assert payload["env"].get("CLAUDE_SETTINGS_PATH") == str(settings_path), (
+            f"CLAUDE_SETTINGS_PATH={payload['env'].get('CLAUDE_SETTINGS_PATH')!r} "
+            f"must name this file for hook correlation"
+        )
 
         # 4. Hook entries reference the pre + post scripts.
         hooks = payload["hooks"]
@@ -457,26 +482,37 @@ def test_agent_settings_path_in_logger(
         data = entry.get("data", {})
         assert "path" in data, f"event data missing path: {data}"
         assert "uuid" in data, f"event data missing uuid: {data}"
-        # Endpoint + credentials only. A model field appears solely when one
-        # actually resolves (caller ``model_env`` or the provider row); this
-        # fixture resolves none, so the field is absent on purpose and the
-        # Claude CLI falls back to the local config.
-        assert data["fields"] == 3, (
-            f"event data.fields must be 3 (endpoint + credentials; no model "
-            f"resolved for this fixture), got {data.get('fields')}"
+        # ``fields`` counts the ANTHROPIC_* keys actually written. The wired
+        # agent defers provider config, so this file carries none — and the
+        # count is what tells a reader of the log that, rather than a
+        # constant that would have said the same thing for a payload holding
+        # a key and for one holding only hooks.
+        assert data["fields"] == 0, (
+            f"the wired agent's settings file must carry no ANTHROPIC_* keys "
+            f"before routing has chosen, got {data.get('fields')}"
+        )
+        assert data["provider_config"] is False, (
+            f"provider_config={data.get('provider_config')!r} must be False "
+            f"for a pre-selection file"
         )
         settings_path = Path(data["path"])
         assert settings_path.exists(), (
             f"event references missing tmpfile: {settings_path}"
         )
 
-        # The file referenced by the log entry must contain the same
-        # endpoint/credential env block that test_agent_uses_subagent_config
-        # asserts.
+        # The file the log entry points at must agree with the payload it
+        # reports: no provider config, and the correlation key that names
+        # the file. A log entry that said ``fields=0`` while the file held
+        # a key would be worse than no entry at all.
         payload = json.loads(settings_path.read_text())
         anthropic_keys = [k for k in payload["env"] if k.startswith("ANTHROPIC_")]
-        assert {"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}.issubset(
-            set(anthropic_keys)
+        assert anthropic_keys == [], (
+            f"the file the log points at carries {anthropic_keys}, but the "
+            f"entry reported fields={data['fields']}"
+        )
+        assert payload["env"].get("CLAUDE_SETTINGS_PATH") == str(settings_path), (
+            f"the logged file must name itself for hook correlation, got "
+            f"{payload['env'].get('CLAUDE_SETTINGS_PATH')!r}"
         )
     finally:
         _cleanup_cfg_calls(record["cfg_calls"])

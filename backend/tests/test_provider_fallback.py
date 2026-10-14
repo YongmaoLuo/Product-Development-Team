@@ -2,10 +2,9 @@
 
 This module pins the contract that:
 
-  1. ``provider_order.load_fallback_order`` reads a valid
-     ``provider-order.json`` and returns its ``order`` array, filtered
-     through the CC Switch consumer layer against the provider names
-     actually present in the database.
+  1. ``provider_order.load_fallback_order`` returns the chain CC Switch
+     reports, in CC Switch's own order, unfiltered — asked over its HTTP
+     provider list, and raised loudly when there is no answer.
 
   2. ``ClaudeCodingTool._run_claude_interactive`` walks
      ``self.provider_priority`` and takes the first provider whose row is
@@ -26,26 +25,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from coding_tool import ClaudeCodingTool
-from provider_order import (
-    SCHEMA_VERSION,
-    load_fallback_order,
-)
-
-# Re-export the load tests from the canonical test module so the
-# ``-k load`` half of the verification filter has coverage in BOTH files
-# (test_command includes both paths).
-from backend.tests.test_provider_order import (  # noqa: F401
-    test_load_order_returns_display_names,
-    test_load_fallback_order_returns_json_order,
-)
+from provider_order import ProviderOrderError, cache_clear, load_fallback_order
 
 
 # ---------------------------------------------------------------------------
@@ -53,35 +39,71 @@ from backend.tests.test_provider_order import (  # noqa: F401
 # ---------------------------------------------------------------------------
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat()
+#: An authority nothing can be listening on, so the resolver fails the
+#: way it does when CC Switch is closed.
+API_DOWN = "http://127.0.0.1:1"
 
 
-def _write_payload(path: Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload), encoding="utf-8")
+def _serve_chain(monkeypatch: pytest.MonkeyPatch, names) -> None:
+    """Make CC Switch's provider list answer with ``names``.
+
+    The chain has one source, so a test that wants a chain gives the
+    transport an answer rather than relying on a local store: there is
+    no second reader that could supply one instead.
+    """
+    import provider_order
+
+    body = json.dumps(
+        {"providers": [{"id": f"id-{i}", "name": n} for i, n in enumerate(names)]}
+    ).encode()
+
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return body
+
+        def getcode(self):
+            return 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        provider_order.urllib.request, "urlopen", lambda *a, **k: _Resp()
+    )
+    cache_clear()
 
 
 def _make_fake_cc_switch_db(tmp_path: Path, provider_names):
     """Create a fake CC Switch DB declaring *provider_names*.
 
-    Production ``providers`` schema — the name is what the backend
-    resolves providers by, and what a ``provider-order.json`` chain
-    carries.
+    Production ``providers`` schema, including ``app_type`` and the
+    ordering columns: this reader filters on the app type and sorts by
+    them, so a fixture without them would not exercise the query it is
+    standing in for. ``sort_index`` follows the given order so the
+    chain comes back in the order listed here.
     """
     db_path = tmp_path / "cc-switch.db"
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute(
             "CREATE TABLE providers ("
-            "id TEXT PRIMARY KEY, name TEXT, settings_config TEXT"
-            ")"
+            "id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL, "
+            "settings_config TEXT NOT NULL, created_at INTEGER, "
+            "sort_index INTEGER, is_current BOOLEAN NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (id, app_type))"
         )
         for i, name in enumerate(provider_names):
             conn.execute(
-                "INSERT INTO providers (id, name, settings_config) "
-                "VALUES (?, ?, ?)",
+                "INSERT INTO providers (id, app_type, name, settings_config, "
+                "created_at, sort_index) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     f"row-{i}",
+                    "claude",
                     name,
                     json.dumps({
                         "env": {
@@ -89,6 +111,8 @@ def _make_fake_cc_switch_db(tmp_path: Path, provider_names):
                             "ANTHROPIC_AUTH_TOKEN": f"sk-{i}",
                         }
                     }),
+                    i,
+                    i,
                 ),
             )
         conn.commit()
@@ -147,31 +171,45 @@ def _run_dispatch(tool, availability: dict):
 
 
 def test_load_chain_supports_fallback_chain(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_cc_switch
 ) -> None:
     """``load_fallback_order`` returns the multi-provider chain the
     runtime walk will follow.
 
     The chain carries CC Switch provider names — the key
-    ``get_provider`` reads by — so the JSON and the DB
-    have to agree on the spelling for anything to survive the filter.
+    ``get_provider`` reads by — and it is the array order CC Switch
+    served, taken whole. Nothing filters it, so every provider the
+    operator ordered survives; the local store below backs the
+    ``get_provider`` lookups the walk makes, not the chain itself.
     """
     chain = ["Vendor A Pro", "Vendor B Pro", "Vendor C App"]
     _make_fake_cc_switch_db(tmp_path, chain)
     monkeypatch.setenv("HOME", str(tmp_path))
+    _serve_chain(monkeypatch, chain)
 
-    target = tmp_path / "provider-order.json"
-    _write_payload(target, {
-        "version": SCHEMA_VERSION,
-        "updated_at": _now_iso(),
-        "source": "producer",
-        "order": chain,
-        "providers": {},
-    })
-
-    result = load_fallback_order(target)
+    result = load_fallback_order()
     assert result == chain
     assert len(result) >= 2, "fallback_chain requires >=2 providers"
+
+
+def test_no_chain_at_all_is_a_failure_not_a_short_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_cc_switch
+) -> None:
+    """With CC Switch not answering there is no chain to walk.
+
+    The runtime walk is a failover over a chain it was given; a broken
+    CC Switch must not reach it as a shorter chain, because a walk that
+    silently starts one provider later looks identical to a failover.
+    """
+    _make_fake_cc_switch_db(tmp_path, ["Vendor A Pro"])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PDT_PROVIDER_ORDER_API_URL", API_DOWN)
+    cache_clear()
+
+    with pytest.raises(ProviderOrderError) as excinfo:
+        load_fallback_order()
+
+    assert excinfo.value.reason == "api_unreachable"
 
 
 def test_fallback_chain_skips_unusable_primary_and_takes_the_next(

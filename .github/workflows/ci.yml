@@ -246,6 +246,42 @@ jobs:
           restore-keys: |
             uv-${{ runner.os }}-
 
+      - name: Check the lockfile is current
+        # Before the install, so a stale lock is reported as itself rather
+        # than as whatever `uv sync --locked` happens to fail on.
+        #
+        # `--locked` already catches the drift — that is the point of the
+        # flag — but uv's message is:
+        #
+        #     The lockfile at `uv.lock` needs to be updated, but
+        #     `--locked` was provided.
+        #
+        # A *relative* path. Every install step in this workflow says
+        # `--project backend`, and there are 18 of them, so which lockfile
+        # moved is a real question — and the path in the message does not
+        # answer it. This step does, before anything is installed.
+        #
+        # One job, not all eighteen: merge-gate needs lint, so a failure
+        # here closes the gate. The other lanes sync the same
+        # backend/uv.lock and would all fail anyway; repeating the message
+        # in seventeen more places is noise.
+        #
+        # The backticks around the command are escaped because this is a
+        # `run:` block: unescaped, bash substitutes them away and the log
+        # reads "Run  and commit backend/uv.lock" — an error message with
+        # its one useful part missing.
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          if uv lock --project backend --check; then
+            echo "ok: backend/uv.lock is current"
+          else
+            echo "::error file=backend/pyproject.toml::backend/uv.lock is stale — backend/pyproject.toml changed without re-locking. Run \`uv lock --project backend\` and commit backend/uv.lock."
+            echo "::error::the lockfile no longer matches the manifest; the version under test would not be the version in the lock"
+            exit 1
+          fi
+
       - name: Install backend dependencies
         # `uv sync` installs backend/uv.lock *and* creates
         # backend/.venv, so this one step is what the old
@@ -1091,6 +1127,37 @@ jobs:
           # still has room to run.
           WATCHDOG_SECONDS=900
 
+          # ``-n 8`` — this lane's pytest invocation runs across 8 workers.
+          #
+          # It is a per-invocation flag on purpose. ``addopts`` in
+          # ``backend/pytest.ini`` is global, so a ``-n`` written there would
+          # reach every lane in this workflow — including
+          # ``existing-test``, whose tests assert on WALL-CLOCK parallelism
+          # contracts ("4 VPs in flight finish in 10s, not 40s"). pytest.ini
+          # says in as many words that those must have the runner to
+          # themselves; parallelising them would make the very bound they
+          # assert unmeasurable. Only the two lanes that carry the gating
+          # marker expression get it.
+          #
+          # What it costs, and what made it safe to do at all:
+          #
+          #   * every ``parametrize`` ID has to be stable across processes.
+          #     xdist aborts a run with "Different tests were collected
+          #     between gw2 and gw14" when two workers import a module in
+          #     different seconds and a wall-clock value has become a case
+          #     ID. ``tests/unit/test_provider_quota_dispatch.py`` was one
+          #     such place and now pins its IDs.
+          #   * every worker needs its OWN scratch root. The controller sets
+          #     ``PDT_TEST_SESSION_ROOT`` while loading the conftest and its
+          #     workers inherit the value, so keying the root on the variable
+          #     alone gave every worker one ``state.db``.
+          #
+          # 8 is the measured plateau, not the biggest number that boots:
+          # ``pytest tests/unit`` is 167 s serial and 39 s at ``-n 10``, and
+          # past 8 workers the curve flattens and then reverses. Sharding
+          # across 20 runner VMs has already taken the coarse-grained
+          # parallelism, so this is about the cores *inside* one VM.
+
           # --- order independence ------------------------------------------
           # Shuffle the order this shard *executes* its files in, seeded
           # from the run so it differs every time but is reproducible from
@@ -1161,6 +1228,7 @@ jobs:
           timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
             ./.venv/bin/python3 -m pytest $EXEC_ORDER \
               -m "not e2e and not integration and not time_sensitive and not perf" \
+              -n 8 \
               --cov=. \
               --cov-report= \
               --tb=short \
@@ -1462,10 +1530,24 @@ jobs:
           # killing the shard; see `backend/utils/process.py`.
           WATCHDOG_SECONDS=1500
           set +e
+          # ``-n 8``, matching the ``unit-tests`` shard it bisects. That
+          # match is the whole point of the flag here: a bisect harness that
+          # runs a *different* shape from the shard it is bisecting cannot
+          # find a bug that only the shard's shape has — which is the defect
+          # ``test_the_bisect_lane_runs_the_shape_it_bisects`` was written
+          # about when the staircase ran without ``--cov=.``. Taking it from
+          # the shard it bisects rather than from a separate judgement is
+          # what keeps that gate's promise true; if the shard's worker count
+          # changes, this line is the one that has to change with it.
+          #
+          # It carries the same two preconditions the shard's does (pinned
+          # ``parametrize`` IDs, one scratch root per worker) because they
+          # are properties of the suite, not of the lane.
           COVERAGE_FILE=.coverage.staircase-${{ matrix.shard }} \
           timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
             ./.venv/bin/python3 -m pytest $TARGETS \
               -m "not e2e and not integration and not time_sensitive and not perf" \
+              -n 8 \
               --cov=. \
               --cov-report= \
               --tb=short \

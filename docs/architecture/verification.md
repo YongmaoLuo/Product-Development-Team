@@ -21,26 +21,74 @@ the running code rather than against the executor's summary.
 | `api_test` | an HTTP request and assertions on the response |
 | `manual_check` | needs a human — reported, not silently passed |
 
-## It runs in parallel, with two nested bounds
+## It runs in parallel, bounded by the fleet
 
 Points are **partitioned by method** into groups. Groups run concurrently,
 and the points inside a group run concurrently too.
 
-Both levels are bounded, and the second bound is the one that matters:
+Both levels are bounded, and both are bounded by the **same number**: how
+many verification points the verification scene's providers can serve right
+now.
 
-!!! note "The per-group cap alone would be a lie"
-    `parallelism_cap` throttles *one group's* own fan-out. With several
-    groups running at once, per-group caps **multiply** (cap × groups) and
-    quietly exceed the number an operator thinks they configured.
+!!! note "The width comes from the providers, not from a typed number"
+    That width is the sum, over the scene's own chain, of each provider's
+    declared cap scaled by how much of its 5-hour window is left — the
+    arithmetic execution already uses for its own pools, read from the same
+    quota payload the dispatch path is handed
+    (`dynamic_provider_concurrency.fleet_capacity`). One provider declaring
+    ten yields ten; two yield twenty; one down to 40% of its window yields
+    four; a provider that has been **shut loses its share**, and when the
+    whole chain is shut the answer is `0` — nobody is dispatched into a
+    window that is closed.
 
-    So a single `plan_semaphore` is created once per round and shared by
-    every group. That shared ceiling — not the per-group knob — is the real
-    fleet limit.
+    It is read **every time the gate binds**, not fixed when the round
+    starts. A window that closes mid-round shrinks the fleet while the
+    round is running, and a gate that froze its width at construction could
+    not see it.
+
+`parallelism_cap` (still in `verification.yaml`, still `4`) is the
+**fallback**: it applies only when nothing is derivable — the verification
+scene's chain could not be resolved at all. It is deliberately not a
+"nothing available → run 4" rule; a measured `0` is a real answer from the
+meters and is used as one.
+
+A second, plan-wide bound sits above the groups so their fan-outs cannot
+multiply past the number of slots the providers actually have. While the
+scene resolves it reads the **same live figure** as each group; when the
+chain cannot be resolved it falls back to the declared capacity ceiling
+(`provider_capacity.configured_capacity_ceiling`).
 
 Each group brackets its run with a `group_started` / `group_completed` pair
 on the JSONL log, carrying the method, the point count and the per-group
 pass/fail counts, so progress is readable while the round is running instead
 of only at the end.
+
+## Waiting on a closed quota window
+
+When the scene has no dispatchable provider because its **quota windows are
+shut** — not because the chain is unresolvable, and not because a local pool
+is full — the dispatch does not fail. It parks the caller's work clock (so a
+wait is not charged to the budget that exists to catch a wedged call), logs
+that it is waiting along with which providers are shut and the soonest moment
+any of them comes back, and probes the quota payload on a fixed five-minute
+beat **with no upper limit on how long it keeps asking**. How long a window
+stays shut is the provider's fact; a caller that gave up on its own schedule
+would not get the window back, only a failure for a wait it declared over on
+a figure it invented.
+
+There is **one** watchdog for the whole process, not one per waiting
+dispatch. The payload fans out to every provider in a single request, so a
+watchdog per waiter would spend one request per waiter per interval to learn
+one thing. Asking at the same moment is merged: one caller reads, the others
+wait for it and take its answer. Measured over a closed window with eight
+verification points asleep on it: **8 requests per tick before, 1 after**.
+
+A wait is not a stall. A verification point asleep on a closed window has no
+subprocess, no stdout and no progress to report, so the sub-agent watchdog's
+stale sweep skips it — otherwise a wait long enough to cross the threshold
+would spend a kill path on a process that does not exist and then throw the
+handle away, disarming the watchdog for the subprocess that does start when
+the window reopens.
 
 ## What happens when a round fails
 

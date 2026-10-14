@@ -1501,9 +1501,18 @@ def temporary_keychain(home: Path) -> Iterator[Path]:
     same path this file created, with its own resolution and its own constant,
     so the read cannot quietly point somewhere else.
 
-    Created with no password, which is a real keychain in its unlocked state —
-    a headless runner has no way to answer an unlock prompt, and a prompt here
-    would be a hang rather than a failure.
+    Created with no password, which is a real keychain in its unlocked state.
+
+    It is worth being exact about how, because ``create-keychain`` does ask:
+    given neither ``-P`` nor ``-p`` it prompts for a password on the command
+    line. What never arrives is the human. :func:`_security` runs the tool with
+    ``stdin`` closed, so the prompt reads EOF and the password it installs is
+    empty — which is the state this file wants, and which a headless runner
+    could not have supplied by answering. Two things follow for whoever edits
+    this next. Adding ``-p`` would work but says nothing the empty password
+    does not, and re-plumbing ``_security``'s ``stdin`` — which every other
+    case in this file also depends on being closed — would turn this into a
+    hang, not a failure.
 
     Destroyed in a ``finally``, and the delete is ``check=False``: cleanup runs
     while an exception is propagating, and a cleanup that raises would replace
@@ -1563,9 +1572,9 @@ class Deployment(NamedTuple):
         """The environment the CLI is started with.
 
         This is the deployment's own environment: the redirected home, the
-        switch, and one account per row of the spec table — the state an
-        operator's machine is in, and what the ``secrets verify`` subprocess
-        has to resolve against a real keychain.
+        switch, the reader, and one account per row of the spec table — the
+        state an operator's machine is in, and what the ``secrets verify``
+        subprocess has to resolve against a real keychain.
 
         Built from nothing rather than copied from ``os.environ``. A copy
         would carry whatever the machine running the suite has exported —
@@ -1578,6 +1587,19 @@ class Deployment(NamedTuple):
             "PYTHONPATH": str(_BACKEND_DIR),
             "HOME": str(self.home),
             credentials._SWITCH_ENV_KEY: "0",
+            # The reader, and it is this file's own constant rather than
+            # whatever the machine running the suite has configured. This env
+            # is built from nothing, so the variable would otherwise be absent
+            # from the child and ``load_dotenv`` — which does not override what
+            # is already set, but has nothing here to not override — would fill
+            # it in from the project-root ``.env``. On a machine that has
+            # narrowed its keychain ACL that is an operator's signed reader,
+            # and it would be pointed at a keychain whose items name only the
+            # tool this file filed them through: the read is refused, and every
+            # row reports itself missing. CI has no ``.env``, so leaving it out
+            # is green there and red on the one machine that migrated — the
+            # same trap ``test_credential_chain_acceptance`` clears by hand.
+            credentials._SECRET_READER_ENV_KEY: _SECURITY_BIN,
         }
         for name, account in self.accounts.items():
             env[credentials.SECRET_SPECS[name].account_env_key] = account
@@ -2348,6 +2370,50 @@ def test_full_delivery_reads_the_real_keychain_entry(deployment, published_secre
         "`secrets verify` printed the secret itself. The command reports where "
         "a secret is read from; a run that printed the value would be "
         "publishing a credential into the log this failure is read from."
+    )
+
+
+def test_the_spawned_cli_is_told_which_reader_to_use(tmp_path):
+    """The reader this deployment configures survives the trip into the child.
+
+    :func:`Deployment.env` builds the subprocess environment from nothing, so a
+    variable it omits is not merely unset in the child — it is *unset*, and
+    ``load_env``'s ``load_dotenv`` runs afterwards with nothing to decline to
+    override. On a machine carrying a project-root ``.env`` the child then
+    reads its reader out of that file, and the read is issued against
+    whatever the operator configured rather than against the tool this
+    deployment filed its items through. Those two are the same tool on a
+    machine that never narrowed its ACL and emphatically not on one that did,
+    where the item's access control list names only the filer — so the read is
+    refused, or worse, prompts, and every row reports itself missing.
+
+    It is asserted on the dict rather than on a subprocess's observed exit
+    code because the failure this guards against is invisible from the
+    outside: the child starts, runs and exits cleanly either way. What changes
+    is which binary it ran, and only the environment says so. CI has no
+    ``.env`` and would pass the case this guards, which is why the guard is a
+    fact about the dict and not a re-run of the delivery case.
+    """
+    deployment = Deployment(
+        home=tmp_path / "home",
+        keychain=tmp_path / "home" / credentials._KEYCHAIN_PATH,
+        accounts={},
+        sentinels={},
+    )
+    env = deployment.env()
+
+    assert credentials._SECRET_READER_ENV_KEY in env, (
+        "the spawned CLI's environment does not name a reader at all, so it "
+        "resolves one from the project-root `.env` if this machine has one — "
+        "and a machine with one is exactly the machine whose keychain items "
+        "are filed through some other tool."
+    )
+    assert env[credentials._SECRET_READER_ENV_KEY] == _SECURITY_BIN, (
+        "the spawned CLI would read through {!r} rather than the {} this file "
+        "files its items through, and an item's access control list names the "
+        "tool that created it.".format(
+            env[credentials._SECRET_READER_ENV_KEY], _SECURITY_BIN
+        )
     )
 
 

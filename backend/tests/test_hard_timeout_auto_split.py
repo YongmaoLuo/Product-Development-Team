@@ -20,6 +20,7 @@
     round-trip round data and reset the top-level array.
 """
 
+import ast
 import asyncio
 import inspect
 import json
@@ -673,8 +674,13 @@ def test_verification_agent_imports_hard_timeout_error():
     """
     agent_path = Path(__file__).parent.parent / "verification_agent.py"
     src = agent_path.read_text(encoding="utf-8")
-    assert "from coding_tool import" in src
-    assert "HardTimeoutError" in src.split("from coding_tool import")[1].split("\n")[0]
+    # Parse the import instead of slicing the first newline after it: the
+    # import is wrapped across lines, so the old slice read as " (".
+    imported = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.ImportFrom) and node.module == "coding_tool":
+            imported.update(alias.name for alias in node.names)
+    assert "HardTimeoutError" in imported
 
 
 # ---------------------------------------------------------------------------
