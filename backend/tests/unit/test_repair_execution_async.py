@@ -70,6 +70,14 @@ def _reset_execution_state():
 # ---------------------------------------------------------------------------
 
 
+# Marked ``time_sensitive`` rather than left in the shard: the assertion
+# below is a wall-clock bound, and it measured 0.120s against its 0.1s
+# bound during a full-suite run. That is a statement about how busy the
+# runner was, not about ``_run_repair_execution_async``. The serial lane
+# (``ci.yml``'s ``existing-test``, chained after the unit shards) is the
+# only lane with the machine to itself, which is what makes a <100ms
+# bound a claim about the code rather than about the scheduler.
+@pytest.mark.time_sensitive
 def test_async_repair_returns_immediately_without_waiting(monkeypatch, tmp_path):
     """Spawn + return must complete within <100ms — no synchronous wait.
 
