@@ -66,6 +66,29 @@ logger = logging.getLogger(__name__)
 _FAST_PATH_DENY_PREFIXES = ("ssh ", "socat ", "kubectl ", "nc ", "ncat ")
 
 
+#: What ``commands_run`` carries when the agent was dispatched but its
+#: final report never came back (it raised, or we stopped waiting for it).
+#:
+#: Deliberately the same shape — and the same constant name — as
+#: :data:`binary_rebuild_agent.AGENT_REPORT_UNAVAILABLE_COMMANDS`, so
+#: that "the agent ran something but we cannot prove what" is greppable
+#: by one name across both sub-agents.
+#:
+#: The commands are **not** recoverable at that point and this module does
+#: not invent them: ``coding_tool`` drains the CLI's stdout internally and
+#: discards it, and the orchestrator hands every sub-agent the same
+#: coding-tool instance, so nothing on it can be attributed to this call.
+#:
+#: An empty list is not an acceptable answer: it reads to every consumer
+#: as "the agent ran no commands", which is the opposite of what can have
+#: happened. This entry says "not known" instead of "nothing ran".
+AGENT_REPORT_UNAVAILABLE_COMMANDS = (
+    "<unknown: the service-restart agent's final report was never "
+    "obtained, so the commands it ran cannot be recovered — see "
+    "diagnostics>"
+)
+
+
 # ---------------------------------------------------------------------------
 # Result contract
 # ---------------------------------------------------------------------------
@@ -256,10 +279,23 @@ class ServiceRestartAgent:
         ports: List[int],
         probes: List[PortProbe],
     ) -> RestartResult:
-        """Spawn the agent once. Never raises; failure → success=False."""
+        """Spawn the agent once. Never raises; failure → success=False.
+
+        "Never raises" does not mean "never ran": the ``except`` arm
+        distinguishes a failure to *dispatch* the agent from a failure to
+        *collect* its answer, because only one of them means no commands
+        were run. See :meth:`_dispatch_failure`.
+        """
         start = time.monotonic()
         settings_path: Optional[str] = None
         handle = None
+        #: Flipped the instant the prompt leaves this module. Everything
+        #: above it is local bookkeeping (temp settings file, watchdog
+        #: registration); everything from it on is a call the provider
+        #: layer owns, and it can fail for reasons that say nothing about
+        #: whether the agent ever ran. The two cases want different
+        #: wording — see the ``except`` arm.
+        dispatched = False
 
         try:
             from verification_subagent import SettingsJsonBuilder
@@ -297,6 +333,7 @@ class ServiceRestartAgent:
                         "(continuing without watchdog): %s", exc,
                     )
 
+            dispatched = True
             raw = self.coding_tool.query_json(
                 self.build_user_prompt(project_dir, ports, probes),
                 system_instruction=self.build_system_prompt(),
@@ -306,14 +343,7 @@ class ServiceRestartAgent:
             )
             return self._parse_agent_output(raw, start)
         except Exception as exc:
-            return RestartResult(
-                success=False,
-                diagnostics=(
-                    f"agent invocation failed: {type(exc).__name__}: {exc}"
-                ),
-                duration_seconds=time.monotonic() - start,
-                agent_used=True,
-            )
+            return self._dispatch_failure(exc, dispatched, start)
         finally:
             if SettingsJsonBuilder is not None and settings_path:
                 try:
@@ -327,6 +357,78 @@ class ServiceRestartAgent:
                     self.registry.unregister(self.plan_id, handle)
                 except Exception:
                     pass
+
+    # ------------------------------------------------------------------
+    # Dispatch failures
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _dispatch_failure(
+        exc: BaseException, dispatched: bool, start: float,
+    ) -> RestartResult:
+        """Turn an exception out of :meth:`run` into an honest result.
+
+        Ported verbatim in shape from
+        :meth:`binary_rebuild_agent.RebuildAgent._dispatch_failure`,
+        which had the identical wording bug. The old text —
+        ``"agent invocation failed: ..."`` — collapsed two different
+        stories into one sentence:
+
+        * **never dispatched** (``dispatched=False``): something local
+          failed before the prompt left — the temp settings file, the
+          watchdog registration. Nothing ran, and ``commands_run=[]`` is
+          the true answer.
+        * **dispatched, answer lost** (``dispatched=True``): the prompt
+          reached the coding tool and the failure came back from the
+          provider layer. The agent may well have run restart commands
+          before the report died; the empty ``commands_run`` that came
+          with it travelled into the preflight evidence pack
+          (:func:`attempt_service_restart` extends the orchestrator
+          result with it, and ``verification_agent`` logs that dict)
+          reading as "it ran nothing".
+
+        Contract differences from ``RebuildResult``, checked before
+        copying the pattern and deliberately NOT changed:
+
+        * ``RestartResult.ports_restarted`` is left alone. On the
+          orchestrator it is extended only when ``agent_result.success``
+          is true, which is false on both paths here, so an "unknown"
+          ``commands_run`` entry cannot leak into ``ports_restarted``.
+        * ``success`` is decided by the independent post-check in
+          :func:`attempt_service_restart`, which re-probes every port
+          itself and still runs after a failure. A lost report therefore
+          does not force failure — the ports may genuinely be up — and
+          that stays true here. ``post_check_passed`` is the only
+          trustworthy signal on the "dispatched, answer lost" path, same
+          as in the rebuild agent.
+        * ``agent_used=dispatched`` rather than a hard-coded ``True``:
+          :func:`attempt_service_restart` already sets ``agent_used=True``
+          before calling :meth:`run`, so the orchestrator-level flag is
+          unaffected; this only makes the agent-level result honest.
+        """
+        detail = f"{type(exc).__name__}: {exc}"
+        if dispatched:
+            diagnostics = (
+                f"service-restart agent was dispatched but its report "
+                f"never came back ({detail}). The agent may have run "
+                f"commands and may have restarted the service — "
+                f"commands_run is therefore unknown, not empty; "
+                f"post_check_passed is the only trustworthy signal here."
+            )
+            commands: List[str] = [AGENT_REPORT_UNAVAILABLE_COMMANDS]
+        else:
+            diagnostics = (
+                f"service-restart agent was never dispatched ({detail}); "
+                f"no commands were run."
+            )
+            commands = []
+        return RestartResult(
+            success=False,
+            commands_run=commands,
+            diagnostics=diagnostics,
+            duration_seconds=time.monotonic() - start,
+            agent_used=dispatched,
+        )
 
     # ------------------------------------------------------------------
     # Output parsing
