@@ -4304,8 +4304,8 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                     return
             if stop_reason == "max_rounds_reached":
                 # 2026-08-25 audit: previous code logged "Per user
-    # max_rounds is no longer a stopping
-                # condition" and kept iterating. That directive was
+                # max_rounds is no longer a stopping
+                # condition" and kept iterating. That decision was
                 # never recorded in the docs and contradicts the
                 # ``/start`` handler's ceiling check (server.py:5242)
                 # which refuses to start a round above ``max_rounds``.
@@ -4872,8 +4872,8 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
 
                 # 2026-09-12: even when both the orchestrator
                 # payload AND the DB queue are empty, we still need
-                # to surface a meaningful stop_reason. The user wants
-                # the chain to keep running, but if there's nothing
+                # to surface a meaningful stop_reason. The chain is meant
+                # to keep running, but if there's nothing
                 # left to run, the chain has truly converged.
                 # Surface ``stop_reason`` from the orchestrator
                 # result (e.g. ``same_failure_repeated_after_max_attempts``

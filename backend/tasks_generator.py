@@ -1140,7 +1140,7 @@ class TasksGenerator:
         #      is wrong: children run in parallel with their siblings,
         #      so they must depend on the parent's upstream deps, not
         #      on the parent itself.
-        # Principle 2 (user audit 2026-08-19): BEFORE the limit split,
+        # Principle 2 (2026-08-19 audit): BEFORE the limit split,
         # backfill any empty ``files_to_modify`` with sentinel and
         # merge description-extracted paths. Without this step,
         # ``framework/task_output_validator.py`` step-3 rejects the

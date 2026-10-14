@@ -121,8 +121,9 @@ class TestBuildLayers:
     def test_unknown_tasks_serial(self):
         """Unknown-modification (sentinel) tasks run in PARALLEL.
 
-        Contract changed 2026-08-19 (explicit user
-        requirement "能并行当然并行" / "把所有task串行化也不行"): the
+        Contract changed 2026-08-19: tasks that CAN run in parallel
+        must stay in parallel — serialising every task is not the
+        answer either. The
         sentinel means "the exact files are not yet known", NOT "this task
         touches every file", so sentinel tasks do NOT inherently conflict.
         Each subagent runs in its own worktree and the executor commits

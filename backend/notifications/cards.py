@@ -382,11 +382,10 @@ def _unified_phase_section(
 
     The shape is ``**📍 当前状态：<phase> →<sub-state>`` so a glance
     is enough to disambiguate "执行 vs 验证". Without this section
-    the operator previously had to mentally compare the "任务执行
+    a reader has to mentally compare the "任务执行
     状态" bar (which counts execution tasks) against the "验证状态"
     line (which describes the verification loop) to figure out which
-    worker was active — exactly the split-state the user complained
-    about.
+    worker was active — a split state the card no longer leaves open.
 
     2026-09-17 (schema v5): this used to take TWO values — a routing
     ``stage`` and an ``execution_current_phase`` — because the two
@@ -493,10 +492,10 @@ def _in_progress_tasks_section(
     """Render a "currently running tasks" block with title + id.
 
     2026-09-11: the previous version rendered
-    ONLY ids (e.g. "🔄 正在执行：`RP-1`、`RP-2`") because the requirement
-    from 2026-09-09 was "minimal — count and ids". But the user
-    reported this is too terse: when only the title is what they
-    recognise, the id-only line is unreadable. Each in_progress task
+    ONLY ids (e.g. "🔄 正在执行：`RP-1`、`RP-2`") because the 2026-09-09
+    requirement was "minimal — count and ids". That proved too terse:
+    when only the title is what a reader recognises, the id-only line
+    is unreadable. Each in_progress task
     gets its own line with `[id] title`, and only truncate the title
     if it overflows the 80-char display budget.
 

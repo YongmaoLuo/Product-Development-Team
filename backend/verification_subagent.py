@@ -1202,10 +1202,10 @@ class VerificationSubAgent:
                     # simply does not get a budget, which is the
                     # behaviour it had before there was one to hand out.
                     pass
-                # 2026-09-14 (user insight — "对于一个活着的pytest，即使它
-                # 的执行时长很长…它其实也会有一些stdout，比如说它的进度
-                # 条"): a healthy long-running tool call streams stdout
-                # continuously, but that liveness only reached
+                # 2026-09-14: a healthy long-running tool call streams
+                # stdout continuously — a live pytest prints progress
+                # lines (its progress bar, among others) however long
+                # it runs — but that liveness only reached
                 # ``scoped_tool._last_output_ts`` — never the plan-dir log
                 # that the verification watchdog measures by mtime. A
                 # 22-minute pytest therefore looked "silent" and got
@@ -1780,7 +1780,7 @@ class VerificationSubAgent:
     ) -> None:
         """Mirror a streaming tool call's liveness into the attempt log.
 
-        2026-09-14 (user insight): a live pytest prints progress lines
+        2026-09-14: a live pytest prints progress lines
         even when it runs far longer than any idle threshold — that is
         exactly the case that was being killed as "silent". The coding
         tool already stamps ``_last_output_ts`` per stdout line
