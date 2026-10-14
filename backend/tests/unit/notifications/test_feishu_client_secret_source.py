@@ -45,6 +45,28 @@ LOGICAL_NAME = "feishu_app_secret"
 _APP_ID_KEY = "FEISHU_APP_ID"
 _APP_SECRET_KEY = "FEISHU_APP_SECRET"
 _SWITCH_KEY = "PDT_DISABLE_KEYCHAIN_SECRETS"
+#: The keychain *reader* override — the fourth thing the module reads out
+#: of the environment. Cleared for the same reason the app id is: it is
+#: read from the project-root ``.env`` before any test runs, so a
+#: workstation that narrowed its ACL with ``setup.sh adopt`` carries it,
+#: and ``_keychain_holds`` below would then stub a process the module is
+#: no longer starting. A case whose result depends on which machine runs
+#: it is a case that proves nothing.
+#:
+#: Cleared rather than left in place, and that is now load-bearing in the
+#: other direction too: ``_secret_reader_bin`` returns ``None`` when this
+#: is unset, so a deployment with no reader issues no keychain read at
+#: all. Every helper below that wants a lookup therefore *sets* it — to
+#: the stand-in below — rather than relying on a default binary.
+_READER_PATH_KEY = "PDT_SECRET_READER_PATH"
+
+#: The binary a test configures as this deployment's reader. Never
+#: executed: ``credentials._run_security`` is stubbed below it, so the
+#: path only has to be one the test can recognise on the recorded argv.
+#: Spelled out rather than read from the environment, because an
+#: assertion that compares the module's answer with the variable the test
+#: just set is not an assertion.
+STUB_READER = "/opt/pdt/tests/stub-secret-reader"
 
 #: What the keychain returns in the cases below. Not a credential and
 #: not shaped like one: a suite that needs a real secret to prove a
@@ -63,7 +85,11 @@ def _isolated_secret_state(monkeypatch):
     Three things, each for a specific reason.
 
     The environment is cleared so a developer's own ``FEISHU_APP_ID``
-    cannot make a "the index is missing" assertion pass. The cache is
+    cannot make a "the index is missing" assertion pass, and so
+    ``PDT_SECRET_READER_PATH`` — which the project-root ``.env`` exports
+    into this process on any machine that has migrated its keychain —
+    cannot point the read at a binary other than the one a test stubbed.
+    The cache is
     cleared because the provider memoises a resolution for the life of
     the process, and a test that resolves a secret leaves an entry
     behind for the next test in the file. The platform is forced to
@@ -71,7 +97,7 @@ def _isolated_secret_state(monkeypatch):
     runs the suite — the keychain is a platform facility, and a case
     that quietly skipped itself on Linux would be a case nobody ran.
     """
-    for key in (_SWITCH_KEY, _APP_ID_KEY, _APP_SECRET_KEY):
+    for key in (_SWITCH_KEY, _APP_ID_KEY, _APP_SECRET_KEY, _READER_PATH_KEY):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(credentials, "_is_macos", lambda: True)
     credentials.reset_cache()
@@ -80,7 +106,7 @@ def _isolated_secret_state(monkeypatch):
 
 
 def _keychain_holds(sentinel, monkeypatch) -> None:
-    """Make the keychain read return ``sentinel``.
+    """Put ``sentinel`` where the client will find it, the way it arrives.
 
     Stubbed at the process boundary rather than above it, so everything
     below the client stays real: the switch is read, the platform is
@@ -90,21 +116,47 @@ def _keychain_holds(sentinel, monkeypatch) -> None:
     would let this pass on a client that still read the plaintext
     variable whenever the ambient environment happened to carry one —
     which is the exact regression the suite exists to catch.
+
+    Stubbing the keychain is no longer enough on its own. The process
+    the client runs in is the *server*, and the server is handed its
+    secrets over a descriptor by the launcher — it does not read the
+    keychain. So this helper finishes the journey the way
+    :mod:`backend.secret_launcher` does: publish what the keychain
+    returned onto a pipe, and name the descriptor in the environment.
+    Both halves stay real, so a client that stopped going through the
+    provider still fails here.
+
+    The reader is configured rather than left to a default, because there
+    is no longer one: with ``PDT_SECRET_READER_PATH`` unset the module
+    starts nothing and reports "no value", which would make every case
+    below pass for a reason that has nothing to do with the client.
     """
+    monkeypatch.setenv(_READER_PATH_KEY, STUB_READER)
+
     def fake_run(argv, timeout):
-        assert argv[0].endswith("security"), argv
+        assert argv[0] == STUB_READER, argv
         assert "-a" in argv and "-w" in argv
         return sentinel.encode("utf-8") + b"\n"
 
     monkeypatch.setattr(credentials, "_run_security", fake_run)
+
+    fd = credentials.publish_secret_fd("feishu_app_secret")
+    assert fd is not None, "the stubbed keychain should have yielded a value"
+    monkeypatch.setenv(
+        credentials.secret_fd_env_var("feishu_app_secret"), str(fd)
+    )
+    credentials.reset_cache()
 
 
 def _keychain_has_nothing(monkeypatch) -> None:
     """Make the keychain read fail the way a missing item does.
 
     A nonzero exit — the ordinary case for a machine where the switch
-    was turned on and the item was never added.
+    was turned on and the item was never added. A reader is configured
+    so that the read is actually *issued* and fails, which is a different
+    case from never being issued at all.
     """
+    monkeypatch.setenv(_READER_PATH_KEY, STUB_READER)
     monkeypatch.setattr(
         credentials,
         "_run_security",
@@ -252,18 +304,25 @@ def test_sdk_missing_and_credentials_missing_are_distinguishable(monkeypatch):
     wrong one. Both cases are armed with everything *other* than their
     own fault, so nothing but the fault itself differs.
     """
-    monkeypatch.setenv(_SWITCH_KEY, "0")
     monkeypatch.setenv(_APP_ID_KEY, SENTINEL_APP_ID)
-    _keychain_holds(SENTINEL_SECRET, monkeypatch)
 
-    # Credentials missing: the switch is off and nothing is set.
+    # Credentials missing: no descriptor was handed down and nothing is
+    # in the environment. The switch is off, which is what makes the
+    # provider willing to look in the environment at all — and there is
+    # nothing there to find.
     monkeypatch.setenv(_SWITCH_KEY, "1")
     with pytest.raises(FeishuUnavailable) as credentials_failure:
         FeishuClient()
     credentials_message = str(credentials_failure.value)
 
-    # SDK missing: every credential is present and correct.
+    # SDK missing: every credential is present and correct. The
+    # descriptor is published here rather than above, because a handed-
+    # down secret outranks the switch: the switch decides whether *this*
+    # process reads the keychain, and a descriptor means the parent
+    # already did. Arming this case before the one above would have
+    # given it a credential it is not supposed to have.
     monkeypatch.setenv(_SWITCH_KEY, "0")
+    _keychain_holds(SENTINEL_SECRET, monkeypatch)
     _sdk_absent(monkeypatch)
     with pytest.raises(FeishuUnavailable) as sdk_failure:
         FeishuClient()

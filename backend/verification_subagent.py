@@ -1998,8 +1998,9 @@ class SettingsJsonBuilder:
     Attributes:
         vp_id: Verification-point ID, e.g. ``"VP-001"``. Used in the
             temp file path.
-        plan_id: Plan ID, e.g. ``"20260101-example"``. Also
-            used in the temp file path.
+        plan_id: Plan ID (see ``framework.ids.validate_plan_id``
+            for what one may contain). Also used in the temp file
+            path.
     """
 
     vp_id: str

@@ -215,6 +215,74 @@ def _log_phase_distribution(context: str, summary: dict) -> None:
               "（按计划顺序执行）")
 
 
+# 2026-10-11: cap on evidence handed to the Phase 3 judgment LLM.
+# VP-016 round 4 shipped 7141 chars of evidence and the old 500-char
+# cap cut it mid-sentence right before the conclusion the reporter
+# needed. 8000 comfortably covers the observed worst case; anything
+# beyond it is clipped — but *declared*, see ``_truncate_annotated``.
+_MAX_PROMPT_EVIDENCE_CHARS = 8000
+
+
+def _truncate_annotated(text: str, limit: int, label: str = "evidence") -> str:
+    """Clip ``text`` to ``limit`` chars, declaring the cut when one happens.
+
+    The point of the declaration is that a silent slice is
+    indistinguishable from the whole thing: the reader cannot tell
+    "that is all there was" from "that is the first N chars", so an
+    LLM downstream reasons about a truncated fragment as if it were a
+    complete argument and reports "I could not verify the FAILED
+    conclusion because the text was cut" — the round then closes FAILED
+    over a sentence about the harness's own output rather than about the
+    code under test. Losing the tail is acceptable; losing the *fact*
+    that the tail is missing is not, so the annotation states the
+    original length too.
+    """
+    if len(text) <= limit:
+        return text
+    notice = (
+        f"…[{label} 已截断，原长 {len(text)} 字符，"
+        f"此处保留前 {limit}]"
+    )
+    return text[:limit] + notice
+
+
+def _render_evidence_for_prompt(
+    evidence: Any, limit: int = _MAX_PROMPT_EVIDENCE_CHARS
+) -> str:
+    """Render a VP ``evidence`` value as readable prompt text, bounded.
+
+    ``evidence`` arrives in two shapes:
+
+    * ``str`` — the legacy / executor path, already flattened;
+    * ``dict`` — the sub-agent path, ``{"details": str, "raw": list[str]}``
+      (see :meth:`Orchestrator._verdict_to_result`).
+
+    ``str(dict)`` on the second shape renders a Python repr — escaped
+    quotes, a leading ``{``, a trailing ``}'`` glued to the end of the
+    text — which reads badly and is easy for a reporter to mis-parse.
+    Here ``raw`` is listed one entry per line (those entries are the
+    actual observations), falling back to ``details`` when ``raw`` is
+    absent or empty. A ``list`` is joined the same way.
+
+    The result is then passed through :func:`_truncate_annotated`, so
+    the bound applies *after* rendering and the annotation reports the
+    post-render length — the number the reader actually has to reason
+    about.
+    """
+    rendered: str
+    if isinstance(evidence, dict):
+        raw = evidence.get("raw")
+        if isinstance(raw, (list, tuple)) and raw:
+            rendered = "\n".join(str(e) for e in raw)
+        else:
+            rendered = str(evidence.get("details") or "")
+    elif isinstance(evidence, (list, tuple)):
+        rendered = "\n".join(str(e) for e in evidence) if evidence else ""
+    else:
+        rendered = str(evidence or "")
+    return _truncate_annotated(rendered, limit)
+
+
 #
 # Refactor note (Phase C7 → Orchestrator): the historical class name
 # ``VerificationAgent`` is kept as a backward-compatibility alias of the
@@ -2718,20 +2786,42 @@ class Orchestrator:
 
         * ``verdict.verdict`` → ``status`` (already coerced —
           SKIPPED never reaches here).
-        * ``verdict.reasons`` (first entry) → ``actual_result``.
+        * ``verdict.reasons`` (**all entries, newline-joined**) →
+          ``actual_result``.
         * ``verdict.evidence`` (joined) → ``evidence``.
         * Provider metadata is dropped at this layer; it is
           surfaced in the persistence log via
           ``sub_agent_completed`` for auditability, not in the
           per-VP result dict.
+
+        2026-10-11: ``actual_result`` used to be ``reasons[0]``
+        only. That is systematically wrong: the sub-agent emits
+        one reason per acceptance criterion, **satisfied criteria
+        first, the failing one last** (confirmed on VP-016 round
+        4: ``reasons[0]`` was criterion ① passing at 246 chars,
+        while the real failure — criterion ④'s second half — sat
+        at ``reasons[4]``, 623 chars). Taking index 0 therefore
+        throws away the failure reason and hands the report writer
+        / repair-task generator a VP that "passed" every check
+        while the verdict says FAILED. Across 34 FAILED verdicts
+        ``reasons[0]`` carried only ~25% (median) of the reason
+        text, and in 41% of cases mentioned the failure not at all.
+        Joining all reasons — the same thing
+        :meth:`_build_execution_results_from_executor` already did
+        on the executor path — makes the failure reason survive to
+        the downstream consumers.
         """
         status = str(verdict.verdict) if verdict.verdict else "FAILED"
-        # ``actual_result`` is a short human-readable summary; the
-        # first reason is usually the most informative. If no
-        # reasons were provided, fall back to a generic message
-        # so the downstream report always has *something* to show.
+        # Keep every reason, in order. The failing criterion is the
+        # LAST one, so truncating to a prefix (or keeping only
+        # reasons[0]) is exactly how the failure reason got lost.
+        # The "satisfied criteria first" convention is what makes
+        # this a prefix-vs-suffix problem rather than a "pick the
+        # best line" one. If no reasons were provided at all, fall
+        # back to a generic message so the downstream report always
+        # has *something* to show.
         if verdict.reasons:
-            actual_result = str(verdict.reasons[0])
+            actual_result = "\n".join(str(r) for r in verdict.reasons)
         else:
             actual_result = f"verdict={status}"
         evidence = " | ".join(str(e) for e in verdict.evidence) if verdict.evidence else ""
@@ -3365,7 +3455,9 @@ class Orchestrator:
 
             parts.append(f"### {vp_id}: {status}")
             parts.append(f"- 实际结果: {actual}")
-            parts.append(f"- 判定依据: {str(evidence)[:500]}")
+            parts.append(
+                f"- 判定依据: {_render_evidence_for_prompt(evidence)}"
+            )
             parts.append("")
 
         return "\n".join(parts)
