@@ -49,8 +49,10 @@ and it is the part the object does not give up.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -136,6 +138,31 @@ def _run(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _load_module(path: Path):
+    """Import the scanner module at *path*, which is not a package.
+
+    Only for the two assertions above that are about a *constant* rather
+    than a behaviour: those cannot be observed from the outside without
+    contriving a file type that happens to disagree with the shared set.
+    Every behavioural case in this file goes through the wrapper script,
+    which is the thing a developer actually runs.
+    """
+    spec = importlib.util.spec_from_file_location(f"_probe_{path.stem}", path)
+    assert spec is not None and spec.loader is not None, path
+    module = importlib.util.module_from_spec(spec)
+    # Registered before exec: both modules define ``@dataclass`` classes
+    # whose annotations are strings, and ``dataclasses`` resolves those
+    # through ``sys.modules[cls.__module__]`` -- which is not populated yet
+    # if the exec happens first.
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[spec.name]
+        raise
+    return module
+
+
 # ---------------------------------------------------------------------------
 # pre-commit: the staged index
 # ---------------------------------------------------------------------------
@@ -156,9 +183,19 @@ def _staged_env(tmp_path: Path) -> dict[str, str]:
 
 def _stage(env: dict[str, str], path: str, content: str) -> None:
     """Put *content* at *path* in the throwaway index, touching no file."""
+    _stage_blob(env, path, content.encode("utf-8"))
+
+
+def _stage_blob(env: dict[str, str], path: str, data: bytes) -> None:
+    """Stage raw *data*, so a NUL byte survives to the index.
+
+    ``_stage`` goes through UTF-8, which cannot express the leading
+    ``\\x00`` these tests are about; the blob is built here instead so the
+    byte under test is the byte the scanner sees.
+    """
     sha = subprocess.run(
         ["git", "-C", str(REPO_ROOT), "hash-object", "-w", "--stdin"],
-        input=content.encode("utf-8"),
+        input=data,
         capture_output=True,
         check=True,
         env=env,
@@ -451,6 +488,254 @@ def test_an_uncompilable_pattern_exits_2(tmp_path) -> None:
         f"an uncompilable pattern reported {got.returncode}, not 2:\n"
         f"{got.stdout}\n{got.stderr}"
     )
+
+
+# ---------------------------------------------------------------------------
+# A NUL byte must not switch the check off
+# ---------------------------------------------------------------------------
+
+
+def _scan_index(env: dict[str, str], list_path: str) -> subprocess.CompletedProcess[str]:
+    """Run the pre-commit name check exactly as the dispatcher runs it."""
+    return subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "scripts" / "scan_forbidden_names.sh"),
+            "--index",
+            "--list",
+            list_path,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=env,
+        check=False,
+    )
+
+
+def _said(got: subprocess.CompletedProcess[str]) -> str:
+    """Everything the check said, on either stream.
+
+    ``scan_forbidden_names.sh`` captures the scanner's output with
+    ``2>&1`` and replays it on **stderr** for any non-zero exit, so on
+    every path these tests care about ``stdout`` is empty. Asserting
+    against ``stdout`` alone would be asserting against a string that is
+    always ``""`` -- which passes no matter what the scanner says.
+    """
+    return got.stdout + got.stderr
+
+
+def test_a_nul_prefixed_source_file_is_still_scanned(tmp_path) -> None:
+    """The bypass itself: a ``\\x00`` in a ``.py`` must not skip it.
+
+    One leading NUL byte used to make the scanner skip the blob, print a
+    reassuring note that changed no exit code, and report ``OK  0
+    violations`` -- with a real name sitting in the skipped file. This is
+    the same shape as the bypass closed in ``staged_content_scan.py``,
+    and this scanner is the *only* place these names are checked: it needs
+    an operator-owned list, so it cannot run in CI, and the hooks are the
+    whole surface.
+    """
+    env = _staged_env(tmp_path)
+    _stage_blob(env, "backend/nul_probe.py", f"\x00{SYNTHETIC_NEEDLE}\n".encode())
+    _stage(env, "backend/innocent.py", 'GREETING = "hello"\n')
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_index(env, list_path)
+
+    assert got.returncode == 1, (
+        f"a NUL-prefixed .py carrying a forbidden name was not blocked "
+        f"(exit {got.returncode}):\n{got.stdout}\n{got.stderr}"
+    )
+    assert "backend/nul_probe.py:1" in got.stderr, (
+        f"the skipped file was not reported as a violation:\n{got.stderr}"
+    )
+    assert SYNTHETIC_NEEDLE in _said(got), _said(got)
+    assert "OK  forbidden-name scan" not in _said(got), (
+        f"a batch containing a forbidden name reported OK:\n{_said(got)}"
+    )
+
+
+def test_a_nul_prefixed_source_file_alone_is_not_a_clean_scan(tmp_path) -> None:
+    """The degenerate batch -- only the NUL file staged -- must still refuse.
+
+    This is the case a "skip binaries, read the rest" fix would leave
+    behind if it only fixed the neighbouring-file shape: with nothing else
+    in the index there is no other file to scan, so an implementation that
+    reported the skip as a clean run would pass here. Any non-zero exit is
+    acceptable; 0 is not.
+    """
+    env = _staged_env(tmp_path)
+    _stage_blob(env, "backend/nul_probe.py", f"\x00{SYNTHETIC_NEEDLE}\n".encode())
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_index(env, list_path)
+
+    assert got.returncode != 0, (
+        f"a batch whose only file carries a forbidden name reported "
+        f"{got.returncode}:\n{got.stdout}\n{got.stderr}"
+    )
+    assert SYNTHETIC_NEEDLE in got.stderr, got.stderr
+
+
+def test_a_nul_source_file_with_no_needle_is_read_not_skipped(tmp_path) -> None:
+    """Reading a NUL-bearing ``.py`` must not cost anything by itself.
+
+    The counterpart of the case above: if the rule were "any NUL is exit
+    2", the ordinary commit would be blocked for no reason and the gate
+    would be switched off. A NUL source file with nothing forbidden in it
+    is a *clean* scan, because nothing was left unread.
+    """
+    env = _staged_env(tmp_path)
+    _stage_blob(env, "backend/nul_probe.py", b"\x00GREETING = 'hello'\n")
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_index(env, list_path)
+
+    assert got.returncode == 0, (
+        f"a NUL-bearing .py with no forbidden name blocked the commit "
+        f"(exit {got.returncode}):\n{got.stdout}\n{got.stderr}"
+    )
+
+
+def test_a_skipped_binary_degrades_the_batch_to_2(tmp_path) -> None:
+    """The second half of the fix: a skip degrades the batch, loudly.
+
+    Extension-based skipping means an extension nobody has met yet is not
+    in the source set, so it gets skipped. If that were free, this same
+    bypass would return with one more file type. So a batch that skipped
+    anything exits 2 and names what it did not read -- and in particular
+    does not print ``OK``.
+    """
+    env = _staged_env(tmp_path)
+    _stage_blob(env, "backend/logo.png", b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02" * 40)
+    _stage(env, "backend/innocent.py", 'GREETING = "hello"\n')
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_index(env, list_path)
+
+    assert got.returncode == 2, (
+        f"a batch with a skipped blob reported {got.returncode}, not 2 -- "
+        f"one unread blob is an unknown number of unexamined bytes:\n"
+        f"{got.stdout}\n{got.stderr}"
+    )
+    assert "not scanned: backend/logo.png" in got.stderr, (
+        f"the skipped file was not named:\n{got.stderr}"
+    )
+    assert "did not read the whole commit" in got.stderr, got.stderr
+    assert "OK  forbidden-name scan" not in _said(got), (
+        f"a degraded batch reported a clean scan:\n{_said(got)}"
+    )
+
+
+def test_a_real_binary_alone_still_exits_2(tmp_path) -> None:
+    """Staging only a real binary keeps its exit code: 2 before, 2 after.
+
+    The batch of one leaves nothing readable, which is the pre-existing
+    "refusing to report a clean scan over an empty read" branch. Pinning
+    it stops a later change from turning "I read nothing" into 0 or 1.
+    """
+    env = _staged_env(tmp_path)
+    _stage_blob(env, "backend/logo.png", b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02" * 40)
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_index(env, list_path)
+
+    assert got.returncode == 2, (
+        f"a batch holding only a real binary reported {got.returncode}, "
+        f"not 2:\n{got.stdout}\n{got.stderr}"
+    )
+
+
+def test_a_skip_does_not_hide_a_violation_in_the_files_that_were_read(
+    tmp_path,
+) -> None:
+    """Degradation must not swallow findings, and findings must come first.
+
+    The two outputs answer different questions, and a reader who is sent
+    to the wrong one is sent looking for a git problem instead of the name
+    that was just found in the file next to the PNG.
+    """
+    env = _staged_env(tmp_path)
+    _stage_blob(env, "backend/logo.png", b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02" * 40)
+    _stage(env, "backend/agent.py", f'NAME = "{SYNTHETIC_NEEDLE}"\n')
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_index(env, list_path)
+
+    assert got.returncode == 2, (
+        f"a degraded batch with a violation reported {got.returncode}:\n"
+        f"{got.stdout}\n{got.stderr}"
+    )
+    # The findings go to stdout and the degradation notice to stderr; the
+    # wrapper captures both and replays them on stderr. What has to hold is
+    # that neither half is dropped, not how the two streams interleave --
+    # stdout is block-buffered through a pipe, so their relative order in
+    # the captured text is not the order ``main()`` printed them in.
+    assert "FAIL forbidden-name scan: 1 violation(s)" in _said(got), (
+        f"the violation was not reported:\n{_said(got)}"
+    )
+    assert "backend/agent.py:1" in _said(got), _said(got)
+    assert "not scanned: backend/logo.png" in _said(got), _said(got)
+
+
+def test_the_binary_probe_bytes_match_the_staged_content_scan() -> None:
+    """Two copies of one constant, held together by a test.
+
+    ``scan_forbidden_names.py`` and ``staged_content_scan.py`` both carry
+    ``_BINARY_PROBE_BYTES`` rather than one importing the other: the
+    constant is git's, and sharing it would drag this hook through the
+    whole import closure of the plan-id gate to save an integer. That is a
+    trade only while the two agree, so this pins them. A test may import
+    both modules; a pre-commit hook may not.
+    """
+    forbidden = _load_module(
+        REPO_ROOT / "scripts" / "scanners" / "scan_forbidden_names.py"
+    )
+    staged = _load_module(
+        REPO_ROOT / "backend" / "tests" / "static_gates" / "staged_content_scan.py"
+    )
+
+    assert forbidden._BINARY_PROBE_BYTES == staged._BINARY_PROBE_BYTES, (
+        f"the two binary probes disagree: "
+        f"{forbidden._BINARY_PROBE_BYTES} != {staged._BINARY_PROBE_BYTES}. "
+        f"They are meant to be git's threshold, so one of them has drifted."
+    )
+    assert forbidden._BINARY_PROBE_BYTES == 1024, (
+        f"git's binary threshold changed: "
+        f"{forbidden._BINARY_PROBE_BYTES} != 1024"
+    )
+
+
+def test_the_scanner_reads_the_shared_source_extension_set() -> None:
+    """The skip decision must not restate which files are source.
+
+    If this scanner carried its own extension set, adding a type to
+    ``source_scan.SOURCE_EXTENSIONS`` and not to the copy would re-open
+    exactly the bypass these tests close, silently. So the set is the
+    imported one, not a literal here.
+    """
+    forbidden = _load_module(
+        REPO_ROOT / "scripts" / "scanners" / "scan_forbidden_names.py"
+    )
+
+    # Identity, not equality: the point is that the scanner *imports* the
+    # set rather than writing its own literal. Loading ``source_scan`` a
+    # second time here would produce an equal-but-distinct frozenset and
+    # prove nothing about provenance, so this compares against the module
+    # object the scanner's own import left in ``sys.modules``.
+    shared = sys.modules.get("source_scan")
+    assert shared is not None, (
+        "loading the scanner did not import source_scan; the extension set "
+        "must come from backend/tests/static_gates/source_scan.py"
+    )
+    assert forbidden.SOURCE_EXTENSIONS is shared.SOURCE_EXTENSIONS, (
+        "the scanner holds its own copy of SOURCE_EXTENSIONS instead of "
+        "importing the shared one; two copies drift, and this particular "
+        "one drifting re-opens the NUL bypass for the new file type"
+    )
+    assert Path("backend/agent.py").suffix in forbidden.SOURCE_EXTENSIONS
+    assert Path("backend/logo.png").suffix not in forbidden.SOURCE_EXTENSIONS
 
 
 # ---------------------------------------------------------------------------

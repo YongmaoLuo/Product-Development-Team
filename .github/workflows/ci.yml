@@ -682,6 +682,40 @@ jobs:
           gitleaks version
           bash scripts/scan_commit_range.sh --ci --max-commits 5
 
+      # A gate that is not here is still a gate. This step checks nothing
+      # and fails nothing: it exists so the absence is *visible in the run
+      # log*, rather than inferred from silence by whoever reads the job
+      # later and concludes the range scan covers everything.
+      #
+      # What is absent: the private proper-name check
+      # (``scripts/scan_forbidden_names.sh``). Its needles live in an
+      # untracked, operator-owned ``.config/forbidden-names`` — a blacklist
+      # that is committed publishes the names it exists to withhold — and a
+      # GitHub runner has no such file by construction. A ``--ci`` path that
+      # ran it could only ever exit 2, which is a permanently red job that
+      # everyone learns to bypass.
+      #
+      # Where it does run: the ``pre-commit`` hook (on the index) and the
+      # ``pre-push`` hook (on the commits about to be published), both wired
+      # by ``scripts/install_git_hooks.sh``. Both are local state git does
+      # not track, so merging this pull request does not install them — run
+      # ``bash scripts/install_git_hooks.sh`` once after the merge. Nothing
+      # in this workflow can check that, and this line is the closest it
+      # gets: the gap is real, permanent, and not CI's to close.
+      #
+      # Not fixed here by injecting the list: shipping the names to the
+      # runner to check them there would reintroduce the exact leak this
+      # arrangement was built to end.
+      - name: Note — the forbidden-name check does not run in CI
+        run: |
+          echo "NOTE: private proper-name checking does NOT run in this job."
+          echo "NOTE: its needles live in an untracked, operator-owned"
+          echo "NOTE:   .config/forbidden-names, which a CI runner does not have."
+          echo "NOTE: it runs in the local pre-commit and pre-push hooks only"
+          echo "NOTE:   (scripts/install_git_hooks.sh), so a leaked name reaches"
+          echo "NOTE:   this workflow only if the hooks were not installed."
+          echo "NOTE: run 'bash scripts/install_git_hooks.sh' after cloning."
+
   # ---------------------------------------------------------------------------
   # STAGE 1d — PR METADATA (the fourth surface)
   #

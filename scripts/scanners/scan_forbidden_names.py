@@ -74,9 +74,11 @@ Exit codes
 * ``0`` -- the list was read, the content was read, zero needles matched.
 * ``1`` -- the list was read, the content was read, at least one needle
   matched. Every hit is reported as ``relative/path:lineno: needle``.
-* ``2`` -- **the check did not run.** The list is missing, holds zero usable
-  needles, or holds a pattern that does not compile; the index could not be
-  read; a range resolved to no commits.
+* ``2`` -- **the check did not run,** or did not run over everything it was
+  asked to read. The list is missing, holds zero usable needles, or holds a
+  pattern that does not compile; the index could not be read; a range
+  resolved to no commits; a binary blob was skipped (see *Binary content*
+  below), so "no violations in what I read" is not a claim about the commit.
 
 ``2`` is load-bearing and is why this module refuses to treat a missing list
 as an empty one. An empty list would make the scan a clean pass over a
@@ -87,11 +89,46 @@ reader "the check did not run" gets bypassed, and the bypass is invisible.
 
 Scope
 -----
-No path is exempt and no extension is filtered. A private name is as
-published inside a test fixture, a docstring, a ``.yaml`` or a shell script
-as it is inside a secret, and the only thing that has no legitimate
-synthetic stand-in is a name. Both modes therefore read every text blob --
-the index and every commit in the range, tests included.
+No path is exempt and no extension is filtered *out of* the read. A private
+name is as published inside a test fixture, a docstring, a ``.yaml`` or a
+shell script as it is inside a secret, and the only thing that has no
+legitimate synthetic stand-in is a name. Both modes therefore read every
+text blob -- the index and every commit in the range, tests included. The
+extension set in *Binary content* below is not a scope filter: it only ever
+decides whether a blob is read despite holding a NUL, never whether a
+readable blob is exempt from a needle.
+
+Binary content
+--------------
+Git calls a blob binary when it holds a NUL byte in the first kilobyte, and
+decoding a genuine PNG with ``errors="replace"`` would manufacture findings
+out of replacement characters. So the skip is legitimate -- but it used to be
+applied to *every* blob, on the reasoning that "a private name is text, and
+no encoding turns one into a NUL". That reasoning holds and the skip is still
+right for a real binary. It does not survive a ``.py`` whose first byte is
+``\0``: the name in it is still text, and this module is the *only* place
+the private names are checked at all (it does not run in CI -- a CI runner
+has no operator-owned ``.config/forbidden-names`` -- so it is the pre-commit
+and pre-push hooks or nothing). One leading NUL byte therefore disabled the
+whole check, silently, with ``OK  forbidden-name scan: 0 violations`` in the
+output and a ``binary blob(s) skipped`` note in the detail line that changes
+no exit code.
+
+The split is by *extension*, not by content, and only for the skip side:
+
+  * a source-suffixed blob (anything in
+    :data:`source_scan.SOURCE_EXTENSIONS`) is always read, NUL or not;
+  * any other blob with a NUL in the first kilobyte is skipped -- and a
+    batch with a skipped blob exits 2, naming the files it did not read.
+
+The degradation is the load-bearing half. Extension-based skipping means a
+new file type (``.toml``, a fixture format nobody has met yet) is *not* in
+the set, so it is skipped, and without the exit-2 rule that would be this
+same bypass with one more step. With it, the worst a wrong extension set can
+do is refuse a commit and name the file -- a loud false positive rather than
+a silent pass. This is the same split and the same exit contract
+``backend/tests/static_gates/staged_content_scan.py`` uses, and the two are
+kept worded identically on purpose: a reader who has seen one has seen both.
 
 Why this module restates the git plumbing
 -----------------------------------------
@@ -114,6 +151,21 @@ appear on a machine whose ``python3`` is not the venv.
 So the plumbing is local. A hook that must always run does not reach into
 a directory whose purpose is testing, and it does not depend on an import
 graph staying a particular shape.
+
+What *is* imported is the extension vocabulary --
+``source_scan.SOURCE_EXTENSIONS``, below. The distinction is deliberate:
+restating the plumbing here would be a second implementation of something
+that has to agree, while restating the extension set would be a second
+*decision* about which files are worth reading, and the two copies would
+drift. ``source_scan`` is stdlib-only (``collections.abc`` and ``pathlib``),
+it is a walker rather than a pytest gate, and the pre-commit stage already
+depends on that directory: ``scripts/scan_staged_privacy.sh`` runs
+``staged_content_scan.py`` from it, which imports the same module. So this
+import adds no dependency the stage did not already carry.
+
+``scripts/check_commit_msg.py`` reaches into the same directory from a bare
+``python3`` commit-msg hook for the same reason, and fails closed with exit
+2 if the import does not resolve -- which this module does too.
 
 What is *not* restated here is a privacy rule. The plan-id shape, the
 attribution phrases, the home-path patterns and the local-measurement
@@ -149,11 +201,51 @@ TEMPLATE_REL = Path("example") / "forbidden-names.example"
 REGEX_PREFIX = "re:"
 
 #: A NUL byte in the first kilobyte is git's own definition of binary.
-#: Decoding a binary as UTF-8 with ``errors="replace"`` would manufacture
-#: findings out of replacement characters. Skipping is a hole rather than a
-#: cure -- a private name is text, and no encoding turns one into a NUL --
-#: so the count of skipped blobs is reported rather than hidden.
+#: Decoding a genuine binary as UTF-8 with ``errors="replace"`` would
+#: manufacture findings out of replacement characters. This decides only
+#: *whether a blob may be skipped* -- never whether a blob is scanned; see
+#: ``_is_scannable`` and the *Binary content* section of the module
+#: docstring for which blobs that actually is.
+#:
+#: Deliberately a second definition rather than an import:
+#: ``backend/tests/static_gates/staged_content_scan.py`` holds the same
+#: constant for the same reason, and importing it here would pull this hook
+#: -- the only surface that checks private names at all -- through the
+#: entire import closure of the plan-id gate, for the sake of sharing an
+#: integer. The duplication is instead pinned by
+#: ``backend/tests/integration/test_forbidden_names_local_list.py``, which
+#: may import both modules because a test is not a hook.
 _BINARY_PROBE_BYTES = 1024
+
+# One definition of "a first-party source file", shared with the tree gates
+# and with ``staged_content_scan``. Imported rather than restated: the set
+# says which files are worth reading, and two copies of a decision is how
+# one of them ends up missing a file type the other knows about -- which,
+# for this particular set, re-opens the bypass the import exists to close.
+# ``source_scan`` is stdlib-only, so the bare-``python3`` fallback in
+# ``scripts/scan_forbidden_names.sh`` stays genuinely equivalent.
+_GATES_DIR = REPO_ROOT / "backend" / "tests" / "static_gates"
+if not _GATES_DIR.is_dir():  # pragma: no cover - broken checkout
+    print(
+        f"error: static gates directory not found: {_GATES_DIR}\n"
+        f"error: without it this scanner cannot tell a source file from a "
+        f"binary one, and a binary one is exactly what it must not mistake "
+        f"for an unreadable file. Nothing has been cleared.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+sys.path.insert(0, str(_GATES_DIR))
+
+try:
+    from source_scan import SOURCE_EXTENSIONS  # noqa: E402
+except ImportError as exc:  # pragma: no cover - broken checkout
+    print(
+        f"error: cannot import the source-extension set from "
+        f"{_GATES_DIR}: {exc}\n"
+        f"error: nothing has been cleared.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 
 class ScanError(RuntimeError):
@@ -391,8 +483,28 @@ def _read_blobs(repo: Path, specs: list[str]) -> list[bytes | None]:
     return _parse_batch(result.stdout, len(specs))
 
 
-def _is_scannable(content: bytes) -> bool:
-    """Return True iff *content* is text this scan should read."""
+def _is_scannable(rel: Path, content: bytes) -> bool:
+    """Return True iff this blob must be read by the scan.
+
+    The extension decides, and the content only ever decides the *skip*
+    side. Two halves, and the order is the fix:
+
+    1. A source-suffixed blob (:data:`source_scan.SOURCE_EXTENSIONS`) is
+       always read. A NUL byte in it does not stop the private name in it
+       from being text; it makes this scanner -- which is the only thing
+       that checks these names, since it cannot run in CI -- skippable
+       with one byte of the developer's choosing, and reports that as
+       ``OK  0 violations``. The replacement characters that decoding
+       produces are a cost; skipping the file is a hole.
+    2. Anything else with a NUL in the first kilobyte is git's own
+       definition of binary, and is skipped -- decoding a PNG with
+       ``errors="replace"`` manufactures findings out of replacement
+       characters. That half is legitimate, so the cost of getting it
+       wrong is paid by the caller instead: a skipped blob makes the whole
+       batch exit 2, naming the files it did not read.
+    """
+    if rel.suffix in SOURCE_EXTENSIONS:
+        return True
     return b"\0" not in content[:_BINARY_PROBE_BYTES]
 
 
@@ -511,12 +623,12 @@ def scan_text(
 ) -> tuple[list[Violation], bool]:
     """Apply every needle to one blob.
 
-    Returns ``(violations, scannable)``. ``scannable`` is False for a
-    binary blob, which is skipped rather than decoded -- decoding one with
-    ``errors="replace"`` would manufacture findings out of replacement
-    characters.
+    Returns ``(violations, scannable)``. ``scannable`` is False only for a
+    blob that is binary *and* not source-suffixed; see :func:`_is_scannable`
+    and the module docstring for why those two conditions are not the same
+    test.
     """
-    if not _is_scannable(content):
+    if not _is_scannable(Path(path), content):
         return [], False
     violations: list[Violation] = []
     for lineno, line in enumerate(
@@ -536,13 +648,18 @@ def scan(
     *,
     index: bool,
     range_specs: Sequence[str],
-) -> tuple[int, int, list[Violation]]:
+) -> tuple[int, list[str], list[Violation]]:
     """Scan the index or the given ranges.
 
-    Returns ``(scanned, skipped, violations)``. Raises :class:`ScanError`
-    when the list cannot be read or the content cannot be read, so that "the
-    check did not run" reaches the caller as something it must not confuse
-    with "found nothing".
+    Returns ``(scanned, skipped_paths, violations)``. ``skipped_paths``
+    names the blobs that were not read, and is part of the result rather
+    than a diagnostic count because it changes the exit code: a batch with
+    a skipped blob is a batch this scan did not read whole, and reporting
+    that as a clean scan is the failure this module exists to avoid.
+
+    Raises :class:`ScanError` when the list cannot be read or the content
+    cannot be read, so that "the check did not run" reaches the caller as
+    something it must not confuse with "found nothing".
     """
     needles = load_needles(list_path)
 
@@ -557,19 +674,19 @@ def scan(
 
     violations: list[Violation] = []
     scanned = 0
-    skipped = 0
+    skipped: list[str] = []
     for source in sources:
         for path, content in source:
             found, scannable = scan_text(path, content, needles)
             if not scannable:
-                skipped += 1
+                skipped.append(path)
                 continue
             scanned += 1
             violations.extend(found)
 
     if scanned == 0:
         raise ScanError(
-            f"{skipped} blob(s) were read and none of them was text; "
+            f"{len(skipped)} blob(s) were read and none of them was text; "
             f"refusing to report a clean scan over an empty read"
         )
     return scanned, skipped, violations
@@ -642,16 +759,49 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     detail = f"scanned {scanned} file(s) against {list_path}"
     if skipped:
-        detail += f" ({skipped} binary blob(s) skipped -- a name is text)"
+        detail += (
+            f" ({len(skipped)} binary blob(s) skipped -- "
+            f"the commit was NOT fully read)"
+        )
     print(detail)
+
+    if violations:
+        print(f"FAIL forbidden-name scan: {len(violations)} violation(s)")
+        for violation in violations:
+            print(f"  {violation.format()}")
+
+    if skipped:
+        # Violations first, then the degradation: the names are real and
+        # were found, and a reader who sees only "the check did not run"
+        # goes looking for a git problem instead of the name. Same wording
+        # and same ordering as ``staged_content_scan``.
+        print(
+            "ERROR: this scan did not read the whole commit, so it cannot "
+            "report a clean result.",
+            file=sys.stderr,
+        )
+        for path in skipped:
+            print(
+                f"ERROR:   not scanned: {path} "
+                f"(binary content, and its extension is not one this scan "
+                f"treats as source)",
+                file=sys.stderr,
+            )
+        print(
+            "ERROR: Unstage the file(s) above, or run the commit with only "
+            "text staged, and commit again. If one of them really is a "
+            "binary that must be committed, commit it on its own -- a "
+            "batch with nothing else in it still cannot be reported clean, "
+            "so `--no-verify` is the honest answer for a deliberate binary "
+            "and only for that.",
+            file=sys.stderr,
+        )
+        return 2
 
     if not violations:
         print("OK  forbidden-name scan: 0 violations")
         return 0
 
-    print(f"FAIL forbidden-name scan: {len(violations)} violation(s)")
-    for violation in violations:
-        print(f"  {violation.format()}")
     return 1
 
 

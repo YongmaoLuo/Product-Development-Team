@@ -48,6 +48,31 @@ The commit *message*. That is a different surface with a different rule
 ``scripts/check_commit_msg.py`` from the ``commit-msg`` hook. Keeping them
 apart is what lets each run at the stage where it can still stop something.
 
+Binary content
+--------------
+Git calls a blob binary when it holds a NUL byte in the first kilobyte,
+and the other three surfaces decode every blob with ``errors="replace"``
+rather than skipping: :mod:`commit_range_scan` reads whole trees that
+carry images, and it reads them as text.
+
+This module used to skip such a blob instead, on the reasoning that "a
+private name is text, and no encoding turns one into a NUL". That
+reasoning holds and the skip is still right for a genuine binary -- but it
+was applied to *every* blob, including ones named ``.py``, and the
+pre-commit stage is the only surface of the four that runs before the text
+is in a commit. So the one gate whose whole value is stopping the commit
+was the one gate a single NUL byte disabled: stage a ``.py`` whose first
+byte is ``\0`` next to any other file, and it is skipped while its
+neighbour is scanned, and the run reports ``OK 0 violations``.
+
+The split is by *extension*, not by content, and only for the skip side:
+
+  * a source-suffixed blob (anything in
+    :data:`source_scan.SOURCE_EXTENSIONS`) is always read, NUL or not,
+    exactly as the range scan reads it;
+  * any other blob with a NUL in the first kilobyte is skipped, and the
+    batch is reported as degraded -- see below.
+
 Failure is loud
 ---------------
 An empty index is reported as an error rather than a pass, for the same
@@ -55,11 +80,18 @@ reason :mod:`commit_range_scan` refuses an empty range: a scan that read
 nothing must not look like one that found nothing. ``git commit -a`` with
 no changes is the case that would otherwise slip through.
 
+The same rule governs a *partial* read. If anything in the batch was
+skipped, the scan did not read everything it was asked to read, so it
+exits 2 even when it found nothing -- one skipped blob means an unknown
+number of unexamined bytes, and "no violations in what I read" is not the
+same claim as "no violations in the commit".
+
 Exit contract
 -------------
-  * 0 -- scan ran, zero violations
-  * 1 -- scan ran, at least one violation
-  * 2 -- the scan could not run (usage error, unreadable index)
+  * 0 -- scan ran, read everything staged, zero violations
+  * 1 -- scan ran, read everything staged, at least one violation
+  * 2 -- the scan could not run, or did not read everything staged
+        (usage error, unreadable index, a skipped blob)
 """
 
 from __future__ import annotations
@@ -99,6 +131,13 @@ STAGED_RULES: tuple[tuple[str, object], ...] = (
 )
 
 
+#: How many leading bytes decide whether a blob is binary. Git's own
+#: threshold, copied so this module's idea of "binary" cannot drift from
+#: ``git diff``'s -- which matters, because a file git renders as binary
+#: in a review is a file a reviewer will not read either.
+_BINARY_PROBE_BYTES = 1024
+
+
 class StagedScanError(RuntimeError):
     """The scan could not run. Never conflated with "found nothing"."""
 
@@ -114,6 +153,26 @@ class Finding:
 
     def format(self) -> str:
         return f"[{self.label}]  {self.path}:{self.lineno}: {self.snippet}"
+
+
+@dataclass(frozen=True)
+class StagedScan:
+    """What one pass over the index actually read, and what it found.
+
+    ``skipped`` is part of the result rather than a diagnostic counter
+    because it changes the exit code: a batch with a skipped blob is a
+    batch this scan did not read whole, and reporting that as a clean scan
+    is the failure this module exists to avoid.
+    """
+
+    scanned: int
+    skipped: tuple[str, ...]
+    findings: tuple[Finding, ...]
+
+    @property
+    def degraded(self) -> bool:
+        """True iff anything staged was left unread."""
+        return bool(self.skipped)
 
 
 def _git(repo: Path, args: Sequence[str]) -> bytes:
@@ -239,23 +298,40 @@ def _parse_batch(out: bytes) -> list[bytes | None]:
     return blobs
 
 
-def _is_scannable(content: bytes) -> bool:
-    """Return True iff *content* is text this scan should read.
+def is_scannable(rel: Path, content: bytes) -> bool:
+    """Return True iff this blob must be read by the scan.
 
-    A NUL byte in the first kilobyte is git's own definition of binary, and
-    decoding one as UTF-8 with ``errors="replace"`` would manufacture
-    findings out of replacement characters. Skipping is correct rather than
-    a hole: a private name is text, and no encoding turns one into a NUL.
+    The extension decides, and the content only ever decides the *skip*
+    side. Two halves, and the order is the fix:
+
+    1. A source-suffixed blob (:data:`source_scan.SOURCE_EXTENSIONS`) is
+       always read. A NUL byte in it does not make the private name in it
+       stop being text -- it makes this module the one gate of four that a
+       leading ``\\x00`` disables, and the pre-commit stage is the only
+       one of the four that can still stop the commit. The replacement
+       characters decoding produces are a cost; skipping the file is a
+       hole. :mod:`commit_range_scan` has always made this trade the other
+       way, and a gate that treats the same bytes as clean in CI and as
+       unreadable at commit time is not two gates, it is one gate with a
+       blind spot in it.
+    2. Anything else with a NUL in the first kilobyte is git's own
+       definition of binary, and is skipped. This half is legitimate --
+       decoding a PNG with ``errors="replace"`` manufactures findings out
+       of replacement characters -- so the cost of getting it wrong is
+       paid by :attr:`StagedScan.degraded` instead: a skipped blob makes
+       the whole batch exit 2.
     """
-    return b"\0" not in content[:1024]
+    if rel.suffix in source_scan.SOURCE_EXTENSIONS:
+        return True
+    return b"\0" not in content[:_BINARY_PROBE_BYTES]
 
 
-def scan_staged(repo: Path = REPO_ROOT) -> tuple[int, list[Finding]]:
+def scan_staged(repo: Path = REPO_ROOT) -> StagedScan:
     """Apply :data:`STAGED_RULES` to every staged file.
 
-    Returns ``(scanned, findings)``. Raises :class:`StagedScanError` when
-    the index holds nothing scannable, so that "I staged nothing" cannot be
-    reported as "I staged something clean".
+    Raises :class:`StagedScanError` when the index holds nothing
+    scannable, so that "I staged nothing" cannot be reported as "I staged
+    something clean".
     """
     paths = staged_paths(repo)
     if not paths:
@@ -267,6 +343,7 @@ def scan_staged(repo: Path = REPO_ROOT) -> tuple[int, list[Finding]]:
         )
 
     findings: list[Finding] = []
+    skipped: list[str] = []
     scanned = 0
     for path, content in iter_staged_blobs(repo, paths):
         if content is None:
@@ -274,9 +351,10 @@ def scan_staged(repo: Path = REPO_ROOT) -> tuple[int, list[Finding]]:
                 f"{path} is in the index but git could not read its blob; "
                 f"refusing to report a clean scan over a partial read"
             )
-        if not _is_scannable(content):
-            continue
         rel = Path(path)
+        if not is_scannable(rel, content):
+            skipped.append(path)
+            continue
         text = content.decode("utf-8", "replace")
         scanned += 1
         for label, rule in STAGED_RULES:
@@ -290,7 +368,7 @@ def scan_staged(repo: Path = REPO_ROOT) -> tuple[int, list[Finding]]:
             f"{len(paths)} staged file(s), none of them text; refusing to "
             f"report a clean scan over an empty read"
         )
-    return scanned, findings
+    return StagedScan(scanned=scanned, skipped=tuple(skipped), findings=tuple(findings))
 
 
 # ---------------------------------------------------------------------------
@@ -318,19 +396,58 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        scanned, findings = scan_staged(Path(args.repo))
+        result = scan_staged(Path(args.repo))
     except StagedScanError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    print(f"scanned {scanned} staged file(s)")
-    if not findings:
+    detail = f"scanned {result.scanned} staged file(s)"
+    if result.skipped:
+        detail += (
+            f" ({len(result.skipped)} binary blob(s) skipped -- "
+            f"the commit was NOT fully read)"
+        )
+    print(detail)
+
+    if result.findings:
+        print(
+            f"FAIL staged-content privacy scan: "
+            f"{len(result.findings)} violation(s)"
+        )
+        for finding in result.findings:
+            print(f"  {finding.format()}")
+
+    if result.degraded:
+        # Findings first, then the degradation: the violations are real and
+        # were found, and a reader who sees only "the scan could not run"
+        # will go looking for a git problem instead of the plan id.
+        print(
+            "ERROR: this scan did not read the whole commit, so it cannot "
+            "report a clean result.",
+            file=sys.stderr,
+        )
+        for path in result.skipped:
+            print(
+                f"ERROR:   not scanned: {path} "
+                f"(binary content, and its extension is not one this scan "
+                f"treats as source)",
+                file=sys.stderr,
+            )
+        print(
+            "ERROR: Unstage the file(s) above, or run the commit with only "
+            "text staged, and commit again. If one of them really is a "
+            "binary that must be committed, commit it on its own -- a "
+            "batch with nothing else in it still cannot be reported clean, "
+            "so `--no-verify` is the honest answer for a deliberate binary "
+            "and only for that.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not result.findings:
         print("OK  staged-content privacy scan: 0 violations")
         return 0
 
-    print(f"FAIL staged-content privacy scan: {len(findings)} violation(s)")
-    for finding in findings:
-        print(f"  {finding.format()}")
     return 1
 
 

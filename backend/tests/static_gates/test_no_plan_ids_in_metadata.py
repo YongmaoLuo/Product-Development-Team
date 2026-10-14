@@ -65,6 +65,18 @@ from test_no_plan_ids_in_non_test_source import PLAN_ID_SHAPE
 COMMIT_MESSAGE_LABEL = Path("commit message")
 BRANCH_NAME_LABEL = Path("branch name")
 
+#: A plan-id stand-in used by the tests below, matching ``PLAN_ID_SHAPE``.
+#:
+#: It replaces an id that used to be written here as two fragments that
+#: reassembled into a real plan name. Fragmenting is not a protection: it
+#: survives exactly until somebody concatenates the parts, which is one
+#: line of reading. This repository has already made that argument once,
+#: about a whole list of names rather than one -- see the module docstring
+#: of ``scripts/scanners/scan_forbidden_names.py`` -- and the same standard
+#: applies here. Nothing is lost by the substitution: the rule keys on
+#: :data:`PLAN_ID_SHAPE` and nothing about the particular slug.
+_SYNTHETIC_PLAN_ID = "2026" + "1012-example" + "-topic"
+
 
 def find_plan_ids_in_metadata(
     label: Path, text: str
@@ -121,16 +133,23 @@ def test_a_leaked_commit_message_is_rejected() -> None:
     assert hits[0][1] == 3, hits
 
 
-def test_every_real_leaked_message_is_rejected() -> None:
+def test_every_leaked_message_shape_is_rejected() -> None:
     """The four leaked message lines found across every ref on this repo.
 
-    Each is a verbatim shape from a real commit message; assembled from
-    fragments so this file does not reproduce them.
+    Each row is a sentence shape from a real commit message, with a plan id
+    assembled from fragments. The fragments used to include one that
+    reassembled into an actual plan name: a name written as ``"chan"`` +
+    ``"lun"`` is one concatenation away from being the name, and that is
+    the same standard this repository applied when it moved the forbidden-
+    name blacklist out of the repository. That row now carries a synthetic
+    id of the identical shape instead, which is all the rule ever keys on
+    -- ``20[0-9]{6}-[A-Za-z][A-Za-z0-9._-]*`` -- so the assertion is
+    unchanged in force and the name is no longer here to be reassembled.
     """
     bodies = [
         "`%s` 上：21 个 VP 里 0 个有 test_command" % ("2026" + "1010-" + "CC-Switch-" + "Remote-Aut"),
         "事故：plan %s 93 条 repair-* 行里 36 条停在" % ("2026" + "1010-" + "CC-Switch-" + "Remote-Aut"),
-        "只有 %s 的 repair-r1-01 被真删掉" % ("2026" + "1012-" + "chan" + "lun"),
+        "只有 %s 的 repair-r1-01 被真删掉" % (_SYNTHETIC_PLAN_ID),
         "%s 一役暴露的问题：该 plan 的任务数在" % ("2026" + "1010-" + "CC-Switch-" + "Remote-Aut"),
     ]
     for body in bodies:
@@ -138,10 +157,21 @@ def test_every_real_leaked_message_is_rejected() -> None:
 
 
 def test_a_leaked_branch_name_is_rejected() -> None:
-    """A branch name reaches the merge commit message on ``main``."""
-    branch = "fix/" + "2026" + "1012-" + "chan" + "lun-buy" + "sell-points"
+    """A branch name reaches the merge commit message on ``main``.
+
+    The id is the synthetic stand-in from the test above, glued to a prefix
+    and a suffix the way a real branch name was. What has to hold is that a
+    plan id is found *inside* a larger token -- a substring, not a whole
+    word -- because ``fix/<id>-zz-retro-widgets`` is what actually
+    reaches ``main``.
+    """
+    branch = "fix/" + _SYNTHETIC_PLAN_ID + "-zz-" + "retro-widgets"
     hits = find_plan_ids_in_metadata(BRANCH_NAME_LABEL, branch)
-    assert [h[2] for h in hits] == ["2026" + "1012-" + "chan" + "lun-buy" + "sell-points"], hits
+    # The shape is greedy on purpose: a slug glued to the id is part of the
+    # id, not the place where the id stops. Reporting only the prefix would
+    # under-report what the branch name actually publishes.
+    assert [h[2] for h in hits] == [_SYNTHETIC_PLAN_ID + "-zz-retro-widgets"], hits
+    assert hits[0][1] == 1, hits
 
 
 def test_a_leaked_pull_request_body_is_rejected() -> None:
