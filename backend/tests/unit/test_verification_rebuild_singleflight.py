@@ -15,10 +15,19 @@ started its own ``BinaryRebuildAgent`` against the same ``target/debug``::
     05:24:01     watchdog hit VERIFICATION_HARD_STALE_SECONDS, CAS -> failed
 
 The watchdog was right. The round was wrong: **a round had no notion of
-"this binary has already been rebuilt"**. ``FreshnessCache`` memoises the
-*check* only, and a failed rebuild leaves the binary's mtime untouched —
-so the cache key is unchanged, all 20 VPs got the same cached "stale",
-and the cache amplified the fan-out instead of collapsing it.
+"this binary has already been rebuilt"**, so every verification point
+that reached a stale verdict started its own rebuild. The check is
+deterministic — two points that ask while the binary is still untouched
+both see the same mtime and both answer "stale"; that is a correct
+check doing its job, not one point interfering with another.
+
+``FreshnessCache`` is not what fanned them out: it records every check
+and is never read back, so it cannot hand one point a verdict another
+point computed. Its key embedding the binary's mtime is the same
+phenomenon from the other side — nothing has rebuilt yet, so the mtime,
+and with it the key, cannot move. That is a consequence of the missing
+single-flight, not a second cause of it. What collapses the fan-out is
+``_BinaryRebuildCoordinator``.
 
 What is pinned here
 -------------------
@@ -42,10 +51,10 @@ produce the concurrency these assertions are about.
 
 4. **preflight and the VP arms share one coordinator.** If the
    round-start preflight rebuilt the binary, the VPs dispatched after it
-   do not rebuild again — the total for the round is still 1. This is
-   the semantics the round is built on ("每一轮验证之前都要有一个
-   VP……专门用来做重建的。重建完之后，之后的 VP 是不可以去做重建的"),
-   and it is the arm that was never implemented.
+   do not rebuild again — the total for the round is still 1. That is
+   the intended shape: one VP per round exists purely to rebuild; once
+   it has rebuilt, the VPs after it must not. It is also the arm that
+   was never implemented.
 
 5. **Round boundaries.** ``run_full_verification`` clears the coordinator
    at the top of every round, before the preflight — otherwise round 2

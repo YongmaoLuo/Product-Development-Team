@@ -10,7 +10,8 @@ Covers:
     returns True iff the post-rebuild check is PASSED.
   * The ``VerificationAgent._sub_agent_runner`` pre-check BLOCKs the
     VP when binary is stale and PASSes when fresh.
-  * The per-round cache short-circuits repeated calls.
+  * The per-round cache records every check and is never read back
+    (write-only) — verified by counting ``Path.stat`` syscalls.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import pytest
 
@@ -107,6 +108,29 @@ def _make_rust_pkg(project_dir: Path, *, fresh: bool) -> Path:
     return pkg
 
 
+def _stats_and_result(fn: Any) -> Tuple[int, Any]:
+    """Run ``fn()``; return ``(Path.stat call count, fn's return value)``.
+
+    ``Path.stat`` is the syscall a freshness check is actually made of,
+    so its call count measures how much of the check really ran — which
+    is the only honest way to test "did the cache skip the work?".
+    """
+    real_stat = Path.stat
+    count = 0
+
+    def _spy(self: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal count
+        count += 1
+        return real_stat(self, *args, **kwargs)
+
+    Path.stat = _spy  # type: ignore[assignment]
+    try:
+        result = fn()
+    finally:
+        Path.stat = real_stat  # type: ignore[assignment]
+    return count, result
+
+
 def test_check_freshness_rust_python_fresh(tmp_path: Path) -> None:
     from binary_freshness import check_binary_freshness
     _make_rust_pkg(tmp_path, fresh=True)
@@ -175,26 +199,67 @@ def test_check_freshness_no_artefacts_is_skipped(tmp_path: Path) -> None:
     assert "no-op" in entry["title"].lower()
 
 
-def test_check_freshness_cache_short_circuits(tmp_path: Path) -> None:
-    """A second call with the same (kind, path, mtime) tuple
-    returns the cached FreshnessReport. We assert this by spying on
-    ``Path.stat`` mtime syscalls (instrumented via patching)."""
+def test_check_freshness_cache_is_write_only(tmp_path: Path) -> None:
+    """The per-round cache records reports; it never reads them back.
+
+    This pins the *real* behaviour: ``check_binary_freshness`` re-runs
+    the entire mtime sweep on every call, even when handed a cache that
+    already holds the byte-identical report. ``FreshnessCache.get()``
+    was removed because it had no caller and could not have saved
+    anything — the key it took,
+    ``(kind, binary_path, binary_mtime, source_mtime)``, is itself only
+    computable by doing the work it would have skipped.
+
+    Replaces ``test_check_freshness_cache_short_circuits``, which
+    promised a short-circuit and a ``Path.stat`` spy that its body
+    never contained: it only asserted that ``_store`` was non-empty
+    and that two calls to a deterministic function agree.
+
+    If a read path is ever reintroduced this test goes red — but
+    *which* assertion catches it depends on where the read lands:
+
+      * read at the top of ``check_binary_freshness``, before any stat
+        work → caught by ``second_stats == first_stats``, since a
+        short-circuit would leave the second call doing no stats at all;
+      * read next to the existing ``put``, after the check has already
+        run → caught by ``len(cache._store) == 1``, because the cheap
+        key adds a second entry. Note this placement saves nothing:
+        the check has already been paid for by then.
+
+    Either way the signal is the same: revisit the corrected
+    docstrings in ``binary_freshness``.
+    """
     from binary_freshness import FreshnessCache, check_binary_freshness
-    pkg = _make_rust_pkg(tmp_path, fresh=True)
+    _make_rust_pkg(tmp_path, fresh=True)
+
     cache = FreshnessCache()
-    # First call populates the cache.
-    first = check_binary_freshness(tmp_path, cache=cache)
-    # Cache should have the report stored.
-    assert (first.kind, first.binary_path, first.binary_mtime,
-            first.newest_source_mtime) in cache._store or any(
-                k[0] == first.kind and k[1] == first.binary_path
-                for k in cache._store
-            )
-    # Second call returns an equivalent report (same mtime tuple).
-    second = check_binary_freshness(tmp_path, cache=cache)
+    first_stats, first = _stats_and_result(
+        lambda: check_binary_freshness(tmp_path, cache=cache))
+    second_stats, second = _stats_and_result(
+        lambda: check_binary_freshness(tmp_path, cache=cache))
+
+    assert first.status == "PASSED"
+    # Both calls agree — because the check is deterministic, NOT because
+    # the second one was served from the cache.
     assert second.status == first.status
     assert second.binary_mtime == first.binary_mtime
     assert second.newest_source_mtime == first.newest_source_mtime
+
+    assert first_stats > 0, "sanity: the check does stat the filesystem"
+    assert second_stats == first_stats, (
+        "the cache stopped short-circuiting (or gained a read path): "
+        f"first call made {first_stats} Path.stat calls, second made "
+        f"{second_stats}. If this is now intentional, update the "
+        "FreshnessCache docstrings, which now describe write-only."
+    )
+
+    # The write side is real: exactly one entry (both calls produced the
+    # same key), keyed as documented, holding the returned report.
+    assert len(cache._store) == 1
+    ((key, stored),) = cache._store.items()
+    assert key == (first.kind, first.binary_path,
+                   first.binary_mtime, first.newest_source_mtime)
+    assert stored.status == "PASSED"
 
 
 # ---------------------------------------------------------------------------

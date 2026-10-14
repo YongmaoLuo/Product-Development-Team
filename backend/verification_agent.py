@@ -557,23 +557,32 @@ class _RebuildOutcome:
 class _BinaryRebuildCoordinator:
     """Per-round single-flight for binary rebuilds.
 
-    2026-10-14 (CC-Switch incident): 20 VPs in ONE round all judged the
-    same ``libcc_switch_lib.dylib`` stale, so each spawned its own
-    ``BinaryRebuildAgent`` and all of them ran ``cargo build`` against
-    the same ``target/debug``. cargo's artifact-directory file lock
-    turned those into a 20-deep queue; for 20 minutes not one VP emitted
-    a log line and the watchdog failed the round by design.
+    (CC-Switch incident): one round had every verification point in it
+    judge the same ``libcc_switch_lib.dylib`` stale, so each spawned its
+    own ``BinaryRebuildAgent`` and each ran ``cargo build`` against the
+    same ``target/debug``. cargo's artifact-directory file lock turned
+    those into a queue, and the round sat silent until the watchdog
+    failed it by design.
 
-    The build being slow is not the root cause. The root cause is that a
-    round had no notion of "this binary has already been rebuilt":
-    :class:`binary_freshness.FreshnessCache` memoises the *check* only,
-    and when a rebuild fails the binary's mtime is unchanged, so the
-    cache key is unchanged, so 20 VPs all got the same cached "stale"
-    verdict and all went to rebuild. The cache amplified concurrency
-    here instead of collapsing it.
+    The build being slow is not the root cause. The root cause is that
+    a round had no notion of "this binary has already been rebuilt", so
+    every verification point that reached a stale verdict started its
+    own rebuild. The check is deterministic, and two points that ask
+    while the binary is still untouched both see the same mtime and both
+    answer "stale" — that is a correct check doing its job, not one
+    point interfering with another.
 
-    Semantics (the intended shape: one VP per round exists
-    purely to rebuild; once it has rebuilt, the VPs after it must not):
+    :class:`binary_freshness.FreshnessCache` is not what fanned them
+    out. It records every check and is never read back — it has no read
+    path — so it cannot hand one point a verdict that another point
+    computed. Its key embedding the binary's mtime is the same
+    phenomenon seen from the other side: nothing has rebuilt yet, so the
+    mtime, and with it the key, cannot move. That is a consequence of
+    the missing single-flight, not a second cause of it. What actually
+    collapses the fan-out is the coordinator below.
+
+    Semantics (the intended shape: one VP per round exists purely to
+    rebuild; once it has rebuilt, the VPs after it must not):
 
       * key = ``(str(project_dir), kind)`` — the same two quantities the
         stale verdict was derived from;
