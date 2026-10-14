@@ -122,6 +122,31 @@ _GENERATED_WITH_RE = re.compile(r"\bgenerated\s+with\b", re.IGNORECASE)
 #: co-author with one of them in their name would false-positive — which
 #: is the right way round: a two-second rewrite beats a permanent
 #: misattribution.
+#:
+#: ``agent``, ``assistant`` and ``bot`` were added 2026-10-14, and they
+#: are the reason the rule can be talked about as covering "an AI system"
+#: rather than "one of these product names". The trailer that got through
+#: read ``Co-Authored-By: Autonomous Agent <agent@…>``: no vendor name, no
+#: model family, nothing any of the tokens above match — and a gate that
+#: only catches leaks spelled the way the last leak was spelled is a gate
+#: waiting for the next spelling. Every vendor now ships something whose
+#: name is one of those three words, so they are the high-value half.
+#:
+#: Deliberately *not* here, though it looks like it belongs: ``ai``. These
+#: are substring matches, and ``ai`` is inside ``email``, ``maintain``,
+#: ``chain``, ``detail`` and most of the English a commit message is made
+#: of. Adding it would not narrow the rule, it would delete it. A token
+#: has to be specific enough that the word cannot occur by accident.
+#:
+#: ``bot`` and ``agent`` are ordinary words in their own right, and this
+#: is a real cost: a human co-author called Abbot, or a team called
+#: "Support Agents", trips the gate. That trade is deliberate and is
+#: pinned by a test rather than left hypothetical — see
+#: ``test_commit_messages_are_not_ai_attributed.py``. It is the same
+#: trade ``opus`` and ``gpt`` already make, and it is the cheaper
+#: direction: the failure mode
+#: of a false positive is a rewritten co-author line, and the failure mode
+#: of a false negative is permanent, public, uncorrectable history.
 _AI_TOKENS: tuple[str, ...] = (
     "claude",
     "anthropic",
@@ -136,6 +161,21 @@ _AI_TOKENS: tuple[str, ...] = (
     "sonnet",
     "haiku",
     "gpt",
+    # Product names that are also ordinary English. See above.
+    "agent",
+    "assistant",
+    "bot",
+    # Coding agents that are neither a vendor nor a model family.
+    "codeium",
+    "windsurf",
+    "tabnine",
+    "opencode",
+    # Model families absent from the list above.
+    "llama",
+    "mistral",
+    "deepseek",
+    "qwen",
+    "grok",
 )
 
 #: Shown when a plan id is found. A commit message is the one surface where

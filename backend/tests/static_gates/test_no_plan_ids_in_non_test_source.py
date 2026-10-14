@@ -45,16 +45,31 @@ and pre-push hooks instead.
 
 Why no ``\\b`` in the shape
 --------------------------
-The shape avoids ``\\b`` on purpose. POSIX ERE -- which ``git grep -E``
-speaks -- has no word boundary, so a pattern written with one and checked
-from a shell matches nothing and reports a clean tree. Reproduced on this
-branch::
+The shape avoids ``\\b`` on purpose, because POSIX does not define a word
+boundary -- ``\\b`` is a GNU extension, and an ERE engine is free to
+either honour it or treat it as a literal ``b``. A pattern written with
+one means different things to different consumers, and the direction that
+hurts is the one where the engine drops it and reports a clean tree.
 
-    $ git grep -E -c '\\b20[0-9]{6}-[A-Za-z]' origin/main -- backend/agent.py ; echo $?
-    1                                     # <- "no match": a false clean
-    $ git grep -E -c '20[0-9]{6}-[A-Za-z]' origin/main -- backend/agent.py ; echo $?
-    origin/main:backend/agent.py:1
+Which engine that is depends on more than the operating system. Measured
+on this branch, same pattern, same command::
+
+    # macOS, git's own regex engine: \\b is dropped -> "no match", exit 1
+    $ git grep -E -c '\\b20[0-9]{6}-[A-Za-z]' --no-index -- probe.txt ; echo $?
+    1
+    # ubuntu-24.04, git grep over GNU grep 3.11: \\b honoured -> exit 0
+    $ git grep -E -c '\\b20[0-9]{6}-[A-Za-z]' --no-index -- probe.txt ; echo $?
+    probe.txt:1
     0
+
+So the failure mode is real and so is its opposite, and *which* one you
+get is a property of the runner rather than of the pattern. A rule
+therefore cannot be kept honest by probing one engine for the absence of
+an extension: the probe answers a question about the machine. The test
+below pins the property the rule actually needs -- that the pattern
+contains nothing POSIX leaves undefined, and that ``git grep -E`` and
+Python agree on both a hit and a near-miss -- which holds on every
+engine.
 
 The unanchored shape is also the safer direction to be wrong in: it catches
 an id wherever it sits, including inside a longer token, and the cost of that
@@ -86,6 +101,26 @@ import source_scan
 #: that is eight digits split by two hyphens, and this shape requires six
 #: digits immediately followed by one.
 PLAN_ID_SHAPE: re.Pattern[str] = re.compile(r"20[0-9]{6}-[A-Za-z][A-Za-z0-9._-]*")
+
+#: Constructs Python's ``re`` accepts and POSIX ERE does not define.
+#: Python's are a superset, not an extension: ``\b``, ``\d`` and
+#: ``(?=`` all work here, and every ERE engine is entitled to read them as
+#: something else -- ``\d`` as the letter ``d``, ``\b`` as the letter
+#: ``b``, ``(?=`` as a syntax error. Kept as data so that naming a new
+#: construct is the whole change, and so the check below can report what
+#: it forbids rather than asserting a dialect it cannot compile.
+#:
+#: The string anchors are here for the same reason as ``\b``: ``re``
+#: matches the whole string, an ERE matches a line, so ``\A`` and ``\z``
+#: would not mean the same thing even where they are understood.
+NOT_POSIX_ERE: tuple[str, ...] = (
+    r"\b", r"\B",
+    r"\A", r"\Z", r"\z", r"\G",
+    r"\d", r"\D", r"\w", r"\W", r"\s", r"\S",
+    r"\Q", r"\E", r"\h", r"\H",
+    "(?<", "(?=", "(?!", "(?>", "(?P<", "(?#", "(?(",
+    "(?i", "(?m", "(?s", "(?x", "(?a", "(?u", "(?L",
+)
 
 #: Path parts that mark a file as test source. A ``tests`` directory
 #: anywhere in the path excludes it, so ``backend/tests/`` and
@@ -162,16 +197,24 @@ def test_the_shape_matches_a_real_leaked_plan_id() -> None:
     assert [h[2] for h in hits] == [leaked], hits
 
 
-def test_the_shape_matches_every_real_leaked_string() -> None:
-    """Every string from the 2026-09-29 incident is caught.
+def test_the_shape_matches_every_leaked_string_shape() -> None:
+    """Every id *shape* from the 2026-09-29 incident is caught.
 
     This is the negative control for the whole gate: if the shape ever
     stops matching one of these, the gate is reporting a clean tree over
     exactly the leak it was written for.
+
+    The second entry is a synthetic stand-in. It used to be two fragments
+    that reassembled into a real plan name, and fragments are not a
+    protection -- that is the same argument that moved the forbidden-name
+    blacklist out of this repository, and it applies to one name just as
+    much as to a list of them. The rule keys on :data:`PLAN_ID_SHAPE`, so
+    what this row pins is the *slug shape* (a hyphenated run glued to the
+    date prefix on both sides), which is the part that could regress.
     """
     samples = [
         "2026" + "1010-" + "CC-Switch-" + "Remote-Aut",
-        "2026" + "1012-" + "chan" + "lun-buy" + "sell-points-rebuild",
+        "2026" + "1012-" + "example-" + "topic-buy" + "sell-points-rebuild",
         "2026" + "0926-" + "Product-" + "Development",
         "2026" + "1004-" + "PDT-" + "Product-" + "Developm",
     ]
@@ -238,21 +281,38 @@ def test_production_sources_are_not_exempt() -> None:
 
 
 def test_the_shape_is_accepted_by_posix_ere(tmp_path) -> None:
-    """The shape round-trips through ``git grep -E`` and still matches.
+    """The shape means the same thing in Python and in ``git grep -E``.
 
-    This pins the "no ``\\b``" claim instead of asserting it in a comment.
-    If someone adds a word boundary or a lookbehind to :data:`PLAN_ID_SHAPE`,
-    the first assertion below names the reason, and the second shows the
-    shell-side check going quiet while Python still reports a hit.
+    :data:`PLAN_ID_SHAPE` is shared with consumers that are not Python --
+    ``git grep -E`` stands in for "somebody checking this from a shell" --
+    and the failure this gate is written against is the two *disagreeing*
+    without anyone noticing. So this pins agreement, in both directions,
+    rather than agreement plus a probe of one engine's extensions.
+
+    The first assertion is what the old version got right and kept: a
+    construct Python understands and POSIX does not define must not appear
+    in the pattern. :data:`NOT_POSIX_ERE` is the full list rather than the
+    three tokens it started as, and it is checked on the pattern text
+    because that is the only question with one answer on every machine.
+
+    The probe is what the old version got wrong, and the reason is worth
+    keeping: it asked whether ``git grep -E`` honours ``\\b`` and asserted
+    the answer, which is a property of the runner. Apple's git dropped it,
+    GNU grep keeps it, so the assertion passed on a laptop and failed on
+    the runner -- a test that could only ever be green on one of the two
+    platforms it was supposed to cover. A probe cannot answer it; the
+    pattern can. What the probe *can* answer, on any engine, is whether
+    the two sides find the same lines, which is the second half.
     """
     import subprocess
 
     pattern = PLAN_ID_SHAPE.pattern
-    for python_only in ("(?<", "(?=", "(?!"):
+    for python_only in NOT_POSIX_ERE:
         assert python_only not in pattern, (
-            f"{pattern!r} contains {python_only!r}, which POSIX ERE — and so "
-            f"`git grep -E` — does not understand. Checking this rule from a "
-            f"shell would then report a clean tree."
+            f"{pattern!r} contains {python_only!r}, which POSIX ERE does not "
+            f"define — an ERE engine may drop it and report a clean tree "
+            f"where Python reports a hit. Remove it, or move the check off "
+            f"`git grep -E` and onto a Python consumer."
         )
 
     # ``git grep --no-index`` only reaches files inside a work tree, so the
@@ -260,26 +320,39 @@ def test_the_shape_is_accepted_by_posix_ere(tmp_path) -> None:
     subprocess.run(["git", "init", "-q", "."], cwd=tmp_path, check=True)
     plan_id = "2026" + "0810-twice-start"
     (tmp_path / "probe.txt").write_text(f"seen on {plan_id} today\n", encoding="utf-8")
+    # The other direction: lines Python calls clean. An ERE engine that
+    # matches one of these has drifted from the rule just as surely as one
+    # that misses ``probe.txt``, and it does so on the same engines, so it
+    # is pinned by the same platform-independent assertion. The last line
+    # is the one that carries the weight: widening the single hyphen after
+    # the date into ``[_-]`` is the loosening this shape is one edit away
+    # from, and it turns that line into a match on both sides at once.
+    near_miss = (
+        "released 2026-10-14 as build 20261014, no plan here\n"
+        "the plan count went 15 -> 35 tasks\n"
+        "see 2099-01-01 and 2026-13-01 for the malformed cases\n"
+        "artifact 20310405_x86 carries no plan id\n"
+    )
+    (tmp_path / "near_miss.txt").write_text(near_miss, encoding="utf-8")
 
-    def grep(expr: str) -> subprocess.CompletedProcess[str]:
+    def grep(expr: str, target: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["git", "grep", "-E", "-c", "-e", expr, "--no-index", "--", "probe.txt"],
+            ["git", "grep", "-E", "-c", "-e", expr, "--no-index", "--", target],
             cwd=tmp_path,
             capture_output=True,
             text=True,
             check=False,
         )
 
-    good = grep(pattern)
+    good = grep(pattern, "probe.txt")
     assert good.returncode == 0, f"git grep -E rejected or missed the shape: {good.stderr!r}"
     # ``git grep -c`` prints ``<path>:<count>`` when given a path.
     assert good.stdout.strip().endswith(":1"), good.stdout
-
-    # And the shape this rule exists to avoid: it matches in Python and is
-    # silently ignored by the very command used above.
-    with_boundary = grep("\\b" + pattern)
-    assert with_boundary.returncode == 1, (
-        "git grep -E now honours \\b; if that ever becomes true the two "
-        f"checks agree and this contrast stops proving anything: {with_boundary.stdout!r}"
-    )
     assert PLAN_ID_SHAPE.search(plan_id), "Python should still match the same id"
+
+    quiet = grep(pattern, "near_miss.txt")
+    assert quiet.returncode == 1, (
+        "git grep -E matched a line the rule calls clean, so the two sides "
+        f"disagree about what a plan id is: {quiet.stdout!r}"
+    )
+    assert find_plan_ids_in_non_test_source(Path("backend/agent.py"), near_miss) == []

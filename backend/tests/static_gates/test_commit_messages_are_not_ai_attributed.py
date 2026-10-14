@@ -961,6 +961,91 @@ def test_flags_an_ai_attribution(message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tokens that are ordinary English
+# ---------------------------------------------------------------------------
+#
+# The row that started this section is the reason it exists. It reads
+# ``Co-Authored-By: Autonomous Agent <agent@…>`` — no vendor, no model
+# family, nothing the original thirteen tokens match — and the checker
+# passed it, exit 0. That is the defect this rule exists to prevent,
+# spelled a way the rule could not see: a gate that only catches leaks
+# phrased like the last leak is not a gate.
+#
+# So the product *names* are not the rule. "Names an AI system" is the
+# rule, and the words vendors actually put in those trailers are the words
+# everybody recognises as ordinary English. Each row below is a spelling a
+# vendor ships today.
+
+
+@pytest.mark.parametrize("message", [
+    # The trailer that got through: no vendor name at all.
+    "Tighten the gate\n\nCo-Authored-By: " + "Autonomous" + " " + "Agent" + " <agent@example.invalid>\n",
+    # Vendor display names built on those words.
+    "Refactor\n\nCo-Authored-By: " + "Copilot" + " " + "Agent" + " <bot@example.invalid>\n",
+    "Refactor\n\nCo-Authored-By: " + "Open" + "AI " + "Assistant" + " <bot@example.invalid>\n",
+    "Refactor\n\nCo-Authored-By: " + "Chat" + "GPT " + "Bot" + " <bot@example.invalid>\n",
+    # Coding agents that are neither a vendor nor a model family.
+    "Refactor\n\nCo-Authored-By: " + "Wind" + "surf <agent@example.invalid>\n",
+    "Refactor\n\nCo-Authored-By: " + "Code" + "ium <agent@example.invalid>\n",
+    "Refactor\n\nCo-Authored-By: " + "Tab" + "nine <agent@example.invalid>\n",
+    "Refactor\n\nCo-Authored-By: " + "open" + "code <agent@example.invalid>\n",
+    # Model families the original list did not carry.
+    "Refactor\n\nCo-Authored-By: " + "Lla" + "ma 3 <agent@example.invalid>\n",
+    "Refactor\n\nCo-Authored-By: " + "Mis" + "tral <agent@example.invalid>\n",
+    "Refactor\n\nCo-Authored-By: " + "Deep" + "Seek <agent@example.invalid>\n",
+    "Refactor\n\nCo-Authored-By: " + "Q" + "wen <agent@example.invalid>\n",
+    "Refactor\n\nCo-Authored-By: " + "Gr" + "ok <agent@example.invalid>\n",
+    # The same words on the other line shape the rule covers.
+    "Refactor\n\nGenerated with " + "Cod" + "ex " + "Agent" + "\n",
+])
+def test_flags_an_ai_system_named_in_ordinary_english(message: str) -> None:
+    assert _violations(message), (
+        f"the checker missed an AI attribution in:\n{message!r}\n"
+        f"Tokens that are also ordinary words are what a leak wears when "
+        f"it is not dressed as one of the listed products."
+    )
+
+
+def test_the_accepted_false_positive_is_pinned_rather_than_assumed() -> None:
+    """``bot`` and ``agent`` cost a false positive. Name what it is.
+
+    A human co-author whose name contains one of those substrings trips the
+    gate. That is a deliberate trade — the two ways this rule can be wrong
+    are not symmetric: a false positive costs a rewritten co-author line,
+    and a false negative is permanent public history that cannot be
+    corrected. Writing the cost down as a test means the next person to
+    widen a token sees what widening already costs, instead of
+    discovering it from a colleague's blocked commit.
+    """
+    human = "Ship the parser\n\nCo-Authored-By: Abbot Example <abbot@example.com>\n"
+    assert _violations(human), (
+        "if this now passes, `bot` was narrowed — which is fine and is a "
+        "change to make deliberately, with the false-positive cost written "
+        "down rather than rediscovered"
+    )
+
+
+def test_no_token_is_generic_enough_to_match_ordinary_prose() -> None:
+    """``ai`` is not a token, and this is why that has to stay true.
+
+    Matching is substring, so a token that occurs inside a common word
+    turns the gate into a coin flip on the commit message's vocabulary
+    rather than on its trailer. ``ai`` is the canonical example — it is
+    inside ``email``, ``maintain``, ``chain``, ``detail`` — and any token
+    with the same property would be a rule that cannot be used.
+    """
+    ordinary = (
+        "maintain the email chain\n\n"
+        "Co-Authored-By: Dana Example <dana@example.com>\n\n"
+        "This message mentions detail, maintainer and email on purpose.\n"
+    )
+    assert not _violations(ordinary), (
+        "a token is matching ordinary English in a human's trailer; the "
+        "rule has stopped being about attribution"
+    )
+
+
+# ---------------------------------------------------------------------------
 # The narrowness — a rule that fires on prose is a rule that gets deleted
 # ---------------------------------------------------------------------------
 

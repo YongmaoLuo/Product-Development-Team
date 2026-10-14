@@ -306,7 +306,9 @@ PYTHON_OUTPUT=$("$PYTHON_CMD" "$SCANNER" --repo "$PROJECT_ROOT" "${RANGE_ARGS[@]
 # ``.gitleaks.toml`` is committed, so a caller need not supply a config.
 SECRET_RC=0
 SECRET_OUTPUT=""
+GITLEAKS_RAN=0
 if command -v gitleaks >/dev/null 2>&1; then
+    GITLEAKS_RAN=1
     for spec in "${RANGE_SPECS[@]}"; do
         out=$(gitleaks detect \
             --no-banner \
@@ -366,8 +368,28 @@ fi
 # ---------------------------------------------------------------------------
 
 printf '%s\n' "$PYTHON_OUTPUT"
-if [ -n "$SECRET_OUTPUT" ]; then
+# gitleaks prints its own verdict, and on success that verdict is the two
+# words "no leaks found" -- about *its* scan, not about this one. It used
+# to be echoed unconditionally, so a run that found a plan id printed
+#
+#     FAIL commit-range privacy scan: 1 violation(s)
+#       [plan id in commit message]  commit message:3: 2026xxxxx-yyy
+#     ...
+#     INF no leaks found
+#
+# and the last line a reader's eye lands on contradicts every line above
+# it, on its own vocabulary, in a different scanner's voice. A person
+# scanning output decides in about a second which of those two they
+# believe, and the one that looks like a summary is the one that wins.
+#
+# So the credential scan speaks only when it has something to say, and
+# otherwise states its verdict in the same place and the same voice as
+# everything else here. Pre-existing, not introduced with the privacy
+# rules: the gitleaks step and this report block both arrived in c809422.
+if [ "$SECRET_RC" -ne 0 ]; then
     printf '%s' "$SECRET_OUTPUT"
+elif [ "$GITLEAKS_RAN" -eq 1 ]; then
+    echo "OK  credential scan (gitleaks): 0 secrets"
 fi
 if [ -n "$FORBIDDEN_NAMES_OUTPUT" ]; then
     printf '%s\n' "$FORBIDDEN_NAMES_OUTPUT"
