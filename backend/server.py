@@ -342,7 +342,7 @@ VERIFICATION_WATCHDOG_STALENESS_SECONDS = float(
 # default is therefore DERIVED (threshold + 30 min of patience) rather
 # than absolute; ``VERIFICATION_HARD_STALE_SECONDS`` can still override it.
 #
-# 2026-10-14 (operator contract): the hard ceiling is 1 HOUR, raised
+# 2026-10-14: the hard ceiling is 1 HOUR, raised
 # from the 45 min this default used to produce. Production, a
 # 2026-10-12 plan, round 1: a healthy round
 # was killed 7 min before it finished, purely because the gap in its
@@ -1584,17 +1584,14 @@ class ResetRoundsRequest(BaseModel):
 
     2026-09-16 — the endpoint was renamed from
     ``reset_max_rounds`` because that name described the *original*
-    behaviour, not the current one::
+    behaviour, not the current one: a name that says "max rounds" tells
+    the reader this rewrites the budget when it resets the counter.
 
-        "这个 reset max rounds 跟实际的作用不符，把这个端点名称改名为
-         reset current verification rounds。"
-
-    The rename follows the 2026-09-14 semantic inversion. The user's
-    words then::
-
-        "本来是要把 MaxRounds 上限修改，现在不去改上限，改的是当前的
-         计数。因为上限本来就没什么好改的，不允许被修改，但是当前的
-         计数的话，在用户授权的情况下是可以被修改的。"
+    The rename follows the 2026-09-14 semantic inversion. The decision
+    behind it: the cap is not what this endpoint is for. The budget is
+    set when the plan is created and is not meant to move afterwards;
+    the counter is the part that legitimately needs to be rewound, and
+    only with the operator's authorization.
 
     So: ``max_rounds`` is the plan's budget and is immutable (raising it
     makes rounds unbounded — the 2026-08-25 incident; lowering it

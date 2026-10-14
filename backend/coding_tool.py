@@ -1555,7 +1555,7 @@ class ClaudeCodingTool(CodingTool):
         # below is guarded, so an unset clock simply means nothing here
         # is accounted to anyone. See WorkClock.
         self._work_clock: Optional["WorkClock"] = None
-        # 2026-09-14 (user insight): the LAST stdout line itself, so
+        # 2026-09-14: the LAST stdout line itself, so
         # callers can surface real progress (pytest's progress bar, tool
         # names) instead of only knowing "something arrived". The
         # verification sub-agent pumps this into its attempt log, which
@@ -1672,10 +1672,11 @@ class ClaudeCodingTool(CodingTool):
     def _load_cc_switch_current_provider() -> Optional["ProviderConfig"]:
         """The provider CC Switch is *currently routing* Claude traffic to.
 
-        2026-09-21: asked for by the operator — "如果走 legacy walk，那就要
-        去获取 cc-switch 当前的实际上路由的那个 provider". CC Switch owns the
-        routing decision, so its current selection is the only honest
-        answer for which provider a scene-less dispatch should use.
+        2026-09-21: the legacy walk still answers "which provider?" by
+        asking CC Switch for the one it is actually routing to. CC
+        Switch owns the routing decision, so its current selection is
+        the only honest answer for which provider a scene-less dispatch
+        should use.
 
         Resolution: ``~/.cc-switch/settings.json::currentProviderClaude``
         (the provider id) → the matching ``providers`` row for

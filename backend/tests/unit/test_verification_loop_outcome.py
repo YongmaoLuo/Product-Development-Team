@@ -21,8 +21,8 @@ the same Feishu card. The card's terminal branch then chose:
 
     ⏸ 暂停（上游阻塞） · a production plan
 
-with a ``⏳1`` in the body — the operator's report was "0921的这个plan
-也暂停了".
+with a ``⏳1`` in the body — reported on 2026-09-22 as a paused plan
+that was not actually paused.
 
 The same confusion hit ``_reap_managed_services`` in the wrapper's
 ``finally``: it tore down the plan's dev servers because "the loop

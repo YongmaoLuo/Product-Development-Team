@@ -28,8 +28,8 @@ CAS layer and desynced from the rest of the state machine. The
 ``_recover_execution_states`` restores from it on restart. The tests
 below assert the SAME contract against that row.
 
-The operator's other requirement ("测试的时候不要去动 state.db") is
-handled by the suite-wide isolation: the ``isolated_plans_dir`` autouse
+The other requirement — never touch ``state.db`` while tests run —
+is handled by the suite-wide isolation: the ``isolated_plans_dir`` autouse
 fixture points both ``PDT_STATE_DB_PATH`` and ``server._state_db_path``
 at a per-test ``tmp_path/state.db``, and the ``state_db_reader`` fixture
 reads from that same file, so these tests can never touch the live

@@ -17,10 +17,24 @@ a different thing. "Nothing writes the file" does not make the reader
 dead; it makes it read empty. The reader is still on a live path, and
 its *result* is still live.
 
-The first test is the one the operator actually asked about: the live
+What this file does and does not pin
+------------------------------------
+It pins **where the number comes from** — the live
 ``GET <base>/api/usage`` reading is what carries the 5-hour window into
-the concurrency cap. Nothing here reaches the network — the payloads
-are the shapes the reader is documented against.
+the concurrency cap, and the legacy file reader is a reachable
+fallback rather than dead code. Nothing here reaches the network — the
+payloads are the shapes the reader is documented against.
+
+It deliberately does **not** pin *which* window scales the cap when a
+row carries two. :func:`_usage_row` emits the burst tier alone (see its
+docstring), so ``max(five_hour_used, weekly_used)`` collapses to
+``five_hour_used`` and every assertion below holds identically whether
+the reader scales by the burst window alone or by the worse of the two.
+That question — the week gates a dispatch but does not shrink the cap —
+is pinned in ``tests/unit/test_provider_quota_dispatch.py``, by
+``test_the_weekly_window_does_not_shrink_the_cap`` and its counterweight
+``test_a_week_with_no_burst_window_beside_it_says_nothing``. This file
+points at them rather than restating them.
 """
 
 from __future__ import annotations
@@ -97,7 +111,7 @@ def _quota_for(provider, five_hour_used):
 
 
 def test_live_reading_carries_the_5h_window_into_the_cap():
-    """The operator's question, answered from the production entry point.
+    """The number that decides the cap, from the production entry point.
 
     ``select_provider_with_dynamic_capacity`` is what ``coding_tool``
     and the dispatch path call. A provider 20% into its 5-hour window

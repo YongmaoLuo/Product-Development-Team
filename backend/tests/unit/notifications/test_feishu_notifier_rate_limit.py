@@ -75,7 +75,7 @@ def test_min_interval_is_configurable() -> None:
 def test_no_global_rate_limit_attributes(notifier: FeishuNotifier) -> None:
     """v4 has NO global / cycle / batch rate-limit fields.
 
-    User clarified the requirement as "per-card 1/min, independent
+    The requirement is "per-card 1/min, independent
     across cards". The v3 ``_last_global_push_ts`` /
     ``_pushes_skipped_global_limit`` / cycle-level gate are all
     gone — each plan throttles independently using its own
