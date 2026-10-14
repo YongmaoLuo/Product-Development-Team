@@ -44,16 +44,20 @@ _refiner_failure_rules: |
   3. Generate hierarchical IDs for the new subtasks. For example, if task "2" failed, create subtasks like "2-1", "2-2", "2-3".
   4. Replace the failed task with the new subtasks in the task list.
 
+  WHAT YOU ARE SHOWN:
+  - The task list you receive gives the LAST task in full — that is the one being refined. Every other task is reduced to an index row of id/title/status/depends_on. You cannot see the other tasks' descriptions, and you must not try to rewrite them.
+  - Because the framework preserves every task you do not mention, your answer is a DELTA: only the tasks you changed or added. Do not echo the rest of the list back.
+
   CRITICAL PRESERVATION RULES (READ THESE FIRST):
   - DO NOT remove tasks unrelated to the current failure. Only the failed task and its hierarchical descendants may be removed/replaced.
-  - If a task's title and description do not relate to the failed task's domain, PRESERVE it verbatim (same id, title, description, status, project_dir, test_commands).
+  - If a task's title and description do not relate to the failed task's domain, PRESERVE it verbatim (same id, title, description, status, project_dir, test_commands) — which now costs you nothing: simply do not mention it.
   - Tasks with IDs not derived from the failed task ID (e.g. task "17" or task "18" when task "15" failed) MUST be preserved unless they are explicitly a descendant of the failed task.
   - User-added tasks (introduced after the initial plan was generated) represent explicit user requirements and MUST be preserved.
   - When in doubt: PRESERVE rather than delete. Cleaning up "redundant" tasks is a destructive operation that loses user intent; defer that judgment to a human reviewer.
 
 # Common refiner JSON format
 _refiner_json_format: |
-  Output the COMPLETE updated list of tasks in the following JSON format:
+  Return ONLY the tasks you changed or added, in this JSON format. Every task you do not mention is preserved exactly as it is by the framework, so you neither need to copy unrelated tasks back nor should you — echoing them is wasted output and a chance to corrupt one. (A reply that does contain the whole table is still accepted and still means "this is the task list", so an echo is never an error.)
   {
     "tasks": [
       {
@@ -67,11 +71,11 @@ _refiner_json_format: |
       }
     ]
   }
-  IMPORTANT: You MUST preserve these metadata fields from existing tasks:
+  IMPORTANT: You MUST preserve these metadata fields from any task you DO return:
   1. "status" - Do not change the status of completed tasks
   2. "updated_time" - Always preserve this field if it exists
   3. "model_type" - Preserve if set; for new/replacement tasks choose by complexity
-  When returning the updated task list, include these fields for all existing tasks.
+  When splitting a task, return the new subtasks and OMIT the parent — the parent is replaced by its children, not kept beside them.
 
 # Common task JSON format for execution tasks (planner + repair generator)
 _planner_json_format: |
