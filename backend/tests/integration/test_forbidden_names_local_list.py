@@ -64,6 +64,14 @@ RANGE_SCRIPT = REPO_ROOT / "scripts" / "scan_commit_range.sh"
 #: ``zz-`` reads as obviously synthetic at a glance.
 SYNTHETIC_NEEDLE = "zz-synthetic-forbidden-project"
 
+#: The same idea with a non-ASCII character in it, which is what makes the
+#: encoding tests below possible. The list is read as UTF-8, so *this* is
+#: ``zz-caf\\xc3\\xa9-synthetic``; :data:`_NON_ASCII_NEEDLE_LATIN1` is the
+#: same characters written the way a Western-locale editor would have
+#: written them, ``zz-caf\\xe9-synthetic``. Same name, different bytes.
+SYNTHETIC_NON_ASCII_NEEDLE = "zz-café-synthetic"
+_NON_ASCII_NEEDLE_LATIN1 = b"NAME = 'zz-caf\xe9-synthetic'\n"
+
 
 # ---------------------------------------------------------------------------
 # A throwaway repository, for the pre-push path
@@ -383,6 +391,160 @@ def test_comments_and_blank_lines_are_ignored(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# A blob that is not UTF-8
+# ---------------------------------------------------------------------------
+#
+# These four are one matrix and the controls are half of it. Before the fix
+# the scanner decoded every blob with errors="replace", which rewrites any
+# byte it cannot decode into U+FFFD -- so a needle holding a non-ASCII
+# character could never be found in a non-UTF-8 file, and the run printed
+# ``OK  forbidden-name scan: 0 violations`` over bytes it had not read.
+# ASCII needles were unaffected, because errors="replace" only rewrites
+# bytes outside ASCII, which is precisely why the hole stayed hidden.
+#
+# The needle is written out whole, like every other fixture in this file:
+# it is synthetic, and a name hidden behind string concatenation is one
+# join away from being published.
+
+
+def _run_name_scan(
+    env: dict[str, str], list_path: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "scripts" / "scan_forbidden_names.sh"),
+            "--index",
+            "--list",
+            list_path,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=env,
+        check=False,
+    )
+
+
+def test_a_non_ascii_needle_is_found_in_a_non_utf8_file(tmp_path) -> None:
+    """The defect itself: a latin-1 blob carrying a latin-1 needle.
+
+    ``errors="replace"`` turns the ``\\xe9`` into U+FFFD, so the needle was
+    unreachable and the scan reported zero violations and exit 0.
+    """
+    env = _staged_env(tmp_path)
+    _stage_blob(env, "backend/agent.py", _NON_ASCII_NEEDLE_LATIN1)
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NON_ASCII_NEEDLE)
+
+    got = _run_name_scan(env, list_path)
+
+    assert got.returncode == 1, (
+        f"a latin-1 blob carrying a latin-1 needle was reported clean "
+        f"(exit {got.returncode}):\n{got.stdout}\n{got.stderr}"
+    )
+    assert "backend/agent.py:1" in got.stderr, got.stderr
+    assert SYNTHETIC_NON_ASCII_NEEDLE in got.stderr, got.stderr
+
+
+def test_an_ascii_needle_is_still_found_in_a_non_utf8_file(tmp_path) -> None:
+    """The control that was never broken, pinned so it cannot start.
+
+    If the fix for the non-ASCII case ever decoded latin-1 instead of
+    searching for the needle's bytes, this is the test that would notice:
+    the ASCII needle would arrive mangled and stop matching.
+    """
+    env = _staged_env(tmp_path)
+    _stage_blob(
+        env, "backend/agent.py", f"NAME = '{SYNTHETIC_NEEDLE}'\n".encode()
+    )
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _run_name_scan(env, list_path)
+
+    assert got.returncode == 1, (
+        f"an ASCII needle stopped matching in a non-UTF-8 file "
+        f"(exit {got.returncode}):\n{got.stdout}\n{got.stderr}"
+    )
+    assert "backend/agent.py:1" in got.stderr, got.stderr
+
+
+def test_a_non_ascii_needle_is_still_found_in_a_utf8_file(tmp_path) -> None:
+    """The control for the ordinary path: encoding loss did not come cheap.
+
+    The scan now makes two passes over a blob it could not decode strictly.
+    A UTF-8 blob must still be reported exactly as it was before.
+    """
+    env = _staged_env(tmp_path)
+    _stage(env, "backend/agent.py", f'NAME = "{SYNTHETIC_NON_ASCII_NEEDLE}"\n')
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NON_ASCII_NEEDLE)
+
+    got = _run_name_scan(env, list_path)
+
+    assert got.returncode == 1, (
+        f"the ordinary UTF-8 path regressed (exit {got.returncode}):\n"
+        f"{got.stdout}\n{got.stderr}"
+    )
+    assert "backend/agent.py:1" in got.stderr, got.stderr
+
+
+def test_a_clean_non_utf8_file_still_exits_0(tmp_path) -> None:
+    """Zero still means "read it whole and found nothing".
+
+    A second decode over a non-UTF-8 blob must not manufacture a violation
+    out of it. ``U+FFFD`` and a mangled ``café`` are not a needle, and a
+    check that cried wolf on a clean file would be bypassed the same week.
+    """
+    env = _staged_env(tmp_path)
+    _stage_blob(env, "backend/agent.py", b"GREETING = 'hello'\n")
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NON_ASCII_NEEDLE)
+
+    got = _run_name_scan(env, list_path)
+
+    assert got.returncode == 0, (
+        f"a clean non-UTF-8 file was reported as a violation "
+        f"(exit {got.returncode}):\n{got.stdout}\n{got.stderr}"
+    )
+
+
+def test_a_regex_match_over_a_mangled_byte_is_still_reported(tmp_path) -> None:
+    """The decoder that makes the fix lossless is also the one that can crash.
+
+    ``surrogateescape`` keeps an undecodable byte as a lone surrogate, which
+    is a real code point in ``str`` and has no ``utf-8`` representation --
+    so ``print`` refuses it. A ``re:`` needle whose match spanned such a
+    byte took the scanner down with ``UnicodeEncodeError`` while reporting a
+    finding it had already made, and a gate that dies on the way to printing
+    the leak it found is worse than the mismatched decode it replaced.
+
+    This is the regression pin for that, and it is also the pin for ``re:``
+    shapes on the byte pass: the pattern is matched over raw bytes in every
+    encoding that can represent it.
+    """
+    env = _staged_env(tmp_path)
+    _stage_blob(env, "backend/agent.py", b"NAME = 'zz-caf\xe9-synthetic'\n")
+    list_path = _write_list(tmp_path / "forbidden-names", r"re:zz-caf.")
+
+    got = _run_name_scan(env, list_path)
+    combined = got.stdout + got.stderr
+
+    assert got.returncode == 1, (
+        "a re: shape was not matched over a non-UTF-8 blob "
+        f"(exit {got.returncode}):\n{combined}"
+    )
+    assert "Traceback" not in combined, (
+        f"the scanner crashed while printing its own finding:\n{combined}"
+    )
+    assert "UnicodeEncodeError" not in combined, combined
+    assert "backend/agent.py:1" in combined, combined
+    # The escape, not a bare surrogate: a reader has to be able to see that
+    # the byte could not be decoded rather than get a character they cannot
+    # render.
+    assert "\\udce9" in combined, (
+        f"the report should name the undecodable byte as an escape:\n{combined}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # "the check did not run" must not read as "clean"
 # ---------------------------------------------------------------------------
 
@@ -426,6 +588,46 @@ def test_a_missing_list_exits_2_not_0(tmp_path) -> None:
     )
     assert "forbidden-names.example" in got.stderr, (
         f"the failure message does not point at the template to copy:\n{got.stderr}"
+    )
+
+
+def test_a_list_that_is_not_utf8_exits_2_not_1(tmp_path) -> None:
+    """A list that cannot be decoded is an unread list, not a violation.
+
+    ``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError``, so
+    ``load_needles`` did not catch it: it escaped ``main``'s ``try`` and
+    took the process down with exit 1 -- which the wrapper reads as "the
+    check ran and found violations" and answers with a HOWTO telling the
+    reader to go and delete each ``path:lineno: needle`` listed above it.
+    There was no needle and no line; the only thing above the HOWTO was a
+    traceback.
+
+    The commit was still refused, so this was never a hole in the check.
+    It was the wrong label on a refusal, which is its own kind of lie
+    about what was examined -- and a reader who believes it goes looking
+    for a leak that is not in their index.
+    """
+    env = _staged_env(tmp_path)
+    _stage(env, "backend/agent.py", 'GREETING = "hello"\n')
+    list_path = tmp_path / "forbidden-names"
+    list_path.write_bytes(b"zz-caf\xe9-synthetic\n")
+
+    got = _run_name_scan(env, str(list_path))
+
+    assert got.returncode == 2, (
+        f"an unreadable list reported {got.returncode}; it must be 2 -- the "
+        f"check did not run, so it did not find a violation:\n"
+        f"{got.stdout}\n{got.stderr}"
+    )
+    assert "Each line above is" not in got.stderr, (
+        "the violation HOWTO was printed for a list that was never read, so "
+        f"there are no lines above it to act on:\n{got.stderr}"
+    )
+    assert "Traceback" not in got.stdout + got.stderr, (
+        f"an undecodable list still crashes the scanner:\n{got.stdout}{got.stderr}"
+    )
+    assert "UTF-8" in got.stderr, (
+        f"the refusal does not say what is wrong with the list:\n{got.stderr}"
     )
 
 

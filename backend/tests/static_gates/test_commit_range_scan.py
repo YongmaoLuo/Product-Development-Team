@@ -39,6 +39,7 @@ built at runtime from pieces.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -383,3 +384,243 @@ def test_the_message_registry_is_not_empty() -> None:
     assert commit_range_scan.MESSAGE_RULES, "commit messages are not scanned at all"
     labels = {label for label, _ in commit_range_scan.MESSAGE_RULES}
     assert "plan id in commit message" in labels, sorted(labels)
+
+
+# ---------------------------------------------------------------------------
+# A blob in a commit that is not UTF-8
+# ---------------------------------------------------------------------------
+#
+# This is the one of the three surfaces where the defect had a *live* needle.
+# ``find_local_measurements`` and ``find_attribution`` both hold non-ASCII
+# characters in their patterns, so against a blob that is not valid UTF-8
+# they could never match -- and the run still printed ``0 violations``.
+#
+# The harness is a temporary tree rather than a throwaway repo passed with
+# ``--repo``, because the brief for this is the production entry point.
+# ``scan_commit_range.sh`` resolves ``PROJECT_ROOT`` from its own location
+# and hard-wires ``--repo "$PROJECT_ROOT"``; there is no environment hook
+# for pointing it elsewhere. So the tree is rebuilt under ``tmp_path`` from
+# the *working tree* -- not from a clone of HEAD, which would test whatever
+# happens to be committed rather than what is in front of the reviewer, and
+# would leave the test passing against code that has been reverted.
+
+
+def _range_harness(tmp_path: Path) -> Path:
+    """A checkout-shaped tree holding the scripts and gates under test.
+
+    Copies ``scripts/scan_commit_range.sh``, the whole ``static_gates``
+    directory (the scanner imports its rule modules and ``source_scan``
+    from beside itself) and ``.gitleaks.toml`` (the credential step reads
+    it, and a missing one makes gitleaks exit non-zero and fail the run for
+    a reason that has nothing to do with what is under test).
+    """
+    tree = tmp_path / "checkout"
+    (tree / "scripts").mkdir(parents=True)
+    (tree / "backend" / "tests").mkdir(parents=True)
+    shutil.copy(
+        _REPO_ROOT / "scripts" / "scan_commit_range.sh", tree / "scripts"
+    )
+    shutil.copytree(
+        _REPO_ROOT / "backend" / "tests" / "static_gates",
+        tree / "backend" / "tests" / "static_gates",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    shutil.copy(_REPO_ROOT / ".gitleaks.toml", tree / ".gitleaks.toml")
+
+    _run_git(tree, "init", "--quiet", "-b", "main")
+    for key, value in (
+        ("user.email", "gate@example.invalid"),
+        ("user.name", "gate"),
+        ("commit.gpgsign", "false"),
+    ):
+        _run_git(tree, "config", key, value)
+    return tree
+
+
+def _commit_bytes(repo: Path, rel: str, data: bytes, message: str) -> None:
+    target = repo / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    _run_git(repo, "add", "--", rel)
+    _run_git(repo, "commit", "--quiet", "-m", message)
+
+
+def _run_range_scan(tree: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(tree / "scripts" / "scan_commit_range.sh"),
+         "--range", "HEAD~1..HEAD"],
+        capture_output=True,
+        text=True,
+        cwd=str(tree),
+        check=False,
+    )
+
+
+#: A source line carrying the Chinese measurement shape and a date. Built
+#: from escapes, because ``test_source_comments_carry_no_local_measurements``
+#: walks every first-party source including this directory and would
+#: otherwise find the shape spelled out here.
+_CJK_MEASUREMENT_LINE = "# " + "\u5b9e\u6d4b\uff082026-01-02\uff09\n"
+
+
+def test_a_non_utf8_blob_in_a_commit_is_refused_not_reported_clean(
+    tmp_path: Path,
+) -> None:
+    """The bypass, end to end through ``scan_commit_range.sh --range``.
+
+    Before the fix this run printed ``OK  commit-range privacy scan: 0
+    violations`` and exited 0 over a commit whose measurement rule could
+    not see it. Now it exits 2 and names the blob.
+    """
+    tree = _range_harness(tmp_path)
+    _commit_bytes(tree, "backend/base.py", b"X = 0\n", "base")
+    _commit_bytes(
+        tree,
+        "backend/probe.py",
+        _CJK_MEASUREMENT_LINE.encode("gb2312"),
+        "add probe",
+    )
+
+    got = _run_range_scan(tree)
+    combined = got.stdout + got.stderr
+    assert got.returncode == 2, (
+        "a commit holding a blob this scan cannot decode must report 'did "
+        f"not run' (exit 2), not a clean scan (exit 0):\n{combined}"
+    )
+    assert "probe.py" in combined, f"the unreadable path must be named:\n{combined}"
+    assert "UTF-8" in combined, (
+        f"the refusal must say what is wrong with the blob:\n{combined}"
+    )
+    assert "0 violations" not in got.stdout, (
+        f"a clean result was printed over an unread blob:\n{got.stdout}"
+    )
+
+
+def test_the_same_line_as_utf8_is_still_reported(tmp_path: Path) -> None:
+    """The control, and the reason the refusal above is not a blanket ban.
+
+    Identical bytes-count-of-content, one encoding different. The rule must
+    still fire, so the refusal is refusing to *guess* rather than refusing
+    to read.
+    """
+    tree = _range_harness(tmp_path)
+    _commit_bytes(tree, "backend/base.py", b"X = 0\n", "base")
+    _commit_bytes(
+        tree,
+        "backend/probe.py",
+        _CJK_MEASUREMENT_LINE.encode("utf-8"),
+        "add probe",
+    )
+
+    got = _run_range_scan(tree)
+    combined = got.stdout + got.stderr
+    assert got.returncode == 1, (
+        f"the measurement rule stopped firing on a UTF-8 blob "
+        f"(exit {got.returncode}):\n{combined}"
+    )
+    assert "local measurement" in combined, combined
+
+
+# ---------------------------------------------------------------------------
+# Startup -- the scanners must come up on a bare interpreter
+# ---------------------------------------------------------------------------
+#
+# The two tests above are the first in this repository to run the scanner
+# through its real entry point from an environment that has no venv, and
+# they failed on a machine that happened to have pytest installed and
+# passed on a runner that did not. The harness copies the tree without a
+# ``backend/.venv``, so ``scan_commit_range.sh`` takes its documented
+# fallback to the system ``python3`` -- and ``commit_range_scan.py`` was
+# importing ``find_home_paths`` from a gate whose module scope imported
+# pytest. The scanner therefore needed a test dependency to start.
+#
+# That is not a detail of the harness. It is the state of a fresh clone:
+# ``scan_commit_range.sh`` is the pre-push hook, it prefers the venv and
+# falls back to whatever ``python3`` is on PATH, and on a GitHub runner
+# that interpreter has no pytest. The scanner died on
+# ``ModuleNotFoundError`` and exited 1, which is the code that means
+# "violations found" -- so a hook that could not run reported findings.
+
+#: Every production entry point that imports its rules out of
+#: ``static_gates/``. They are listed rather than discovered so that adding
+#: a fifth scanner is a visible edit here, and so the assertion below names
+#: a file a reader can go and look at.
+_SCANNER_ENTRY_POINTS = (
+    "commit_range_scan",       # scripts/scan_commit_range.sh
+    "staged_content_scan",     # scripts/scan_staged_privacy.sh
+    "pr_metadata_scan",        # the PR-metadata CI step
+)
+
+#: Runs the imports in a *fresh* interpreter with ``pytest`` made
+#: unimportable. The interpreter is this suite's own, which does have
+#: pytest: the point is that nothing in the graph below needs it, so the
+#: block is what a bare interpreter amounts to, on every platform.
+_BLOCKS_PYTEST = """
+import importlib, importlib.util, sys
+from pathlib import Path
+
+
+class _NoPytest:
+    \"\"\"A meta-path finder that refuses to find pytest, like a runner that
+    never installed it. Raising rather than returning None means a module
+    that reaches for pytest gets the ModuleNotFoundError it would have got
+    there, rather than a confusing success from a later finder.\"\"\"
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "pytest" or fullname.startswith("pytest."):
+            raise ModuleNotFoundError("No module named %r" % fullname, name=fullname)
+        return None
+
+
+sys.meta_path.insert(0, _NoPytest())
+
+gates, script = sys.argv[1], sys.argv[2]
+sys.path.insert(0, gates)
+
+for name in sys.argv[3:]:
+    importlib.import_module(name)
+
+spec = importlib.util.spec_from_file_location("check_commit_msg", script)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+assert "pytest" not in sys.modules, sorted(
+    name for name in sys.modules if name.split(".")[0] == "pytest"
+)
+print("OK", len(sys.argv) - 3 + 1, "entry points")
+"""
+
+
+def test_the_scanners_start_without_pytest(tmp_path: Path) -> None:
+    """The four hook entry points import on an interpreter without pytest.
+
+    They live in two places -- three under ``static_gates/`` and
+    ``scripts/check_commit_msg.py`` -- and they get their rules by
+    importing pytest gate *modules*, which is the only way a production
+    script ends up needing a test package. Three of those modules already
+    say in their docstrings that they must not import pytest, and one of
+    them still did, silently: no test noticed, because every suite that
+    exercises these scanners runs under a venv that has pytest.
+
+    This is hermetic rather than environmental on purpose. Skipping a
+    test when pytest is importable, or spawning a scanner and hoping the
+    PATH ``python3`` is bare, reproduces the original bug's *shape* -- it
+    passes on the machine that has the package. Blocking the import pins
+    the invariant on every machine.
+    """
+    gates = _REPO_ROOT / "backend" / "tests" / "static_gates"
+    script = _REPO_ROOT / "scripts" / "check_commit_msg.py"
+    got = subprocess.run(
+        [sys.executable, "-c", _BLOCKS_PYTEST, str(gates), str(script),
+         *_SCANNER_ENTRY_POINTS],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(tmp_path),
+    )
+    assert got.returncode == 0, (
+        "a scanner imported pytest at module scope, so the pre-push hook "
+        "and the PR-metadata CI step cannot start without a venv:\n"
+        f"{got.stdout}{got.stderr}"
+    )
+    assert got.stdout.startswith("OK"), got.stdout

@@ -130,6 +130,59 @@ a silent pass. This is the same split and the same exit contract
 ``backend/tests/static_gates/staged_content_scan.py`` uses, and the two are
 kept worded identically on purpose: a reader who has seen one has seen both.
 
+Content that is not UTF-8
+--------------------------
+Every blob here is a byte string and every needle is a character string,
+and the two cannot be compared until one of them has been decoded. The old
+decode was ``errors="replace"``, which settles that question without
+looking: an undecodable byte becomes ``U+FFFD``, so a needle holding any
+character outside ASCII can never be found in a blob that is not valid
+UTF-8 -- not "is unlikely to be found", never -- and the run then printed
+``OK  forbidden-name scan: 0 violations`` over bytes it had not actually
+read. That is the NUL skip above reached from the other side: there the
+file was not read at all; here it was read, and the part of it that could
+have answered the question was thrown away before the needles saw it.
+
+ASCII is why this stayed invisible. ASCII is a byte-identical subset of
+every ASCII-superset encoding, and ``errors="replace"`` only ever rewrites
+bytes *outside* ASCII, so an ASCII needle -- ``zz-scaffold``,
+``zz-sample-widgets`` -- is still found verbatim in a latin-1 file. The
+bypass is precisely the needles that are not ASCII, and the list is the
+operator's, so the trigger surface is theirs to widen at any time.
+
+The decode is strict now, and the failure branch is the whole point:
+
+* **A UTF-8 blob** is decoded with ``errors="strict"``, which for that blob
+  is byte-for-byte what the old call produced. A UTF-8 blob cannot hide
+  anything from the string pass -- a UTF-8 blob *is* its own UTF-8 view --
+  so no byte pass runs over it and the cost is one decode, exactly as
+  before.
+* **A blob that is not valid UTF-8** is decoded with ``surrogateescape``,
+  which is lossless, so line numbering and the report still work, and the
+  needles are searched a second time against the **raw bytes**, in every
+  encoding :data:`NEEDLE_ENCODINGS` names.
+
+``surrogateescape`` on its own is *not* the fix, and the measurement that
+decided that is worth recording: it recovers the bytes but not their
+identity. A ``café-project`` needle is ``caf\\xc3\\xa9-project``; in a
+latin-1 file the ``\\xe9`` survives decoding as ``U+DCE9`` and still is
+not the needle, and across every case in the measurement that chose this
+shape the two decoders returned identical verdicts. Searching for the
+needle's *own* bytes is what finds it. What closes the gap is a second
+encoding, not a better error handler -- :data:`NEEDLE_ENCODINGS` and its
+docstring say which and why.
+
+What this does *not* reach, stated rather than left implied: a needle
+whose characters are written in a legacy multi-byte encoding -- ``zz-示例`` in
+a gb2312 or big5 file -- is still not found. Covering that would mean
+guessing the file's encoding from a list that is allowed to hold any
+characters at all, and a guessed encoding that fires is a false positive
+the operator has to chase down with no way to tell it apart from a real
+one. Latin-1 is the one alternative encoding added, because it is the one
+that historically holds Western prose and because adding it costs a
+second ``find`` over content that is already outside the common path.
+Every other legacy encoding remains a named gap, not a solved problem.
+
 Why this module restates the git plumbing
 -----------------------------------------
 It is stdlib-only and reads git itself rather than importing the plumbing
@@ -176,6 +229,7 @@ where they are, in the tree gates, and are unchanged by this module.
 from __future__ import annotations
 
 import argparse
+import bisect
 import re
 import shlex
 import subprocess
@@ -199,6 +253,26 @@ TEMPLATE_REL = Path("example") / "forbidden-names.example"
 
 #: Prefix marking an entry as a regular expression rather than a literal.
 REGEX_PREFIX = "re:"
+
+#: Encodings a needle is additionally searched as, on a blob that is not
+#: valid UTF-8. The needle's characters are encoded into each of these and
+#: the raw bytes are searched for the result.
+#:
+#: ``utf-8`` is the list's own encoding, so the form is usually a no-op --
+#: it is listed to make the set explicit rather than to add coverage.
+#: ``latin-1`` is the one that earns its place: it is a total map from
+#: bytes 0-255 onto U+0000-U+00FF, so *every* character of a needle that
+#: latin-1 can represent is representable, and the file written by a
+#: Western-locale editor decades ago is a byte string in exactly that map.
+#: It costs one extra ``find`` per needle, and only on content that has
+#: already failed a strict UTF-8 decode.
+#:
+#: Nothing else is listed. ``gb2312``/``big5``/``shift_jis`` would be
+#: guessing at a file's encoding from a list that may hold any characters
+#: at all, and each guess that fires is a false positive the operator
+#: cannot tell apart from a real finding. An operator who needs one can
+#: add it here knowing exactly what it will and will not catch.
+NEEDLE_ENCODINGS: tuple[str, ...] = ("utf-8", "latin-1")
 
 #: A NUL byte in the first kilobyte is git's own definition of binary.
 #: Decoding a genuine binary as UTF-8 with ``errors="replace"`` would
@@ -262,6 +336,14 @@ class Needle:
     pattern: str
     #: Compiled for ``kind == "regex"``, else ``None``.
     compiled: "re.Pattern[str] | None"
+    #: The same needle over *bytes*: ``bytes`` for a literal, a compiled
+    #: ``re.Pattern[bytes]`` for a shape, one entry per (spelling,
+    #: encoding) pair that can represent it and is not pure ASCII. Empty
+    #: for a pure-ASCII needle, because then the byte pass could only
+    #: repeat what the string pass already found -- ASCII bytes are
+    #: byte-identical in every ASCII-superset encoding and no decoder
+    #: rewrites them.
+    byte_forms: tuple["bytes | re.Pattern[bytes]", ...] = ()
 
     def search(self, line: str) -> str | None:
         """Return the offending text in *line*, or ``None`` if absent."""
@@ -272,6 +354,92 @@ class Needle:
         assert self.compiled is not None
         match = self.compiled.search(line)
         return match.group(0) if match else None
+
+
+def _spellings(needle: str) -> tuple[str, ...]:
+    """Return *needle* in the capitalisations it can plausibly appear in.
+
+    Needed because ``bytes.lower()`` folds ASCII and nothing else: in a
+    latin-1 file ``café-project`` is ``caf\\xe9-project`` and
+    ``CAFÉ-PROJECT`` is ``CAF\\xc9-PROJECT``, and no amount of ASCII
+    case-folding turns the second into the first. Case-insensitivity is a
+    pinned part of this scanner's contract -- a name shouted in capitals is
+    the same leak -- so a byte pass that found only the exact spelling
+    would trade one silent miss for a quieter one.
+
+    Four forms, not every possible capitalisation: the needle as written,
+    and its lower / upper / title cases. Those are the shapes that turn up
+    in a filename, a heading and a shouted string. An arbitrary mixed-case
+    spelling inside a non-UTF-8 file stays out of reach -- the string pass
+    is what covers mixed case, and it covers it for every UTF-8 blob, which
+    is nearly all of them.
+    """
+    out: list[str] = []
+    for candidate in (needle, needle.lower(), needle.upper(), needle.title()):
+        if candidate not in out:
+            out.append(candidate)
+    return tuple(out)
+
+
+def _byte_forms(
+    needle: str, *, is_regex: bool
+) -> tuple["bytes | re.Pattern[bytes]", ...]:
+    """Return the raw-byte forms of *needle*: every spelling, every encoding.
+
+    *needle* is the entry with any ``re:`` prefix already stripped -- the
+    prefix is list syntax, not pattern, and leaving it in would compile a
+    bytes pattern that can never match anything. *is_regex* says which kind
+    of form to build: a literal becomes ``bytes``, a shape becomes a
+    compiled bytes pattern.
+
+    Forms that come out identical (a pure-ASCII needle is the same bytes in
+    every spelling and every encoding) collapse to one entry, so nothing is
+    searched twice.
+
+    A pure-ASCII form is dropped outright. ``surrogateescape`` leaves every
+    ASCII byte exactly as it was, and the string pass folds case with
+    ``str.lower()``, which for ASCII is at least as capable as
+    ``bytes.lower()`` -- so an ASCII form could only ever repeat a hit the
+    string pass has already reported. For the same reason an ASCII *shape*
+    is dropped: compiled from a string it folds case the Unicode way, which
+    the bytes version cannot.
+
+    A form that cannot be built is left out rather than raising. That is a
+    deliberate exception to this module's "never skip silently" rule, and
+    it is bounded on purpose: ``r"\\u1234"`` is a valid pattern in string
+    mode and ``b"\\u1234"`` is not a valid pattern in bytes mode, so a
+    shape that is perfectly correct can have no byte form. Skipping costs
+    that one shape's participation in the byte pass and nothing else -- its
+    string form still runs, in full, on every blob -- and raising would
+    mean one exotic entry could stop the whole check for everybody.
+    """
+    forms: list[bytes | re.Pattern[bytes]] = []
+    for spelling in _spellings(needle):
+        for encoding in NEEDLE_ENCODINGS:
+            try:
+                raw = spelling.encode(encoding)
+            except UnicodeEncodeError:
+                continue
+            if raw.isascii():
+                continue
+            if is_regex:
+                try:
+                    form: bytes | re.Pattern[bytes] = re.compile(
+                        raw, re.IGNORECASE
+                    )
+                except re.error:
+                    continue
+            else:
+                # Lower-cased, because that is the side the content is
+                # searched in: ``_scan_bytes`` folds the content once and
+                # then matches every form against it. Folding a *spelling*
+                # rather than the form would defeat the point -- that is
+                # precisely why :func:`_spellings` enumerates the
+                # capitalisations instead of relying on this call.
+                form = raw.lower()
+            if form not in forms:
+                forms.append(form)
+    return tuple(forms)
 
 
 @dataclass(frozen=True)
@@ -319,9 +487,13 @@ def parse_needles(text: str) -> list[Needle]:
                     f"line {lineno}: '{pattern}' is not a valid regular "
                     f"expression: {exc}"
                 ) from exc
-            needles.append(Needle("regex", pattern, compiled))
+            needles.append(
+                Needle("regex", pattern, compiled, _byte_forms(pattern, is_regex=True))
+            )
         else:
-            needles.append(Needle("literal", entry, None))
+            needles.append(
+                Needle("literal", entry, None, _byte_forms(entry, is_regex=False))
+            )
     return needles
 
 
@@ -346,9 +518,21 @@ def dedupe(needles: Sequence[Needle]) -> list[Needle]:
 def load_needles(list_path: Path) -> list[Needle]:
     """Read and parse the list, or raise :class:`ScanError`.
 
-    Both failure modes -- absent file, and a file with nothing usable in it
-    -- raise, and both are exit 2 at the CLI. Zero usable needles is not a
-    clean tree; it is an unconfigured check.
+    All three failure modes -- absent file, a file with nothing usable in
+    it, and a file that is not valid UTF-8 -- raise, and all three are exit
+    2 at the CLI. Zero usable needles is not a clean tree; it is an
+    unconfigured check.
+
+    The third is here because ``UnicodeDecodeError`` is a ``ValueError``,
+    not an ``OSError``, so it used to escape this function uncaught and
+    terminate the process out of ``main``'s ``try``. That reported exit 1
+    -- which the wrapper in ``scripts/scan_forbidden_names.sh`` reads as
+    "the check ran and found violations", and answers with a HOWTO telling
+    the reader to go and delete each reported ``path:lineno: needle``.
+    The list was never read, so there was no needle and no line, and the
+    advice pointed at a leak that does not exist. The commit was still
+    refused, so this was never a hole in the check; it was the wrong label
+    on a refusal, which is its own kind of lie about what was examined.
     """
     try:
         text = list_path.read_text(encoding="utf-8")
@@ -369,6 +553,20 @@ def load_needles(list_path: Path) -> list[Needle]:
     except OSError as exc:
         raise ScanError(
             f"forbidden-name list could not be read: {list_path}: {exc}"
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise ScanError(
+            f"forbidden-name list is not valid UTF-8: {list_path}: {exc}\n"
+            f"The list is read as UTF-8 so that a needle in it names one "
+            f"specific string of characters. A list saved in another "
+            f"encoding does not: the same bytes are different characters "
+            f"under a different decoder, so the needles in it would mean "
+            f"something other than what they look like, and this check "
+            f"would be running against a rule nobody wrote.\n"
+            f"Re-save it as UTF-8, e.g.\n"
+            f"    iconv -f <its-current-encoding> -t UTF-8 "
+            f"{list_path} > /tmp/list && mv /tmp/list {list_path}\n"
+            f"Nothing has been scanned, and nothing has been cleared."
         ) from exc
 
     needles = dedupe(parse_needles(text))
@@ -618,6 +816,23 @@ def iter_commit_blobs(repo: Path, sha: str) -> Iterator[tuple[str, bytes]]:
 # ---------------------------------------------------------------------------
 
 
+#: A lone surrogate is what ``surrogateescape`` puts where a byte could not
+#: be decoded. It is a real code point in ``str`` and it is what makes that
+#: decode lossless, but ``print`` cannot encode one -- ``utf-8`` has no
+#: representation of it and the default error handler refuses -- so a
+#: ``re:`` needle whose match happened to span such a byte would crash the
+#: scanner while reporting a finding it had already made. A gate that dies
+#: on the way to printing the leak it found is a worse outcome than the
+#: mismatched decode it replaced, so every label goes through this first.
+#:
+#: ``backslashreplace`` rather than ``replace``: it prints the escape
+#: (``\udce9``) instead of a substitution character, so the report names the
+#: exact byte that could not be read and a reader can tell a mangled match
+#: from a clean one.
+def _printable(text: str) -> str:
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def scan_text(
     path: str, content: bytes, needles: Sequence[Needle]
 ) -> tuple[list[Violation], bool]:
@@ -627,19 +842,123 @@ def scan_text(
     blob that is binary *and* not source-suffixed; see :func:`_is_scannable`
     and the module docstring for why those two conditions are not the same
     test.
+
+    Two passes, and which ones run is decided by the decode rather than by
+    the content:
+
+    * a blob that is valid UTF-8 gets the string pass only. It is decoded
+      strictly, which for that blob is what ``errors="replace"`` used to
+      produce, and a UTF-8 blob cannot hide a needle from its own UTF-8
+      view -- so there is nothing a byte pass would add, and the fast path
+      costs exactly what the old code cost.
+    * a blob that is not gets the string pass *and* :func:`_scan_bytes`.
+      ``surrogateescape`` keeps every byte addressable so lines still
+      number correctly, and the raw bytes are searched for the needles'
+      own encodings, which is the only thing that can answer "is this
+      character in there" for a file that is not UTF-8.
+
+    A violation found by both passes is reported once, at the line the
+    string pass named, so the count stays the number of distinct hits a
+    reader has to look at rather than the number of ways the scanner found
+    the same line.
     """
     if not _is_scannable(Path(path), content):
         return [], False
+
+    try:
+        text = content.decode("utf-8")
+        raw: bytes | None = None
+    except UnicodeDecodeError:
+        text = content.decode("utf-8", "surrogateescape")
+        raw = content
+
     violations: list[Violation] = []
-    for lineno, line in enumerate(
-        content.decode("utf-8", "replace").splitlines(), start=1
-    ):
+    reported: set[tuple[int, str]] = set()
+    for lineno, line in enumerate(text.splitlines(), start=1):
         for needle in needles:
             hit = needle.search(line)
             if hit is not None:
-                label = f"re:{hit}" if needle.kind == "regex" else hit
+                label = _printable(
+                    f"re:{hit}" if needle.kind == "regex" else hit
+                )
                 violations.append(Violation(path, lineno, label))
+                reported.add((lineno, label))
+
+    if raw is not None:
+        violations.extend(_scan_bytes(path, raw, needles, reported))
+
     return violations, True
+
+
+def _scan_bytes(
+    path: str,
+    raw: bytes,
+    needles: Sequence[Needle],
+    reported: set[tuple[int, str]],
+) -> list[Violation]:
+    """Search *raw* for each needle's byte forms; return the new hits.
+
+    Only reached for a blob that is not valid UTF-8. *reported* is the
+    string pass's output, both so a line found twice is listed once and so
+    this pass adds only what the string pass genuinely missed.
+
+    ``bytes.lower()`` folds ASCII and nothing else, which is what makes the
+    case-insensitive literal match work here: it folds the needle and the
+    content the same way and both stay byte-aligned. The string pass remains
+    the one that understands ``É`` for ``é``; this pass is the one that can
+    look at a file where those characters are not UTF-8, and neither can do
+    the other's job.
+
+    Line numbers come from a precomputed offset table rather than counting
+    newlines per hit, so a file with many hits stays linear.
+    """
+    if not any(needle.byte_forms for needle in needles):
+        return []
+
+    starts = [0]
+    newline = raw.find(b"\n")
+    while newline != -1:
+        starts.append(newline + 1)
+        newline = raw.find(b"\n", newline + 1)
+
+    lowered = raw.lower()
+    found: list[Violation] = []
+    for needle in needles:
+        for form in needle.byte_forms:
+            spans: Iterator[tuple[int, str]] = _byte_spans(lowered, form, needle.pattern)
+            for index, label in spans:
+                lineno = bisect.bisect_right(starts, index)
+                if (lineno, label) in reported:
+                    continue
+                reported.add((lineno, label))
+                found.append(Violation(path, lineno, label))
+    return found
+
+
+def _byte_spans(
+    lowered: bytes, form: "bytes | re.Pattern[bytes]", pattern: str
+) -> Iterator[tuple[int, str]]:
+    """Yield ``(offset, label)`` for every occurrence of *form*.
+
+    Everything is matched against *lowered*, the lower-cased content, and
+    that is correct for both kinds of form. ``bytes.lower()`` rewrites
+    ASCII ``A-Z`` and leaves every other byte alone, so a literal folded
+    against folded content stays byte-aligned; and a compiled bytes pattern
+    already carries ``re.IGNORECASE``, which for a bytes pattern folds
+    ASCII and nothing more -- so a non-ASCII byte in the pattern still
+    meets the same non-ASCII byte at the same offset.
+    """
+    if isinstance(form, re.Pattern):
+        for match in form.finditer(lowered):
+            yield match.start(), f"re:{match.group(0).decode('utf-8', 'replace')}"
+        return
+    start = 0
+    while True:
+        index = lowered.find(form, start)
+        if index == -1:
+            return
+        yield index, pattern
+        start = index + 1
 
 
 def scan(

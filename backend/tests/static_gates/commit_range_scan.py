@@ -50,6 +50,37 @@ An empty commit list, an unreadable blob, or a git command that fails is a
 hard error, never a clean result. A range scanner that silently reports
 "0 violations" when it in fact scanned nothing is the failure mode this
 whole module exists to prevent.
+
+Content that is not UTF-8
+-------------------------
+Blobs were decoded with ``errors="replace"``, and that decided the
+question of what is in a blob without looking at it: an undecodable byte
+becomes ``U+FFFD``. Two of the rules -- the Chinese measurement shape
+(实测/观察于/复现于) and the dated changelog-bullet attribution shape --
+hold non-ASCII characters, so against a blob that is not valid UTF-8 they
+could never match, and the run still printed ``OK ... 0 violations``.
+ASCII rules were unaffected, because ``errors="replace"`` only rewrites
+bytes outside ASCII: that is why this stayed invisible, and why the same
+hole in a file that had been UTF-8 all along would have shown up as a
+failure instead.
+
+A second decode does not fix it and is worth recording why. ``surrogateescape``
+keeps the bytes but not their identity, so a rule pattern still does not
+match; and neither does latin-1 or cp1252, because *none* of the non-ASCII
+characters in these rules' patterns -- ``。``, ``（``, ``：``, ``实测`` --
+is even representable in latin-1. Measured over every rule and every
+encoding, no decoder other than strict UTF-8 ever returned a different
+verdict. So the honest move for a rule set that is not this module's to
+change is to refuse rather than to guess: a blob that is not valid UTF-8
+now raises :class:`RangeScanError` naming it, which is exit 2 and the
+"unreadable blob" case above.
+
+That is a real refusal, not a formality. This module reads
+``SOURCE_EXTENSIONS`` files under the scan roots, so the shape is a source
+file saved in the wrong encoding rather than an image -- and the fix is to
+re-save it as UTF-8 and rewrite the commit, which at pre-push time is
+still free. The alternative was to keep reporting a clean result over bytes
+nobody read, which is the thing this module was written to stop.
 """
 
 from __future__ import annotations
@@ -177,6 +208,33 @@ def _git(repo: Path, args: Sequence[str]) -> str:
     return result.stdout.decode("utf-8", "replace")
 
 
+def _undecodable_message(path: str, exc: UnicodeDecodeError) -> str:
+    """The refusal text for a blob that is not valid UTF-8.
+
+    A hard error, and that is this module's existing contract rather than a
+    new one: "an empty commit list, an unreadable blob, or a git command
+    that fails is a hard error, never a clean result." A blob this module
+    cannot decode is unreadable, so it belongs there.
+
+    The wording is shared verbatim with
+    :func:`staged_content_scan._undecodable_message`, for the reason the
+    two modules already share the binary rule: a reader who has seen one
+    has seen both.
+    """
+    return (
+        f"{path} is not valid UTF-8 and this scan cannot read it: {exc}\n"
+        f"The privacy rules are patterns over text, and running them over a "
+        f"blob whose encoding this scan would have to guess is not reading "
+        f"it. It used to be decoded with errors=\"replace\", which rewrites "
+        f"every byte it cannot decode into U+FFFD -- and a rule whose shape "
+        f"holds a non-ASCII character (the Chinese measurement and "
+        f"attribution shapes do) can then never match, while the run still "
+        f"reported a clean result over bytes it had not examined.\n"
+        f"Re-save the file as UTF-8 and rewrite the commit that introduced "
+        f"it. Nothing has been scanned and nothing has been cleared."
+    )
+
+
 def iter_range_commits(repo: Path, range_spec: str) -> list[str]:
     """Return the SHAs in *range_spec*, oldest first.
 
@@ -234,7 +292,13 @@ def iter_commit_sources(repo: Path, sha: str) -> Iterator[tuple[str, str]]:
                 f"{sha[:9]}:{rel.as_posix()} is listed by ls-tree but has no "
                 f"blob; refusing to report a clean scan over a partial read"
             )
-        yield rel.as_posix(), blob.decode("utf-8", "replace")
+        try:
+            text = blob.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RangeScanError(
+                _undecodable_message(f"{sha[:9]}:{rel.as_posix()}", exc)
+            ) from exc
+        yield rel.as_posix(), text
 
 
 def _read_blob_batch(repo: Path, specs: list[str]) -> list[bytes | None]:
