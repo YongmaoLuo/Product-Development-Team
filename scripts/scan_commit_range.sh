@@ -47,6 +47,22 @@
 # gate did not run" need different responses from whoever reads the
 # message, and collapsing them lets a broken gate look like a clean one.
 #
+# Three checks, and the third one is local-only
+# ---------------------------------------------
+#   1. the privacy rules (home paths, attribution, measurements, plan-id
+#      shape) — every commit in the range;
+#   2. gitleaks, over the same commits;
+#   3. forbidden proper names — the operator's untracked
+#      .config/forbidden-names.
+#
+# Check 3 runs on the ``--stdin-pre-push`` path ONLY. Its needles are
+# operator-owned and gitignored, so a CI runner does not have the file and
+# invoking it under ``--ci`` could only ever exit 2. On the ``--range`` and
+# ``--ci`` paths it is skipped, and a clean run says so on stderr rather
+# than letting the reader assume it ran. That asymmetry is the whole reason
+# the list stayed untracked: a gate that can only fail is a gate everybody
+# learns to bypass.
+#
 # Usage
 # -----
 #   bash scripts/scan_commit_range.sh --stdin-pre-push      # from the hook
@@ -309,6 +325,43 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# The forbidden-name check — local pre-push only
+# ---------------------------------------------------------------------------
+#
+# The needles for this one are operator-owned and untracked
+# (.config/forbidden-names), which has two consequences that decide where it
+# runs:
+#
+#   * It CANNOT run in --ci mode. A GitHub runner has no local list, so a
+#     CI invocation could only ever be exit 2 — "the check did not run" —
+#     and the job would be red forever for a file it is not allowed to have.
+#     A gate that can only fail is a gate everybody learns to bypass.
+#   * It MUST run on the pre-push path, because that is the earliest point
+#     at which rewriting the offending commit is still free. Nothing has
+#     been published yet, so refusing costs an amend rather than a force-
+#     push onto a shared branch.
+#
+# So it is keyed on USE_STDIN, which is set only by --stdin-pre-push. The
+# `--range` and `--ci` paths skip it silently *by design*, and that silence
+# is stated here rather than left for a reader to infer.
+FORBIDDEN_NAMES_RC=0
+FORBIDDEN_NAMES_OUTPUT=""
+FORBIDDEN_NAMES_SCRIPT="$SCRIPT_DIR/scan_forbidden_names.sh"
+if [ "$USE_STDIN" -eq 1 ]; then
+    if [ ! -f "$FORBIDDEN_NAMES_SCRIPT" ]; then
+        FORBIDDEN_NAMES_OUTPUT="ERROR: forbidden-name wrapper not found: $FORBIDDEN_NAMES_SCRIPT"
+        FORBIDDEN_NAMES_RC=2
+    else
+        FORBIDDEN_ARGS=()
+        for spec in "${RANGE_SPECS[@]}"; do
+            FORBIDDEN_ARGS+=(--range "$spec")
+        done
+        FORBIDDEN_NAMES_RC=0
+        FORBIDDEN_NAMES_OUTPUT=$(bash "$FORBIDDEN_NAMES_SCRIPT" "${FORBIDDEN_ARGS[@]}" 2>&1) || FORBIDDEN_NAMES_RC=$?
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -316,9 +369,16 @@ printf '%s\n' "$PYTHON_OUTPUT"
 if [ -n "$SECRET_OUTPUT" ]; then
     printf '%s' "$SECRET_OUTPUT"
 fi
+if [ -n "$FORBIDDEN_NAMES_OUTPUT" ]; then
+    printf '%s\n' "$FORBIDDEN_NAMES_OUTPUT"
+fi
 
-if [ "$PYTHON_RC" -ne 0 ] || [ "$SECRET_RC" -ne 0 ]; then
-    cat >&2 <<'HOWTO'
+if [ "$PYTHON_RC" -ne 0 ] || [ "$SECRET_RC" -ne 0 ] || [ "$FORBIDDEN_NAMES_RC" -ne 0 ]; then
+    # The rewrite advice is for a *violation*. When a check exited 2 it did
+    # not run, and telling somebody to go and rebase a branch over a config
+    # file they have not created yet sends them to the wrong place entirely.
+    if [ "$PYTHON_RC" -eq 1 ] || [ "$SECRET_RC" -eq 1 ] || [ "$FORBIDDEN_NAMES_RC" -eq 1 ]; then
+        cat >&2 <<'HOWTO'
 
 A violation inside a commit cannot be fixed by adding another commit — the
 commit that carries it stays fetchable by its SHA. Rewrite it instead:
@@ -331,13 +391,20 @@ commit that carries it stays fetchable by its SHA. Rewrite it instead:
 
 On an unmerged branch this is free: nothing has been published yet.
 HOWTO
+    fi
+
     # A non-zero python exit is 1 (violations) or 2 (could not run); the
     # script's 2 means the same thing, so pass the distinction through.
-    if [ "$PYTHON_RC" -eq 2 ] || [ "$SECRET_RC" -gt 1 ]; then
+    if [ "$PYTHON_RC" -eq 2 ] || [ "$SECRET_RC" -gt 1 ] || [ "$FORBIDDEN_NAMES_RC" -eq 2 ]; then
         exit 2
     fi
     exit 1
 fi
 
-echo "OK  commit-range privacy scan: clean"
+if [ "$USE_STDIN" -eq 1 ]; then
+    echo "OK  commit-range privacy scan: clean (privacy rules, secrets, forbidden names)"
+else
+    echo "OK  commit-range privacy scan: clean"
+    echo "note: the forbidden-name check did NOT run — it is local-only (it reads an untracked .config/forbidden-names, which CI does not have)." >&2
+fi
 exit 0

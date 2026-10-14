@@ -36,9 +36,12 @@ That is the only mechanically separable line available, and it is a real
 boundary rather than a loophole: the accident was in production source.
 
 It is deliberately **not** a loophole for the private-name blacklist
-(:mod:`test_no_private_names_in_source`), which has no test exemption at
-all -- a real project name in a test file is exactly as published as one in
-a docstring.
+(``scripts/scanners/scan_forbidden_names.py``), which has no test
+exemption at all -- a real project name in a test file is exactly as
+published as one in a docstring. That check is not here, and not in
+``tests/`` either: its needles are operator-owned and untracked, so it
+cannot be a pytest gate without publishing them. It runs in the pre-commit
+and pre-push hooks instead.
 
 Why no ``\\b`` in the shape
 --------------------------
