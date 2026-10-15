@@ -110,6 +110,18 @@ violations to be a subset of that set. The realistic way a third one
 appears is another ``backup/pre-*`` branch taken before a later rewrite:
 the shape that turns this red is the same mistake, one task on.
 
+**The sweep covers two rules, and each ref is judged against the rules it
+is actually exempt for.** ``find_violations`` rejects an AI attribution
+trailer *and* a date-prefixed plan id, and a declaration in the table
+above exempts a ref from named rules only — so a ref that is red for a
+plan id is still red after being added to a table whose name says
+*trailer*. ``test_a_plan_id_finding_survives_the_trailer_allowlist`` is
+the control for that boundary, and it pins a property that used to be
+unstated anywhere: the sweep put both rules' findings in one list, the
+message called all of them trailers and gave all of them the trailer's
+remedy, and a reader who followed that advice granted a plan-id finding
+a permanent exemption under a heading that never described it.
+
 ``test_no_remote_tracking_ref_retains_the_trailer`` is the push rule in
 the only form that survives after the event. A ``refs/remotes/**`` ref
 carrying a violation means the history is already on the remote, and
@@ -877,6 +889,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -885,31 +898,6 @@ _CHECKER = _REPO_ROOT / "scripts" / "check_commit_msg.py"
 _INSTALLER = _REPO_ROOT / "scripts" / "install_git_hooks.sh"
 _PRECOMMIT = _REPO_ROOT / ".pre-commit-config.yaml"
 _CI = _REPO_ROOT / ".github" / "workflows" / "ci.yml"
-
-#: The refs permitted to retain commits carrying the trailer this rule
-#: forbids, each with the one-line reason it is permitted to.
-#:
-#: These are audit references taken *before* a history rewrite, and a
-#: rewrite cannot rewrite a reference someone is holding on to for
-#: comparison — that is the point of taking one. They are local-only; the
-#: push rule is enforced by ``test_no_remote_tracking_ref_retains_the_
-#: trailer``, the only check that can catch a push after the fact.
-#:
-#: The set is deliberately closed. A new ref carrying the trailer is a
-#: finding, not a name to add here: adding one is how this list stops
-#: being a bound and becomes a running inventory of whatever the history
-#: happens to contain. ``refs/original/**`` is residue left behind by a
-#: rewrite and is never a legitimate entry — if one appears, the rewrite
-#: was not cleaned up, and the answer is to delete that ref, not to
-#: declare it.
-_ALLOWED_TRAILER_REFS: dict[str, str] = {
-    "refs/heads/backup/pre-ai-trailer-strip-20261005": (
-        "audit ref taken before the AI trailer was stripped from history"
-    ),
-    "refs/heads/backup/pre-fd-secrets-sync-20261004": (
-        "audit ref taken before the secrets sync rewrite"
-    ),
-}
 
 
 def _load_checker():
@@ -932,9 +920,201 @@ def _load_checker():
 
 checker = _load_checker()
 
+#: Which of the two rules a finding broke. Read off the checker rather than
+#: spelled out here so the two cannot drift: these names are what the
+#: failure output prints to say which rule sent a ref red, and a copy that
+#: drifts is a report that sorts under a heading nothing was ever checked
+#: against.
+_RULE_TRAILER = checker.RULE_TRAILER
+_RULE_PLAN_ID = checker.RULE_PLAN_ID
+#: Both rules, in the order the report groups them.
+_RULES = (_RULE_TRAILER, _RULE_PLAN_ID)
+
+
+class _Declared(NamedTuple):
+    """One allowlist entry: why a ref is exempt, and from which rules.
+
+    *rules* is the load-bearing half. ``find_violations`` enforces two
+    independent rules with two different remedies, so "this ref is allowed
+    to keep the trailer" is a statement about the trailer rule only —
+    reading it as a blanket exemption is how a plan-id violation acquires a
+    permanent waiver by being filed under the wrong heading. The negative
+    control ``test_a_plan_id_finding_survives_the_trailer_allowlist`` pins
+    that reading shut.
+    """
+
+    reason: str
+    rules: frozenset[str]
+
+
+#: The fix for a ``[trailer]`` finding, and only for one. Kept apart from
+#: :data:`_PLAN_ID_REMEDY` so neither can be handed to the other rule's
+#: findings: the two were one string until it produced a report that told
+#: a reader to amend an allowlist over a private id.
+_TRAILER_REMEDY = (
+    "For a [trailer] finding: delete the line from the commit message. If "
+    "one of these is a ref/original/** path, a history rewrite left it "
+    "behind and it should be deleted — residue is not an audit trail. If "
+    "it is a backup taken before a rewrite, say so by adding it to "
+    "_ALLOWED_TRAILER_REFS with its reason and with the rules it is "
+    "exempt from; do not delete it without checking what it is the only "
+    "remaining copy of. It is not exempt from the plan-id rule by being "
+    "listed here."
+)
+
+#: The fix for a ``[plan id]`` finding. It is a message rewrite and it is
+#: never an allowlist entry — the allowlist is the one thing in this file
+#: that turns a finding into a permanent exemption, so it is the wrong
+#: instrument for a private identifier that should not have been written
+#: down at all.
+_PLAN_ID_REMEDY = (
+    "For a [plan id] finding: do NOT add the ref to "
+    "_ALLOWED_TRAILER_REFS. That table exempts a ref from the trailer "
+    "rule; a name entered there for a plan-id finding does not excuse it "
+    "and, read as a blanket exemption, would leave a private date-prefixed "
+    "id sitting in permanent history under a waiver nobody chose "
+    "deliberately. Rewrite the id out of the commit message and describe "
+    "the behaviour change instead — deleting the ref does not delete the "
+    "commit, and a merge commit on the remote cannot be force-pushed away."
+)
+
+
+#: The refs permitted to retain commits carrying the trailer this rule
+#: forbids, each with the one-line reason it is permitted to.
+#:
+#: These are audit references taken *before* a history rewrite, and a
+#: rewrite cannot rewrite a reference someone is holding on to for
+#: comparison — that is the point of taking one. They are local-only; the
+#: push rule is enforced by ``test_no_remote_tracking_ref_retains_the_
+#: trailer``, the only check that can catch a push after the fact.
+#:
+#: **Both entries name both rules, and that is deliberate.** When this
+#: table was first written the sweep below bucketed the two rules together,
+#: so "declared here" meant "exempt from everything the checker finds",
+#: and these two entries have meant that from the start. Narrowing them to
+#: the trailer rule now would silently shrink a standing audit exemption
+#: that was taken on purpose — the refs are kept precisely so their history
+#: is never edited, and an entry that quietly stops covering what it
+#: covered is the failure mode worth spending this paragraph on. A *new*
+#: entry gets no such carry-over: it exempts the trailer rule alone unless
+#: it says otherwise in its own ``rules``, and a plan-id finding has no
+#: exemption to be had here at all (see ``_PLAN_ID_REMEDY``).
+#:
+#: The set is deliberately closed. A new ref carrying the trailer is a
+#: finding, not a name to add here: adding one is how this list stops
+#: being a bound and becomes a running inventory of whatever the history
+#: happens to contain. ``refs/original/**`` is residue left behind by a
+#: rewrite and is never a legitimate entry — if one appears, the rewrite
+#: was not cleaned up, and the answer is to delete that ref, not to
+#: declare it.
+_ALLOWED_TRAILER_REFS: dict[str, _Declared] = {
+    "refs/heads/backup/pre-ai-trailer-strip-20261005": _Declared(
+        "audit ref taken before the AI trailer was stripped from history",
+        frozenset(_RULES),
+    ),
+    "refs/heads/backup/pre-fd-secrets-sync-20261004": _Declared(
+        "audit ref taken before the secrets sync rewrite",
+        frozenset(_RULES),
+    ),
+}
+
 
 def _violations(message: str) -> list:
     return checker.find_violations(message)
+
+
+def _exempted_rules(ref: str) -> set[str]:
+    """The rules *ref* is allowed to keep a finding for, or nothing.
+
+    A ref absent from the allowlist is exempt from nothing; that is the
+    closed-set property the gate depends on, so it is spelled out here
+    rather than inherited from a ``dict.get`` default that could widen.
+    """
+    entry = _ALLOWED_TRAILER_REFS.get(ref)
+    return set(entry.rules) if entry is not None else set()
+
+
+def _sweep(
+    refs: list[str],
+    allowed: dict[str, _Declared] | None = None,
+    repo: Path | None = None,
+) -> dict[str, dict[str, list[str]]]:
+    """Findings no declaration exempts, as ``{ref: {rule: [finding, ...]}}``.
+
+    The one place the ref tests read history, so the negative controls
+    below exercise the same walk the tests they guard depend on rather
+    than a parallel implementation that could agree with them while both
+    were broken.
+
+    A *finding* is ``"<sha10> L<lineno>"``. The offending line itself is
+    deliberately not carried through: every line the plan-id rule matches
+    is by definition a line carrying a private date-prefixed id, and the
+    trailer rule's lines name a vendor. Neither belongs in a failure
+    message, and a message that quotes them has to be scrubbed before it
+    can be pasted anywhere.
+    """
+    table = _ALLOWED_TRAILER_REFS if allowed is None else allowed
+    offenders: dict[str, dict[str, list[str]]] = {}
+    for ref in refs:
+        exempted = (
+            set(table[ref].rules) if ref in table else set()
+        )
+        per_rule: dict[str, list[str]] = {}
+        for sha, body in _history_messages(ref=ref, repo=repo):
+            for v in _violations(body):
+                if v.rule in exempted:
+                    continue
+                per_rule.setdefault(v.rule, []).append(f"{sha[:10]} L{v.lineno}")
+        if per_rule:
+            offenders[ref] = per_rule
+    return offenders
+
+
+def _census(offenders: dict[str, dict[str, list[str]]]) -> str:
+    """One line per rule saying how many findings of it are on the report.
+
+    A reader who only reads the first line of a 40-finding failure should
+    still learn that two rules are implicated, not one — otherwise the
+    natural next question is "which of these is the trailer I should be
+    deleting", which is a different question per rule.
+    """
+    counts = {
+        rule: sum(len(found[rule]) for found in offenders.values() if rule in found)
+        for rule in _RULES
+    }
+    counts = {rule: n for rule, n in counts.items() if n}
+    if not counts:
+        return "no findings\n"
+    return (
+        ", ".join(f"{counts[rule]} {rule}" for rule in _RULES if rule in counts)
+        + f" ({sum(counts.values())} findings total)\n\n"
+    )
+
+
+def _report(offenders: dict[str, dict[str, list[str]]]) -> str:
+    """The per-ref body of a failure message, grouped by rule.
+
+    Shape::
+
+        refs/heads/<name>  (2 findings: 1 trailer, 1 plan id)
+            [trailer] 8a66858489 L7
+            [plan id] 8a66858489 L7
+    """
+    blocks = []
+    for ref, found in sorted(offenders.items()):
+        total = sum(len(hits) for hits in found.values())
+        breakdown = ", ".join(
+            f"{len(found[rule])} {rule}" for rule in _RULES if rule in found
+        )
+        blocks.append(
+            f"  {ref}  ({total} findings: {breakdown})\n      "
+            + "\n      ".join(
+                f"[{rule}] {finding}"
+                for rule in _RULES if rule in found
+                for finding in found[rule][:3]
+            )
+        )
+    return "\n".join(blocks)
 
 
 # ---------------------------------------------------------------------------
@@ -1174,15 +1354,30 @@ def test_no_commit_in_this_history_carries_an_ai_trailer() -> None:
         "would pass without checking anything"
     )
 
-    offenders = []
+    offenders: dict[str, list[str]] = {}
     for sha, body in history:
         for v in _violations(body):
-            offenders.append(f"{sha[:10]} L{v.lineno}: {v.reason}\n    {v.line}")
+            offenders.setdefault(v.rule, []).append(
+                f"{sha[:10]} L{v.lineno}: {v.reason}"
+            )
 
     assert not offenders, (
-        "commits in this repository carry an AI attribution trailer. It "
-        "asserts a model identity the committer could not have known, and "
-        "it is in permanent public history:\n  " + "\n  ".join(offenders)
+        "commits in this repository carry something the commit-message "
+        "gate rejects:\n"
+        + "".join(
+            f"  {_RULE_TRAILER}: " if rule == _RULE_TRAILER else f"  {rule}: "
+            for rule in _RULES if rule in offenders
+        )
+        + "\n"
+        + "\n".join(
+            "    " + line
+            for rule in _RULES if rule in offenders
+            for line in offenders[rule]
+        )
+        + "\n\n"
+        + _TRAILER_REMEDY
+        + "\n\n"
+        + _PLAN_ID_REMEDY
     )
 
 
@@ -1245,6 +1440,198 @@ def test_the_ref_sweep_reports_a_planted_trailer(tmp_path) -> None:
     assert not repo.exists(), "the planted repository outlived the test"
 
 
+#: A plan id that matches :data:`PLAN_ID_SHAPE`, assembled from fragments so
+#: this file does not carry the literal it is planting. Same convention as
+#: ``_SYNTHETIC_PLAN_ID`` in ``test_no_plan_ids_in_metadata``.
+_PLANTED_PLAN_ID = "2026" + "1012-example" + "-topic"
+
+#: A ref name whose only finding is a plan id, and one whose only finding is
+#: a trailer. Two separate branches rather than two commits on one branch, so
+#: neither ref's history can pick up the other rule's finding and the
+#: "only" in the test below is a fact about the history, not an assumption.
+_TRAILER_ONLY_REF = "refs/heads/backup/planted-trailer-only"
+_PLAN_ID_ONLY_REF = "refs/heads/backup/planted-plan-id-only"
+
+
+def test_a_plan_id_finding_survives_the_trailer_allowlist(tmp_path) -> None:
+    """Negative control for the boundary between the two rules.
+
+    The defect this pins shut: ``find_violations`` enforces two rules, the
+    sweep reported their findings in one list, and the failure message
+    named only the trailer rule and handed out only the trailer rule's
+    fix. So a ref that was red for a plan id was described as "retaining
+    an AI attribution trailer", and the remedy printed underneath it was
+    to add the ref to ``_ALLOWED_TRAILER_REFS``. Following that advice
+    grants a permanent exemption for a finding it never described — and
+    since one entry then covers every future finding on that ref, the
+    private id stays in history under a waiver.
+
+    The judgement it encodes: **a ref that is red only for a plan id must
+    still be red after being added to the trailer allowlist.** Both refs
+    below are declared, in the exact shape a new entry takes, exempting
+    the trailer rule alone. The trailer-only ref must go quiet; the
+    plan-id-only ref must not.
+    """
+    repo = tmp_path / "planted-two-rules"
+    repo.mkdir()
+    trailer = (
+        "Co-Authored-By: " + "Claude" + " Opus 5 <noreply@anthropic.com>"
+    )
+    plan_id_line = f"see {_PLANTED_PLAN_ID} for the round-4 rewrite\n"
+    try:
+        _run_git(repo, "init", "-q")
+        (repo / "trailer.txt").write_text("x\n", encoding="utf-8")
+        (repo / "planid.txt").write_text("x\n", encoding="utf-8")
+
+        def commit(ref: str, filename: str, message: str) -> None:
+            """Point *ref* at a fresh commit with **no parent**.
+
+            ``git commit`` would chain the second commit onto the first,
+            so the plan-id ref would also reach the trailer-bearing commit
+            and stop being a plan-id-*only* ref. Each ref is built as its
+            own root, which is the whole point of having two of them.
+            ``commit-tree`` rather than ``commit`` also means no hook can
+            reject the fixture before the sweep gets to walk it.
+            """
+            _run_git(repo, "add", filename)
+            tree = _run_git(repo, "write-tree").strip()
+            _run_git(repo, "read-tree", "--empty")
+            sha = _run_git(
+                repo,
+                "-c", "user.name=Plant", "-c", "user.email=plant@example.invalid",
+                "commit-tree", tree, "-m", message,
+            ).strip()
+            _run_git(repo, "update-ref", ref, sha)
+
+        commit(_TRAILER_ONLY_REF, "trailer.txt", f"a commit\n\n{trailer}\n")
+        commit(_PLAN_ID_ONLY_REF, "planid.txt", f"a commit\n\n{plan_id_line}")
+
+        # The fixtures are only meaningful if each really breaks exactly one
+        # rule. Asserted against the checker directly, so a change to the
+        # planted text that quietly broke both would fail here rather than
+        # make the boundary below look correct for the wrong reason.
+        trailer_rules = {v.rule for v in _violations(f"a commit\n\n{trailer}\n")}
+        plan_id_rules = {v.rule for v in _violations(f"a commit\n\n{plan_id_line}")}
+        assert trailer_rules == {_RULE_TRAILER}, (
+            f"the trailer fixture no longer breaks exactly the trailer rule: "
+            f"{sorted(trailer_rules)} — the boundary check below would be "
+            f"measuring the wrong thing"
+        )
+        assert plan_id_rules == {_RULE_PLAN_ID}, (
+            f"the plan-id fixture no longer breaks exactly the plan-id rule: "
+            f"{sorted(plan_id_rules)} — the boundary check below would be "
+            f"measuring the wrong thing"
+        )
+
+        # What "adding it to _ALLOWED_TRAILER_REFS" actually produces for a
+        # new entry: a reason, and the trailer rule as the exemption.
+        trailer_only_allowlist = {
+            ref: _Declared("planted by the boundary control", frozenset({_RULE_TRAILER}))
+            for ref in (_TRAILER_ONLY_REF, _PLAN_ID_ONLY_REF)
+        }
+        offenders = _sweep(
+            [_TRAILER_ONLY_REF, _PLAN_ID_ONLY_REF],
+            allowed=trailer_only_allowlist,
+            repo=repo,
+        )
+
+        assert _TRAILER_ONLY_REF not in offenders, (
+            "a ref declared exempt from the trailer rule was still reported "
+            "for it — the declaration does nothing, so the exemption is "
+            "either a no-op or a name that suppresses every rule at once: "
+            f"{offenders}"
+        )
+        assert _PLAN_ID_ONLY_REF in offenders, (
+            "the plan-id-only ref was declared in _ALLOWED_TRAILER_REFS and "
+            "the sweep stopped reporting it. That is the hole this control "
+            "exists to close: the trailer allowlist now grants a standing "
+            "exemption to any ref named in it, whatever rule the ref is "
+            "actually red for. Declare it exempt from the plan-id rule in "
+            "its own `rules`, or narrow the entry to the trailer rule, and "
+            "the finding comes back."
+        )
+        assert set(offenders[_PLAN_ID_ONLY_REF]) == {_RULE_PLAN_ID}, (
+            "the plan-id-only ref is reported under rules "
+            f"{sorted(offenders[_PLAN_ID_ONLY_REF])}, but its planted commit "
+            f"breaks exactly one — {_RULE_PLAN_ID}. The bucket a finding is "
+            "filed under has to be the rule it broke, or the remedy printed "
+            "next to it belongs to a different rule."
+        )
+
+        # The other half: the exemption is real and rule-scoped, so naming
+        # the plan-id rule too does quiet it. Without this, "still red"
+        # above could be satisfied by a sweep that reports everything and
+        # ignores every declaration.
+        both_rules_allowlist = {
+            ref: _Declared("planted by the boundary control", frozenset(_RULES))
+            for ref in (_TRAILER_ONLY_REF, _PLAN_ID_ONLY_REF)
+        }
+        wide = _sweep(
+            [_TRAILER_ONLY_REF, _PLAN_ID_ONLY_REF],
+            allowed=both_rules_allowlist,
+            repo=repo,
+        )
+        assert wide == {}, (
+            "declaring the refs exempt from both rules did not quiet them, so "
+            "the control above is not measuring the declaration at all — it "
+            f"would go green on a sweep that reports everything: {wide}"
+        )
+    finally:
+        # Nothing started here may outlive the test: tmp_path is pytest's
+        # to clean, but the repository is this test's own.
+        shutil.rmtree(repo, ignore_errors=True)
+    assert not repo.exists(), "the planted repository outlived the test"
+
+
+def test_the_ref_report_names_the_rule_beside_every_finding() -> None:
+    """The grouping in ``_report``/``_census`` is the deliverable, so pin it.
+
+    A report that lists both rules' findings in one flat list is the
+    original defect: the reader cannot tell which remedy belongs to which
+    finding, and the one remedy printed underneath applies to the wrong
+    one. So this asserts the *structure* — the rule is a prefix on the
+    line the finding is printed on, and the per-ref header breaks the
+    total down by rule.
+
+    Deliberately not ``"[plan-id]" in report``: a legend, a HOWTO or a
+    trailing sentence would satisfy that while every finding stayed
+    unlabelled, which is the shape of assertion that let this file's own
+    guidance go stale in the first place. Here a line must *equal* the
+    tagged finding, so a flat list fails even if the tag is spelled
+    somewhere in the blob.
+    """
+    assert _RULE_TRAILER != _RULE_PLAN_ID, (
+        f"the two rules report under the same name ({_RULE_TRAILER!r}); "
+        f"anything that buckets by rule name now merges them again"
+    )
+    offenders = {
+        "refs/heads/example": {
+            _RULE_TRAILER: ["aaaaaaaaaa L3"],
+            _RULE_PLAN_ID: ["bbbbbbbbbb L7"],
+        }
+    }
+
+    lines = [line.strip() for line in _report(offenders).splitlines()]
+    assert lines == [
+        "refs/heads/example  (2 findings: 1 trailer, 1 plan-id)",
+        f"[{_RULE_TRAILER}] aaaaaaaaaa L3",
+        f"[{_RULE_PLAN_ID}] bbbbbbbbbb L7",
+    ], (
+        "the report no longer puts one rule per finding line with the rule "
+        "as the line's prefix, and no longer breaks the per-ref total down "
+        "by rule. That grouping is the whole reason this file can tell a "
+        f"reader which remedy applies:\n{_report(offenders)}"
+    )
+
+    assert _census(offenders).splitlines()[0] == (
+        "1 trailer, 1 plan-id (2 findings total)"
+    ), (
+        "the census no longer names both rules with their counts, so a "
+        f"reader who stops after the first line learns that one rule is "
+        f"implicated: {_census(offenders)!r}"
+    )
+
+
 def _all_refs() -> list[str]:
     """Every ref name git knows about, or fail: a sweep of nothing is not
     evidence of nothing."""
@@ -1265,6 +1652,13 @@ def test_only_the_declared_refs_retain_the_trailer() -> None:
     It is a statement about one ref. The realistic way a third one appears
     is a ``backup/pre-*`` branch taken before some later rewrite — the
     same mistake as 2026-10-05, one task after it.
+
+    The report says which rule sent each ref red, because the two rules
+    have opposite remedies and the old single-list message handed both of
+    them the trailer's fix. Telling a reader to "add it to
+    _ALLOWED_TRAILER_REFS" about a plan-id finding is how a private id
+    acquires a standing exemption: the entry is then consulted for that
+    ref on every future run and the id stays.
     """
     refs = _all_refs()
     assert refs, (
@@ -1272,30 +1666,15 @@ def test_only_the_declared_refs_retain_the_trailer() -> None:
         "test would pass without checking anything"
     )
 
-    offenders: dict[str, list[str]] = {}
-    for ref in refs:
-        found = [
-            f"{sha[:10]} L{v.lineno}: {v.line}"
-            for sha, body in _history_messages(ref=ref)
-            for v in _violations(body)
-        ]
-        if found:
-            offenders[ref] = found
-
-    undeclared = sorted(set(offenders) - set(_ALLOWED_TRAILER_REFS))
-    assert not undeclared, (
-        "these refs retain commits carrying an AI attribution trailer but "
-        "are not declared in _ALLOWED_TRAILER_REFS:\n  "
-        + "\n  ".join(
-            f"{ref} ({len(offenders[ref])} commits)\n      "
-            + "\n      ".join(offenders[ref][:3])
-            for ref in undeclared
-        )
-        + "\n\nIf one is a ref/original/** path, a history rewrite left it "
-        "behind and it should be deleted — residue is not an audit trail. "
-        "If it is a backup taken before a rewrite, say so by adding it to "
-        "_ALLOWED_TRAILER_REFS with its reason; do not delete it without "
-        "checking what it is the only remaining copy of."
+    offenders = _sweep(refs)
+    assert not offenders, (
+        "undeclared refs retain commits the commit-message gate rejects:\n"
+        + _census(offenders)
+        + _report(offenders)
+        + "\n\n"
+        + _TRAILER_REMEDY
+        + "\n\n"
+        + _PLAN_ID_REMEDY
     )
 
 
@@ -1325,24 +1704,17 @@ def test_no_remote_tracking_ref_retains_the_trailer() -> None:
             "ref — the scan is broken, so this test cannot detect a push"
         )
 
-    offenders: dict[str, list[str]] = {}
-    for ref in remote_refs:
-        found = [
-            f"{sha[:10]} L{v.lineno}: {v.line}"
-            for sha, body in _history_messages(ref=ref)
-            for v in _violations(body)
-        ]
-        if found:
-            offenders[ref] = found
-
+    offenders = _sweep(remote_refs)
     assert not offenders, (
-        "remote-tracking refs carry commits with an AI attribution "
-        "trailer, so that history has been published:\n  "
-        + "\n  ".join(
-            f"{ref} ({len(found)} commits)\n      " + "\n      ".join(found[:3])
-            for ref, found in sorted(offenders.items())
-        )
-        + "\n\nThis cannot be undone by rewriting local history; the remote "
-        "has to be dealt with, and the trailer cannot be recalled from "
-        "what was already fetched."
+        "remote-tracking refs carry commits the commit-message gate "
+        "rejects, so that history has been published:\n"
+        + _census(offenders)
+        + _report(offenders)
+        + "\n\n"
+        + _TRAILER_REMEDY
+        + "\n\n"
+        + _PLAN_ID_REMEDY
+        + "\n\nNone of this can be undone by rewriting local history; the "
+        "remote has to be dealt with, and nothing already fetched can be "
+        "recalled."
     )
