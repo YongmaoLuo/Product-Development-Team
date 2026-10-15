@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from coding_tool import CodingTool
+from coding_tool import CodingTool, JsonSession, query_in_session
 from framework.task_output_validator import is_to_be_created_path
 from test_command_quality import (
     check_falsifiable,
@@ -1283,6 +1283,13 @@ class TasksGenerator:
 
         Returns the last probe report.
         """
+        # One session for the loop rather than one per round: round N+1
+        # is round N plus the probe results it did not act on, and the
+        # prompt names the upstream architecture / test design by path
+        # rather than inlining them, so a fresh session per round
+        # re-reads all of them every round.
+        session = JsonSession()
+
         for _ in range(max(0, self.FALSIFIABILITY_MAX_ROUNDS - 1)):
             if falsifiability.get("skipped") or not _probe_problem_count(falsifiability):
                 return falsifiability
@@ -1291,6 +1298,7 @@ class TasksGenerator:
             try:
                 self._run_tasks_self_review(
                     tasks_data, falsifiability=falsifiability,
+                    session=session,
                 )
             except Exception as exc:  # noqa: BLE001 — must not abort generation
                 print(
@@ -1427,6 +1435,7 @@ class TasksGenerator:
         self,
         tasks_data: Dict[str, Any],
         falsifiability: Optional[Dict[str, Any]] = None,
+        session: Optional["JsonSession"] = None,
     ) -> None:
         """Run the mandatory second LLM pass on tasks.json.
 
@@ -1441,6 +1450,12 @@ class TasksGenerator:
         the tasks contract needs the LLM to return JSON
         (not markdown), so we drive the coding tool directly with a
         custom prompt and run our own parse / apply path.
+
+        ``session`` is the caller's reusable-session handle: a loop that
+        repeats this pass passes one handle for all of its rounds.
+        ``None`` (the default, and what the single pre-loop pass at the
+        top of ``generate_tasks`` uses) is the fresh-session-per-call
+        behaviour this method has always had.
         """
         # Round-trip JSON so the LLM sees the same canonical shape
         # we plan to write back. ``ensure_ascii=False`` keeps
@@ -1462,7 +1477,12 @@ class TasksGenerator:
         # semantics: any failure here must surface; the generator
         # cannot promote an unaudited draft.
         try:
-            llm_reply = self.coding_tool.query(prompt=prompt)
+            if session is not None:
+                llm_reply = query_in_session(
+                    self.coding_tool, session, prompt=prompt,
+                )
+            else:
+                llm_reply = self.coding_tool.query(prompt=prompt)
         except Exception as exc:  # noqa: BLE001 — mandatory path
             raise RuntimeError(
                 f"tasks second-pass LLM call failed: "
