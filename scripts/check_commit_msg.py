@@ -258,8 +258,8 @@ def find_violations(message: str) -> list[Violation]:
                     Violation(
                         lineno,
                         stripped,
-                        "co-author trailer names an AI system "
-                        f"({redact_span(token)})",
+                        "co-author trailer names an AI system: "
+                        f"{redact_span(token)}",
                     )
                 )
             continue
@@ -271,8 +271,8 @@ def find_violations(message: str) -> list[Violation]:
                     Violation(
                         lineno,
                         stripped,
-                        "'generated with' line names an AI system "
-                        f"({redact_span(token)})",
+                        "'generated with' line names an AI system: "
+                        f"{redact_span(token)}",
                     )
                 )
 
@@ -281,7 +281,7 @@ def find_violations(message: str) -> list[Violation]:
             Violation(
                 lineno,
                 _line_at(message, lineno).strip(),
-                f"commit message carries a plan id ({redact_span(plan_id)})",
+                f"commit message carries a plan id: {redact_span(plan_id)}",
             )
         )
     return found
