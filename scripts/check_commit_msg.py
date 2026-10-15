@@ -203,18 +203,35 @@ _FIX_HINT = (
 )
 
 
+#: The two rules this module enforces, as stable short names. They are
+#: part of :attr:`Violation.rule` rather than something a caller recovers
+#: from :attr:`Violation.reason`, because a caller that buckets findings by
+#: a substring of the human-readable reason is one wording change away from
+#: silently merging two rules into one report. These names are not private:
+#: they are what a consumer prints to say which rule a finding came from.
+RULE_TRAILER = "trailer"
+RULE_PLAN_ID = "plan-id"
+
+
 class Violation:
-    """One offending line, with the reason it was rejected."""
+    """One offending line, with the rule it broke and why.
 
-    __slots__ = ("lineno", "line", "reason")
+    *rule* is one of :data:`RULE_TRAILER` / :data:`RULE_PLAN_ID`. The two
+    are independent: a message can break both, and a caller that needs to
+    report on one of them must be able to tell which findings it is
+    looking at. *reason* is for a human and is not a stable key.
+    """
 
-    def __init__(self, lineno: int, line: str, reason: str) -> None:
+    __slots__ = ("lineno", "line", "reason", "rule")
+
+    def __init__(self, lineno: int, line: str, reason: str, rule: str) -> None:
         self.lineno = lineno
         self.line = line
         self.reason = reason
+        self.rule = rule
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"Violation(lineno={self.lineno}, reason={self.reason!r})"
+        return f"Violation(lineno={self.lineno}, rule={self.rule!r}, reason={self.reason!r})"
 
 
 def _has_ai_token(value: str) -> str | None:
@@ -227,7 +244,15 @@ def _has_ai_token(value: str) -> str | None:
 
 
 def find_violations(message: str) -> list[Violation]:
-    """Return every attribution claim in *message*, in line order.
+    """Return every finding against *message*, in line order.
+
+    This enforces **two** independent rules, and each finding says which
+    one it came from in :attr:`Violation.rule`: :data:`RULE_TRAILER` (a
+    ``Co-Authored-By:`` or "Generated with" line naming an AI system) and
+    :data:`RULE_PLAN_ID` (a date-prefixed plan id anywhere in the message).
+    The two have different remedies and different exemptions, so a caller
+    that reports on them as one thing reports the wrong fix for half of
+    what it found.
 
     Line numbers are 1-based so the failure message can be pasted into an
     editor. Blank lines and comments (``#``) are skipped — git strips them
@@ -250,7 +275,7 @@ def find_violations(message: str) -> list[Violation]:
             token = _has_ai_token(trailer.group("value"))
             if token is not None:
                 found.append(
-                    Violation(lineno, stripped, f"co-author trailer names an AI system ({token!r})")
+                    Violation(lineno, stripped, f"co-author trailer names an AI system ({token!r})", RULE_TRAILER)
                 )
             continue
 
@@ -258,7 +283,7 @@ def find_violations(message: str) -> list[Violation]:
             token = _has_ai_token(line)
             if token is not None:
                 found.append(
-                    Violation(lineno, stripped, f"'generated with' line names an AI system ({token!r})")
+                    Violation(lineno, stripped, f"'generated with' line names an AI system ({token!r})", RULE_TRAILER)
                 )
 
     for _, lineno, plan_id in find_plan_ids_in_metadata(COMMIT_MESSAGE_LABEL, message):
@@ -267,6 +292,7 @@ def find_violations(message: str) -> list[Violation]:
                 lineno,
                 _line_at(message, lineno).strip(),
                 f"commit message carries a plan id ({plan_id!r})",
+                RULE_PLAN_ID,
             )
         )
     return found
@@ -323,8 +349,8 @@ def main(argv: list[str] | None = None) -> int:
     if not violations:
         return 0
 
-    attribution = [v for v in violations if "plan id" not in v.reason]
-    plan_ids = [v for v in violations if "plan id" in v.reason]
+    attribution = [v for v in violations if v.rule == RULE_TRAILER]
+    plan_ids = [v for v in violations if v.rule == RULE_PLAN_ID]
 
     if attribution:
         print("commit message carries an AI attribution trailer:\n", file=sys.stderr)
