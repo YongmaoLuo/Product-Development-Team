@@ -42,14 +42,29 @@ excluded-dir set accidentally swallowed every scanned file, the
 repository was reorganised so the scan root no longer exists)
 silently passes. That is how the original defect shipped — the
 paths were there, the check was not running, and the export passed.
+
+Why this file must not import pytest
+-------------------------------------
+``scripts/scan_commit_range.sh`` runs
+``commit_range_scan.py`` under a **bare** interpreter -- the venv if the
+clone has one, the system ``python3`` if it does not, and a fresh clone
+usually does not. That scanner imports :func:`find_home_paths` from
+*this* module for the rule, so anything this module imports at module
+scope becomes a startup dependency of a pre-push hook. ``pytest`` is
+installed in neither place on a GitHub runner, and a scanner that dies
+on ``ModuleNotFoundError`` reports a crash where the reader expects a
+verdict -- which is how a broken gate gets read as a clean one.
+
+The same rule is stated in ``test_no_operator_attribution_in_source.py``
+and ``test_no_plan_ids_in_non_test_source.py``, which both dropped their
+``import pytest`` for it. ``test_commit_range_scan.py::test_the_scanners_
+start_without_pytest`` is what keeps the three of them honest.
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
-
-import pytest
 
 # Locate the static_gates module shared with sibling gates; the
 # first-party source scan it exposes is what the test uses to build

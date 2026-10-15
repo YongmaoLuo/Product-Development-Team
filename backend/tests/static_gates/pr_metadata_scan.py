@@ -34,14 +34,21 @@ private project name into this repository in order to blacklist it
 publishes that name inside the blacklist, which is the exact shape the
 rule exists to prevent.
 
-That objection was correct and it has been answered rather than argued
-away. ``test_no_private_names_in_source`` now carries the names, and the
-one already published in this very file -- written here as the worked
-example of the mistake -- is why ``origin/main`` is scanned by the same
-rule as any other ref. The residual gap is unchanged: a branch named
-after an unrelated project is caught by a human reading the pull
-request, which is why that check belongs **before** the merge rather
-than after it, where it is no longer actionable at any price.
+That objection was correct, and it was answered once by committing the
+names -- which is a contradiction, not a refutation, and it was withdrawn
+on 2026-10-14. ``test_no_private_names_in_source`` carried the names for
+nine days and was itself a pytest gate, so the names sat in every fetch of
+this repository while the check ran only where a leak could no longer be
+stopped. The names now live in an untracked, operator-owned
+``.config/forbidden-names`` and the check runs in the pre-commit and
+pre-push hooks.
+
+So the residual gap here is the original one, and it is now permanent for
+this surface: a pull request whose branch is named after an unrelated
+private project is caught by a human reading it, before the merge, which
+is the only point at which that reading is still actionable. A check that
+could decide it automatically would have to publish the thing it decides
+on.
 
 Failure is loud
 ---------------
@@ -69,6 +76,9 @@ from test_no_local_home_path_in_first_party import (  # noqa: E402
 from test_no_operator_attribution_in_source import (  # noqa: E402
     find_attribution,
 )
+from test_no_plan_ids_in_metadata import (  # noqa: E402
+    find_plan_ids_in_metadata,
+)
 from test_source_comments_carry_no_local_measurements import (  # noqa: E402
     find_local_measurements,
 )
@@ -84,10 +94,22 @@ PR_FIELDS: tuple[tuple[str, str, bool], ...] = (
 
 #: ``(label, pure_rule)`` pairs -- the same table shape and the same rules
 #: :mod:`commit_range_scan` uses, so the two scans cannot drift apart.
+#:
+#: The private-name rule was the fourth entry until 2026-10-14. It cannot
+#: come back here: its needles are literals, and a tracked literal is a
+#: published name. They now live in the operator's untracked
+#: ``.config/forbidden-names`` and are read by
+#: ``scripts/scanners/scan_forbidden_names.py``, which runs in the two local
+#: hooks. It runs in *neither* CI nor the pre-push hook's CI mode -- a
+#: runner has no local list, so invoking it here could only ever exit 2.
+#: The residual gap is therefore back to where the paragraph below says it
+#: is: a branch named after an unrelated private project is caught by a
+#: human reading the pull request.
 METADATA_RULES: tuple[tuple[str, object], ...] = (
     ("home path", find_home_paths),
     ("operator attribution", find_attribution),
     ("local measurement", find_local_measurements),
+    ("plan id in metadata", find_plan_ids_in_metadata),
 )
 
 

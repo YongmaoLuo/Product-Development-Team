@@ -84,7 +84,38 @@ repos:
         entry: bash scripts/grep_guard.sh
 
       # ---------------------------------------------------------------
-      # Commit-message hygiene — no AI attribution trailer.
+      # Staged-content privacy gate — the pre-commit stage's blocker.
+      #
+      # Added 2026-10-14 after the 2026-09-29 publication. Every other
+      # privacy surface in this repository runs *after* the text is in a
+      # commit: the range scan sees committed trees, the tree gates see
+      # the working tree, and the PR-metadata scan sees a pull request.
+      # This one sees the index, so a refusal happens while the offending
+      # text is still just a file that can be edited.
+      #
+      # It is declared as its own hook id rather than folded into
+      # ``grep-guard`` above so that pre-commit reports which of the two
+      # gates failed. ``scripts/pre_commit_gate.sh`` runs both for the
+      # native git hook (a git hook is a single executable); the framework
+      # has no such limit, so it keeps one id per gate. Both point at the
+      # same wrappers — no rule is reimplemented in either path.
+      #
+      # ``pass_filenames: false`` for the same reason as grep-guard: the
+      # scanner reads the index itself rather than trusting a filename list,
+      # because the index and the working tree differ exactly when it
+      # matters — a file edited back to clean after staging is still
+      # committed as it was staged.
+      # ---------------------------------------------------------------
+      - id: staged-privacy
+        name: staged content (private names, plan ids)
+        language: system
+        stages: [pre-commit]
+        pass_filenames: false
+        always_run: true
+        entry: bash scripts/scan_staged_privacy.sh
+
+      # ---------------------------------------------------------------
+      # Commit-message hygiene — no AI attribution trailer, no plan id.
       #
       # ``stages: [commit-msg]`` is a different stage from the hook
       # above: it runs *after* git has assembled the message, and
@@ -97,13 +128,16 @@ repos:
       # script is a stdlib-only Python file run with the interpreter on
       # PATH, so a managed venv would be pure overhead.
       #
-      # Rationale and the exact rule live in ``scripts/check_commit_msg.py``.
-      # It is intentionally narrow: it checks the attribution *trailer*,
-      # not the prose, so a message may still discuss Claude Code,
-      # providers, or models.
+      # Rationale and the exact rules live in
+      # ``scripts/check_commit_msg.py``. The attribution rule is
+      # intentionally narrow: it checks the *trailer*, not the prose, so a
+      # message may still discuss Claude Code, providers, or models. The
+      # plan-id rule is the opposite and is deliberately zero-exemption —
+      # nothing under ``tests/`` is reachable from a message, so there is
+      # no fixture-shaped date-prefixed id to excuse there.
       # ---------------------------------------------------------------
       - id: commit-msg-no-ai-attribution
-        name: commit-msg (no AI attribution trailer)
+        name: commit-msg (no AI attribution trailer, no plan id)
         language: system
         stages: [commit-msg]
         entry: python3 scripts/check_commit_msg.py

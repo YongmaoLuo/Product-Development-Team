@@ -192,11 +192,38 @@ class TestTheRulesAreTheOnesTheOtherGatesUse:
                 f"that will drift from the first"
             )
 
-    def test_the_rule_set_is_exactly_the_three_existing_ones(self) -> None:
+    def test_the_rule_set_is_exactly_the_four_existing_ones(self) -> None:
         labels = [label for label, _ in pr_metadata_scan.METADATA_RULES]
-        assert labels == ["home path", "operator attribution", "local measurement"], (
+        assert labels == [
+            "home path",
+            "operator attribution",
+            "local measurement",
+            "plan id in metadata",
+        ], (
             f"the metadata rules changed to {labels}; commit_range_scan "
             f"deliberately mirrors this list, so a change belongs in both"
+        )
+
+    def test_the_private_name_rule_is_not_here(self) -> None:
+        """It cannot be: a needle that lives in a tracked file is a leak.
+
+        Until 2026-10-14 this was the fourth entry, calling
+        ``find_private_names``. That module held the names as literals, so
+        "enforcing the rule here" meant committing the names -- and this
+        scan runs in CI, where the names would have been read out of the
+        repository on every pull request.
+
+        The names now live in an untracked ``.config/forbidden-names`` and
+        the check runs in the two local hooks. It therefore cannot run on
+        this surface, and the residual gap is a human reading the pull
+        request -- see the module docstring.
+        """
+        labels = [label for label, _ in pr_metadata_scan.METADATA_RULES]
+        assert "private name" not in labels, (
+            "the private-name rule is back in the PR-metadata scan. Its "
+            "needles are literals in a tracked module, so this is a "
+            "published blacklist. Use "
+            "scripts/scanners/scan_forbidden_names.py in the hooks instead."
         )
 
 
