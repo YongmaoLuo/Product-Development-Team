@@ -2,7 +2,7 @@
 
 What this pins
 --------------
-Four call sites used to pay for a fresh session on every turn, each of
+Seven call sites used to pay for a fresh session on every turn, each of
 them a *loop* -- the same subject asked again, with only the delta
 changed:
 
@@ -17,6 +17,10 @@ changed:
 4. ``PRDGenerator.generate`` emitted the PRD, then had the self-review
    re-establish the whole conversation to audit what it had just
    written.
+5. ``ArchGenerator.generate`` did the same, on the plain-text path.
+6. ``TestDesignGenerator.generate`` did the same again.
+7. ``TasksGenerator.generate`` ran its synthesis, its first self-review
+   and its falsifiability rounds in three unrelated conversations.
 
 The contract
 ------------
@@ -41,8 +45,11 @@ Per point:
   instance, a loop) is pinned separately so neither shape is left
   unchecked.
 * **Point 3** -- ``_iterate_on_falsifiability`` over two or more rounds.
-* **Point 4** -- ``PRDGenerator.generate()`` end to end, generation and
+* **Points 4-6** -- ``PRDGenerator`` / ``ArchGenerator`` /
+  ``TestDesignGenerator.generate()`` end to end, generation and
   self-review, through the real ``run_doc_self_review``.
+* **Point 7** -- ``TasksGenerator.generate()`` end to end: the synthesis,
+  the first self-review and both falsifiability rounds on one id.
 
 The re-ask must carry the new ask
 ---------------------------------
@@ -581,4 +588,240 @@ def test_a_prd_generation_that_is_not_self_reviewed_still_answers(
 
     assert rec.where(with_system=False) == [], (
         "no self-review was requested, so none should have dispatched"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Point 5 -- the arch's self-review audits in the generation's session
+# ---------------------------------------------------------------------------
+
+
+_ARCH_MD = """# 架构设计
+
+### 决策点 1: 模块划分
+
+**[C] 背景：** 需要拆分模块。
+**[P] 问题：** 单文件过重。
+**[E] 评估：** 单一职责更清晰。
+**[A] 行动：** 每个模块一个 reason to change。
+
+## Design Principles
+
+- **single responsibility (SOLID)**: 每个模块只有一个变更理由。
+- **twelve-factor config**: 配置来自 env var。
+- **layered architecture**: layer 之间单向依赖。
+- **stateless services**: 服务不持有可变状态。
+- **explicit error boundaries**: 跨层返回 typed error / Result。
+"""
+
+
+def _install_doc_phase(recorder, doc_md):
+    """Answer a doc phase's two calls: generation (system) then review (none).
+
+    Same shape as :func:`_install_prd` -- the generation passes the
+    phase's system instruction and the self-review passes none, which is
+    what tells the two apart at the argv.
+    """
+    def _reply(call):
+        if call["system"] is None:
+            return json.dumps(
+                {"findings": [], "fixed_content": doc_md},
+                ensure_ascii=False,
+            )
+        return doc_md
+
+    return recorder(_reply)
+
+
+def test_the_arch_self_review_reuses_the_generation_session(
+    tmp_path, recorder, monkeypatch
+):
+    """The audit of the arch design re-opens the conversation that wrote it.
+
+    Driven through the production entry point (``ArchGenerator.generate``)
+    and the real ``run_doc_self_review``, because wiring the handle into
+    one of them without the other is exactly the failure this catches.
+    """
+    import arch_generator
+    import self_review
+    from arch_generator import ArchGenerator, ARCH_SYSTEM_PROMPT
+
+    # ``tests/unit/test_arch_generator_hard_gate.py`` rebinds
+    # ``arch_generator.run_doc_self_review`` to a no-op stub at *import*
+    # time and never restores it, so any later test in the same process
+    # that drives the real self-review silently gets the stub instead.
+    # Rebind the real one here rather than depend on collection order.
+    monkeypatch.setattr(
+        arch_generator, "run_doc_self_review", self_review.run_doc_self_review,
+    )
+
+    rec = _install_doc_phase(recorder, _ARCH_MD)
+    tool = _tool()
+    plan_dir = tmp_path / "plans" / "P-1"
+    plan_dir.mkdir(parents=True)
+    (plan_dir / "prd.md").write_text("# PRD\n测试 PRD", encoding="utf-8")
+
+    ArchGenerator(tool, plan_dir, self_review_enabled=True).generate()
+
+    generation = rec.where(system_contains=ARCH_SYSTEM_PROMPT[:40])
+    review = rec.where(with_system=False)
+    assert len(generation) == 1, (
+        f"expected one arch render dispatch, got {len(generation)}"
+    )
+    assert len(review) == 1, (
+        f"expected one arch self-review dispatch, got {len(review)}"
+    )
+
+    assert generation[0]["session_flag"] == "--session-id"
+    assert review[0]["session_flag"] == "--resume", (
+        "the self-review audits the arch design the render just wrote; "
+        "re-establishing that whole conversation is the cost this avoids"
+    )
+    assert review[0]["session_id"] == generation[0]["session_id"]
+
+
+# ---------------------------------------------------------------------------
+# Point 6 -- the test design's self-review audits in the generation's session
+# ---------------------------------------------------------------------------
+
+
+_TEST_DESIGN_MD = """# 测试设计
+
+### 决策点 1: 单元测试策略
+
+**[C] 背景：** 需要覆盖核心逻辑。
+**[P] 问题：** 无自动化回归。
+**[E] 评估：** 单元测试先行。
+**[A] 行动：** 每个决策点配一个 pytest 用例。
+"""
+
+
+def test_the_test_design_self_review_reuses_the_generation_session(
+    tmp_path, recorder
+):
+    """Same contract as the arch phase, on the plain-text path."""
+    from test_design_generator import (
+        TestDesignGenerator, TEST_DESIGN_SYSTEM_PROMPT,
+    )
+
+    rec = _install_doc_phase(recorder, _TEST_DESIGN_MD)
+    tool = _tool()
+    plan_dir = tmp_path / "plans" / "P-1"
+    plan_dir.mkdir(parents=True)
+    (plan_dir / "arch-design.md").write_text(_ARCH_MD, encoding="utf-8")
+    (plan_dir / "interview.json").write_text(
+        json.dumps({"dimensions": {"background": "背景", "goals": "目标"}},
+                   ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    TestDesignGenerator(tool, plan_dir, self_review_enabled=True).generate()
+
+    generation = rec.where(system_contains=TEST_DESIGN_SYSTEM_PROMPT[:40])
+    review = rec.where(with_system=False)
+    assert len(generation) == 1, (
+        f"expected one test-design render dispatch, got {len(generation)}"
+    )
+    assert len(review) == 1, (
+        f"expected one test-design self-review dispatch, got {len(review)}"
+    )
+
+    assert generation[0]["session_flag"] == "--session-id"
+    assert review[0]["session_flag"] == "--resume"
+    assert review[0]["session_id"] == generation[0]["session_id"]
+
+
+# ---------------------------------------------------------------------------
+# Point 7 -- one generate() for tasks: synthesis, review, repair rounds
+# ---------------------------------------------------------------------------
+
+
+def _tasks_payload():
+    return {"tasks": [
+        {
+            "id": "1", "title": "写记账接口",
+            "description": "支持新增与查询", "files_to_modify": ["app.py"],
+            "test_command": "pytest -q tests/test_api.py",
+        },
+        {
+            "id": "2", "title": "端到端验收",
+            "description": "模拟用户输入并断言页面",
+            "files_to_modify": ["app.py", "tests/test_e2e.py"],
+            "test_command": "pytest -q tests/test_e2e.py",
+        },
+    ]}
+
+
+def test_the_whole_tasks_generate_shares_one_session(tmp_path, recorder,
+                                                    monkeypatch):
+    """Synthesis, first review and every repair round are one conversation.
+
+    Driven through the production entry point (``TasksGenerator.generate``)
+    so the three steps cannot drift apart again: the synthesis is a
+    ``query_json`` carrying the tasks system instruction, and both the
+    first review and the falsifiability rounds are plain ``query`` calls
+    that carry none.
+    """
+    from tasks_generator import TasksGenerator
+
+    payload = _tasks_payload()
+
+    def _reply(call):
+        if call["system"] is not None:
+            return json.dumps(payload, ensure_ascii=False)
+        # Same ids, same count, no changes -- the idempotent rewrite, so
+        # the self-review pass does not have to invent a correction to
+        # be applicable.
+        return json.dumps({"tasks": payload["tasks"], "findings": []},
+                          ensure_ascii=False)
+
+    rec = recorder(_reply)
+    tool = _tool()
+    plan_dir = tmp_path / "plans" / "P-1"
+    plan_dir.mkdir(parents=True)
+    (plan_dir / "prd.md").write_text("# PRD", encoding="utf-8")
+    (plan_dir / "arch-design.md").write_text(_ARCH_MD, encoding="utf-8")
+
+    gen = TasksGenerator(tool, plan_dir, self_review_enabled=True)
+
+    # Everything below shells out or reads the plan's own upstream docs;
+    # none of it is the session path under test.
+    monkeypatch.setattr(gen, "_run_preflight_gate", lambda: None)
+    monkeypatch.setattr(gen, "_enforce_e2e_task_gate", lambda data: None)
+    monkeypatch.setattr(gen, "_load_tasks_upstream_block", lambda: "")
+    monkeypatch.setattr(gen, "_compute_decision_coverage_findings",
+                        lambda data: [])
+
+    # First probe (before the first review) reports two unusable
+    # commands; each repair round then removes one, so the loop keeps
+    # going for its full ``FALSIFIABILITY_MAX_ROUNDS - 1`` == 2 rounds.
+    counts = iter([2, 1, 0])
+    monkeypatch.setattr(
+        gen, "probe_falsifiability",
+        lambda t, **k: {"skipped": False,
+                        "vacuous": [{"command": "exit 1"}] * next(counts),
+                        "unreachable": []},
+    )
+
+    gen.generate()
+
+    synthesis = [c for c in rec.calls if c["system"] is not None]
+    plain = rec.where(with_system=False)
+    assert len(synthesis) == 1, (
+        f"expected one tasks synthesis dispatch, got {len(synthesis)}"
+    )
+    assert len(plain) == 3, (
+        "expected the first self-review plus two falsifiability rounds, "
+        f"got {len(plain)}"
+    )
+
+    assert synthesis[0]["session_flag"] == "--session-id", (
+        "the synthesis opens the session"
+    )
+    assert all(c["session_flag"] == "--resume" for c in plain), (
+        "the review and both repair rounds re-open it rather than each "
+        "re-reading the upstream architecture and test design by path"
+    )
+    assert len({c["session_id"] for c in rec.calls}) == 1, (
+        "one session for the whole generate(), not one per step"
     )
