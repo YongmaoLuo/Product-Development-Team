@@ -191,6 +191,12 @@ class TestSubagentSettingsPropagatesAnthropicEnv(unittest.TestCase):
         # PDT_SUBAGENT_*: must be present (regression check)
         self.assertIn("PDT_SUBAGENT_UUID", env_block)
         self.assertIn("PDT_SUBAGENT_LOG_FILE", env_block)
+        # Sub-agent auto-compact window: must ride in the --settings payload so it
+        # can beat the machine's own ~/.claude/settings.json, which is folded into
+        # process.env earlier (userSettings precedes flagSettings).
+        self.assertEqual(
+            "384000", env_block.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+        )
         # The crucial regression assertion: when env[] has ANTHROPIC_*
         # (set by the registry loop), they MUST be in the settings file.
         # We simulate that by re-running with env pre-populated.
