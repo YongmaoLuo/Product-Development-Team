@@ -515,11 +515,16 @@ jobs:
   # ---------------------------------------------------------------------------
   # Commit-message hygiene
   # ---------------------------------------------------------------------------
-  # Rejects the two shapes that make an authorship claim about an AI system:
-  # a ``Co-Authored-By:`` trailer naming one, or a "Generated with <tool>"
-  # line. The rule and its rationale live in scripts/check_commit_msg.py —
-  # this job exists so that ``git commit --no-verify``, or a clone with no
-  # hooks installed, still cannot land such a trailer on main.
+  # Rejects three shapes, enforced as two independent rules. The attribution
+  # rule covers the two shapes that make a claim about *who wrote this*: a
+  # ``Co-Authored-By:`` trailer naming an AI system, and a "Generated with
+  # <tool>" line naming one. The plan-id rule covers the third shape on its
+  # own: a date-prefixed plan id anywhere in the message, which this job also
+  # refuses. The two rules are reported separately and are not exempt from
+  # each other — the rules and their rationale live in
+  # scripts/check_commit_msg.py. This job exists so that ``git commit
+  # --no-verify``, or a clone with no hooks installed, still cannot land any
+  # of the three on main.
   #
   # No venv and no dependency install: the checker is stdlib-only, so the
   # job costs a deep checkout and a few milliseconds.
