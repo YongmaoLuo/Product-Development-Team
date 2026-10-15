@@ -405,3 +405,89 @@ def test_delta_prompt_teaches_the_current_method_vocabulary() -> None:
             f"{method!r} missing from the delta prompt"
         )
     assert "verification_phase" in DELTA_SYSTEM_PROMPT
+
+
+def test_added_api_test_keeps_the_fields_that_make_it_runnable() -> None:
+    """新增的 api_test VP 必须**原样**落进计划，否则整条路是堵死的。
+
+    2026-10-14（本 plan 的 VP-009 退休）：``apply_delta`` 的 add 分支按一份
+    写死白名单建 VP，``request`` / ``assertions`` / ``target_url`` /
+    ``timeout_seconds`` / ``execution_group`` 从不被读取 —— 于是 delta 明明
+    写了，落地却消失。新 VP 因缺 ``request`` 被
+    ``verification_api_runner.validate_vp`` 在 schema 阶段判为不可运行，
+    又被 ``verification_agent._maybe_evaluate_plan_delta`` 的护栏**整条丢弃**。
+
+    后果不是「少一条 VP」，而是「作废旧 VP + 新增一条表达正确的」这条路在框架层
+    根本不存在 —— 只能看着旧判据继续失败。所以这里钉的是**透传**：计划里
+    落地的那条 VP，经 ``validate_vp`` 检查必须零 issue。
+    """
+    from verification_api_runner import validate_vp
+    from verification_plan_delta import apply_delta, parse_delta_payload
+
+    plan = _plan(_vp("VP-009"))
+    item = {
+        "title": "空窗与数据源故障可区分",
+        "reason": "接替已作废的 VP-009",
+        "related_prd_criteria": "PRD 验收 1 / 测试设计决策点 9",
+        "verification_method": "api_test",
+        "expected_result": "200 + 空数组；同形状注入故障时是 5xx",
+        "request": {
+            "method": "GET",
+            "url": "http://127.0.0.1:1/never-reached",
+            "headers": {"Accept": "application/json"},
+            "body": None,
+            "timeout_seconds": 240,
+        },
+        "assertions": [{"name": "状态码 200（不是 5xx）", "status": 200}],
+        "target_url": "http://127.0.0.1:1/never-reached",
+        "timeout_seconds": 3600,
+        "execution_group": 0,
+    }
+
+    apply_delta(plan, parse_delta_payload({"add": [item], "obsolete": []}, plan), 4)
+
+    added = plan["verification_points"][-1]
+    assert added["id"] == "VP-010"
+    for key in ("request", "assertions", "target_url",
+                "timeout_seconds", "execution_group"):
+        assert key in added, (
+            f"apply_delta dropped {key!r}: it builds the new VP from a fixed "
+            f"whitelist, so the delta's {key!r} lands nowhere and the VP "
+            f"comes out unrunnable. 落地键: {sorted(added)}"
+        )
+        assert added[key] == item[key], (
+            f"{key!r} was carried but rewritten: {added[key]!r} != {item[key]!r}"
+        )
+
+    issues = validate_vp(added)
+    assert issues == [], (
+        "an api_test VP added through the delta must survive schema "
+        "validation, otherwise _maybe_evaluate_plan_delta's guardrail drops "
+        f"the whole VP and 'obsolete + add' is a dead end: "
+        f"{[i.detail for i in issues]}"
+    )
+
+
+def test_added_vp_without_the_optional_execution_fields_stays_clean() -> None:
+    """透传是**有条件**的：delta 没写的键不能凭空长出来。
+
+    白名单扩了不等于要给每条新增 VP 塞五个键 —— 一条没有 ``request`` 的
+    ``code_review`` VP 不应该因为框架改了就被塞进 ``timeout_seconds: None``。
+    """
+    from verification_plan_delta import apply_delta, parse_delta_payload
+
+    plan = _plan(_vp("VP-001"))
+    apply_delta(plan, parse_delta_payload({
+        "add": [{
+            "title": "代码审查",
+            "reason": "本轮新增了批处理路径",
+            "verification_method": "code_review",
+        }],
+        "obsolete": [],
+    }, plan), 5)
+
+    added = plan["verification_points"][-1]
+    for key in ("request", "assertions", "target_url", "execution_group"):
+        assert key not in added, (
+            f"{key!r} appeared on a VP whose delta never mentioned it"
+        )

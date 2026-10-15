@@ -708,7 +708,11 @@ def _load_vp_from_plan(plan_dir: Path, vp_id: str) -> Optional[Dict[str, Any]]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """Replay one ``api_test`` VP. Exit 0 iff every assertion holds.
+    """Replay one ``api_test`` VP.
+
+    Exit 0 when every assertion holds — **or** when the plan itself marked
+    this VP ``obsolete`` / ``superseded_by`` (nothing ran, nothing failed);
+    exit 1 on a failed assertion; exit 2 only when no such id exists.
 
     This is what a repair task gets as its ``test_command`` (2026-09-18):
     the acceptance criterion the repair must satisfy, executed by the
@@ -748,6 +752,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    # 2026-10-14（VP-009 退休）：计划自己已经作废的验证点**不适用**，不是
+    # 失败。``verification_executor._build_items_from_plan`` 早就过滤掉带
+    # ``obsolete`` / ``superseded_by`` 的 VP —— 理由写在它的 2026-09-16 注释
+    # 里：「跑它们等于为一个计划已经不再要求的东西制造失败」。重放 CLI 是同
+    # 一份契约的另一半，当初却只按 id 查、把作废标记当没看见，于是这条判据
+    # 在 round 里不跑、在重放里一直红 —— 一条已被计划废弃的判据继续生产失败。
+    # ``exit 2`` 留给「id 根本不存在」：那种失败操作者必须看见。
+    if vp.get("obsolete") or vp.get("superseded_by"):
+        markers = [m for m in ("obsolete", "superseded_by") if vp.get(m)]
+        detail = str(vp.get("obsolete_reason") or vp.get("superseded_by") or "")
+        print(
+            f"VP {args.vp}: not applicable — the plan marked it "
+            f"{'/'.join(markers)}; nothing was executed."
+        )
+        if detail:
+            print(f"  reason: {detail}")
+        return 0
 
     artifact_dir = Path(args.artifact_dir) if args.artifact_dir else (
         plan_dir / "vp_artifacts"

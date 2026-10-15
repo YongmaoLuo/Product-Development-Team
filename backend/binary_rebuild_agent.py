@@ -25,7 +25,7 @@ the rebuild to a **tool-restricted LLM sub-agent** that *reads* the project
 (build manifest, venv layout, available toolchains) and picks the right
 command. That is what makes the mechanism generic across projects.
 
-Safety model (A + C, user-approved):
+Safety model (A + C, agreed before this module shipped):
   * **A — hard tool restriction.** The spawned ``claude`` CLI is invoked with
     ``--allowedTools Bash,Read,Grep,Glob`` so the agent *cannot* Edit/Write.
   * **C — prompt restriction + audit.** The system prompt explicitly forbids
@@ -34,10 +34,13 @@ Safety model (A + C, user-approved):
 
 Trust model: the agent's self-report is **never** trusted. After the agent
 returns, :func:`attempt_intelligent_rebuild` independently re-runs
-``check_binary_freshness`` and only that mtime comparison decides success.
-If the agent claims success but the artefact is still stale, the result is
+``check_binary_freshness``, and that mtime comparison is a **necessary**
+condition for ``success`` — never the only voice. ``success`` is reported
+only when the agent said so *and* the independent re-check agreed; if the
+agent claims success but the artefact is still stale, the result is
 forced to ``success=False`` and the diagnostics are annotated with
-``AGENT SELF-REPORT MISMATCH``.
+``AGENT SELF-REPORT MISMATCH``. (This is deliberately more conservative
+than ``service_restart_agent``, which adjudicates on the post-check alone.)
 """
 from __future__ import annotations
 
@@ -55,6 +58,29 @@ from binary_freshness import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+#: What ``commands_run`` carries when the agent was dispatched but its
+#: final report never came back (it raised).
+#:
+#: The commands are **not** recoverable at that point and this module does
+#: not invent them: the only trace is the ``[CLAUDE STREAM] tool_use``
+#: lines ``coding_tool`` writes to the main log while it drains the CLI's
+#: stdout, and that stream is consumed and discarded inside
+#: ``ClaudeCodingTool._run_claude_interactive``. ``_last_output_line`` on
+#: the tool is not a substitute either — it holds one truncated line, and
+#: the orchestrator hands every sub-agent the **same** coding-tool
+#: instance, so nothing on it can be attributed to this call.
+#:
+#: An empty list is not an acceptable answer: it reads to every consumer
+#: as "the agent ran no commands", which is the exact opposite of what
+#: happened (2026-10-14: the agent ran maturin, produced a fresh dylib,
+#: and its report died in the provider layer). This one entry says "not
+#: known" instead of "nothing ran", and is greppable by name.
+AGENT_REPORT_UNAVAILABLE_COMMANDS = (
+    "<unknown: the rebuild agent's final report was never obtained, so the "
+    "commands it ran cannot be recovered — see diagnostics>"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -243,10 +269,23 @@ class BinaryRebuildAgent:
     # ------------------------------------------------------------------
 
     def run(self, project_dir: Path, freshness: FreshnessReport) -> RebuildResult:
-        """Spawn the agent once. Never raises; failure → success=False."""
+        """Spawn the agent once. Never raises; failure → success=False.
+
+        "Never raises" does not mean "never ran": the ``except`` arm
+        distinguishes a failure to *dispatch* the agent from a failure to
+        *collect* its answer, because only one of them means no commands
+        were run. See :meth:`_dispatch_failure`.
+        """
         start = time.monotonic()
         settings_path: Optional[str] = None
         handle = None
+        #: Flipped the instant the prompt leaves this module. Everything
+        #: above it is local bookkeeping (temp settings file, watchdog
+        #: registration); everything from it on is a call the provider
+        #: layer owns, and it can fail for reasons that say nothing about
+        #: whether the agent ever ran. The two cases want different
+        #: wording — see the ``except`` arm.
+        dispatched = False
 
         # Lazy imports so this module stays importable without pulling the
         # heavier sub-agent modules (and so tests can patch freely).
@@ -291,6 +330,7 @@ class BinaryRebuildAgent:
                         "(continuing without watchdog): %s", exc,
                     )
 
+            dispatched = True
             raw = self.coding_tool.query_json(
                 self.build_user_prompt(project_dir, freshness),
                 system_instruction=self.build_system_prompt(),
@@ -300,12 +340,7 @@ class BinaryRebuildAgent:
             result = self._parse_agent_output(raw, start)
             return result
         except Exception as exc:
-            return RebuildResult(
-                success=False,
-                diagnostics=f"agent invocation failed: {type(exc).__name__}: {exc}",
-                duration_seconds=time.monotonic() - start,
-                agent_used=True,
-            )
+            return self._dispatch_failure(exc, dispatched, start)
         finally:
             if SettingsJsonBuilder is not None and settings_path:
                 try:
@@ -319,6 +354,67 @@ class BinaryRebuildAgent:
                     self.registry.unregister(self.plan_id, handle)
                 except Exception:
                     pass
+
+    # ------------------------------------------------------------------
+    # Dispatch failures
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _dispatch_failure(
+        exc: BaseException, dispatched: bool, start: float,
+    ) -> RebuildResult:
+        """Turn an exception out of :meth:`run` into an honest result.
+
+        The old wording — ``"agent invocation failed: ..."`` — collapsed
+        two different stories into one sentence, and both of them lie to
+        whoever reads ``binary_rebuild_attempted``:
+
+        * **never dispatched** (``dispatched=False``): something local
+          failed before the prompt left — the temp settings file, the
+          watchdog registration. Nothing ran, and ``commands_run=[]`` is
+          the true answer.
+        * **dispatched, answer lost** (``dispatched=True``): the prompt
+          reached the coding tool and the failure came back from the
+          provider layer. 2026-10-14: the agent ran maturin, produced a
+          fresh ``lib*.dylib`` and self-verified ``FRESH``, then
+          could not get a provider for one more turn and raised
+          ``SceneProviderUnavailable`` 40 minutes later. Recording that
+          as "invocation failed" told the operator the agent had never
+          been sent, and the empty ``commands_run`` that came with it
+          travelled on into the repair agent's evidence pack as "it ran
+          nothing".
+
+        ``success`` stays ``False`` on both paths. The independent
+        post-check in :func:`attempt_intelligent_rebuild` still runs and
+        still populates ``post_check_passed``; the two are reconciled by
+        the conjunction at the end of that function, which is a
+        deliberate design choice and not touched here. What changes is
+        that the record no longer *asserts* something false about work
+        that demonstrably happened.
+        """
+        detail = f"{type(exc).__name__}: {exc}"
+        if dispatched:
+            diagnostics = (
+                f"rebuild agent was dispatched but its report never came "
+                f"back ({detail}). The agent may have run commands and may "
+                f"have produced a usable artefact — commands_run is "
+                f"therefore unknown, not empty; post_check_passed is the "
+                f"only trustworthy signal here."
+            )
+            commands: List[str] = [AGENT_REPORT_UNAVAILABLE_COMMANDS]
+        else:
+            diagnostics = (
+                f"rebuild agent was never dispatched ({detail}); no "
+                f"commands were run."
+            )
+            commands = []
+        return RebuildResult(
+            success=False,
+            commands_run=commands,
+            diagnostics=diagnostics,
+            duration_seconds=time.monotonic() - start,
+            agent_used=dispatched,
+        )
 
     # ------------------------------------------------------------------
     # Output parsing
@@ -391,7 +487,10 @@ def attempt_intelligent_rebuild(
          (cheap, no LLM). If it succeeds, return immediately.
       2. **Slow path** — spawn :class:`BinaryRebuildAgent`.
       3. **Independent verification** — re-run ``check_binary_freshness``.
-         Only this decides ``success``; the agent's self-report is advisory.
+         This is a **necessary** condition for ``success``: the agent's
+         self-report alone is never enough, and the post-check alone is
+         never enough either. The conjunction at the end of this function
+         is deliberate and stricter than ``service_restart_agent``'s.
     """
     project_dir = Path(project_dir)
 

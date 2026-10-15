@@ -1,7 +1,7 @@
 """2026-09-14: verification resume must not bleed the previous
 cycle's repair_tasks into the new round's card.
 
-User report: the plan's card showed round-4 repair tasks from a
+Reported: the plan's card showed round-4 repair tasks from a
 PREVIOUS execution cycle on the CURRENT round-1 verification card.
 
 Root cause chain:

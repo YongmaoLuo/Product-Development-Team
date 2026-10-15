@@ -52,7 +52,7 @@ class TestFormatDocReference(unittest.TestCase):
             "PRD 文档", Path("/tmp/prd.json")
         )
         self.assertIn("/tmp/prd.json", ref)
-        # The user explicitly wants the LLM to Read one DP at a time
+        # The LLM is to Read one DP at a time
         # so the LLM never has to load the full doc into its context.
         self.assertIn("Read", ref)
         self.assertIn("一次", ref)

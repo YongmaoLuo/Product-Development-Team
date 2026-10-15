@@ -4,7 +4,7 @@ Contract (2026-09-13 provider-routing feature):
 
   * ``AutonomousAgent.plan()`` queries the LLM with ``scene="planning"``.
   * ``TaskRefiner.refine()`` queries with ``scene="refiner"`` — the
-    user-pinned "post-failure replanning uses the strong tier" rule.
+    pinned "post-failure replanning uses the strong tier" rule.
   * ``AutonomousAgent._audit_task_second_pass`` queries with
     ``scene="audit_second_pass"`` (replacing the old dead
     ``model_type="haiku"`` hint).

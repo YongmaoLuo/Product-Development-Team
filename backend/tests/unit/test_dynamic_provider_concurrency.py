@@ -18,7 +18,7 @@ capacity, or ``None`` if the chain is exhausted.
 
 Rounding rule
 -------------
-The user's spec pins "四舍五入" (round-half-up). ``int(math.floor(x +
+The spec pins "四舍五入" (round-half-up). ``int(math.floor(x +
 0.5))`` is the canonical implementation: 0.5 → 1, 1.5 → 2, 2.5 → 3.
 Python's built-in :func:`round` uses banker's rounding (half-to-even)
 and produces 2 for 2.5 — wrong for this spec.

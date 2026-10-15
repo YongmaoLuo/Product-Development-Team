@@ -1,8 +1,7 @@
 """Regression tests: the notifier must never push a contentless card.
 
-User report (2026-09-13): "它新推了一张卡片, 在展示执行状态, 但是那张卡片
-里面除了状态什么都没有。" — a freshly pushed card whose entire body was a
-single "📍 当前状态" line plus an empty "🔍 verification 状态" header.
+Reported 2026-09-13: a freshly pushed card whose entire body was
+a single "📍 当前状态" line plus an empty "🔍 verification 状态" header.
 
 That happens when a plan id exists in the routing store but has no
 execution content at all: ``tasks.total == 0``, verification still at its

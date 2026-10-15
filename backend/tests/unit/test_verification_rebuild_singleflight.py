@@ -2,18 +2,32 @@
 
 Background
 ----------
-A verification round can dispatch N VPs that all judge the *same* native
-library stale; each starts its own ``BinaryRebuildAgent`` against the same
-``target/debug``, every agent reports ``"Blocking waiting for file lock on
-artifact directory"``, a few VPs eventually get the rebuilt binary, and the
-rest never emit a single event — until the watchdog hits
-``VERIFICATION_HARD_STALE_SECONDS`` and CASes the round to failed.
+2026-10-14, CC-Switch plan. A verification round dispatched 20 VPs;
+all 20 judged the *same* ``libcc_switch_lib.dylib`` stale and each one
+started its own ``BinaryRebuildAgent`` against the same ``target/debug``::
+
+    03:38:32-33  20 x binary_stale_detected (libcc_switch_lib.dylib)
+                 every agent: "Blocking waiting for file lock on
+                 artifact directory"
+    03:41-03:59  3 VPs got the rebuilt binary -> vp_complete
+    04:02:22     last log line
+                 11 VPs never emitted a single event
+    05:24:01     watchdog hit VERIFICATION_HARD_STALE_SECONDS, CAS -> failed
 
 The watchdog was right. The round was wrong: **a round had no notion of
-"this binary has already been rebuilt"**. ``FreshnessCache`` memoises the
-*check* only, and a failed rebuild leaves the binary's mtime untouched —
-so the cache key is unchanged, every VP got the same cached "stale",
-and the cache amplified the fan-out instead of collapsing it.
+"this binary has already been rebuilt"**, so every verification point
+that reached a stale verdict started its own rebuild. The check is
+deterministic — two points that ask while the binary is still untouched
+both see the same mtime and both answer "stale"; that is a correct
+check doing its job, not one point interfering with another.
+
+``FreshnessCache`` is not what fanned them out: it records every check
+and is never read back, so it cannot hand one point a verdict another
+point computed. Its key embedding the binary's mtime is the same
+phenomenon from the other side — nothing has rebuilt yet, so the mtime,
+and with it the key, cannot move. That is a consequence of the missing
+single-flight, not a second cause of it. What collapses the fan-out is
+``_BinaryRebuildCoordinator``.
 
 What is pinned here
 -------------------
@@ -37,10 +51,10 @@ produce the concurrency these assertions are about.
 
 4. **preflight and the VP arms share one coordinator.** If the
    round-start preflight rebuilt the binary, the VPs dispatched after it
-   do not rebuild again — the total for the round is still 1: exactly one
-   VP per round exists purely to rebuild, and once it has rebuilt the VPs
-   dispatched after it must not rebuild. That is the arm that was never
-   implemented.
+   do not rebuild again — the total for the round is still 1. That is
+   the intended shape: one VP per round exists purely to rebuild; once
+   it has rebuilt, the VPs after it must not. It is also the arm that
+   was never implemented.
 
 5. **Round boundaries.** ``run_full_verification`` clears the coordinator
    at the top of every round, before the preflight — otherwise round 2

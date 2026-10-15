@@ -559,22 +559,31 @@ class _BinaryRebuildCoordinator:
     """Per-round single-flight for binary rebuilds.
 
     N VPs in ONE round can all judge the same native library stale, each
-    spawn its own ``BinaryRebuildAgent``, and all run ``cargo build``
+    spawns its own ``BinaryRebuildAgent``, and each runs ``cargo build``
     against the same ``target/debug``. cargo's artifact-directory file
     lock turns those into a queue as deep as the VP count; while it is
     queued not one VP emits a log line, and the watchdog fails the round
     by design.
 
     The build being slow is not the root cause. The root cause is that a
-    round had no notion of "this binary has already been rebuilt":
-    :class:`binary_freshness.FreshnessCache` memoises the *check* only,
-    and when a rebuild fails the binary's mtime is unchanged, so the
-    cache key is unchanged, so concurrent VPs all get the same cached
-    "stale" verdict and all go to rebuild. The cache amplified
-    concurrency here instead of collapsing it.
+    round had no notion of "this binary has already been rebuilt", so
+    every verification point that reached a stale verdict started its own
+    rebuild. The check is deterministic, and two points that ask while
+    the binary is still untouched both see the same mtime and both
+    answer "stale" — that is a correct check doing its job, not one point
+    interfering with another.
 
-    Semantics (one VP per round exists purely to rebuild; once it has
-    rebuilt, the VPs after it must not):
+    :class:`binary_freshness.FreshnessCache` is not what fanned them out.
+    It records every check and is never read back — it has no read path —
+    so it cannot hand one point a verdict that another point computed.
+    Its key embedding the binary's mtime is the same phenomenon seen
+    from the other side: nothing has rebuilt yet, so the mtime, and with
+    it the key, cannot move. That is a consequence of the missing
+    single-flight, not a second cause of it. What actually collapses the
+    fan-out is this coordinator.
+
+    Semantics (the intended shape: one VP per round exists purely to
+    rebuild; once it has rebuilt, the VPs after it must not):
 
       * key = ``(str(project_dir), kind)`` — the same two quantities the
         stale verdict was derived from;
@@ -1302,8 +1311,8 @@ class Orchestrator:
             delta = parse_delta_payload(raw, plan_data)
             summary = apply_delta(plan_data, delta, round_number)
 
-            # 新增的 VP 必须和初次生成时一样过护栏。用户 2026-09-18：
-            # "考虑到会生成新的 VP，所以每一轮跑之前都应该去跑护栏"。
+            # 新增的 VP 必须和初次生成时一样过护栏（2026-09-18 定下）：
+            # 每轮跑之前都要先过护栏，因为这一轮会生成新的 VP。
             #
             # 护栏的内容随方法收敛而变：VP 不再有 test_command，所以查的是
             # **method 的契约** —— 不支持的 method，以及 api_test 的
