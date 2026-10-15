@@ -50,6 +50,37 @@ An empty commit list, an unreadable blob, or a git command that fails is a
 hard error, never a clean result. A range scanner that silently reports
 "0 violations" when it in fact scanned nothing is the failure mode this
 whole module exists to prevent.
+
+Content that is not UTF-8
+-------------------------
+Blobs were decoded with ``errors="replace"``, and that decided the
+question of what is in a blob without looking at it: an undecodable byte
+becomes ``U+FFFD``. Two of the rules -- the Chinese measurement shape
+(实测/观察于/复现于) and the dated changelog-bullet attribution shape --
+hold non-ASCII characters, so against a blob that is not valid UTF-8 they
+could never match, and the run still printed ``OK ... 0 violations``.
+ASCII rules were unaffected, because ``errors="replace"`` only rewrites
+bytes outside ASCII: that is why this stayed invisible, and why the same
+hole in a file that had been UTF-8 all along would have shown up as a
+failure instead.
+
+A second decode does not fix it and is worth recording why. ``surrogateescape``
+keeps the bytes but not their identity, so a rule pattern still does not
+match; and neither does latin-1 or cp1252, because *none* of the non-ASCII
+characters in these rules' patterns -- ``。``, ``（``, ``：``, ``实测`` --
+is even representable in latin-1. Measured over every rule and every
+encoding, no decoder other than strict UTF-8 ever returned a different
+verdict. So the honest move for a rule set that is not this module's to
+change is to refuse rather than to guess: a blob that is not valid UTF-8
+now raises :class:`RangeScanError` naming it, which is exit 2 and the
+"unreadable blob" case above.
+
+That is a real refusal, not a formality. This module reads
+``SOURCE_EXTENSIONS`` files under the scan roots, so the shape is a source
+file saved in the wrong encoding rather than an image -- and the fix is to
+re-save it as UTF-8 and rewrite the commit, which at pre-push time is
+still free. The alternative was to keep reporting a clean result over bytes
+nobody read, which is the thing this module was written to stop.
 """
 
 from __future__ import annotations
@@ -72,6 +103,12 @@ from test_no_local_home_path_in_first_party import (  # noqa: E402
 from test_no_operator_attribution_in_source import (  # noqa: E402
     find_attribution,
 )
+from test_no_plan_ids_in_metadata import (  # noqa: E402
+    find_plan_ids_in_metadata,
+)
+from test_no_plan_ids_in_non_test_source import (  # noqa: E402
+    find_plan_ids_in_non_test_source,
+)
 from test_source_comments_carry_no_local_measurements import (  # noqa: E402
     find_local_measurements,
 )
@@ -84,11 +121,44 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 #: ``(path: Path, text: str) -> list[tuple[Path, int, str]]``, which is why
 #: this is data and not code. Adding a rule here is the whole change; there
 #: is no second place to teach about it.
+#:
+#: The private-name rule used to be the fifth entry, and what it cost is
+#: worth recording. Its needles were literals in
+#: ``test_no_private_names_in_source.py`` -- a *tracked* file -- so the rule
+#: could only be enforced by committing the names it was meant to keep out.
+#: It has moved to ``scripts/scanners/scan_forbidden_names.py``, which reads
+#: the operator's untracked ``.config/forbidden-names``; ``scan_commit_range.sh``
+#: runs it as a separate step of the pre-push hook, and it deliberately does
+#: not run in ``--ci`` mode, because a CI runner has no local list and could
+#: only ever report "the check did not run".
 RANGE_RULES: tuple[tuple[str, object], ...] = (
     ("home path", find_home_paths),
     ("operator attribution", find_attribution),
     ("local measurement", find_local_measurements),
+    # Added after the 2026-09-29 publication. Structurally absent from the
+    # three rules above: feeding the real leaked plan-id strings to them
+    # returns zero findings, because a plan id is neither a path, an
+    # attribution, nor a measurement.
+    ("plan id in source", find_plan_ids_in_non_test_source),
 )
+
+#: ``(label, pure_rule)`` pairs applied to each commit's *message*, not to
+#: its tree. Separate from :data:`RANGE_RULES` on purpose: the plan-id
+#: shape is checked in source files only where the file is not a test,
+#: because a date-prefixed id in a test is a fixture. On a commit message
+#: there are no fixtures -- nothing under ``tests/`` is reachable from
+#: one -- so the rule applies with no exemptions at all, and is a different
+#: function with the same ``(path, text)`` signature. Rule 3 therefore
+#: cannot simply be appended to :data:`RANGE_RULES`: doing so would flag
+#: every synthetic fixture in the tree.
+MESSAGE_RULES: tuple[tuple[str, object], ...] = (
+    ("plan id in commit message", find_plan_ids_in_metadata),
+)
+
+#: The synthetic path recorded for a message finding. A message has no file
+#: behind it; naming the surface is what lets a reader tell a message
+#: violation from a tree violation in the same report.
+COMMIT_MESSAGE_PATH = Path("commit message")
 
 
 class RangeScanError(RuntimeError):
@@ -136,6 +206,33 @@ def _git(repo: Path, args: Sequence[str]) -> str:
             f"{result.stderr.decode('utf-8', 'replace').strip()}"
         )
     return result.stdout.decode("utf-8", "replace")
+
+
+def _undecodable_message(path: str, exc: UnicodeDecodeError) -> str:
+    """The refusal text for a blob that is not valid UTF-8.
+
+    A hard error, and that is this module's existing contract rather than a
+    new one: "an empty commit list, an unreadable blob, or a git command
+    that fails is a hard error, never a clean result." A blob this module
+    cannot decode is unreadable, so it belongs there.
+
+    The wording is shared verbatim with
+    :func:`staged_content_scan._undecodable_message`, for the reason the
+    two modules already share the binary rule: a reader who has seen one
+    has seen both.
+    """
+    return (
+        f"{path} is not valid UTF-8 and this scan cannot read it: {exc}\n"
+        f"The privacy rules are patterns over text, and running them over a "
+        f"blob whose encoding this scan would have to guess is not reading "
+        f"it. It used to be decoded with errors=\"replace\", which rewrites "
+        f"every byte it cannot decode into U+FFFD -- and a rule whose shape "
+        f"holds a non-ASCII character (the Chinese measurement and "
+        f"attribution shapes do) can then never match, while the run still "
+        f"reported a clean result over bytes it had not examined.\n"
+        f"Re-save the file as UTF-8 and rewrite the commit that introduced "
+        f"it. Nothing has been scanned and nothing has been cleared."
+    )
 
 
 def iter_range_commits(repo: Path, range_spec: str) -> list[str]:
@@ -195,7 +292,13 @@ def iter_commit_sources(repo: Path, sha: str) -> Iterator[tuple[str, str]]:
                 f"{sha[:9]}:{rel.as_posix()} is listed by ls-tree but has no "
                 f"blob; refusing to report a clean scan over a partial read"
             )
-        yield rel.as_posix(), blob.decode("utf-8", "replace")
+        try:
+            text = blob.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RangeScanError(
+                _undecodable_message(f"{sha[:9]}:{rel.as_posix()}", exc)
+            ) from exc
+        yield rel.as_posix(), text
 
 
 def _read_blob_batch(repo: Path, specs: list[str]) -> list[bytes | None]:
@@ -293,6 +396,31 @@ def scan_commit(repo: Path, sha: str, subject: str = "") -> list[Finding]:
     return findings
 
 
+def scan_commit_message(
+    repo: Path, sha: str, message: str, subject: str = ""
+) -> list[Finding]:
+    """Apply every rule in :data:`MESSAGE_RULES` to one commit message.
+
+    The message is a separate surface from the tree and is scanned
+    separately: it survives into ``main`` verbatim through GitHub's merge
+    commit, and no tree rule reads it.
+    """
+    findings: list[Finding] = []
+    for label, rule in MESSAGE_RULES:
+        for _, lineno, snippet in rule(COMMIT_MESSAGE_PATH, message):  # type: ignore[operator]
+            findings.append(
+                Finding(
+                    commit=sha,
+                    subject=subject,
+                    label=label,
+                    path=COMMIT_MESSAGE_PATH.as_posix(),
+                    lineno=lineno,
+                    snippet=snippet,
+                )
+            )
+    return findings
+
+
 def commit_subjects(repo: Path, shas: Iterable[str]) -> dict[str, str]:
     """Map each SHA to its one-line subject, for readable failure output."""
     subjects: dict[str, str] = {}
@@ -300,6 +428,20 @@ def commit_subjects(repo: Path, shas: Iterable[str]) -> dict[str, str]:
         out = _git(repo, ["log", "-1", "--format=%s", sha])
         subjects[sha] = out.strip()
     return subjects
+
+
+def commit_messages(repo: Path, shas: Iterable[str]) -> dict[str, str]:
+    """Map each SHA to its whole message, subject and body.
+
+    ``%B`` rather than ``%s``: a plan id quoted in the body is as permanent
+    as one in the subject, and the body is where a long incident note ends
+    up. ``commit_subjects`` reads ``%s`` for display only.
+    """
+    messages: dict[str, str] = {}
+    for sha in shas:
+        out = _git(repo, ["log", "-1", "--format=%B", sha])
+        messages[sha] = out
+    return messages
 
 
 def scan_ranges(
@@ -332,9 +474,12 @@ def scan_ranges(
                 ordered.append(sha)
 
     subjects = commit_subjects(repo, ordered)
+    messages = commit_messages(repo, ordered)
     findings: list[Finding] = []
     for sha in ordered:
-        findings.extend(scan_commit(repo, sha, subjects.get(sha, "")))
+        subject = subjects.get(sha, "")
+        findings.extend(scan_commit(repo, sha, subject))
+        findings.extend(scan_commit_message(repo, sha, messages.get(sha, ""), subject))
     return ordered, findings
 
 

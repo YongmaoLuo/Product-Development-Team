@@ -15,6 +15,26 @@
 # directory through git so it also works inside a linked worktree — where
 # ``.git`` is a file, not the directory the hooks actually live in.
 #
+# Run this once after merging a pull request that touches these hooks
+# --------------------------------------------------------------------
+# ``.git/hooks/`` is not tracked by git. Merging a change to
+# ``scripts/pre_commit_gate.sh`` updates the script every *new* checkout
+# would run and the script no *existing* checkout runs, because the hook
+# body that decides which gates to run is a file in that untracked
+# directory. Nothing in the merge tells anybody, and nothing in CI can
+# check it: a GitHub runner has no hooks to check. A checkout whose
+# ``pre-commit`` still points at the one-gate version runs one gate,
+# reports success, and enforces none of the additions.
+#
+# So: after merging, run ``bash scripts/install_git_hooks.sh`` on the
+# machine. ``--check`` answers "is what is installed what this script
+# would write?" and is safe to run at any time — it changes nothing.
+#
+# Note also that hooks are shared by every linked worktree of a checkout
+# (``git rev-parse --git-common-dir``), so installing here changes the
+# hooks the other worktrees run too. That is a reason to run it
+# deliberately, not to run it from a scratch worktree by accident.
+#
 # Usage
 # -----
 #     bash scripts/install_git_hooks.sh          # install / refresh
@@ -23,7 +43,7 @@
 # Exit contract
 # -------------
 #   * 0 — hooks installed (or, with --check, all present and current)
-#   * 1 — with --check: at least one hook is missing or stale
+#   * 1 — with --check: at least one hook is missing, stale, or not executable
 #   * 2 — setup error (not a git work tree, hooks dir unwritable)
 
 set -euo pipefail
@@ -65,29 +85,38 @@ fi
 MARKER="# installed by scripts/install_git_hooks.sh"
 
 # hook-name<TAB>relative-script<TAB>one-line description
+#
+# ``pre-commit`` points at ``scripts/pre_commit_gate.sh`` rather than
+# directly at ``scripts/grep_guard.sh`` because a git hook is one
+# executable and the stage now runs two gates: the forbidden-filename
+# sweep, and the staged-content privacy scan added after the 2026-09-29
+# publication. The dispatcher keeps each gate in its own wrapper with its
+# own exit contract, so neither is reimplemented and both stay runnable
+# from a shell.
+#
+# ``commit-msg`` keeps pointing at the same script it always did; that
+# script grew the plan-id rule, so the hook entry did not have to change.
 HOOKS=(
-    "commit-msg	scripts/check_commit_msg.py	rejects AI attribution trailers"
-    "pre-commit	scripts/grep_guard.sh	forbidden-filename sweep"
+    "commit-msg	scripts/check_commit_msg.py	rejects AI attribution trailers and plan ids in the message"
+    "pre-commit	scripts/pre_commit_gate.sh	forbidden-filename sweep, then the staged-content privacy scan"
     "pre-push	scripts/scan_commit_range.sh	scans the commits being pushed for private info"
 )
 
-missing=0
-for entry in "${HOOKS[@]}"; do
-    IFS=$'\t' read -r name script desc <<<"$entry"
-    target="$HOOKS_DIR/$name"
-
-    if [[ -f "$target" ]] && ! grep -qF "$MARKER" "$target" 2>/dev/null; then
-        echo "skip  $name — exists and was not written by this script" >&2
-        continue
-    fi
-
-    # How to run it: ``.py`` through the interpreter, everything else as a
-    # shell script.
+# Render the exact body a hook should hold. Kept as one function so the
+# writer and the checker cannot disagree: they call the same renderer and
+# compare, rather than each restating what "correct" looks like.
+#
+# The body stores ``$REPO_ROOT`` unexpanded and resolves it when the hook
+# runs, so a checkout that moves does not leave the hook pointing at
+# whatever now sits at the old path -- and git runs hooks with the working
+# tree as cwd, so this is always the tree being committed to.
+render_hook() {
+    local script="$1" desc="$2" name="$3"
+    local invoke passthrough
     case "$script" in
         *.py) invoke="python3 \"\$REPO_ROOT/$script\"" ;;
         *)    invoke="bash \"\$REPO_ROOT/$script\"" ;;
     esac
-
     # The body differs by hook kind: a commit-msg hook must pass the
     # message file through ("$1"); pre-push must be told to read the ref
     # lines from stdin, because git gives those on stdin and not in argv;
@@ -97,33 +126,7 @@ for entry in "${HOOKS[@]}"; do
         pre-push)   passthrough='--stdin-pre-push' ;;
         *)          passthrough="" ;;
     esac
-
-    if [[ $CHECK_ONLY -eq 1 ]]; then
-        # Compare against the *relative* script path and the marker: the
-        # hook body stores ``$REPO_ROOT`` unexpanded, so grepping for the
-        # absolute path would report every correctly-installed hook as
-        # stale. (It did, on the first run of this script.)
-        #
-        # Also compare the passthrough token. Without that, changing what
-        # a hook is invoked with leaves every installed copy stale while
-        # ``--check`` reports it current -- which is exactly what happened
-        # when pre-push gained ``--stdin-pre-push``: the hook ran, took the
-        # no-argument path, and rejected an ordinary ``git push``.
-        # ``-e`` because a passthrough token may begin with ``-``
-        # (``--stdin-pre-push``), and grep would otherwise read it as an
-        # option and match nothing -- reporting a freshly written hook as
-        # stale.
-        if [[ ! -f "$target" ]] \
-            || ! grep -qF "$MARKER" "$target" 2>/dev/null \
-            || ! grep -qF "$script" "$target" 2>/dev/null \
-            || { [[ -n "$passthrough" ]] && ! grep -qFe "$passthrough" "$target" 2>/dev/null; }; then
-            echo "stale $name — run: bash scripts/install_git_hooks.sh" >&2
-            missing=1
-        fi
-        continue
-    fi
-
-    cat >"$target" <<EOF
+    cat <<EOF
 #!/usr/bin/env bash
 $MARKER — $desc.
 # Edit scripts/install_git_hooks.sh (and the script it points at), not this
@@ -136,10 +139,64 @@ set -euo pipefail
 REPO_ROOT="\$(git rev-parse --show-toplevel)"
 $invoke $passthrough
 EOF
+}
+
+missing=0
+for entry in "${HOOKS[@]}"; do
+    IFS=$'\t' read -r name script desc <<<"$entry"
+    target="$HOOKS_DIR/$name"
+
+    if [[ -f "$target" ]] && ! grep -qF "$MARKER" "$target" 2>/dev/null; then
+        echo "skip  $name — exists and was not written by this script" >&2
+        continue
+    fi
+
+    # Byte-for-byte, against the same renderer that writes the file.
+    #
+    # The earlier check compared *tokens* — the marker, the script path,
+    # the passthrough argument. That caught the two drifts it was written
+    # for and nothing else: a hook that had picked up every token it was
+    # supposed to have while any other line had been edited, moved to a
+    # baked-in absolute path, or quietly stopped being executable, was
+    # reported current. A hook is not a bag of tokens; it is a file, and
+    # the only question worth asking of a file is whether it equals the
+    # one the generator would produce.
+    #
+    # ``-x`` is part of the same question: git skips a non-executable hook
+    # silently, so a lost mode bit disables the entire gate and leaves a
+    # token-compatible, therefore "current", file behind.
+    expected="$(mktemp)"
+    render_hook "$script" "$desc" "$name" >"$expected"
+    if [[ $CHECK_ONLY -eq 1 ]]; then
+        if [[ ! -f "$target" ]]; then
+            echo "stale $name — not installed at all" >&2
+            missing=1
+        elif ! cmp -s "$expected" "$target"; then
+            echo "stale $name — content differs from what this script writes:" >&2
+            diff -u "$target" "$expected" | sed 's/^/    /' >&2 || true
+            echo "stale $name — run: bash scripts/install_git_hooks.sh" >&2
+            missing=1
+        elif [[ ! -x "$target" ]]; then
+            echo "stale $name — installed but not executable (git skips it)" >&2
+            missing=1
+        fi
+        rm -f "$expected"
+        continue
+    fi
+
+    cat "$expected" >"$target"
+    rm -f "$expected"
     chmod +x "$target"
     echo "ok    $name — $desc"
 done
 
 if [[ $CHECK_ONLY -eq 1 ]]; then
+    if [[ $missing -ne 0 ]]; then
+        echo >&2
+        echo "The hooks live in $HOOKS_DIR, which git does not track: merging" >&2
+        echo "a pull request that changes them installs nothing. Run" >&2
+        echo "    bash scripts/install_git_hooks.sh" >&2
+        echo "once per checkout after the merge." >&2
+    fi
     exit $missing
 fi

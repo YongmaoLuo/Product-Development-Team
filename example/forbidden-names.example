@@ -1,0 +1,91 @@
+# .config/forbidden-names — TEMPLATE. Copy it, do not edit it in place.
+#
+#     mkdir -p .config
+#     cp example/forbidden-names.example .config/forbidden-names
+#
+# Why this file is a template and the list itself is not tracked
+# -------------------------------------------------------------
+# This list exists to keep certain proper names out of this repository. A
+# blacklist cannot be committed: writing a name down in order to check for
+# it publishes the name, which is the exact thing the list exists to
+# prevent. So the working copy lives at .config/forbidden-names, which
+# .gitignore excludes ("Local configuration — operator-owned, never
+# committed").
+#
+# THIS FILE MUST NEVER BE COMMITTED either, once it carries a real name.
+# The template below is safe to track only because every entry in it is a
+# placeholder that will never match anything.
+#
+# Format
+# ------
+# One entry per line.
+#
+#   * Blank lines are ignored.
+#   * A line whose first non-space character is '#' is a comment.
+#   * Everything else is a needle.
+#
+# A plain needle is matched as a case-insensitive SUBSTRING of each line —
+# not as a whole word, and not with any boundary rule. Substring is
+# deliberate: a boundary rule built on [A-Za-z0-9._-] treats a hyphen as a
+# word character, so it cannot match a name glued to a prefix
+# ("lib" + NAME + "_rs.dylib") nor a name inside a plan-id slug
+# ("2026xxxx-" + NAME + "-step"). Those are the two forms that actually
+# leak, and a rule that cannot match them is green over exactly what it was
+# written for. False positives are the right way round here: a two-second
+# rewrite beats a permanent publication.
+#
+# There is no per-file allowlist and no tests/ exemption. A private name is
+# as published inside a fixture as inside a secret.
+#
+# Regular expressions
+# -------------------
+# Prefix an entry with "re:" to match it as a case-insensitive regular
+# expression instead of a literal. Use this for a *shape* — something where
+# the structure matters rather than any one word in it — for example a live
+# quote identifier. Python's `re` syntax is what is used, not POSIX ERE, and
+# a pattern that does not compile is a hard error rather than a silently
+# skipped entry: an uncompilable pattern means the check is not running as
+# you configured it, and that must not read as a pass.
+#
+#     re:<some-shape>[0-9]{<n>}
+#
+# A line that is exactly "re:" with nothing after it is an error too.
+#
+# Duplicates
+# ----------
+# An entry repeated twice is dropped with a warning rather than reported
+# twice, so the violation count you see is the number of *distinct* needles
+# that fired. Note that substring matching makes shorter entries subsume
+# longer ones: if you list "widget" you do not need "widget-loader", though
+# keeping both costs nothing but a second line on the same finding.
+#
+# When the list is missing or has no usable entry
+# -----------------------------------------------
+# The pre-commit and pre-push hooks exit 2 — an explicit "the check did not
+# run" — rather than 0. An absent list and a clean tree have to be
+# distinguishable, because a gate that silently stops checking is
+# indistinguishable from a gate that is passing. That is not a
+# hypothetical: this repository once had a name check driven by an
+# environment variable that was never set on any machine, and it reported a
+# pass forever while checking nothing.
+#
+# The checks that read this file
+# ------------------------------
+#   * scripts/pre_commit_gate.sh  -> scan_forbidden_names.sh --index
+#   * scripts/scan_commit_range.sh -> scan_forbidden_names.sh --range ...
+#
+# Both run the scanner at scripts/scanners/scan_forbidden_names.py, which is
+# where the matching lives; nothing here is enforced by pytest, on purpose —
+# by the time the suite is green the text is already in a commit.
+
+# --- literals ---------------------------------------------------------------
+# One real private proper name per line, verbatim, as it appears in a leak.
+#
+# <a-private-project-name>
+# <a-private-feature-branch>
+# <a-private-vocabulary-term>
+
+# --- shapes -----------------------------------------------------------------
+# re:<pattern> for structure rather than a specific word.
+#
+# re:symbol=[0-9]{6}
