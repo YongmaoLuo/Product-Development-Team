@@ -98,6 +98,67 @@ extension set in *Binary content* below is not a scope filter: it only ever
 decides whether a blob is read despite holding a NUL, never whether a
 readable blob is exempt from a needle.
 
+Four surfaces, because a name leaks four ways
+----------------------------------------------
+This module reads content, and for a long time that was the whole of it.
+Three surfaces sat outside it, each of them a place a private name reaches
+the world with nothing about the *content* of the repository to show for
+it:
+
+**Commit messages.** A message is prose. Nobody reads a rebase note line by
+line, ``git log --format=%B`` is not something anybody runs by hand, and
+CI's message gates look for attribution trailers, not for proper names. A
+name in a commit body is therefore invisible to every other gate here --
+and a commit body is exactly where a leak *note* ends up, because that is
+what a person writes when they are documenting that they found one.
+
+**Path and file names.** ``ls-tree`` already hands this module a path for
+every entry it reads; the path was in hand and used only for the extension
+test and for labelling a finding. A file called ``<name>_notes.md`` whose
+contents are entirely clean publishes the name just as effectively. The
+whole path is searched, directory segments included, because
+``work/<name>/plan.md`` names it in the directory just as plainly.
+
+**Ref names.** A branch or tag name is published the moment it exists on a
+remote: it appears in every clone's ``git branch -a``, in every
+``git ls-remote``, in every web URL, and in the reflogs of every machine
+that has fetched it. Unlike a commit message it is not fixed by a later
+commit, and unlike a file it cannot be ``.gitignore``d after the fact.
+
+What the local gate can and cannot reach on refs, stated rather than left
+implied
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Two halves, and only one of them is a local gate's to check.
+
+*The half that is covered.* ``pre-push`` receives the refs a push is about
+to publish, as ref lines on stdin, and those names are checked here
+(``--ref``, one per line). This is also the last moment at which the name
+can still be changed: nothing has left the machine, so
+``git branch -m`` / ``git tag -d`` is free. This covers the names *this
+push* publishes, on ``refs/heads`` and ``refs/tags`` alike -- a tag is as
+public as a branch and is scanned the same way.
+
+*The half that is not.* A ref that is **already on a remote** cannot be
+enumerated by any local command; there is no ``git ls-remote`` of the sort
+that would make a local check over it meaningful, and by the time this
+check exists on every machine, a name published by an earlier push or from
+another machine has already been cloned. This module does not pretend to
+cover it. ``--refs-local`` is the operator-side check over what *this*
+repository holds, and it is a different question from what a push is about
+to publish -- it is run by a person, before a push, not by the hook.
+
+Commit messages and ``--index``
+-------------------------------
+``--index`` reads the index, and the index holds no commit message:
+nothing is committed yet. ``HEAD``'s message is not a stand-in -- it
+describes a commit that already exists and says nothing about the one about
+to be made -- so this path does not read one, and the detail line it prints
+says so and names where messages *are* checked (``pre-push``, over the
+range). A dimension that did not run is named, not silently dropped:
+``--index`` and a silent message check would read as a clean pass over a
+check that never happened, which is the one thing this module exists to
+prevent.
+
 Binary content
 --------------
 Git calls a blob binary when it holds a NUL byte in the first kilobyte, and
@@ -442,16 +503,41 @@ def _byte_forms(
     return tuple(forms)
 
 
+#: The four surfaces a private name can be published on, each with the tag
+#: its report lines carry. A tag rather than a differently-shaped line
+#: because the content shape ``path:lineno: needle`` is pinned -- it is what
+#: ``scripts/scan_forbidden_names.sh`` describes in its HOWTO and what every
+#: reader of a content finding already knows -- so the new surfaces are
+#: added *alongside* it rather than by reformatting it.
+WHERE_CONTENT = "content"
+WHERE_PATH = "path-name"
+WHERE_MESSAGE = "commit-message"
+WHERE_REF = "ref-name"
+
+
 @dataclass(frozen=True)
 class Violation:
-    """One needle found in one line of one blob."""
+    """One needle found in one place.
+
+    *path* is the path, the commit, or the ref, depending on *where*, and
+    *lineno* is the line within it -- meaningful for a blob and for a commit
+    message, and unused (0) for a path or a ref name, which are one string
+    each and have no interior lines.
+    """
 
     path: str
     lineno: int
     needle: str
+    where: str = WHERE_CONTENT
 
     def format(self) -> str:
-        return f"{self.path}:{self.lineno}: {self.needle}"
+        if self.where == WHERE_CONTENT:
+            return f"{self.path}:{self.lineno}: {self.needle}"
+        if self.where == WHERE_MESSAGE:
+            return f"{self.path} [{self.where}]:{self.lineno}: {self.needle}"
+        # A path or a ref: one string, no line number, so naming a line
+        # would be inventing precision the finding does not have.
+        return f"{self.path} [{self.where}]: {self.needle}"
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +897,77 @@ def iter_commit_blobs(repo: Path, sha: str) -> Iterator[tuple[str, bytes]]:
         yield path, blob
 
 
+def read_commit_messages(repo: Path, shas: Sequence[str]) -> Iterator[tuple[str, bytes]]:
+    """Yield ``(sha, message)`` for every commit in *shas*.
+
+    Read through :func:`_read_blobs`, which is the batch reader the blob
+    path already uses and whose response count is already validated. One
+    subprocess for the whole range, not one per commit: this runs on the
+    pre-push path, where a few hundred commits would otherwise be a few
+    hundred subprocesses on the critical path of somebody's push.
+
+    The commit object is taken apart here rather than through
+    ``git log --format=``: a commit object is header lines, one blank line,
+    then the message -- a format documented, immutable, and with no record
+    separator to get wrong. A pretty format is a *rendering* of that, and
+    its framing is a detail of the renderer (git terminates each record
+    with a newline, which interleaves with a message that itself ends in
+    one); parsing the object does not have that problem, and a malformed
+    object is a case this function refuses rather than guesses at.
+
+    An empty message is an empty message, not a failure: ``--allow-empty-
+    message`` can produce one, there is simply nothing in it to match, and
+    the count check below still holds the read to the full range. What is
+    refused is an object with no header/message separator at all, because
+    that is not a commit object and reading it as one would scan the
+    headers under the pretence of scanning the message.
+    """
+    if not shas:
+        return
+    objects = _read_blobs(repo, list(shas))
+    for sha, obj in zip(shas, objects):
+        if obj is None:
+            raise ScanError(
+                f"{sha[:9]} is in the range but git could not read its "
+                f"commit object; refusing to report a clean scan over a "
+                f"partial read of the commit messages"
+            )
+        head, separator, message = obj.partition(b"\n\n")
+        if not separator:
+            raise ScanError(
+                f"{sha[:9]} is a commit object with no blank line between "
+                f"its headers and its message, so it cannot be read as one; "
+                f"refusing to report a clean scan over a partial read of "
+                f"the commit messages"
+            )
+        del head
+        yield sha, message
+
+
+def read_ref_names(repo: Path) -> list[str]:
+    """Return every local branch and tag name, for an operator-run check.
+
+    This is the ``--refs-local`` surface: a name the operator can inspect
+    and act on *before* pushing. It is deliberately separate from the ref
+    names a push publishes (see :func:`scan_ref_name` and the module
+    docstring, *Ref names*), because the two answer different questions:
+    this one asks "what do I have locally", the push one asks "what am I
+    about to publish".
+
+    Read through ``for-each-ref`` over ``refs/heads`` and ``refs/tags``, so
+    both kinds are in scope and nothing else is. If either read fails,
+    :func:`_git` raises and the scan exits 2 rather than reporting a clean
+    pass over a list it never obtained.
+    """
+    refs: list[str] = []
+    for pattern in ("refs/heads", "refs/tags"):
+        out = _git(repo, ["for-each-ref", "--format=%(refname)", pattern])
+        refs.extend(
+            line for line in out.decode("utf-8", "replace").splitlines() if line
+        )
+    return refs
+
+
 # ---------------------------------------------------------------------------
 # Scanning
 # ---------------------------------------------------------------------------
@@ -831,6 +988,49 @@ def iter_commit_blobs(repo: Path, sha: str) -> Iterator[tuple[str, bytes]]:
 #: from a clean one.
 def _printable(text: str) -> str:
     return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def _scan_bytes_text(
+    label: str,
+    content: bytes,
+    needles: Sequence[Needle],
+    where: str,
+) -> list[Violation]:
+    """Apply every needle to one chunk of decoded-or-raw content.
+
+    The shared body of every surface that is *text with lines*: a staged
+    blob, a committed blob, a commit message. Split out from the blob path
+    so the commit-message surface runs the identical two passes -- same
+    decode decision, same byte fallback, same "a line found twice is
+    reported once" rule -- instead of a second, weaker copy of the rule.
+
+    *label* is what the report names the finding's location as (a path, or a
+    commit SHA); *where* is which surface this is, so a reader can tell a
+    name in a file from a name in a message.
+    """
+    try:
+        text = content.decode("utf-8")
+        raw: bytes | None = None
+    except UnicodeDecodeError:
+        text = content.decode("utf-8", "surrogateescape")
+        raw = content
+
+    violations: list[Violation] = []
+    reported: set[tuple[int, str]] = set()
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        for needle in needles:
+            hit = needle.search(line)
+            if hit is not None:
+                label_text = _printable(
+                    f"re:{hit}" if needle.kind == "regex" else hit
+                )
+                violations.append(Violation(label, lineno, label_text, where))
+                reported.add((lineno, label_text))
+
+    if raw is not None:
+        violations.extend(_scan_bytes(label, raw, needles, reported, where))
+
+    return violations
 
 
 def scan_text(
@@ -865,29 +1065,65 @@ def scan_text(
     if not _is_scannable(Path(path), content):
         return [], False
 
-    try:
-        text = content.decode("utf-8")
-        raw: bytes | None = None
-    except UnicodeDecodeError:
-        text = content.decode("utf-8", "surrogateescape")
-        raw = content
+    return _scan_bytes_text(path, content, needles, WHERE_CONTENT), True
 
+
+def scan_path(path: str, needles: Sequence[Needle]) -> list[Violation]:
+    """Apply every needle to a path itself, not to what is inside it.
+
+    A file called ``<name>_notes.md`` with clean contents leaks the name
+    just as effectively as one that writes it out, and the index and the
+    commit tree both already hand this module the path for every entry it
+    reads -- the path was in hand and unused.
+
+    The whole path is searched, slashes included, because a directory
+    segment is as identifying as a file name: ``work/<name>/plan.md`` names
+    it in the directory. Searching the joined string also means no
+    ``ls-tree`` variant that emits directories separately can miss one.
+
+    ``lineno`` is 0: a path is one string with no interior lines, and
+    :meth:`Violation.format` does not print a line number for this surface
+    rather than inventing one.
+    """
     violations: list[Violation] = []
-    reported: set[tuple[int, str]] = set()
-    for lineno, line in enumerate(text.splitlines(), start=1):
-        for needle in needles:
-            hit = needle.search(line)
-            if hit is not None:
-                label = _printable(
-                    f"re:{hit}" if needle.kind == "regex" else hit
-                )
-                violations.append(Violation(path, lineno, label))
-                reported.add((lineno, label))
+    reported: set[str] = set()
+    for needle in needles:
+        hit = needle.search(path)
+        if hit is None:
+            continue
+        label = _printable(f"re:{hit}" if needle.kind == "regex" else hit)
+        if label in reported:
+            continue
+        reported.add(label)
+        violations.append(Violation(path, 0, label, WHERE_PATH))
+    return violations
 
-    if raw is not None:
-        violations.extend(_scan_bytes(path, raw, needles, reported))
 
-    return violations, True
+def scan_ref_name(ref: str, needles: Sequence[Needle]) -> list[Violation]:
+    """Apply every needle to a branch or tag name.
+
+    A ref name is published the moment it exists on a remote: it appears in
+    every clone's ``git branch -a``, in every ``git ls-remote``, in every
+    web URL for the repository, and a rename does not take the old name
+    back out of anybody's reflog. That makes it the one surface here whose
+    cost of getting it wrong is permanent rather than merely messy, and it
+    is the one surface content scanning cannot reach at all.
+
+    *ref* is the full ref name (``refs/heads/...``, ``refs/tags/...``)
+    because that is what git publishes and what the reader has to edit.
+    """
+    violations: list[Violation] = []
+    reported: set[str] = set()
+    for needle in needles:
+        hit = needle.search(ref)
+        if hit is None:
+            continue
+        label = _printable(f"re:{hit}" if needle.kind == "regex" else hit)
+        if label in reported:
+            continue
+        reported.add(label)
+        violations.append(Violation(ref, 0, label, WHERE_REF))
+    return violations
 
 
 def _scan_bytes(
@@ -895,10 +1131,11 @@ def _scan_bytes(
     raw: bytes,
     needles: Sequence[Needle],
     reported: set[tuple[int, str]],
+    where: str = WHERE_CONTENT,
 ) -> list[Violation]:
     """Search *raw* for each needle's byte forms; return the new hits.
 
-    Only reached for a blob that is not valid UTF-8. *reported* is the
+    Only reached for content that is not valid UTF-8. *reported* is the
     string pass's output, both so a line found twice is listed once and so
     this pass adds only what the string pass genuinely missed.
 
@@ -931,7 +1168,7 @@ def _scan_bytes(
                 if (lineno, label) in reported:
                     continue
                 reported.add((lineno, label))
-                found.append(Violation(path, lineno, label))
+                found.append(Violation(path, lineno, label, where))
     return found
 
 
@@ -961,42 +1198,97 @@ def _byte_spans(
         start = index + 1
 
 
+@dataclass(frozen=True)
+class ScanResult:
+    """What a scan read, and what it found.
+
+    ``scanned`` is the count of text blobs read; ``skipped_paths`` names the
+    blobs that were not read and is part of the result rather than a
+    diagnostic count because it changes the exit code: a batch with a
+    skipped blob is a batch this scan did not read whole, and reporting that
+    as a clean scan is the failure this module exists to avoid.
+
+    The per-dimension counts are here for the same reason, and are *not*
+    cosmetic. Each is checked against zero before the result is returned,
+    so a dimension that silently read nothing cannot be reported as a clean
+    scan over it. ``messages_read`` is 0 by design in ``--index`` mode,
+    which has no commit-message surface at all -- see :func:`scan`.
+    """
+
+    scanned: int
+    skipped_paths: list[str]
+    violations: list[Violation]
+    paths_read: int
+    messages_read: int
+    refs_read: int
+
+
 def scan(
     repo: Path,
     list_path: Path,
     *,
     index: bool,
     range_specs: Sequence[str],
-) -> tuple[int, list[str], list[Violation]]:
-    """Scan the index or the given ranges.
+    ref_names: Sequence[str] = (),
+    check_local_refs: bool = False,
+) -> ScanResult:
+    """Scan the index or the given ranges, plus paths, messages and refs.
 
-    Returns ``(scanned, skipped_paths, violations)``. ``skipped_paths``
-    names the blobs that were not read, and is part of the result rather
-    than a diagnostic count because it changes the exit code: a batch with
-    a skipped blob is a batch this scan did not read whole, and reporting
-    that as a clean scan is the failure this module exists to avoid.
-
-    Raises :class:`ScanError` when the list cannot be read or the content
+    Raises :class:`ScanError` when the list cannot be read or any dimension
     cannot be read, so that "the check did not run" reaches the caller as
     something it must not confuse with "found nothing".
+
+    The four dimensions, and what each one's absence means
+    ------------------------------------------------------
+
+    **blob content** -- the index, or every commit in the range.
+
+    **paths** -- every path read alongside that content. Checked for every
+    entry the content pass reads, *including* the ones whose content was
+    skipped as binary: a binary blob named ``<name>.png`` publishes the name
+    in its path even though its bytes were never read, so tying the path
+    check to the content check would hide exactly the case where the name
+    is the only part of the entry that could carry it.
+
+    **commit messages** -- ``--range`` only. ``--index`` has no commit
+    message surface: nothing has been committed yet, so there is no message
+    to read, and ``HEAD``'s message is not a substitute (it describes a
+    commit that already exists and says nothing about the one about to be
+    made). Rather than quietly reading nothing, the detail line this
+    returns says the dimension did not run on this path and names where it
+    does run. The pre-commit stage is not left blind to messages by this:
+    the message is not in the index either, and it is checked where it
+    exists, by ``pre-push`` over the range.
+
+    **ref names** -- the names a push is about to publish (``--ref``,
+    repeatable), or every local branch and tag (``--refs-local``). Absent
+    both, this dimension is not selected and is not claimed.
     """
     needles = load_needles(list_path)
-
-    sources: list[Iterator[tuple[str, bytes]]]
-    if index:
-        sources = [iter_index_blobs(repo)]
-    else:
-        sources = [
-            iter_commit_blobs(repo, sha)
-            for sha in iter_range_commits(repo, range_specs)
-        ]
 
     violations: list[Violation] = []
     scanned = 0
     skipped: list[str] = []
+    paths_read = 0
+
+    def consume_path(path: str) -> None:
+        nonlocal paths_read
+        paths_read += 1
+        violations.extend(scan_path(path, needles))
+
+    if index:
+        sources = [iter_index_blobs(repo)]
+        shas: list[str] = []
+    else:
+        shas = list(iter_range_commits(repo, range_specs))
+        sources = [iter_commit_blobs(repo, sha) for sha in shas]
+
     for source in sources:
         for path, content in source:
             found, scannable = scan_text(path, content, needles)
+            # The path is checked whether or not the content was readable:
+            # see this function's docstring.
+            consume_path(path)
             if not scannable:
                 skipped.append(path)
                 continue
@@ -1008,7 +1300,74 @@ def scan(
             f"{len(skipped)} blob(s) were read and none of them was text; "
             f"refusing to report a clean scan over an empty read"
         )
-    return scanned, skipped, violations
+
+    # -- commit messages -----------------------------------------------------
+    #
+    # Fail-closed by count: one message per commit in the range, and any
+    # shortfall is an error from ``read_commit_messages`` before it gets
+    # here. The explicit ``!= len(shas)`` is the belt to that braces --
+    # it names the dimension in the message when the two disagree.
+    messages_read = 0
+    if not index:
+        for sha, message in read_commit_messages(repo, shas):
+            messages_read += 1
+            violations.extend(
+                _scan_bytes_text(sha[:9], message, needles, WHERE_MESSAGE)
+            )
+        if messages_read != len(shas):
+            raise ScanError(
+                f"the commit-message dimension read {messages_read} "
+                f"message(s) for {len(shas)} commit(s) in the range; "
+                f"refusing to report a clean scan over a partial read of "
+                f"the commit messages"
+            )
+
+    # -- ref names -----------------------------------------------------------
+    #
+    # Selected explicitly (``--ref`` / ``--refs-local``) rather than always,
+    # because a pre-commit run has no ref being published and should not
+    # fail over one. When selected, an empty result is an error: being asked
+    # to check ref names and being handed none means the list of names did
+    # not arrive, and "I checked no names" is not a passing result.
+    refs_read = 0
+    if check_local_refs:
+        local = read_ref_names(repo)
+        refs_read += len(local)
+        for ref in local:
+            violations.extend(scan_ref_name(ref, needles))
+    for ref in ref_names:
+        if not ref:
+            raise ScanError(
+                f"an empty ref name was passed to the ref-name dimension; "
+                f"refusing to report a clean scan over a name that could "
+                f"not be read"
+            )
+        refs_read += 1
+        violations.extend(scan_ref_name(ref, needles))
+    # Selecting the ref dimension and reading no names out of it is a read
+    # that did not happen, not a repository that happens to be clean -- and
+    # this is the exact shape the whole module exists to reject: a check
+    # that reports success having checked nothing. The three ways in are a
+    # repository with no branches and no tags (every ref deleted, or a
+    # checkout that never committed), and a caller that selected the
+    # dimension and supplied no names.
+    if (check_local_refs or ref_names) and refs_read == 0:
+        raise ScanError(
+            f"the ref-name dimension was selected but no ref name could be "
+            f"read from {repo}; refusing to report a clean scan over a "
+            f"dimension that did not run. Either this checkout holds no "
+            f"branch and no tag, or the names never arrived -- both are a "
+            f"read that did not happen, not a clean result."
+        )
+
+    return ScanResult(
+        scanned=scanned,
+        skipped_paths=skipped,
+        violations=violations,
+        paths_read=paths_read,
+        messages_read=messages_read,
+        refs_read=refs_read,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1055,6 +1414,26 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SPEC",
         help="scan every commit in SPEC (repeatable), e.g. origin/main..HEAD",
     )
+    parser.add_argument(
+        "--ref",
+        dest="refs",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "also scan this branch or tag name (repeatable). What the "
+            "pre-push hook passes, one per ref line git feeds it"
+        ),
+    )
+    parser.add_argument(
+        "--refs-local",
+        action="store_true",
+        help=(
+            "also scan every local branch and tag name (an operator-run "
+            "check; it is not what pre-push uses, which sees only the refs "
+            "that push is publishing)"
+        ),
+    )
     return parser
 
 
@@ -1066,17 +1445,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     try:
-        scanned, skipped, violations = scan(
+        result = scan(
             repo,
             list_path,
             index=bool(args.index),
             range_specs=args.ranges,
+            ref_names=args.refs,
+            check_local_refs=bool(args.refs_local),
         )
     except ScanError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
+    scanned = result.scanned
+    skipped = result.skipped_paths
+    violations = result.violations
+
     detail = f"scanned {scanned} file(s) against {list_path}"
+    if result.paths_read:
+        detail += f", {result.paths_read} path name(s)"
+    if result.messages_read:
+        detail += f", {result.messages_read} commit message(s)"
+    if result.refs_read:
+        detail += f", {result.refs_read} ref name(s)"
+    elif not args.refs_local and not args.refs:
+        detail += (
+            " (no ref names selected: this invocation did not ask for the "
+            "ref-name dimension, so it did not run -- pre-push passes "
+            "--ref, or use --refs-local)"
+        )
+    if args.index:
+        detail += (
+            " (--index has no commit-message dimension: nothing is "
+            "committed yet, so there is no message to read; messages are "
+            "checked by pre-push over the range)"
+        )
     if skipped:
         detail += (
             f" ({len(skipped)} binary blob(s) skipped -- "

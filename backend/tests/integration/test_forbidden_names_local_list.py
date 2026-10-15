@@ -49,11 +49,15 @@ and it is the part the object does not give up.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import subprocess
 import sys
+import zlib
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PRE_COMMIT_GATE = REPO_ROOT / "scripts" / "pre_commit_gate.sh"
@@ -1242,3 +1246,575 @@ def test_the_wrapper_is_registered_for_both_hooks() -> None:
     assert "scan_forbidden_names.sh" in dispatcher, (
         "the dispatcher no longer runs the forbidden-name check"
     )
+
+
+# ---------------------------------------------------------------------------
+# The other three surfaces
+# ---------------------------------------------------------------------------
+#
+# The three above all put a name in file *contents*. These put one somewhere
+# else -- a commit's message, a file's name, a branch's name -- where content
+# scanning does not reach and where the other gates in this repository do not
+# look either. Each test below is built so that removing the detection makes
+# exactly that test go red and no other, which is what makes the negative
+# control a measurement rather than a claim.
+#
+# The needles stay synthetic (:data:`SYNTHETIC_NEEDLE`) for the reason given
+# in this file's docstring: a name written here to test a check for names is
+# a name published.
+
+
+def _scan_repo(repo: Path, list_path: Path, *args: str):
+    """Run the scanner module against a throwaway repository."""
+    return subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "scanners" / "scan_forbidden_names.py"),
+            "--repo", str(repo),
+            "--list", str(list_path),
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _commit_with_message(repo: Path, subject: str, body: str = "") -> str:
+    """Commit an empty tree change carrying *subject* and *body*."""
+    args = ["-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty",
+            "-m", subject]
+    if body:
+        args += ["-m", body]
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _commit_file_under(repo: Path, rel: str, content: str, message: str) -> str:
+    """Commit *content* at *rel* under an explicit *message*.
+
+    :func:`_commit_file` derives its message from the path -- ``add <rel>``
+    -- which is right for the tests that predate the commit-message
+    dimension and wrong for the ones that isolate the *path* dimension: a
+    message naming the file names the needle a second time, so the path
+    test would pass for two reasons and prove only one. This takes the
+    message so the path test can hold the other dimension still.
+    """
+    target = repo / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", rel], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "commit.gpgsign=false",
+         "commit", "-q", "-m", message],
+        check=True, capture_output=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def test_a_name_in_a_commit_message_is_reported(tmp_path) -> None:
+    """The message is a surface, and the surface is reachable.
+
+    ``--range`` scans every commit's message, and reports it tagged so a
+    reader can tell it from a name in a file. The name here is in the
+    *body*, not the subject: ``%s`` would miss it, and a leak note, a
+    rebase rationale or an audit line is body text.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    _commit_with_message(
+        repo,
+        "docs: record what this branch is for",
+        f"noted while investigating: {SYNTHETIC_NEEDLE} is the other one",
+    )
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_repo(repo, list_path, "--range", "HEAD~1..HEAD")
+
+    assert got.returncode == 1, f"a name in a commit message was not blocked:\n{_said(got)}"
+    assert "[commit-message]" in _said(got), (
+        f"the finding is not tagged as a commit message, so it cannot be "
+        f"told from a name in a file:\n{_said(got)}"
+    )
+    assert "1 violation" in _said(got), (
+        f"expected exactly one violation from one message:\n{_said(got)}"
+    )
+
+
+def test_a_clean_commit_message_does_not_report(tmp_path) -> None:
+    """The control for the test above: nothing to find, nothing reported.
+
+    Without this, "the message dimension reports" and "the message
+    dimension reports something on every commit" are indistinguishable.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    _commit_with_message(repo, "docs: a perfectly ordinary note", "nothing here at all")
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_repo(repo, list_path, "--range", "HEAD~1..HEAD")
+
+    assert got.returncode == 0, _said(got)
+    assert "1 commit message(s)" in got.stdout, (
+        f"the message dimension did not run, so this proves nothing:\n{got.stdout}"
+    )
+
+
+def test_a_name_in_a_path_is_reported(tmp_path) -> None:
+    """A clean file with a leaky name is still a leak.
+
+    The blob is entirely clean, so the content pass has nothing to say --
+    which is the point: the only thing carrying the name is the path.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    # The message is held neutral deliberately: git's own default would name
+    # the file, which names the needle, and the message dimension would then
+    # fire alongside the path one.
+    _commit_file_under(
+        repo, f"docs/{SYNTHETIC_NEEDLE}_notes.md",
+        "clean, and says nothing.\n", "docs: add notes",
+    )
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_repo(repo, list_path, "--range", "HEAD~1..HEAD")
+
+    assert got.returncode == 1, f"a name in a path was not blocked:\n{_said(got)}"
+    assert "[path-name]" in _said(got), (
+        f"the finding is not tagged as a path, so a reader cannot tell it "
+        f"from a name in the file's contents:\n{_said(got)}"
+    )
+    assert "1 violation" in _said(got), (
+        f"expected the path to be the only finding:\n{_said(got)}"
+    )
+
+
+def test_a_name_in_a_directory_component_is_reported(tmp_path) -> None:
+    """The whole path is searched, not just the file name.
+
+    ``work/<name>/plan.md`` names it in the directory segment exactly as
+    ``<name>.md`` names it in the file segment. Searching only the final
+    component would miss one and pass the other.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    _commit_file_under(
+        repo, f"work/{SYNTHETIC_NEEDLE}/plan.md", "clean.\n", "docs: add plan",
+    )
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_repo(repo, list_path, "--range", "HEAD~1..HEAD")
+
+    assert got.returncode == 1, f"a name in a directory component was not blocked:\n{_said(got)}"
+    assert "[path-name]" in _said(got), _said(got)
+    assert "1 violation" in _said(got), (
+        f"expected the directory component to be the only finding:\n{_said(got)}"
+    )
+
+
+def test_a_name_in_a_staged_path_is_reported(tmp_path) -> None:
+    """The index checks paths too, not only the range.
+
+    The pre-commit hook runs ``--index``. A path dimension that existed only
+    on the range path would leave the earliest and cheapest interception
+    point -- before the file is in a commit at all -- checking names in
+    contents and nothing else.
+    """
+    env = _staged_env(tmp_path)
+    _stage(env, f"docs/{SYNTHETIC_NEEDLE}_notes.md", "clean.\n")
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "scan_forbidden_names.sh"),
+         "--index", "--list", str(list_path)],
+        capture_output=True, text=True, env=env, check=False,
+    )
+
+    assert got.returncode == 1, f"a staged path was not blocked:\n{_said(got)}"
+    assert "[path-name]" in _said(got), (
+        f"the staged-path finding is not tagged as a path:\n{_said(got)}"
+    )
+
+
+def test_a_name_in_a_local_ref_is_reported(tmp_path) -> None:
+    """``--refs-local`` reads branch and tag names.
+
+    Both kinds, because both are published the moment they reach a remote
+    and a tag is no less public than a branch.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", f"feat/{SYNTHETIC_NEEDLE}"],
+        check=True, capture_output=True,
+    )
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_repo(repo, list_path, "--range", "HEAD", "--refs-local")
+
+    assert got.returncode == 1, f"a name in a branch name was not blocked:\n{_said(got)}"
+    assert "[ref-name]" in _said(got), (
+        f"the finding is not tagged as a ref name:\n{_said(got)}"
+    )
+    assert "1 violation" in _said(got), _said(got)
+
+
+def test_a_name_in_a_local_tag_is_reported(tmp_path) -> None:
+    """The tag half of ``--refs-local``, which is a separate ref namespace."""
+    repo = _init_repo(tmp_path / "repo")
+    subprocess.run(
+        ["git", "-C", str(repo), "tag", f"v1.0-{SYNTHETIC_NEEDLE}"],
+        check=True, capture_output=True,
+    )
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_repo(repo, list_path, "--range", "HEAD", "--refs-local")
+
+    assert got.returncode == 1, f"a name in a tag name was not blocked:\n{_said(got)}"
+    assert "[ref-name]" in _said(got), _said(got)
+
+
+def test_ref_names_passed_explicitly_are_scanned(tmp_path) -> None:
+    """``--ref`` checks the names a push is publishing.
+
+    This is the pre-push shape, and it is deliberately independent of
+    ``--refs-local``: what a push publishes is what its ref lines say, which
+    is not necessarily what this repository currently holds. A ref the
+    operator has already deleted locally, or one that only exists on a
+    remote, still appears in those lines.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_repo(
+        repo, list_path, "--range", "HEAD",
+        "--ref", f"refs/heads/feat/{SYNTHETIC_NEEDLE}",
+        "--ref", "refs/tags/v1.0-release",
+    )
+
+    assert got.returncode == 1, f"a pushed ref name was not blocked:\n{_said(got)}"
+    assert "[ref-name]" in _said(got), _said(got)
+    assert "1 violation" in _said(got), (
+        f"the clean tag name alongside it was reported too:\n{_said(got)}"
+    )
+
+
+def test_an_unselected_ref_dimension_says_it_did_not_run(tmp_path) -> None:
+    """A dimension that did not run must say so.
+
+    The failure this module exists to prevent is a check that silently did
+    not happen reading as a clean pass. When no ref name is selected and
+    ``--refs-local`` is absent, the ref dimension has not run -- and the
+    output has to name that, because the exit code for it is the same 0
+    that a real clean run produces.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    _commit_file(repo, "backend/agent.py", "clean\n")
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_repo(repo, list_path, "--range", "HEAD")
+
+    assert got.returncode == 0, _said(got)
+    assert "ref name(s)" not in got.stdout.split("\n")[0], (
+        f"the detail line claims a ref count although none was selected:\n{got.stdout}"
+    )
+    assert "no ref names selected" in got.stdout, (
+        f"the run did not say the ref-name dimension did not run:\n{got.stdout}"
+    )
+
+
+def test_index_says_it_has_no_commit_message_dimension(tmp_path) -> None:
+    """``--index`` has no message surface, and says so rather than passing.
+
+    Nothing is committed yet, so there is no message to read. The failure
+    this guards against is the ``--index`` equivalent of a green-but-dead
+    check: a caller reading exit 0 and concluding the message was checked
+    when no message existed.
+    """
+    env = _staged_env(tmp_path)
+    _stage(env, "backend/agent.py", "clean\n")
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "scan_forbidden_names.sh"),
+         "--index", "--list", str(list_path)],
+        capture_output=True, text=True, env=env, check=False,
+    )
+
+    assert got.returncode == 0, _said(got)
+    assert "no commit-message dimension" in got.stdout, (
+        f"--index did not say the message dimension does not run here:\n{got.stdout}"
+    )
+
+
+def test_a_missing_message_object_is_exit_2_not_0(tmp_path) -> None:
+    """A partial read of the messages is exit 2, never a clean pass.
+
+    This is the fail-closed half of the message dimension and it is the
+    reason the count is checked rather than the output being scanned for
+    what happens to be there. An empty message -- real, and produced by
+    ``--allow-empty-message`` -- is a *read* of zero bytes and exits 0; an
+    unreadable object is a read that did not happen and exits 2.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    _commit_with_message(repo, "chore: an empty message", "")
+    list_path = _write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE)
+
+    got = _scan_repo(repo, list_path, "--range", "HEAD~1..HEAD")
+
+    assert got.returncode == 0, (
+        f"a commit with an empty message is a complete read of zero bytes, "
+        f"not a failed one:\n{_said(got)}"
+    )
+    assert "1 commit message(s)" in got.stdout, got.stdout
+
+
+def test_the_pre_push_hook_receives_the_ref_names_it_is_pushing(tmp_path) -> None:
+    """The ref dimension is wired to the hook, not merely available.
+
+    ``--ref`` existing proves nothing on its own: a flag nothing passes is
+    the dead-code failure this repository has shipped twice. This drives the
+    pre-push entry point with a ref line whose name carries a needle and
+    requires the push to be blocked for it.
+
+    The needle is :data:`_CLEAN_TREE_NEEDLE`, which occurs nowhere in this
+    repository, so the *only* thing that can block this push is the ref
+    name. A needle that also occurs in the tree would let the content scan
+    block it, and the test would then pass with the ref dimension dead --
+    which is exactly what happened when this test was first written, and
+    which the negative control below caught. Likewise the assertion is on a
+    *finding line*, not on the string ``[ref-name]``: the wrapper's HOWTO
+    legend contains that tag on every blocked push, so asserting on the
+    bare tag passes whether or not the dimension ran.
+    """
+    needle = _CLEAN_TREE_NEEDLE
+    ref = f"refs/heads/feat/{needle}-work"
+    _write_list(tmp_path / "forbidden-names", needle)
+    head = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    tip = _unpublished_tip(head)
+
+    real_list = REPO_ROOT / ".config" / "forbidden-names"
+    real_existed = real_list.exists()
+    real_bytes = real_list.read_bytes() if real_existed else None
+    try:
+        real_list.parent.mkdir(parents=True, exist_ok=True)
+        real_list.write_text(needle + "\n", encoding="utf-8")
+        got = subprocess.run(
+            ["bash", str(RANGE_SCRIPT), "--stdin-pre-push"],
+            input=f"{ref} {tip} {ref} {head}\n",
+            capture_output=True, text=True, cwd=str(REPO_ROOT), check=False,
+        )
+    finally:
+        if real_existed:
+            real_list.write_bytes(real_bytes)
+        else:
+            real_list.unlink(missing_ok=True)
+
+    if real_existed:
+        assert real_list.read_bytes() == real_bytes, (
+            "the test did not restore .config/forbidden-names byte-for-byte"
+        )
+
+    said = got.stdout + got.stderr
+    assert got.returncode == 1, (
+        f"the pre-push hook did not block a push publishing a forbidden "
+        f"ref name (exit {got.returncode}):\n{said}"
+    )
+    # A finding line: the two-space indent the scanner gives each reported
+    # violation, followed by this ref and its tag. Asserting on the tag
+    # alone would match the HOWTO legend instead.
+    assert f"  {ref} [ref-name]:" in said, (
+        f"the push was not blocked by a ref-name *finding*; the only way it "
+        f"can have been blocked is by something else:\n{said}"
+    )
+
+
+#: A needle for the pre-push control test that occurs nowhere in this
+#: repository's tree. The pre-push scan reads every blob in the range, and
+#: this file is one of them -- so a needle written here as one literal would
+#: be found in this file and every "the push was clean" assertion would fail
+#: on the test's own text. The concatenation is not concealment and is not
+#: the practice this file's docstring warns about; that warning is about
+#: real names, where splitting a string hides a name that must not be
+#: written down. Here the opposite is wanted: a string that is definitely
+#: not written down, so that "clean" means clean.
+_CLEAN_TREE_NEEDLE = "zz-synthetic" + "-clean-control-needle"
+
+
+def test_the_pre_push_hook_does_not_block_a_clean_ref_name(tmp_path) -> None:
+    """The control for the wiring test above.
+
+    A hook that blocked every push would pass that test too. This one pushes
+    a ref name that carries no needle and requires the push to be allowed.
+
+    The needle is :data:`_CLEAN_TREE_NEEDLE`, which occurs nowhere in this
+    tree, so a clean result is a statement about the whole scan -- every
+    blob, the message, the paths and the ref name -- rather than one
+    surviving a wall of unrelated findings. That is what leaves "the ref
+    name was clean" as the only thing that could have blocked this push.
+    """
+    needle = _CLEAN_TREE_NEEDLE
+    _write_list(tmp_path / "forbidden-names", needle)
+    head = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    tip = _unpublished_tip(head)
+
+    real_list = REPO_ROOT / ".config" / "forbidden-names"
+    real_existed = real_list.exists()
+    real_bytes = real_list.read_bytes() if real_existed else None
+    try:
+        real_list.parent.mkdir(parents=True, exist_ok=True)
+        real_list.write_text(needle + "\n", encoding="utf-8")
+        got = subprocess.run(
+            ["bash", str(RANGE_SCRIPT), "--stdin-pre-push"],
+            input=(
+                f"refs/heads/work/an-ordinary-name {tip} "
+                f"refs/heads/work/an-ordinary-name {head}\n"
+            ),
+            capture_output=True, text=True, cwd=str(REPO_ROOT), check=False,
+        )
+    finally:
+        if real_existed:
+            real_list.write_bytes(real_bytes)
+        else:
+            real_list.unlink(missing_ok=True)
+
+    if real_existed:
+        assert real_list.read_bytes() == real_bytes, (
+            "the test did not restore .config/forbidden-names byte-for-byte"
+        )
+
+    assert got.returncode == 0, (
+        f"the pre-push hook blocked a push whose ref name and commits are "
+        f"both clean (exit {got.returncode}):\n{got.stdout}\n{got.stderr}"
+    )
+    # No finding line of any kind. The bare tag is not the assertion: it
+    # appears in the HOWTO legend whenever the check blocks, so testing for
+    # it here would pass for a blocked push and mean nothing.
+    said = got.stdout + got.stderr
+    assert not [l for l in said.splitlines() if l.startswith("  ") and "[ref-name]:" in l], (
+        f"a ref-name finding was reported for a clean ref name:\n{said}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed: a dimension that did not run is exit 2, never a clean pass
+# ---------------------------------------------------------------------------
+#
+# The three tests above the per-surface ones would still pass if a dimension
+# silently reported nothing, which is the failure this module was written to
+# stop. These pin the other half: when a dimension is *selected* and cannot
+# read its input, the answer is exit 2, not 0.
+
+
+def test_the_ref_dimension_selected_with_no_names_is_exit_2(tmp_path) -> None:
+    """Asking for the ref dimension and reading no names is exit 2.
+
+    Found by writing this feature and testing only the happy path: with
+    ``--refs-local`` selected and an empty ref list the scan reported
+    ``OK  0 violations`` and exited 0 -- the new check, existing only to
+    find things, quietly finding nothing and saying so in the voice of a
+    clean run.
+
+    Driven through :func:`scan` with the ref reader stubbed, because the
+    honest way to reach "selected but empty" is a repository whose refs were
+    all deleted, and building one is a fixture whose brittleness would be its
+    own test. What is under test is the branch, not the plumbing above it.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    _commit_file(repo, "backend/agent.py", "clean\n")
+    list_path = Path(_write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE))
+
+    forbidden = _load_module(
+        REPO_ROOT / "scripts" / "scanners" / "scan_forbidden_names.py"
+    )
+    original = forbidden.read_ref_names
+    forbidden.read_ref_names = lambda repo: []
+    try:
+        with pytest.raises(forbidden.ScanError, match="ref-name dimension"):
+            forbidden.scan(
+                repo, list_path, index=False, range_specs=["HEAD"],
+                check_local_refs=True,
+            )
+    finally:
+        forbidden.read_ref_names = original
+
+
+def test_the_ref_dimension_raises_on_an_empty_ref_name(tmp_path) -> None:
+    """An empty ``--ref`` value is exit 2, not a name that matches nothing.
+
+    The same reasoning one level down: an empty string is a name that did
+    not arrive. The wrapper rejects it at the argument layer; this pins the
+    scanner, which is reachable directly and must not rely on every caller
+    being the wrapper.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    _commit_file(repo, "backend/agent.py", "clean\n")
+    list_path = Path(_write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE))
+
+    forbidden = _load_module(
+        REPO_ROOT / "scripts" / "scanners" / "scan_forbidden_names.py"
+    )
+    with pytest.raises(forbidden.ScanError, match="empty ref name"):
+        forbidden.scan(
+            repo, list_path, index=False, range_specs=["HEAD"],
+            ref_names=[""],
+        )
+
+
+def test_an_unreadable_commit_message_object_is_exit_2(tmp_path) -> None:
+    """A commit object that cannot be read is exit 2, not a clean message.
+
+    The message dimension's partial-read guard. Driven with a SHA that
+    resolves to no object, which is the shape a shallow or partially
+    fetched checkout produces and which the reader has to survive without
+    reporting "no messages to scan".
+    """
+    repo = _init_repo(tmp_path / "repo")
+    _commit_file(repo, "backend/agent.py", "clean\n")
+    list_path = Path(_write_list(tmp_path / "forbidden-names", SYNTHETIC_NEEDLE))
+
+    forbidden = _load_module(
+        REPO_ROOT / "scripts" / "scanners" / "scan_forbidden_names.py"
+    )
+    with pytest.raises(forbidden.ScanError, match="could not read its commit object"):
+        list(forbidden.read_commit_messages(repo, ["0" * 40]))
+
+
+def test_a_malformed_commit_object_is_exit_2(tmp_path) -> None:
+    """A commit object with no message separator is refused, not guessed at.
+
+    Taking ``tree``/``author`` headers for a message would scan the commit's
+    authorship under the pretence of scanning its prose -- which for this
+    gate is not a harmless over-scan but a different rule from the one the
+    operator wrote.
+
+    The object is written straight into the object store: ``hash-object``
+    refuses to create it (``fsck: unterminatedHeader``), which is git being
+    stricter than this scanner has any need to be -- git will decline to
+    *make* the object, and this test needs git to be able to *read* one it
+    did not make.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    _commit_file(repo, "backend/agent.py", "clean\n")
+
+    forbidden = _load_module(
+        REPO_ROOT / "scripts" / "scanners" / "scan_forbidden_names.py"
+    )
+    body = b"tree 1234\nauthor T <t@e.invalid> 0 +0000"
+    raw = b"commit %d\0" % len(body) + body
+    sha = hashlib.sha1(raw).hexdigest()
+    directory = repo / ".git" / "objects" / sha[:2]
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / sha[2:]).write_bytes(zlib.compress(raw))
+
+    with pytest.raises(forbidden.ScanError, match="no blank line"):
+        list(forbidden.read_commit_messages(repo, [sha]))
