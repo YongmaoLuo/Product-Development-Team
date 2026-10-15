@@ -107,6 +107,8 @@ from pathlib import Path
 
 import pytest
 
+import source_scan  # noqa: E402  (same directory; stdlib-only walker)
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 #: Root-level documents that ship. The repository-root ``CLAUDE.md`` is not
@@ -304,7 +306,13 @@ def scan_public_docs() -> list[tuple[Path, int, str]]:
 
 def test_public_docs_carry_no_incident_narrative() -> None:
     hits = scan_public_docs()
-    offenders = "\n  ".join(f"{p}:L{n}: {m!r}" for p, n, m in hits)
+    # The matched span is withheld. ``_SECRET_FRAGMENTS`` matches on
+    # whatever follows a secret prefix in a published document, so ``m`` is
+    # a slice of the very thing being withheld, and a slice of it is still
+    # it.
+    offenders = "\n  ".join(
+        f"{p}:L{n}: {source_scan.redact_span(m)}" for p, n, m in hits
+    )
     assert not hits, (
         "a public document describes what happened on one machine rather than "
         "what is wrong with the code. A defect is re-derivable by any reader "

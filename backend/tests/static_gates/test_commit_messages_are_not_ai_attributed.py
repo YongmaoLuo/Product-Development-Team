@@ -1177,7 +1177,12 @@ def test_no_commit_in_this_history_carries_an_ai_trailer() -> None:
     offenders = []
     for sha, body in history:
         for v in _violations(body):
-            offenders.append(f"{sha[:10]} L{v.lineno}: {v.reason}\n    {v.line}")
+            # sha + line number + the rule's own reason. NOT ``v.line``:
+            # a commit message is exactly where a private plan name and a
+            # private project name get quoted, and reprinting it here puts
+            # both on the operator's terminal -- which is how the
+            # ``refs/backup/old-origin/*`` sweep below leaked them.
+            offenders.append(f"{sha[:10]} L{v.lineno}: {v.reason}")
 
     assert not offenders, (
         "commits in this repository carry an AI attribution trailer. It "
@@ -1275,7 +1280,12 @@ def test_only_the_declared_refs_retain_the_trailer() -> None:
     offenders: dict[str, list[str]] = {}
     for ref in refs:
         found = [
-            f"{sha[:10]} L{v.lineno}: {v.line}"
+            # sha + line number only. NOT ``v.line``: the ref sweep reads
+            # commit bodies on refs that a rewrite left behind, and those
+            # bodies quote the private plan name in prose. Reprinting them
+            # is how this assertion painted them across the terminal the
+            # first time it ran red.
+            f"{sha[:10]} L{v.lineno}: <redacted>"
             for sha, body in _history_messages(ref=ref)
             for v in _violations(body)
         ]
@@ -1328,7 +1338,12 @@ def test_no_remote_tracking_ref_retains_the_trailer() -> None:
     offenders: dict[str, list[str]] = {}
     for ref in remote_refs:
         found = [
-            f"{sha[:10]} L{v.lineno}: {v.line}"
+            # sha + line number only. NOT ``v.line``: the ref sweep reads
+            # commit bodies on refs that a rewrite left behind, and those
+            # bodies quote the private plan name in prose. Reprinting them
+            # is how this assertion painted them across the terminal the
+            # first time it ran red.
+            f"{sha[:10]} L{v.lineno}: <redacted>"
             for sha, body in _history_messages(ref=ref)
             for v in _violations(body)
         ]

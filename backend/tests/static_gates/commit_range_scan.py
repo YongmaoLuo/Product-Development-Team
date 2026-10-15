@@ -165,9 +165,23 @@ class RangeScanError(RuntimeError):
     """The scan could not run. Never conflated with "found nothing"."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class Finding:
-    """One rule violation inside one commit's snapshot."""
+    """One rule violation inside one commit's snapshot.
+
+    ``snippet`` is the matched text and it stays in memory -- the rule
+    functions return it, the hit count is computed from the list length,
+    and the exit code follows it. :meth:`format` is what withholds it.
+
+    A commit is the one surface where a matched span is most likely to
+    *be* the private thing: a plan id is a quoted identifier by
+    definition, and a home path's username is a proper name. Printing
+    either here republishes it into a terminal and a CI log.
+
+    ``repr=False`` because the generated one interpolates every field,
+    ``snippet`` included, and a ``repr`` reaches a traceback and a pytest
+    assertion message as readily as ``print`` reaches a terminal.
+    """
 
     commit: str
     subject: str
@@ -179,8 +193,11 @@ class Finding:
     def format(self) -> str:
         return (
             f"{self.commit[:9]}  [{self.label}]  "
-            f"{self.path}:{self.lineno}: {self.snippet}"
+            f"{self.path}:{self.lineno}: {source_scan.redact_span(self.snippet)}"
         )
+
+    def __repr__(self) -> str:
+        return f"Finding({self.format()})"
 
 
 # ---------------------------------------------------------------------------

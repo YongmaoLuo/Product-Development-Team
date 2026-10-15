@@ -223,7 +223,14 @@ def test_no_first_party_source_carries_a_local_measurement() -> None:
         except OSError:
             continue
         for _, lineno, matched in find_local_measurements(path, text):
-            offenders.append(f"{path}:{lineno}: {matched}")
+            # The measurement shape is ``<verb> ... <date>`` with up to 30
+            # characters of free text in between, so the match routinely
+            # carries the plan id it was written next to -- and a plan id is
+            # a quoted private identifier. Withheld; ``path:lineno`` is
+            # what a reader needs.
+            offenders.append(
+                f"{path}:{lineno}: {source_scan.redact_span(matched)}"
+            )
 
     assert not offenders, (
         "First-party source carries a dated first-hand measurement or the "
