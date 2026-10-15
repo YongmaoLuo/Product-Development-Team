@@ -5270,7 +5270,28 @@ class Orchestrator:
         the rebuild command. See
         ``_build_binary_freshness_blocked_verdict``.
         """
-        verification_points = plan_data.get("verification_points", [])
+        # 2026-10-14：交给 Phase 3 的 ``verification_points`` 只包含本轮
+        # **真的会跑**的 VP —— 计划自己标记了 ``obsolete`` / ``superseded_by``
+        # 的那些被排除在外（``verification_executor._plan_retired_vps`` 是
+        # 同一个判据）。
+        #
+        # 为什么必须在信封这一层也摘掉，而不只是让
+        # ``executor.collect_verdicts()`` 不返回它们的裁决：Phase 3 的判定
+        # 提示词（``_build_judgment_prompt``）会把 ``verification_points``
+        # 原样列成「## 验证计划」。一个只有计划条目、没有任何执行结果的
+        # 作废 VP 对判定 LLM 来说是一张空白支票——它会替它编一个状态出来
+        # （同一个计划的第 4 轮里，判定 LLM 给被门禁延后的 VP-028 编了
+        # "记为 FAILED" 的散文，框架随后才把它强制还原成 DEFERRED）。顺带
+        # 也不再为作废 VP 白烧一次 ``_supplement_spec_code_review`` 的
+        # LLM 调用（2026-10-14 第 4 轮日志里 VP-009 唯一的一条记录就是这条
+        # ``judgment_heartbeat``）。
+        #
+        # 计划文件本身保留作废标记（打标记、不删除），审计痕迹不受影响。
+        retired = executor._plan_retired_vps()
+        verification_points = [
+            vp for vp in plan_data.get("verification_points", []) or []
+            if not (isinstance(vp, dict) and str(vp.get("id")) in retired)
+        ]
 
         executor_verdicts = executor.collect_verdicts()
 
