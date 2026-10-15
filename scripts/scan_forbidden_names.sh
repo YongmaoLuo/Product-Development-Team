@@ -53,6 +53,34 @@
 #   bash scripts/scan_forbidden_names.sh --range origin/main..HEAD
 #   bash scripts/scan_forbidden_names.sh --index --list /tmp/forbidden-names
 #   bash scripts/scan_forbidden_names.sh --help
+#
+# What it scans
+# -------------
+# Four surfaces, not one. A private name leaks through a file's contents, a
+# file's *name*, a commit's *message*, and a branch or tag *name*, and only
+# the first was checked before. The last two are the ones that survive
+# review: a commit message is prose nobody reads line by line, and a ref
+# name is published the moment it exists on a remote.
+#
+# Each is reported with its own tag so a reader can tell them apart:
+#
+#   path:lineno: needle               content of a staged/committed file
+#   <path> [path-name]: needle        the path itself
+#   <sha> [commit-message]:N: needle  a commit message, N lines in
+#   refs/... [ref-name]: needle       a branch or tag name
+#
+# --index has no commit-message surface: nothing is committed yet, so there
+# is no message to read, and the line says so rather than passing quietly.
+#
+# What --refs-local does and does not cover
+# ------------------------------------------
+# It reads every local branch and tag, which is what an operator can act on
+# before pushing. It CANNOT see a ref that already exists on a remote: no
+# local command enumerates what a remote holds. The pre-push path covers
+# what it can see for real -- the ref lines git feeds it, one --ref per line
+# -- which is every name *this push* is about to publish. A name already on
+# a remote, pushed from another machine or before this check existed, is
+# outside the reach of any local gate and is not claimed by this one.
 
 set -euo pipefail
 
@@ -79,6 +107,8 @@ Usage:
 Options:
   --index        Scan the content staged for the next commit
   --range SPEC   Scan every commit in SPEC (repeatable)
+  --ref NAME     Also scan this branch/tag name (repeatable)
+  --refs-local   Also scan every local branch and tag name
   --list PATH    Read the list from PATH (default: <repo>/.config/forbidden-names)
   --help         This text
 
@@ -120,6 +150,21 @@ while [ $# -gt 0 ]; do
             LIST_PATH="$2"
             PY_ARGS+=(--list "$2")
             shift 2
+            ;;
+        --ref)
+            # A ref name is not a mode: it selects the ref-name dimension
+            # alongside --index or --range, which is what pre-push needs
+            # (it has both a range and the names being published).
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                echo "ERROR: --ref requires a non-empty branch or tag name" >&2
+                exit 2
+            fi
+            PY_ARGS+=(--ref "$2")
+            shift 2
+            ;;
+        --refs-local)
+            PY_ARGS+=(--refs-local)
+            shift
             ;;
         --help|-h)
             usage
@@ -167,14 +212,23 @@ if [ "$RC" -eq 1 ]; then
     printf '%s\n' "$OUTPUT" >&2
     cat >&2 <<'HOWTO'
 
-Each line above is `relative/path:lineno: needle`. There is no per-file
-allowlist and no `tests/` exemption: a private name is as published in a
-fixture or a docstring as in a secret.
+Each line above names where the name was found:
+
+  relative/path:lineno: needle        inside a staged or committed file
+  relative/path [path-name]: needle   in the path itself
+  <sha> [commit-message]:N: needle   in a commit message, line N
+  refs/heads/... [ref-name]: needle   in a branch or tag name
+
+There is no per-file allowlist and no `tests/` exemption: a private name is
+as published in a fixture or a docstring as in a secret.
 
 To fix it, delete the name from the line — or, if the file genuinely has to
 name something the list flags, narrow the list entry rather than the
-check. The list is yours (.config/forbidden-names); the check is not
-optional once you have one.
+check. For a `[ref-name]` line the fix is `git branch -m` / `git tag -d`
+and a fresh push: the old name stays in every clone's reflog and in every
+`git ls-remote` that already saw it, so a rename is the only remedy there
+is. The list is yours (.config/forbidden-names); the check is not optional
+once you have one.
 HOWTO
     exit 1
 fi

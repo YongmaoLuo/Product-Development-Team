@@ -95,6 +95,12 @@ USE_CI=0
 USE_STDIN=0
 MAX_COMMITS=""
 RANGE_SPECS=()
+#: Ref names the push is about to publish, filled in from the pre-push
+#: ref lines below and passed to the forbidden-name check. Declared here
+#: rather than inside the ``--stdin-pre-push`` block because ``set -u`` is
+#: on: a run on any other path reads it, and an unset array would abort the
+#: script before it could say anything.
+PUSH_REF_NAMES=()
 
 usage() {
     cat <<'USAGE'
@@ -198,12 +204,35 @@ if [ "$USE_STDIN" -eq 1 ]; then
     # The final line may lack a trailing newline, hence the ``|| [ -n ... ]``
     # -- without it the last ref is silently skipped, which is the one case
     # a hook must not get wrong.
+    #
+    # PUSH_REF_NAMES collects the ref *names* on the way past. Content
+    # scanning cannot reach them: a branch called ``<name>-work`` publishes
+    # that name into every clone, every ``ls-remote`` and every web URL the
+    # moment it lands on a remote, and unlike a commit message it is not
+    # something a later commit removes. Both sides of the line are kept --
+    # the remote name is what the remote ends up holding, and the local one
+    # is what the developer sees and what a refspec like ``HEAD:refs/heads/
+    # main`` leaves behind.
+    #
+    # This is the *only* half of ref-name coverage a local gate can have,
+    # and the limit is worth stating: these are the refs this push is
+    # publishing. A ref that is already on a remote is not enumerated by
+    # any local command, so a name published by an earlier push, or from
+    # another machine, cannot be checked here. What can be checked is what
+    # can still be fixed before it goes out.
+    PUSH_REF_NAMES=()
     while read -r local_ref local_sha remote_ref remote_sha || [ -n "${local_sha:-}" ]; do
         if [ -z "${local_sha:-}" ]; then
             continue
         fi
         if [[ "$local_sha" =~ ^0+$ ]]; then
             continue   # deleting a ref: nothing to scan
+        fi
+        if [ -n "${local_ref:-}" ]; then
+            PUSH_REF_NAMES+=("$local_ref")
+        fi
+        if [ -n "${remote_ref:-}" ] && [ "$remote_ref" != "${local_ref:-}" ]; then
+            PUSH_REF_NAMES+=("$remote_ref")
         fi
         if [[ "$remote_sha" =~ ^0+$ ]]; then
             RANGE_SPECS+=("${local_sha} --not --remotes")
@@ -357,6 +386,14 @@ if [ "$USE_STDIN" -eq 1 ]; then
         FORBIDDEN_ARGS=()
         for spec in "${RANGE_SPECS[@]}"; do
             FORBIDDEN_ARGS+=(--range "$spec")
+        done
+        # The ref names this push publishes, one --ref each. Passed
+        # alongside the ranges rather than in a second invocation: one
+        # wrapper call means one list read and one exit code for both
+        # dimensions, and there is no state in which the commits were
+        # checked and the names were not.
+        for ref in "${PUSH_REF_NAMES[@]}"; do
+            FORBIDDEN_ARGS+=(--ref "$ref")
         done
         FORBIDDEN_NAMES_RC=0
         FORBIDDEN_NAMES_OUTPUT=$(bash "$FORBIDDEN_NAMES_SCRIPT" "${FORBIDDEN_ARGS[@]}" 2>&1) || FORBIDDEN_NAMES_RC=$?
