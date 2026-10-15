@@ -105,10 +105,10 @@ That inventory was prose, and prose is what the three tests below were
 written against. ``_ALLOWED_TRAILER_REFS`` declares the two backup refs —
 and only those two — as permitted to retain the trailer, each with its
 one-line reason, and ``test_only_the_declared_refs_retain_the_trailer``
-walks every name from ``git for-each-ref`` and requires the refs carrying
-violations to be a subset of that set. The realistic way a third one
-appears is another ``backup/pre-*`` branch taken before a later rewrite:
-the shape that turns this red is the same mistake, one task on.
+requires every ref carrying violations on its sweep surface to be a
+subset of that set. The realistic way a third one appears is another
+``backup/pre-*`` branch taken before a later rewrite: the shape that
+turns this red is the same mistake, one task on.
 
 **The sweep covers two rules, and each ref is judged against the rules it
 is actually exempt for.** ``find_violations`` rejects an AI attribution
@@ -138,6 +138,35 @@ repository under ``tmp_path`` and the same helper is required to report
 it. Both mutations were run and both are caught — breaking the helper
 turns the control red, and making the enumeration return nothing turns
 both ref tests red.
+
+The surface, narrowed to what can still be published
+----------------------------------------------------
+The sweep originally read every name ``git for-each-ref`` would give it,
+and that turned out to be the wrong question rather than a wider net.
+**The danger was never a dirty local branch; it was a ref reaching a
+remote.** The carrier of the event above was ``refs/pull/45/head`` — a ref
+GitHub minted, fetched locally as a ``refs/remotes/**`` mirror. Sweeping
+every ``refs/heads/**`` name meant every development branch reported, so a
+real finding arrived buried in a wall of findings that were all the same
+non-finding: branches that were never pushed cannot leak.
+
+So :func:`_publishable_refs` reads the refs that can still become public
+— ``HEAD`` (whichever branch is checked out, and about to be pushed or
+merged whatever it is called), ``refs/remotes/**``, ``refs/tags/**``, and
+the declared audit refs. Narrowing does not open a hole on the push path,
+because that path has its own gate: ``scripts/scan_commit_range.sh
+--stdin-pre-push`` applies ``RANGE_RULES`` and ``MESSAGE_RULES`` to every
+commit git is about to publish, and it runs *before* publication rather
+than after it. ``test_the_narrowed_sweep_still_finds_a_pushed_ref`` plants
+a violation on the narrowed surface to show it still reaches a published
+ref, and empties a repository to show the non-emptiness guard is not
+itself vacuous.
+
+What narrowing costs is stated rather than argued away: a local branch
+that is never pushed is no longer reported by either test, so a leak
+sitting on one is caught when somebody tries to publish it rather than
+while it waits. That is the trade, and it is the operator's: a branch
+nobody submits has not leaked.
 
 A red that was real, and is now historical
 ------------------------------------------
@@ -952,14 +981,16 @@ class _Declared(NamedTuple):
 #: findings: the two were one string until it produced a report that told
 #: a reader to amend an allowlist over a private id.
 _TRAILER_REMEDY = (
-    "For a [trailer] finding: delete the line from the commit message. If "
-    "one of these is a ref/original/** path, a history rewrite left it "
-    "behind and it should be deleted — residue is not an audit trail. If "
-    "it is a backup taken before a rewrite, say so by adding it to "
+    "For a [trailer] finding: delete the line from the commit message. "
+    "Every ref on this report is one that can still be published, so "
+    "none of them is history you are only keeping locally. If one is a "
+    "backup taken before a rewrite, say so by adding it to "
     "_ALLOWED_TRAILER_REFS with its reason and with the rules it is "
-    "exempt from; do not delete it without checking what it is the only "
-    "remaining copy of. It is not exempt from the plan-id rule by being "
-    "listed here."
+    "exempt from; that also keeps it on the sweep surface, so the entry "
+    "goes on being checked rather than quietly dropping the ref out of "
+    "it. Do not delete it without checking what it is the only remaining "
+    "copy of. It is not exempt from the plan-id rule by being listed "
+    "here."
 )
 
 #: The fix for a ``[plan id]`` finding. It is a message rewrite and it is
@@ -1023,11 +1054,28 @@ def _violations(message: str) -> list:
     return checker.find_violations(message)
 
 
+class _Scan(NamedTuple):
+    """What one sweep looked at, and what it found in it.
+
+    *refs* and *commits* are counted on the walk itself rather than
+    beside it. That is the whole point of carrying them out of
+    :func:`_sweep`: a surface that resolves to nothing makes every
+    assertion reading the result pass without having read anything, and
+    the narrower the surface is drawn the easier that is to cause by
+    accident. A count taken from the same loop is the only one that
+    cannot disagree with what was walked.
+    """
+
+    offenders: dict[str, dict[str, list[str]]]
+    refs: int
+    commits: int
+
+
 def _sweep(
     refs: list[str],
     allowed: dict[str, _Declared] | None = None,
     repo: Path | None = None,
-) -> dict[str, dict[str, list[str]]]:
+) -> _Scan:
     """Findings no declaration exempts, as ``{ref: {rule: [finding, ...]}}``.
 
     The one place the ref tests read history, so the negative controls
@@ -1044,6 +1092,7 @@ def _sweep(
     """
     table = _ALLOWED_TRAILER_REFS if allowed is None else allowed
     offenders: dict[str, dict[str, list[str]]] = {}
+    walked: set[str] = set()
     for ref in refs:
         # A ref absent from the table is exempt from nothing: the set is
         # closed, and a ref it names is exempt only from the rules that
@@ -1051,13 +1100,14 @@ def _sweep(
         exempted = set(table[ref].rules) if ref in table else set()
         per_rule: dict[str, list[str]] = {}
         for sha, body in _history_messages(ref=ref, repo=repo):
+            walked.add(sha)
             for v in _violations(body):
                 if v.rule in exempted:
                     continue
                 per_rule.setdefault(v.rule, []).append(f"{sha[:10]} L{v.lineno}")
         if per_rule:
             offenders[ref] = per_rule
-    return offenders
+    return _Scan(offenders, len(refs), len(walked))
 
 
 def _census(offenders: dict[str, dict[str, list[str]]]) -> str:
@@ -1523,7 +1573,7 @@ def test_a_plan_id_finding_survives_the_trailer_allowlist(tmp_path) -> None:
             [_TRAILER_ONLY_REF, _PLAN_ID_ONLY_REF],
             allowed=trailer_only_allowlist,
             repo=repo,
-        )
+        ).offenders
 
         assert _TRAILER_ONLY_REF not in offenders, (
             "a ref declared exempt from the trailer rule was still reported "
@@ -1560,7 +1610,7 @@ def test_a_plan_id_finding_survives_the_trailer_allowlist(tmp_path) -> None:
             [_TRAILER_ONLY_REF, _PLAN_ID_ONLY_REF],
             allowed=both_rules_allowlist,
             repo=repo,
-        )
+        ).offenders
         assert wide == {}, (
             "declaring the refs exempt from both rules did not quiet them, so "
             "the control above is not measuring the declaration at all — it "
@@ -1622,26 +1672,233 @@ def test_the_ref_report_names_the_rule_beside_every_finding() -> None:
     )
 
 
-def _all_refs() -> list[str]:
+def _all_refs(repo: Path | None = None) -> list[str]:
     """Every ref name git knows about, or fail: a sweep of nothing is not
     evidence of nothing."""
-    if not (_REPO_ROOT / ".git").exists():
+    cwd = _REPO_ROOT if repo is None else repo
+    if repo is None and not (_REPO_ROOT / ".git").exists():
         pytest.skip("not a git work tree — no refs to sweep")
     out = subprocess.run(
         ["git", "for-each-ref", "--format=%(refname)"],
-        cwd=_REPO_ROOT, capture_output=True, text=True, check=True,
+        cwd=cwd, capture_output=True, text=True, check=True,
     ).stdout
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
+#: The ref namespaces this gate sweeps, and what each one is.
+#:
+#: * ``refs/remotes/**`` — the local mirror of a remote. The receipt that
+#:   a ref has already been published, and the only check that can catch
+#:   a push after the fact. GitHub's pull-request head refs land here
+#:   too, under whichever remote they were fetched through.
+#: * ``refs/tags/**`` — a tag is pushed exactly like a branch and carries
+#:   history with it, so it publishes on the same terms.
+#:
+#: What is deliberately **not** here is the ``refs/heads/**`` namespace.
+#: Sweeping it meant sweeping every development branch, and a branch that
+#: is never pushed cannot leak; the gate turned that into a finding on
+#: every one of them, which is the opposite of a gate. A local branch is
+#: still checked twice over — ``HEAD`` is in this surface whichever branch
+#: is checked out, and anything reaching a remote has to pass the pre-push
+#: hook on the way, which is the one gate that runs *before* publication
+#: rather than after it.
+_PUBLISHABLE_PREFIXES: tuple[str, ...] = ("refs/remotes/", "refs/tags/")
+
+
+def _publishable_refs(repo: Path | None = None) -> list[str]:
+    """The refs that can still be published: the surface both ref tests read.
+
+    Three parts, in the order the report lists them:
+
+    * ``HEAD`` — the branch being worked on, which is about to be pushed
+      or merged whatever it is called. Added only when it resolves to a
+      commit, so an unborn ``HEAD`` does not put a name on the surface
+      that walks nothing and makes the emptiness counters read non-zero.
+    * every ref under :data:`_PUBLISHABLE_PREFIXES`.
+    * every ref named in :data:`_ALLOWED_TRAILER_REFS`, which is how a
+      declared audit ref stays *on* the surface rather than falling off
+      it. The table and the surface are built from each other, so
+      neither can be emptied without the other noticing — see
+      ``test_only_the_declared_refs_retain_the_trailer``.
+    """
+    cwd = _REPO_ROOT if repo is None else repo
+    if repo is None and not (_REPO_ROOT / ".git").exists():
+        pytest.skip("not a git work tree — no refs to sweep")
+    refs: list[str] = []
+    head = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        cwd=cwd, capture_output=True, text=True,
+    )
+    if head.returncode == 0:
+        refs.append("HEAD")
+    refs.extend(r for r in _all_refs(repo=cwd) if r.startswith(_PUBLISHABLE_PREFIXES))
+    refs.extend(r for r in _ALLOWED_TRAILER_REFS if r not in refs)
+    return refs
+
+
+#: The namespaces a published ref can live under, spelled out here rather
+#: than read from :data:`_PUBLISHABLE_PREFIXES`.
+#:
+#: The first version of the check below imported that constant, which made
+#: it useless: a deliberately broken prefix changed the constant, the check
+#: looked for refs under the broken prefix, found none missing, and passed.
+#: The check was asking the implementation what it ought to have found. An
+#: expectation derived from the thing under test is not a check, so these two
+#: strings are written out and the duplication is deliberate — if a namespace
+#: is ever added, this is the second place to add it, and the mutation below
+#: is what proves the two have not drifted apart.
+_EXPECTED_PUBLISHABLE_PREFIXES: tuple[str, ...] = ("refs/remotes/", "refs/tags/")
+
+
+def _assert_no_published_ref_was_dropped(
+    refs: list[str], repo: Path | None = None
+) -> None:
+    """Fail unless every ref under a publishable namespace is on *refs*.
+
+    The counters in :func:`_assert_the_sweep_was_not_empty` are totals, and
+    a total is satisfied by whichever part of the surface still works. When
+    the prefixes were first narrowed this assertion did not exist, and a
+    deliberately broken prefix left the sweep reading ``HEAD`` alone — a
+    branch whose history is clean, both counters comfortably above zero,
+    and the ref test green while it no longer looked at a single published
+    ref. A count cannot catch the loss of a whole namespace; enumerating
+    what the namespace should have contributed can.
+    """
+    missing = sorted(
+        r for r in _all_refs(repo=repo)
+        if r.startswith(_EXPECTED_PUBLISHABLE_PREFIXES) and r not in set(refs)
+    )
+    assert not missing, (
+        f"{len(missing)} ref(s) that can still be published are not on the "
+        f"sweep surface, first {missing[:3]}. Every ref under "
+        f"{_EXPECTED_PUBLISHABLE_PREFIXES} has to be swept — a surface that "
+        f"quietly omits one is a gate that has stopped watching it, and the "
+        f"counts in _assert_the_sweep_was_not_empty will not say so."
+    )
+
+
+def _assert_the_sweep_was_not_empty(scan: _Scan) -> None:
+    """Fail unless the sweep actually walked something.
+
+    Both ref tests assert that nothing was found, which a sweep of zero
+    refs satisfies for the wrong reason. The narrower this surface is
+    drawn, the cheaper that mistake is to make — one changed prefix and
+    the gate is green because it stopped looking, not because the
+    repository is clean. So the counters the walk produced itself are
+    asserted non-zero before its verdict is read.
+
+    ``test_the_narrowed_sweep_still_finds_a_pushed_ref`` plants a
+    violation on the surface to show the walk is real, and empties a
+    repository to show this guard is not vacuous.
+    """
+    assert scan.refs > 0 and scan.commits > 0, (
+        f"the sweep walked {scan.refs} ref(s) and {scan.commits} commit(s). "
+        f"A surface that resolves to nothing makes every assertion below "
+        f"pass without checking anything: either the prefixes in "
+        f"_PUBLISHABLE_PREFIXES match no ref in this repository, or "
+        f"HEAD is unborn."
+    )
+
+
+def test_the_narrowed_sweep_still_finds_a_pushed_ref(tmp_path) -> None:
+    """Negative control for the narrowing, on the surface it defines.
+
+    Narrowing a scan surface has one failure mode that no assertion
+    downstream can catch: the surface becomes empty, or stops containing
+    anything reachable, and the tests that read it go green because they
+    stopped looking. That is the risk this control takes on directly.
+
+    Two halves, against throwaway repositories under ``tmp_path`` rather
+    than this one — a control that planted a ref in the real repository
+    to make itself red would leave it behind the first time it was
+    interrupted, and the gate it guards reads every ref there.
+
+    * A repository holding one commit whose message carries a synthetic
+      plan id, published onto a ``refs/remotes/**`` ref. It must appear
+      in :func:`_publishable_refs`, and the sweep must report it — so the
+      narrowed surface still reaches a published ref.
+    * A repository with no commits at all. The surface it yields walks
+      nothing, so :func:`_assert_the_sweep_was_not_empty` must refuse it
+      — so the guard both ref tests call is not itself vacuous.
+    """
+    planted = tmp_path / "planted-pushed"
+    planted.mkdir()
+    empty = tmp_path / "planted-empty"
+    empty.mkdir()
+    remote_ref = "refs/remotes/example/plausible-branch"
+    try:
+        _run_git(planted, "init", "-q")
+        _run_git(planted, "read-tree", "--empty")
+        tree = _run_git(planted, "write-tree").strip()
+        sha = _run_git(
+            planted,
+            "-c", "user.name=Plant", "-c", "user.email=plant@example.invalid",
+            "commit-tree", tree, "-m",
+            f"a commit\n\nsee {_PLANTED_PLAN_ID} for the round-4 rewrite\n",
+        ).strip()
+        _run_git(planted, "update-ref", remote_ref, sha)
+
+        surface = _publishable_refs(repo=planted)
+        assert remote_ref in surface, (
+            "a published ref is not on the surface the narrowed sweep reads: "
+            f"{surface}. Either _PUBLISHABLE_PREFIXES has stopped matching "
+            "refs/remotes/**, or the surface builder is not reading the "
+            "repository it was given — and the sweep would then go green "
+            "for having found nothing."
+        )
+
+        scan = _sweep(surface, repo=planted)
+        _assert_the_sweep_was_not_empty(scan)
+        assert scan.commits > 0, (
+            "the sweep walked a repository holding a commit and reached "
+            "none of it"
+        )
+        assert scan.offenders.get(remote_ref, {}).get(_RULE_PLAN_ID), (
+            "a refs/remotes/** ref carrying a planted plan id was not "
+            f"reported: {scan.offenders}. The surface the two ref tests "
+            "read has lost the published refs, which is the one thing it "
+            "was narrowed to keep."
+        )
+
+        # The other half: the guard is not a formality. This repository
+        # has no commits, so nothing is reachable and the surface walks
+        # nothing — the exact state in which "no offenders" would be a
+        # vacuous pass rather than a clean result.
+        _run_git(empty, "init", "-q")
+        empty_scan = _sweep(_publishable_refs(repo=empty), repo=empty)
+        assert empty_scan.commits == 0, (
+            f"a repository with no commits reported {empty_scan.commits} "
+            "walked commit(s); the fixture is not exercising the empty case"
+        )
+        with pytest.raises(AssertionError, match="commit"):
+            _assert_the_sweep_was_not_empty(empty_scan)
+    finally:
+        # Nothing started here may outlive the test: tmp_path is pytest's
+        # to clean, but the repositories are this test's own.
+        shutil.rmtree(planted, ignore_errors=True)
+        shutil.rmtree(empty, ignore_errors=True)
+    assert not planted.exists(), "the planted repository outlived the test"
+    assert not empty.exists(), "the planted repository outlived the test"
+
+
 def test_only_the_declared_refs_retain_the_trailer() -> None:
-    """Every ref, not just the one HEAD reaches.
+    """Every ref that can still be published, and not one branch more.
 
     ``test_no_commit_in_this_history_carries_an_ai_trailer`` is green and
     can be misread as *this repository has no trailer-bearing history*.
     It is a statement about one ref. The realistic way a third one appears
     is a ``backup/pre-*`` branch taken before some later rewrite — the
     same mistake as 2026-10-05, one task after it.
+
+    The surface used to be every ref ``git for-each-ref`` would name,
+    which swept in every development branch as well. That is not a wider
+    net for the thing this gate is about, it is a different question: a
+    branch nobody pushes cannot leak, and reporting one turns a finding
+    into background noise that trains the reader to ignore the report.
+    What is left is the set of refs that can still become public — the
+    branch in hand, the remote mirrors, the tags, and the declared audit
+    refs — and those are what this asserts on. See
+    :func:`_publishable_refs` for why each part is in it.
 
     The report says which rule sent each ref red, because the two rules
     have opposite remedies and the old single-list message handed both of
@@ -1650,15 +1907,33 @@ def test_only_the_declared_refs_retain_the_trailer() -> None:
     acquires a standing exemption: the entry is then consulted for that
     ref on every future run and the id stays.
     """
-    refs = _all_refs()
-    assert refs, (
-        "git for-each-ref returned no refs — the scan is broken, and this "
-        "test would pass without checking anything"
+    refs = _publishable_refs()
+
+    # Every ref under the publishable prefixes has to be on the surface.
+    # Read as a set rather than left to the counters below, which a single
+    # surviving part of the surface satisfies on its own.
+    _assert_no_published_ref_was_dropped(refs)
+
+    # The allowlist earns its place by being the reason a declared ref is
+    # still swept at all. Drop the union in _publishable_refs and these
+    # two fall off the surface, the table stops being consulted for
+    # anything, and it would then be a declaration that is green because
+    # the set it names is never looked at — worse than no table, because
+    # it still reads as one.
+    assert set(_ALLOWED_TRAILER_REFS) <= set(refs), (
+        "every declared ref is on the sweep surface; "
+        f"{sorted(set(_ALLOWED_TRAILER_REFS) - set(refs))} is not. The table "
+        "and the surface are built from each other — a declared ref is "
+        "swept and exempted, never merely absent — so a table entry that "
+        "has fallen off the surface is an exemption nothing consults."
     )
 
-    offenders = _sweep(refs)
+    scan = _sweep(refs)
+    _assert_the_sweep_was_not_empty(scan)
+    offenders = scan.offenders
     assert not offenders, (
-        "undeclared refs retain commits the commit-message gate rejects:\n"
+        "undeclared refs that can still be published retain commits the "
+        "commit-message gate rejects:\n"
         + _census(offenders)
         + _report(offenders)
         + "\n\n"
@@ -1675,14 +1950,12 @@ def test_no_remote_tracking_ref_retains_the_trailer() -> None:
     whether it was published. A remote-tracking ref is the receipt: if
     ``refs/remotes/**`` carries a violation, the trailer is already on
     the remote, and stripping it locally has not undone that.
-    """
-    refs = _all_refs()
-    assert refs, (
-        "git for-each-ref returned no refs — the scan is broken, and this "
-        "test would pass without checking anything"
-    )
 
-    remote_refs = [r for r in refs if r.startswith("refs/remotes/")]
+    Read from the same surface the test above reads, rather than from
+    ``git for-each-ref`` directly, so the two cannot come to disagree
+    about which refs are in scope.
+    """
+    remote_refs = [r for r in _publishable_refs() if r.startswith("refs/remotes/")]
     if not remote_refs:
         # Vacuous unless a remote is configured and simply not fetched —
         # that is a broken scan, not an absence of pushes.
@@ -1694,7 +1967,9 @@ def test_no_remote_tracking_ref_retains_the_trailer() -> None:
             "ref — the scan is broken, so this test cannot detect a push"
         )
 
-    offenders = _sweep(remote_refs)
+    scan = _sweep(remote_refs)
+    _assert_the_sweep_was_not_empty(scan)
+    offenders = scan.offenders
     assert not offenders, (
         "remote-tracking refs carry commits the commit-message gate "
         "rejects, so that history has been published:\n"
