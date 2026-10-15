@@ -1023,17 +1023,6 @@ def _violations(message: str) -> list:
     return checker.find_violations(message)
 
 
-def _exempted_rules(ref: str) -> set[str]:
-    """The rules *ref* is allowed to keep a finding for, or nothing.
-
-    A ref absent from the allowlist is exempt from nothing; that is the
-    closed-set property the gate depends on, so it is spelled out here
-    rather than inherited from a ``dict.get`` default that could widen.
-    """
-    entry = _ALLOWED_TRAILER_REFS.get(ref)
-    return set(entry.rules) if entry is not None else set()
-
-
 def _sweep(
     refs: list[str],
     allowed: dict[str, _Declared] | None = None,
@@ -1056,9 +1045,10 @@ def _sweep(
     table = _ALLOWED_TRAILER_REFS if allowed is None else allowed
     offenders: dict[str, dict[str, list[str]]] = {}
     for ref in refs:
-        exempted = (
-            set(table[ref].rules) if ref in table else set()
-        )
+        # A ref absent from the table is exempt from nothing: the set is
+        # closed, and a ref it names is exempt only from the rules that
+        # entry lists, never from the rule it does not.
+        exempted = set(table[ref].rules) if ref in table else set()
         per_rule: dict[str, list[str]] = {}
         for sha, body in _history_messages(ref=ref, repo=repo):
             for v in _violations(body):
