@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from coding_tool import CodingTool, JsonSession, query_in_session
+from plan_sessions import KEY_TEST_DESIGN, persist_session
 from self_review import run_doc_self_review, write_self_review_report
 from execution_logger import get_logger
 
@@ -273,6 +274,16 @@ class TestDesignGenerator:
                 prompt=retry_prompt,
                 system_instruction=TEST_DESIGN_SYSTEM_PROMPT,
             )
+
+        # Record which session wrote ``test-design.md`` so the revise
+        # that answers the reviewer's rejection can re-open it rather
+        # than paste the whole design back into a fresh prompt. That
+        # revise is a separate request, so the handle above is out of
+        # reach by then — see ``plan_sessions`` for the file and for why
+        # nothing user-facing lists it. Placed after the format re-ask
+        # above so the recorded id is the one the surviving document
+        # came out of, not the one the rejected draft came out of.
+        persist_session(self.plan_dir, KEY_TEST_DESIGN, session)
 
         self.plan_dir.mkdir(parents=True, exist_ok=True)
 

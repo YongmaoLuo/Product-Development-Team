@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -825,3 +826,658 @@ def test_the_whole_tasks_generate_shares_one_session(tmp_path, recorder,
     assert len({c["session_id"] for c in rec.calls}) == 1, (
         "one session for the whole generate(), not one per step"
     )
+
+
+# ---------------------------------------------------------------------------
+# Points 8-10 -- the sidecar: a whole-document revise is a *different*
+# request from the generate that wrote the document
+# ---------------------------------------------------------------------------
+#
+# Everything above drives both halves of a conversation inside one
+# process, which is what the in-process ``JsonSession`` handle was built
+# for. The whole-document revise is not that: ``/api/prd/{id}/refine``
+# builds a brand-new ``PRDRefiner`` in a request that arrives after the
+# one that ran ``generate()`` has finished -- and across a service
+# restart, in a different process entirely. By then the handle is gone
+# and the reviser has to paste the whole document back into the prompt.
+#
+# What these pin: the generation records the session it used in a
+# sidecar under ``plan_dir``, and the refine re-opens it. The three
+# degradation paths and the "the first call must not change" contract
+# are pinned alongside, because a reuse channel that costs a regression
+# on the first turn is not worth having.
+
+
+# The child process one request runs in.
+#
+# Why a real subprocess rather than "clear the module dicts": the whole
+# claim under test is that the id survives *the process*. Deleting
+# ``interviewer._INTERVIEW_SESSIONS`` proves the same thing for one
+# known dict, and would keep proving it if someone added a second
+# in-process carrier that the test does not know to clear. A fresh
+# interpreter cannot carry anything, so every in-process route is closed
+# at once by construction -- which is exactly the property being claimed.
+#
+# The child reports how many handles its own process holds, so the
+# evidence that it really started empty is in the output rather than
+# inferred.
+_CROSS_REQUEST_CHILD = r'''
+import json
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock
+
+backend = Path(sys.argv[1])
+sys.path.insert(0, str(backend))
+
+import coding_tool as ct
+
+phase, action, plan_dir_s, rules_s = sys.argv[2:6]
+plan_dir = Path(plan_dir_s)
+rules = json.loads(rules_s)
+
+CALLS = []
+PROMPTS = []
+#: When set, a ``--resume`` of this id is refused the way the CLI
+#: refuses one it no longer has: no assistant text, non-zero exit.
+DEAD_RESUME_ID = None
+
+
+def _flag(cmd, flag):
+    return cmd[cmd.index(flag) + 1] if flag in cmd else None
+
+
+def _pick(call):
+    system = call["system"] or ""
+    for rule in rules:
+        if "system_contains" in rule and rule["system_contains"] in system:
+            return rule["reply"]
+        if "system_is_none" in rule and call["system"] is None:
+            return rule["reply"]
+        if "any" in rule:
+            return rule["reply"]
+    return ""
+
+
+def _popen(cmd, *a, **k):
+    cmd = list(cmd)
+    call = {
+        "session_flag": (
+            "--resume" if "--resume" in cmd
+            else "--session-id" if "--session-id" in cmd
+            else None
+        ),
+        "session_id": _flag(cmd, "--resume") or _flag(cmd, "--session-id"),
+        "system": _flag(cmd, "--append-system-prompt"),
+    }
+    CALLS.append(call)
+    PROMPTS.append([])
+    proc = MagicMock()
+    if DEAD_RESUME_ID is not None and call["session_id"] == DEAD_RESUME_ID:
+        proc.stdout = iter([])
+        proc.returncode = 1
+        proc.stderr = MagicMock()
+        proc.stderr.read.return_value = "Error: Invalid session ID"
+    else:
+        proc.stdout = iter([
+            json.dumps({"type": "result", "result": _pick(call)},
+                       ensure_ascii=False) + "\n",
+        ])
+        proc.returncode = 0
+        proc.stderr = MagicMock()
+        proc.stderr.read.return_value = ""
+    proc.stdin = MagicMock()
+    proc.stdin.write.side_effect = PROMPTS[-1].append
+    return proc
+
+
+ct.subprocess.Popen = _popen
+tool = ct.ClaudeCodingTool()
+tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
+tool.logger = MagicMock()
+
+if action == "generate":
+    if phase == "prd":
+        from prd_generator import PRDGenerator
+        PRDGenerator(tool, plan_dir, self_review_enabled=True).generate()
+    elif phase == "arch":
+        from arch_generator import ArchGenerator
+        ArchGenerator(tool, plan_dir, self_review_enabled=True).generate()
+    else:
+        from test_design_generator import TestDesignGenerator
+        TestDesignGenerator(tool, plan_dir, self_review_enabled=True).generate()
+elif action == "refine":
+    if phase == "prd":
+        from prd_refiner import PRDRefiner
+        PRDRefiner(tool, plan_dir).refine()
+    elif phase == "arch":
+        from arch_refiner import ArchRefiner
+        ArchRefiner(tool, plan_dir).refine(feedback="范围要收窄")
+    else:
+        from test_design_refiner import TestDesignRefiner
+        TestDesignRefiner(tool, plan_dir).refine(feedback="范围要收窄")
+elif action == "interview_start":
+    from interviewer import Interviewer
+    Interviewer(tool, plan_dir).start("我要一个记账工具")
+elif action == "interview_continue":
+    from interviewer import Interviewer
+    Interviewer(tool, plan_dir).continue_interview("要支持多币种")
+else:
+    raise SystemExit(f"unknown action {action!r}")
+
+import interviewer
+import plan_sessions
+
+print(json.dumps({
+    "calls": CALLS,
+    "prompts": ["".join(p) for p in PROMPTS],
+    "in_process_interview_handles": len(interviewer._INTERVIEW_SESSIONS),
+    "sidecar": str(plan_sessions.sessions_path(plan_dir)),
+    "sidecar_exists": plan_sessions.sessions_path(plan_dir).exists(),
+}, ensure_ascii=False))
+'''
+
+
+def _run_child(script, backend_dir, phase, action, plan_dir, rules, extra_env=None):
+    """Run one request in its own interpreter; return its JSON report."""
+    import os
+    import subprocess
+
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    if extra_env:
+        env.update(extra_env)
+    completed = subprocess.run(
+        [sys.executable, str(script), str(backend_dir), phase, action,
+         str(plan_dir), json.dumps(rules, ensure_ascii=False)],
+        capture_output=True, text=True, timeout=300, env=env,
+    )
+    assert completed.returncode == 0, (
+        f"child request {action!r} for phase {phase!r} failed:\n"
+        f"--- stdout ---\n{completed.stdout}\n"
+        f"--- stderr ---\n{completed.stderr}"
+    )
+    return json.loads(completed.stdout.strip().splitlines()[-1])
+
+
+@pytest.fixture
+def child_script(tmp_path_factory):
+    """The child program, written once per session to a real file."""
+    script = tmp_path_factory.mktemp("cross_request") / "child.py"
+    script.write_text(_CROSS_REQUEST_CHILD, encoding="utf-8")
+    return script
+
+
+# Reply rules for each child's dispatches. The generator and the refiner
+# both pass a system instruction, the self-review passes none -- that is
+# what tells the three apart inside one child.
+def _plan_phase_rules(phase):
+    from interviewer import INTERVIEWER_SYSTEM_PROMPT, SCOPE_PRECHECK_SYSTEM_PROMPT
+
+    if phase == "prd":
+        prd = {
+            "title": "测试项目",
+            "overview": "测试概述",
+            "decision_points": [{
+                "title": "决策点1", "context": "x", "problem": "y",
+                "evidence": "z", "action": "a",
+            }],
+        }
+        main = json.dumps(prd, ensure_ascii=False)
+        doc = "reviewed prd"
+    elif phase == "arch":
+        main = _ARCH_MD
+        doc = _ARCH_MD
+    else:
+        main = _TEST_DESIGN_MD
+        doc = _TEST_DESIGN_MD
+    review = json.dumps({"findings": [], "fixed_content": doc},
+                        ensure_ascii=False)
+    # The refiner's own dispatch carries the refiner system instruction
+    # and wants a rewritten document, so it gets its own rule; the
+    # generator's dispatch falls through to the same reply as the review.
+    return [
+        {"system_contains": INTERVIEWER_SYSTEM_PROMPT[:40], "reply": _interviewer_reply(0)},
+        {"system_contains": SCOPE_PRECHECK_SYSTEM_PROMPT[:40], "reply": _precheck_reply()},
+        {"system_contains": "你是一位资深产品经理", "reply": main},
+        {"system_contains": "你是一位资深系统架构师", "reply": doc},
+        {"system_contains": "你是一位资深测试架构师", "reply": doc},
+        {"system_is_none": True, "reply": review},
+        {"any": True, "reply": main},
+    ]
+
+
+def _seed_plan_for_phase(phase, plan_dir):
+    """The upstream documents each phase's generator reads."""
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    if phase == "prd":
+        (plan_dir / "interview.json").write_text(
+            json.dumps({
+                "dimensions": {
+                    "background": {"value": "背景"},
+                    "goals": {"value": "目标"},
+                    "scope": {"value": "范围"},
+                    "constraints": {"value": "约束"},
+                    "acceptance": {"value": "验收"},
+                },
+                "product_form": {"form": "software"},
+                "chat_history": [{"content": "测试需求"}],
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        # The PRD refine reads the reviewer's rejections, so give it one.
+        (plan_dir / "review.json").write_text(
+            json.dumps({"items": [{"index": 0, "status": "rejected",
+                                   "note": "范围太大"}]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    elif phase == "arch":
+        (plan_dir / "prd.md").write_text("# PRD\n测试 PRD", encoding="utf-8")
+    else:
+        (plan_dir / "arch-design.md").write_text(_ARCH_MD, encoding="utf-8")
+        (plan_dir / "interview.json").write_text(
+            json.dumps({"dimensions": {"background": "背景", "goals": "目标"}},
+                       ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+
+# Point 8 -- generate in one process, revise in another.
+
+
+@pytest.mark.parametrize("phase", ["prd", "arch", "test_design"])
+def test_a_revise_in_a_new_process_reopens_the_generation_session(
+    tmp_path, child_script, phase
+):
+    """The load-bearing case: the whole document need not be sent again.
+
+    Request A runs the generator. Request B -- a *different interpreter*,
+    which therefore holds none of A's objects -- runs the refiner the
+    reviewer triggered. B's dispatch must be ``--resume`` with A's
+    generation id.
+    """
+    plan_dir = tmp_path / "plans" / "P-1"
+    _seed_plan_for_phase(phase, plan_dir)
+    rules = _plan_phase_rules(phase)
+
+    request_a = _run_child(child_script, _BACKEND_DIR, phase, "generate",
+                           plan_dir, rules)
+    assert request_a["in_process_interview_handles"] == 0
+    generated = [c for c in request_a["calls"] if c["system"] is not None]
+    assert generated, f"request A dispatched nothing: {request_a['calls']!r}"
+    generation_id = generated[0]["session_id"]
+    assert generated[0]["session_flag"] == "--session-id"
+    assert request_a["sidecar_exists"], (
+        f"request A wrote no sidecar at {request_a['sidecar']!r}"
+    )
+
+    request_b = _run_child(child_script, _BACKEND_DIR, phase, "refine",
+                           plan_dir, rules)
+    assert request_b["in_process_interview_handles"] == 0, (
+        "request B started with an in-process handle, so this did not "
+        "test a restart"
+    )
+    assert request_b["calls"], f"request B dispatched nothing: {request_b}"
+    assert request_b["calls"][0]["session_flag"] == "--resume", (
+        "the revise is a different process and still re-opens the "
+        "conversation that wrote the document -- that is the whole point"
+    )
+    assert request_b["calls"][0]["session_id"] == generation_id, (
+        "and it re-opens *that* conversation, not some other one"
+    )
+
+
+# Point 9 -- the three ways this degrades, none of which may raise.
+
+
+def _plan_dir_for_refine(tmp_path, phase, session_id):
+    """A plan directory ready for ``refine``, with a given sidecar."""
+    plan_dir = tmp_path / "plans" / "P-1"
+    _seed_plan_for_phase(phase, plan_dir)
+    if phase == "prd":
+        (plan_dir / "prd.json").write_text(
+            json.dumps({"decision_points": [{"title": "决策点1"}],
+                        "title": "测试项目"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    elif phase == "arch":
+        (plan_dir / "arch-design.md").write_text(_ARCH_MD, encoding="utf-8")
+    else:
+        (plan_dir / "test-design.md").write_text(_TEST_DESIGN_MD,
+                                                 encoding="utf-8")
+    if session_id is not None:
+        from plan_sessions import sessions_path
+        import plan_sessions
+        key = {"prd": plan_sessions.KEY_PRD, "arch": plan_sessions.KEY_ARCH,
+               "test_design": plan_sessions.KEY_TEST_DESIGN}[phase]
+        plan_sessions.save_session_id(plan_dir, key, session_id)
+    return plan_dir
+
+
+@pytest.mark.parametrize("phase", ["prd", "arch", "test_design"])
+def test_a_revise_with_no_sidecar_opens_a_fresh_session(tmp_path, recorder,
+                                                        phase):
+    """No recorded session is the case every plan generated before the
+    sidecar existed is in. It must dispatch exactly what it dispatched
+    before, and must not raise."""
+    import plan_sessions
+    rules = _plan_phase_rules(phase)
+    rec = recorder(lambda call: _pick_rule(rules, call))
+    tool = _tool()
+    plan_dir = _plan_dir_for_refine(tmp_path, phase, session_id=None)
+
+    assert not plan_sessions.sessions_path(plan_dir).exists()
+
+    _refine(phase, tool, plan_dir)
+
+    assert rec.calls, "the refine dispatched nothing"
+    assert rec.calls[0]["session_flag"] == "--session-id", (
+        "no recorded session means a fresh one, which is the behaviour "
+        "this code had before the sidecar existed"
+    )
+
+
+@pytest.mark.parametrize("corrupt", [
+    "{not json at all",
+    "",
+    "[]",
+    '{"version": 1}',
+    '{"version": 1, "sessions": {"prd": 42}}',
+])
+@pytest.mark.parametrize("phase", ["prd", "arch", "test_design"])
+def test_a_corrupt_sidecar_degrades_to_a_fresh_session(tmp_path, recorder,
+                                                       phase, corrupt):
+    """Truncated, non-JSON, wrong-shaped and wrong-typed sidecars all
+    read as "this plan has never been generated"."""
+    from plan_sessions import sessions_path
+
+    rules = _plan_phase_rules(phase)
+    rec = recorder(lambda call: _pick_rule(rules, call))
+    tool = _tool()
+    plan_dir = _plan_dir_for_refine(tmp_path, phase, session_id=None)
+    sessions_path(plan_dir).write_text(corrupt, encoding="utf-8")
+
+    _refine(phase, tool, plan_dir)
+
+    assert rec.calls[0]["session_flag"] == "--session-id", (
+        "an unreadable sidecar costs a fresh session and nothing else"
+    )
+
+
+@pytest.mark.parametrize("empty_response_retries", [0, 1])
+def test_a_recorded_session_the_cli_no_longer_knows_degrades_to_a_fresh_one(
+    tmp_path, recorder, empty_response_retries
+):
+    """The id can outlive the transcript: pruned, expired, or never
+    created because the provider died before its first token.
+
+    The CLI refuses such a ``--resume`` immediately and produces no
+    assistant text. Both of the existing degradation paths must answer
+    that -- the empty-response retry (fresh id, no resume) when there is
+    retry budget left, and ``_resume_or_fresh_session`` when there is
+    not -- and neither may raise."""
+    from plan_sessions import save_session_id, KEY_ARCH
+    from arch_refiner import ArchRefiner
+
+    dead_id = "00000000-1111-2222-3333-444444444444"
+    rules = _plan_phase_rules("arch")
+
+    rec = recorder(lambda call: _pick_rule(rules, call))
+    # Refuse the dead session the way the CLI does: no assistant text.
+    original_popen = ct.subprocess.Popen
+
+    def _refusing_popen(cmd, *a, **k):
+        if "--resume" in list(cmd) and dead_id in list(cmd):
+            proc = MagicMock()
+            proc.stdout = iter([])
+            proc.returncode = 1
+            proc.stderr = MagicMock()
+            proc.stderr.read.return_value = "Error: Invalid session ID"
+            rec.calls.append({
+                "cmd": list(cmd), "resume": True, "session_flag": "--resume",
+                "session_id": dead_id, "system": None,
+            })
+            return proc
+        return original_popen(cmd, *a, **k)
+
+    ct.subprocess.Popen = _refusing_popen
+    try:
+        tool = _tool()
+        tool.EMPTY_RESPONSE_RETRY_BACKOFF_SEC = 0.0
+        tool.MAX_EMPTY_RESPONSE_RETRIES = empty_response_retries
+        plan_dir = _plan_dir_for_refine(tmp_path, "arch", session_id=None)
+        save_session_id(plan_dir, KEY_ARCH, dead_id)
+
+        refined = ArchRefiner(tool, plan_dir).refine(feedback="范围要收窄")
+    finally:
+        ct.subprocess.Popen = original_popen
+
+    assert refined == _ARCH_MD, "the revise still produced its document"
+    flags = [c["session_flag"] for c in rec.calls]
+    assert flags[0] == "--resume" and flags[0] is not None
+    assert "--session-id" in flags, (
+        f"the dead session was never re-opened as a fresh one: {flags!r}"
+    )
+
+
+# Point 10 -- the interview, across a real restart.
+
+
+def test_the_interview_continues_in_the_same_session_after_a_restart(
+    tmp_path, child_script
+):
+    """Turn one of an interview, then the service restarts, then turn two.
+
+    The in-process registry keyed by plan directory cannot help here --
+    it dies with the process -- so the sidecar is the only thing that
+    can. Each turn runs in its own interpreter.
+    """
+    from interviewer import INTERVIEWER_SYSTEM_PROMPT
+
+    plan_dir = tmp_path / "plans" / "P-1"
+    plan_dir.mkdir(parents=True)
+    rules = [
+        {"system_contains": INTERVIEWER_SYSTEM_PROMPT[:40],
+         "reply": _interviewer_reply(1)},
+        {"any": True, "reply": _precheck_reply()},
+    ]
+
+    probe = INTERVIEWER_SYSTEM_PROMPT[:40]
+
+    def _turns(report):
+        """The interview's own dispatches, not the scope pre-check's.
+
+        ``start`` runs a scope pre-check first, in its own conversation;
+        the multi-turn dialogue is the other one.
+        """
+        return [c for c in report["calls"] if probe in (c["system"] or "")]
+
+    turn_one = _run_child(child_script, _BACKEND_DIR, "interview",
+                          "interview_start", plan_dir, rules)
+    assert turn_one["in_process_interview_handles"] == 1
+    assert len(_turns(turn_one)) == 1
+    first = _turns(turn_one)[0]
+    assert first["session_flag"] == "--session-id"
+
+    turn_two = _run_child(child_script, _BACKEND_DIR, "interview",
+                          "interview_continue", plan_dir, rules)
+    assert turn_two["in_process_interview_handles"] == 1, (
+        "turn two built its own handle, so it can only have come from "
+        "the sidecar"
+    )
+    second = _turns(turn_two)[0]
+    assert second["session_flag"] == "--resume", (
+        "after a restart the interview's second turn opened a new "
+        "conversation and re-established the whole dialogue"
+    )
+    assert second["session_id"] == first["session_id"]
+
+
+# ---------------------------------------------------------------------------
+# The first call must not change
+# ---------------------------------------------------------------------------
+
+
+def test_reuse_does_not_alter_the_first_call_it_touches(tmp_path, recorder,
+                                                        monkeypatch):
+    """Byte for byte, the opening dispatch is what it was.
+
+    Reuse is a change to *which conversation opens*, never to *what is
+    asked*. If a future change seeds the generator's handle from the
+    sidecar, or prepends the re-ask cue to the opening turn, the prompt
+    on stdin stops being the prompt the caller assembled -- and the whole
+    reuse chain starts paying for the first turn twice over.
+    """
+    import prd_generator
+    import plan_sessions
+
+    assembled = []
+    real_query_json_in_session = prd_generator.query_json_in_session
+
+    def _spy(tool, session, /, *args, **kwargs):
+        assembled.append(kwargs.get("prompt", args[0] if args else None))
+        return real_query_json_in_session(tool, session, *args, **kwargs)
+
+    monkeypatch.setattr(prd_generator, "query_json_in_session", _spy)
+
+    rec = _install_prd(recorder)
+    tool = _tool()
+    plan_dir = _plan_dir_with_interview(tmp_path)
+
+    prd_generator.PRDGenerator(
+        tool, plan_dir, self_review_enabled=True,
+    ).generate()
+
+    generation = [c for c in rec.calls if c["system"] is not None]
+    assert generation[0]["session_flag"] == "--session-id", (
+        "the generation opens a session; it does not re-open the one it "
+        "recorded last time -- a regeneration is a new conversation"
+    )
+    assert rec.sent_prompts()[0] == assembled[0] + ct.JSON_ONLY_SUFFIX + "\n", (
+        "the opening prompt on stdin must be exactly the prompt the "
+        "generator assembled: no cue prepended, nothing appended but "
+        "the JSON contract that was always there"
+    )
+
+    # And the same generator, run again on a plan that already has a
+    # recorded id, still opens fresh -- the sidecar is for the refiner.
+    rec2 = _install_prd(recorder)
+    assert plan_sessions.load_session_id(plan_dir, plan_sessions.KEY_PRD)
+    prd_generator.PRDGenerator(
+        tool, plan_dir, self_review_enabled=True,
+    ).generate()
+    again = [c for c in rec2.calls if c["system"] is not None]
+    assert again[0]["session_flag"] == "--session-id", (
+        "a second generate() must not resume the session the first one "
+        "recorded"
+    )
+
+
+def test_a_refine_with_no_sidecar_sends_the_prompt_it_always_sent(
+    tmp_path, recorder, monkeypatch
+):
+    """The degradation path is not a different prompt, only a different
+    session flag."""
+    import arch_refiner
+
+    assembled = []
+    real_query_in_session = arch_refiner.query_in_session
+
+    def _spy(tool, session, /, *args, **kwargs):
+        assembled.append(kwargs.get("prompt", args[0] if args else None))
+        return real_query_in_session(tool, session, *args, **kwargs)
+
+    monkeypatch.setattr(arch_refiner, "query_in_session", _spy)
+
+    rules = _plan_phase_rules("arch")
+    rec = recorder(lambda call: _pick_rule(rules, call))
+    tool = _tool()
+    plan_dir = _plan_dir_for_refine(tmp_path, "arch", session_id=None)
+
+    arch_refiner.ArchRefiner(tool, plan_dir).refine(feedback="范围要收窄")
+
+    assert rec.calls[0]["session_flag"] == "--session-id"
+    assert rec.sent_prompts()[0] == assembled[0] + "\n", (
+        "without a recorded session the refine sends exactly the prompt "
+        "it built -- no re-ask cue, no continuation cue"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The sidecar is invisible to everything that lists a plan
+# ---------------------------------------------------------------------------
+
+
+def test_the_sidecar_is_invisible_to_everything_that_lists_a_plan(tmp_path):
+    """Why this file is safe to drop into ``plan_dir``.
+
+    The three plan listings and the one artifact scan, checked against a
+    plan directory that actually carries the sidecar.
+    """
+    from plan_sessions import KEY_ARCH, sessions_path, save_session_id
+    from state_machine.db.archive_scan import scan_archived_plans
+    from state_machine.db.artifact_scan import scan_artifacts
+
+    plans_dir = tmp_path / "plans"
+    plan_dir = plans_dir / "20260101-x"
+    _seed_plan_for_phase("arch", plan_dir)
+    save_session_id(plan_dir, KEY_ARCH, "11111111-2222-3333-4444-555555555555")
+    assert sessions_path(plan_dir).exists()
+
+    # 1. Artifact status is an explicit allowlist of four filenames.
+    rows = scan_artifacts(plan_dir)
+    assert sessions_path(plan_dir).name not in {r["file_path"] for r in rows}
+    assert len(rows) == 4, f"the allowlist grew or shrank: {rows!r}"
+
+    # 2. The archived-plan listing walks plans_dir and skips non-dirs.
+    assert [r["plan_id"] for r in scan_archived_plans(
+        plans_dir, datetime(2026, 1, 2))] == ["20260101-x"]
+
+    # 3. The sidebar's fallback listing does the same.
+    listed = [
+        d.name for d in sorted(plans_dir.iterdir())
+        if d.is_dir()
+    ]
+    assert listed == ["20260101-x"], (
+        f"a file in plans_dir reached the plan listing: {listed!r}"
+    )
+
+    # 4. The lifecycle static gate's forbidden set must not name it.
+    import importlib.util
+    gate_path = (_BACKEND_DIR / "tests" / "static_gates"
+                 / "test_e2e_lifecycle_produces_no_state_json.py")
+    spec = importlib.util.spec_from_file_location(
+        "_lifecycle_gate_probe", gate_path,
+    )
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    assert sessions_path(plan_dir).name not in gate.FORBIDDEN_STATE_JSONS
+
+
+# ---------------------------------------------------------------------------
+# helpers shared by the cases above
+# ---------------------------------------------------------------------------
+
+
+def _pick_rule(rules, call):
+    """Apply the same rule list the child applies, in the parent too."""
+    system = call["system"] or ""
+    for rule in rules:
+        if "system_contains" in rule and rule["system_contains"] in system:
+            return rule["reply"]
+        if "system_is_none" in rule and call["system"] is None:
+            return rule["reply"]
+        if "any" in rule:
+            return rule["reply"]
+    return ""
+
+
+def _refine(phase, tool, plan_dir):
+    if phase == "prd":
+        from prd_refiner import PRDRefiner
+        return PRDRefiner(tool, plan_dir).refine()
+    if phase == "arch":
+        from arch_refiner import ArchRefiner
+        return ArchRefiner(tool, plan_dir).refine(feedback="范围要收窄")
+    from test_design_refiner import TestDesignRefiner
+    return TestDesignRefiner(tool, plan_dir).refine(feedback="范围要收窄")

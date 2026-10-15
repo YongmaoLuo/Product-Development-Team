@@ -9,7 +9,8 @@ Preserves accepted and skipped decision points.
 from pathlib import Path
 from typing import List, Optional
 
-from coding_tool import CodingTool
+from coding_tool import CodingTool, query_in_session
+from plan_sessions import KEY_ARCH, persist_session, persisted_session
 
 
 ARCH_REFINER_SYSTEM_PROMPT = """你是一位资深系统架构师。你的任务是修订架构设计文档，根据用户的反馈调整决策点。
@@ -81,10 +82,29 @@ class ArchRefiner:
 
 请输出完整的修订后架构设计文档，保持 Markdown 格式一致。"""
 
-        refined_arch = self.coding_tool.query(
-            prompt=prompt,
-            system_instruction=ARCH_REFINER_SYSTEM_PROMPT,
-        )
+        # Re-open the session that generated this arch design. The
+        # generation and this refine are two different HTTP requests
+        # (and two different processes, across a restart), so the handle
+        # the generator held is gone — ``plan_sessions`` carried its id
+        # across instead. A plan generated before that file existed, a
+        # corrupt sidecar and an id the CLI no longer recognises all
+        # arrive here as an *empty* handle, which dispatches the fresh
+        # session this method has always dispatched. The prompt is
+        # unchanged either way: reuse decides which conversation opens,
+        # not what is asked.
+        session = persisted_session(self.plan_dir, KEY_ARCH)
+        try:
+            refined_arch = query_in_session(
+                self.coding_tool, session,
+                prompt=prompt,
+                system_instruction=ARCH_REFINER_SYSTEM_PROMPT,
+            )
+        finally:
+            # Recorded on the failure path too: the tool hands the live
+            # id back into the handle at every dispatch, so a round that
+            # raised after dispatching still leaves a session worth
+            # re-asking in.
+            persist_session(self.plan_dir, KEY_ARCH, session)
 
         self.plan_dir.mkdir(parents=True, exist_ok=True)
         with open(self.arch_file, "w", encoding="utf-8") as f:

@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from coding_tool import CodingTool, JsonSession, query_in_session
+from plan_sessions import KEY_ARCH, persist_session
 from self_review import run_doc_self_review, write_self_review_report
 from execution_logger import get_logger
 
@@ -173,6 +174,14 @@ class ArchGenerator:
         session = JsonSession()
 
         arch_md = self._render_markdown(session=session)
+
+        # Record which session wrote ``arch-design.md`` so the revise
+        # that answers the reviewer's rejection can re-open it rather
+        # than paste the whole design back into a fresh prompt. That
+        # revise is a separate request, so the handle above is out of
+        # reach by then — see ``plan_sessions`` for the file and for why
+        # nothing user-facing lists it.
+        persist_session(self.plan_dir, KEY_ARCH, session)
 
         if not is_legacy:
             arch_md = self._apply_design_principles_gate(arch_md)

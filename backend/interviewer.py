@@ -11,6 +11,7 @@ from typing import Optional, List, Dict
 from datetime import datetime
 
 from coding_tool import CodingTool, JsonSession, query_in_session
+from plan_sessions import KEY_INTERVIEW, persist_session, persisted_session
 
 
 REQUIRED_DIMENSIONS = ["background", "goals", "scope", "acceptance"]
@@ -110,21 +111,32 @@ SCOPE_PRECHECK_VALID_FORMS = frozenset({"software", "skill", "agent", "workflow"
 #:
 #: Entries are one small handle per plan directory this process has run
 #: an interview for, and live until the process ends.
+#:
+#: The registry alone does not outlive a restart: after the service comes
+#: back, a plan whose interview is half-finished has an entry that is
+#: gone, and turn two would open a fresh conversation and re-establish
+#: the whole dialogue. So the handle is *seeded* from ``plan_sessions``
+#: on first use and written back after every turn — the registry keeps
+#: turns 2..N of one process free, the sidecar keeps turn N+1 of the
+#: next one free.
 _INTERVIEW_SESSIONS: Dict[str, JsonSession] = {}
 
 
 def interview_session(plan_dir: Path) -> JsonSession:
     """The resumable session for ``plan_dir``'s interview turns.
 
-    Created on first use. The handle comes back carrying whichever
-    session the dispatch actually answered in — including one a provider
-    fallback switched to — so the next turn resumes a session that
-    exists rather than one the caller guessed at.
+    Created on first use, seeded with the session a previous process
+    recorded for this plan (empty when there is none, which is the
+    fresh-session behaviour an interview that starts today gets). The
+    handle comes back carrying whichever session the dispatch actually
+    answered in — including one a provider fallback switched to — so the
+    next turn resumes a session that exists rather than one the caller
+    guessed at.
     """
     key = str(Path(plan_dir).resolve())
     session = _INTERVIEW_SESSIONS.get(key)
     if session is None:
-        session = JsonSession()
+        session = persisted_session(plan_dir, KEY_INTERVIEW)
         _INTERVIEW_SESSIONS[key] = session
     return session
 
@@ -444,11 +456,20 @@ class Interviewer:
         # The handle is keyed by plan directory rather than held on
         # ``self``, because the HTTP routes build a new ``Interviewer``
         # per request — see ``interview_session``.
-        return query_in_session(
-            self.coding_tool, interview_session(self.plan_dir),
-            prompt=context,
-            system_instruction=INTERVIEWER_SYSTEM_PROMPT,
-        )
+        session = interview_session(self.plan_dir)
+        try:
+            return query_in_session(
+                self.coding_tool, session,
+                prompt=context,
+                system_instruction=INTERVIEWER_SYSTEM_PROMPT,
+            )
+        finally:
+            # Written back on the failure path too: the tool hands the
+            # live id into the handle at every dispatch, so a turn that
+            # raised after dispatching still leaves a session worth
+            # continuing in — and a service restart after that turn
+            # still resumes rather than restarts the dialogue.
+            persist_session(self.plan_dir, KEY_INTERVIEW, session)
 
     def _parse_response(self, response: str) -> dict:
         try:
