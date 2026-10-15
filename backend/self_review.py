@@ -81,6 +81,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Imported for the reusable-session helper only; ``coding_tool`` itself
+# stays a duck-typed argument below, and does not import this module, so
+# this introduces no cycle.
+from coding_tool import JsonSession, query_in_session
+
 
 log = logging.getLogger("self_review")
 
@@ -467,6 +472,7 @@ def run_doc_self_review(
     upstream_label: Optional[str] = None,
     *,
     mandatory: bool = True,
+    session: Optional["JsonSession"] = None,
 ) -> Dict[str, Any]:
     """Run the LLM-agent self-review (second-pass generation).
 
@@ -491,6 +497,13 @@ def run_doc_self_review(
             ``succeeded=False``); callers that still rely on
             graceful degradation (legacy tests) pass
             ``mandatory=False``.
+        session: Optional reusable-session handle. When given, both
+            attempts run in that session, so this second pass re-opens
+            the conversation the first pass already had rather than
+            re-establishing it. The PRD generator passes the handle
+            from its own generation call; every other caller passes
+            nothing and gets the fresh-session-per-call behaviour this
+            function has always had.
 
     Returns:
         Dict with audit payload::
@@ -579,10 +592,22 @@ def run_doc_self_review(
     # plain prose, expected a JSON object").
     last_error: Optional[Exception] = None
     parsed: Optional[Dict[str, Any]] = None
+
+    def _ask(ask_prompt: str) -> str:
+        """One self-review LLM call, in the caller's session if it has one.
+
+        Both attempts go through here so the format re-ask lands in the
+        same conversation as the ask it is re-asking — it is the same
+        question plus the parser error, not a new one.
+        """
+        if session is not None:
+            return query_in_session(coding_tool, session, prompt=ask_prompt)
+        return coding_tool.query(prompt=ask_prompt)
+
     for attempt in range(2):
         try:
             if attempt == 0:
-                llm_reply = coding_tool.query(prompt=prompt)
+                llm_reply = _ask(prompt)
             else:
                 # Retry with the error appended as a *follow-up
                 # question*. We don't mutate the original prompt
@@ -601,7 +626,7 @@ def run_doc_self_review(
                     "中间不要夹带任何 prose、Markdown 围栏、"
                     "或第二个 JSON 对象。"
                 )
-                llm_reply = coding_tool.query(prompt=follow_up)
+                llm_reply = _ask(follow_up)
         except Exception as exc:  # noqa: BLE001 — best-effort surface
             message = (
                 f"second-pass self-review failed: coding_tool.query raised "

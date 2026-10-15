@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional, List, Dict
 from datetime import datetime
 
-from coding_tool import CodingTool
+from coding_tool import CodingTool, JsonSession, query_in_session
 
 
 REQUIRED_DIMENSIONS = ["background", "goals", "scope", "acceptance"]
@@ -88,6 +88,45 @@ product_form 取值（4 类枚举，必须小写）：
 # DP8 4-class lowercase enum. Anything outside this set defaults to
 # "software" per the spec's boundary conditions.
 SCOPE_PRECHECK_VALID_FORMS = frozenset({"software", "skill", "agent", "workflow"})
+
+
+#: One resumable session per plan directory, for that plan's interview
+#: turns.
+#:
+#: A handle hung on the ``Interviewer`` would be empty again on every
+#: turn after the first, which is the same shape as having no handle at
+#: all — it reads as reuse and pays for a fresh session each turn. It is
+#: also empty in production rather than only in theory:
+#: ``routes/phases.py`` builds a **new** ``Interviewer`` for
+#: ``/api/interview`` and again for ``/api/interview/{plan_id}/continue``,
+#: with the conversation carried across in ``interview.json`` by
+#: ``_load_state()``. So the handle is keyed by plan directory and lives
+#: here instead, which is the shape ``repair_generator`` already uses for
+#: the same reason (see ``repair_content_session``).
+#:
+#: Turn N+1 is turn N plus the user's answer, and the prompt names the
+#: dimensions and the last ten turns of history rather than inlining a
+#: document, so a fresh session per turn re-establishes all of it.
+#:
+#: Entries are one small handle per plan directory this process has run
+#: an interview for, and live until the process ends.
+_INTERVIEW_SESSIONS: Dict[str, JsonSession] = {}
+
+
+def interview_session(plan_dir: Path) -> JsonSession:
+    """The resumable session for ``plan_dir``'s interview turns.
+
+    Created on first use. The handle comes back carrying whichever
+    session the dispatch actually answered in — including one a provider
+    fallback switched to — so the next turn resumes a session that
+    exists rather than one the caller guessed at.
+    """
+    key = str(Path(plan_dir).resolve())
+    session = _INTERVIEW_SESSIONS.get(key)
+    if session is None:
+        session = JsonSession()
+        _INTERVIEW_SESSIONS[key] = session
+    return session
 
 
 class Interviewer:
@@ -402,7 +441,11 @@ class Interviewer:
             "chat_history": self.state["chat_history"][-10:],
         }, ensure_ascii=False)
 
-        return self.coding_tool.query(
+        # The handle is keyed by plan directory rather than held on
+        # ``self``, because the HTTP routes build a new ``Interviewer``
+        # per request — see ``interview_session``.
+        return query_in_session(
+            self.coding_tool, interview_session(self.plan_dir),
             prompt=context,
             system_instruction=INTERVIEWER_SYSTEM_PROMPT,
         )

@@ -14,7 +14,9 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from coding_tool import CodingTool
+from coding_tool import (
+    CodingTool, JsonSession, query_in_session, query_json_in_session,
+)
 from framework.task_output_validator import is_to_be_created_path
 from test_command_quality import (
     check_falsifiable,
@@ -1036,7 +1038,22 @@ class TasksGenerator:
             system_instruction = f"{system_instruction}\n\n{NO_WORKSPACE_PROMPT}"
         system_instruction = append_json_output_contract(system_instruction)
 
-        tasks_data = self.coding_tool.query_json(
+        # One handle for the whole of this ``generate()``. Three steps
+        # below ask about the same subject — this synthesis, the
+        # mandatory self-review that audits it, and the falsifiability
+        # rounds that re-ask the review with probe results it did not
+        # act on — so they run in one conversation instead of each
+        # re-reading the upstream architecture / test design that every
+        # one of their prompts names. The falsifiability loop used to
+        # open its own handle for its rounds only; lifting it to the
+        # whole ``generate()`` is what closes the gap between the
+        # synthesis and the first review. Created before the first
+        # dispatch, and scoped to this call: a later regeneration of the
+        # same plan is a different conversation.
+        session = JsonSession()
+
+        tasks_data = query_json_in_session(
+            self.coding_tool, session,
             prompt=prompt,
             system_instruction=system_instruction,
         )
@@ -1251,9 +1268,11 @@ class TasksGenerator:
         if self.self_review_enabled:
             self._run_tasks_self_review(
                 tasks_data, falsifiability=falsifiability,
+                session=session,
             )
             falsifiability = self._iterate_on_falsifiability(
                 tasks_data, falsifiability,
+                session=session,
             )
 
         return tasks_data
@@ -1262,6 +1281,7 @@ class TasksGenerator:
         self,
         tasks_data: Dict[str, Any],
         falsifiability: Dict[str, Any],
+        session: Optional["JsonSession"] = None,
     ) -> Dict[str, Any]:
         """Re-run the self-review while commands still pass before their task.
 
@@ -1282,7 +1302,23 @@ class TasksGenerator:
           ``falsifiability_report.json`` for an operator.
 
         Returns the last probe report.
+
+        ``session`` is the caller's reusable-session handle: one handle
+        for every round, since round N+1 is round N plus the probe
+        results it did not act on. ``generate()`` passes the handle that
+        already carried the synthesis and the first review, so the whole
+        ``generate()`` is one conversation. ``None`` (the default) opens
+        a fresh handle here, which is what a caller driving this method
+        on its own — the loop is still reusable by itself — gets.
         """
+        # One session for the loop rather than one per round: round N+1
+        # is round N plus the probe results it did not act on, and the
+        # prompt names the upstream architecture / test design by path
+        # rather than inlining them, so a fresh session per round
+        # re-reads all of them every round.
+        if session is None:
+            session = JsonSession()
+
         for _ in range(max(0, self.FALSIFIABILITY_MAX_ROUNDS - 1)):
             if falsifiability.get("skipped") or not _probe_problem_count(falsifiability):
                 return falsifiability
@@ -1291,6 +1327,7 @@ class TasksGenerator:
             try:
                 self._run_tasks_self_review(
                     tasks_data, falsifiability=falsifiability,
+                    session=session,
                 )
             except Exception as exc:  # noqa: BLE001 — must not abort generation
                 print(
@@ -1427,6 +1464,7 @@ class TasksGenerator:
         self,
         tasks_data: Dict[str, Any],
         falsifiability: Optional[Dict[str, Any]] = None,
+        session: Optional["JsonSession"] = None,
     ) -> None:
         """Run the mandatory second LLM pass on tasks.json.
 
@@ -1441,6 +1479,13 @@ class TasksGenerator:
         the tasks contract needs the LLM to return JSON
         (not markdown), so we drive the coding tool directly with a
         custom prompt and run our own parse / apply path.
+
+        ``session`` is the caller's reusable-session handle. ``generate()``
+        passes one handle for the synthesis, this first review and every
+        falsifiability round, since all three ask about the same task
+        plan; a caller that runs this pass on its own and passes nothing
+        gets the fresh-session-per-call behaviour this method has always
+        had.
         """
         # Round-trip JSON so the LLM sees the same canonical shape
         # we plan to write back. ``ensure_ascii=False`` keeps
@@ -1462,7 +1507,12 @@ class TasksGenerator:
         # semantics: any failure here must surface; the generator
         # cannot promote an unaudited draft.
         try:
-            llm_reply = self.coding_tool.query(prompt=prompt)
+            if session is not None:
+                llm_reply = query_in_session(
+                    self.coding_tool, session, prompt=prompt,
+                )
+            else:
+                llm_reply = self.coding_tool.query(prompt=prompt)
         except Exception as exc:  # noqa: BLE001 — mandatory path
             raise RuntimeError(
                 f"tasks second-pass LLM call failed: "

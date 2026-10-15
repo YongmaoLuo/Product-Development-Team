@@ -30,7 +30,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
-from coding_tool import CodingTool
+from coding_tool import CodingTool, JsonSession, query_in_session
 from self_review import run_doc_self_review, write_self_review_report
 from execution_logger import get_logger
 
@@ -156,7 +156,23 @@ class ArchGenerator:
         """
         is_legacy = self._is_legacy_arch_on_disk()
 
-        arch_md = self._render_markdown()
+        # One handle for the whole of this ``generate()``: the render
+        # below writes the document, the mandatory self-review further
+        # down audits *that* document against the same PRD, so it is a
+        # new ask about the same subject rather than a fresh one. The
+        # handle is created before the first dispatch so the render is
+        # the session's opening turn and the review its resume; scoped to
+        # this call, because a later regeneration of the same plan is a
+        # different conversation.
+        #
+        # The design-principles hard gate between them is deliberately
+        # left out: it only dispatches when validation already failed,
+        # and it raises ``ArchHardGateError`` after a bounded number of
+        # regenerate attempts — a different shape of ask (rewrite this
+        # chapter for this one principle) from "audit what you wrote".
+        session = JsonSession()
+
+        arch_md = self._render_markdown(session=session)
 
         if not is_legacy:
             arch_md = self._apply_design_principles_gate(arch_md)
@@ -180,6 +196,7 @@ class ArchGenerator:
                     coding_tool=self.coding_tool,
                     upstream_content=self._load_prd(),
                     upstream_label="prd",
+                    session=session,
                 )
             except Exception as exc:  # noqa: BLE001 — mandatory path
                 log.warning(
@@ -418,12 +435,20 @@ class ArchGenerator:
     # a regenerate failure without duplicating the decision-point retry)
     # ------------------------------------------------------------------
 
-    def _render_markdown(self) -> str:
+    def _render_markdown(
+        self, session: Optional[JsonSession] = None
+    ) -> str:
         """Produce the raw arch-design.md markdown body via the coding tool.
 
         If the first response is missing ``### 决策点 N: ...`` headings
         (the contract for a structured CPEA arch doc), the LLM is
         called once more with an explicit format reminder.
+
+        ``session`` is the caller's reusable-session handle: the format
+        re-ask below is the same ask plus a format reminder, so it runs
+        in the same conversation rather than re-reading the PRD. ``None``
+        (the default) is the fresh-session-per-call behaviour this
+        method has always had.
         """
         prd_content = self._load_prd()
         skip_block = self._build_skip_notice_block()
@@ -443,7 +468,8 @@ PRD 文档：
 7. 严格聚焦系统设计层面:模块划分、接口契约、数据流、技术选型、关键非功能需求
 8. **禁止**在架构设计中包含:测试策略、错误处理模式、CI/CD、性能基准、部署 Stage、历史数据重生成(这些归后续 test_design / 部署工程 / 独立 follow-up plan)"""
 
-        arch_content = self.coding_tool.query(
+        arch_content = query_in_session(
+            self.coding_tool, session,
             prompt=prompt,
             system_instruction=ARCH_SYSTEM_PROMPT,
         )
@@ -469,7 +495,8 @@ PRD 文档：
 1. 严格遵循 PRD 中的约束与 scope，不要引入 PRD 未指定的组件。
 2. 决策点数量根据 PRD 实际范围调整，通常 3-7 个，不要硬凑。
 3. 不要输出概览或摘要，直接输出完整的架构设计文档。"""
-            arch_content = self.coding_tool.query(
+            arch_content = query_in_session(
+                self.coding_tool, session,
                 prompt=retry_prompt,
                 system_instruction=ARCH_SYSTEM_PROMPT,
             )

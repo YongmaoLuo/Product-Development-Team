@@ -116,6 +116,27 @@ def query_json_in_session(tool, session: Optional[JsonSession], /, *args, **kwar
         _JSON_SESSION.reset(token)
 
 
+def query_in_session(tool, session: Optional[JsonSession], /, *args, **kwargs) -> str:
+    """``tool.query(*args, **kwargs)`` with ``session`` bound for that call.
+
+    The ``query_json`` twin (see :func:`query_json_in_session`) for the
+    plain-text path. One per loop rather than one per call: a loop that
+    re-asks — the second interview turn, a second repair pass over the
+    same file — otherwise re-reads everything the first ask already
+    read, and the prompts name files by path rather than inlining them.
+
+    Same contract, same handle, same context variable. ``query`` takes
+    neither ``scene``-nor-``allowed_tools``-shaped extras nor a session
+    of its own: the handle is read at the dispatch, not at the
+    signature, so every existing ``query`` caller is untouched.
+    """
+    token = _JSON_SESSION.set(session)
+    try:
+        return tool.query(*args, **kwargs)
+    finally:
+        _JSON_SESSION.reset(token)
+
+
 class ApiError(Exception):
     """Raised when the LLM API returns an error (e.g., rate limit, auth failure)."""
 
@@ -3908,10 +3929,13 @@ class ClaudeCodingTool(CodingTool):
     # from ``_run_claude_interactive`` instead of the legacy
     # (the legacy ``_run_claude`` --print path was deleted; the ``_run_claude_interactive``
     #
-    # One-shot per call: ``session_id=None`` (no resume), so retries
-    # always start a fresh conversation. Caller is responsible for any
-    # multi-turn resume semantics (currently nothing in this codebase
-    # needs them on the ``query()`` path).
+    # One-shot per call *unless the caller opts in*: ``session_id=None``
+    # (no resume), so retries always start a fresh conversation and every
+    # ``query()`` caller that does not bind a handle is unaffected. A
+    # caller that wants multi-turn resume semantics asks for them with
+    # ``query_in_session(tool, JsonSession(), ...)`` — the interview's
+    # per-turn conversation is the first such caller — and the handle is
+    # read at the top of this function rather than in the signature.
     # ================================================================
     def _record_llm_call(
         self,
@@ -4154,6 +4178,32 @@ class ClaudeCodingTool(CodingTool):
                            *, start_time, prompt_len,
                            retry_count=0, excluded_providers=None,
                            scene=None, resume_session=None):
+        # Resolve a caller's reusable-session opt-in here, once, at the
+        # entry, exactly as ``_query_json_internal`` does. An explicit
+        # ``resume_session`` is the provider-fallback recursion below
+        # and wins outright: that path is switching providers
+        # mid-answer and must re-open the session that timed out, not
+        # whatever session the caller's loop is holding. A handle bound
+        # by ``query_in_session`` is the other case entirely — a loop's
+        # next round, which is a *new* ask about the same subject — so
+        # the two are kept apart here and dispatched differently below.
+        session_handle = _JSON_SESSION.get()
+        entry_resume = resume_session
+        from_handle = entry_resume is None and session_handle is not None
+        if entry_resume is None and session_handle is not None:
+            entry_resume = session_handle.session_id
+
+        def _remember(sid: Optional[str]) -> None:
+            """Hand the live session id back to the caller's loop.
+
+            Written at every dispatch rather than once at the end, so a
+            loop whose answer was unusable still has an id worth
+            re-asking in — that session exists, and the loop exists
+            precisely because the answer was no good.
+            """
+            if session_handle is not None and sid:
+                session_handle.session_id = sid
+
         compacted_prompt = self._compact_prompt(prompt, system_instruction)
         if compacted_prompt != prompt and self.logger:
             self.logger.info(
@@ -4179,9 +4229,23 @@ class ClaudeCodingTool(CodingTool):
             """
             nonlocal pinned_session_id
             if resume:
+                if from_handle:
+                    # Re-ask: the caller's loop ran here last round and
+                    # the prompt has moved on since (the user's reply,
+                    # the reason the last answer was rejected). Send the
+                    # new ask alongside the restored conversation; the
+                    # cut-off cue would both misdescribe the turn and
+                    # drop what changed.
+                    resume_prompt = RESUME_REASK_PROMPT + compacted_prompt
+                else:
+                    # Provider switch: the previous attempt died
+                    # partway through this same ask, so resume its
+                    # session rather than paying for the whole prompt
+                    # again.
+                    resume_prompt = RESUME_CONTINUATION_PROMPT
                 text, used_sid = self._resume_or_fresh_session(
                     prev_session_id=pinned_session_id,
-                    resume_prompt=RESUME_CONTINUATION_PROMPT,
+                    resume_prompt=resume_prompt,
                     fresh_prompt=compacted_prompt,
                     system_instruction=system_instruction,
                     excluded_providers=excluded,
@@ -4194,6 +4258,7 @@ class ClaudeCodingTool(CodingTool):
                     # reports the new id — keep pointing at the
                     # session that exists rather than the dead one.
                     pinned_session_id = used_sid
+                _remember(used_sid)
                 return text
             # ``str(uuid4())``: ``--session-id`` rejects the 32-char
             # undashed ``uuid4().hex`` form with "Invalid session ID".
@@ -4206,18 +4271,19 @@ class ClaudeCodingTool(CodingTool):
                 allowed_tools=None,
                 scene=scene,
             )
+            _remember(_sid or pinned_session_id)
             return text
 
         # The session this call will dispatch into. Pinning the id here
         # is what makes a provider switch resumable at all: without it
         # the CLI picks the id, the id is never returned on the failure
         # path, and the retry has nothing to resume.
-        pinned_session_id = resume_session or str(uuid.uuid4())
+        pinned_session_id = entry_resume or str(uuid.uuid4())
 
         try:
             if timeout is None:
                 result = _call(excluded=excluded_providers,
-                               resume=resume_session is not None)
+                               resume=entry_resume is not None)
             else:
                 # 2026-09-06 — BOTH layers of timeout cap are active:
                 # 1. ``total_timeout=timeout`` → daemon watcher inside
@@ -4238,7 +4304,7 @@ class ClaudeCodingTool(CodingTool):
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(
                         _ctx.run, _call, excluded_providers, timeout,
-                        resume_session is not None,
+                        entry_resume is not None,
                     )
                     try:
                         result = future.result(timeout=timeout)
