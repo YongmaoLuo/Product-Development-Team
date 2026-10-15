@@ -1481,3 +1481,117 @@ def _refine(phase, tool, plan_dir):
         return ArchRefiner(tool, plan_dir).refine(feedback="范围要收窄")
     from test_design_refiner import TestDesignRefiner
     return TestDesignRefiner(tool, plan_dir).refine(feedback="范围要收窄")
+# Point 7, continued -- the upstream docs ride the FIRST review only
+# ---------------------------------------------------------------------------
+
+# Marker strings that exist nowhere but inside the two upstream documents.
+# The synthesis prompt only *names* arch-design.md / test-design.md (it tells
+# the model which decision-point numbering to use), so a marker can reach a
+# dispatched prompt by exactly one route: ``_load_tasks_upstream_block``
+# inlining the file body. That is what makes the presence/absence pair below
+# a real assertion rather than a tautology.
+_ARCH_MARKER = "ARCH-UPSTREAM-MARKER-7f3c91"
+_TEST_MARKER = "TEST-UPSTREAM-MARKER-b2d40a"
+
+
+def test_the_upstream_docs_are_inlined_into_the_first_review_only(
+    tmp_path, recorder, monkeypatch,
+):
+    """The first self-review carries the upstream text; later rounds do not.
+
+    ``generate()`` runs the synthesis, the first self-review and every
+    falsifiability round on **one** session, so the architecture and test
+    design are already in that conversation after the first review. Every
+    later round used to re-read both files and re-inline ~6k characters of
+    each into its prompt -- bytes the model can already see, spent once
+    per falsifiability round.
+
+    Driven through ``TasksGenerator.generate()`` with the real
+    ``_load_tasks_upstream_block`` (no stubbing of it) so the assertion is
+    about what the CLI actually receives, not about a helper's return value.
+    """
+    from tasks_generator import TasksGenerator
+
+    payload = _tasks_payload()
+
+    def _reply(call):
+        if call["system"] is not None:
+            return json.dumps(payload, ensure_ascii=False)
+        # Idempotent rewrite: same ids, same count, no corrections, so the
+        # self-review pass has an applicable result without inventing one.
+        return json.dumps({"tasks": payload["tasks"], "findings": []},
+                          ensure_ascii=False)
+
+    rec = recorder(_reply)
+    tool = _tool()
+    plan_dir = tmp_path / "plans" / "P-1"
+    plan_dir.mkdir(parents=True)
+    (plan_dir / "prd.md").write_text("# PRD", encoding="utf-8")
+    (plan_dir / "arch-design.md").write_text(
+        f"# 架构设计\n\n{_ARCH_MARKER}\n", encoding="utf-8")
+    (plan_dir / "test-design.md").write_text(
+        f"# 测试设计\n\n{_TEST_MARKER}\n", encoding="utf-8")
+
+    gen = TasksGenerator(tool, plan_dir, self_review_enabled=True)
+
+    # Everything below shells out or is not the subject under test. Note
+    # what is *not* stubbed: ``_load_tasks_upstream_block`` stays real.
+    monkeypatch.setattr(gen, "_run_preflight_gate", lambda: None)
+    monkeypatch.setattr(gen, "_enforce_e2e_task_gate", lambda data: None)
+    monkeypatch.setattr(gen, "_compute_decision_coverage_findings",
+                        lambda data: [])
+
+    # Two unusable commands reported, then one, then none -- the loop runs
+    # its full ``FALSIFIABILITY_MAX_ROUNDS - 1`` == 2 extra rounds, which is
+    # what makes "the second dispatch" exist at all.
+    counts = iter([2, 1, 0])
+    monkeypatch.setattr(
+        gen, "probe_falsifiability",
+        lambda t, **k: {"skipped": False,
+                        "vacuous": [{"command": "exit 1"}] * next(counts),
+                        "unreachable": []},
+    )
+
+    gen.generate()
+
+    # Dispatch order: synthesis (carries a system prompt), then the first
+    # self-review and both falsifiability rounds (carry none).
+    prompts = rec.sent_prompts()
+    synthesis = [c for c in rec.calls if c["system"] is not None]
+    plain_idx = [i for i, c in enumerate(rec.calls) if c["system"] is None]
+    assert len(synthesis) == 1, (
+        f"expected one tasks synthesis dispatch, got {len(synthesis)}"
+    )
+    assert len(plain_idx) == 3, (
+        "expected the first self-review plus two falsifiability rounds, "
+        f"got {len(plain_idx)}"
+    )
+
+    # Pin the route: the synthesis never inlines the documents, only names
+    # them. If this ever stops holding the marker proves nothing below.
+    assert _ARCH_MARKER not in prompts[plain_idx[0] - 1], (
+        "the synthesis prompt is expected to name arch-design.md, not "
+        "inline it -- if it inlines the body this test no longer proves "
+        "the self-review is what carries the upstream text"
+    )
+
+    first_review = prompts[plain_idx[0]]
+    assert _ARCH_MARKER in first_review, (
+        "the first self-review must inline arch-design.md -- its session "
+        "is empty at that point, so this is the only place the model can "
+        "read the upstream document"
+    )
+    assert _TEST_MARKER in first_review, (
+        "the first self-review must inline test-design.md as well"
+    )
+
+    for label, idx in (("second", plain_idx[1]), ("third", plain_idx[2])):
+        prompt = prompts[idx]
+        assert _ARCH_MARKER not in prompt, (
+            f"the {label} dispatch re-inlined arch-design.md; it resumes "
+            "the session the first review already filled with it"
+        )
+        assert _TEST_MARKER not in prompt, (
+            f"the {label} dispatch re-inlined test-design.md; it resumes "
+            "the session the first review already filled with it"
+        )

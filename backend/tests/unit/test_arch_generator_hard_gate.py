@@ -105,9 +105,6 @@ def _stub_mandatory_self_review(monkeypatch):
     monkeypatch.setattr(
         _arch_gen, "run_doc_self_review", _passthrough_self_review,
     )
-    monkeypatch.setattr(
-        _ts_gen, "run_doc_self_review", _passthrough_self_review,
-    )
 
 
 SAMPLE_PRD = {

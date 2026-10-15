@@ -1328,6 +1328,11 @@ class TasksGenerator:
                 self._run_tasks_self_review(
                     tasks_data, falsifiability=falsifiability,
                     session=session,
+                    # Round 2+ resumes the session the first review
+                    # already filled with the upstream documents, so
+                    # re-inlining them here would only re-send text the
+                    # model can still see.
+                    include_upstream=False,
                 )
             except Exception as exc:  # noqa: BLE001 — must not abort generation
                 print(
@@ -1465,6 +1470,7 @@ class TasksGenerator:
         tasks_data: Dict[str, Any],
         falsifiability: Optional[Dict[str, Any]] = None,
         session: Optional["JsonSession"] = None,
+        include_upstream: bool = True,
     ) -> None:
         """Run the mandatory second LLM pass on tasks.json.
 
@@ -1486,6 +1492,13 @@ class TasksGenerator:
         plan; a caller that runs this pass on its own and passes nothing
         gets the fresh-session-per-call behaviour this method has always
         had.
+
+        ``include_upstream`` decides whether the architecture / test design
+        are inlined into this pass's prompt. Only the **first** pass needs
+        them: every pass after it resumes the same session, which already
+        carries that text, so re-reading both files and re-sending ~6k
+        characters per file buys nothing. Defaults to ``True`` so a caller
+        driving this method on its own keeps the behaviour it always had.
         """
         # Round-trip JSON so the LLM sees the same canonical shape
         # we plan to write back. ``ensure_ascii=False`` keeps
@@ -1494,7 +1507,9 @@ class TasksGenerator:
             tasks_data, ensure_ascii=False, indent=2,
         )
         original_markdown = self._tasks_to_markdown(tasks_data)
-        upstream = self._load_tasks_upstream_block()
+        upstream = (
+            self._load_tasks_upstream_block() if include_upstream else ""
+        )
 
         prompt = _build_tasks_self_review_prompt(
             original_json=original_json_text,

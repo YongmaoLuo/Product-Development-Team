@@ -80,9 +80,6 @@ def _stub_mandatory_self_review(monkeypatch):
     ``self_review.run_doc_self_review``. ``monkeypatch`` restores the
     original when each test in this module ends.
     """
-    monkeypatch.setattr(
-        _ts_gen, "run_doc_self_review", _passthrough_self_review,
-    )
 
 
 def _make_coding_tool(canned_response):
