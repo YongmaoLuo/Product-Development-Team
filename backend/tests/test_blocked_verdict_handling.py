@@ -125,6 +125,10 @@ def test_executor_results_preserves_explicit_actual_result():
         def get(self, key, default=None):
             # Mimics dict-like access for plan_data.get('verification_points', [])
             return default if key != "verification_points" else []
+        def _plan_retired_vps(self):
+            # Mimics the executor's retired-VP predicate. Nothing here was
+            # retired by the plan, so the envelope keeps every VP.
+            return {}
 
     result = agent._build_execution_results_from_executor({}, _StubExecutor())
     results = result["execution_results"] if isinstance(result, dict) else result
@@ -155,6 +159,9 @@ def test_executor_results_falls_back_to_reasons_join_when_no_actual_result():
             }]
         def get(self, key, default=None):
             return default if key != "verification_points" else []
+        def _plan_retired_vps(self):
+            # Same stub contract as above: the plan retired nothing.
+            return {}
 
     result = agent._build_execution_results_from_executor({}, _StubExecutor())
     results = result["execution_results"] if isinstance(result, dict) else result
