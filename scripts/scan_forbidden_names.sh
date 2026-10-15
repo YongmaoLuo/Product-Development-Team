@@ -167,14 +167,19 @@ if [ "$RC" -eq 1 ]; then
     printf '%s\n' "$OUTPUT" >&2
     cat >&2 <<'HOWTO'
 
-Each line above is `relative/path:lineno: needle`. There is no per-file
-allowlist and no `tests/` exemption: a private name is as published in a
-fixture or a docstring as in a secret.
+Each line above is `relative/path:lineno: <redacted> (N chars) [list entry
+#K]`. The name itself is not printed — a report that repeats the private
+proper name it exists to catch is the leak with extra steps, and this
+output ends up in terminals, CI logs and pasted issues. `#K` is the
+position of the matching entry in your own .config/forbidden-names, so you
+can look it up without this script telling you what it says. There is no
+per-file allowlist and no `tests/` exemption: a private name is as
+published in a fixture or a docstring as in a secret.
 
-To fix it, delete the name from the line — or, if the file genuinely has to
-name something the list flags, narrow the list entry rather than the
-check. The list is yours (.config/forbidden-names); the check is not
-optional once you have one.
+To fix it, open the file at that line and delete the name — or, if the file
+genuinely has to name something the list flags, narrow the list entry
+rather than the check. The list is yours (.config/forbidden-names); the
+check is not optional once you have one.
 HOWTO
     exit 1
 fi
