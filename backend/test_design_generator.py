@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from coding_tool import CodingTool
+from coding_tool import CodingTool, JsonSession, query_in_session
 from self_review import run_doc_self_review, write_self_review_report
 from execution_logger import get_logger
 
@@ -202,6 +202,16 @@ class TestDesignGenerator:
 
     def generate(self) -> str:
         """Generate test design from architecture. Returns test design content."""
+        # One handle for the whole of this ``generate()``: the dispatch
+        # below writes the document, the mandatory self-review further
+        # down audits *that* document against the same architecture, so
+        # it is a new ask about the same subject rather than a fresh one.
+        # The handle is created before the first dispatch so the render
+        # is the session's opening turn and the review its resume; scoped
+        # to this call, because a later regeneration of the same plan is
+        # a different conversation.
+        session = JsonSession()
+
         arch_content = self._load_arch()
         project = self._load_project_context()
         self._load_arch_review_skips()
@@ -233,7 +243,8 @@ class TestDesignGenerator:
 4. 不要只生成概览或摘要，必须展开每个决策点的完整内容
 5. 至少包含 6 个决策点"""
 
-        test_content = self.coding_tool.query(
+        test_content = query_in_session(
+            self.coding_tool, session,
             prompt=prompt,
             system_instruction=TEST_DESIGN_SYSTEM_PROMPT,
         )
@@ -257,7 +268,8 @@ class TestDesignGenerator:
 备选方案：...
 
 不要输出概览或摘要，直接输出完整的测试设计文档，包含至少 6 个决策点。"""
-            test_content = self.coding_tool.query(
+            test_content = query_in_session(
+                self.coding_tool, session,
                 prompt=retry_prompt,
                 system_instruction=TEST_DESIGN_SYSTEM_PROMPT,
             )
@@ -278,6 +290,7 @@ class TestDesignGenerator:
                     coding_tool=self.coding_tool,
                     upstream_content=arch_content,
                     upstream_label="arch",
+                    session=session,
                 )
             except Exception as exc:  # noqa: BLE001 — mandatory path
                 log.warning(

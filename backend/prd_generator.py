@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from coding_tool import CodingTool
+from coding_tool import CodingTool, JsonSession, query_json_in_session
 from framework.text import circled_list
 from self_review import run_doc_self_review, write_self_review_report
 from execution_logger import get_logger
@@ -414,7 +414,16 @@ class PRDGenerator:
         from llm_prompts import append_json_output_contract
         system_prompt = append_json_output_contract(system_prompt)
 
-        prd_data = self.coding_tool.query_json(
+        # One handle for this generation *and* the mandatory self-review
+        # below: the second pass audits the document the first pass just
+        # wrote, so it is a new ask about the same subject rather than a
+        # fresh one, and re-reading everything the first pass read is the
+        # cost this avoids. Scoped to this ``generate()`` call — a later
+        # generation of the same plan is a different subject.
+        session = JsonSession()
+
+        prd_data = query_json_in_session(
+            self.coding_tool, session,
             prompt=prompt,
             system_instruction=system_prompt,
         )
@@ -460,6 +469,7 @@ class PRDGenerator:
                     doc_content=prd_markdown,
                     doc_type="prd",
                     coding_tool=self.coding_tool,
+                    session=session,
                 )
             except Exception as exc:  # noqa: BLE001 — mandatory path
                 log.warning(

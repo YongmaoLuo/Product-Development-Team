@@ -75,7 +75,9 @@ def _patch_tasks_self_review(monkeypatch):
         if str(_BACKEND_DIR) in sys.path:
             sys.path.remove(str(_BACKEND_DIR))
 
-    def _no_self_review(self, tasks_data, falsifiability=None):
+    def _no_self_review(self, tasks_data, falsifiability=None, **_ignored):
+        # ``**_ignored`` absorbs the reusable-session handle ``generate()``
+        # binds; this stub only suppresses the call, it never inspects it.
         return None
 
     monkeypatch.setattr(tg.TasksGenerator, "_run_tasks_self_review", _no_self_review)

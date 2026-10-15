@@ -19,6 +19,8 @@ import unittest
 from pathlib import Path
 from typing import List, Optional
 
+import pytest
+
 # Add the backend directory to import path
 BACKEND_DIR = Path(__file__).resolve().parents[1] \
     if not os.environ.get("PDT_DEV_REPO") \
@@ -88,16 +90,38 @@ import test_design_generator as _td_gen
 import tasks_generator as _ts_gen
 import self_review as _self_review_mod
 
-_arch_gen.run_doc_self_review = _passthrough_self_review
-_td_gen.run_doc_self_review = _passthrough_self_review
-# tasks_generator imports ``run_doc_self_review`` into its own
-# namespace (``from self_review import run_doc_self_review``),
-# so the passthrough must replace BOTH the source module and
-# the local binding.
-_tg_passthrough = _passthrough_self_review
-_tg_passthrough.__module__ = _self_review_mod.__name__
-_ts_gen.run_doc_self_review = _tg_passthrough
-_self_review_mod.run_doc_self_review = _tg_passthrough
+
+@pytest.fixture(autouse=True)
+def _stub_mandatory_self_review(monkeypatch):
+    """Hand these tests the second-pass stub, then give the originals back.
+
+    These four rebindings used to run at *import* time and were never
+    undone, so they lasted for the whole pytest process. That included
+    ``self_review.run_doc_self_review`` itself, which is why
+    ``tests/unit/test_session_reuse_planning_phases.py`` broke: it
+    defends itself by re-binding ``arch_generator.run_doc_self_review``
+    to ``self_review.run_doc_self_review``, and that "restore the real
+    one" read back the stub, leaving 0 self-review dispatches.
+    ``monkeypatch`` restores the originals when each test here ends.
+    """
+    # tasks_generator imports ``run_doc_self_review`` into its own
+    # namespace (``from self_review import run_doc_self_review``),
+    # so the passthrough must replace BOTH the source module and
+    # the local binding.
+    _tg_passthrough = _passthrough_self_review
+    _tg_passthrough.__module__ = _self_review_mod.__name__
+    monkeypatch.setattr(
+        _arch_gen, "run_doc_self_review", _passthrough_self_review,
+    )
+    monkeypatch.setattr(
+        _td_gen, "run_doc_self_review", _passthrough_self_review,
+    )
+    monkeypatch.setattr(
+        _ts_gen, "run_doc_self_review", _tg_passthrough,
+    )
+    monkeypatch.setattr(
+        _self_review_mod, "run_doc_self_review", _tg_passthrough,
+    )
 
 
 class MockCodingTool:

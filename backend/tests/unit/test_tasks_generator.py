@@ -75,7 +75,9 @@ def _patch_tasks_self_review(monkeypatch):
 
     monkeypatch.setattr(
         tg.TasksGenerator, "_run_tasks_self_review",
-        lambda self, tasks_data, falsifiability=None: None,
+        # ``**_ignored`` absorbs the reusable-session handle ``generate()``
+        # binds; this stub only suppresses the call, never inspects it.
+        lambda self, tasks_data, falsifiability=None, **_ignored: None,
     )
     return monkeypatch
 

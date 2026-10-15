@@ -90,8 +90,24 @@ def _passthrough_self_review(*args, **kwargs):
 import arch_generator as _arch_gen
 import tasks_generator as _ts_gen
 
-_arch_gen.run_doc_self_review = _passthrough_self_review
-_ts_gen.run_doc_self_review = _passthrough_self_review
+
+@pytest.fixture(autouse=True)
+def _stub_mandatory_self_review(monkeypatch):
+    """Hand these tests the second-pass stub, then give the originals back.
+
+    These two rebindings used to run at *import* time and were never
+    undone, so they lasted for the whole pytest process: every module
+    collected after this one silently received the no-op instead of the
+    real ``self_review.run_doc_self_review``. ``monkeypatch`` restores
+    the originals when each test in this module ends, so a leak can no
+    longer reach the tests that drive the real self-review.
+    """
+    monkeypatch.setattr(
+        _arch_gen, "run_doc_self_review", _passthrough_self_review,
+    )
+    monkeypatch.setattr(
+        _ts_gen, "run_doc_self_review", _passthrough_self_review,
+    )
 
 
 SAMPLE_PRD = {

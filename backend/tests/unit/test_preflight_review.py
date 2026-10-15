@@ -68,7 +68,21 @@ def _passthrough_self_review(*args, **kwargs):
 
 
 import tasks_generator as _ts_gen
-_ts_gen.run_doc_self_review = _passthrough_self_review
+
+
+@pytest.fixture(autouse=True)
+def _stub_mandatory_self_review(monkeypatch):
+    """Hand these tests the second-pass stub, then give the originals back.
+
+    This rebinding used to run at *import* time and was never undone,
+    so ``tasks_generator.run_doc_self_review`` stayed a no-op for the
+    whole pytest process -- including for tests that drive the real
+    ``self_review.run_doc_self_review``. ``monkeypatch`` restores the
+    original when each test in this module ends.
+    """
+    monkeypatch.setattr(
+        _ts_gen, "run_doc_self_review", _passthrough_self_review,
+    )
 
 
 def _make_coding_tool(canned_response):
