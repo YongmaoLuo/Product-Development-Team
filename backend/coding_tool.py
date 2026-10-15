@@ -1253,6 +1253,15 @@ class ClaudeCodingTool(CodingTool):
     MAX_PROMPT_TOKENS = 180_000   # target ceiling; leaves 20K headroom below 200K limit
     MAX_TOKENS_PER_FILE = 15_000  # per-file truncation cap (mirrors POST_COMPACT_MAX_TOKENS_PER_FILE)
     COMPACT_BUFFER_TOKENS = 5_000 # safety buffer after compaction
+
+    # Auto-compact window handed to the CLI for every sub-agent, in tokens.
+    # Distinct from MAX_PROMPT_TOKENS above: that one caps the *initial*
+    # prompt PDT sends, this one caps the *session* the CLI accumulates
+    # across turns. CLAUDE_CODE_AUTO_COMPACT_WINDOW takes a plain integer in
+    # [100000, 1000000] -- a suffixed "384k" reads as 384 and clamps to the
+    # floor. The effective window is still min(this, model's context window).
+    SUBAGENT_AUTO_COMPACT_WINDOW = "384000"
+
     TRUNCATION_MARKER = (
         "\n\n[... content truncated for context limit; "
         "use Read on the file path if you need the full text]"
@@ -1911,6 +1920,16 @@ class ClaudeCodingTool(CodingTool):
 
         if settings_data is not None:
             settings_data.setdefault("env", {})
+            # Must ride in the ``--settings`` payload (flagSettings), NOT in the
+            # child process env. At startup the CLI folds its settings scopes
+            # into ``process.env`` in the order userSettings, flagSettings,
+            # policySettings, each via an unconditional ``Object.assign`` -- so
+            # a value passed through ``env=`` is clobbered by whatever this
+            # machine's ``~/.claude/settings.json`` says, and only this file is
+            # late enough to win. See SUBAGENT_AUTO_COMPACT_WINDOW.
+            settings_data["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = (
+                self.SUBAGENT_AUTO_COMPACT_WINDOW
+            )
             settings_data["env"]["PDT_SUBAGENT_UUID"] = subagent_uuid
             settings_data["env"]["PDT_SUBAGENT_LOG_FILE"] = subagent_log_file
             if self.cwd:
