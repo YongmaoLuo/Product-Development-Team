@@ -333,6 +333,18 @@ class VerificationExecutor(BaseExecutor):
         called, so the caller can render verdicts in the same order
         as the original plan.
 
+        2026-10-14：计划自己已经作废的 VP（``obsolete`` / ``superseded_by``）
+        **不出现**在这里。这是 :meth:`_build_items_from_plan` 执行侧过滤的
+        另一半 —— 没有它，一个被计划丢弃的 VP 会带着**上一轮**的裁决继续
+        生产报告：2026-10-14 的该计划第 4 轮里，VP-009
+        在第 3 轮被标记 ``obsolete``，执行器第 4 轮一次都没跑它，但
+        SQLite 里的第 3 轮裁决（``verif_repo.summary()``，见
+        ``_load_or_init_state``）被重新水合成 ``_verdicts``，从
+        ``collect_verdicts()`` 原样流进 Phase 3 判定提示词，报告里
+        VP-009 又是 ``FAILED``（``actual_result`` 还是第 3 轮的原文）
+        → ``overall_status = FAILED`` → 修复环永远收敛不了。
+        判据与执行侧共用 :meth:`_plan_retired_vps`，两边不可能再漂移。
+
         Returns:
             A list of ``{"vp_id": str, "status": str, "reasons": list,
             "evidence": dict, ...}`` dicts. The ``vp_id`` key is
@@ -340,8 +352,15 @@ class VerificationExecutor(BaseExecutor):
             ``Dict[vp_id, verdict]``, so the key is not duplicated
             inside the verdict body).
         """
+        retired = self._plan_retired_vps()
         out: List[Dict[str, Any]] = []
         for vp_id, verdict in self._verdicts.items():
+            # ``str()``: ``_plan_retired_vps`` keys on ``str(vp["id"])`` and
+            # the executor derives ids the same way, but a verdict key that
+            # arrived as a non-str from a persisted store must not silently
+            # miss the filter (failing open is the bug being fixed here).
+            if str(vp_id) in retired:
+                continue
             entry = dict(verdict)  # defensive copy
             entry["vp_id"] = vp_id
             out.append(entry)
@@ -944,8 +963,32 @@ class VerificationExecutor(BaseExecutor):
         for vp_id in stale_ids:
             self._verdicts.pop(vp_id, None)
 
+        # 2026-10-14：计划自己已经作废的 VP，它的裁决同样不进失败桶。判据是
+        # **计划有没有标记**，不是命令有没有变过 —— 一个被 ``obsolete`` 的
+        # 验证点不是"出处过期"，它是计划不再要求的东西，继续把它记成失败
+        # 等于为一个没人要的判据生产失败（2026-10-14 的
+        # 计划第 4 轮就因此 ``overall_status = FAILED``，修复环不收敛）。
+        #
+        # 刻意**不 pop** ``_verdicts``（与上面 stale 的处理不同）：那份裁决
+        # 是审计痕迹，报告侧在 :meth:`collect_verdicts` 里过滤即可。
+        # ``superseded_by`` 的父 VP 尤其不能摘 —— 它的 SPLIT 裁决是"父不重跑"
+        # 这条契约的承重件（见下面 SPLIT 分支），摘掉等于让拆分过的大 VP
+        # 每轮重跑一次。
+        retired = self._plan_retired_vps()
+
         for vp_id, verdict in self._verdicts.items():
             status = verdict.get("status") if isinstance(verdict, dict) else None
+            if status == "FAILED" and str(vp_id) in retired:
+                if retired[str(vp_id)] == "superseded_by":
+                    # 父 VP 已被子 VP 取代，结论由子 VP 承担。仍进 skipped
+                    # （= ``completed_set``），否则下一轮会把拆分过的那条
+                    # 大 VP 重新跑一遍 —— 那正是拆分要避免的代价。
+                    skipped.append(vp_id)
+                # ``obsolete`` 的 VP 进哪个桶都不影响重跑判定：
+                # ``_build_items_from_plan`` 已经把它们排除在 items 之外，
+                # 它们永远进不了 pending。刻意不进 completed —— 把一个
+                # 从没验证过的东西记成"验证通过"同样是说谎。
+                continue
             if status == "FAILED":
                 failed.append(vp_id)
             elif status == "SKIPPED":
@@ -1480,15 +1523,71 @@ class VerificationExecutor(BaseExecutor):
         their feature/criterion is gone, so running them would manufacture
         failures for something the plan no longer requires. The marker is
         kept in the plan for audit (they are marked, never deleted).
+
+        2026-10-14: the predicate moved into :meth:`_plan_retired_vps` so
+        the **verdict** side (:meth:`collect_verdicts`,
+        :meth:`_backfill_index_lists_from_verdicts`) reads the same
+        definition. Two copies of "what counts as retired" is exactly how
+        the plan ended up not running VP-009 in round 4 while still
+        reporting it FAILED.
         """
-        vps = self.plan.get("vps") or self.plan.get("verification_points") or []
+        # The predicate itself moved to :meth:`_vp_retired_marker`; the
+        # filtering here stays keyed on the **marker**, not on the id —
+        # the historical comprehension filtered on the marker alone, so a
+        # marker-carrying VP without an ``id`` was dropped and still is.
         return [
-            vp for vp in vps
-            if not (
-                isinstance(vp, dict)
-                and (vp.get("superseded_by") or vp.get("obsolete"))
-            )
+            vp for vp in self._plan_vps()
+            if not self._vp_retired_marker(vp)
         ]
+
+    def _plan_retired_vps(self) -> Dict[str, str]:
+        """VP ids the plan itself retired → the marker that retired it.
+
+        Returns ``{vp_id: "obsolete" | "superseded_by"}`` for every VP in
+        ``self.plan`` carrying either marker. The single source of truth
+        for "the plan no longer requires this VP":
+
+          * :meth:`_build_items_from_plan` skips them (nothing runs);
+          * :meth:`collect_verdicts` hides their verdicts (nothing is
+            reported);
+          * :meth:`_backfill_index_lists_from_verdicts` keeps their
+            verdicts out of the failure set.
+
+        Accepts both plan shapes (``vps`` = executor schema,
+        ``verification_points`` = LLM schema). A VP carrying both markers
+        reports ``obsolete`` — both mean "not run", and the verdict-side
+        handling differs (an ``obsolete`` VP never reaches ``pending``, so
+        it needs no terminal bucket to stay un-rerun; a ``superseded_by``
+        parent does, because
+        ``verification_agent._convert_plan_to_executor_schema`` does not
+        forward ``superseded_by`` to the executor schema).
+        """
+        retired: Dict[str, str] = {}
+        for vp in self._plan_vps():
+            marker = self._vp_retired_marker(vp)
+            if marker:
+                vp_id = vp.get("id")
+                if vp_id:
+                    retired[str(vp_id)] = marker
+        return retired
+
+    def _vp_retired_marker(self, vp: Any) -> Optional[str]:
+        """``"obsolete"`` / ``"superseded_by"`` / ``None`` for one plan VP."""
+        if not isinstance(vp, dict):
+            return None
+        if vp.get("obsolete"):
+            return "obsolete"
+        if vp.get("superseded_by"):
+            return "superseded_by"
+        return None
+
+    def _plan_vps(self) -> List[Any]:
+        """The plan's VP list, in whichever schema the caller supplied."""
+        return (
+            self.plan.get("vps")
+            or self.plan.get("verification_points")
+            or []
+        )
 
     def _build_execution_layers(
         self,
