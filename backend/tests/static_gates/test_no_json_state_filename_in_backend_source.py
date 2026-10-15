@@ -91,6 +91,8 @@ from pathlib import Path
 
 import pytest
 
+import source_scan  # noqa: E402  (same directory; stdlib-only walker)
+
 # Backend root for the static scan.  ``backend/tests/static_gates`` is
 # three levels deep from ``backend/``.
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -328,7 +330,8 @@ def test_no_json_state_filename_in_backend_source() -> None:
         for path, line_no, line in _scan_for_filename(BACKEND_DIR, filename):
             violations.append(
                 f"{path.relative_to(BACKEND_DIR)}:{line_no}: "
-                f"{line.strip()!r}  <-- contains {filename!r}"
+                f"{source_scan.redact_span(line.strip())}"
+                f"  <-- contains {filename!r}"
             )
     assert not violations, (
         "Production code still references deprecated JSON state "

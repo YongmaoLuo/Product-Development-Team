@@ -48,6 +48,7 @@ live string.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -68,6 +69,28 @@ sys.path.insert(0, str(GATES_DIR))
 # constant below matches it and the rule fires -- while naming nothing that
 # exists.
 LEAK_PLAN_ID = "20260101-synthetic-plan-id"
+
+#: One complete discovery line, matched whole. The staged-content scan
+#: reports ``[label]  path:lineno: <redacted> (N chars)`` and nothing else.
+#:
+#: Why whole-line and not "the plan id showed up somewhere": this scan
+#: runs from the pre-commit hook, and the plan id is the private quoted
+#: identifier the hook exists to keep out of the commit -- reprinting it
+#: into the committer's terminal publishes it. What has to survive is the
+#: ``path:lineno``, because that is what the committer opens an editor
+#: with.
+_DISCOVERY_RE = re.compile(
+    r"^\[[^\]]+\]\s+\S+:\d+: <redacted> \((\d+) chars\)$"
+)
+
+
+def _discovery_lines(output: str) -> list[re.Match[str]]:
+    """Every line of *output* that is a complete finding report."""
+    return [
+        m
+        for m in (_DISCOVERY_RE.match(line.strip()) for line in output.splitlines())
+        if m is not None
+    ]
 
 CLEAN_SOURCE = 'GREETING = "hello"\nCOUNT = 3\n'
 
@@ -129,7 +152,20 @@ def test_a_plan_id_in_staged_source_is_blocked(tmp_path) -> None:
     _stage(env, "backend/agent.py", f'PLAN = "{LEAK_PLAN_ID}"\n')
     got = _scan(env)
     assert got.returncode == 1, f"leak not blocked (exit {got.returncode}):\n{got.stdout}"
-    assert LEAK_PLAN_ID in got.stderr, got.stderr
+    reported = _discovery_lines(got.stderr)
+    assert [m[1] for m in reported] == [str(len(LEAK_PLAN_ID))], (
+        f"the finding is not reported as one complete discovery line naming "
+        f"path, lineno and the length of the match -- so the reader has "
+        f"neither a place to go nor evidence the shape matched:\n{got.stderr}"
+    )
+    assert "backend/agent.py:1" in got.stderr, (
+        f"the finding lost its path:lineno, so the reader cannot open the "
+        f"file:\n{got.stderr}"
+    )
+    assert LEAK_PLAN_ID not in got.stderr, (
+        f"the plan id was reprinted by the pre-commit hook that exists to "
+        f"keep it out of the commit:\n{got.stderr}"
+    )
 
 
 def test_the_index_is_read_not_the_working_tree(tmp_path) -> None:

@@ -1397,6 +1397,14 @@ def test_no_commit_in_this_history_carries_an_ai_trailer() -> None:
     offenders: dict[str, list[str]] = {}
     for sha, body in history:
         for v in _violations(body):
+# sha + line number + the rule's own reason, bucketed by rule.
+            # NOT ``v.line``: a commit message is exactly where a private
+            # plan name and a private project name get quoted, and
+            # reprinting it here puts both on the operator's terminal --
+            # which is how the ``refs/backup/old-origin/*`` sweep below
+            # leaked them. ``v.reason`` is safe to print because
+            # ``check_commit_msg.find_violations`` builds it through
+            # ``redact_span``; the line it names is not.
             offenders.setdefault(v.rule, []).append(
                 f"{sha[:10]} L{v.lineno}: {v.reason}"
             )
@@ -1931,6 +1939,12 @@ def test_only_the_declared_refs_retain_the_trailer() -> None:
     scan = _sweep(refs)
     _assert_the_sweep_was_not_empty(scan)
     offenders = scan.offenders
+    # sha + line number only. NOT ``v.line``: the ref sweep reads
+    # commit bodies on refs that a rewrite left behind, and those
+    # bodies quote the private plan name in prose. Reprinting them
+    # is how this assertion painted them across the terminal the
+    # first time it ran red. ``_sweep`` therefore carries the
+    # location only -- see its docstring.
     assert not offenders, (
         "undeclared refs that can still be published retain commits the "
         "commit-message gate rejects:\n"
@@ -1970,6 +1984,12 @@ def test_no_remote_tracking_ref_retains_the_trailer() -> None:
     scan = _sweep(remote_refs)
     _assert_the_sweep_was_not_empty(scan)
     offenders = scan.offenders
+    # sha + line number only. NOT ``v.line``: the ref sweep reads
+    # commit bodies on refs that a rewrite left behind, and those
+    # bodies quote the private plan name in prose. Reprinting them
+    # is how this assertion painted them across the terminal the
+    # first time it ran red. ``_sweep`` therefore carries the
+    # location only -- see its docstring.
     assert not offenders, (
         "remote-tracking refs carry commits the commit-message gate "
         "rejects, so that history has been published:\n"

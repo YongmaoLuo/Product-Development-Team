@@ -73,7 +73,11 @@ Exit codes
 ----------
 * ``0`` -- the list was read, the content was read, zero needles matched.
 * ``1`` -- the list was read, the content was read, at least one needle
-  matched. Every hit is reported as ``relative/path:lineno: needle``.
+  matched. Every hit is reported as
+  ``relative/path:lineno: <redacted> (N chars) [list entry #K]`` -- the
+  location and the position in the operator's own list, never the
+  matched text, because a report that prints the private name is the
+  leak with extra steps. See ``source_scan.redact_span``.
 * ``2`` -- **the check did not run,** or did not run over everything it was
   asked to read. The list is missing, holds zero usable needles, or holds a
   pattern that does not compile; the index could not be read; a range
@@ -296,7 +300,7 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 #: Repository root -- this file lives at ``scripts/scanners/``, two levels
@@ -372,7 +376,10 @@ if not _GATES_DIR.is_dir():  # pragma: no cover - broken checkout
 sys.path.insert(0, str(_GATES_DIR))
 
 try:
-    from source_scan import SOURCE_EXTENSIONS  # noqa: E402
+    from source_scan import (  # noqa: E402
+        SOURCE_EXTENSIONS,
+        redact_span,
+    )
 except ImportError as exc:  # pragma: no cover - broken checkout
     print(
         f"error: cannot import the source-extension set from "
@@ -405,6 +412,12 @@ class Needle:
     #: byte-identical in every ASCII-superset encoding and no decoder
     #: rewrites them.
     byte_forms: tuple["bytes | re.Pattern[bytes]", ...] = ()
+    #: 1-based position in the *de-duplicated* list, assigned by
+    #: :func:`dedupe`. Reported so an operator can look up which of their
+    #: own entries fired without the report naming it: the position is
+    #: not the content, and it is the one part of the finding still
+    #: actionable once the text itself is withheld.
+    index: int = 0
 
     def search(self, line: str) -> str | None:
         """Return the offending text in *line*, or ``None`` if absent."""
@@ -505,17 +518,17 @@ def _byte_forms(
 
 #: The four surfaces a private name can be published on, each with the tag
 #: its report lines carry. A tag rather than a differently-shaped line
-#: because the content shape ``path:lineno: needle`` is pinned -- it is what
-#: ``scripts/scan_forbidden_names.sh`` describes in its HOWTO and what every
-#: reader of a content finding already knows -- so the new surfaces are
-#: added *alongside* it rather than by reformatting it.
+#: because the content shape ``path:lineno: <redacted>`` is pinned -- it is
+#: what ``scripts/scan_forbidden_names.sh`` describes in its HOWTO and what
+#: every reader of a content finding already knows -- so the new surfaces
+#: are added *alongside* it rather than by reformatting it.
 WHERE_CONTENT = "content"
 WHERE_PATH = "path-name"
 WHERE_MESSAGE = "commit-message"
 WHERE_REF = "ref-name"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class Violation:
     """One needle found in one place.
 
@@ -523,21 +536,58 @@ class Violation:
     *lineno* is the line within it -- meaningful for a blob and for a commit
     message, and unused (0) for a path or a ref name, which are one string
     each and have no interior lines.
+
+    ``needle`` holds the matched text and stays in memory: de-duplication
+    and the hit count are computed on it, and redacting there would
+    weaken the check. :meth:`format` -- the one place this value is
+    *rendered* -- is what withholds it, on every one of the four surfaces
+    alike.
+
+    The report is ``<location>: <redacted> (N chars) [list entry #K]``.
+    The first half is the location, which is what a reader needs in order
+    to go and fix the file. The rest says how much text is involved and
+    which of the operator's own list entries fired; neither is the text.
+
+    ``repr=False`` on the dataclass because the generated ``__repr__``
+    interpolates every field, ``needle`` included -- and a ``repr``
+    reaches a traceback, a debugger and a ``pytest`` assertion message
+    just as readily as ``print`` reaches a terminal. The ``__repr__``
+    below is :meth:`format` for the same reason.
     """
 
     path: str
     lineno: int
     needle: str
+    #: Which of the four surfaces this finding is from. ``WHERE_CONTENT``
+    #: unless a caller says otherwise, so a finding built the old way
+    #: still renders as the content shape every reader knows.
     where: str = WHERE_CONTENT
+    #: 1-based position of the needle in the de-duplicated list. ``0``
+    #: when a caller built a :class:`Violation` without going through
+    #: :func:`dedupe`, and then the report simply omits it.
+    #:
+    #: Every construction site passes *both* ``where`` and ``index`` by
+    #: keyword. They are the same field position in the two histories this
+    #: merged from -- one side's fourth positional argument was ``where``,
+    #: the other's was ``index`` -- so a positional call here would be a
+    #: silent type error rather than a ``TypeError``: a ``str`` landing in
+    #: ``index`` renders as ``#content`` and a ``int`` landing in ``where``
+    #: falls through to the path/ref shape with an int tag.
+    index: int = 0
 
     def format(self) -> str:
+        entry = f" [list entry #{self.index}]" if self.index else ""
+        shown = f"{redact_span(self.needle)}{entry}"
         if self.where == WHERE_CONTENT:
-            return f"{self.path}:{self.lineno}: {self.needle}"
+            return f"{self.path}:{self.lineno}: {shown}"
         if self.where == WHERE_MESSAGE:
-            return f"{self.path} [{self.where}]:{self.lineno}: {self.needle}"
+            return f"{self.path} [{self.where}]:{self.lineno}: {shown}"
         # A path or a ref: one string, no line number, so naming a line
         # would be inventing precision the finding does not have.
-        return f"{self.path} [{self.where}]: {self.needle}"
+        return f"{self.path} [{self.where}]: {shown}"
+
+    def __repr__(self) -> str:
+        return f"Violation({self.format()})"
 
 
 # ---------------------------------------------------------------------------
@@ -570,8 +620,14 @@ def parse_needles(text: str) -> list[Needle]:
                 compiled = re.compile(pattern, re.IGNORECASE)
             except re.error as exc:
                 raise ScanError(
-                    f"line {lineno}: '{pattern}' is not a valid regular "
-                    f"expression: {exc}"
+                    f"line {lineno} is a '{REGEX_PREFIX}' entry that is not "
+                    f"a valid regular expression: {exc}\n"
+                    f"The pattern itself is not repeated here: an entry in "
+                    f"this list is a private proper name, or a shape built "
+                    f"from one, and printing it would publish the very thing "
+                    f"the list exists to withhold. The line number above is "
+                    f"enough to open the list at it, and the compiler's own "
+                    f"message names the construct it choked on."
                 ) from exc
             needles.append(
                 Needle("regex", pattern, compiled, _byte_forms(pattern, is_regex=True))
@@ -589,6 +645,11 @@ def dedupe(needles: Sequence[Needle]) -> list[Needle]:
     Without this a name listed twice reports the same line twice, and a
     count nobody can read is a count nobody checks. Literals are compared
     case-insensitively, because they match case-insensitively.
+
+    Each surviving needle is numbered 1..N in list order. That number is
+    what :attr:`Needle.index` carries and what a report prints: the
+    operator holds the list, so "entry #7" is actionable, and it says
+    nothing about what entry 7 says to anybody who does not hold it.
     """
     seen: set[tuple[str, str]] = set()
     out: list[Needle] = []
@@ -597,7 +658,9 @@ def dedupe(needles: Sequence[Needle]) -> list[Needle]:
         if key in seen:
             continue
         seen.add(key)
-        out.append(needle)
+        out.append(
+            needle if needle.index else replace(needle, index=len(out) + 1)
+        )
     return out
 
 
@@ -976,16 +1039,31 @@ def read_ref_names(repo: Path) -> list[str]:
 #: A lone surrogate is what ``surrogateescape`` puts where a byte could not
 #: be decoded. It is a real code point in ``str`` and it is what makes that
 #: decode lossless, but ``print`` cannot encode one -- ``utf-8`` has no
-#: representation of it and the default error handler refuses -- so a
-#: ``re:`` needle whose match happened to span such a byte would crash the
-#: scanner while reporting a finding it had already made. A gate that dies
-#: on the way to printing the leak it found is a worse outcome than the
-#: mismatched decode it replaced, so every label goes through this first.
+#: representation of it and the default error handler refuses.
 #:
 #: ``backslashreplace`` rather than ``replace``: it prints the escape
-#: (``\udce9``) instead of a substitution character, so the report names the
-#: exact byte that could not be read and a reader can tell a mangled match
-#: from a clean one.
+#: (``\udce9``) instead of a substitution character, so it names the exact
+#: byte that could not be read and a reader can tell a mangled match from a
+#: clean one.
+#:
+#: **It no longer has a crash to prevent, and that is worth saying plainly
+#: rather than leaving the original rationale standing.** The original
+#: reason was that ``print`` could not encode a label holding a surrogate.
+#: Nothing prints a label any more: :meth:`Violation.format` withholds
+#: ``needle``, and every ``path`` this module scans is decoded with
+#: ``errors="replace"`` (see :func:`iter_index_blobs` and the ``ls-tree``
+#: reader), so a path holds U+FFFD rather than a surrogate and encodes
+#: cleanly. So today this call is inert: it normalises the de-duplication
+#: key and nothing else.
+#:
+#: It is kept because the call sites are real -- :func:`_scan_bytes_text`,
+#: :func:`scan_path` and :func:`scan_ref_name` all still call it -- and a
+#: removal here would be a second, separate argument about whether the
+#: label should be normalised at all, not part of resolving this merge. If
+#: it is ever deleted, the label it produced stops being a printable
+#: string, and the one thing that has to survive that is every rendering
+#: path that can reach a :class:`Violation`. :meth:`Violation.__repr__` is
+#: the one to re-check first.
 def _printable(text: str) -> str:
     return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
@@ -1024,7 +1102,15 @@ def _scan_bytes_text(
                 label_text = _printable(
                     f"re:{hit}" if needle.kind == "regex" else hit
                 )
-                violations.append(Violation(label, lineno, label_text, where))
+                violations.append(
+                    Violation(
+                        path=label,
+                        lineno=lineno,
+                        needle=label_text,
+                        where=where,
+                        index=needle.index,
+                    )
+                )
                 reported.add((lineno, label_text))
 
     if raw is not None:
@@ -1095,7 +1181,15 @@ def scan_path(path: str, needles: Sequence[Needle]) -> list[Violation]:
         if label in reported:
             continue
         reported.add(label)
-        violations.append(Violation(path, 0, label, WHERE_PATH))
+        violations.append(
+            Violation(
+                path=path,
+                lineno=0,
+                needle=label,
+                where=WHERE_PATH,
+                index=needle.index,
+            )
+        )
     return violations
 
 
@@ -1122,7 +1216,15 @@ def scan_ref_name(ref: str, needles: Sequence[Needle]) -> list[Violation]:
         if label in reported:
             continue
         reported.add(label)
-        violations.append(Violation(ref, 0, label, WHERE_REF))
+        violations.append(
+            Violation(
+                path=ref,
+                lineno=0,
+                needle=label,
+                where=WHERE_REF,
+                index=needle.index,
+            )
+        )
     return violations
 
 
@@ -1168,7 +1270,15 @@ def _scan_bytes(
                 if (lineno, label) in reported:
                     continue
                 reported.add((lineno, label))
-                found.append(Violation(path, lineno, label, where))
+                found.append(
+                    Violation(
+                        path=path,
+                        lineno=lineno,
+                        needle=label,
+                        where=where,
+                        index=needle.index,
+                    )
+                )
     return found
 
 

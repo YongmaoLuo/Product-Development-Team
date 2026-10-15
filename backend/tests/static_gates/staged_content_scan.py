@@ -171,9 +171,20 @@ class StagedScanError(RuntimeError):
     """The scan could not run. Never conflated with "found nothing"."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class Finding:
-    """One rule violation inside one staged blob."""
+    """One rule violation inside one staged blob.
+
+    ``snippet`` holds the matched text and stays in memory; ``format`` is
+    what withholds it. A staged blob is arbitrary content the operator is
+    about to publish, so the matched span is exactly the material this
+    rule exists to keep out of history -- quoting it in the pre-commit
+    output puts it on screen and in any log that captures the hook.
+
+    ``repr=False`` because the generated ``__repr__`` interpolates every
+    field, ``snippet`` included, and a ``repr`` reaches a traceback and a
+    pytest assertion message as readily as ``print`` reaches a terminal.
+    """
 
     label: str
     path: str
@@ -181,7 +192,13 @@ class Finding:
     snippet: str
 
     def format(self) -> str:
-        return f"[{self.label}]  {self.path}:{self.lineno}: {self.snippet}"
+        return (
+            f"[{self.label}]  {self.path}:{self.lineno}: "
+            f"{source_scan.redact_span(self.snippet)}"
+        )
+
+    def __repr__(self) -> str:
+        return f"Finding({self.format()})"
 
 
 @dataclass(frozen=True)

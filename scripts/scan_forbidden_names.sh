@@ -212,23 +212,29 @@ if [ "$RC" -eq 1 ]; then
     printf '%s\n' "$OUTPUT" >&2
     cat >&2 <<'HOWTO'
 
-Each line above names where the name was found:
+Each line above names where the name was found. The name itself is not
+printed — a report that repeats the private proper name it exists to catch
+is the leak with extra steps, and this output ends up in terminals, CI logs
+and pasted issues. What you get instead is `<redacted> (N chars) [list
+entry #K]`: `N chars` is how much text is involved and `#K` is the position
+of the matching entry in your own .config/forbidden-names, so you can look
+it up without this script telling you what it says.
 
-  relative/path:lineno: needle        inside a staged or committed file
-  relative/path [path-name]: needle   in the path itself
-  <sha> [commit-message]:N: needle   in a commit message, line N
-  refs/heads/... [ref-name]: needle   in a branch or tag name
+  relative/path:lineno: …          inside a staged or committed file
+  relative/path [path-name]: …     in the path itself
+  <sha> [commit-message]:N: …      in a commit message, line N
+  refs/heads/... [ref-name]: …     in a branch or tag name
 
 There is no per-file allowlist and no `tests/` exemption: a private name is
 as published in a fixture or a docstring as in a secret.
 
-To fix it, delete the name from the line — or, if the file genuinely has to
-name something the list flags, narrow the list entry rather than the
-check. For a `[ref-name]` line the fix is `git branch -m` / `git tag -d`
-and a fresh push: the old name stays in every clone's reflog and in every
-`git ls-remote` that already saw it, so a rename is the only remedy there
-is. The list is yours (.config/forbidden-names); the check is not optional
-once you have one.
+To fix it, open the place named and delete the name — or, if the file
+genuinely has to name something the list flags, narrow the list entry
+rather than the check. For a `[ref-name]` line the fix is `git branch -m` /
+`git tag -d` and a fresh push: the old name stays in every clone's reflog
+and in every `git ls-remote` that already saw it, so a rename is the only
+remedy there is. The list is yours (.config/forbidden-names); the check is
+not optional once you have one.
 HOWTO
     exit 1
 fi

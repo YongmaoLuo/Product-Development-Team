@@ -283,8 +283,13 @@ def test_no_operator_attribution_outside_claude_md() -> None:
 
         # Attribution phrases
         for _, lineno, phrase in find_attribution(path, text):
+            # ``phrase`` is the matched span. For the structural shapes it
+            # is arbitrary source text around the marker, which can be any
+            # word in the file -- including one this repository's own
+            # forbidden-name check exists to keep out of it. Withheld.
             offenders.append(
-                f"{path}:{lineno}: attribution phrase {phrase!r}"
+                f"{path}:{lineno}: attribution phrase "
+                f"{source_scan.redact_span(phrase)}"
             )
 
     assert not offenders, (

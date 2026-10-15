@@ -177,7 +177,14 @@ def test_no_non_placeholder_home_path() -> None:
             # formatting ``path`` directly would print the runner's whole
             # checkout prefix into the failure message.
             rel = source_scan.repo_relative(path)
-            offenders.append(f"{rel}:{lineno}: /Users/{segment}/...")
+            # ``segment`` is the account name in the path -- a proper name
+            # of a person or an employer, and the one thing here that is
+            # genuinely private. ``/Users/<segment>/...`` identified one
+            # developer's machine and now also identifies them in every log
+            # this gate writes, so the segment is withheld and the shape
+            # is kept: ``/Users/<redacted>/...`` still says what to go and
+            # change.
+            offenders.append(f"{rel}:{lineno}: /Users/{source_scan.REDACTED}/...")
 
     assert not offenders, (
         "First-party source contains a local-machine home path. "

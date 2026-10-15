@@ -144,7 +144,11 @@ def test_no_settings_tmpfile_is_built_from_a_flat_tmp_literal() -> None:
         except OSError:
             continue
         for _, lineno, literal in find_flat_tmp_settings_paths(path, text):
-            offenders.append(f"{path}:L{lineno}: {literal}")
+            # ``literal`` is the matched source span. Withheld; ``path:L``
+            # is what a reader needs to go and change it.
+            offenders.append(
+                f"{path}:L{lineno}: {source_scan.redact_span(literal)}"
+            )
 
     assert not offenders, (
         "a settings file is built from a literal path under /tmp. Those "

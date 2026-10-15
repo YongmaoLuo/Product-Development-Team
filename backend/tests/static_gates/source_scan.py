@@ -43,12 +43,63 @@ Exclusions
 source but never should be scanned — vendor caches, build outputs,
 the plans the application writes at runtime. Names, not paths: a
 match anywhere in the relative path's parts removes the file.
+
+Reporting — what a gate is allowed to print
+-------------------------------------------
+:data:`REDACTED` and :func:`redact_span` are the shared answer to a
+question every gate in this repository has to answer the same way: **a
+gate that exists to catch a private name must not print one.**
+
+The failure this prevents is not hypothetical. A rule that reports
+``path:lineno: <the matched text>`` prints the thing it was written to
+remove, into whatever reads the log — a terminal, a CI annotation, a
+commit somebody pastes into an issue. The ``path:lineno`` half is not
+private and is not optional: it is what lets the reader go and fix the
+file. The matched-text half is the leak, and it is the half every one
+of these scanners used to print.
+
+What survives redaction is the three things a reader needs in order to
+act: where it is (``path:lineno``, or ``sha`` and ``lineno``), which
+rule fired (the scan's own label), and how many. What goes is the span
+itself. The character count is kept because it is a property of the
+rule's output rather than of its content, and it is the one
+not-derivable-from-the-location hint that helps a reader with more than
+one candidate at the same line.
+
+Nothing here weakens a check. Redaction happens at *render* time --
+:class:`Violation` and the ``Finding`` dataclasses still carry the
+matched text in memory, so de-duplication, hit counts and the exit code
+are computed on exactly the same data as before. A reader who needs the
+matched text to fix a line reads the line; a reader who needs it pasted
+into someone else's terminal does not get it.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+
+#: What stands in for a matched span in every report this repository
+#: prints. A fixed token rather than a blank, so that "there was a hit
+#: here" and "there was no hit here" are distinguishable by shape alone
+#: and a reader knows the span was withheld on purpose rather than lost.
+REDACTED = "<redacted>"
+
+
+def redact_span(matched: str | None) -> str:
+    """Return the report token standing in for a matched *span*.
+
+    ``"<redacted> (18 chars)"`` -- never any substring of *matched*. The
+    character count is the only extra datum, and it is a length rather
+    than a fragment: it says how much text is on the line without saying
+    what is in it.
+
+    An empty or ``None`` span renders as the bare token, so a caller that
+    has a hit but no text to describe never invents one.
+    """
+    if not matched:
+        return REDACTED
+    return f"{REDACTED} ({len(matched)} chars)"
 
 #: Top-level first-party source roots. Every directory here is
 #: checked into the repository; ``.config/`` is intentionally absent

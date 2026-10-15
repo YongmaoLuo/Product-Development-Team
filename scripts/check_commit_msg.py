@@ -94,6 +94,11 @@ if not _GATES_DIR.is_dir():  # pragma: no cover - broken checkout
 sys.path.insert(0, str(_GATES_DIR))
 
 try:
+    # The same ``redact_span`` every other gate renders findings with, and
+    # for the same reason. Imported from ``source_scan`` rather than
+    # restated because the *shape* of a redaction has to agree across the
+    # tree: a reader who has seen one report has seen the rest.
+    from source_scan import redact_span  # noqa: E402
     from test_no_plan_ids_in_metadata import (  # noqa: E402
         COMMIT_MESSAGE_LABEL,
         find_plan_ids_in_metadata,
@@ -275,7 +280,13 @@ def find_violations(message: str) -> list[Violation]:
             token = _has_ai_token(trailer.group("value"))
             if token is not None:
                 found.append(
-                    Violation(lineno, stripped, f"co-author trailer names an AI system ({token!r})", RULE_TRAILER)
+                    Violation(
+                        lineno,
+                        stripped,
+                        "co-author trailer names an AI system: "
+                        f"{redact_span(token)}",
+                        RULE_TRAILER,
+                    )
                 )
             continue
 
@@ -283,7 +294,13 @@ def find_violations(message: str) -> list[Violation]:
             token = _has_ai_token(line)
             if token is not None:
                 found.append(
-                    Violation(lineno, stripped, f"'generated with' line names an AI system ({token!r})", RULE_TRAILER)
+                    Violation(
+                        lineno,
+                        stripped,
+                        "'generated with' line names an AI system: "
+                        f"{redact_span(token)}",
+                        RULE_TRAILER,
+                    )
                 )
 
     for _, lineno, plan_id in find_plan_ids_in_metadata(COMMIT_MESSAGE_LABEL, message):
@@ -291,7 +308,7 @@ def find_violations(message: str) -> list[Violation]:
             Violation(
                 lineno,
                 _line_at(message, lineno).strip(),
-                f"commit message carries a plan id ({plan_id!r})",
+                f"commit message carries a plan id: {redact_span(plan_id)}",
                 RULE_PLAN_ID,
             )
         )
@@ -352,18 +369,21 @@ def main(argv: list[str] | None = None) -> int:
     attribution = [v for v in violations if v.rule == RULE_TRAILER]
     plan_ids = [v for v in violations if v.rule == RULE_PLAN_ID]
 
+    # ``v.line`` is the offending commit-message line and is deliberately
+    # NOT printed. This is a commit-msg hook: its stderr lands in whatever
+    # the committer is looking at, and the message it is rejecting is by
+    # construction a message that quotes a private plan name. The reason
+    # already names the rule, and the line number already says where.
     if attribution:
         print("commit message carries an AI attribution trailer:\n", file=sys.stderr)
         for v in attribution:
             print(f"  line {v.lineno}: {v.reason}", file=sys.stderr)
-            print(f"    {v.line}", file=sys.stderr)
         print(f"\n{_FIX_HINT}", file=sys.stderr)
 
     if plan_ids:
         print("commit message carries a plan id:\n", file=sys.stderr)
         for v in plan_ids:
             print(f"  line {v.lineno}: {v.reason}", file=sys.stderr)
-            print(f"    {v.line}", file=sys.stderr)
         print(f"\n{_PLAN_ID_FIX_HINT}", file=sys.stderr)
 
     return 1

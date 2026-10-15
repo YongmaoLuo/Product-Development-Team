@@ -70,6 +70,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from source_scan import redact_span  # noqa: E402
 from test_no_local_home_path_in_first_party import (  # noqa: E402
     find_home_paths,
 )
@@ -117,9 +118,20 @@ class MetadataScanError(RuntimeError):
     """The scan could not run. Never conflated with "found nothing"."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class Finding:
-    """One rule violation in one pull-request field."""
+    """One rule violation in one pull-request field.
+
+    ``snippet`` holds the matched text and stays in memory; ``format`` is
+    what withholds it. The field here is the pull request's own branch
+    name, title or body, and those reach the merge commit verbatim -- so
+    the matched span is not merely sensitive, it is about to become
+    permanent public history whether or not this gate says anything.
+
+    ``repr=False`` because the generated ``__repr__`` interpolates every
+    field, ``snippet`` included, and a ``repr`` reaches a traceback and a
+    pytest assertion message as readily as ``print`` reaches a terminal.
+    """
 
     field: str
     label: str
@@ -127,7 +139,13 @@ class Finding:
     snippet: str
 
     def format(self) -> str:
-        return f"[{self.label}]  {self.field}:{self.lineno}: {self.snippet}"
+        return (
+            f"[{self.label}]  {self.field}:{self.lineno}: "
+            f"{redact_span(self.snippet)}"
+        )
+
+    def __repr__(self) -> str:
+        return f"Finding({self.format()})"
 
 
 def scan_text(path: str, text: str) -> list[Finding]:

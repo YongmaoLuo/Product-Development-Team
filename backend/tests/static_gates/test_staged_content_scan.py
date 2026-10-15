@@ -448,11 +448,21 @@ def test_a_leading_nul_in_source_is_still_scanned(tmp_path: Path) -> None:
         "the staged-content scan passed a commit carrying a plan id in a "
         f"NUL-prefixed source file:\n{combined}"
     )
-    assert _LEAK_PLAN_ID in combined, (
-        "the plan id must be reported against the file that carries it, "
-        f"not merely blocked:\n{combined}"
+    # The report has to name the file and the line, because that is what
+    # the committer acts on -- and it must NOT quote the plan id, because
+    # this scan runs from the pre-commit hook and its stderr lands in
+    # whatever the operator is looking at. Both halves are asserted here;
+    # the second is the half this assertion used to get backwards.
+    assert (
+        "backend/leak_bin.py:1:" in combined
+    ), f"the finding is not reported as path:lineno:\n{combined}"
+    assert "<redacted>" in combined, (
+        f"the report does not mark the matched text as withheld:\n{combined}"
     )
-    assert "leak_bin.py" in combined, combined
+    assert _LEAK_PLAN_ID not in combined, (
+        "the plan id was reprinted by the gate that exists to keep it out "
+        f"of the commit:\n{combined}"
+    )
 
 
 def test_a_nul_prefixed_source_file_is_counted_as_scanned(tmp_path: Path) -> None:
