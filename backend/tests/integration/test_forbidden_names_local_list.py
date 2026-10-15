@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -71,6 +72,62 @@ SYNTHETIC_NEEDLE = "zz-synthetic-forbidden-project"
 #: written them, ``zz-caf\\xe9-synthetic``. Same name, different bytes.
 SYNTHETIC_NON_ASCII_NEEDLE = "zz-café-synthetic"
 _NON_ASCII_NEEDLE_LATIN1 = b"NAME = 'zz-caf\xe9-synthetic'\n"
+
+#: One complete discovery line, matched whole. The scanner reports
+#: ``path:lineno: <redacted> (N chars) [list entry #K]`` and nothing else,
+#: so this is the shape a finding has to arrive in.
+#:
+#: Why the shape and not "the needle appeared somewhere": this scanner
+#: exists to stop a private proper name being published, so it must not
+#: print one either. An assertion of the form ``needle in output`` cannot
+#: be written any more -- and the form that *could* be written loosely,
+#: ``"<redacted>" in output``, is satisfied by the HOWTO legend the
+#: wrapper prints on every failure. So the path, the line number, the
+#: redaction token and the list position are pinned together, and the
+#: needle's own absence is pinned alongside.
+_DISCOVERY_RE = re.compile(
+    r"^(?P<path>\S+):(?P<lineno>\d+): <redacted> \((?P<chars>\d+) chars\)"
+    r"(?: \[list entry #(?P<entry>\d+)\])?$"
+)
+
+
+def _discovery_lines(output: str) -> list[re.Match[str]]:
+    """Every line of *output* that is a complete finding report."""
+    return [
+        m
+        for m in (_DISCOVERY_RE.match(line.strip()) for line in output.splitlines())
+        if m is not None
+    ]
+
+
+def _assert_reported_at(output: str, *, path: str, lineno: int, needle: str) -> None:
+    """The finding is reported at *path*:*lineno*, in full, and the needle
+    is nowhere in *output*.
+
+    Both halves matter. The first is the only way a reader can go and fix
+    the commit, so a redaction that dropped it would have made the gate
+    unusable. The second is the reason this gate exists at all: its
+    stderr reaches the operator's terminal, and a scanner that repeats the
+    private name it just found has published it to everyone watching.
+    """
+    wanted = [m for m in _discovery_lines(output) if m["path"] == path]
+    assert wanted, (
+        f"no finding reported as '{path}:<lineno>: <redacted> ...' in the "
+        f"output, so the reader is told a path but not which line:\n{output}"
+    )
+    got = wanted[0]
+    assert int(got["lineno"]) == lineno, (
+        f"the finding was reported at line {got['lineno']}, not {lineno} -- "
+        f"the line number is what a reader pastes into an editor:\n{output}"
+    )
+    assert got["entry"] == "1", (
+        "the report does not name which of the operator's own list entries "
+        f"fired, so it cannot be acted on without re-deriving it:\n{output}"
+    )
+    assert needle not in output, (
+        f"the needle was reprinted by the gate that exists to keep it out of "
+        f"the commit:\n{output}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -245,10 +302,9 @@ def test_pre_commit_blocks_a_staged_forbidden_name(tmp_path) -> None:
         f"a staged forbidden name was not blocked (exit {got.returncode}):\n"
         f"{got.stdout}\n{got.stderr}"
     )
-    assert "backend/agent.py:1" in got.stderr, (
-        f"the violation was not reported as path:lineno:\n{got.stderr}"
+    _assert_reported_at(
+        got.stderr, path="backend/agent.py", lineno=1, needle=SYNTHETIC_NEEDLE
     )
-    assert SYNTHETIC_NEEDLE in got.stderr, got.stderr
 
 
 def test_pre_commit_passes_when_the_staged_content_is_clean(tmp_path) -> None:
@@ -358,7 +414,17 @@ def test_pre_commit_applies_the_re_prefixed_shape(tmp_path) -> None:
         check=False,
     )
     assert got.returncode == 1, f"a re: shape was not matched:\n{got.stdout}\n{got.stderr}"
-    assert "zzshape=000001" in got.stderr, got.stderr
+    # The label a ``re:`` hit is recorded under is ``re:`` + the matched
+    # text, so the reported length is 17 and not 14. Asserting the exact
+    # figure is what keeps this from being satisfied by any old scan that
+    # merely said something at that path and line.
+    _assert_reported_at(
+        got.stderr, path="backend/agent.py", lineno=1, needle="zzshape=000001"
+    )
+    assert '[list entry #1]' in got.stderr, got.stderr
+    assert "zzshape=000001" not in got.stderr, (
+        f"the matched text was reprinted:\n{got.stderr}"
+    )
 
 
 def test_comments_and_blank_lines_are_ignored(tmp_path) -> None:
@@ -442,8 +508,12 @@ def test_a_non_ascii_needle_is_found_in_a_non_utf8_file(tmp_path) -> None:
         f"a latin-1 blob carrying a latin-1 needle was reported clean "
         f"(exit {got.returncode}):\n{got.stdout}\n{got.stderr}"
     )
-    assert "backend/agent.py:1" in got.stderr, got.stderr
-    assert SYNTHETIC_NON_ASCII_NEEDLE in got.stderr, got.stderr
+    _assert_reported_at(
+        got.stderr,
+        path="backend/agent.py",
+        lineno=1,
+        needle=SYNTHETIC_NON_ASCII_NEEDLE,
+    )
 
 
 def test_an_ascii_needle_is_still_found_in_a_non_utf8_file(tmp_path) -> None:
@@ -535,12 +605,23 @@ def test_a_regex_match_over_a_mangled_byte_is_still_reported(tmp_path) -> None:
         f"the scanner crashed while printing its own finding:\n{combined}"
     )
     assert "UnicodeEncodeError" not in combined, combined
-    assert "backend/agent.py:1" in combined, combined
-    # The escape, not a bare surrogate: a reader has to be able to see that
-    # the byte could not be decoded rather than get a character they cannot
-    # render.
-    assert "\\udce9" in combined, (
-        f"the report should name the undecodable byte as an escape:\n{combined}"
+    # The finding is reported at the right place, in the full shape.
+    # This used to assert that the escape ``\udce9`` appeared in the
+    # report, because the report used to print the matched span and
+    # ``print`` cannot encode a lone surrogate. It prints no span now, so
+    # the crash this test was written for is impossible by construction
+    # rather than by escaping -- and the way to pin that is to assert no
+    # surrogate escaped into the output either way.
+    _assert_reported_at(
+        combined, path="backend/agent.py", lineno=1, needle="zz-caf"
+    )
+    assert "\\udce9" not in combined, (
+        f"a lone surrogate reached the report, so the undecodable byte is "
+        f"still being rendered somewhere:\n{combined}"
+    )
+    assert "\ufffd" not in combined, (
+        f"a replacement character reached the report -- the byte pass is "
+        f"printing the decoded match rather than its length:\n{combined}"
     )
 
 
@@ -749,10 +830,12 @@ def test_a_nul_prefixed_source_file_is_still_scanned(tmp_path) -> None:
         f"a NUL-prefixed .py carrying a forbidden name was not blocked "
         f"(exit {got.returncode}):\n{got.stdout}\n{got.stderr}"
     )
-    assert "backend/nul_probe.py:1" in got.stderr, (
-        f"the skipped file was not reported as a violation:\n{got.stderr}"
+    _assert_reported_at(
+        _said(got),
+        path="backend/nul_probe.py",
+        lineno=1,
+        needle=SYNTHETIC_NEEDLE,
     )
-    assert SYNTHETIC_NEEDLE in _said(got), _said(got)
     assert "OK  forbidden-name scan" not in _said(got), (
         f"a batch containing a forbidden name reported OK:\n{_said(got)}"
     )
@@ -777,7 +860,9 @@ def test_a_nul_prefixed_source_file_alone_is_not_a_clean_scan(tmp_path) -> None:
         f"a batch whose only file carries a forbidden name reported "
         f"{got.returncode}:\n{got.stdout}\n{got.stderr}"
     )
-    assert SYNTHETIC_NEEDLE in got.stderr, got.stderr
+    _assert_reported_at(
+        got.stderr, path="backend/nul_probe.py", lineno=1, needle=SYNTHETIC_NEEDLE
+    )
 
 
 def test_a_nul_source_file_with_no_needle_is_read_not_skipped(tmp_path) -> None:
@@ -1105,10 +1190,22 @@ def test_pre_push_blocks_a_forbidden_name_in_a_commit(tmp_path) -> None:
         f"the pre-push hook did not block a commit carrying a listed name "
         f"(exit {got.returncode}):\n{got.stdout}\n{got.stderr}"
     )
-    assert needle in got.stdout + got.stderr, (
-        f"the needle was not named in the report:\n{got.stdout}\n{got.stderr}"
+    # This is the operator's own pre-push hook, on their terminal, over a
+    # real range in this checkout -- the single most-read output this
+    # repository produces. The finding must be locatable from the report
+    # alone, and the needle must not be in it.
+    combined = got.stdout + got.stderr
+    reported = _discovery_lines(combined)
+    assert reported, (
+        f"the pre-push report named no file:line for a listed name:\n{combined}"
     )
-    assert ":" in got.stdout, got.stdout
+    assert any(m["path"] == "README.md" for m in reported), (
+        f"README.md carries the needle at HEAD and is not named in the "
+        f"report:\n{combined}"
+    )
+    assert needle not in combined, (
+        f"the pre-push hook reprinted the needle it exists to block:\n{combined}"
+    )
 
 
 def test_the_range_mode_finds_a_name_in_this_repository(tmp_path) -> None:
@@ -1144,8 +1241,9 @@ def test_the_range_mode_finds_a_name_in_this_repository(tmp_path) -> None:
         f"the range scan missed a forbidden name in a commit "
         f"(exit {got.returncode}):\n{got.stdout}\n{got.stderr}"
     )
-    assert "backend/agent.py:1" in got.stdout, got.stdout
-    assert SYNTHETIC_NEEDLE in got.stdout, got.stdout
+    _assert_reported_at(
+        got.stdout, path="backend/agent.py", lineno=1, needle=SYNTHETIC_NEEDLE
+    )
 
 
 def test_a_clean_range_exits_0(tmp_path) -> None:
