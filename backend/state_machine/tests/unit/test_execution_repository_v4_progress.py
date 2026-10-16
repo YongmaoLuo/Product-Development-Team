@@ -90,8 +90,8 @@ def test_progress_ignores_legacy_task_progress_json_column(
     """
     # Insert a plan_execution row with stale task_progress JSON
     conn.execute(
-        "INSERT INTO plan_execution (plan_id, current_phase, task_progress, updated_at) "
-        "VALUES (?, 'executing', ?, '2026-01-01T00:00:00Z')",
+        "INSERT INTO plan_execution (plan_id, task_progress, updated_at) "
+        "VALUES (?, ?, '2026-01-01T00:00:00Z')",
         (
             "p-stale",
             '{"tasks": {"a":": {"status": "completed"}, "b":": {"status": "failed"}}}',

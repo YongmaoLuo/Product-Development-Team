@@ -382,10 +382,8 @@ def _seed_plan_sqlite(
         )
         if project_dir is not None:
             conn.execute(
-                "INSERT OR IGNORE INTO plan_execution "
-                "(plan_id, current_phase, attempt_count, project_dir, "
-                "updated_at) VALUES (?, ?, 0, ?, ?)",
-                (plan_id, "executing", str(project_dir), now),
+                "INSERT OR IGNORE INTO plan_execution (plan_id, attempt_count, project_dir, updated_at) VALUES (?, 0, ?, ?)",
+                (plan_id, str(project_dir), now),
             )
         conn.commit()
     finally:

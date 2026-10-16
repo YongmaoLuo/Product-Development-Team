@@ -87,11 +87,8 @@ def _seed_plan(
         (plan_id, stage, version),
     )
     conn.execute(
-        "INSERT INTO plan_execution "
-        "(plan_id, current_phase, attempt_count, project_dir, "
-        " task_progress, next_run_at, updated_at) "
-        "VALUES (?, ?, 0, NULL, NULL, ?, '2026-08-05T00:00:00Z')",
-        (plan_id, current_phase, next_run_at),
+        "INSERT INTO plan_execution (plan_id, attempt_count, project_dir, task_progress, next_run_at, updated_at) VALUES (?, 0, NULL, NULL, ?, '2026-08-05T00:00:00Z')",
+        (plan_id, next_run_at),
     )
     if verification_status is not None:
         conn.execute(
@@ -112,8 +109,15 @@ def _cold_replay_state(db_path: Path, plan_id: str) -> dict:
             "SELECT current_phase, substage, version FROM plan_routing WHERE plan_id = ?",
             (plan_id,),
         ).fetchone()
+                # 2026-10-16 (schema v6): plan_execution no longer
+                # carries a phase column, so there is nothing to read
+                # here.  The workflow phase is plan_routing's, read
+                # above; the assertion side of this test used to check
+                # both columns, which is precisely the two-column
+                # split that let the state machine and the API
+                # disagree.
         exec_row = c.execute(
-            "SELECT current_phase, task_progress FROM plan_execution WHERE plan_id = ?",
+            "SELECT task_progress FROM plan_execution WHERE plan_id = ?",
             (plan_id,),
         ).fetchone()
         return {
@@ -123,8 +127,7 @@ def _cold_replay_state(db_path: Path, plan_id: str) -> dict:
                 "version": routing_row[2] if routing_row else None,
             },
             "execution": {
-                "current_phase": exec_row[0] if exec_row else None,
-                "task_progress": exec_row[1] if exec_row else None,
+                "task_progress": exec_row[0] if exec_row else None,
             },
         }
     finally:

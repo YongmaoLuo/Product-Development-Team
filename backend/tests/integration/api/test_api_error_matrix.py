@@ -177,13 +177,17 @@ def _seed_execution(
     conn: sqlite3.Connection,
     plan_id: str,
     *,
-    current_phase: str = "ready",
     project_dir: Optional[str] = None,
 ) -> None:
-    """Insert an execution row."""
+    """Insert an execution row.
+
+    2026-10-16 (schema v6): the ``current_phase`` argument is gone.  It
+    fed ``plan_execution.current_phase``, the mirror column; the phase a
+    plan is in lives in ``plan_routing`` alone, so a caller that wants a
+    phase seeds the routing row instead.
+    """
     ExecutionRepository(conn).insert(
         plan_id=plan_id,
-        current_phase=current_phase,
         project_dir=project_dir or "/tmp/somewhere",
     )
 
@@ -324,25 +328,25 @@ def _seed_for_condition(
 
     if condition == "archived_plan_read" or condition == "archived_plan_write":
         _seed_routing(conn, plan_id, stage="ready")
-        _seed_execution(conn, plan_id, current_phase="ready")
+        _seed_execution(conn, plan_id)
         _seed_verification(conn, plan_id, status="not_started")
         return
 
     if condition == "cas_predicate_fail":
         _seed_routing(conn, plan_id, stage="prd_review")
-        _seed_execution(conn, plan_id, current_phase="executing")
+        _seed_execution(conn, plan_id)
         _seed_verification(conn, plan_id, status="not_started")
         return
 
     if condition == "normal_plan":
         _seed_routing(conn, plan_id, stage="executing")
-        _seed_execution(conn, plan_id, current_phase="executing")
+        _seed_execution(conn, plan_id)
         _seed_verification(conn, plan_id, status="not_started")
         return
 
     if condition == "concurrent_start":
         _seed_routing(conn, plan_id, stage="executing")
-        _seed_execution(conn, plan_id, current_phase="executing")
+        _seed_execution(conn, plan_id)
         _seed_verification(conn, plan_id, status="not_started")
         return
 

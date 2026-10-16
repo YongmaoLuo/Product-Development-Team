@@ -169,19 +169,8 @@ def _seed_plan(
         (plan_id, stage, None, version, "2026-08-05T00:00:00Z"),
     )
     conn.execute(
-        "INSERT INTO plan_execution "
-        "(plan_id, current_phase, attempt_count, project_dir, "
-        " stop_reason, task_progress, next_run_at, card_state, "
-        " flags, exec_pid, exec_status, started_at, updated_at) "
-        "VALUES (?, ?, 0, ?, NULL, NULL, ?, NULL, NULL, NULL, "
-        "NULL, NULL, ?)",
-        (
-            plan_id,
-            current_phase,
-            f"/abs/{plan_id}",
-            next_run_at,
-            "2026-08-05T00:00:00Z",
-        ),
+        "INSERT INTO plan_execution (plan_id, attempt_count, project_dir, stop_reason, task_progress, next_run_at, card_state, flags, exec_pid, exec_status, started_at, updated_at) VALUES (?, 0, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, ?)",
+        (plan_id, f"/abs/{plan_id}", next_run_at, "2026-08-05T00:00:00Z"),
     )
     conn.execute(
         "INSERT INTO plan_verification "
@@ -214,8 +203,11 @@ def _cold_replay_state(db_path: Path, plan_id: str) -> dict:
             (plan_id,),
         )
         routing_row = cur.fetchone()
+        # Schema v6: plan_execution no longer has a phase column —
+        # only plan_routing does. The cold-replay contract is
+        # therefore about (task_progress, next_run_at) here.
         cur = fresh.execute(
-            "SELECT current_phase, task_progress, next_run_at "
+            "SELECT task_progress, next_run_at "
             "FROM plan_execution WHERE plan_id = ?",
             (plan_id,),
         )
@@ -232,9 +224,8 @@ def _cold_replay_state(db_path: Path, plan_id: str) -> dict:
                 "version": routing_row[1] if routing_row else None,
             },
             "execution": {
-                "current_phase": execution_row[0] if execution_row else None,
-                "task_progress": execution_row[1] if execution_row else None,
-                "next_run_at": execution_row[2] if execution_row else None,
+                "task_progress": execution_row[0] if execution_row else None,
+                "next_run_at": execution_row[1] if execution_row else None,
             },
             "verification": {
                 "status": verification_row[0] if verification_row else None,

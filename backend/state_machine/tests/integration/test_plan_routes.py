@@ -248,7 +248,6 @@ def test_list_plans_aggregates_four_tables(monkeypatch, tmp_path, clean_state):
     )
     execution.insert(
         plan_id=plan_id,
-        current_phase="ready",
         project_dir=str(plans_dir / "project"),
         exec_pid=LIVE_PID,
         exec_status="running",
@@ -307,8 +306,11 @@ def test_list_plans_aggregates_four_tables(monkeypatch, tmp_path, clean_state):
         f"non-archived plan must have archived=False, got "
         f"{item.get('archived')!r}; full item={item!r}"
     )
+    # Schema v6: current_phase comes from plan_routing (the authority),
+    # not from a plan_execution mirror. The routing row above was seeded
+    # with phase="ready", so the API must report exactly that.
     assert item.get("current_phase") == "ready", (
-        f"current_phase must come from plan_execution, got "
+        f"current_phase must come from plan_routing, got "
         f"{item.get('current_phase')!r}; full item={item!r}"
     )
     assert item.get("pid") == LIVE_PID, (
@@ -470,7 +472,6 @@ def test_get_summary_includes_artifact_manifest(monkeypatch, tmp_path, clean_sta
     )
     execution.insert(
         plan_id=plan_id,
-        current_phase="ready",
     )
     tasks_file = str(plan_dir / "tasks.json")
     artifact.upsert(

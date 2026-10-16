@@ -92,7 +92,7 @@ def fake_state(monkeypatch, tmp_path):
         def __init__(self, _conn):
             pass
 
-        def update_phase(self, plan_id, **kwargs):
+        def update_fields(self, plan_id, **kwargs):
             fs.plan_execution_writes.append((plan_id, kwargs))
 
         def update_status(self, plan_id, status):

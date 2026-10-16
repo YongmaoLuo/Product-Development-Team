@@ -278,9 +278,8 @@ class TestPlanSummaryExecution:
         conn = db_open(_state_db_path())
         try:
             migrate(conn)
-            ExecutionRepository(conn).update_phase(
+            ExecutionRepository(conn).update_fields(
                 plan_id,
-                current_phase="executing",
                 create_if_missing=True,
                 exec_status="stopped",
                 stop_reason="user_requested",

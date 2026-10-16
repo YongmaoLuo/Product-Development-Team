@@ -168,7 +168,6 @@ def _seed_archived_plan(
     plan_id: str,
     *,
     stage: str = "ready",
-    current_phase: str = "ready",
     verification_status: str = "not_started",
 ) -> Path:
     """Seed an archived plan (dirname <= cutoff) with full DB rows.
@@ -198,9 +197,11 @@ def _seed_archived_plan(
     )
 
     RoutingRepository(conn).insert(plan_id, stage)
+    # 2026-10-16 (schema v6): no ``current_phase`` argument -- the phase
+    # is ``stage`` above, in plan_routing.  plan_execution no longer
+    # keeps a second copy of it.
     ExecutionRepository(conn).insert(
         plan_id=plan_id,
-        current_phase=current_phase,
         project_dir=str(project_dir),
     )
     VerificationRepository(conn).insert(plan_id, verification_status)
@@ -399,7 +400,7 @@ def test_archived_plan_direct_select_does_not_contain_archived_row(
     """
     plans_dir, conn, _db_path = archived_env
     plan_id = "20260801-archived-cumulative"
-    _seed_archived_plan(plans_dir, conn, plan_id)
+    plan_dir = _seed_archived_plan(plans_dir, conn, plan_id)
 
     client = TestClient(app)
     project_dir = "backend/.tmp"
@@ -467,11 +468,18 @@ def test_archived_plan_direct_select_does_not_contain_archived_row(
     assert route["current_phase"] == "ready", (
         f"routing.stage must remain 'ready'; got {route['stage']!r}"
     )
+    # 2026-10-16 (schema v6): summary() carries no phase key any more.
+    # What this assertion was really protecting is that the 410 left the
+    # execution row untouched, so check a column that still exists.
     exec_row = ExecutionRepository(conn).summary(plan_id)
     assert exec_row is not None
-    assert exec_row["current_phase"] == "ready", (
-        f"execution.current_phase must remain 'ready'; got "
-        f"{exec_row['current_phase']!r}"
+    assert "current_phase" not in exec_row, (
+        "summary() must not report a phase; plan_routing is the only "
+        f"workflow-phase authority. got {exec_row['current_phase']!r}"
+    )
+    assert exec_row["project_dir"] == str(plan_dir / "project"), (
+        f"execution.project_dir must remain the seeded value; got "
+        f"{exec_row['project_dir']!r}"
     )
     verif_row = VerificationRepository(conn).current(plan_id)
     assert verif_row is not None

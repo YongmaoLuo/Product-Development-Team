@@ -48,13 +48,13 @@ from state_machine.repositories.artifact_repository import ArtifactRepository
 
 
 SEED_PLAN_ID = "p1"
-SEED_PHASE = "ready"
+SEED_NEXT_RUN = "2099-01-01T00:00:00Z"
 SEED_STATUS = "pending"
 SEED_VERIFICATION_STATUS = "running"
 SEED_ARTIFACT_TYPE = "interview"
 
-PRE_UPDATE_PHASE = "executing"
-POST_UPDATE_PHASE = "verification_running"
+PRE_UPDATE_NEXT_RUN = "2099-01-01T00:00:00Z"
+POST_UPDATE_NEXT_RUN = "2100-01-01T00:00:00Z"
 
 PRE_UPDATE_VERIFICATION_STATUS = "running"
 POST_UPDATE_VERIFICATION_STATUS = "passed"
@@ -70,16 +70,9 @@ def _bootstrap(db_path):
     try:
         migrate(bootstrap)
         bootstrap.execute(
-            "INSERT INTO plan_execution "
-            "(plan_id, current_phase, attempt_count, project_dir, "
-            " stop_reason, task_progress, next_run_at, card_state, "
-            " flags, exec_pid, exec_status, started_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                SEED_PLAN_ID, SEED_PHASE, 0, "/orig/path", None,
-                None, None, None, None, None, None, None,
-                "2026-08-05T11:00:00Z",
-            ),
+            "INSERT INTO plan_execution (plan_id, attempt_count, project_dir, stop_reason, task_progress, next_run_at, card_state, flags, exec_pid, exec_status, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (SEED_PLAN_ID, 0, "/orig/path", None, None, SEED_NEXT_RUN,
+             None, None, None, None, None, "2026-08-05T11:00:00Z"),
         )
         bootstrap.execute(
             "INSERT INTO plan_verification "
@@ -127,7 +120,11 @@ def test_execution_repository_has_no_stale_cache(tmp_path):
         repo_a = ExecutionRepository(reader_a)
         first = repo_a.summary(SEED_PLAN_ID)
         assert first is not None
-        assert first["current_phase"] == SEED_PHASE
+        # Schema v6: ``plan_execution`` has no phase column, so the
+        # no-cache contract is pinned on ``next_run_at`` — a column that
+        # still exists and that a sibling connection can write behind
+        # the repository's back exactly the same way.
+        assert first["next_run_at"] == SEED_NEXT_RUN
     finally:
         reader_a.close()
 
@@ -137,8 +134,8 @@ def test_execution_repository_has_no_stale_cache(tmp_path):
     writer_b = open_db(db_path)
     try:
         writer_b.execute(
-            "UPDATE plan_execution SET current_phase = ? WHERE plan_id = ?",
-            (POST_UPDATE_PHASE, SEED_PLAN_ID),
+            "UPDATE plan_execution SET next_run_at = ? WHERE plan_id = ?",
+            (POST_UPDATE_NEXT_RUN, SEED_PLAN_ID),
         )
     finally:
         writer_b.close()
@@ -146,18 +143,18 @@ def test_execution_repository_has_no_stale_cache(tmp_path):
     # Phase 3: a brand-new repo on a brand-new connection reads.
     # If the repo carried a cache, this would return the pre-update
     # value.  The contract is "no cache": we must observe
-    # POST_UPDATE_PHASE.
+    # POST_UPDATE_NEXT_RUN.
     reader_c = open_db(db_path)
     try:
         repo_c = ExecutionRepository(reader_c)
         second = repo_c.summary(SEED_PLAN_ID)
         assert second is not None
-        assert second["current_phase"] == POST_UPDATE_PHASE, (
+        assert second["next_run_at"] == POST_UPDATE_NEXT_RUN, (
             "ExecutionRepository returned a stale value after a "
             "sibling connection wrote to plan_execution; the repo "
             "appears to be caching reads."
         )
-        assert second["current_phase"] != PRE_UPDATE_PHASE
+        assert second["next_run_at"] != PRE_UPDATE_NEXT_RUN
     finally:
         reader_c.close()
 

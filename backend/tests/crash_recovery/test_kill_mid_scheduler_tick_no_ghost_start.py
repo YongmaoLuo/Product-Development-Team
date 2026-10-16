@@ -126,13 +126,8 @@ def _seed_plan(
         (plan_id, stage, version),
     )
     conn.execute(
-        "INSERT INTO plan_execution "
-        "(plan_id, current_phase, attempt_count, project_dir, "
-        " stop_reason, task_progress, next_run_at, card_state, "
-        " flags, exec_pid, exec_status, started_at, updated_at) "
-        "VALUES (?, ?, 0, ?, NULL, NULL, ?, NULL, NULL, NULL, "
-        "NULL, NULL, '2026-08-05T00:00:00Z')",
-        (plan_id, current_phase, f"/abs/{plan_id}", next_run_at),
+        "INSERT INTO plan_execution (plan_id, attempt_count, project_dir, stop_reason, task_progress, next_run_at, card_state, flags, exec_pid, exec_status, started_at, updated_at) VALUES (?, 0, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, '2026-08-05T00:00:00Z')",
+        (plan_id, f"/abs/{plan_id}", next_run_at),
     )
     if verification_status is not None:
         conn.execute(
@@ -156,9 +151,14 @@ def _cold_replay_state(db_path: Path, plan_id: str) -> dict:
             "SELECT current_phase, version FROM plan_routing WHERE plan_id = ?",
             (plan_id,),
         ).fetchone()
+        # 2026-10-16 (schema v6): plan_execution no longer carries a
+        # phase column, so there is nothing to read for one here.  The
+        # workflow phase is plan_routing's, read above; this block used
+        # to expose the mirror too, and the assertions checked both --
+        # which is exactly the two-column split that let the state
+        # machine and the API disagree.
         execution_row = fresh.execute(
-            "SELECT current_phase, next_run_at FROM plan_execution "
-            "WHERE plan_id = ?",
+            "SELECT next_run_at FROM plan_execution WHERE plan_id = ?",
             (plan_id,),
         ).fetchone()
         return {
@@ -167,8 +167,7 @@ def _cold_replay_state(db_path: Path, plan_id: str) -> dict:
                 "version": routing_row[1] if routing_row else None,
             },
             "execution": {
-                "current_phase": execution_row[0] if execution_row else None,
-                "next_run_at": execution_row[1] if execution_row else None,
+                "next_run_at": execution_row[0] if execution_row else None,
             },
         }
     finally:

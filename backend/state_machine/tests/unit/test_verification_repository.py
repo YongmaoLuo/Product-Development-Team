@@ -90,7 +90,7 @@ def test_append_verdict_initializes_null_verdicts_to_empty_array(db_path):
 def test_verification_write_never_touches_execution_row(db_path, operation):
     conn, repo = _repo(db_path)
     repo.insert("p1", "pending")
-    conn.execute("INSERT INTO plan_execution(plan_id,current_phase,updated_at) VALUES('p1','executing','before')")
+    conn.execute("INSERT INTO plan_execution(plan_id, updated_at) VALUES ('p1', 'before')")
     before = conn.execute("SELECT * FROM plan_execution WHERE plan_id='p1'").fetchone()
     if operation == "init_round":
         repo.init_round("p1", 2, 5)

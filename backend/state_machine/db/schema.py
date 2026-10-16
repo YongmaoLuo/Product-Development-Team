@@ -37,6 +37,17 @@ richer vocabulary; ``stage`` was a lossy projection of it) and ``stage``
 is dropped by a full table rebuild — the drop is one-way, so take a
 copy of ``state.db`` before the first v5 boot.
 
+v6 (2026-10-16) drops ``plan_execution.current_phase``.  This is the
+*other* half of the same split, left behind when v5 collapsed only the
+one inside ``plan_routing``.  It was documented as a "display-only
+mirror", but it was not a second vocabulary and not a second owner: all
+five of its writers passed a routing word, none ever wrote a terminal
+phase, and the only reader (``GET /api/plans``) therefore reported
+``executing`` for plans the routing column had already finished.  With
+it gone there is exactly one workflow-state column in the database.
+Like v5 the drop is a full table rebuild and is one-way — take a copy
+of ``state.db`` before the first v6 boot.
+
 The ``schema_version`` table is the migration-logbook: a single
 INTEGER column primary key recording which schema version is live.
 This is the bootstrap version (1) so the first ``INSERT`` is
@@ -52,7 +63,7 @@ __all__ = ["migrate", "CURRENT_SCHEMA_VERSION"]
 
 #: Schema version this module produces.  Bumped in tandem with any
 #: DDL change so the upgrade script can branch on it.
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 # Each CREATE TABLE statement is kept as a top-level string constant
@@ -94,7 +105,18 @@ CREATE TABLE IF NOT EXISTS plan_routing (
 _DDL_PLAN_EXECUTION = """
 CREATE TABLE IF NOT EXISTS plan_execution (
   plan_id TEXT PRIMARY KEY,
-  current_phase TEXT NOT NULL,
+  -- NO workflow-phase column here (schema v6).  Before v6 this table
+  -- carried a second ``current_phase`` beside ``plan_routing``'s — a
+  -- "display-only mirror" that was supposed to describe the execution
+  -- window only.  It never did.  Every one of its five writers passed
+  -- a *routing* vocabulary word (``executing`` / ``verification`` /
+  -- ``ready``), none of them ever wrote a terminal phase, and so the
+  -- column could not represent a finished plan at all: on real data it
+  -- read ``executing`` forever while ``plan_routing`` advanced to
+  -- ``completed`` / ``failed``.  A strictly-lossy second copy of a
+  -- value the authority column already holds exactly.  ``current_phase``
+  -- is the survivor — one column, one value.  See
+  -- ``_v6_drop_execution_current_phase``.
   attempt_count INTEGER NOT NULL DEFAULT 0,
   project_dir TEXT,
   stop_reason TEXT,
@@ -434,6 +456,96 @@ def _v5_collapse_routing_stage(conn: sqlite3.Connection) -> None:
     )
 
 
+def _v6_drop_execution_current_phase(conn: sqlite3.Connection) -> None:
+    """Drop ``plan_execution.current_phase``; ``plan_routing`` is the only column.
+
+    The exact shape of the v5 collapse (full table rebuild, because the
+    outgoing column carries ``NOT NULL``), pointed at the other table.
+
+    Why the values are DISCARDED rather than backfilled
+    ----------------------------------------------------
+    A backfill would mean copying ``plan_execution.current_phase`` into
+    ``plan_routing.current_phase`` — i.e. letting the mirror overwrite
+    the authority.  That is the reverse of what v5 did (where
+    ``current_phase`` won over ``stage``), and here the mirror never
+    wins:
+
+      * ``plan_routing.current_phase`` is the declared authority
+        (:mod:`plan_status`, ``plan_status.PlanStatus.phase``) and the
+        only source ``routes.plans._build_plan_status`` reads.
+      * The mirror was never written with anything the authority column
+        does not already hold.  All five of its writers passed a
+        *routing* vocabulary word, and none ever wrote a terminal
+        phase, so it cannot even represent a finished plan.  Measured
+        on real data before this migration: one distinct value
+        (``executing``), and zero rows holding a word absent from the
+        routing vocabulary.
+      * Every row that has a ``plan_execution`` row also has a
+        ``plan_routing`` row (verified: 0 orphans), so the drop cannot
+        strand a plan without any phase at all.
+
+    So the column is strictly lossy: it can only ever be *behind* the
+    authority, never ahead of it and never richer.  Copying it forward
+    would import that lag into the one column everything else reads.
+
+    Guarded by a column-presence check rather than a version number, for
+    the same reason as v5: self-describing and idempotent, and the check
+    runs inside the transaction so two processes racing the same upgrade
+    serialise.  Transaction handling (autocommit vs. caller-owned) is
+    identical to :func:`_v5_collapse_routing_stage`.
+    """
+    owns_txn = conn.isolation_level is None
+    if owns_txn:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(plan_execution)")}
+        if "current_phase" not in cols:
+            if owns_txn:
+                conn.execute("COMMIT")
+            return
+
+        conn.execute("DROP TABLE IF EXISTS plan_execution_v6")
+        conn.execute(_DDL_PLAN_EXECUTION.replace(
+            "CREATE TABLE IF NOT EXISTS plan_execution",
+            "CREATE TABLE plan_execution_v6",
+            1,
+        ))
+        conn.execute(
+            "INSERT INTO plan_execution_v6 ("
+            " plan_id, attempt_count, project_dir, stop_reason,"
+            " task_progress, next_run_at, card_state, flags, exec_pid,"
+            " exec_status, started_at, updated_at"
+            ") SELECT "
+            " plan_id, attempt_count, project_dir, stop_reason,"
+            " task_progress, next_run_at, card_state, flags, exec_pid,"
+            " exec_status, started_at, updated_at "
+            "FROM plan_execution"
+        )
+        moved = conn.execute("SELECT count(*) FROM plan_execution_v6").fetchone()[0]
+        discarded = conn.execute(
+            "SELECT count(*) FROM plan_execution WHERE current_phase IS NOT NULL"
+        ).fetchone()[0]
+        conn.execute("DROP TABLE plan_execution")
+        conn.execute("ALTER TABLE plan_execution_v6 RENAME TO plan_execution")
+        if owns_txn:
+            conn.execute("COMMIT")
+    except BaseException:
+        if owns_txn:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                # ROLLBACK can fail if the txn is already unwound; the
+                # original exception is what matters.
+                pass
+        raise
+
+    print(
+        f"[schema.v6] plan_execution.current_phase dropped — moved {moved} "
+        f"rows ({discarded} stale mirror values discarded, not merged: "
+        f"plan_routing.current_phase is the authority)"
+    )
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Create the five ``plan_*`` tables and the ``schema_version`` row.
 
@@ -571,6 +683,17 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     # ``_v5_collapse_routing_stage`` for the guard and the backfill rule.
     # ----------------------------------------------------------------
     _v5_collapse_routing_stage(conn)
+
+    # ----------------------------------------------------------------
+    # Schema v6 upgrade (2026-10-16): drop ``plan_execution.current_phase``.
+    # The remaining second workflow-state column.  Unlike v5 there is no
+    # backfill question to answer — the column was a lossy mirror of
+    # ``plan_routing.current_phase``, never written with a terminal
+    # phase and never holding a word the routing vocabulary lacks, so
+    # merging it forward would only import its lag into the authority.
+    # See ``_v6_drop_execution_current_phase``.
+    # ----------------------------------------------------------------
+    _v6_drop_execution_current_phase(conn)
 
     # Record the bootstrap schema version.  We use ``INSERT OR
     # IGNORE`` so a second migrate() call (where the row already

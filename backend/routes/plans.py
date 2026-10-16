@@ -478,7 +478,10 @@ def list_plans(
       fields.
     * ExecutionRepository.snapshot_for_list(plan_ids) — bulk
       enrichment for the SQLite (new) rows; archived rows have no
-      execution rows so they get ``None``.
+      execution rows so they get ``None``.  Used for the run-state
+      fields only (``exec_status`` / ``exec_pid`` / ``project_dir`` …);
+      the workflow phase comes from the routing row above, not from
+      here (schema v6).
 
     Architecture decision point 5 forbids an in-memory aggregation
     facade: this route composes the two repositories directly
@@ -645,16 +648,24 @@ def _list_plans_body(
             elif has_interview:
                 status = "interviewed"
 
-            # ``current_phase`` and ``flags`` used to live in the
-            # legacy ``plan_state.json`` file; both are now in the
-            # state-machine SQLite row.  Resolve them via the
-            # ExecutionRepository's bulk-snapshot (already populated
-            # above) rather than reading the JSON file directly.
+            # ``current_phase`` used to be read from the ``plan_execution``
+            # row — the "display-only mirror" of the routing phase — with
+            # ``status`` (a heuristic guessed from which documents happen
+            # to exist on disk) as the fallback for plans that had no
+            # execution row at all.  Schema v6 removed that column, so
+            # this reads the authority: ``plan_routing.current_phase``,
+            # the same column ``_build_plan_status`` and every card
+            # already use.  One phase column, one answer.
+            #
+            # The heuristic survives ONLY as the fallback for a plan with
+            # no routing row, which is the archived / no-state.db path
+            # where there is no recorded phase to report at all.  Note
+            # that its vocabulary is NOT the phase vocabulary
+            # (``reviewed`` / ``interviewed`` / ``new`` are not valid
+            # phases), so preferring it would reintroduce exactly the
+            # two-vocabulary split v5 removed.
             exec_row = execution_by_plan.get(plan_id)
-            if isinstance(exec_row, dict):
-                current_phase = exec_row.get("current_phase") or status
-            else:
-                current_phase = status
+            current_phase = str(row.get("current_phase") or "") or status
             if not include_terminal and current_phase in terminal_phases:
                 continue
 

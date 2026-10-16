@@ -294,9 +294,11 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
          A concurrent second ``start`` (or a state we don't expect
          to start from) raises :class:`ConflictError` which we
          surface as HTTP 409.
-      3. Persist ``current_phase=executing``, ``project_dir``,
-         ``exec_pid`` via :meth:`ExecutionRepository.update_phase`.
-         The transition is wrapped in the repository's own
+      3. Persist ``project_dir`` and ``exec_pid`` via
+         :meth:`ExecutionRepository.update_fields`.  The workflow
+         phase is *not* written here — step 2's routing CAS owns it
+         (schema v6: one phase column, one owner).  The transition is
+         wrapped in the repository's own
          ``BEGIN IMMEDIATE`` transaction so partial writes are
          impossible.
     """
@@ -528,9 +530,8 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
             persist_conn = open_db(_server._state_db_path())
             try:
                 migrate(persist_conn)
-                ExecutionRepository(persist_conn).update_phase(
+                ExecutionRepository(persist_conn).update_fields(
                     plan_id,
-                    current_phase="executing",
                     create_if_missing=True,
                     exec_status="failed",
                     stop_reason="process_died_unexpectedly",
@@ -547,7 +548,7 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
     state["process"] = process
     state["pid"] = process.pid
     # NOTE: the immediate "running" persist that used to live here is
-    # redundant with the ``update_phase(exec_status="running", exec_pid=...)``
+    # redundant with the ``update_fields(exec_status="running", exec_pid=...)``
     # call below — that single write covers both fields atomically. The
     # legacy JSON-only fallback (ExecPlanNotFoundError) is handled by
     # the same exception branch.
@@ -570,9 +571,8 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
     try:
         persist_conn = open_db(_server._state_db_path())
         migrate(persist_conn)
-        ExecutionRepository(persist_conn).update_phase(
+        ExecutionRepository(persist_conn).update_fields(
             plan_id,
-            current_phase="executing",
             create_if_missing=True,
             project_dir=str(project_dir),
             exec_pid=process.pid,

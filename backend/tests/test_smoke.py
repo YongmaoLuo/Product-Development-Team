@@ -90,9 +90,8 @@ def _seed_execution_row(plan_id: str, **fields) -> None:
     conn = db_open(_state_db_path())
     try:
         migrate(conn)
-        ExecutionRepository(conn).update_phase(
+        ExecutionRepository(conn).update_fields(
             plan_id,
-            current_phase=fields.pop("current_phase", "executing"),
             create_if_missing=True,
             **fields,
         )

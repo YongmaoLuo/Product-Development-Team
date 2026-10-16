@@ -939,26 +939,15 @@ def reset_verification(
             except sqlite3.OperationalError:
                 pass
 
-    # --- current_phase mirror --------------------------------------------
-    try:
-        from state_machine.db.connection import open as _open_db
-        from state_machine.db.schema import migrate as _migrate
-        from state_machine.repositories.execution_repository import (
-            ExecutionRepository as _ExecRepo,
-        )
-
-        _conn = _open_db(_server._state_db_path())
-        try:
-            _migrate(_conn)
-            _ExecRepo(_conn).update_phase(
-                plan_id, "verification", create_if_missing=True,
-            )
-        finally:
-            _conn.close()
-        summary["cleared"]["current_phase_mirror"] = True
-    except Exception:  # noqa: BLE001 — display-only mirror
-        _server.logger.exception("[reset] current_phase mirror failed plan=%s", plan_id)
-        summary["cleared"]["current_phase_mirror"] = False
+    # 2026-10-16 (schema v6): the ``current_phase`` mirror that used to
+    # live here is GONE — and its ``except`` clause with it.  That block
+    # wrote ``plan_execution.current_phase='verification'`` on a SEPARATE
+    # connection after the routing UPDATE above had already committed, and
+    # swallowed any failure into a ``cleared.current_phase_mirror: false``
+    # response key that nothing has ever read.  So the failure mode was
+    # invisible in both directions: the response said "fine" to a caller
+    # that never checked the key, and the mirror silently kept a stale
+    # phase.  There is no second column left to disagree with.
 
     # --- disk artifacts ---------------------------------------------------
     removed: List[str] = []

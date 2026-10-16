@@ -34,7 +34,8 @@ data-preservation guarantee.
 
 Contract pinned here
 --------------------
-1. A fresh database has no ``stage`` column and reports version 5.
+1. A fresh database has no ``stage`` column and reports the current
+   schema version (6 as of the ``plan_execution`` phase-column drop).
 2. Collapsing a v4 database preserves every non-``stage`` column
    byte-for-byte and rewrites ``current_phase`` under the documented
    rule (non-empty kept verbatim; NULL/empty derived from ``stage``).
@@ -208,7 +209,7 @@ def test_fresh_database_has_a_single_phase_column(tmp_path: Path) -> None:
         )
         assert "current_phase" in _columns(conn)
         version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        assert version == CURRENT_SCHEMA_VERSION == 5
+        assert version == CURRENT_SCHEMA_VERSION == 6
     finally:
         conn.close()
 
@@ -323,7 +324,7 @@ def test_migration_is_idempotent(tmp_path: Path) -> None:
         second = sorted(conn.execute("SELECT * FROM plan_routing"))
         assert first == second
         assert "stage" not in _columns(conn)
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 5
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
     finally:
         conn.close()
 

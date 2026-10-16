@@ -3,28 +3,35 @@
 Background
 ----------
 ``plan_execution`` is the state-machine's per-plan row that records
-the execution metadata (current phase, attempt count, project_dir,
-stop_reason, task_progress, next_run_at, card_state, flags,
+the execution metadata (attempt count, project_dir, stop_reason,
+task_progress, next_run_at, card_state, flags,
 exec_pid, exec_status, started_at, updated_at).
+
+Schema v6 removed this table's ``current_phase``.  It was a second
+copy of ``plan_routing.current_phase`` that no writer could keep
+honest — see :func:`state_machine.db.schema._v6_drop_execution_current_phase`
+— so the phase is now answered in exactly one place.  The tests below
+pin that absence as well as the surviving behaviour: a caller passing
+``current_phase=`` must raise, and no read method may surface a phase
+key for a caller to fall back on.
 
 :class:`ExecutionRepository` is the single write/read path for this
 table.  The repository contract pinned by these tests is:
 
-  * ``insert(plan_id, current_phase, **fields)`` — bootstrap a row.
+  * ``insert(plan_id, **fields)`` — bootstrap a row.
   * ``snapshot_for_list(plan_ids)`` — return dicts for many plans
     in one round-trip (used by the API list view).
   * ``summary(plan_id)`` — return the row's "summary" view
-    (current_phase + project_dir + flags + task_progress).
+    (project_dir + flags + task_progress + exec_status).
   * ``progress(plan_id)`` — return the parsed ``task_progress``
     dict, or ``None`` if the plan has no execution row yet.
-  * ``update_phase(plan_id, current_phase=None, **fields)`` — mutate
+  * ``update_fields(plan_id, **fields)`` — mutate
     any subset of columns inside one ``BEGIN IMMEDIATE`` txn.
-    ``current_phase=None`` means "leave the phase column alone" (it is
-    ``NOT NULL``, so ``None`` is never a value to store).
+    There is no phase argument to get wrong.
   * ``update_task_progress(plan_id, progress)`` — read-modify-write
     the ``task_progress`` JSON column with full IMMEDIATE isolation.
   * ``card_table()`` — return a list of card-table rows for the
-    planner UI (one per plan, with phase + progress %).
+    planner UI (one per plan, with progress %).
   * ``update_next_run_at(plan_id, next_run_at)`` — schedule next run.
   * ``update_card_state(plan_id, card_state)`` — UI state dict.
   * ``update_flags(plan_id, flags)`` — feature-flag overrides.
@@ -111,13 +118,11 @@ def test_insert_then_summary_returns_same_fields(
     """``insert`` → ``summary`` returns the same fields."""
     repo.insert(
         plan_id="p1",
-        current_phase="ready",
         project_dir="/abs/p1",
     )
 
     summary = repo.summary("p1")
     assert summary is not None
-    assert summary["current_phase"] == "ready"
     assert summary["project_dir"] == "/abs/p1"
 
 
@@ -158,9 +163,9 @@ def test_progress_returns_none_when_row_missing(
 # below MUST keep plan_verification and plan_routing rows unchanged.
 EXECUTION_WRITE_METHODS = [
     (
-        "update_phase",
-        lambda repo: repo.update_phase(
-            "p1", current_phase="executing", project_dir="/new/path"
+        "update_fields",
+        lambda repo: repo.update_fields(
+            "p1", project_dir="/new/path"
         ),
     ),
     (
@@ -231,12 +236,12 @@ def test_execution_write_never_touches_verification_row(
         )
         setup.execute(
             "INSERT INTO plan_execution "
-            "(plan_id, current_phase, attempt_count, project_dir, "
-            " stop_reason, task_progress, next_run_at, card_state, "
-            " flags, exec_pid, exec_status, started_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(plan_id, attempt_count, project_dir, stop_reason, "
+            " task_progress, next_run_at, card_state, flags, exec_pid, "
+            " exec_status, started_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                "p1", "ready", 0, "/orig/path", None, None,
+                "p1", 0, "/orig/path", None, None,
                 None, None, None, None, None, None,
                 "2026-08-05T11:00:00Z",
             ),
@@ -335,12 +340,12 @@ def test_execution_write_never_touches_routing_stage(
         )
         setup.execute(
             "INSERT INTO plan_execution "
-            "(plan_id, current_phase, attempt_count, project_dir, "
-            " stop_reason, task_progress, next_run_at, card_state, "
-            " flags, exec_pid, exec_status, started_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(plan_id, attempt_count, project_dir, stop_reason, "
+            " task_progress, next_run_at, card_state, flags, exec_pid, "
+            " exec_status, started_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                "p1", "ready", 0, None, None, None,
+                "p1", 0, None, None, None,
                 None, None, None, None, None, None,
                 "2026-08-05T11:00:00Z",
             ),
@@ -392,7 +397,7 @@ def test_repository_has_no_stale_cache(
     the repo must be visible to ``summary()`` / ``progress()`` on
     the next call without any cache-invalidation step.
     """
-    repo.insert(plan_id="p1", current_phase="ready")
+    repo.insert(plan_id="p1")
 
     # Simulate a sibling module / migration script writing directly
     # to the table — bypassing every method on the repository.
@@ -419,13 +424,17 @@ def test_snapshot_for_list_returns_dict_per_plan(
     repo: ExecutionRepository,
 ) -> None:
     """``snapshot_for_list`` returns ``{plan_id: row-dict}`` for the input."""
-    repo.insert(plan_id="p1", current_phase="ready")
-    repo.insert(plan_id="p2", current_phase="executing")
+    repo.insert(plan_id="p1")
+    repo.insert(plan_id="p2")
 
     snap = repo.snapshot_for_list(["p1", "p2", "missing"])
     assert set(snap.keys()) == {"p1", "p2", "missing"}
-    assert snap["p1"]["current_phase"] == "ready"
-    assert snap["p2"]["current_phase"] == "executing"
+    assert snap["p1"] is not None
+    assert snap["p2"] is not None
+    assert "current_phase" not in snap["p1"], (
+        "the execution snapshot must not carry a phase; that is the "
+        "routing table's answer (schema v6)"
+    )
     assert snap["missing"] is None
 
 
@@ -433,124 +442,153 @@ def test_card_table_returns_one_row_per_plan(
     repo: ExecutionRepository,
 ) -> None:
     """``card_table`` returns the planner-UI rows."""
-    repo.insert(plan_id="p1", current_phase="executing")
+    repo.insert(plan_id="p1")
     repo.update_task_progress(
         "p1", {"current": "1-2", "completed": 1, "total": 5}
     )
-    repo.insert(plan_id="p2", current_phase="ready")
+    repo.insert(plan_id="p2")
 
     rows = repo.card_table()
     by_id = {row["plan_id"]: row for row in rows}
     assert set(by_id.keys()) == {"p1", "p2"}
-    assert by_id["p1"]["current_phase"] == "executing"
     assert by_id["p1"]["task_progress"]["current"] == "1-2"
-    assert by_id["p2"]["current_phase"] == "ready"
+    assert "current_phase" not in by_id["p1"], (
+        "the card table must not carry a phase (schema v6)"
+    )
+    assert "task_progress" in by_id["p2"]
 
 
 # ---------------------------------------------------------------------------
-# update_phase (generic field-mutation path)
+# update_fields (generic field-mutation path)
 # ---------------------------------------------------------------------------
 
 
-def test_update_phase_updates_current_phase(
+def test_update_fields_mutates_columns(
     repo: ExecutionRepository,
 ) -> None:
-    """``update_phase`` mutates the ``current_phase`` column."""
-    repo.insert(plan_id="p1", current_phase="ready")
+    """``update_fields`` mutates the columns it is handed."""
+    repo.insert(plan_id="p1", exec_status="not_started")
 
-    repo.update_phase("p1", current_phase="executing")
-
-    assert repo.summary("p1")["current_phase"] == "executing"
-
-
-def test_update_phase_leaves_current_phase_alone_when_omitted(
-    repo: ExecutionRepository,
-) -> None:
-    """Omitting ``current_phase`` must not rewrite it.
-
-    2026-09-19 regression: the column is ``NOT NULL``, so ``None`` can
-    only mean "leave it alone" — there is no legitimate NULL payload to
-    confuse it with.
-    """
-    repo.insert(plan_id="p1", current_phase="ready")
-
-    repo.update_phase("p1", exec_status="failed")
+    repo.update_fields("p1", exec_status="running", project_dir="/x")
 
     summary = repo.summary("p1")
-    assert summary["current_phase"] == "ready"
-    assert summary["exec_status"] == "failed"
+    assert summary["exec_status"] == "running"
+    assert summary["project_dir"] == "/x"
 
 
-def test_update_phase_with_nothing_to_write_raises(
+def test_update_fields_has_no_phase_argument(
+    repo: ExecutionRepository,
+) -> None:
+    """There is no ``current_phase`` to write here — the column is gone.
+
+    Schema v6. ``plan_execution`` no longer carries a workflow phase;
+    ``plan_routing.current_phase`` is the only one. A caller that
+    passes ``current_phase=`` is a bug, and it must raise loudly rather
+    than being quietly accepted-and-dropped (which is how the mirror
+    drifted in the first place).
+    """
+    repo.insert(plan_id="p1", exec_status="not_started")
+
+    with pytest.raises(ValueError, match="unknown field"):
+        repo.update_fields("p1", current_phase="executing")
+
+
+def test_summary_exposes_no_phase_column(
+    repo: ExecutionRepository,
+) -> None:
+    """``summary`` must not surface a phase key at all.
+
+    The reader that made the split visible was ``GET /api/plans``
+    (``current_phase = exec_row.get("current_phase") or status``). With
+    the column gone there is nothing for that expression to read, and a
+    lingering ``None`` key would invite it back.
+    """
+    repo.insert(plan_id="p1", exec_status="running")
+    assert "current_phase" not in repo.summary("p1")
+
+
+def test_update_fields_with_nothing_to_write_raises(
     repo: ExecutionRepository,
 ) -> None:
     """A call that would write zero columns is a caller bug, not a no-op."""
-    repo.insert(plan_id="p1", current_phase="ready")
+    repo.insert(plan_id="p1", exec_status="not_started")
 
     with pytest.raises(ValueError, match="nothing to write"):
-        repo.update_phase("p1")
+        repo.update_fields("p1")
 
 
-def test_update_phase_create_if_missing_requires_current_phase(
+def test_update_fields_create_if_missing_upserts_on_run_state_alone(
     repo: ExecutionRepository,
 ) -> None:
-    """``create_if_missing`` cannot omit a ``NOT NULL`` column."""
-    with pytest.raises(ValueError, match="create_if_missing"):
-        repo.update_phase("p-missing", exec_status="running", create_if_missing=True)
+    """``create_if_missing`` no longer needs a phase to satisfy NOT NULL.
+
+    The 2026-09-13 legacy-plan path upserts run state for a plan whose
+    ``plan_execution`` row was never bootstrapped. It used to have to
+    pass a phase to get past the column's NOT NULL; with no phase
+    column the upsert stands on ``exec_status`` alone.
+    """
+    repo.update_fields(
+        "p-missing", exec_status="running", create_if_missing=True,
+    )
+
+    assert repo.summary("p-missing")["exec_status"] == "running"
 
 
-def test_update_status_does_not_clobber_current_phase(
+def test_update_status_does_not_touch_routing(
     repo: ExecutionRepository,
 ) -> None:
-    """``update_status`` writes ``exec_status`` ONLY.
+    """``update_status`` writes ``exec_status`` and nothing else.
 
     2026-09-19 regression (real data bug). ``update_status`` used to call
-    ``update_phase(plan_id, current_phase="executing", ...)``, so every
+    ``update_fields(plan_id, current_phase="executing", ...)``, so every
     status write stamped ``current_phase='executing'``. The startup
     recovery path (``server._mark_failed_dead``) hits this on every plan
     whose executor died: a plan resting at ``ready`` came back from a
-    server restart reading ``current_phase='executing'``, and
-    ``GET /api/plans`` surfaces that column verbatim.
+    server restart reading ``current_phase='executing'``. Schema v6 removes
+    the argument that travelled, so the failure has no path left.
     """
-    repo.insert(plan_id="p1", current_phase="ready", exec_status="running")
+    from state_machine.repositories.routing_repository import RoutingRepository
+
+    RoutingRepository(repo._conn).write_plan_state(
+        "p1", phase="ready", completed_phases=[], review_rounds={},
+        flags={}, verification={}, last_updated=None,
+    )
+    repo.insert(plan_id="p1", exec_status="running")
 
     repo.update_status("p1", "failed")
 
-    summary = repo.summary("p1")
-    assert summary["exec_status"] == "failed"
-    assert summary["current_phase"] == "ready", (
-        "update_status must not touch current_phase; a status write is "
-        "not a phase transition"
+    assert repo.summary("p1")["exec_status"] == "failed"
+    assert RoutingRepository(repo._conn).current("p1")["current_phase"] == "ready", (
+        "update_status must not move the routing phase; a status write "
+        "is not a phase transition"
     )
 
 
-def test_update_phase_with_extra_fields(
+def test_update_fields_with_extra_fields(
     repo: ExecutionRepository,
 ) -> None:
-    """``update_phase`` accepts arbitrary ``**fields`` and persists them."""
-    repo.insert(plan_id="p1", current_phase="ready")
+    """``update_fields`` accepts arbitrary ``**fields`` and persists them."""
+    repo.insert(plan_id="p1", exec_status="not_started")
 
-    repo.update_phase(
+    repo.update_fields(
         "p1",
-        current_phase="executing",
         project_dir="/new/abs",
         stop_reason="user_stop",
         exec_pid=4242,
     )
 
     summary = repo.summary("p1")
-    assert summary["current_phase"] == "executing"
     assert summary["project_dir"] == "/new/abs"
     assert summary["stop_reason"] == "user_stop"
     assert summary["exec_pid"] == 4242
 
 
-def test_update_phase_unknown_plan_raises(
+def test_update_fields_unknown_plan_raises(
     repo: ExecutionRepository,
 ) -> None:
-    """``update_phase`` on unknown plan_id raises ``PlanNotFoundError``."""
+    """``update_fields`` on unknown plan_id raises ``PlanNotFoundError``."""
     with pytest.raises(PlanNotFoundError):
-        repo.update_phase("does-not-exist", current_phase="executing")
+        repo.update_fields("does-not-exist", exec_status="running")
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +600,7 @@ def test_update_next_run_at_persists_value(
     repo: ExecutionRepository,
 ) -> None:
     """``update_next_run_at`` stores the scheduled time on the row."""
-    repo.insert(plan_id="p1", current_phase="ready")
+    repo.insert(plan_id="p1")
 
     repo.update_next_run_at("p1", "2099-01-01T00:00:00Z")
 
@@ -573,7 +611,7 @@ def test_update_next_run_at_accepts_none_to_clear(
     repo: ExecutionRepository,
 ) -> None:
     """``update_next_run_at(None)`` clears the column (schedule removed)."""
-    repo.insert(plan_id="p1", current_phase="ready")
+    repo.insert(plan_id="p1")
     repo.update_next_run_at("p1", "2099-01-01T00:00:00Z")
 
     repo.update_next_run_at("p1", None)
@@ -585,7 +623,7 @@ def test_update_card_state_persists_json(
     repo: ExecutionRepository,
 ) -> None:
     """``update_card_state`` round-trips the card-state dict via JSON."""
-    repo.insert(plan_id="p1", current_phase="executing")
+    repo.insert(plan_id="p1")
 
     repo.update_card_state("p1", {"expanded": True, "active": "verifying"})
 
@@ -601,7 +639,7 @@ def test_update_flags_persists_json(
     repo: ExecutionRepository,
 ) -> None:
     """``update_flags`` round-trips the flags dict via JSON."""
-    repo.insert(plan_id="p1", current_phase="executing")
+    repo.insert(plan_id="p1")
 
     repo.update_flags("p1", {"arch_enabled": True, "test_enabled": False})
 
@@ -636,17 +674,17 @@ def test_write_failure_leaves_existing_row_intact(
     public ``update_*`` methods all use the same helper, so a
     regression in any of them is caught here.
     """
-    repo.insert(plan_id="p1", current_phase="ready")
+    repo.insert(plan_id="p1", project_dir="/orig")
 
     # Sanity: the initial summary.
-    assert repo.summary("p1")["current_phase"] == "ready"
+    assert repo.summary("p1")["project_dir"] == "/orig"
 
     # Simulate a failing write.
     try:
         repo._conn.execute("BEGIN IMMEDIATE")
         repo._conn.execute(
-            "UPDATE plan_execution SET current_phase = ? WHERE plan_id = ?",
-            ("executing", "p1"),
+            "UPDATE plan_execution SET project_dir = ? WHERE plan_id = ?",
+            ("/rolled-back", "p1"),
         )
         # Rollback simulates any exception in the write path.
         repo._conn.execute("ROLLBACK")
@@ -656,4 +694,4 @@ def test_write_failure_leaves_existing_row_intact(
         pass
 
     # The original value must survive.
-    assert repo.summary("p1")["current_phase"] == "ready"
+    assert repo.summary("p1")["project_dir"] == "/orig"

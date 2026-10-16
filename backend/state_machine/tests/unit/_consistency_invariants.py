@@ -86,17 +86,10 @@ The five invariants
          executor-owned stage means the executor has not yet
          observed the verdict.
 
-      2. ``plan_execution.current_phase`` is in a verification-
-         owned phase AND the routing layer is in an executor-
-         owned stage AND ``plan_verification.verification_status``
-         is ``"pending"``.  Pending means the verification round
-         has not started; an executor-owned routing stage with
-         a verification-owned current_phase means the two
-         layers disagree about which worker is active.  Active
-         (non-pending) verification_status is allowed to coexist
-         with an executor-owned routing stage because the
-         dispatcher's normal transition window briefly puts the
-         plan in this state.
+      2. (removed in schema v6 — this rule policed the
+         ``plan_execution`` / ``plan_routing`` phase split, and the
+         split no longer exists.  See
+         ``_check_i4_no_mutually_exclusive_activity``.)
 
     The check is deliberately NOT a full "no overlap" invariant
     — that would flag every normal mid-transition. The check
@@ -354,10 +347,10 @@ def _check_i4_no_mutually_exclusive_activity(
 ) -> Optional[str]:
     """Return an error message if I4 fails, else ``None``.
 
-    Two truly-impossible (stage, verification_status, current_phase)
-    triples are flagged.  Transient mid-transition states (e.g.
-    ``stage='executing'`` AND ``verification_status='running'``
-    during a normal dispatch) are NOT flagged.
+    One truly-impossible (phase, verification_status) pair is flagged.
+    Transient mid-transition states (e.g. ``current_phase='executing'``
+    AND ``verification_status='running'`` during a normal dispatch) are
+    NOT flagged.
 
     Anti-pattern 1: terminal verification result, but routing
     layer still in an executor-owned stage.
@@ -365,14 +358,10 @@ def _check_i4_no_mutually_exclusive_activity(
         verification_status ∈ {passed, failed, loop_stopped}
         AND stage ∈ {ready, executing, tasks_done}
 
-    Anti-pattern 2: verification-owned current_phase + pending
-    verification_status + executor-owned stage.  Pending means the
-    round has not started; this triple means the executor is
-    pretending to be the verifier.
-
-        current_phase ∈ verification_stages
-        AND stage ∈ executor_stages
-        AND verification_status == "pending"
+    Anti-pattern 2 was removed in schema v6 with the second phase
+    column it policed.  It required ``plan_execution.current_phase``
+    and ``plan_routing.current_phase`` to disagree on the same row;
+    with one column there is no disagreement to find.
 
     "Verification stages" = :data:`_VERIFICATION_STAGES`.
     "Executor stages" = ``{"ready", "executing", "tasks_done"}``.
@@ -399,34 +388,17 @@ def _check_i4_no_mutually_exclusive_activity(
                 f"layer has not advanced past the verification result"
             )
 
-    # Anti-pattern 2: verification-owned execution phase + pending
-    # verification status + executor-owned routing stage.
-    cur = conn.execute(
-        "SELECT e.plan_id, e.current_phase, v.verification_status, "
-        "       r.current_phase "
-        "FROM plan_execution e "
-        "JOIN plan_verification v ON v.plan_id = e.plan_id "
-        "JOIN plan_routing r ON r.plan_id = e.plan_id"
-    )
-    # 2026-09-17 (schema v5): ``plan_execution.current_phase`` and
-    # ``plan_routing.current_phase`` now share a column NAME but are
-    # still two different tables' columns — the executor's own
-    # sub-state vs the workflow phase. Bind them to distinct Python
-    # names so the comparison below stays legible.
-    for plan_id, current_phase, verification_status, routing_phase \
-            in cur.fetchall():
-        if (
-            current_phase in _VERIFICATION_STAGES
-            and routing_phase in executor_stages
-            and verification_status == "pending"
-        ):
-            return (
-                f"plan_id={plan_id!r} execution.current_phase="
-                f"{current_phase!r} + verification_status='pending' + "
-                f"plan_routing.current_phase={routing_phase!r} — the "
-                f"executor is impersonating the verifier before any "
-                f"verification round started"
-            )
+    # 2026-10-16 (schema v6): anti-pattern 2 is DELETED, and the delete
+    # is the point.  It read ``plan_execution.current_phase`` and
+    # ``plan_routing.current_phase`` off the same row and flagged the
+    # case where the first said "verification-owned" while the second
+    # said "executor-owned" — i.e. it existed to catch precisely the
+    # two-column split that no longer has two columns.  The executor
+    # cannot impersonate the verifier any more, because it no longer
+    # has a phase of its own to impersonate with.  Anti-pattern 1
+    # above survives: it compares ``plan_routing.current_phase``
+    # against ``plan_verification.verification_status``, which are two
+    # genuinely different facts about the same plan.
     return None
 
 

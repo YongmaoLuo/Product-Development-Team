@@ -2342,9 +2342,8 @@ def _run_repair_execution_async(
         _persist_conn = _open_db(_server._state_db_path())
         try:
             _migrate(_persist_conn)
-            _ExecRepo(_persist_conn).update_phase(
+            _ExecRepo(_persist_conn).update_fields(
                 plan_id,
-                current_phase="executing",
                 project_dir=str(project_dir),
                 exec_pid=process.pid,
                 exec_status="running",
@@ -2355,7 +2354,7 @@ def _run_repair_execution_async(
         pass
     except Exception:
         _server.logger.exception(
-            "[repair_async] update_phase to plan_execution failed plan=%s",
+            "[repair_async] update_fields to plan_execution failed plan=%s",
             plan_id,
         )
 
@@ -2955,26 +2954,14 @@ def _rollback_dead_end_to_ready(
         )
         return False
 
-    # Mirror current_phase so /api/plans and the summary endpoint agree.
-    try:
-        from state_machine.db.connection import open as _open_db
-        from state_machine.db.schema import migrate as _migrate
-        from state_machine.repositories.execution_repository import (
-            ExecutionRepository as _ExecRepo,
-        )
-
-        conn = _open_db(_server._state_db_path())
-        try:
-            _migrate(conn)
-            _ExecRepo(conn).update_phase(
-                plan_id, "ready", create_if_missing=True
-            )
-        finally:
-            conn.close()
-    except Exception:  # noqa: BLE001 — phase mirror is best-effort
-        _server.logger.exception(
-            f"[{log_tag}] current_phase mirror failed plan=%s", plan_id,
-        )
+    # 2026-10-16 (schema v6): the ``update_phase(plan_id, "ready")``
+    # mirror that used to live here is GONE, and that is the point of
+    # this change.  The routing CAS above already moved the one phase
+    # column to ``ready``; the mirror existed only to keep a second
+    # copy of that same value in step, and a best-effort copy that is
+    # allowed to fail silently cannot be a copy worth keeping.  With
+    # ``GET /api/plans`` reading the routing column there is nothing
+    # left for it to reconcile.
 
     _server.logger.warning(
         f"[{log_tag}] plan=%s verification stopped (%s) with %d "

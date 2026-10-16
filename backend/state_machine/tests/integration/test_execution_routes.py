@@ -185,7 +185,6 @@ def _seed_plan(
     RoutingRepository(conn).insert(plan_id, stage)
     ExecutionRepository(conn).insert(
         plan_id=plan_id,
-        current_phase=stage,
         project_dir=str(target),
     )
     return plan_dir
@@ -226,14 +225,17 @@ def test_start_execution_succeeds_from_ready(execution_env):
         f"got stage={route['stage']!r}; full row={route!r}"
     )
 
-    # The execution row must carry the new current_phase + project_dir.
+    # The execution row must carry the run state (pid + project_dir).
+    # Schema v6: there is no ``plan_execution.current_phase`` to check —
+    # the phase lives in exactly one column, and the assertion above
+    # reads it there.
     summary = ExecutionRepository(conn).summary(plan_id)
     assert summary is not None, (
         f"plan_execution row missing for {plan_id} after start"
     )
-    assert summary["current_phase"] == "executing", (
-        f"plan_execution.current_phase must be 'executing'; got "
-        f"{summary['current_phase']!r}; full summary={summary!r}"
+    assert "current_phase" not in summary, (
+        f"plan_execution must not carry a phase; got "
+        f"{summary!r}"
     )
     assert summary["project_dir"] == str(project_dir.resolve()), (
         f"plan_execution.project_dir must be persisted; got "

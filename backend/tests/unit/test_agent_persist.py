@@ -144,10 +144,8 @@ def state_db(tmp_path):
     # here so the canonical-file tests don't have to re-seed.
     for plan_id in ("project", "plan", "tmp_path"):
         conn.execute(
-            "INSERT OR IGNORE INTO plan_execution "
-            "(plan_id, current_phase, updated_at) "
-            "VALUES (?, ?, ?)",
-            (plan_id, "executing", "2026-08-14T00:00:00"),
+            "INSERT OR IGNORE INTO plan_execution (plan_id, updated_at) VALUES (?, ?)",
+            (plan_id, "2026-08-14T00:00:00"),
         )
     conn.commit()
     yield db_path, conn
