@@ -100,14 +100,19 @@ def _count_unfinished_tasks(plan_id: str, tasks_file: Path) -> Dict[str, int]:
     """
     out = {"total": 0, "pending_or_unstarted": 0, "failed": 0}
 
-    # Static task ids from tasks.json.
+    # Static task ids from tasks.json, plus each row's on-disk status.
+    # ``save_tasks`` strips runtime fields, so the status of a row that was
+    # never mirrored into the overlay is only readable here.
     static_ids: set[str] = set()
+    static_status: Dict[str, str] = {}
     try:
         data = json.loads(tasks_file.read_text())
         tasks = data if isinstance(data, list) else data.get("tasks", [])
         for t in tasks:
             if isinstance(t, dict) and t.get("id"):
-                static_ids.add(str(t["id"]))
+                tid = str(t["id"])
+                static_ids.add(tid)
+                static_status[tid] = str(t.get("status") or "").lower()
     except Exception:
         return out
     out["total"] = len(static_ids)
@@ -134,15 +139,39 @@ def _count_unfinished_tasks(plan_id: str, tasks_file: Path) -> Dict[str, int]:
         runtime = {}
 
     TERMINAL_SUCCESS = {"completed", "skipped"}
+    # 2026-10-16: statuses that are RESOLVED but not successful. A
+    # split parent now stays in ``tasks.json`` with ``status="superseded"``
+    # (its work moved to its children) and a revoked task carries
+    # ``"voided"``. Neither is unfinished work, and counting either as
+    # ``pending_or_unstarted`` would report a plan that can never finish:
+    # the executor would not re-run them (both are terminal for the
+    # dispatcher) yet this counter would keep reporting leftover work, so
+    # the plan would never advance to its verification round. They join
+    # ``failed`` as "not going to run again, and the executor must not sit
+    # on them" — but unlike ``failed`` they are not blocker candidates,
+    # because ``is_dependency_ready`` follows the superseded pointer and
+    # the void cascade has already taken the voided subtree.
+    TERMINAL_RESOLVED = {"superseded", "voided"}
     for tid in static_ids:
         entry = runtime.get(tid) if isinstance(runtime.get(tid), dict) else None
         if entry is None:
             # Never written to runtime overlay — the executor never
             # picked this task up.
+            #
+            # 2026-10-16: a row whose on-disk STATUS says it is resolved
+            # is not "never picked up" even when the overlay has no entry.
+            # A split parent recorded ``superseded`` can be absent from
+            # the overlay, and counting it as unstarted is the same
+            # permanent stall (the dispatcher will not re-run it, so no
+            # dispatch can ever clear the count).
+            if static_status.get(tid, "") in TERMINAL_RESOLVED:
+                continue
             out["pending_or_unstarted"] += 1
             continue
         status = entry.get("status")
         if status in TERMINAL_SUCCESS:
+            continue
+        if status in TERMINAL_RESOLVED:
             continue
         if status == "failed":
             out["failed"] += 1
@@ -289,7 +318,14 @@ def _are_all_unfinished_blocked_by_failed_upstream(
                 dep_status = (dep_entry.get("status") or "").lower()
                 if dep_status == "failed":
                     return True
-                if dep_status in ("completed", "skipped", "superseded"):
+                # 2026-10-16: ``voided`` joins the terminal-not-failed
+                # set. A voided ancestor is not a *failure* — nothing
+                # failed; the premise was revoked and the cascade has
+                # already taken its subtree — so it must not be reported
+                # as a blocker. ``superseded`` was already here for the
+                # same reason, and the walk stops at either because
+                # neither verdict propagates further down.
+                if dep_status in ("completed", "skipped", "superseded", "voided"):
                     # Terminal non-failed: walk further to see if a
                     # deeper ancestor failed. This handles cases
                     # like 11-5-1 → [11-4 completed] → [11-2 failed]
@@ -3220,9 +3256,57 @@ def _split_parent_ids(all_tasks: Dict[str, Dict[str, Any]]) -> set:
     parent would run the same fix a second time, so the caller uses this
     set to keep them out of the executor queue.
 
-    Pure function over the rows already read; no extra query. ``{parent}-1``
-    is only ever a child id — no id in either scheme ends in a bare numeric
-    segment that is not a breakdown ordinal.
+    Pure function over the rows already read; no extra query.
+
+    **What the id-shape heuristic cannot see (2026-10-16).** This used to
+    carry the claim "``{parent}-1`` is only ever a child id — no id in
+    either scheme ends in a bare numeric segment that is not a breakdown
+    ordinal". That claim is FALSE and this note replaces it rather than
+    defending it.
+
+    The parse is ``rpartition("-")`` + ``suffix.isdigit()``. It recovers
+    the parent correctly only when the last segment really is the
+    breakdown ordinal. It has no other evidence to go on: it never looks
+    at ``depends_on``, which for breakdown children is usually empty in
+    the live database anyway (129 of 436 rows carry a non-empty
+    ``depends_on``, and breakdown children are not among them). So a last
+    segment that is a bare number for any OTHER reason is read as a
+    breakdown ordinal, and a parent that does not exist is manufactured.
+
+    ``repair-r1-01`` is the live example. ``rpartition("-")`` gives
+    ``("repair-r1", "01")``: the function concludes ``repair-r1`` was
+    split, when ``repair-r1`` is a bare ROUND number that never exists as
+    a task id. ``repair-r1`` / ``repair-r2`` / ``repair-r3`` /
+    ``repair-r4`` are exactly such ghosts — read-only audit of the live
+    ``state.db`` (436 rows, 5 plans, 309 distinct ids) finds 268 ids
+    ending in a bare numeric segment producing 49 distinct phantom
+    parents, 22 of which name a task that does not exist at all.
+
+    **Why it is harmless today.** A phantom parent is inert unless it
+    collides with a REAL task id, because the only consumer is
+    ``if tid in split_parents`` over ids already read from the table. The
+    audit found 27 phantom names that are also real ids, and every one of
+    them is a genuine breakdown parent (they have real id-shaped children
+    of their own). The bare-round shapes — the ones that would need an id
+    scheme nobody uses — do not occur.
+
+    **What would make it bite.** Any id scheme whose last segment is a
+    bare integer that is NOT a breakdown ordinal, for a task id that also
+    exists: a round-scoped task named ``repair-r1``, a bare ``R6`` or
+    ``RP``, or a ``task_group`` value ever becoming a task id. Then
+    :func:`_get_pending_repair_tasks` would classify that task as already
+    split and DROP it from revival via ``repair_task_skipped_split_into_children``
+    — a ``failed`` repair task whose verification point is still failing
+    would silently never be offered again, while the log line reads like a
+    routine breakdown decision.
+
+    The real fix is not a smarter regex: ``depends_on`` should be written
+    by the breakdown flow so the parent is known rather than inferred
+    from spelling. That is a change to the breakdown writer and its
+    existing rows, not to this reader, and it is deliberately NOT made
+    here — this is a comment fix plus a test that pins the trap, and
+    :func:`test_repair_r1_with_breakdown_child_is_silently_dropped`
+    documents it as standing, not as fixed.
     """
     parents: set = set()
     for tid in all_tasks:

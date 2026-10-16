@@ -88,6 +88,19 @@ def _build_mock_agent(max_retries: int = 2):
     agent.task_manager = MagicMock()
     agent.task_manager.update_task_status = MagicMock()
     agent.task_manager.record_task_failure = MagicMock()
+    # 2026-10-16: the failure tail now chooses between two terminal
+    # writers. ``record_task_superseded`` returns True only when the plan
+    # actually holds ``<id>-*`` children — the work was handed over — and
+    # False otherwise, in which case the task really did fail and the tail
+    # writes ``failed``.
+    #
+    # This fixture's refiner is a no-op (no split happens), so the real
+    # TaskManager would answer False here. Saying so explicitly is what
+    # keeps the assertion below meaningful: without it the MagicMock
+    # returns a truthy object for every call, the superseded branch is
+    # taken for the wrong reason, and ``record_task_failure`` is never
+    # reached for a reason that has nothing to do with refine timing.
+    agent.task_manager.record_task_superseded = MagicMock(return_value=False)
 
     # config: minimum needed by _execute_task_with_retry
     agent.config = MagicMock()
@@ -195,9 +208,43 @@ def test_refine_only_after_retries_exhausted_cheat_path():
     # Sanity: cross_verify ran once per attempt (2 attempts in max_retries=2)
     assert agent._cross_verify_test_result.call_count == 2
 
-    # The single refine call is the LAST action before record_task_failure,
+    # The single refine call is the LAST action before the terminal write,
     # so the failure is properly recorded after the breakdown.
     assert agent.task_manager.record_task_failure.call_count == 1
+    # 2026-10-16: with no split in this fixture, ``superseded`` was asked
+    # and correctly declined — the tail asked once and fell back to
+    # ``failed``. Both halves matter: asking twice would mean the
+    # breakdown ran twice.
+    assert agent.task_manager.record_task_superseded.call_count == 1, (
+        "the tail must consult the children exactly once, after the refine"
+    )
+
+
+def test_refine_with_a_real_split_records_superseded_not_failed():
+    """Companion to the cheat-path test: when the refine DID split, the
+    terminal write is ``superseded`` and ``failed`` is never written.
+
+    2026-10-16. This is the case the whole change exists for, pinned at
+    the level the other test in this file uses: one refine call, then one
+    terminal write — of the other kind.
+    """
+    agent = _build_mock_agent(max_retries=2)
+    # The plan now holds the children, which is what the real
+    # ``record_task_superseded`` checks for before it agrees.
+    agent.task_manager.record_task_superseded = MagicMock(return_value=True)
+    task = _build_task("1")
+
+    result = agent._execute_task_with_retry(task, max_retries=2)
+
+    assert result is False
+    assert len(agent.refine_call_log) == 1, (
+        f"refine must still run exactly once; got {agent.refine_call_log}"
+    )
+    assert agent.task_manager.record_task_superseded.call_count == 1
+    assert agent.task_manager.record_task_failure.call_count == 0, (
+        "a split parent must not also be recorded as failed — that is "
+        "the red card entry this change removes"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1736,8 +1736,16 @@ _STATUS_TASK_KEYS = ("completed", "failed", "in_progress", "pending", "skipped")
 #: Statuses that end a task's life. Used to decide whether a ``plan_tasks``
 #: row with no counterpart in ``tasks.json`` is a *terminal* DB-only orphan
 #: — the rows the card drops (``drop_terminal_db_orphans``).
+#:
+#: ``voided`` (2026-10-16) joins the set because a voided task is exactly
+#: as unschedulable as a completed one: its premise was revoked, so there
+#: is nothing left to run. It must be here or the summary endpoint
+#: hydrates a voided DB-only row back into the plan's task list as work.
+#: It is NOT in ``_STATUS_TASK_KEYS`` above — voiding is not a phase the
+#: plan passes through, so giving it a bucket would make the status object
+#: claim the plan spent a phase it never spent.
 _TERMINAL_TASK_STATUSES = frozenset(
-    {"completed", "failed", "skipped", "superseded"}
+    {"completed", "failed", "skipped", "superseded", "voided"}
 )
 
 

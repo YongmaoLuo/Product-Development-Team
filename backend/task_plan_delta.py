@@ -25,9 +25,22 @@ commit checkpoint、失败原因全部对不上号，审计链断掉。所以：
 任何一个动作试图改动已有任务 → 记入 ``rejected_modifications``，
 不执行：不做人工审批流程、不设数量上限，但必须可回溯。
 
-``obsolete`` 落成 ``plan_tasks.status = "superseded"`` —— 该状态本来
+``obsolete`` 落成 ``plan_tasks.status = "voided"`` —— 该状态本来
 就在 ``_TERMINAL_TASK_STATUSES`` 里，dispatcher 不会再调度它，卡片会
 用 ``db_orphan_terminal`` 那条路径把它显示出来。
+
+2026-10-16：``voided`` 是新状态，与 ``superseded`` 分工——
+
+* ``superseded``：**这条不再自己跑，工作已经交给子任务了**。resolver
+  遇到它会展开到子任务去判（``is_dependency_ready``）。
+* ``voided``：**前提被推翻了**，这条和它整条下游都不该跑了。作废时
+  沿 ``depends_on`` 级联，下游一并 ``voided``。
+
+改名的理由：以前「人工作废」和「验证重置丢弃判决」都写成
+``superseded``，与「refiner 拆开后残留的孤儿」共用一个词，于是 resolver
+无法区分「去追子任务」和「永远不会有结果」。24 行存量 ``superseded``
+全部来自 ``/reset``（前提没了），没有一行是「工作转给了子任务」，
+所以它们本就该是 ``voided``。
 """
 
 from __future__ import annotations
@@ -287,12 +300,20 @@ def apply_task_delta(
 
     两个动作各自落两处，因为执行期的任务有两个真相来源：
 
-    * ``obsolete`` → ``plan_tasks.status = "superseded"``（终态，
+    * ``obsolete`` → ``plan_tasks.status = "voided"``（终态，
       dispatcher 不再调度）+ ``failure_reason`` 里的作废标记。**不改**
       任务的任何静态字段，也不从 ``tasks.json`` 里删除它 —— 要求
       留痕。``tasks.json`` 不动：那份文件是静态定义，状态归 SQLite。
     * ``add`` → ``repo.add_task``（单写者路径）+ 追加进 ``tasks.json``，
       否则下一次 ``_load_tasks`` 从磁盘重读时新任务就消失了。
+
+    2026-10-16: ``obsolete`` 落成 ``voided``，不再是 ``superseded``。
+    「作废」的本义是**前提没了**，而 ``superseded`` 从 2026-10-16 起
+    只表示「工作已交给子任务，去找子任务」—— resolver 对这两者的行为
+    正好相反（``is_dependency_ready`` 展开前者、不满足后者），所以一个
+    人工作废的任务如果写成 ``superseded``，它的下游会去追一个根本不
+    存在的子任务集合。这正是 ``obsolete`` 这个动作名字一直在说的事情，
+    只是以前没有专门的状态可以落地。
 
     ``repo`` 是已打开的 :class:`PlanTaskRepository`；调用方负责事务与
     连接生命周期。返回可直接写进响应的摘要。
@@ -311,7 +332,7 @@ def apply_task_delta(
             plan_id=plan_id,
             task_id=task_id,
             fields={
-                "status": "superseded",
+                "status": "voided",
                 "failure_reason": reason,
             },
             expected_version=0,

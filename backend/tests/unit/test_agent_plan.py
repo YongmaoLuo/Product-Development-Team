@@ -165,13 +165,23 @@ def test_status_enum_no_dependency_failed():
     # refiner-orphan residue in state.db that is NOT in ``tasks.json``
     # and must not be re-executed. It is not a ``dependency_failed``
     # reintroduction — see ``agent._TERMINAL_TASK_STATUSES``.
+    #
+    # 2026-10-16: ``voided`` joined the set as the fifth member, in the
+    # same split that narrowed ``superseded`` to mean "work handed to
+    # children". The two now differ in what the *dependency resolver*
+    # does — ``superseded`` is expanded to its children and re-judged,
+    # ``voided`` blocks its downstream — but they are equally terminal
+    # for the dispatcher: neither is ever scheduled again. This test
+    # pins the dispatcher's view only; the resolver's divergence is
+    # pinned in ``tests/unit/test_split_lifecycle.py``.
     assert _TERMINAL_TASK_STATUSES == frozenset({
         "completed",
         "failed",
         "skipped",
         "superseded",
+        "voided",
     }), (
-        f"terminal statuses must be exactly the 4-status union; "
+        f"terminal statuses must be exactly the 5-status union; "
         f"got {_TERMINAL_TASK_STATUSES!r}"
     )
 

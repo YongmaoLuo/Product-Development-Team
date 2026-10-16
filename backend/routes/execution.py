@@ -1334,7 +1334,7 @@ def get_execution_progress(plan_id: str):
     # orphans get a placeholder, terminal orphans are dropped
     # because the dispatcher never re-runs them anyway.
     try:
-        _TERMINAL = {"completed", "failed", "skipped", "superseded"}
+        _TERMINAL = {"completed", "failed", "skipped", "superseded", "voided"}
         disk_ids = {t.get("id") for t in tasks if isinstance(t, dict)}
         for tid, rt in runtime.items():
             if tid in disk_ids:

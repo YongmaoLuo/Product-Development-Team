@@ -24,7 +24,16 @@ from typing import Optional, List, Dict, Any, Union
 # grep / monitoring.
 log = logging.getLogger("agent")
 
-from coding_tool import CodingTool, OpenCodeCodingTool, ClaudeCodingTool, VendorCCodingTool, ApiError, HardTimeoutError
+from coding_tool import (
+    CodingTool,
+    OpenCodeCodingTool,
+    ClaudeCodingTool,
+    VendorCCodingTool,
+    ApiError,
+    HardTimeoutError,
+    JsonSession,
+    query_in_session,
+)
 from bounded_subprocess import run_bounded
 from usage_registry import plan_usage_context
 from task_manager import TaskManager, CycleInTaskGraph
@@ -408,6 +417,27 @@ _TERMINAL_TASK_STATUSES = frozenset({
                    # a finished task). See
                    # :meth:`PlanTaskRepository.iter_orphan_tasks`
                    # and the ``task_orphans_reconciled`` audit event.
+                   #
+                   # 2026-10-16: the meaning is NARROWED to "this row
+                   # stopped running because its work was handed to
+                   # breakdown children", and the resolver follows that
+                   # pointer (see ``_resolve_upstream_candidates``).
+                   # Rows that mean "the premise was revoked" are
+                   # ``voided`` below instead — those two used to share
+                   # this one label, which is why a split parent used to
+                   # read as a permanent red failure on the card.
+    "voided",      # 2026-10-16: the premise behind this task was
+                   # revoked (a verification reset discarded the
+                   # verdicts it was generated from, or a human ran the
+                   # ``obsolete`` delta action). It and its whole
+                   # downstream subtree are marked by
+                   # ``TaskManager.void_task``; neither the dispatcher
+                   # nor the card may schedule or count it as work.
+                   # Distinguishing it from ``superseded`` is what lets
+                   # a split parent be "handed over" while a voided one
+                   # is "cancelled" — same terminal-ness, opposite
+                   # resolver behaviour, and ``is_dependency_ready``
+                   # treats them differently on purpose.
 })
 
 # Orphan-reconcile rules are shared with
@@ -465,6 +495,88 @@ def strip_framework_result_trailer(text: str) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _breakdown_children(task_id: str, by_id: dict) -> list:
+    """Tasks that are breakdown children of ``task_id``.
+
+    The one definition of "``X`` was split" in this codebase:
+    ``refiner.py:436`` (``superseded = {oid for oid in old_ids -
+    returned_ids if any(cid.startswith(f"{oid}-") for ...)}``) and
+    ``refiner_structure.py:383`` both use the ``<parent>-`` prefix test,
+    so this uses it too — a criterion that disagreed with the writers
+    would stamp depth onto rows the writers consider something else.
+
+    Returns them in ``by_id`` order so the resolver's reason token is
+    stable across runs (the dispatcher logs it verbatim).
+    """
+    prefix = task_id + "-"
+    return [t for tid, t in by_id.items() if tid.startswith(prefix)]
+
+
+def _resolve_upstream_candidates(upstream_id: str, by_id: dict) -> tuple:
+    """Resolve one ``depends_on`` entry to the candidates that must pass.
+
+    Returns ``(candidates, outcome)`` where ``outcome`` is one of:
+
+      * ``"ok"`` — ``candidates`` is the non-empty list of tasks whose
+        status decides this dependency;
+      * ``"missing"`` — neither a row nor any child carries this id.
+
+    Why ``superseded`` expands (2026-10-16)
+    ---------------------------------------
+    ``superseded`` means *this row stopped running because its work was
+    handed to breakdown children*. So for a dependency, a superseded
+    upstream is not a verdict at all — it is a pointer. Following it is
+    the whole point: without it, a plan whose task ``12`` was split into
+    ``12-1``/``12-2`` deadlocks, because ``13`` depends on ``12``, ``12``
+    is terminal and never re-runs, and the resolver has no rule that says
+    "look at the children". The card and the repair sweep
+    (``verification_loop.py:292``) both already treated ``superseded`` as
+    satisfied; the dispatcher side did not, and that disagreement is the
+    deadlock.
+
+    The expansion is **recursive** because a child can itself have been
+    split (``12-1`` → ``12-1-1``/``12-1-2``); stopping at one level would
+    just move the deadlock one level down.
+
+    A ``superseded`` upstream with **no** children resolves to no
+    candidates at all, which is deliberately *not* routed to the
+    ``missing`` outcome: the row exists, so its premise never went
+    missing, and pretending it did would report a plan-shape bug for a
+    row that is merely inert. It is reported as ``ok`` with an empty
+    candidate list, i.e. the dependency is satisfied — the caller logs
+    ``upstream_superseded_no_children`` so an operator can see it. This
+    is the "no status may be a silent fallback" rule applied: an inert
+    ``superseded`` row blocks nothing and says so out loud.
+    """
+    upstream = by_id.get(upstream_id)
+    if upstream is not None and getattr(upstream, "status", None) != "superseded":
+        return [upstream], "ok"
+    # Either absent (split parents can be pruned) or explicitly
+    # superseded — both mean "the answer lives in the children".
+    children = _breakdown_children(upstream_id, by_id)
+    if not children:
+        return ([], "ok") if upstream is not None else ([], "missing")
+    resolved: list = []
+    for child in children:
+        # A child that was itself split contributes its own children,
+        # never itself — it is a pointer row for the same reason its
+        # parent is. A child that was NOT split contributes itself.
+        #
+        # No cycle guard is needed and adding one would hide a real
+        # defect: every step takes a child whose id starts with
+        # ``<this id>-``, so the id strictly grows and the recursion is
+        # bounded by the longest id in the plan. A loop is not
+        # constructible here, which is why this is a note rather than a
+        # ``seen`` set.
+        sub, outcome = _resolve_upstream_candidates(child.id, by_id)
+        if outcome == "missing":
+            continue
+        for c in sub:
+            if not any(r.id == c.id for r in resolved):
+                resolved.append(c)
+    return resolved, "ok"
+
+
 def is_dependency_ready(task, all_tasks) -> tuple[bool, str]:
     """Decide whether ``task`` is ready to be scheduled, given the
     status of every upstream task referenced in its ``depends_on``.
@@ -479,11 +591,28 @@ def is_dependency_ready(task, all_tasks) -> tuple[bool, str]:
         is in ``{"completed", "skipped"}``. Both terminal-success
         statuses unlock downstream execution; ``failed``,
         ``in_progress``, ``pending`` all block it.
+      * **``superseded`` upstream is a pointer, not a verdict**
+        (2026-10-16). It resolves — recursively — to the breakdown
+        children that took over its work, and *those* decide the
+        dependency. A ``superseded`` upstream with no children is
+        inert and satisfies the dep. See
+        :func:`_resolve_upstream_candidates`.
+      * **``voided`` upstream blocks** with its own token. Its
+        premise was revoked, so its output will never exist;
+        ``void_task`` cascades ``voided`` down the subtree rather
+        than leaving downstream to discover the block.
       * If any upstream is in a non-success terminal status, or is
         still pending / in_progress, the function returns
         ``(False, "upstream_<status>:<upstream_id>")``. The reason
         is machine-readable so the dispatcher can surface it via
-        the watchdog signal without further parsing.
+        the watchdog signal without further parsing. Every status
+        this gate knows has its own token; an unrecognised status
+        fails closed as ``upstream_unknown_status:<id>:<status>``
+        rather than being swept into a generic "not yet ready".
+        There is deliberately **no** ``upstream_not_ready``
+        catch-all left: a status nobody can name is a defect, and
+        hiding it behind a token that reads like ordinary progress
+        is how this deadlock survived in the first place.
       * If any ``depends_on`` entry refers to a task that does not
         exist in ``all_tasks`` (defensive guard against a plan-load
         bug), the function returns
@@ -546,32 +675,38 @@ def is_dependency_ready(task, all_tasks) -> tuple[bool, str]:
         # in a success terminal status — the dep is logically
         # satisfied by the parent running and completing.
         candidates: list = []
-        if upstream is not None:
-            candidates.append(upstream)
-        else:
-            # Build children list dynamically — the plan can shrink
-            # or grow between dispatcher passes and we want the
-            # children match to reflect the current plan state.
-            prefix = upstream_id + "-"
-            children_matching = [
-                t for tid, t in by_id.items()
-                if tid.startswith(prefix)
-            ]
-            if children_matching:
-                candidates.extend(children_matching)
-            # If no children matched, fall through to the existing
-            # missing-upstream error below.
+        outcome = "ok"
+        # Resolve through ``superseded`` pointers: a ``superseded``
+        # upstream is replaced by its breakdown children (recursively).
+        # A plain non-superseded upstream resolves to itself. The
+        # children list is built dynamically — the plan can shrink or
+        # grow between dispatcher passes and we want the match to
+        # reflect the current plan state.
+        candidates, outcome = _resolve_upstream_candidates(
+            upstream_id, by_id,
+        )
 
-        if not candidates:
+        if outcome == "missing" or (not candidates and upstream is None):
             # Missing upstream: id is not in the plan and has no
             # surviving children. The plan-load validator catches
             # this at load time, but the runtime gate must still
             # be safe.
             return False, f"missing_upstream:{upstream_id}"
 
-        # All candidates (parent + every child) must be in a
-        # success terminal state. Any failure or non-terminal
-        # candidate blocks the downstream task.
+        if not candidates:
+            # A ``superseded`` row that resolves to no children (see
+            # ``_resolve_upstream_candidates``): inert, not missing.
+            # The dependency is satisfied, so the dep loop continues.
+            # This function is a pure module-level gate with no logger,
+            # so the case is deliberately silent here; the observability
+            # for it is at the writer (``record_task_superseded`` only
+            # ever runs once children are confirmed present) and in
+            # ``test_superseded_parent_*``.
+            continue
+
+        # Every resolved candidate must be in a success terminal
+        # state. Any failure or non-terminal candidate blocks the
+        # downstream task.
         for candidate in candidates:
             candidate_status = getattr(candidate, "status", None)
             if candidate_status in ("completed", "skipped"):
@@ -580,15 +715,35 @@ def is_dependency_ready(task, all_tasks) -> tuple[bool, str]:
                 continue
             if candidate_status == "failed":
                 return False, f"upstream_failed:{candidate.id}"
+            if candidate_status == "voided":
+                # Cascade target: this upstream's premise was revoked,
+                # so its work will never exist. Do NOT satisfy the dep —
+                # ``void_task`` cascades ``voided`` down the subtree, so
+                # a task that still points here is either pre-cascade
+                # (and about to be voided itself) or a refiner addition
+                # made after the cascade. Either way the honest answer
+                # is "blocked", and it is a distinct token from every
+                # other block so an operator can tell a revoked premise
+                # from a slow upstream.
+                return False, f"upstream_voided:{candidate.id}"
             if candidate_status == "in_progress":
                 return False, f"upstream_in_progress:{candidate.id}"
             if candidate_status == "pending":
                 return False, f"upstream_pending:{candidate.id}"
-            # Any other status (e.g. ``breakdown_in_progress``, a
-            # non-standard label introduced by a future feature) is
-            # treated as "not yet ready" with a generic token so
-            # the dispatcher can surface it without a special case.
-            return False, f"upstream_not_ready:{candidate.id}"
+            if candidate_status == "breakdown_in_progress":
+                # A split is being minted for this row right now: it
+                # has not produced a verdict yet, so it blocks. Named
+                # explicitly rather than swept into a generic bucket.
+                return False, f"upstream_breakdown_in_progress:{candidate.id}"
+            # A status this gate has never heard of. Fail closed — an
+            # unknown verdict must never unlock downstream — but with a
+            # token that cannot be confused with ordinary progress: it
+            # carries the status itself, so the watchdog line names the
+            # label to fix instead of reporting "not ready" at an
+            # operator who has no other way to see it.
+            return False, (
+                f"upstream_unknown_status:{candidate.id}:{candidate_status}"
+            )
 
     return True, ""
 
@@ -663,12 +818,29 @@ def _is_plan_failed(tasks: list) -> bool:
     return False
 
 
-# Maximum number of times a single parent task may be broken down into
-# subtasks before the executor stops re-breaking it and marks it failed.
-# PRD decision point: at depth 5 the executor has tried four prior
-# breakdowns; if the fifth still fails to converge, automated breakdown
-# is unlikely to help and human inspection is required. See
-# :meth:`AutonomousAgent._breakdown_task` for the enforcement site.
+# Maximum number of LEVELS a single task's breakdown chain may reach
+# before the executor stops splitting it and lets it stay failed.
+#
+# REINTERPRETED 2026-10-16 — this used to read "maximum number of
+# times a parent may be broken down", i.e. a count of SPLITS, and it was
+# dead code (its only enforcement site, ``_breakdown_task``, was deleted
+# when the split path moved to the refiner). It is now a count of
+# LEVELS and it is enforced, and the two readings differ by exactly one:
+#
+#   * levels: a fresh task is level 1; splitting it produces level 2;
+#     ... a level-5 task that fails is NOT split again.
+#   * splits: levels 1→2, 2→3, 3→4, 4→5 is four splits.
+#
+# So ``EXECUTOR_BREAKDOWN_MAX - 1`` is the split budget, and the
+# enforcement site tests ``breakdown_count >= EXECUTOR_BREAKDOWN_MAX - 1``
+# (``breakdown_count`` is 0 on a level-1 task). This matches the PRD:
+# at level 5 the executor has already tried four prior breakdowns, and if
+# the fifth still fails to converge, automated breakdown is unlikely to
+# help and human inspection is required.
+#
+# Scoped to ALL tasks, not only repairs. The repair-only cap below is
+# stricter (2) and still applies to repair tasks; this one bounds
+# everything else, which is where the unbounded tail lived.
 EXECUTOR_BREAKDOWN_MAX = 5
 
 # How deep the breakdown flow may nest a REPAIR task before the executor
@@ -694,9 +866,13 @@ EXECUTOR_BREAKDOWN_MAX = 5
 #: thing that actually compounds — rather than a count of refinements,
 #: which a single split can spend several of.
 #:
-#: Scoped to repair tasks on purpose: this is the one path whose
-#: breakdown budget was lost with ``_breakdown_task``, and widening it to
-#: ordinary plan tasks would change behaviour this change is not about.
+#: Scoped to repair tasks: kept deliberately stricter than
+#: :data:`EXECUTOR_BREAKDOWN_MAX` (2 levels vs 5) because a repair task is
+#: regenerated every verification round — it has a fresh row each time, so
+#: a cap counted in rows is reset by every round and only a per-ROW depth
+#: survives. An ordinary plan task has one row for the whole run, so
+#: ``EXECUTOR_BREAKDOWN_MAX`` covers it. Both are enforced; the tighter of
+#: the two wins for a given task.
 REPAIR_MAX_BREAKDOWN_DEPTH = 2
 
 # How many times one execution run may let the refiner restructure the
@@ -807,7 +983,7 @@ def _stamp_breakdown_depths(
 
     A child ``"40-2"`` split out of ``"40"`` inherits ``40``'s depth and
     adds one, so a chain that keeps splitting reads 0, 1, 2 and then stops
-    (see :data:`REPAIR_MAX_BREAKDOWN_DEPTH`). Entries whose id is not a
+    (see :data:`EXECUTOR_BREAKDOWN_MAX`). Entries whose id is not a
     breakdown child of a pre-existing task — a brand-new task the refiner
     invented with no parent, or a sibling that merely sorts after another
     one — are left untouched.
@@ -816,6 +992,42 @@ def _stamp_breakdown_depths(
     to write to ``tasks.json``) and returns ``{child_id: depth}`` for the
     ``plan_tasks`` write, which has to go through ``update_task``
     because ``breakdown_count`` is a runtime column.
+
+    Why "nearest existing ancestor" and not "count the hyphens"
+    ----------------------------------------------------------
+    Two criteria were available and only one of them is a criterion:
+
+    * **Counting hyphens** is not one. ``repair-r1-01`` carries two and
+      is a first-level repair task; ``12-6-4`` carries two and is a
+      second-level breakdown of a first-level one. The same string shape
+      carries two different depths, so the hyphen count decides nothing
+      on its own.
+
+    * **Resolving to the nearest ancestor that is a real task row**
+      does decide, because the parent must exist. ``repair-r1-01``'s
+      longest existing ancestor is none (there is no ``repair-r1`` task),
+      so it is a root at depth 0 — correct. ``12-6-4``'s is ``12-6``,
+      which exists, so it inherits ``12-6``'s depth — correct.
+
+    The "must exist" part is also what makes the stamp agree with the
+    writers. ``refiner.py:436`` and ``refiner_structure.py:383`` both
+    decide "``X`` was split" with ``any(cid.startswith(f"{X}-"))``, so a
+    child that is *not* named after its parent is already invisible to
+    them — and a depth counter that disagreed with them would bound a
+    budget the split logic does not recognise.
+
+    This was a real mismatch before 2026-10-16: the stamp required
+    ``suffix.isdigit()``, so a child the LLM named ``12-a`` got NO
+    depth even though ``refiner_structure`` treated it as ``12``'s
+    child and *dropped* ``12`` as superseded. The parent was then gone
+    from the DAG and the budget silently never applied to it.
+
+    Limitation (not fixable here): a child whose id does not contain its
+    parent's id as a prefix at all (``auth-module`` spawned from ``12``)
+    is undetectable by every criterion in this repo, prefix-based ones
+    included. Enforcing the id shape would mean renaming ids after the
+    refiner returned, which would invalidate every ``depends_on``
+    reference to them — so the hole is documented, not papered over.
 
     Pure bookkeeping: it changes no scheduling decision, it only records
     a number that was previously always absent.
@@ -828,6 +1040,21 @@ def _stamp_breakdown_depths(
         for t in (current_tasks or [])
         if t.get("id")
     }
+
+    def _nearest_ancestor(tid: str) -> str:
+        """Longest prefix of ``tid`` that is a real task row, else ``""``.
+
+        Longest wins so a grandchild inherits from its immediate parent
+        and the depth increments exactly once per split, however deep the
+        id chain goes.
+        """
+        rest = tid
+        while "-" in rest:
+            rest = rest.rsplit("-", 1)[0]
+            if rest in current_ids:
+                return rest
+        return ""
+
     stamped: dict = {}
     for entry in effective or []:
         if not isinstance(entry, dict):
@@ -835,10 +1062,10 @@ def _stamp_breakdown_depths(
         tid = str(entry.get("id") or "")
         if not tid or tid in current_ids:
             continue
-        parent, _, suffix = tid.rpartition("-")
-        # Same shape test as ``refiner_structure``'s split-parent rule:
-        # the child is exactly ``f"{parent}-{ordinal}"``.
-        if not parent or not suffix.isdigit() or parent not in current_ids:
+        parent = _nearest_ancestor(tid)
+        if not parent:
+            # Not a breakdown child of anything that exists: a
+            # brand-new task the refiner invented with no parent.
             continue
         depth = depths.get(parent, 0) + 1
         entry["breakdown_count"] = depth
@@ -4438,6 +4665,43 @@ class AutonomousAgent:
             # path; the executor will run the test again after the
             # implementation lands.
 
+        # 2026-10-16 — one session per TASK, reused across its attempts.
+        #
+        # What this is: attempt 2 asks the same question attempt 1 already
+        # spent minutes answering — the files it read, the commands it
+        # ran, the diff it got wrong. Reusing that context is what the
+        # operator asked for ("基于已有的上下文，再注入一些错误的相关提示").
+        #
+        # Which mechanism that is: ``query_in_session`` with a bound
+        # handle takes the RE-ASK path (``RESUME_REASK_PROMPT``), which
+        # restores the transcript and re-sends the caller's prompt
+        # alongside it. It is deliberately NOT the provider-switch path
+        # (``RESUME_CONTINUATION_PROMPT``), which describes a turn cut off
+        # mid-flight and withholds the original prompt on purpose — wrong
+        # text for this case, since nothing cut attempt 1 off: it finished
+        # and its answer was wrong. The failure text reaches the model
+        # because the retry's own ``context`` already carries it (the
+        # ``get_retry_prompt_modifier`` failure feedback), and it is
+        # re-sent with the prompt rather than replacing it.
+        #
+        # Scope: in-process, per run, per task — deliberately NOT the
+        # ``plan_sessions`` sidecar. That sidecar exists to carry a turn
+        # across a *process* boundary for one logical conversation; a
+        # fresh ``/execution/start`` is a new run whose transcript
+        # describes a codebase that may since have been reset or rolled
+        # back, and resuming that would describe the past. A retry inside
+        # one run is unambiguously the same work.
+        #
+        # The empty-response edge (``EmptyResponseError``): the handle is
+        # only bound once a dispatch returns a real session id, and
+        # ``_remember`` skips unbound ids. An attempt that produced no
+        # assistant text never created a session, so the handle stays
+        # empty, ``from_handle`` is False, and the next attempt opens a
+        # fresh session — which is the only correct move, since
+        # ``--resume``-ing a session that was never written fails in
+        # ~0.4s.
+        task_session = JsonSession()
+
         for attempt in range(max_retries):
             try:
                 print(f"\n--- Processing Task [{task.id}] (Attempt {attempt + 1}/{max_retries}): {task.title} ---")
@@ -4620,7 +4884,8 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                         if self.logger:
                             self.logger.info("task_background_mode", "Using background execution due to previous timeout",
                                              task_id=task.id)
-                        coder_response = self.coding_tool.query(
+                        coder_response = query_in_session(
+                            self.coding_tool, task_session,
                             context,
                             system_instruction=coder_prompt,
                             # 2026-09-15: the execution-phase
@@ -4634,11 +4899,27 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                             scene="execution",
                         )
                     else:
-                        coder_response = self.coding_tool.query(
+                        coder_response = query_in_session(
+                            self.coding_tool, task_session,
                             context,
                             system_instruction=coder_prompt,
                             model_type=task.model_type,
                             scene="execution",
+                        )
+                    if task_session.session_id and self.logger:
+                        # Observable proof that the retry re-opened the same
+                        # conversation: one session id per task, carried
+                        # across attempts.
+                        self.logger.info(
+                            "task_session_bound",
+                            f"Task [{task.id}] attempt {attempt + 1} ran in "
+                            f"session {task_session.session_id}",
+                            task_id=task.id,
+                            data={
+                                "attempt": attempt + 1,
+                                "session_id": task_session.session_id,
+                                "reused": attempt > 0,
+                            },
                         )
                 except HardTimeoutError as e:
                     # 2026-09-08: inner or outer cap fired on the task.
@@ -4725,7 +5006,7 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                                 )
                             except Exception:
                                 pass
-                    self.task_manager.record_task_failure(task.id, error_msg)
+                    self._record_failure_or_supersede(task, error_msg)
                     duration = int(time.monotonic() - task_start_time)
                     if self.logger:
                         self.logger.error(
@@ -4782,7 +5063,7 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                                 )
                             except Exception:
                                 pass
-                    self.task_manager.record_task_failure(task.id, error_msg)
+                    self._record_failure_or_supersede(task, error_msg)
                     duration = int(time.monotonic() - task_start_time)
                     if self.logger:
                         self.logger.error("task_failed", f"Task [{task.id}] failed after {max_retries} timeouts",
@@ -5244,7 +5525,7 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     self._refine_after_failure(task, coder_response, result_context, "", 1)
 
                     print("All retries exhausted for this run.")
-                    self.task_manager.record_task_failure(task.id, error_msg)
+                    self._record_failure_or_supersede(task, error_msg)
                     duration = int(time.monotonic() - task_start_time)
                     if self.logger:
                         self.logger.error("task_failed",
@@ -6872,6 +7153,55 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
             self._leaf_tasks.discard(child.id)
         self._leaf_tasks.add(parent.id)
 
+    def _record_failure_or_supersede(self, task: SubTask, error_msg: str) -> str:
+        """Write the terminal label for a task that just failed and was refined.
+
+        2026-10-16. Every failure tail runs ``_refine_after_failure`` and
+        then wrote ``failed`` unconditionally. That is wrong whenever the
+        refine actually split the task: the row's work now belongs to
+        ``<id>-*`` children, and leaving it ``failed`` put a permanent red
+        mark on the card for a task that is not broken — it is handed
+        over. ``refiner_structure.py:373-378`` already deletes the row when
+        a *protected* (repair) parent is split, and its comment records
+        four repair parents stranded beside completed children for exactly
+        this reason; the non-repair path never got the same treatment
+        because the parent survives there, so ``failed`` was the only thing
+        it could be marked with.
+
+        The label is therefore chosen by what the plan now contains, not by
+        the fact that an attempt failed:
+
+          * children present  → ``superseded`` ("go look at the children")
+          * no children       → ``failed`` (the split did not take, or the
+            depth/run budget refused it — either way this task really did
+            fail and its downstream must stay blocked)
+
+        ``record_task_superseded`` re-checks the children itself and
+        returns ``False`` if they are gone, so a refiner that renamed or
+        dropped them mid-write cannot leave a pointer row with nothing
+        behind it.
+
+        Returns the status written, so the caller's log line can name it.
+        """
+        if self.task_manager.record_task_superseded(
+            task.id, error_msg,
+        ):
+            if self.logger:
+                self.logger.info(
+                    "task_superseded_after_split",
+                    (
+                        f"Task [{task.id}] failed but was split into "
+                        f"breakdown children; recorded as superseded so "
+                        f"its downstream follows the children instead of a "
+                        f"dead parent."
+                    ),
+                    task_id=task.id,
+                    data={"error": error_msg[:500]},
+                )
+            return "superseded"
+        self.task_manager.record_task_failure(task.id, error_msg)
+        return "failed"
+
     def _refine_after_failure(self, task: SubTask, coder_response: str, result_context: str,
                               file_context: str, exit_code: int):
         """
@@ -6902,6 +7232,41 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     data={
                         "refinements": self._refinement_count,
                         "cap": EXECUTOR_MAX_REFINEMENTS,
+                        "task_count": len(self.task_manager.tasks),
+                    },
+                )
+            return
+        # 2026-10-16 — the per-task breakdown cap that applies to EVERY
+        # task, reviving ``EXECUTOR_BREAKDOWN_MAX`` (dead since
+        # ``_breakdown_task`` was deleted). Checked before the
+        # repair-only cap so a repair task reports whichever bound it hit
+        # first, and both are enforced: this one is 5 levels, the repair
+        # one is 2, and the tighter wins.
+        #
+        # ``breakdown_count`` is 0 on a level-1 task, so ``>= MAX - 1`` is
+        # "this is already level 5". A level-5 failure returns here
+        # WITHOUT splitting and WITHOUT being marked superseded, so the
+        # caller marks it ``failed`` — that is the real fail the PRD
+        # describes, the point at which a human has to look.
+        _breakdown_depth = int(getattr(task, "breakdown_count", 0) or 0)
+        if _breakdown_depth >= EXECUTOR_BREAKDOWN_MAX - 1:
+            if self.logger:
+                self.logger.error(
+                    "breakdown_depth_exhausted",
+                    (
+                        f"Task [{task.id}] failed at breakdown level "
+                        f"{_breakdown_depth + 1} (cap "
+                        f"{EXECUTOR_BREAKDOWN_MAX} levels, "
+                        f"{EXECUTOR_BREAKDOWN_MAX - 1} splits); not "
+                        f"splitting it again. The task stays failed and "
+                        f"needs human inspection."
+                    ),
+                    task_id=task.id,
+                    data={
+                        "plan_id": self.plan_id,
+                        "breakdown_count": _breakdown_depth,
+                        "level": _breakdown_depth + 1,
+                        "max_levels": EXECUTOR_BREAKDOWN_MAX,
                         "task_count": len(self.task_manager.tasks),
                     },
                 )

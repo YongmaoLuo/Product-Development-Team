@@ -235,7 +235,22 @@ def test_reset_supersedes_repair_tasks_but_never_deletes_them(env, client):
     """Repairs generated from the discarded verdicts must not run.
 
     Task-level data may only be voided or created, never rewritten — so
-    the row is marked ``superseded`` and kept, not removed.
+    the row is marked and kept, not removed.
+
+    2026-10-16: the marked status changed ``superseded`` → ``voided``,
+    and this is a **deliberate rewrite** of a pinned assertion. The reset
+    discards a verification verdict; the repair tasks that verdict
+    spawned rest on a premise that no longer exists. That is exactly
+    ``voided`` — cascade, block the downstream, never look for children.
+    ``superseded`` from the same date means the opposite ("the work was
+    handed to ``<id>-*`` children, go follow those"), and a reset does
+    not create children, so writing ``superseded`` here would leave the
+    repair's dependents chasing a child set that does not exist.
+
+    The request field ``supersede_repair_tasks`` and the response key
+    ``cleared.superseded_repair_tasks`` keep their old spelling on
+    purpose: they are the wire contract callers already speak, and
+    renaming them is a breaking API change, not a status-vocabulary fix.
     """
     plans_dir, _conn, db_path = env
     _seed_mid_flight_plan(plans_dir, db_path)
@@ -244,7 +259,7 @@ def test_reset_supersedes_repair_tasks_but_never_deletes_them(env, client):
     resp = client.post(f"/api/verification/{PLAN_ID}/reset", json={})
     assert resp.status_code == 200, resp.text
 
-    assert _task_status(db_path, "RP-1") == "superseded"
+    assert _task_status(db_path, "RP-1") == "voided"
     assert _task_status(db_path, "1-1") == "pending", (
         "a non-repair task is the executor's work, not verification's — "
         "the reset must not void it"
