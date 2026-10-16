@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import socket as _socket_mod
 import tempfile
 from pathlib import Path
@@ -42,7 +43,70 @@ from typing import Iterable, Optional
 
 import pytest
 
+from _pytest_hermetic_env import (
+    install_hermetic_env,
+    install_request_guard_header,
+    xdist_worker_id,
+)
 
+# ---------------------------------------------------------------------------
+# The shared process-global environment contract.
+# ---------------------------------------------------------------------------
+#
+# Until 2026-10-16 this conftest installed none of it, and this tree's green
+# depended on the pytest command line mentioning ``backend/tests/`` as well.
+# ``backend/tests/conftest.py`` sets these as import-time side effects, so an
+# invocation that collected it patched ``starlette.testclient.TestClient`` and
+# the environment process-wide and every test here inherited the result;
+# ``pytest state_machine/tests`` on its own inherited nothing and 20 route
+# tests answered HTTP 403 while 3 more refused to open the live ``state.db``.
+#
+# Calling the same shared installer both roots call makes that outcome a
+# property of the tree rather than of the invocation, which is the whole
+# difference between a test suite and a test suite that happens to be run
+# alongside another one.  See ``backend/_pytest_hermetic_env.py``.
+#
+# This is deliberately the SAME installer, not a second copy of the same env
+# vars: two copies would drift, and the drift would again only show up in
+# whichever tree was run alone.
+install_request_guard_header()
+_HERMETIC_ENV = install_hermetic_env()
+_XDIST_WORKER = xdist_worker_id()
+_XDIST_WORKER = xdist_worker_id()
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:
+    """Remove the session scratch roots this tree may have minted.
+
+    Both roots are only removed by the process that owns them: under xdist
+    the controller loads this conftest during ``_preparse``, runs no test,
+    and so never instantiates the session fixture below — but it IS the
+    process that mints ``PDT_TEST_SESSION_ROOT``. Skipping the removal there
+    is what keeps one directory per run from surviving forever. A worker,
+    which has an id, does remove its own scoped root.
+    """
+    if not _XDIST_WORKER:
+        shutil.rmtree(_HERMETIC_ENV.state_db_dir, ignore_errors=True)
+        shutil.rmtree(_HERMETIC_ENV.lock_root, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _hermetic_state_db_dir():
+    """Pre-create and then remove this session's throwaway state DB root.
+
+    The DB itself is created lazily by whichever module first opens it; only
+    the directory and the plans tree are pre-created here. Kept as a fixture
+    rather than an ``atexit`` hook so the cleanup is visible in the fixture
+    list and reports failures through pytest — the same shape as the
+    identically-named fixture in ``backend/tests/conftest.py``, which is what
+    keeps both trees closing over one pair of roots when a single invocation
+    collects both.
+    """
+    _HERMETIC_ENV.state_db_dir.mkdir(parents=True, exist_ok=True)
+    (_HERMETIC_ENV.state_db_dir / "plans").mkdir(parents=True, exist_ok=True)
+    yield _HERMETIC_ENV.state_db_dir
+    shutil.rmtree(_HERMETIC_ENV.state_db_dir, ignore_errors=True)
+    shutil.rmtree(_HERMETIC_ENV.lock_root, ignore_errors=True)
 # ---------------------------------------------------------------------------
 # Constants — kept in sync with test_json_static_gate.py
 # ---------------------------------------------------------------------------

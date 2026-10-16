@@ -1064,7 +1064,24 @@ jobs:
             # static-gate failure arrived at the same moment 19 shards
             # were already in flight — the cost this job exists to remove.
             root) LANE_PATHS="tests/ --ignore=tests/unit --ignore=tests/static_gates --ignore=tests/contract --ignore=tests/concurrency --ignore=tests/performance --ignore=tests/security --ignore=tests/meta_tests" ;;
-            misc) LANE_PATHS="tests/contract tests/security tests/meta_tests tests/concurrency tests/performance" ;;
+            # ``state_machine/tests`` joins this lane 2026-10-16. It is the
+            # backend's SECOND test root (244 tests) and no lane collected it,
+            # so nothing ran it: it had been red on its own since before CI
+            # existed here, and only looked green because it was always run in
+            # the same pytest invocation as ``tests/``, whose conftest installs
+            # a process-global environment this tree was silently depending on.
+            # ``misc`` is its right home: this is the unsliced catch-all for
+            # small self-contained directories, ``misc`` carries no (index,
+            # count) pair so no new shard-sizing work or runner VM is needed, and
+            # the 244 fast hermetic tests keep it inside the measured
+            # "completes on the runner" band (~200 tests / under 2.5 min) that
+            # ``unit`` and ``root`` are sharded to respect. The ``-m`` filter
+            # below drops nothing here -- none of the 244 carries e2e,
+            # integration, time_sensitive or perf -- which is the one property
+            # this placement depends on and that
+            # ``tests/static_gates/test_ci_lanes_match_marker_contracts.py``
+            # pins for the marker expression itself.
+            misc) LANE_PATHS="tests/contract tests/security tests/meta_tests tests/concurrency tests/performance state_machine/tests" ;;
             *) echo "::error::unknown lane '${{ matrix.lane }}'"; exit 2 ;;
           esac
           if [ -n "${{ matrix.index }}" ]; then
