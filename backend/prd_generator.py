@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 
 from coding_tool import CodingTool, JsonSession, query_json_in_session
 from framework.text import circled_list
+from plan_sessions import KEY_PRD, persist_session
 from self_review import run_doc_self_review, write_self_review_report
 from execution_logger import get_logger
 
@@ -427,6 +428,17 @@ class PRDGenerator:
             prompt=prompt,
             system_instruction=system_prompt,
         )
+
+        # Record which session wrote ``prd.json`` so the revise that
+        # answers the reviewer's rejection can re-open it instead of
+        # pasting the whole document back into a fresh prompt. The
+        # revise is a different HTTP request, so the handle above is
+        # unreachable by then — see ``plan_sessions`` for the file and
+        # for why nothing user-facing lists it. Recorded before the
+        # self-review below: that pass is a different subject (audit
+        # this document), and this id is the one whose conversation
+        # produced the document a revise has to rewrite.
+        persist_session(self.plan_dir, KEY_PRD, session)
 
         # Defensive: some providers occasionally return a raw string
         # instead of a parsed dict (e.g. when the model emits prose

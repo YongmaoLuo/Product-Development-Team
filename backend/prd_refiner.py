@@ -11,7 +11,8 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from coding_tool import CodingTool
+from coding_tool import CodingTool, query_json_in_session
+from plan_sessions import KEY_PRD, persist_session, persisted_session
 
 
 REFINER_SYSTEM_PROMPT = """你是一位资深产品经理。你的任务是修订 PRD 文档中**被拒绝的决策点**，保留其他所有决策点不变。
@@ -82,14 +83,31 @@ class PRDRefiner:
 
 请输出修订后的决策点 JSON 对象，保持 CPEA 格式。"""
 
+        # Re-open the session that generated this PRD. The generation
+        # and this refine are two different HTTP requests (and two
+        # different processes, across a restart), so the handle the
+        # generator held is gone — ``plan_sessions`` carried its id
+        # across instead. A plan generated before that file existed, a
+        # corrupt sidecar and an id the CLI no longer recognises all
+        # arrive here as an *empty* handle, which dispatches the fresh
+        # session this method has always dispatched. The prompt is
+        # unchanged either way: reuse decides which conversation opens,
+        # not what is asked.
+        session = persisted_session(self.plan_dir, KEY_PRD)
         try:
-            refined_dp = self.coding_tool.query_json(
+            refined_dp = query_json_in_session(
+                self.coding_tool, session,
                 prompt=prompt,
                 system_instruction=REFINER_SYSTEM_PROMPT,
             )
             return refined_dp
         except Exception:
             return None
+        finally:
+            # Recorded on the failure path too: the tool hands the live
+            # id back into the handle at every dispatch, so a round that
+            # failed to parse still leaves a session worth re-asking in.
+            persist_session(self.plan_dir, KEY_PRD, session)
 
     def _load_prd(self) -> dict:
         with open(self.prd_file, "r", encoding="utf-8") as f:
