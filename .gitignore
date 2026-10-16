@@ -135,3 +135,22 @@ backend/tests/e2e/_artifacts/
 # installation, not about the product. The published repo documents the
 # product; this file documents my machine.
 CLAUDE.md
+
+# The strict-lane measurement record for the macOS keychain E2E gate.
+#
+# Kept local for the same reason, and the file said so itself before it was
+# ever untracked: it opens by calling itself "a measurement record, not a
+# design note", and the baseline figures it carries are a claim about one
+# machine rather than a claim about the code. The published repo documents
+# the product; this file documents my machine.
+#
+# Nothing reads it — no test, no script, no mkdocs nav entry — so dropping it
+# from the index costs the build nothing. What that costs is covered by
+# test_the_strict_lane_record_is_not_staged and
+# test_the_strict_lane_record_is_not_tracked, which are what stop it coming
+# back.
+#
+# This stops the leak. It does not undo it: the file is in the published
+# history of every commit that carried it, and clearing that is a history
+# rewrite, which is a separate decision with a separate owner.
+KEYCHAIN_STRICT_LANE_RECORD.md
