@@ -625,6 +625,251 @@ class TaskManager:
             self._persist_status_to_sqlite(task_id, "failed")
         self.save_tasks()
 
+    def record_task_superseded(self, task_id: str, reason: str = "") -> bool:
+        """Mark a split parent ``superseded`` instead of ``failed``.
+
+        2026-10-16. The failure tail used to write ``failed`` on the very
+        same row whose work the refiner had just handed to breakdown
+        children, so the parent kept a red mark on the card for the rest
+        of the plan's life while its children all completed. The status
+        now records what happened: the row stopped running *because* its
+        work moved to ``<id>-*``.
+
+        Refuses unless the children are actually present in the plan. That
+        guard is the whole contract: ``superseded`` means "go look at the
+        children", and a ``superseded`` row with nothing to look at is a
+        lie the resolver would have to special-case. Returning ``False``
+        tells the caller to keep writing ``failed``, which is the correct
+        label for a task whose split did not take.
+
+        The failure text is kept in ``failure_reason`` (truncated like
+        ``record_task_failure``) because the attempt really happened — only
+        the *status* changes, never the evidence.
+        """
+        prefix = task_id + "-"
+        if not any(
+            str(getattr(t, "id", "") or "").startswith(prefix)
+            for t in self.tasks
+        ):
+            return False
+        for task in self.tasks:
+            if task.id == task_id:
+                task.status = "superseded"
+                task.failure_reason = (reason or "")[:1000]
+                task.updated_time = datetime.utcnow().isoformat()
+                break
+        if task_id in {t.id for t in self.tasks}:
+            self.runtime_overrides[task_id] = {
+                "status": "superseded",
+                "failure_reason": (reason or "")[:1000],
+                "updated_time": datetime.utcnow().isoformat(),
+            }
+            self._persist_status_to_sqlite(task_id, "superseded")
+        self.save_tasks()
+        return True
+
+    def void_task(self, task_id: str, reason: str) -> dict:
+        """Void ``task_id`` and cascade ``voided`` down its whole subtree.
+
+        2026-10-16. The inverse of :meth:`record_task_superseded`:
+        ``superseded`` says "the work moved to my children", ``voided``
+        says "the premise is gone, so neither this row nor anything behind
+        it will ever run". Because the premise is what the downstream was
+        waiting on, the downstream is voided too rather than left blocked —
+        a blocked downstream is a permanent stall, and the operator who
+        voided the task did not ask for one.
+
+        Cascade follows ``depends_on`` transitively (``A → B → C`` voiding
+        ``A`` voids ``B`` and ``C``). An id may appear in several tasks'
+        ``depends_on``, so the walk is over ids, not rows.
+
+        ``completed`` is the ONE status never rewritten (2026-10-16,
+        answering the conflict with ``task_plan_delta.py:18-31``'s audit
+        rule). A completed descendant carries a verdict that was actually
+        earned and verified; re-labelling it ``voided`` would destroy the
+        only record that the work happened, which is exactly the
+        "掩盖" that module exists to prevent.
+
+        **2026-10-16 (later the same day) — hitting ``completed`` is a
+        scheduler bug, and this method now STOPS instead of tolerating
+        it.** The earlier version of this docstring treated a completed
+        descendant as a data shape to be reported and stepped over. That
+        was wrong about what the shape *means*. A downstream task can
+        only reach ``completed`` if its upstream's premise held; voiding
+        that upstream is the definition of the premise being revoked. So
+        "downstream of a voided premise, already completed" is not a
+        state the scheduler is allowed to produce — reaching it means the
+        ordering guarantee broke. The user-facing decision is therefore
+        the opposite of "spare it and carry on":
+
+        * an **error** is logged (``void_task_refused_completed_downstream``),
+          worded so the reader sees "this is a scheduler bug", not "this
+          is odd data";
+        * **this voiding is judged a failure** — the summary comes back
+          with ``ok=False`` and a human-readable ``error``, so a caller
+          can see it rather than infer it from an empty list;
+        * **nothing is written at all.** The walk STAGES its writes and
+          only commits them once the whole subtree is known to be free of
+          ``completed``. A half-applied cascade would leave the exact
+          state this method exists to prevent: an unearned ``voided`` in
+          front of an earned ``completed``, with everything behind that
+          completed row left pointing at a dead premise — which is the
+          permanent stall ``test_no_task_is_left_pointing_at_a_voided_task``
+          pins down. Aborting whole is the only outcome that is not a
+          partial success.
+        * the ``completed`` rows themselves are still never rewritten, so
+          the audit rule above is untouched by any of this.
+
+        The same rule applies when the row being voided is ITSELF already
+        ``completed`` — the root is not a special case, because "I asked
+        to void a row that already earned its verdict" is an operator
+        error of the same kind, not a scheduling observation. It is
+        refused with the same error event and the same ``ok=False``.
+
+        Returns a summary dict: ``{"voided": [...], "completed_kept":
+        [...], "reason": reason, "ok": bool, "error": str | None}``.
+        Ids only — the caller logs them. ``ok`` is the field to branch
+        on: ``voided`` is empty both when nothing depended on the target
+        and when the cascade was refused, which is precisely why the
+        refusal carries its own flag rather than being inferred.
+
+        Raises nothing. An operator asking to void one task must not be
+        able to abort an unrelated caller (the cascade is reachable from
+        a reset path), so the failure is returned, not thrown.
+        """
+        by_id = {t.id: t for t in self.tasks}
+        voided: list = []
+        completed_kept: list = []
+        # Deps point backwards (a task depends on its upstream), so
+        # "downstream of A" is every task that reaches A through its own
+        # deps. Precompute the reverse index once.
+        dependents: dict = {}
+        for t in self.tasks:
+            for dep in (getattr(t, "depends_on", None) or []):
+                dependents.setdefault(dep, []).append(t.id)
+
+        seen: set = set()
+        # Writes are STAGED here and only applied after the whole
+        # subtree has been walked (see the "nothing is written at all"
+        # clause in the docstring). Applying as we went would make a
+        # refused cascade a partially-applied one.
+        staged: list = []
+        queue = [task_id]
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            task = by_id.get(current)
+            if task is not None:
+                status = getattr(task, "status", None)
+                if status == "completed":
+                    # Earned verdict, and the whole reason the cascade is
+                    # about to abort. Recorded, NOT spared: the walk
+                    # continues so the caller learns about every offender
+                    # in one pass rather than one per retry, but nothing
+                    # staged behind it will ever be committed.
+                    #
+                    # The ROOT lands here too, and that is the whole
+                    # reason this branch is unconditional — "I asked to
+                    # void a row that already earned its verdict" is an
+                    # operator error of the same kind, not a scheduling
+                    # observation.
+                    completed_kept.append(current)
+                elif status == "voided":
+                    pass  # already cascaded; re-walk adds nothing
+                else:
+                    staged.append(current)
+            queue.extend(dependents.get(current, []))
+
+        if completed_kept:
+            self._log_void_refused(task_id, completed_kept, reason)
+            return {
+                "voided": [],
+                "completed_kept": completed_kept,
+                "reason": reason,
+                "ok": False,
+                "error": (
+                    f"refused: {len(completed_kept)} row(s) in the subtree "
+                    f"of {task_id!r} are already completed; a downstream "
+                    f"task cannot be completed under a revoked premise, "
+                    f"so this state indicates a scheduler bug. Nothing was "
+                    f"written."
+                ),
+            }
+
+        for current in staged:
+            task = by_id[current]
+            task.status = "voided"
+            task.failure_reason = (reason or "")[:1000]
+            task.updated_time = datetime.utcnow().isoformat()
+            voided.append(current)
+            self.runtime_overrides[current] = {
+                "status": "voided",
+                "failure_reason": (reason or "")[:1000],
+                "updated_time": datetime.utcnow().isoformat(),
+            }
+            self._persist_status_to_sqlite(current, "voided")
+
+        if voided:
+            self.save_tasks()
+        return {
+            "voided": voided,
+            "completed_kept": completed_kept,
+            "reason": reason,
+            "ok": True,
+            "error": None,
+        }
+
+    def _log_void_refused(
+        self, task_id: str, completed_kept: list, reason: str,
+    ) -> None:
+        """Emit ``void_task_refused_completed_downstream`` to stderr + logger.
+
+        2026-10-16. :meth:`void_task` aborts when its subtree contains a
+        ``completed`` row, and this is the signal that it did. The
+        wording is deliberately NOT "unexpected data": a completed
+        descendant of a revoked premise is unreachable through the
+        scheduler, so the reader needs to go looking at the scheduler,
+        not at the plan's contents.
+
+        stderr is written unconditionally because the executor
+        subprocess can redirect stdout to /dev/null, and ``self.logger``
+        is best-effort (:class:`TaskManager` callers usually do not
+        attach one) — same two-channel shape as
+        :meth:`_log_persist_failure`.
+        """
+        import sys
+        msg = (
+            f"[TaskManager.void_task] REFUSED to void task_id={task_id!r}: "
+            f"its subtree contains {len(completed_kept)} already-"
+            f"completed row(s) {sorted(completed_kept)!r}. A downstream "
+            f"task can only reach 'completed' if its upstream's premise "
+            f"held, and voiding that upstream is exactly what revokes it "
+            f"— so this state is unreachable through the scheduler and "
+            f"means the scheduler has a bug. The cascade was abandoned "
+            f"WHOLE: nothing was written, so there is no partial void to "
+            f"clean up, and the earned 'completed' verdicts were not "
+            f"rewritten. (requested reason: {reason!r})"
+        )
+        print(msg, file=sys.stderr)
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            try:
+                logger.error(
+                    "void_task_refused_completed_downstream",
+                    msg,
+                    task_id=task_id,
+                    data={
+                        "requested_reason": (reason or "")[:500],
+                        "completed_rows": sorted(completed_kept),
+                        "completed_row_count": len(completed_kept),
+                        "written": False,
+                    },
+                )
+            except Exception:
+                pass
+
     def update_task_commit_sha(self, task_id: str, sha: str):
         """
         Write back the git commit SHA produced by ``_commit_task_changes``.

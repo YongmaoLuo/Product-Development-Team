@@ -81,9 +81,15 @@ def _task_counts(
 ) -> Dict[str, int]:
     """Counted the way the card counts, or the two will disagree.
 
-    Two things are not work and must not reach ``total``:
+    Three things are not work and must not reach ``total``:
 
-    * ``superseded`` rows — the dispatcher refuses to schedule them.
+    * ``superseded`` rows — the dispatcher refuses to schedule them, and
+      their work now belongs to the children that took it over.
+    * ``voided`` rows (2026-10-16) — the premise was revoked, so they will
+      never run. Same reason as ``superseded``, and deliberately counted the
+      same way rather than given a bucket: a voided task is a decision, not
+      a phase, and ``_STATUS_TASK_KEYS`` (the five phases a plan passes
+      through) is the wrong home for it.
     * **terminal** rows that exist only in ``plan_tasks`` — "DB-only
       orphans". The card already drops these (``drop_terminal_db_orphans``);
       counting them here would put the status object's ``total`` out of
@@ -93,7 +99,7 @@ def _task_counts(
     counts["total"] = 0
     for task_id, row in rows.items():
         status = str(row.get("status") or "").strip().lower() or "pending"
-        if status == "superseded":
+        if status in ("superseded", "voided"):
             continue
         if (
             disk_ids is not None
@@ -920,7 +926,7 @@ def _get_plan_summary_body(
                     # orphan reconcile; mirror that here so the
                     # summary endpoint doesn't lie about progress.
                     disk_ids = {t.get("id") for t in tasks if isinstance(t, dict)}
-                    _TERMINAL = {"completed", "failed", "skipped", "superseded"}
+                    _TERMINAL = {"completed", "failed", "skipped", "superseded", "voided"}
                     for tid, rt in runtime.items():
                         if tid in disk_ids:
                             continue

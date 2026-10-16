@@ -123,12 +123,26 @@ class TestTaskExecutionScene:
         Static contract on agent.py source: the two coder_response query
         call sites in _execute_task_with_retry must carry
         scene="execution" (model_type stays as inert metadata).
+
+        2026-10-16: the anchor used to be the literal
+        ``coder_response = self.coding_tool.query(``. Those two sites now
+        go through ``query_in_session(self.coding_tool, task_session, ...)``
+        so the retry can resume one session per task, and that literal no
+        longer appears. The contract being pinned is "both per-task
+        dispatch sites forward scene='execution'", which is a statement
+        about the SCENE argument and not about which helper is called, so
+        the anchor is the assignment ``coder_response = `` — stable under
+        either call form. The assertion itself is unchanged.
         """
         import inspect
         import agent as agent_module
 
         src = inspect.getsource(agent_module)
-        region = src[src.find("coder_response = self.coding_tool.query("):]
+        assert "coder_response = " in src, (
+            "the per-task dispatch sites must still be assigned to "
+            "coder_response; the anchor this test searches for is missing"
+        )
+        region = src[src.find("coder_response = "):]
         # Both background and foreground call sites.
         count = region.count('scene="execution"')
         assert count >= 2, (

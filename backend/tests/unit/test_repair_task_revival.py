@@ -563,20 +563,114 @@ def test_repair_split_still_allowed_below_the_cap():
 
 
 def test_non_repair_task_is_unaffected_by_the_repair_budget():
-    """The cap is scoped to repair tasks on purpose — widening it to the
-    whole plan would change behaviour this change is not about."""
+    """The REPAIR-specific budget stays scoped to repair tasks.
+
+    REWRITTEN 2026-10-16. This test used to assert that a non-repair
+    task at ``breakdown_count=9`` is refined freely, with the comment
+    "the cap is scoped to repair tasks on purpose". That was correct for
+    the 2026-10-13 change, whose subject was restoring the repair
+    budget that ``_breakdown_task`` had taken with it — widening it to
+    the whole plan was explicitly out of scope *there*.
+
+    It is in scope now: the user decision is that a task is split at most
+    4 times (5 levels), and the subject of this change is that bound. So
+    the split of this test is deliberate and both halves are kept:
+
+      * a non-repair task must NOT trip the repair-specific event (that
+        half is unchanged and still asserted below), and
+      * a non-repair task at depth 9 is now stopped by the GENERAL cap
+        (``breakdown_depth_exhausted``), asserted in
+        :func:`test_non_repair_task_is_capped_by_the_general_depth_cap`.
+
+    The old assertion — "refine was called once" at depth 9 — is the part
+    that could not survive the user's decision, and it is the part that
+    was doing the damage: an ordinary plan task had no per-task bound at
+    all, which is how a chain reached ``12-6-4`` eleven times over.
+    """
     from task import SubTask
 
     stub = _agent_stub()
     task = SubTask(
         id="12", title="ship it", description="d",
-        test_command="pytest -q", breakdown_count=9,
+        test_command="pytest -q", breakdown_count=1,
     )
 
     events = _refine_with(stub, task)
 
     assert "repair_breakdown_budget_exhausted" not in events
+    assert "breakdown_depth_exhausted" not in events, (
+        "depth 1 is level 2 — well inside the 5-level budget"
+    )
     stub.refiner.refine.assert_called_once()
+
+
+def test_non_repair_task_is_capped_by_the_general_depth_cap():
+    """The general cap bounds EVERY task, not only repair tasks.
+
+    2026-10-16. ``EXECUTOR_BREAKDOWN_MAX`` was dead code — its only
+    enforcement site (``_breakdown_task``) was deleted when the split
+    path moved to the refiner, and no cap travelled with it. This pins
+    the revived bound on the path that has no other one: an ordinary
+    plan task whose breakdown chain has already reached level 5.
+    """
+    from agent import EXECUTOR_BREAKDOWN_MAX
+    from task import SubTask
+
+    assert EXECUTOR_BREAKDOWN_MAX == 5
+    stub = _agent_stub()
+    task = SubTask(
+        id="12", title="ship it", description="d",
+        test_command="pytest -q",
+        # breakdown_count 4 == level 5 == the cap. Four splits have
+        # already happened (1→2→3→4→5).
+        breakdown_count=EXECUTOR_BREAKDOWN_MAX - 1,
+    )
+
+    events = _refine_with(stub, task)
+
+    assert "breakdown_depth_exhausted" in events
+    assert "repair_breakdown_budget_exhausted" not in events, (
+        "an ordinary task must report the general budget, not the "
+        "repair-specific one"
+    )
+    stub.refiner.refine.assert_not_called()
+    assert stub._refinement_count == 0, (
+        "an exhausted breakdown budget must not spend the run-wide "
+        "refinement budget either"
+    )
+
+
+def test_five_level_chain_splits_exactly_four_times():
+    """The user's arithmetic, pinned: 5 levels means 4 splits.
+
+    Walks a chain of tasks at each level and asserts that levels 1-4 are
+    each offered one more split while level 5 is not. Written as a table
+    rather than four separate tests so the "exactly four" claim is one
+    assertion instead of four that could drift apart.
+    """
+    from agent import EXECUTOR_BREAKDOWN_MAX
+    from task import SubTask
+
+    stub = _agent_stub()
+    assert EXECUTOR_BREAKDOWN_MAX == 5
+
+    splits = []
+    for breakdown_count in range(EXECUTOR_BREAKDOWN_MAX - 1):
+        stub = _agent_stub()
+        task = SubTask(
+            id=f"12-{breakdown_count or ''}".rstrip("-") or "12",
+            title="t", description="d", test_command="pytest -q",
+            breakdown_count=breakdown_count,
+        )
+        _refine_with(stub, task)
+        splits.append(stub.refiner.refine.call_count)
+
+    # levels 1,2,3,4 → each split once. Level 5 is covered by
+    # test_non_repair_task_is_capped_by_the_general_depth_cap.
+    assert splits == [1, 1, 1, 1], (
+        f"expected exactly 4 splits across a 5-level chain, got {splits}"
+    )
+    assert sum(splits) == 4
 
 
 def test_split_writes_the_depth_to_both_stores(tmp_path):

@@ -753,9 +753,21 @@ def reset_verification(
     ``plan_routing``             ``current_phase='verification'`` (a phase
                                  ``/start`` accepts), ``current_phase``
                                  mirrored, ``version`` bumped
-    ``plan_tasks``               pending ``RP-*`` → ``superseded`` (never
+    ``plan_tasks``               pending ``RP-*`` → ``voided`` (never
                                  deleted: task data may only be voided or
                                  created, never rewritten)
+
+    2026-10-16: the status written here was ``superseded`` and is now
+    ``voided``. These repair rows had no work handed to breakdown
+    children — their *premise* (the round's verdicts) was thrown away —
+    so ``voided`` is the status whose resolver behaviour matches
+    ("this will never run"), and ``superseded`` is now reserved for
+    "go look at my children". The request field
+    (``supersede_repair_tasks``) and the response key
+    (``cleared.superseded_repair_tasks``) deliberately keep their old
+    names: they are an external API contract with a test pinning them,
+    and renaming a response key to match an internal status word is a
+    breaking change for no functional gain.
     ``plans/<id>/`` on disk      per-round verification artifacts, when
                                  ``clear_artifacts``; ``verification_plan.json``
                                  only when ``clear_verification_plan``
@@ -909,6 +921,9 @@ def reset_verification(
         summary["restart_at_round"] = req.restart_at_round
 
         # --- pending repair tasks ----------------------------------------
+        # Local name kept aligned with the response key below (which is
+        # part of the pinned API surface) even though the status written
+        # is now ``voided``.
         superseded: List[str] = []
         if req.supersede_repair_tasks:
             pending = _server._get_pending_repair_tasks(plan_id)
@@ -916,12 +931,12 @@ def reset_verification(
                 ids = [t.get("id") for t in pending if t.get("id")]
                 with conn:
                     conn.executemany(
-                        "UPDATE plan_tasks SET status = 'superseded', "
+                        "UPDATE plan_tasks SET status = 'voided', "
                         "failure_reason = ?, updated_at = ? "
                         "WHERE plan_id = ? AND task_id = ?",
                         [
                             (
-                                "[reset] superseded by verification reset — "
+                                "[reset] voided by verification reset — "
                                 "generated from verdicts that were discarded",
                                 now,
                                 plan_id,

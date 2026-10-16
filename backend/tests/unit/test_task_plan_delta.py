@@ -255,7 +255,19 @@ def _apply(tmp_path, conn, payload, disk_tasks):
     return plan_dir, summary
 
 
-def test_obsolete_marks_the_task_superseded(tmp_path, conn):
+def test_obsolete_marks_the_task_voided(tmp_path, conn):
+    """``obsolete`` 落成 ``voided``，不再是 ``superseded``（2026-10-16）。
+
+    这是**有意改写**的一条既存测试。改名之前它钉的是
+    ``row["status"] == "superseded"``，而 2026-10-16 起 ``superseded``
+    只表示「工作已交给子任务」（resolver 会展开到子任务去判），
+    ``voided`` 才是「前提被推翻」。人工作废属于后者。
+
+    改写理由不是改名好看，而是两个状态对下游的行为**相反**：
+    一条被人工作废的任务写成 ``superseded``，它的下游会去追一个根本
+    不存在的子任务集合并且永远等不到。任务名 ``obsolete`` 一直在说
+    的就是现在这个状态。
+    """
     _seed(conn, "repair-r4-01", status="failed", description="real content")
     _, summary = _apply(
         tmp_path, conn,
@@ -268,7 +280,7 @@ def test_obsolete_marks_the_task_superseded(tmp_path, conn):
     ]
 
     row = PlanTaskRepository(conn).load_all(PLAN_ID)["repair-r4-01"]
-    assert row["status"] == "superseded"
+    assert row["status"] == "voided"
     assert is_obsolete_reason(row["failure_reason"])
     assert "已被 C3 修复取代" in row["failure_reason"]
 
