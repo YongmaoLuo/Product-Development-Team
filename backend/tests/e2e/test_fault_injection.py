@@ -98,7 +98,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3] \
     if not os.environ.get("PDT_DEV_REPO") \
     else Path(os.environ["PDT_DEV_REPO"])
 BACKEND_DIR = PROJECT_ROOT / "backend"
-VENV_PYTHON = BACKEND_DIR / ".venv" / "bin" / "python3"
+
+# Prefer the project venv: the watchdog subprocess must run on the
+# interpreter this suite was installed into.  But a checkout with no
+# ``backend/.venv`` (fresh worktree, container, CI before the venv
+# bootstrap step) must not turn every fault-injection test into a
+# ``FileNotFoundError`` raised *before* any fault is injected -- a red
+# suite that asserts nothing.  Fall back to the interpreter already
+# running pytest; ``_run_watchdog_once`` still puts the backend root on
+# the child's ``PYTHONPATH``, so ``-m watchdog`` resolves exactly as it
+# does under the venv.  Deliberately not ``pytest.skip``: skipping would
+# swap 2 fake reds for 2 fake greens.  Same idiom as
+# ``backend/tests/concurrency/test_busy_timeout_absorbs_contention_without_raising.py``.
+_VENV_PYTHON = BACKEND_DIR / ".venv" / "bin" / "python3"
+VENV_PYTHON = _VENV_PYTHON if _VENV_PYTHON.exists() else Path(sys.executable)
 
 WATCHDOG_ONCE_TIMEOUT_SECONDS = 10
 HARD_TIMEOUT_SECONDS = 30

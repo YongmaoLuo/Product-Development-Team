@@ -94,7 +94,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3] \
     if not os.environ.get("PDT_DEV_REPO") \
     else Path(os.environ["PDT_DEV_REPO"])
 BACKEND_DIR = PROJECT_ROOT / "backend"
-VENV_PYTHON = BACKEND_DIR / ".venv" / "bin" / "python3"
+
+# Prefer the project venv (see the note above): a checkout with no
+# ``backend/.venv`` must not turn the happy path into a
+# ``FileNotFoundError`` raised *before* the dispatcher ever runs.  Fall
+# back to the interpreter already running pytest -- the watchdog child
+# still gets the backend root on its ``PYTHONPATH``, so the run is the
+# same run, not a weaker one.  Deliberately not ``pytest.skip``:
+# skipping would swap 1 fake red for 1 fake green.  Same idiom as
+# ``backend/tests/concurrency/test_busy_timeout_absorbs_contention_without_raising.py``.
+_VENV_PYTHON = BACKEND_DIR / ".venv" / "bin" / "python3"
+VENV_PYTHON = _VENV_PYTHON if _VENV_PYTHON.exists() else Path(sys.executable)
 
 # A watchdog process that hangs forever (e.g. a buggy selector loop)
 # is the most plausible regression for the "independent process"

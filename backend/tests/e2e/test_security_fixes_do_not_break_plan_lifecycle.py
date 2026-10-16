@@ -81,7 +81,19 @@ pytestmark = [
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = BACKEND_DIR.parent
-VENV_PYTHON = BACKEND_DIR / ".venv" / "bin" / "python3"
+
+# Prefer the project venv: the backend subprocess this lifecycle boots
+# must run on the interpreter this suite was installed into.  But a
+# checkout with no ``backend/.venv`` (fresh worktree, container, CI
+# before the venv bootstrap step) must not turn every lifecycle test into
+# a ``FileNotFoundError`` raised *before* the server is ever started --
+# a red suite that asserts nothing.  Fall back to the interpreter
+# already running pytest, so the security fixes are really exercised
+# against a really-booted server.  Deliberately not ``pytest.skip``:
+# skipping would swap 4 fake reds for 4 fake greens.  Same idiom as
+# ``backend/tests/concurrency/test_busy_timeout_absorbs_contention_without_raising.py``.
+_VENV_PYTHON = BACKEND_DIR / ".venv" / "bin" / "python3"
+VENV_PYTHON = _VENV_PYTHON if _VENV_PYTHON.exists() else Path(sys.executable)
 REQUEST_HEADER = "X-PDT-Request"
 REQUEST_HEADER_VALUE = "1"
 
