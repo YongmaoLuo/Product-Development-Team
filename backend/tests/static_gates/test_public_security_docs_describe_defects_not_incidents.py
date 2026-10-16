@@ -88,11 +88,21 @@ Public-facing documents at the repository root and under ``docs/``. The
 entry template lives in ``SECURITY_AUDIT.md`` itself, so the rule and its
 enforcement are in the same file.
 
-The sweep record is deliberately *outside* this gate's reach **and**
-outside its text: it is supposed to carry the baseline and the coverage
-grid. Naming where it lives would be the disclosure this gate exists to
-prevent, so the tests below avoid that term — see
-``test_the_operator_private_doc_is_not_named_here``.
+The sweep record is deliberately *outside* this gate's reach: it is supposed
+to carry the baseline and the coverage grid. Naming where it lives would be
+the disclosure this gate exists to prevent, so the tests below avoid that
+term — see ``test_the_operator_private_doc_is_not_named_here``.
+
+Two things sit outside that reach and are named here anyway, because the
+distinction is what the tests at the bottom turn on. What must stay unnamed
+is the private **state directory** — *where* an operator's records are kept.
+A repository-root **filename** is a different object: it is already on every
+fetch, it names no location, and a rule that cannot say which file it
+forbids cannot say what to do about that file. So the strict-lane record is
+named, and the rules below require it to be untracked rather than merely
+unscanned. It was tracked for as long as it was not named, and pointing this
+module's own detector at it returned 92 hits — every one the **Catches**
+list above already bans — while the gate reported green.
 
 The structural half of the same rule is pinned separately by
 ``test_the_public_doc_carries_no_sweep_bookkeeping``: the four sections
@@ -103,6 +113,7 @@ because a heading that comes back takes its contents with it.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -237,6 +248,15 @@ _SECRET_FRAGMENTS: tuple[str, ...] = (
 #: this file's own text, and a literal would make the gate flag its own
 #: definition — which it did, on the first run, in the failure message.
 _PRIVATE_DIR_TERM = "." + "config"
+
+#: The strict-lane measurement record, untracked as of the commit that added
+#: it to ``.gitignore``. Naming it here is not the disclosure the rule above
+#: avoids: ``test_the_operator_private_doc_is_not_named_here`` is about the
+#: private *state directory* — where records live — and this is a repository
+#: root filename that the published history already carries on every fetch.
+#: The name is the whole point of the rule below: a rule that cannot name
+#: what it forbids cannot say what to do about it.
+_STRICT_LANE_RECORD = "KEYCHAIN_STRICT_LANE_RECORD.md"
 
 
 def deemphasise(text: str) -> str:
@@ -534,4 +554,80 @@ def test_leaves_correct_defect_language_alone(line: str) -> None:
     assert not find_incident_narrative(Path("x.md"), line), (
         f"false positive on {line!r}; a gate that fires on legitimate "
         f"threat-model prose is a gate that gets deleted"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The strict-lane record is untracked, not merely unscanned
+# ---------------------------------------------------------------------------
+#
+# Everything above is about *scanning*: the rule can only fire on a document
+# the gate reads, and ``_PUBLIC_DOCS`` is the list of what it reads. That left
+# a gap with a particular shape — a root-level ``.md`` outside both
+# ``_PUBLIC_DOCS`` and ``docs/`` was published on every fetch while no gate
+# had an opinion about it, and the gate stayed green. A gate that is green
+# over a file it never opens has not cleared the file; it has not looked.
+#
+# The file was not hypothetical. Aiming this module's own detector at it
+# returns 92 hits, every one of them the suite-baseline family this
+# file's docstring lists under **Catches** — so the patterns were never
+# wrong, they had simply never been pointed at it. Its third line called
+# itself "a measurement record, not a design note", which is the object class
+# this gate exists to keep out of a published surface.
+#
+# So the record is untracked and gitignored, and the rule that keeps it that
+# way is here. Two moments are checked, because they fail for different
+# reasons and a commit is the irreversible one:
+#
+#   * the **index** — the moment a change is in progress, which is also the
+#     last moment at which refusing is free. The sibling scanner moved out
+#     of pytest for exactly this reason: by the time the suite is green the
+#     text is already in a commit.
+#   * **HEAD** — the commit, where the file is published regardless of what
+#     any scan lists.
+#
+# ``HEAD`` rather than the index for the second check, per the reasoning
+# ``test_every_tracked_directory_is_scanned`` spells out: the commit is the
+# moment an unscanned artefact becomes a defect, so it is the moment this
+# checks.
+
+
+def _git_lines(*args: str) -> list[str]:
+    result = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def test_the_strict_lane_record_is_not_staged() -> None:
+    """The record must not be in the index, which is the last free refusal."""
+    staged = _git_lines("ls-files", "--", _STRICT_LANE_RECORD)
+    assert not staged, (
+        f"{_STRICT_LANE_RECORD} is staged for commit. It is a measurement "
+        "record about one machine: the baseline figures in it are the "
+        "suite-baseline shape this module bans from published documents, and "
+        "nothing reads the file. Unstage it (`git rm --cached "
+        f"{_STRICT_LANE_RECORD}`); it stays on disk, ignored."
+    )
+
+
+def test_the_strict_lane_record_is_not_tracked() -> None:
+    """The record must not be at HEAD, which is where publication happens.
+
+    ``git ls-tree HEAD`` rather than a filesystem walk: the question is what
+    the repository publishes, and a file that is on disk but untracked is not
+    published. That is also why the file's absence from the working tree is
+    not required for this to pass — the record stays available to the
+    operator, who owns it.
+    """
+    tracked = set(_git_lines("ls-tree", "HEAD", "--name-only"))
+    assert _STRICT_LANE_RECORD not in tracked, (
+        f"{_STRICT_LANE_RECORD} is tracked at HEAD, so every fetch publishes "
+        "a measurement record. The gate above cannot catch it while it is "
+        "outside the published-document list, and 'outside the list' is what "
+        "kept it there. Take it out of the index and out of the commit: "
+        f"`git rm --cached {_STRICT_LANE_RECORD}` and commit that."
     )

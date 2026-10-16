@@ -88,4 +88,4 @@
 # --- shapes -----------------------------------------------------------------
 # re:<pattern> for structure rather than a specific word.
 #
-# re:symbol=[0-9]{6}
+# re:<some-shape>[0-9]{<n>}
