@@ -51,7 +51,18 @@ import pytest
 
 # Backend root is two levels up from this file's directory.
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
-VENV_PYTHON = BACKEND_ROOT / ".venv" / "bin" / "python3"
+
+# Prefer the project venv: the workers must run on the interpreter this
+# suite was installed into.  But a checkout with no ``backend/.venv``
+# (fresh worktree, container, CI before the venv bootstrap step) must not
+# turn every contention test into a FileNotFoundError raised *before* any
+# race is exercised -- a red suite that asserts nothing.  Fall back to the
+# interpreter already running pytest so the workers really contend.
+# Deliberately not ``pytest.skip``: skipping would swap 13 fake reds for
+# 13 fake greens.  ``Path(...)`` preserves the ``python_exe: Path``
+# contract the spawn helpers are annotated with.
+_VENV_PYTHON = BACKEND_ROOT / ".venv" / "bin" / "python3"
+VENV_PYTHON = _VENV_PYTHON if _VENV_PYTHON.exists() else Path(sys.executable)
 
 
 NUM_WORKERS = 8
