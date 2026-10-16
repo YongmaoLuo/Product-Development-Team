@@ -859,12 +859,8 @@ class TestStateMachineIllegalTransitionsRejected:
                     (plan_id, terminal_phase, _now_iso()),
                 )
                 conn.execute(
-                    "INSERT OR REPLACE INTO plan_execution "
-                    "(plan_id, current_phase, exec_status, project_dir, "
-                    " updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (plan_id, terminal_phase, "completed",
-                     str(project_dir), _now_iso())  # exec_status value,
+                    "INSERT OR REPLACE INTO plan_execution (plan_id, exec_status, project_dir, updated_at) VALUES (?, ?, ?, ?)",
+                    (plan_id, "completed", str(project_dir), _now_iso())  # exec_status value,
                 )
                 conn.execute(
                     "INSERT OR REPLACE INTO plan_verification "

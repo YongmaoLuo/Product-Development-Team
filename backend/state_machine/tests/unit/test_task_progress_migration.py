@@ -60,8 +60,7 @@ def plan_dir(tmp_path: Path) -> Path:
 
 def _seed_plan(conn: sqlite3.Connection, plan_id: str = "p1") -> None:
     conn.execute(
-        "INSERT INTO plan_execution (plan_id, current_phase, updated_at) "
-        "VALUES (?, 'executing', '2026-01-01T00:00:00Z')",
+        "INSERT INTO plan_execution (plan_id, updated_at) VALUES (?, '2026-01-01T00:00:00Z')",
         (plan_id,),
     )
 

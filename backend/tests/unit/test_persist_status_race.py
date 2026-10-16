@@ -204,15 +204,8 @@ def _persist_with_atomic_txn(
             # IMMEDIATE).
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                "INSERT OR IGNORE INTO plan_execution "
-                "(plan_id, current_phase, attempt_count, "
-                " task_progress, next_run_at, card_state, flags, "
-                " exec_pid, exec_status, started_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    plan_id, "executing", 0, "{}", None, "{}", "{}",
-                    None, "running", updated_time, updated_time,
-                ),
+                "INSERT OR IGNORE INTO plan_execution (plan_id, attempt_count, task_progress, next_run_at, card_state, flags, exec_pid, exec_status, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (plan_id, 0, "{}", None, "{}", "{}", None, "running", updated_time, updated_time),
             )
             repo = _MinimalPlanTaskRepository(conn)
             current_version = repo.get_version(plan_id, task_id)
@@ -459,15 +452,8 @@ def test_retry_exhausted_logs_and_returns(tmp_path: Path, capsys):
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
-                    "INSERT OR IGNORE INTO plan_execution "
-                    "(plan_id, current_phase, attempt_count, "
-                    " task_progress, next_run_at, card_state, flags, "
-                    " exec_pid, exec_status, started_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        plan_id, "executing", 0, "{}", None, "{}", "{}",
-                        None, "running", updated_time, updated_time,
-                    ),
+                    "INSERT OR IGNORE INTO plan_execution (plan_id, attempt_count, task_progress, next_run_at, card_state, flags, exec_pid, exec_status, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (plan_id, 0, "{}", None, "{}", "{}", None, "running", updated_time, updated_time),
                 )
                 repo = _MinimalPlanTaskRepository(conn)
                 current_version = repo.get_version(plan_id, "T-CONFLICT")
@@ -504,15 +490,8 @@ def test_retry_exhausted_logs_and_returns(tmp_path: Path, capsys):
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
-                    "INSERT OR IGNORE INTO plan_execution "
-                    "(plan_id, current_phase, attempt_count, "
-                    " task_progress, next_run_at, card_state, flags, "
-                    " exec_pid, exec_status, started_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        plan_id, "executing", 0, "{}", None, "{}", "{}",
-                        None, "running", updated_time, updated_time,
-                    ),
+                    "INSERT OR IGNORE INTO plan_execution (plan_id, attempt_count, task_progress, next_run_at, card_state, flags, exec_pid, exec_status, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (plan_id, 0, "{}", None, "{}", "{}", None, "running", updated_time, updated_time),
                 )
                 repo = _MinimalPlanTaskRepository(conn)
                 current_version = repo.get_version(plan_id, "T-CONFLICT")
@@ -543,15 +522,8 @@ def test_retry_exhausted_logs_and_returns(tmp_path: Path, capsys):
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
-                    "INSERT OR IGNORE INTO plan_execution "
-                    "(plan_id, current_phase, attempt_count, "
-                    " task_progress, next_run_at, card_state, flags, "
-                    " exec_pid, exec_status, started_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        plan_id, "executing", 0, "{}", None, "{}", "{}",
-                        None, "running", updated_time, updated_time,
-                    ),
+                    "INSERT OR IGNORE INTO plan_execution (plan_id, attempt_count, task_progress, next_run_at, card_state, flags, exec_pid, exec_status, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (plan_id, 0, "{}", None, "{}", "{}", None, "running", updated_time, updated_time),
                 )
                 repo = _MinimalPlanTaskRepository(conn)
                 current_version = repo.get_version(plan_id, "T-CONFLICT")

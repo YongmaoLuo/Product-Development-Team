@@ -68,7 +68,6 @@ def _seed_state_db(db_path: Path, plan_id: str, project_dir: Path) -> None:
         # Aggregated task_progress column — the sanity-check hint.
         er.insert(
             plan_id,
-            "running",
             exec_status="running",
             project_dir=str(project_dir),
             task_progress=json.dumps(

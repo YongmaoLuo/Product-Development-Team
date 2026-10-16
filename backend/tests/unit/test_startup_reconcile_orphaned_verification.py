@@ -252,9 +252,18 @@ def test_dead_end_repairing_no_unfinished_tasks_goes_terminal(
 def test_dead_end_repairing_with_unfinished_tasks_rolls_back_to_ready(
     seeded_stalled_plan,
 ):
-    """repairing + no_repair_tasks + pending execution tasks → routing
-    rolls back to ready and current_phase mirrors 'ready', so the
-    operator can resume execution explicitly (Ready != Start)."""
+    """repairing + no_repair_tasks + pending execution tasks → the
+    phase rolls back to ready, so the operator can resume execution
+    explicitly (Ready != Start).
+
+    2026-10-16 (schema v6): this test used to assert the phase TWICE —
+    once on ``plan_routing`` and once on the ``plan_execution`` mirror —
+    because the rollback wrote both. The mirror write was a separate
+    best-effort block on its own connection; when it failed the plan
+    kept a stale phase and ``GET /api/plans`` served it. There is one
+    phase column now, so there is one assertion, and it cannot pass
+    while the column the API reads says something else.
+    """
     import server
     from state_machine.repositories.routing_repository import RoutingRepository
 
@@ -267,14 +276,16 @@ def test_dead_end_repairing_with_unfinished_tasks_rolls_back_to_ready(
         assert row is not None
         assert row["current_phase"] == "ready", (
             f"a dead-ended verification_repairing row with unfinished "
-            f"work must roll back to ready, got {row['stage']!r}"
+            f"work must roll back to ready, got {row['current_phase']!r}"
         )
-        phase = conn.execute(
-            "SELECT current_phase FROM plan_execution WHERE plan_id = ?",
-            (plan_id,),
-        ).fetchone()
-        assert phase is not None and phase[0] == "ready", (
-            f"current_phase must mirror the rollback (ready), got {phase!r}"
+
+        # The mirror is gone, so the rollback cannot half-apply: assert
+        # the column is not merely absent by name but structurally so.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution)")}
+        assert "current_phase" not in cols, (
+            "plan_execution must carry no workflow-phase column; a "
+            "second copy of the phase is what let the API disagree "
+            "with the state machine"
         )
     finally:
         conn.close()

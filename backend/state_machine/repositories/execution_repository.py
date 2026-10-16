@@ -2,9 +2,14 @@
 
 The :class:`ExecutionRepository` is the single write/read path for
 ``plan_execution`` — the per-plan row that records the execution
-metadata (current_phase, attempt_count, project_dir, stop_reason,
+metadata (attempt_count, project_dir, stop_reason,
 task_progress, next_run_at, card_state, flags, exec_pid, exec_status,
 started_at, updated_at).
+
+It holds **no workflow-phase column** (schema v6).  ``plan_execution``
+answers "what happened to the last execution run"; ``plan_routing``
+answers "where is the plan".  Before v6 both claimed the second
+question, and the copy that lived here was the strictly-lossy one.
 
 Design contract (anchored by ``test_execution_repository.py``):
 
@@ -52,9 +57,12 @@ __all__ = ["ExecutionRepository", "PlanNotFoundError"]
 #: Anything outside this set must NOT be referenced by the write
 #: methods — that is how the bug-1 cross-table invariant is held
 #: at the SQL layer (in addition to the parameterised test).
+#:
+#: There is no ``current_phase`` here (schema v6).  The workflow phase
+#: lives in exactly one place, ``plan_routing.current_phase``; this
+#: table describes the *execution run* (pid, status, progress, dir).
 _WRITEABLE_COLUMNS: frozenset[str] = frozenset(
     {
-        "current_phase",
         "attempt_count",
         "project_dir",
         "stop_reason",
@@ -119,9 +127,14 @@ class ExecutionRepository:
 
     # The columns returned by ``summary`` / ``snapshot_for_list``.
     # Anything outside this set is hidden from the API layer.
+    #
+    # ``current_phase`` is deliberately absent (schema v6): the phase is
+    # the routing table's to answer, and returning it here is what let
+    # ``GET /api/plans`` keep serving a phase the authority had already
+    # moved past.  A caller that needs the phase reads
+    # ``RoutingRepository``.
     _SUMMARY_COLUMNS: tuple[str, ...] = (
         "plan_id",
-        "current_phase",
         "attempt_count",
         "project_dir",
         "stop_reason",
@@ -173,14 +186,15 @@ class ExecutionRepository:
     def insert(
         self,
         plan_id: str,
-        current_phase: str,
         **fields: Any,
     ) -> None:
         """Insert a new ``plan_execution`` row.
 
-        ``current_phase`` is required (the schema declares it
-        ``NOT NULL``).  Every other column accepts the canonical
-        defaults and can be overridden via ``**fields``.
+        Every column accepts the canonical defaults and can be
+        overridden via ``**fields``.  There is no phase argument and
+        there is no phase column (schema v6): the row this inserts
+        describes an execution *run*, and where the workflow is lives
+        in ``plan_routing``.
 
         Recognised field names must be in :data:`_WRITEABLE_COLUMNS`;
         any unknown name is rejected with ``ValueError`` so a typo
@@ -206,11 +220,10 @@ class ExecutionRepository:
         # stored value is stable (no float/key-order drift).
         encoded = self._encode_fields(fields)
 
-        columns = ("plan_id", "current_phase", *encoded.keys(), "updated_at")
+        columns = ("plan_id", *encoded.keys(), "updated_at")
         placeholders = ", ".join("?" for _ in columns)
         values = (
             plan_id,
-            current_phase,
             *encoded.values(),
             _now_iso(),
         )
@@ -304,18 +317,19 @@ class ExecutionRepository:
         """Return one row per plan for the planner UI card table.
 
         The card view is a strict subset of the summary columns:
-        ``plan_id``, ``current_phase``, ``task_progress`` (parsed
-        so the UI can read ``completed`` / ``total`` directly),
-        ``updated_at``.  No ``exec_pid`` / ``exec_status`` / ``flags``
-        leak into the UI surface.
+        ``plan_id``, ``task_progress`` (parsed so the UI can read
+        ``completed`` / ``total`` directly), ``updated_at``.  No
+        ``exec_pid`` / ``exec_status`` / ``flags`` leak into the UI
+        surface, and no workflow phase — that is the routing table's
+        to answer (schema v6).
         """
-        cols = "plan_id, current_phase, task_progress, updated_at"
+        cols = "plan_id, task_progress, updated_at"
         cur = self._conn.execute(
             f"SELECT {cols} FROM plan_execution ORDER BY plan_id"
         )
         out: list[dict[str, Any]] = []
         for row in cur.fetchall():
-            plan_id, current_phase, task_progress, updated_at = row
+            plan_id, task_progress, updated_at = row
             progress = None
             if task_progress:
                 try:
@@ -325,7 +339,6 @@ class ExecutionRepository:
             out.append(
                 {
                     "plan_id": plan_id,
-                    "current_phase": current_phase,
                     "task_progress": progress,
                     "updated_at": updated_at,
                 }
@@ -336,34 +349,36 @@ class ExecutionRepository:
     # Write API
     # ------------------------------------------------------------------
 
-    def update_phase(
+    def update_fields(
         self,
         plan_id: str,
-        current_phase: Optional[str] = None,
         *,
         create_if_missing: bool = False,
         **fields: Any,
     ) -> None:
-        """Mutate ``current_phase`` (and any extra fields) on the row.
+        """Mutate columns on the row.
 
-        ``current_phase`` is written **only when it is not ``None``**.
-        ``None`` means "leave that column alone" — the same convention
-        :meth:`RoutingRepository.write_plan_state` uses for its ``phase``
-        argument. The column is ``NOT NULL``, so ``None`` could never be
-        a legitimate value to store and the two readings cannot be
-        confused.
+        Every column is written through ``**fields``; each name must be
+        in :data:`_WRITEABLE_COLUMNS``.
 
-        2026-09-19: before this, ``current_phase`` was required and
-        always written, which made :meth:`update_status` — a method whose
-        entire job is to set ``exec_status`` — silently overwrite the
-        phase with a hard-coded ``"executing"``. The startup recovery
-        path hit that on every plan whose executor had died: the plan's
-        real phase (e.g. ``ready``) was replaced by ``executing`` in
-        ``plan_execution``, and ``GET /api/plans`` surfaces that column
-        as ``current_phase``.
+        2026-10-16 (schema v6): this used to be ``update_phase`` and to
+        take a ``current_phase`` argument, which made it look like the
+        table's phase column had an owner.  It did not have one that
+        worked.  Three writers passed a *routing* word (``executing`` /
+        ``verification`` / ``ready``) and none ever wrote a terminal
+        phase, so ``plan_execution.current_phase`` could not represent a
+        finished plan: it read ``executing`` forever while
+        ``plan_routing.current_phase`` advanced to ``completed`` /
+        ``failed``, and ``GET /api/plans`` served that stale value.  The
+        column is gone.  Phase writes go through
+        ``RoutingRepository.try_mark_phase`` / ``write_plan_state``.
 
-        Additional column writes are accepted via ``**fields``;
-        each name must be in :data:`_WRITEABLE_COLUMNS`.
+        The 2026-09-19 history still matters, because it explains why
+        the argument was optional in the first place: it used to be
+        required and always written, which made :meth:`update_status` —
+        a method whose entire job is to set ``exec_status`` — silently
+        stamp a phase.  The parameter is now gone entirely, so that
+        failure mode has no argument left to travel through.
 
         ``create_if_missing`` (2026-09-13): when True, a missing row is
         INSERTed instead of raising — an atomic
@@ -378,7 +393,9 @@ class ExecutionRepository:
         the server's in-memory ``_execution_state`` dict and
         ``_recover_execution_states`` could not restore it after a
         restart — the exact crash-recovery hole the retired
-        ``execution.json`` write used to cover.
+        ``execution.json`` write used to cover.  (It no longer needs an
+        explicit phase to satisfy ``NOT NULL``, so it upserts on the
+        run-state columns alone.)
 
         Raises
         ------
@@ -386,10 +403,8 @@ class ExecutionRepository:
             If no row exists for ``plan_id`` and
             ``create_if_missing`` is False.
         ValueError
-            If no column would be written at all, or if
-            ``create_if_missing`` is combined with ``current_phase=None``
-            (the INSERT would have nothing for a ``NOT NULL`` column),
-            or if ``fields`` contains an unknown column name.
+            If no column would be written at all, or if ``fields``
+            contains an unknown column name.
         """
         if "updated_at" in fields:
             fields.pop("updated_at")
@@ -400,18 +415,10 @@ class ExecutionRepository:
                     f"{sorted(_WRITEABLE_COLUMNS)}"
                 )
         encoded = self._encode_fields(fields)
-        if current_phase is not None:
-            encoded = {"current_phase": current_phase, **encoded}
         if not encoded:
             raise ValueError(
-                "update_phase was called with nothing to write: "
-                "current_phase is None and no **fields were passed"
-            )
-        if create_if_missing and current_phase is None:
-            raise ValueError(
-                "create_if_missing needs an explicit current_phase — "
-                "plan_execution.current_phase is NOT NULL, so an "
-                "INSERT cannot omit it"
+                "update_fields was called with nothing to write: "
+                "no **fields were passed"
             )
 
         set_clause = ", ".join(f"{col} = ?" for col in encoded)
@@ -452,8 +459,7 @@ class ExecutionRepository:
             publish_safe(
                 KIND_TASK_STATE_CHANGED,
                 plan_id,
-                sub_kind="update_phase",
-                phase=current_phase,
+                sub_kind="update_fields",
                 exec_status=fields.get("exec_status"),
             )
         except Exception:
@@ -463,7 +469,7 @@ class ExecutionRepository:
     def update_status(self, plan_id: str, status: str) -> None:
         """Persist ``status`` to the row's ``exec_status`` column.
 
-        Thin convenience wrapper around :meth:`update_phase` for the
+        Thin convenience wrapper around :meth:`update_fields` for the
         common case where the caller only has a new status string
         (no other columns to write). The ``exec_status`` column is
         what ``GET /api/plan/<id>/summary`` and the planner UI
@@ -480,9 +486,9 @@ class ExecutionRepository:
         the row — including the terminal ``failed``/``completed`` writes
         and the startup recovery path in ``_mark_failed_dead``. A plan
         sitting at ``ready`` whose executor had died came back from a
-        restart reading ``current_phase='executing'``. ``update_phase``
-        now treats ``current_phase=None`` as "leave it alone", so this
-        method no longer touches the column.
+        restart reading ``current_phase='executing'``. That argument no
+        longer exists (schema v6), so there is nothing left for this
+        method to stamp.
 
         Raises
         ------
@@ -497,7 +503,7 @@ class ExecutionRepository:
                 f"unknown execution status {status!r}; must be one of "
                 f"{sorted(recognised)}"
             )
-        self.update_phase(plan_id, exec_status=status)
+        self.update_fields(plan_id, exec_status=status)
 
     def update_task_progress(
         self, plan_id: str, progress: dict[str, Any]

@@ -157,10 +157,8 @@ def _seed_plan(
         (plan_id, "execution", None, 0, now),
     )
     conn.execute(
-        "INSERT INTO plan_execution (plan_id, current_phase, "
-        "attempt_count, project_dir, updated_at) VALUES "
-        "(?, ?, 0, ?, ?)",
-        (plan_id, "executing", str(BACKEND_DIR), now),
+        "INSERT INTO plan_execution (plan_id, attempt_count, project_dir, updated_at) VALUES (?, 0, ?, ?)",
+        (plan_id, str(BACKEND_DIR), now),
     )
     conn.execute(
         "INSERT INTO plan_verification (plan_id, verification_status, "

@@ -9,7 +9,7 @@ row and the row MUST satisfy:
 Production code path (backend/server.py ``@app.post(
 "/api/execution/{plan_id}/start")``) calls ``subprocess.Popen`` synchronously,
 captures ``process.pid`` into the in-memory state, then invokes
-``ExecutionRepository.update_phase(..., create_if_missing=True)`` which
+``ExecutionRepository.update_fields(..., create_if_missing=True)`` which
 writes the following columns on the ``plan_execution`` row::
 
     current_phase = "executing"

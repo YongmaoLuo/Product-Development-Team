@@ -15,7 +15,7 @@ The tests below cover:
 
   1. ``test_execution_write_keeps_verification_snapshot`` — every
      :class:`ExecutionRepository` write method, parameterised across
-     ``update_phase`` / ``update_task_progress`` /
+     ``update_fields`` / ``update_task_progress`` /
      ``update_next_run_at`` / ``update_card_state`` / ``update_flags``,
      leaves the ``plan_verification`` row byte-for-byte unchanged.
   2. ``test_verification_write_keeps_execution_snapshot`` — every
@@ -49,9 +49,9 @@ from state_machine.repositories.verification_repository import VerificationRepos
 
 EXECUTION_WRITE_METHODS = [
     (
-        "update_phase",
-        lambda repo: repo.update_phase(
-            "p1", current_phase="executing", project_dir="/new/path"
+        "update_fields",
+        lambda repo: repo.update_fields(
+            "p1", project_dir="/new/path"
         ),
     ),
     (
@@ -99,16 +99,8 @@ def _bootstrap_all_tables(db_path):
             ("p1", "executing", "task_1", 3, "2026-08-05T12:00:00Z"),
         )
         setup.execute(
-            "INSERT INTO plan_execution "
-            "(plan_id, current_phase, attempt_count, project_dir, "
-            " stop_reason, task_progress, next_run_at, card_state, "
-            " flags, exec_pid, exec_status, started_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                "p1", "ready", 0, "/orig/path", None, None,
-                None, None, None, None, None, None,
-                "2026-08-05T11:00:00Z",
-            ),
+            "INSERT INTO plan_execution (plan_id, attempt_count, project_dir, stop_reason, task_progress, next_run_at, card_state, flags, exec_pid, exec_status, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("p1", 0, "/orig/path", None, None, None, None, None, None, None, None, "2026-08-05T11:00:00Z"),
         )
         setup.execute(
             "INSERT INTO plan_verification "
@@ -346,7 +338,7 @@ def test_execution_insert_does_not_touch_verification(tmp_path):
     write_conn = open_db(db_path)
     try:
         write_repo = ExecutionRepository(write_conn)
-        write_repo.insert("p1", current_phase="ready")
+        write_repo.insert("p1")
     finally:
         write_conn.close()
 

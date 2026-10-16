@@ -131,18 +131,8 @@ def plan_dir(tmp_path, tmp_state_db, project_dir) -> Path:
         # runs against a plan that's already in ``verification_running``,
         # which by construction has a plan_execution row in production.
         conn.execute(
-            "INSERT INTO plan_execution ("
-            "  plan_id, current_phase, attempt_count, project_dir,"
-            "  exec_status, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                plan.name,
-                "verification_running",
-                0,
-                str(project_dir),
-                "completed",
-                "2026-01-01T00:00:00Z",
-            ),
+            "INSERT INTO plan_execution (plan_id, attempt_count, project_dir, exec_status, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (plan.name, 0, str(project_dir), "completed", "2026-01-01T00:00:00Z"),
         )
         conn.commit()
     finally:
@@ -440,8 +430,7 @@ def test_repair_tasks_persisted_via_add_task_have_pending_status(
     try:
         migrate(conn)
         conn.execute(
-            "INSERT INTO plan_execution (plan_id, current_phase, updated_at) "
-            "VALUES (?, 'executing', '2026-01-01T00:00:00Z')",
+            "INSERT INTO plan_execution (plan_id, updated_at) VALUES (?, '2026-01-01T00:00:00Z')",
             (plan_id,),
         )
         conn.commit()

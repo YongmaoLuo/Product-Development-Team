@@ -686,11 +686,8 @@ class TestStartVerificationAutoFix:
         conn, _, _ = _open_verification_state()
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO plan_execution ("
-                "  plan_id, current_phase, attempt_count, project_dir,"
-                "  exec_status, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?)",
-                (plan_id, "executing", 0, str(project_dir), "completed", "2026-01-01T00:00:00"),
+                "INSERT OR REPLACE INTO plan_execution (plan_id, attempt_count, project_dir, exec_status, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (plan_id, 0, str(project_dir), "completed", "2026-01-01T00:00:00"),
             )
             conn.commit()
         finally:

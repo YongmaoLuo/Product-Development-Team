@@ -2453,22 +2453,16 @@ def seed_plan_sqlite(
                         "WHERE plan_id = ?",
                         (str(project_dir), plan_id),
                     )
-                if phase is not None:
-                    conn.execute(
-                        "UPDATE plan_execution SET current_phase = ? "
-                        "WHERE plan_id = ?",
-                        (phase, plan_id),
-                    )
+                # 2026-10-16 (schema v6): the mirror ``UPDATE ... SET
+                # current_phase`` that used to sit here is deleted.  It
+                # wrote a second copy of the phase from this helper,
+                # which is the same drift the migration removed; the
+                # authoritative write is the ``plan_routing`` UPDATE a
+                # few lines above.
             else:
                 conn.execute(
-                    "INSERT INTO plan_execution "
-                    "(plan_id, current_phase, attempt_count, project_dir,"
-                    " updated_at) VALUES (?, ?, 0, ?, datetime('now'))",
-                    (
-                        plan_id,
-                        phase or "executing",
-                        str(project_dir) if project_dir is not None else None,
-                    ),
+                    "INSERT INTO plan_execution (plan_id, attempt_count, project_dir, updated_at) VALUES (?, 0, ?, datetime('now'))",
+                    (plan_id, str(project_dir) if project_dir is not None else None),
                 )
         conn.commit()
     finally:

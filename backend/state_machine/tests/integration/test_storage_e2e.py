@@ -324,10 +324,8 @@ def test_per_task_runtime_state_lives_in_sqlite_only(tmp_path, monkeypatch) -> N
     conn = _open_db(db_path)
     _migrate(conn)
     conn.execute(
-        "INSERT INTO plan_execution "
-        "(plan_id, current_phase, updated_at) "
-        "VALUES (?, ?, ?)",
-        (plan_id, "executing", "2026-08-14T00:00:00"),
+        "INSERT INTO plan_execution (plan_id, updated_at) VALUES (?, ?)",
+        (plan_id, "2026-08-14T00:00:00"),
     )
     conn.commit()
     conn.close()

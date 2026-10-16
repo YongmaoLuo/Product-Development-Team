@@ -8,7 +8,7 @@ introspectable list — the list that ``test_cross_table_isolation.py``
 parameterises across.  Concretely:
 
   1.  Every public write method on :class:`ExecutionRepository`
-      (``update_phase``, ``update_task_progress``,
+      (``update_fields``, ``update_task_progress``,
       ``update_next_run_at``, ``update_card_state``, ``update_flags``)
       is invoked once here and we assert each call mutates the
       ``plan_execution`` row AND leaves the ``plan_verification`` row
@@ -38,9 +38,9 @@ from state_machine.repositories.verification_repository import VerificationRepos
 
 EXECUTION_WRITE_METHODS = [
     (
-        "update_phase",
-        lambda repo: repo.update_phase(
-            "p1", current_phase="executing", project_dir="/new/path"
+        "update_fields",
+        lambda repo: repo.update_fields(
+            "p1", project_dir="/new/path"
         ),
     ),
     (
@@ -88,16 +88,8 @@ def _bootstrap_all_tables(db_path):
             ("p1", "executing", "task_1", 3, "2026-08-05T12:00:00Z"),
         )
         setup.execute(
-            "INSERT INTO plan_execution "
-            "(plan_id, current_phase, attempt_count, project_dir, "
-            " stop_reason, task_progress, next_run_at, card_state, "
-            " flags, exec_pid, exec_status, started_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                "p1", "ready", 0, "/orig/path", None, None,
-                None, None, None, None, None, None,
-                "2026-08-05T11:00:00Z",
-            ),
+            "INSERT INTO plan_execution (plan_id, attempt_count, project_dir, stop_reason, task_progress, next_run_at, card_state, flags, exec_pid, exec_status, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("p1", 0, "/orig/path", None, None, None, None, None, None, None, None, "2026-08-05T11:00:00Z"),
         )
         setup.execute(
             "INSERT INTO plan_verification "

@@ -94,16 +94,8 @@ def _seed_plan(db_path: Path, plan_id: str, project_dir: Path) -> None:
             ),
         )
         conn.execute(
-            "INSERT OR REPLACE INTO plan_execution "
-            "(plan_id, current_phase, attempt_count, project_dir, stop_reason, "
-            " task_progress, next_run_at, card_state, flags, exec_pid, exec_status, "
-            " started_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                plan_id, "ready", 0, str(project_dir), None,
-                json.dumps({"tasks": {}}), None, "{}", "{}", None, "not_started",
-                None, "2026-09-13T00:00:00Z",
-            ),
+            "INSERT OR REPLACE INTO plan_execution (plan_id, attempt_count, project_dir, stop_reason, task_progress, next_run_at, card_state, flags, exec_pid, exec_status, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (plan_id, 0, str(project_dir), None, json.dumps({"tasks": {}}), None, "{}", "{}", None, "not_started", None, "2026-09-13T00:00:00Z"),
         )
         conn.commit()
     finally:

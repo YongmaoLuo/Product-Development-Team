@@ -57,8 +57,7 @@ def repo(conn: sqlite3.Connection) -> PlanTaskRepository:
 def _seed_plan(conn: sqlite3.Connection, plan_id: str) -> None:
     """Insert a plan_execution row so legacy FK + readers have a target."""
     conn.execute(
-        "INSERT INTO plan_execution (plan_id, current_phase, updated_at) "
-        "VALUES (?, 'executing', '2026-01-01T00:00:00Z')",
+        "INSERT INTO plan_execution (plan_id, updated_at) VALUES (?, '2026-01-01T00:00:00Z')",
         (plan_id,),
     )
 

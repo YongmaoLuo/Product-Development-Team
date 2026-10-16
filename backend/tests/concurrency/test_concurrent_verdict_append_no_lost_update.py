@@ -78,10 +78,9 @@ def seeded_db(db_path: Path) -> Path:
     repo = VerificationRepository(conn)
     repo.insert("p1", "running", verdicts=[])
     conn.execute(
-        "INSERT INTO plan_execution "
-        "(plan_id, current_phase, attempt_count, project_dir, "
-        " task_progress, next_run_at, updated_at) "
-        "VALUES ('p1', 'executing', 0, NULL, NULL, NULL, '2026-08-05T00:00:00Z')"
+        "INSERT INTO plan_execution (plan_id, attempt_count, project_dir, "
+        "task_progress, next_run_at, updated_at) "
+        "VALUES ('p1', 0, NULL, NULL, NULL, '2026-08-05T00:00:00Z')"
     )
     conn.execute(
         "INSERT INTO plan_routing "
@@ -393,21 +392,26 @@ def test_concurrent_verdict_append_no_lost_update(seeded_db: Path, tmp_path: Pat
             assert isinstance(v["worker_id"], int)
             assert isinstance(v["seq"], int)
 
+        # 2026-10-16 (schema v6): the phase column is gone, so this
+        # assertion block no longer has a phase index to check.  What it
+        # was really pinning is the POINT of the test -- a concurrent
+        # verdict append must not touch the execution row at all -- and
+        # that still holds for every column that remains.
         exec_before = cold.execute(
-            "SELECT plan_id, current_phase, attempt_count, project_dir, "
+            "SELECT plan_id, attempt_count, project_dir, "
             "task_progress, next_run_at, updated_at "
             "FROM plan_execution WHERE plan_id = 'p1'"
         ).fetchone()
         assert exec_before is not None
         # Schema column order:
-        #   0 plan_id, 1 current_phase, 2 attempt_count, 3 project_dir,
-        #   4 task_progress, 5 next_run_at, 6 updated_at
-        assert exec_before[1] == "executing"
-        assert exec_before[2] == 0
-        assert exec_before[3] is None
-        assert exec_before[4] is None  # task_progress untouched
-        assert exec_before[5] is None  # next_run_at untouched
-        assert exec_before[6] == "2026-08-05T00:00:00Z"
+        #   0 plan_id, 1 attempt_count, 2 project_dir,
+        #   3 task_progress, 4 next_run_at, 5 updated_at
+        assert exec_before[0] == "p1"
+        assert exec_before[1] == 0
+        assert exec_before[2] is None
+        assert exec_before[3] is None  # task_progress untouched
+        assert exec_before[4] is None  # next_run_at untouched
+        assert exec_before[5] == "2026-08-05T00:00:00Z"
     finally:
         cold.close()
 

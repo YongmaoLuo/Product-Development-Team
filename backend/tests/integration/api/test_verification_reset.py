@@ -111,8 +111,10 @@ def _seed_mid_flight_plan(plans_dir: Path, db_path: Path, *, max_rounds: int = 3
     conn = open_db(db_path)
     migrate(conn)
     RoutingRepository(conn).insert(PLAN_ID, "verification_running")
+    # 2026-10-16 (schema v6): no ``current_phase`` argument.  The
+    # routing row inserted just above is the only place the phase lives.
     ExecutionRepository(conn).insert(
-        plan_id=PLAN_ID, current_phase="verification",
+        plan_id=PLAN_ID,
         project_dir=str(plan_dir / "project"),
     )
     verif = VerificationRepository(conn)

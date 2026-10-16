@@ -140,14 +140,8 @@ def _seed_plan(
         (plan_id, stage, None, "2026-08-05T00:00:00Z"),
     )
     conn.execute(
-        "INSERT INTO plan_execution "
-        "(plan_id, current_phase, attempt_count, project_dir, "
-        " stop_reason, task_progress, next_run_at, card_state, "
-        " flags, exec_pid, exec_status, started_at, updated_at) "
-        "VALUES (?, ?, 0, ?, NULL, NULL, ?, NULL, NULL, NULL, "
-        "NULL, NULL, ?)",
-        (plan_id, current_phase, f"/abs/{plan_id}", next_run_at,
-         "2026-08-05T00:00:00Z"),
+        "INSERT INTO plan_execution (plan_id, attempt_count, project_dir, stop_reason, task_progress, next_run_at, card_state, flags, exec_pid, exec_status, started_at, updated_at) VALUES (?, 0, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, ?)",
+        (plan_id, f"/abs/{plan_id}", next_run_at, "2026-08-05T00:00:00Z"),
     )
     if verification_status is not None:
         conn.execute(

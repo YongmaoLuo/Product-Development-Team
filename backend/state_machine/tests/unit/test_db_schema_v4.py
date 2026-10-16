@@ -80,8 +80,7 @@ def test_v4_migration_idempotent(db_path: Path) -> None:
         migrate(c1)
         # Insert a plan + a task row
         c1.execute(
-            "INSERT INTO plan_execution (plan_id, current_phase, updated_at) "
-            "VALUES (?, 'executing', '2026-01-01T00:00:00Z')",
+            "INSERT INTO plan_execution (plan_id, updated_at) VALUES (?, '2026-01-01T00:00:00Z')",
             ("p1",),
         )
         c1.execute(
@@ -138,8 +137,7 @@ def test_v4_backfill_lifts_task_progress_json_into_plan_tasks(
         }
     )
     conn.execute(
-        "INSERT INTO plan_execution (plan_id, current_phase, task_progress, updated_at) "
-        "VALUES (?, 'executing', ?, '2026-09-09T00:00:00Z')",
+        "INSERT INTO plan_execution (plan_id, task_progress, updated_at) VALUES (?, ?, '2026-09-09T00:00:00Z')",
         ("plan-1", progress_json),
     )
     conn.commit()
@@ -169,13 +167,11 @@ def test_v4_backfill_survives_corrupt_task_progress_json(
 ) -> None:
     """Corrupt JSON must NOT crash migration — log + skip the row."""
     conn.execute(
-        "INSERT INTO plan_execution (plan_id, current_phase, task_progress, updated_at) "
-        "VALUES (?, 'executing', ?, '2026-09-09T00:00:00Z')",
+        "INSERT INTO plan_execution (plan_id, task_progress, updated_at) VALUES (?, ?, '2026-09-09T00:00:00Z')",
         ("plan-corrupt", "this is not valid JSON {{{"),
     )
     conn.execute(
-        "INSERT INTO plan_execution (plan_id, current_phase, task_progress, updated_at) "
-        "VALUES (?, 'executing', ?, '2026-09-09T00:00:00Z')",
+        "INSERT INTO plan_execution (plan_id, task_progress, updated_at) VALUES (?, ?, '2026-09-09T00:00:00Z')",
         (
             "plan-good",
             json.dumps({"tasks": {"ok": {"status": "completed", "end_ts": "x"}}})
@@ -196,8 +192,7 @@ def test_v4_backfill_empty_task_progress_no_op(conn: sqlite3.Connection) -> None
     """Plan rows with empty / {} task_progress produce no plan_tasks rows."""
     for progress in (None, "", "{}"):
         conn.execute(
-            "INSERT INTO plan_execution (plan_id, current_phase, task_progress, updated_at) "
-            "VALUES (?, 'executing', ?, '2026-09-09T00:00:00Z')",
+            "INSERT INTO plan_execution (plan_id, task_progress, updated_at) VALUES (?, ?, '2026-09-09T00:00:00Z')",
             (f"plan-{progress!r}", progress),
         )
     conn.commit()
@@ -216,8 +211,7 @@ def test_v4_backfill_idempotent_does_not_duplicate(
         {"tasks": {"t1": {"status": "completed", "_repo_version": 1}}}
     )
     conn.execute(
-        "INSERT INTO plan_execution (plan_id, current_phase, task_progress, updated_at) "
-        "VALUES (?, 'executing', ?, '2026-09-09T00:00:00Z')",
+        "INSERT INTO plan_execution (plan_id, task_progress, updated_at) VALUES (?, ?, '2026-09-09T00:00:00Z')",
         ("plan-dup", progress_json),
     )
     conn.commit()
@@ -257,8 +251,7 @@ def test_v4_migration_runs_after_v3_on_existing_db(db_path: Path) -> None:
             {"tasks": {"t1": {"status": "completed", "end_ts": "x"}}}
         )
         c.execute(
-            "INSERT INTO plan_execution (plan_id, current_phase, task_progress, updated_at) "
-            "VALUES (?, 'executing', ?, '2026-09-09T00:00:00Z')",
+            "INSERT INTO plan_execution (plan_id, task_progress, updated_at) VALUES (?, ?, '2026-09-09T00:00:00Z')",
             ("plan-pre-v4", progress),
         )
         c.commit()

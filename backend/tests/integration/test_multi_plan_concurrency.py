@@ -117,18 +117,18 @@ def _drive_execution_worker(
     conn = open_db(db_path)
     try:
         repo = ExecutionRepository(conn)
+        # 2026-10-16 (schema v6): the mirror column is gone; the phase
+        # is seeded on plan_routing by the caller.
         repo.insert(
             plan_id=plan_id,
-            current_phase="executing",
             project_dir="/tmp/" + plan_id,
             exec_status="running",
             started_at="2026-08-05T00:00:00Z",
         )
         barrier.wait(timeout=10)
         for i in range(rounds):
-            repo.update_phase(
+            repo.update_fields(
                 plan_id,
-                current_phase="executing",
                 attempt_count=i + 1,
                 exec_status="running",
             )
@@ -144,7 +144,14 @@ def _drive_execution_worker(
             )
             snap = repo.summary(plan_id)
             assert snap is not None, "summary(%r) returned None" % plan_id
-            assert snap["current_phase"] == "executing"
+            # 2026-10-16 (schema v6): summary() no longer exposes a phase
+            # key at all -- the one it used to carry was the mirror, and
+            # asserting on it is what let a stale value pass unnoticed.
+            assert "current_phase" not in snap, (
+                "summary() must not report a phase: the only workflow-phase "
+                "value is plan_routing.current_phase; got %r"
+                % (snap.get("current_phase"),)
+            )
     except BaseException as exc:  # noqa: BLE001
         errors.append(exc)
     finally:
@@ -422,7 +429,6 @@ def test_two_executions_and_one_verification_coexist(
     try:
         ExecutionRepository(cas_winner_conn).insert(
             plan_id=plan_cas,
-            current_phase="executing",
             project_dir="/tmp/" + plan_cas,
             exec_status="running",
             started_at="2026-08-05T00:00:00Z",
@@ -515,16 +521,12 @@ def test_two_executions_and_one_verification_coexist(
 
         for plan_id in (plan_a, plan_b):
             row = conn_main.execute(
-                "SELECT current_phase, attempt_count, project_dir, exec_status "
+                "SELECT attempt_count, project_dir, exec_status "
                 "FROM plan_execution WHERE plan_id = ?",
                 (plan_id,),
             ).fetchone()
             assert row is not None, "plan_execution row for %r missing" % (plan_id,)
-            cur_phase, attempt_count, project_dir, exec_status = row
-            assert cur_phase == "executing", (
-                "plan_execution.current_phase for %r must be 'executing'; got %r"
-                % (plan_id, cur_phase)
-            )
+            attempt_count, project_dir, exec_status = row
             assert attempt_count == rounds, (
                 "plan_execution.attempt_count for %r must equal %d; got %r"
                 % (plan_id, rounds, attempt_count)

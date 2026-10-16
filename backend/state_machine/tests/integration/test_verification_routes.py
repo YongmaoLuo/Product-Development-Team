@@ -70,7 +70,7 @@ def _seed_plan(
     plan_dir = plans_dir / plan_id
     project_dir = plan_dir / "project"
     project_dir.mkdir(parents=True)
-    ExecutionRepository(conn).insert(plan_id, stage, project_dir=str(project_dir))
+    ExecutionRepository(conn).insert(plan_id, project_dir=str(project_dir))
     RoutingRepository(conn).insert(plan_id, stage)
     VerificationRepository(conn).insert(
         plan_id, "not_started",
