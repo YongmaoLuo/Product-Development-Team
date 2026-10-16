@@ -660,7 +660,15 @@ def test_agent_py_imports_hard_timeout_error():
     agent_path = Path(__file__).parent.parent / "agent.py"
     src = agent_path.read_text(encoding="utf-8")
     assert "from coding_tool import" in src
-    assert "HardTimeoutError" in src.split("from coding_tool import")[1].split("\n")[0]
+    # Parse the import instead of slicing the first newline after it: the
+    # import may be written on one line (``from coding_tool import A, B,
+    # HardTimeoutError``) or wrapped in parentheses across many lines, and
+    # the slice only read correctly for the former shape.
+    imported = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.ImportFrom) and node.module == "coding_tool":
+            imported.update(alias.name for alias in node.names)
+    assert "HardTimeoutError" in imported
 
 
 # ---------------------------------------------------------------------------
