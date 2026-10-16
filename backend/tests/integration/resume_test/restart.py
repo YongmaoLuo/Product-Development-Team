@@ -24,6 +24,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -47,7 +48,34 @@ WAIT_READY_POLL_SECONDS = 0.1
 # anchor every path on the current working directory rather than on
 # ``__file__`` (which would point at ``backend/tests/integration/...``).
 PROJECT_ROOT = Path(os.getcwd())
-VENV_PYTHON = PROJECT_ROOT / "backend" / ".venv" / "bin" / "python"
+
+# Prefer the project venv, falling back to the interpreter this module was
+# imported under.  Same idiom as
+# ``backend/tests/concurrency/test_busy_timeout_absorbs_contention_without_raising.py``:
+# a hard-derived venv path turns "no ``backend/.venv`` here" into an unhandled
+# ``FileNotFoundError`` raised from inside ``subprocess.Popen``, long after
+# ``hard_restart`` has already killed the old server.
+#
+# Three caveats that the pytest files do not carry, recorded here because
+# they are the reasons this fallback is *not* automatically equivalent:
+#
+#   * ``PROJECT_ROOT`` is ``os.getcwd()``, not ``__file__``.  The probe below
+#     can therefore be False because the helper was launched from the wrong
+#     directory, not because the venv is missing -- and the fallback would
+#     then quietly paper over a genuine invocation mistake.
+#   * ``bin/python`` without the ``3`` has strictly more ways to be absent
+#     than ``bin/python3``; several venv-creating tools only symlink the
+#     versioned name.
+#   * This module is an operator script, not a pytest case.  Nothing in the
+#     suite calls ``start_server``, so the fallback branch is never executed
+#     by CI and cannot be negative-controlled.  It is correct only for the
+#     documented invocation -- running this helper with the project venv's own
+#     interpreter, where ``sys.executable`` *is* that interpreter.  Run it
+#     under a system Python and the fallback will start the server on the
+#     system Python instead, which is a different server than the one this
+#     module documents starting.
+_VENV_PYTHON = PROJECT_ROOT / "backend" / ".venv" / "bin" / "python"
+VENV_PYTHON = _VENV_PYTHON if _VENV_PYTHON.exists() else Path(sys.executable)
 SERVER_SCRIPT = PROJECT_ROOT / "backend" / "server.py"
 
 
