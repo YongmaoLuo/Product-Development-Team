@@ -60,7 +60,21 @@ import pytest
 # Absolute paths — no placeholders, no relative paths.
 BACKEND_DIR = Path(__file__).resolve().parents[3]
 PROJECT_ROOT = BACKEND_DIR.parent
-VENV_PYTHON = BACKEND_DIR / ".venv" / "bin" / "python3"
+#: Interpreter the nested ``pytest --collect-only`` below runs under.
+#:
+#: Prefer the project venv — the collect must see the same package set the
+#: parent run is using.  But a checkout with no ``backend/.venv`` (fresh
+#: worktree, container, CI before the venv bootstrap step) must not turn
+#: every marker test into a ``FileNotFoundError`` raised *before* anything is
+#: collected — a red suite that asserts nothing.
+#:
+#: Deliberately not ``pytest.skip``: skipping would swap 16 fake reds for 16
+#: fake greens.  The fallback still runs a real ``pytest --collect-only``,
+#: on the interpreter already running pytest, so the counts the assertions
+#: below depend on are still measured rather than assumed.  Same idiom as
+#: ``backend/tests/concurrency/test_busy_timeout_absorbs_contention_without_raising.py``.
+_VENV_PYTHON = BACKEND_DIR / ".venv" / "bin" / "python3"
+VENV_PYTHON = _VENV_PYTHON if _VENV_PYTHON.exists() else Path(sys.executable)
 
 # Bug markers: must each select at least one anchor.
 BUG_MARKERS: tuple[str, ...] = ("bug_1", "bug_2", "bug_3", "bug_4", "bug_5")

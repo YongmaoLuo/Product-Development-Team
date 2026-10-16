@@ -21,55 +21,40 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from _pytest_hermetic_env import (
+    install_hermetic_env,
+    install_request_guard_header,
+    xdist_worker_id,
+)
+
 #: The backend package root — ``<repo>/backend``, since this file lives in
 #: ``backend/tests/``. Used to tell "a worker this application started"
 #: (which the suite must reclaim) from a library's own thread.
 _BACKEND_DIR = Path(__file__).resolve().parents[1]
 
-# Prevent a shell-provided CC Switch proxy URL from leaking into backend tests
-# that exercise provider-specific routing.
-os.environ.pop("ANTHROPIC_BASE_URL", None)
-
-# Provider mode is a property of the *deployment*, not of one test process.
-#
-# ``ClaudeCodingTool._detect_inherit_mode()`` probes for a CC Switch database
-# under ``$HOME``.  This suite redirects ``$HOME`` per-test (the isolation
-# fixtures below), so an unpinned mode is re-derived from ambient state and
-# can flip *mid-run*: a test that points HOME at a scratch dir would silently
-# switch the whole pipeline into inherit mode and then fail its own
-# provider-contract assertions.
-#
-# It is worse on a machine without CC Switch — which is exactly CI, and
-# exactly the audience this repo is for.  There the suite would run *entirely*
-# in inherit mode and ~16 provider-contract tests would fail, while the same
-# commit passed on the maintainer's machine.  A suite whose result depends on
-# the runner's installed apps is not a suite.
-#
-# ``setdefault`` so an explicit outer override still wins; inherit-mode tests
-# set ``PDT_PROVIDER_MODE=inherit`` themselves (``test_dispatch_inherit_mode``,
-# ``test_subagent_inherit_env``) and are unaffected.
-os.environ.setdefault("PDT_PROVIDER_MODE", "cc-switch")
 
 # ---------------------------------------------------------------------------
-# Talking to the guarded API like a real client would.
+# The process-global environment contract.
 # ---------------------------------------------------------------------------
 #
-# ``server.request_guard`` refuses any ``/api/*`` request that arrives
-# without the guard header, and serves only loopback hostnames. Both are
-# the intended production behaviour, so the suite adapts to the guard
-# rather than the other way round — a bypass here would leave the guard
-# untested by the very requests that exercise every route.
+# The guard-header patch, ``PDT_ALLOWED_HOSTS`` / ``PDT_DEBUG_ROUTES``, the
+# throwaway state database and every other hermetic env var live in
+# ``backend/_pytest_hermetic_env.py``.  They used to be inline here, which
+# made "this tree is hermetic" an accident of *this file being imported*:
+# ``backend/state_machine/tests/`` collected on its own got no guard header,
+# no allowed hostname and no throwaway database, and 20 of its route tests
+# answered HTTP 403 while 3 more refused to touch the live ``state.db``.
+# See that module's docstring for the whole account.
 #
-#   * ``testserver`` joins the allowed hostnames: that is the ``Host``
-#     Starlette's TestClient sends by default.
-#   * every ``TestClient`` has the guard header injected below, which
-#     keeps 62 construction sites across 48 files unchanged.
-#   * the debug routes are opt-in production; this suite is what
-#     exercises them, so it opts in.
-#
-# All three are set at import, before any test module imports ``server``.
-os.environ.setdefault("PDT_ALLOWED_HOSTS", "testserver")
-os.environ.setdefault("PDT_DEBUG_ROUTES", "1")
+# The four aliases below exist so the fixtures further down keep the names
+# they have always had.  ``_SUBAGENT_ROOT`` and ``_XDIST_WORKER`` are read by
+# ``pytest_sessionfinish`` and by the session fixture, both at call time.
+install_request_guard_header()
+_HERMETIC_ENV = install_hermetic_env()
+_TEST_STATE_DB_DIR = _HERMETIC_ENV.state_db_dir
+_LOCK_ROOT = _HERMETIC_ENV.lock_root
+_SUBAGENT_ROOT = _HERMETIC_ENV.subagent_root
+_XDIST_WORKER = xdist_worker_id()
 
 
 # ---------------------------------------------------------------------------
@@ -170,36 +155,6 @@ def pytest_sessionfinish(session, exitstatus) -> None:
 
 
 _install_killpg_tripwire()
-
-
-def _install_request_guard_header() -> None:
-    """Make every ``TestClient`` request carry the guard header.
-
-    Wrapping ``TestClient.__init__`` rather than editing call sites: a
-    guard that only some of the 62 clients satisfy would fail in the
-    least informative way available, and the call sites would drift back
-    out of sync the first time someone adds one.
-    """
-    from starlette.testclient import TestClient as _TestClient
-
-    import request_guard
-
-    if getattr(_TestClient, "_pdt_guard_installed", False):
-        return
-
-    _original_init = _TestClient.__init__
-
-    def _init_with_guard(self, *args, **kwargs):
-        headers = dict(kwargs.pop("headers", None) or {})
-        headers.setdefault(request_guard.REQUEST_HEADER, request_guard.REQUEST_HEADER_VALUE)
-        kwargs["headers"] = headers
-        _original_init(self, *args, **kwargs)
-
-    _TestClient.__init__ = _init_with_guard
-    _TestClient._pdt_guard_installed = True
-
-
-_install_request_guard_header()
 
 
 # ---------------------------------------------------------------------------
@@ -324,169 +279,14 @@ def capacity_from_text(tmp_path, monkeypatch):
 # ``monkeypatch.setenv("PDT_STATE_DB_PATH", ...)`` — monkeypatch restores
 # this session value on teardown, so the two mechanisms compose.
 # ---------------------------------------------------------------------------
-# The session scratch root — must be idempotent across re-imports
-# ---------------------------------------------------------------------------
 #
-# pytest loads this file as ``conftest``. A test that does ``from
-# backend.tests.conftest import ...`` loads it a **second** time under the
-# dotted name, which runs this module body again — so an unconditional
-# ``mkdtemp`` here mints one directory per execution while only the one
-# the fixture closes over is ever removed. The other one is never
-# collected by anything, which is how a suite run leaks a directory,
-# every run, forever.
-#
-# Keying the root on the environment makes the second execution reuse the
-# first one's directory, so there is exactly one per process and the one
-# teardown removes is the only one that exists. An externally-set value
-# wins, which is also what lets a caller point the suite somewhere it
-# owns.
-#
-# Under xdist that key is no longer enough on its own, because the key is
-# inherited rather than per-process. The controller loads this module during
-# ``_preparse`` — before it starts any worker — so by the time the workers
-# are execnet children that copy its ``os.environ``, the variable is already
-# set and every worker reuses the controller's one directory. N processes,
-# one ``state.db``, one plans tree. Measured on ``tests/unit -n 4``: exactly
-# one scratch directory appears for the whole run, not four.
-#
-# So the key has to carry the worker id, which is what ``PYTEST_XDIST_WORKER``
-# holds (``gw0``/``gw1``/... in a worker, absent in the controller). A worker
-# therefore scopes itself to ``<root>/<worker id>`` rather than adopting the
-# root verbatim, which keeps the two halves of the contract at once: the
-# workers stop sharing one ``state.db``, and a caller who pinned the variable
-# still owns the directory they named — it is scoped per worker, not
-# discarded. Idempotency needs one more key to tell "this is the value I
-# installed" from "this is the value I inherited":
-# ``_PDT_TEST_SESSION_ROOT_OWNER`` records which process installed it, so
-#
-#   * the dotted re-import inside one worker sees its own id and reuses;
-#   * a different worker sees a different id and scopes itself separately;
-#   * a serial run, which has no worker id, mints once and reuses, exactly
-#     as the ``if`` above it always did.
-_XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER") or ""
-_SESSION_ROOT_OWNER = "_PDT_TEST_SESSION_ROOT_OWNER"
+# The env vars themselves -- the session scratch root, ``PDT_STATE_DB_PATH``,
+# ``PDT_PLANS_DIR``, ``PDT_LOCK_ROOT`` and the credential scratch root -- are
+# installed by ``install_hermetic_env()`` at the top of this file, which is
+# where their per-entry reasoning moved with them.  The fixtures below only
+# read the four aliases it returned, and ``_hermetic_state_db_dir`` closes
+# over the same two roots the session-finish hook removes.
 
-if not os.environ.get("PDT_TEST_SESSION_ROOT"):
-    os.environ["PDT_TEST_SESSION_ROOT"] = tempfile.mkdtemp(prefix="ac-test-state-")
-    os.environ[_SESSION_ROOT_OWNER] = ""
-elif _XDIST_WORKER and os.environ.get(_SESSION_ROOT_OWNER) != _XDIST_WORKER:
-    _WORKER_STATE_DB_DIR = (
-        Path(os.environ["PDT_TEST_SESSION_ROOT"]) / _XDIST_WORKER
-    )
-    _WORKER_STATE_DB_DIR.mkdir(parents=True, exist_ok=True)
-    os.environ["PDT_TEST_SESSION_ROOT"] = str(_WORKER_STATE_DB_DIR)
-    os.environ[_SESSION_ROOT_OWNER] = _XDIST_WORKER
-_TEST_STATE_DB_DIR = Path(os.environ["PDT_TEST_SESSION_ROOT"])
-os.environ["PDT_STATE_DB_PATH"] = str(_TEST_STATE_DB_DIR / "state.db")
-
-# ---------------------------------------------------------------------------
-# Hermetic plans root — 2026-09-14, the same decision that moved the
-# suite off the live database: tests must not touch state.db, they
-# create their own.
-#
-# The SQLite redirect above stops the suite writing the live DATABASE;
-# without this second redirect it still wrote the live TREE. Leaf helpers
-# that take no explicit directory — ``ExecutionLogger(plan_id)``,
-# ``plan_state.plans_dir``, ``repair_generator.generate_repair_tasks``,
-# ``verification_agent.run_verification`` — each defaulted to
-# ``<repo>/plans``, so a fixture plan_id materialised a real
-# ``plans/<fixture-id>/`` directory (``ac-skip-test-arch-*``,
-# ``resume-test-*``, ``vp-sync-targets-*``, ...). The running server's
-# notifier startup sweep treats every ``plans/<id>/`` with an
-# executing/verification_running routing row as an in-flight plan and
-# pushes a card for it — which is how the junk got to Feishu even after
-# the DB was clean.
-#
-# ``PDT_PLANS_DIR`` mirrors ``server.PLANS_DIR``'s pre-existing override;
-# every leaf resolver now routes through ``config_paths.resolve_plans_dir``.
-# ---------------------------------------------------------------------------
-
-os.environ["PDT_PLANS_DIR"] = str(_TEST_STATE_DB_DIR / "plans")
-
-# The startup credential sweep is a machine-wide rewrite — it walks the
-# real temp roots and overwrites credentials in the settings payloads it
-# recognises. In production that is the point (booting is the one moment
-# nothing of ours can legitimately be running). Under test it would mean
-# the suite silently rewrites the developer's own residue: the lifespan
-# tests here enter ``server._lifespan`` directly, and
-# ``test_state_from_db.py`` enters it through ``TestClient``'s context
-# manager.
-#
-# Set for the whole session rather than stubbed per test, because the
-# hazard is attached to *booting the app*, not to any one test — a new
-# test that boots the app would otherwise reintroduce it silently.
-# ``utils.secret_sweep.default_roots`` and ``sweep`` are untouched, so the
-# pipeline is still exercisable against a ``tmp_path``.
-os.environ.setdefault("PDT_DISABLE_TEMP_SWEEP", "1")
-
-# Workspace-derived lock state — the fallback lock directory and the
-# broker socket are keyed by workspace digest, so a suite that gives every
-# case its own ``tmp_path`` mints one lock directory per case. Left at the
-# default root, that lands in the machine's temp root, for workspaces that
-# were deleted seconds later, and nothing ever collects it.
-#
-# The redirect root gets its **own** short ``mkdtemp`` rather than a
-# subdirectory of ``_TEST_STATE_DB_DIR`` on purpose: ``socket_path`` puts a
-# 32-character socket name under it, and ``AF_UNIX`` paths are capped at
-# 104 bytes on macOS. Nested under the state dir the full path measures
-# 108 characters and ``bind()`` fails with "AF_UNIX path too long" — the
-# lock layer silently gone, which is the exact failure ``socket_path``'s
-# docstring exists to warn about.
-#
-# Idempotent for the same re-import reason as the session root above, and
-# keyed on the same variable the production code reads so there is one
-# source of truth for "where the lock state goes".
-if not os.environ.get("PDT_LOCK_ROOT"):
-    os.environ["PDT_LOCK_ROOT"] = tempfile.mkdtemp(prefix="lk-")
-_LOCK_ROOT = Path(os.environ["PDT_LOCK_ROOT"])
-
-# The broker socket is the second half of the pair above, and it needs the
-# opposite treatment: ``socket_path`` consults ``PDT_LOCK_BROKER`` first and
-# returns it **verbatim**, ignoring ``project_dir`` entirely. Redirecting the
-# root above is therefore not enough to make the socket hermetic — an
-# ambient value short-circuits the whole derivation.
-#
-# The value is written by the executor into the environment block of each
-# sub-agent's settings (``coding_tool`` renders ``socket_path(self.cwd)``
-# there), so it is a process-environment variable inherited by anything
-# the suite launches — including ``run_tests.sh`` itself. It is derived
-# from one workspace and published verbatim, which is the shape that
-# makes taking it over worthwhile: the override collapses *every*
-# workspace onto that one socket. Three unrelated ``project_dir`` values
-# hash to three different digests and land on three different sockets,
-# but under the override they all return the same literal path, so tests
-# asserting that workspaces are separated fail against a value no test
-# in the file set. That is a machine-level variable deciding the gate's
-# verdict.
-#
-# Cleared unconditionally rather than defaulted with ``setdefault`` /
-# ``if not``: there is no suite-owned value to fall back *to* — an absent
-# variable is precisely the state in which the digest derivation runs and
-# the assertions mean what they say. A caller that genuinely wants a pinned
-# socket for one case sets it with ``monkeypatch.setenv`` inside that case,
-# which outranks this and is undone with it. The production override
-# semantics are untouched on purpose: pinning a socket is how a deployment
-# opts out of discovery, and the gap was suite-side environment ownership,
-# not the override.
-os.environ.pop("PDT_LOCK_BROKER", None)
-
-# Credential-payload scratch directories. Every dispatch mints one
-# ``pdt-subagent-*`` directory through ``secret_files.private_dir``, and
-# the suite dispatches constantly, so left at the default root the suite
-# mints them in the machine's temp root and **nothing there collects
-# them**: the boot-time sweep is switched off above (deliberately — it
-# would rewrite the developer's own residue), and the directories that do
-# hold a settings payload are non-empty, so the empty-directory prune
-# cannot reach them either.
-#
-# Redirected rather than swept so the suite's scratch never leaves the
-# suite in the first place — the same shape as the lock root above, and
-# keyed on the variable production reads so there is one source of truth
-# for "where the private directories go". Nesting it under the session
-# root is safe here, unlike the socket: these are regular paths, with no
-# ``sun_path`` cap to clear.
-_SUBAGENT_ROOT = _TEST_STATE_DB_DIR / "private"
-os.environ.setdefault("PDT_SECRET_TEMP_ROOT", str(_SUBAGENT_ROOT))
 
 
 @pytest.fixture(scope="session", autouse=True)

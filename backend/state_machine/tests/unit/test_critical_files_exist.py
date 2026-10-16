@@ -23,6 +23,7 @@ refactor rollout.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,16 @@ import pytest
 # Project root — the parent of the ``backend/`` directory.
 BACKEND_DIR = Path(__file__).resolve().parents[3]
 PROJECT_ROOT = BACKEND_DIR.parent
+
+# Interpreter the nested ``pytest --collect-only`` below runs under. Prefer
+# the project venv; fall back to the interpreter already running pytest when
+# the checkout has none (fresh worktree, container, CI before the venv
+# bootstrap step) so this guard measures a real collection instead of dying
+# on ``FileNotFoundError`` before it measured anything.  Deliberately not
+# ``pytest.skip`` — that would swap a fake red for a fake green.  Same idiom
+# as ``backend/tests/concurrency/test_busy_timeout_absorbs_contention_without_raising.py``.
+_VENV_PYTHON = BACKEND_DIR / ".venv" / "bin" / "python3"
+VENV_PYTHON = _VENV_PYTHON if _VENV_PYTHON.exists() else Path(sys.executable)
 
 # The 13 critical test files pinned by the test-design contract.
 # Each entry is a path relative to PROJECT_ROOT (so the test works
@@ -108,7 +119,7 @@ def test_critical_files_collection_collects_all() -> None:
     start = time.time()
     proc = subprocess.run(
         [
-            str(BACKEND_DIR / ".venv" / "bin" / "python3"),
+            str(VENV_PYTHON),
             "-m",
             "pytest",
             "--collect-only",
