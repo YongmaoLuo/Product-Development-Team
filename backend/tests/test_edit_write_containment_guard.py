@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from _pytest_hermetic_env import REAL_HOME_ENV
 from coding_tool import _build_guard_hook
 
 
@@ -33,13 +34,49 @@ def guard_path():
     return Path(_build_guard_hook()["command"].split(" ", 1)[1])
 
 
+def _real_home() -> Path:
+    """The home this test run was *launched* with -- not the redirected one.
+
+    Every path this module hands the guard has to be **outside tempdir**, or
+    the test stops testing the containment rule: the guard allows temp scratch
+    unconditionally (``in_tmp_scratch`` in ``coding_tool.py``), so a target
+    under the temp root is allowed no matter which checkout it is "in", and an
+    assertion of ``rc == 2`` fails while proving nothing about containment.
+
+    ``Path.home()`` is unusable here. ``install_hermetic_env()`` redirects
+    ``$HOME`` at ``tempfile.mkdtemp(prefix="home-")``, which lands *under* the
+    temp root -- so ``Path.home()`` returns a path the guard already allows
+    and every case below stops discriminating. That is not hypothetical: it
+    is what turned these five tests red, and it is silent, because a
+    containment test that allows everything still returns a well-formed exit
+    code.
+
+    Falls back to nothing: the variable is installed by the same function that
+    installs the redirect, so its absence means the environment contract is
+    broken, and defaulting to ``Path.home()`` here would quietly restore the
+    vacuous version rather than say so.
+    """
+    value = os.environ.get(REAL_HOME_ENV)
+    if not value:
+        raise RuntimeError(
+            f"{REAL_HOME_ENV} is unset; install_hermetic_env() must run before "
+            f"this module derives a path. Falling back to Path.home() would "
+            f"return the redirected tempdir home, which the guard allows "
+            f"unconditionally -- the cases below would then pass or fail "
+            f"without exercising containment at all."
+        )
+    return Path(value)
+
+
 # Fixture paths for "another repo" — the containment guard's whole
 # purpose is to block edits across repos, so we need concrete paths to
-# other checkouts. Resolve from ``$HOME`` so the test is portable
-# across developer machines; if those checkouts don't exist locally
+# other checkouts. Resolve from the *launch* home (``_real_home()``, not
+# ``Path.home()``) so the test is portable across developer machines and so
+# the paths stay outside tempdir -- see ``_real_home`` for why the second
+# half is load-bearing. If those checkouts don't exist locally
 # the relevant test will simply not find its target.
-_FOREIGN_CHECKOUT_DIR = Path.home() / "work" / "other-repo"
-_FOREIGN_PRODUCTION_DIR = Path.home() / "work" / "production-checkout"
+_FOREIGN_CHECKOUT_DIR = _real_home() / "work" / "other-repo"
+_FOREIGN_PRODUCTION_DIR = _real_home() / "work" / "production-checkout"
 
 
 def _run_guard(file_path: str, *, pdt_project_dir: str, pdt_formal_repo: str = "",
@@ -148,8 +185,8 @@ def test_allows_write_in_private_tmp(dev_checkout):
 def test_blocks_edit_outside_project_dir_to_production_repo(dev_checkout):
     """The 2026-08-26 incident: project_dir=dev-checkout, but a sub-agent
     must NOT be able to write to the formal/deploy production checkout.
-    Path is derived from ``Path.home()`` rather than hard-coded so the
-    test is portable across developer machines."""
+    Path is derived from the launch home (``_real_home()``) rather than
+    hard-coded so the test is portable across developer machines."""
     target = str(_FOREIGN_CHECKOUT_DIR / "src" / "stock_data" / "data_updater.py")
     rc = _run_guard(target, pdt_project_dir=str(dev_checkout))
     assert rc == 2, \
@@ -168,7 +205,7 @@ def test_blocks_edit_outside_project_dir_to_arbitrary_path(dev_checkout):
 
 def test_blocks_edit_to_formal_ac_repo(dev_checkout):
     """The sub-agent must not be able to edit the backend's own formal repo either.
-    Path derived from ``Path.home()`` rather than hard-coded."""
+    Path derived from the launch home (``_real_home()``) rather than hard-coded."""
     target = str(_FOREIGN_PRODUCTION_DIR / "backend" / "server.py")
     rc = _run_guard(target, pdt_project_dir=str(dev_checkout))
     assert rc == 2, "Edit to the checkout the backend runs from must be blocked"
@@ -193,10 +230,13 @@ def test_blocks_edit_to_sibling_directory(dev_checkout, tmp_path):
     Note: pytest's ``tmp_path`` lives under macOS's ``tempfile.gettempdir()``
     which the guard deliberately allows as scratch space. To assert the
     containment rule for *non-temp* siblings we mount project_dir under
-    the user's $HOME, which is outside tempdir and the checkout the backend runs from.
+    the home this run was launched with, which is outside tempdir and the
+    checkout the backend runs from -- ``_real_home()``, not ``Path.home()``,
+    because the redirected one *is* a tempdir path and would make this case
+    allow the sibling for the wrong reason.
     """
     import shutil
-    parent = Path.home() / ".pdt-guard-tests"
+    parent = _real_home() / ".pdt-guard-tests"
     if parent.exists():
         shutil.rmtree(parent)
     parent.mkdir()
