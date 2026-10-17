@@ -39,7 +39,7 @@ from quota_watchdog import get_shared_quota_watchdog as _shared_quota_watchdog
 # Per-plan LLM-call attribution registry (2026-09-21). Pure logging side
 # channel — record failures must never break a dispatch, so the registry
 # swallows its own errors and we never let them propagate either.
-from usage_registry import current_task_id
+from usage_registry import current_task_id, current_task_is_readonly
 from usage_registry import record_llm_call as _record_usage_entry
 from file_lock_protocol import socket_path
 
@@ -679,6 +679,28 @@ _PLANS_DIR = Path(os.environ.get(
 # fail-open — which is why the declared-file locks are taken inside the
 # executor, where no hook timeout applies.
 #
+# Stage 3 — the read-only task. Containment answers "may this edit ever
+# happen"; the broker answers "may it happen *now*"; this one answers "was
+# this task ever supposed to write at all".
+#
+# A task's ``files_to_modify`` is a contract, and until 2026-10-17 nothing
+# enforced it at the point of the write. A task that declared nothing (or
+# only a sentinel) got its claim set re-derived by sweeping its own prose
+# for file names — per task, so two undeclared siblings produced DISJOINT
+# guessed sets, the conflict graph read that as "no overlap", and the two
+# ran concurrently while touching the same files. The graph orders declared
+# claims, so a wrong claim set is not a missed warning, it is a wrong
+# schedule; the broker was left to serialise the resulting pile-up one
+# unordered acquire at a time, which is how two siblings each holding A and
+# wanting B deadlocked.
+#
+# So the declaration is now checked where it is spent. When it is not a
+# concrete list of paths, the task is read-only and this hook says so on
+# every write. The environment variable is stamped per task (never a
+# process-wide setting), so a read-only sibling does not constrain a task
+# that did declare its files — and, because the refusal happens before the
+# broker acquire, it leaves no lock row behind.
+#
 # The hook script is written to a per-process tmpfile once and re-execed
 # via ``python3 <file>``. This avoids the multi-line-inside-``python3 -c``
 # quoting hazards that bit us in 2026-08-26 (newline-collapsed nested-if
@@ -711,6 +733,27 @@ if rp:
         blocked = inside(rp, fr_r)
 if blocked:
     print("[pdt] refusing to edit outside the project dir: " + rp, file=sys.stderr)
+    sys.exit(2)
+
+# A task whose ``files_to_modify`` is not a concrete list of paths is
+# READ-ONLY. This is the write-time half of the declaration contract
+# (``PDT_READONLY_TASK`` is stamped per task by ``_run_claude_interactive``);
+# the ordering half is ``agent._extract_target_files``.
+#
+# Deliberately BEFORE the broker acquire below. Refusing here costs the
+# task nothing to clean up; refusing after the acquire would leave an entry
+# in the broker table that only the executor's release can drop, and a task
+# that can never complete a write is exactly the kind that gets killed
+# mid-run.
+ro=os.environ.get("PDT_READONLY_TASK","")
+if ro:
+    print('[pdt] task ' + os.environ.get("PDT_LOCK_TASK_ID","?") + ' declared no '
+          'files_to_modify, so it is running READ-ONLY; refusing to edit ' + rp
+          + '. This is not a lock conflict and waiting will not clear it. If this '
+          'task must change files, add those paths (relative to the project '
+          'directory) to its files_to_modify declaration; if it genuinely changes '
+          'nothing, declare ["__NO_FILE_CHANGES__"] instead of leaving the '
+          'declaration out.', file=sys.stderr)
     sys.exit(2)
 
 cli=os.environ.get("PDT_LOCK_CLI","")
@@ -769,6 +812,37 @@ def _ensure_guard_hook_path() -> Path:
 
 
 _GUARD_HOOK_PATH: Optional[Path] = None  # initialised lazily above
+
+
+def _stamp_readonly_task(settings_data: dict, lock_task_id: Optional[str]) -> None:
+    """Tell this sub-agent's guard hook that its task is read-only (2026-10-17).
+
+    The file-declaration contract, enforced at the write: a task whose
+    ``files_to_modify`` is not a concrete list of paths may not Edit/Write
+    anything. The executor computes that verdict and binds it to the
+    per-task context (``usage_registry.plan_usage_context(task_read_only=
+    ...)``); this turns it into the env var the guard script reads.
+
+    Extracted from the settings assembly so the seam can be tested without
+    spawning a CLI. It is the ONLY place ``PDT_READONLY_TASK`` is set.
+
+    Two guards, both deliberate:
+
+    * ``lock_task_id`` must be set. The stamp rides a task context, so a
+      call made outside one — the refiner's own queries, the verification
+      sub-agents — is never marked. That makes the no-task case fail
+      OPEN, matching this hook's existing asymmetric degradation: a false
+      refusal bricks a task that was going to succeed, a missed refusal is
+      merely the status quo.
+    * it never CLEARS the key. ``settings_data`` is rebuilt per dispatch
+      from the pristine template (``_settings_template_cache`` holds the
+      pre-mutation copy), so a read-only task cannot leak the stamp onto
+      the next task that shares this process.
+    """
+    if not lock_task_id:
+        return
+    if current_task_is_readonly():
+        settings_data["env"]["PDT_READONLY_TASK"] = "1"
 
 
 def _build_guard_hook() -> Dict[str, str]:
@@ -2094,6 +2168,7 @@ class ClaudeCodingTool(CodingTool):
                     _THIS_DIR / "file_lock_cli.py"
                 )
                 lock_task_id = current_task_id()
+                _stamp_readonly_task(settings_data, lock_task_id)
                 if lock_task_id:
                     # Lock ownership is keyed by task id, so the executor
                     # can release everything the task acquired — including

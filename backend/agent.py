@@ -1325,13 +1325,16 @@ def _infer_parent_id(task, by_id: dict):
 
 #: Section of a task description that describes deliverables. Same shape
 #: and same rationale as ``TasksGenerator._MOD_SECTION_RE`` /
-#: ``_extraction_scope`` in ``backend/tasks_generator.py`` — keep the two
-#: in lock-step: the generator scopes its ``files_to_modify`` backfill
-#: with this regex, and this module scopes its description fallback with
-#: it. Prose outside the section (背景 / 输入示例 / 边界条件) routinely
-#: *cites* files the task will not touch; reading those as write claims
-#: is what collides with the conflict graph and serialises a whole layer (see
-#: :func:`_declared_modification_files`).
+#: ``_extraction_scope`` in ``backend/tasks_generator.py`` — the GENERATOR
+#: still uses this to backfill ``files_to_modify`` at plan-authoring time.
+#:
+#: 2026-10-17: ``_modification_section`` / ``_MOD_SECTION_RE`` are no
+#: longer called by anything on the execution side — the runtime guard's
+#: prose fallback is gone (see
+#: :func:`AutonomousAgent._extract_target_files`). They are kept rather
+#: than deleted because they are the exact scoping rule the generator
+#: applies, and the two must not be able to drift apart silently if an
+#: execution-side use is ever added back. Currently production-dead.
 _MOD_SECTION_RE = re.compile(r"^##\s*修改位置\s*$(.*?)(?=^##\s|\Z)", re.M | re.S)
 
 
@@ -1356,8 +1359,18 @@ def _declared_modification_files(task) -> Optional[list[str]]:
 
     ``None`` means the declaration is unusable — ``files_to_modify`` is
     absent or carries one of the two sentinels. Callers decide what that
-    implies: the planner gives the task a private conflict key, the
-    runtime guard falls back to scanning the description.
+    implies: the planner gives the task a private conflict key, and the
+    runtime guard (``AutonomousAgent._extract_target_files``) treats it
+    as no claim at all.
+
+    2026-10-17: the runtime guard no longer scans the description when
+    this returns ``None``. It used to, which is the whole reason this
+    helper exists (below) — and which also turned an unusable
+    declaration into a PER-TASK GUESS, so two undeclared siblings got
+    disjoint claim sets and were scheduled as non-conflicting while
+    their real edit surfaces overlapped. Both callers now answer "no
+    claim", and the write-time rule (a task with no concrete declaration
+    is read-only) is what makes that safe.
 
     Why this exists (2026-09-23): the planner keyed on
     ``files_to_modify`` while the runtime guard re-derived the same set
@@ -1957,7 +1970,19 @@ class AutonomousAgent:
         self.git_manager = GitManager(str(project_dir))
         self.retry_manager = RetryManager()
         self.rollback_manager = RollbackManager(str(project_dir))
-        self.refiner = TaskRefiner(self.coding_tool, self.config, logger=logger)
+        # 2026-10-17: ``project_dir`` is what makes the refiner's output
+        # validator exist at all. Without it ``refine()`` computes
+        # ``effective_project_dir=None`` → ``validator=None`` → it returns
+        # the LLM's candidate unvalidated, so the ONLY guard against an
+        # undeclared ``files_to_modify`` (step 3) never ran. Children then
+        # reached dispatch with the unknown-modification sentinel and the
+        # conflict graph had nothing to order them by.
+        self.refiner = TaskRefiner(
+            self.coding_tool,
+            self.config,
+            logger=logger,
+            project_dir=str(project_dir),
+        )
 
         # 2026-10-11 (丁): session-local budget on how many times the
         # refiner may restructure this plan.
@@ -4131,54 +4156,48 @@ class AutonomousAgent:
     def _extract_target_files(self, task: SubTask) -> list[str]:
         """Files a task claims for the runtime conflict-check contract.
 
-        Source order (2026-09-23):
+        ``task.files_to_modify`` via :func:`_declared_modification_files`,
+        and nothing else. That helper is the *same* input
+        :func:`_build_micro_layers` uses to decide which tasks may share a
+        micro layer, so "these two conflict" stays a single definition; its
+        docstring records the 2026-09-23 run where the two disagreed and a
+        task was failed for a claim it never made.
 
-        1. ``task.files_to_modify`` via
-           :func:`_declared_modification_files` — the structured
-           declaration, and the *same* input :func:`_build_micro_layers`
-           uses to decide which tasks may share a micro layer. Reading
-           it here keeps "these two conflict" a single definition; the
-           helper's docstring records the run where the two
-           definitions disagreed and a task was failed for a claim it
-           never made.
-        2. Only when (1) is unknown (absent / sentinel): explicit
-           ``FILE: <path>`` markers, then a heuristic scan for
-           relative source-file paths, so tasks that name files inline
-           still participate in the conflict-check contract.
+        2026-10-17 — the description is no longer a second opinion. This
+        used to fall back, when the declaration was unusable, to ``FILE:``
+        markers and then to a regex sweep of the ``## 修改位置`` section.
+        Two things made that guess actively harmful, and both are the same
+        bug seen from opposite ends:
 
-        The ``FILE:`` marker is an explicit machine-readable
-        declaration and is honoured anywhere in the description. The
-        heuristic scan is prose, so it is restricted to the
-        ``## 修改位置`` section — mirroring ``TasksGenerator``'s
-        ``_extraction_scope`` / ``_backfill_files_to_modify_from_description``
-        in ``backend/tasks_generator.py``. A citation elsewhere
-        ("由既有 ``tests/x.rs`` 承担，本任务不写") must not be read as a
-        write claim; the generator learnt that on 2026-09-15, this
-        guard had not.
+        * It invented claim sets nobody made. A description *citing* a file
+          became a write claim, which is the 2026-09-23 false failure — and
+          which is now simply unnecessary, because the planner never used
+          prose either. Prose-derived sets could only ever make the runtime
+          guard see MORE conflicts than the planner did, never fewer, so
+          every disagreement was a false positive by construction.
+        * The claim set it produced was per-task and, for two siblings with
+          no declaration, DISJOINT. The conflict graph orders declared
+          files; two guessed sets that do not overlap read as "no
+          conflict" and get scheduled together — while their real edit
+          surfaces overlap. The ordering stage cannot help there, and the
+          only remaining backstop was the hook taking the broker lock one
+          edit at a time, unordered, which is how two siblings that both
+          held A and wanted B deadlocked.
+
+        So: an unusable declaration means NO claim, and this returns ``[]``.
+        That is the same answer the planner already gives such a task (it
+        gets a private ``__SENTINEL__#<id>`` key that conflicts with
+        nothing), so the two finally agree instead of disagreeing.
+
+        The invariant that replaces the guess is enforced at the write, not
+        here: a task with no concrete declaration is READ-ONLY and the
+        PreToolUse Edit|Write guard refuses every write it attempts
+        (``PDT_READONLY_TASK`` in ``backend/coding_tool.py``). A task that
+        cannot write has nothing to conflict over, which is why returning
+        ``[]`` here is safe rather than a hole.
         """
         declared = _declared_modification_files(task)
-        if declared is not None:
-            return declared
-
-        files: list[str] = []
-        pattern = re.compile(r"^FILE:\s*(.+)$", re.MULTILINE)
-        for match in pattern.finditer(task.description or ""):
-            path = match.group(1).strip()
-            if path:
-                files.append(path)
-        if files:
-            return files
-
-        fallback = re.compile(
-            r"\b([a-zA-Z0-9_./-]+\.(?:py|js|ts|jsx|tsx|java|kt|go|rs|c|cpp|h|hpp|cs|rb|php|swift|m|mm|ets|yaml|yml|json|toml|md))\b"
-        )
-        seen: set[str] = set()
-        for match in fallback.finditer(_modification_section(task.description or "")):
-            path = match.group(1).strip()
-            if path and path not in seen and not path.startswith("http"):
-                seen.add(path)
-                files.append(path)
-        return files
+        return declared if declared else []
 
     def _pre_task_lock_hook(
         self, task: SubTask
@@ -4474,7 +4493,21 @@ class AutonomousAgent:
                 # task's id for every LLM call the executor makes. The
                 # plan id resolves via the PDT_PLAN_ID env var that
                 # server.py sets on the executor subprocess.
-                with plan_usage_context(task_id=task.id):
+                #
+                # ``task_read_only`` is the same binding carrying the
+                # file-declaration verdict (2026-10-17). Read with the
+                # SAME helper the lock hook's sibling callers use, so
+                # "which files does this task claim" has one answer:
+                # a task that did not name concrete paths cannot write,
+                # and ``coding_tool`` turns that into a per-sub-agent
+                # ``PDT_READONLY_TASK`` the PreToolUse hook refuses on.
+                # Computed here, once, from the task about to run — not
+                # inside the hook — because the hook runs in the spawned
+                # CLI's process and has no access to this object.
+                with plan_usage_context(
+                    task_id=task.id,
+                    task_read_only=not _declared_modification_files(task),
+                ):
                     return self._execute_task_with_retry(
                         task,
                         max_retries=self.config.max_retries,
