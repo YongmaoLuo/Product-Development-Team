@@ -40,10 +40,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
-#: ``{"plan_id": Optional[str], "task_id": Optional[str]}`` — per-thread /
+#: ``{"plan_id": Optional[str], "task_id": Optional[str],
+#: "task_read_only": Optional[bool]}`` — per-thread /
 #: per-async-task attribution context set by server middleware, background
 #: thread entries, and per-task scopes in the executor.
-_plan_ctx: ContextVar[Optional[Dict[str, Optional[str]]]] = ContextVar(
+#:
+#: ``task_read_only`` (2026-10-17) rides here rather than in a module
+#: global because it is a property of ONE task and tasks run concurrently
+#: on separate threads. It shares the context with ``task_id`` for the same
+#: reason it must: the two are read at the same moment, by the same call,
+#: to decide the same task's sub-agent settings — and a global would have
+#: the last task to start silently re-scoping every other running task.
+_plan_ctx: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
     "pdt_plan_usage_ctx", default=None
 )
 
@@ -92,16 +100,43 @@ def current_task_id() -> Optional[str]:
     return (ctx or {}).get("task_id")
 
 
+def current_task_is_readonly() -> bool:
+    """Whether the task in scope declared no concrete files to modify.
+
+    ``False`` outside any task scope. The read-only refusal is the one
+    guard rule that fails OPEN by design (see ``coding_tool``'s
+    ``PDT_READONLY_TASK`` stamp): an unbound context means "no task said
+    anything", which is not the same as "a task said it changes nothing",
+    and the sub-agents that run without a task scope (the refiner's own
+    queries, the verification agents) must keep working.
+    """
+    ctx = _plan_ctx.get()
+    return bool((ctx or {}).get("task_read_only"))
+
+
 @contextmanager
 def plan_usage_context(
-    plan_id: Optional[str] = None, task_id: Optional[str] = None
+    plan_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    task_read_only: Optional[bool] = None,
 ) -> Iterator[None]:
     """Bind LLM calls in this scope to ``plan_id`` / ``task_id``.
 
     Passing ``plan_id=None`` (e.g. only task attribution is known) keeps
     the env ``PDT_PLAN_ID`` fallback alive for plan resolution.
+
+    ``task_read_only`` is the task's file-declaration verdict, computed by
+    the caller from the task it is about to run (see
+    ``agent._declared_modification_files``). Defaulting to ``None`` means
+    "unknown", which :func:`current_task_is_readonly` reads as not
+    read-only — so every pre-existing caller of this helper keeps its old
+    behaviour without having to be edited.
     """
-    token = _plan_ctx.set({"plan_id": plan_id, "task_id": task_id})
+    token = _plan_ctx.set({
+        "plan_id": plan_id,
+        "task_id": task_id,
+        "task_read_only": task_read_only,
+    })
     try:
         yield
     finally:

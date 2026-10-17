@@ -87,6 +87,22 @@ def _lock_file_path(agent, file_path: str) -> Path:
     return lock_file_path(agent._locks_dir, agent.project_dir, file_path)
 
 
+# 2026-10-17 — fixture change, assertion change: NONE.
+#
+# These tests exercise the lock hook's MECHANICS (acquire, release,
+# conflict, in-flight bookkeeping). Every one of them declared its files
+# the old way — a ``FILE:`` marker in the description — because
+# ``_extract_target_files`` used to guess from prose when
+# ``files_to_modify`` carried no usable value.
+#
+# That guess is gone (see ``test_sentinel_task_claims_nothing_and_locks_
+# nothing`` below for why it had to go). The tasks below therefore now
+# carry the declaration explicitly. Every assertion in these tests is
+# byte-for-byte unchanged: they assert the same lock sets, the same
+# RuntimeError, the same in-flight map. Only the way the task SAYS which
+# files it touches changed, which is the whole point of the contract.
+
+
 def test_pre_task_acquires_locks(tmp_path: Path) -> None:
     """Pre-task hook acquires OS-level locks for all target files."""
     project_dir = tmp_path / "project"
@@ -97,6 +113,7 @@ def test_pre_task_acquires_locks(tmp_path: Path) -> None:
         id="1",
         title="lock test",
         description="Modify backend/agent.py and backend/file_lock_manager.py\nFILE: backend/agent.py\nFILE: backend/file_lock_manager.py",
+        files_to_modify=["backend/agent.py", "backend/file_lock_manager.py"],
         test_command="echo ok",
     )
 
@@ -120,6 +137,7 @@ def test_post_task_releases_locks(tmp_path: Path) -> None:
         id="1",
         title="lock test",
         description="FILE: backend/agent.py",
+        files_to_modify=["backend/agent.py"],
         test_command="echo ok",
     )
 
@@ -148,12 +166,14 @@ def test_in_memory_conflict_check(tmp_path: Path) -> None:
         id="A",
         title="first task",
         description="FILE: backend/agent.py",
+        files_to_modify=["backend/agent.py"],
         test_command="echo A",
     )
     task_b = SubTask(
         id="B",
         title="second task",
         description="FILE: backend/agent.py",
+        files_to_modify=["backend/agent.py"],
         test_command="echo B",
     )
 
@@ -184,12 +204,14 @@ def test_in_flight_files_cleared(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         id="A",
         title="first task",
         description="FILE: backend/agent.py\nFILE: backend/file_lock_manager.py",
+        files_to_modify=["backend/agent.py", "backend/file_lock_manager.py"],
         test_command="echo A",
     )
     task_b = SubTask(
         id="B",
         title="second task reusing same files",
         description="FILE: backend/agent.py\nFILE: backend/file_lock_manager.py",
+        files_to_modify=["backend/agent.py", "backend/file_lock_manager.py"],
         test_command="echo B",
     )
 
@@ -218,6 +240,7 @@ def test_in_flight_files_cleared(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         id="C",
         title="exploding task",
         description="FILE: backend/agent.py",
+        files_to_modify=["backend/agent.py"],
         test_command="echo C",
     )
     controller = ProviderConcurrencyController(global_limit=5)
@@ -237,6 +260,7 @@ def test_in_flight_files_cleared(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         id="D",
         title="task after explosion",
         description="FILE: backend/agent.py",
+        files_to_modify=["backend/agent.py"],
         test_command="echo D",
     )
     files_d, manager_d = agent._pre_task_lock_hook(task_d)
@@ -310,6 +334,7 @@ def test_env_var_disables_check(
         id="B",
         title="conflicting task",
         description="FILE: backend/agent.py",
+        files_to_modify=["backend/agent.py"],
         test_command="echo B",
     )
 
@@ -472,14 +497,35 @@ def test_shared_declared_file_still_conflicts(tmp_path: Path) -> None:
         agent._post_task_lock_hook(first.id, files, manager)
 
 
-def test_sentinel_task_still_falls_back_to_the_modification_section(
+def test_sentinel_task_claims_nothing_and_locks_nothing(
     tmp_path: Path,
 ) -> None:
-    """Unknown-file tasks keep the prose fallback — but scoped.
+    """REWRITTEN 2026-10-17 — this used to pin the prose fallback.
 
-    A task with no usable declaration has only its prose, so the scan
-    stays. It must read the ``## 修改位置`` section, not the whole
-    description, or a citation in 边界条件 becomes a write claim again.
+    Before: a task with no usable declaration had its claim set re-derived
+    by scanning ``FILE:`` markers and then the ``## 修改位置`` section,
+    and this test asserted exactly that (``files ==
+    ["backend/file_lock_manager.py"]``).
+
+    It had to be rewritten, not kept, because the fallback was the bug.
+    A guess is per-task, so two undeclared siblings produced DISJOINT
+    guessed claim sets; the conflict graph orders *declared* claims, so
+    disjoint guesses read as "no conflict" and the pair was scheduled
+    together while their real edit surfaces overlapped. The graph cannot
+    fix a wrong claim set — it faithfully schedules one.
+
+    The citation-vs-claim bug this file's other tests (2026-09-23) were
+    written for does not come back with the fallback gone: there is no
+    longer any path from prose to a claim, so prose cannot be misread as
+    a claim. ``test_declared_files_win_over_description_citation`` and
+    ``test_parallel_tasks_with_disjoint_declarations_do_not_conflict``
+    still hold unchanged.
+
+    What replaces the guess is the write-time rule: a task with no
+    concrete declaration is READ-ONLY and its Edit/Write is refused
+    (``PDT_READONLY_TASK``, see ``test_readonly_task_guard_hook.py``). A
+    task that cannot write has nothing to conflict over, which is what
+    makes an empty claim set safe rather than a hole.
     """
     project_dir = tmp_path / "project"
     _git_init(project_dir)
@@ -497,10 +543,16 @@ def test_sentinel_task_still_falls_back_to_the_modification_section(
         test_command="echo ok",
     )
 
+    # The declaration is unusable, so there is no claim set at all —
+    # including the file the 修改位置 section names.
+    assert agent._extract_target_files(task) == []
+
     files, manager = agent._pre_task_lock_hook(task)
     try:
-        assert files == ["backend/file_lock_manager.py"]
-        assert "backend/agent.py" not in files
+        assert files == [], (
+            "an undeclared task must take no lock: it is read-only, and a "
+            "lock taken on a guess is the deadlock this rule removes"
+        )
     finally:
         agent._post_task_lock_hook(task.id, files, manager)
 
@@ -603,6 +655,7 @@ def test_active_broker_never_starts_one(tmp_path: Path) -> None:
         id="1",
         title="lock test",
         description="FILE: backend/agent.py",
+        files_to_modify=["backend/agent.py"],
         test_command="echo ok",
     )
     files, manager = agent._pre_task_lock_hook(task)
