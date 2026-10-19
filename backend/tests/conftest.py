@@ -57,6 +57,8 @@ _LOCK_ROOT = _HERMETIC_ENV.lock_root
 _SUBAGENT_ROOT = _HERMETIC_ENV.subagent_root
 _HOME_ROOT = _HERMETIC_ENV.home_root
 _HOME_ROOT_OWNER_PID = _HERMETIC_ENV.home_root_owner_pid
+_LOCK_ROOT_OWNER_PID = _HERMETIC_ENV.lock_root_owner_pid
+_STATE_ROOT_OWNER_PID = _HERMETIC_ENV.state_root_owner_pid
 _XDIST_WORKER = xdist_worker_id()
 
 
@@ -151,10 +153,15 @@ def pytest_sessionfinish(session, exitstatus) -> None:
     # session fixture is ever instantiated in it, and its directory would
     # otherwise be the one directory per run that survives — which is the
     # leak the idempotency note above exists to prevent, reintroduced by the
-    # fix for it.
+    # fix for it.  Each removal is additionally gated on having minted the
+    # root: this block already runs only in the controller, but the guard is
+    # what makes "the process that owns it" the rule rather than "the process
+    # that got here first", which is what a nested session inherits from us.
     if not _XDIST_WORKER:
-        shutil.rmtree(_TEST_STATE_DB_DIR, ignore_errors=True)
-        shutil.rmtree(_LOCK_ROOT, ignore_errors=True)
+        if os.getpid() == _STATE_ROOT_OWNER_PID:
+            shutil.rmtree(_TEST_STATE_DB_DIR, ignore_errors=True)
+        if os.getpid() == _LOCK_ROOT_OWNER_PID:
+            shutil.rmtree(_LOCK_ROOT, ignore_errors=True)
         # Only the process that minted this root removes it: a nested pytest
         # session inherits ``PDT_TEST_FAKE_HOME`` and reuses this directory,
         # so an unconditional removal here would delete the CC Switch database
@@ -310,8 +317,17 @@ def _hermetic_state_db_dir():
     _TEST_STATE_DB_DIR.mkdir(parents=True, exist_ok=True)
     (_TEST_STATE_DB_DIR / "plans").mkdir(parents=True, exist_ok=True)
     yield _TEST_STATE_DB_DIR
-    shutil.rmtree(_TEST_STATE_DB_DIR, ignore_errors=True)
-    shutil.rmtree(_LOCK_ROOT, ignore_errors=True)
+    # Only the process that minted a root removes it.  Under xdist this
+    # fixture is instantiated once *per worker*, and every worker inherited
+    # one ``PDT_LOCK_ROOT`` from the controller -- so the unconditional
+    # removal this replaced deleted the live broker sockets of the workers
+    # still running, which surfaces as "[pdt-lock] broker unavailable
+    # (exit 4)".  A worker owns the state directory (it minted or scoped it
+    # to its own worker id) but not the lock root.
+    if os.getpid() == _STATE_ROOT_OWNER_PID:
+        shutil.rmtree(_TEST_STATE_DB_DIR, ignore_errors=True)
+    if os.getpid() == _LOCK_ROOT_OWNER_PID:
+        shutil.rmtree(_LOCK_ROOT, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

@@ -95,8 +95,10 @@ def pytest_sessionfinish(session, exitstatus) -> None:
     which has an id, does remove its own scoped root.
     """
     if not _XDIST_WORKER:
-        shutil.rmtree(_HERMETIC_ENV.state_db_dir, ignore_errors=True)
-        shutil.rmtree(_HERMETIC_ENV.lock_root, ignore_errors=True)
+        if os.getpid() == _HERMETIC_ENV.state_root_owner_pid:
+            shutil.rmtree(_HERMETIC_ENV.state_db_dir, ignore_errors=True)
+        if os.getpid() == _HERMETIC_ENV.lock_root_owner_pid:
+            shutil.rmtree(_HERMETIC_ENV.lock_root, ignore_errors=True)
         # Owner-scoped for the reason in ``backend/tests/conftest.py``: a
         # nested pytest session inherits this root and must not delete it.
         if os.getpid() == _HERMETIC_ENV.home_root_owner_pid:
@@ -118,8 +120,15 @@ def _hermetic_state_db_dir():
     _HERMETIC_ENV.state_db_dir.mkdir(parents=True, exist_ok=True)
     (_HERMETIC_ENV.state_db_dir / "plans").mkdir(parents=True, exist_ok=True)
     yield _HERMETIC_ENV.state_db_dir
-    shutil.rmtree(_HERMETIC_ENV.state_db_dir, ignore_errors=True)
-    shutil.rmtree(_HERMETIC_ENV.lock_root, ignore_errors=True)
+    # Owner-scoped for the reason in ``backend/tests/conftest.py``: this
+    # fixture is instantiated once per xdist worker, and every worker
+    # inherited one shared ``PDT_LOCK_ROOT`` from the controller, so an
+    # unconditional removal here deleted the broker sockets of the workers
+    # still running.  A worker owns its own state root but not the lock root.
+    if os.getpid() == _HERMETIC_ENV.state_root_owner_pid:
+        shutil.rmtree(_HERMETIC_ENV.state_db_dir, ignore_errors=True)
+    if os.getpid() == _HERMETIC_ENV.lock_root_owner_pid:
+        shutil.rmtree(_HERMETIC_ENV.lock_root, ignore_errors=True)
 # ---------------------------------------------------------------------------
 # Constants — kept in sync with test_json_static_gate.py
 # ---------------------------------------------------------------------------

@@ -88,6 +88,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 # The database is named and redirected through the one resolver, exactly as
 # every other module that opens it does.  ``test_state_db_path_has_one_resolver``
@@ -133,6 +134,24 @@ class HermeticEnv:
     subagent_root: Path
     home_root: Path
     home_root_owner_pid: int
+
+    #: PID that minted ``lock_root`` / ``state_db_dir`` in this process, or
+    #: ``None`` when this process merely inherited them.  Only the minter may
+    #: remove them: under xdist every worker inherits one shared
+    #: ``PDT_LOCK_ROOT``, and a worker that removes it deletes the broker
+    #: sockets of the workers still running.
+    lock_root_owner_pid: Optional[int]
+    state_root_owner_pid: Optional[int]
+
+
+#: The environment installed in *this* process.  Ownership of a scratch root
+#: is a fact about the process that minted it, so it has to be remembered
+#: rather than re-derived: a second call sees ``PDT_LOCK_ROOT`` already set
+#: and could only conclude "someone else minted it", losing the answer for
+#: the caller that did the minting.  The cache is per-process -- an xdist
+#: worker or a nested session re-enters with ``None`` and records its own
+#: (non-)ownership, which is exactly the case the rule is about.
+_INSTALLED_ENV: Optional[HermeticEnv] = None
 
 
 def install_request_guard_header() -> None:
@@ -218,6 +237,10 @@ def install_hermetic_env() -> HermeticEnv:
     reasoning travelled with the rule when it was lifted out of
     ``backend/tests/conftest.py``.
     """
+    global _INSTALLED_ENV
+    if _INSTALLED_ENV is not None:
+        return _INSTALLED_ENV
+
     # Prevent a shell-provided CC Switch proxy URL from leaking into tests
     # that exercise provider-specific routing.
     os.environ.pop("ANTHROPIC_BASE_URL", None)
@@ -305,14 +328,17 @@ def install_hermetic_env() -> HermeticEnv:
     #   * a serial run, which has no worker id, mints once and reuses.
     xdist_worker = os.environ.get("PYTEST_XDIST_WORKER") or ""
     session_root_owner = "_PDT_TEST_SESSION_ROOT_OWNER"
+    state_root_owner_pid = None
     if not os.environ.get("PDT_TEST_SESSION_ROOT"):
         os.environ["PDT_TEST_SESSION_ROOT"] = tempfile.mkdtemp(prefix="ac-test-state-")
         os.environ[session_root_owner] = ""
+        state_root_owner_pid = os.getpid()
     elif xdist_worker and os.environ.get(session_root_owner) != xdist_worker:
         worker_state_db_dir = Path(os.environ["PDT_TEST_SESSION_ROOT"]) / xdist_worker
         worker_state_db_dir.mkdir(parents=True, exist_ok=True)
         os.environ["PDT_TEST_SESSION_ROOT"] = str(worker_state_db_dir)
         os.environ[session_root_owner] = xdist_worker
+        state_root_owner_pid = os.getpid()
     state_db_dir = Path(os.environ["PDT_TEST_SESSION_ROOT"])
 
     # ``setdefault`` rather than ``[...] = ...``: the sibling tree's conftest
@@ -364,6 +390,9 @@ def install_hermetic_env() -> HermeticEnv:
     # docstring exists to warn about.
     if not os.environ.get("PDT_LOCK_ROOT"):
         os.environ["PDT_LOCK_ROOT"] = tempfile.mkdtemp(prefix="lk-")
+        lock_root_owner_pid = os.getpid()
+    else:
+        lock_root_owner_pid = None
     lock_root = Path(os.environ["PDT_LOCK_ROOT"])
 
     # The broker socket is the second half of the pair above, and it needs the
@@ -537,13 +566,17 @@ def install_hermetic_env() -> HermeticEnv:
                 if candidate.is_dir():
                     os.environ[var] = str(candidate)
 
-    return HermeticEnv(
+    env = HermeticEnv(
         state_db_dir=state_db_dir,
         lock_root=lock_root,
         subagent_root=subagent_root,
         home_root=home_root,
         home_root_owner_pid=home_root_owner_pid,
+        lock_root_owner_pid=lock_root_owner_pid,
+        state_root_owner_pid=state_root_owner_pid,
     )
+    _INSTALLED_ENV = env
+    return env
 
 
 def xdist_worker_id() -> str:
