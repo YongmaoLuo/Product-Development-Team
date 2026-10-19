@@ -38,7 +38,38 @@ _executor_file_format: |
 
 # Common refiner failure handling rules
 _refiner_failure_rules: |
-  CRITICAL: If the last task FAILED, you MUST:
+  SPLIT GATE — READ THE [FAILURE CLASSIFICATION] BLOCK FIRST.
+  The refinement context carries a block with `kind`, `signature`,
+  `occurrences_in_lineage` and `split_allowed`.
+  1. If `split_allowed` is false, do NOT split. Keep the task as a single
+     item (you may clarify its description or test_command), and say in the
+     description that an operator should look at it.
+  2. Only when `split_allowed` is true may you replace the failed task with
+     smaller subtasks.
+  3. `kind: report_format` means the previous answer's evidence or report
+     shape was rejected — the code may already be correct. Do not treat it
+     as evidence that the task is too large.
+  4. `kind: infra` (timeouts, provider errors) is not a task-decomposition
+     problem. Do not split it.
+  5. "Do not split" always wins over any instruction below that says to
+     break down a failed task.
+  6. kind: lock_conflict — two tasks contended for the same files. Splitting
+     the task does not remove the contention; the declaration or the
+     schedule must change. Do not split.
+  7. kind: undeclared_write — the task tried to write a path it did not
+     declare, and the write was refused. Do not split the task into smaller
+     versions of the same work. Instead add ONE targeted task whose
+     files_to_modify names exactly the refused path (taken from the
+     classification block's `detail`), with a description of the specific
+     change it must make. Make it a dependency of the original task if the
+     original work cannot continue until that file is touched; otherwise
+     leave both pending and independent. The original task may then run
+     again with its unchanged declaration.
+  If the context does NOT contain a [FAILURE CLASSIFICATION] block, this is a
+  timeout / legacy refinement: keep the historical rule below and break the
+  task down when smaller subtasks can plausibly help.
+
+  IF `split_allowed` IS TRUE, you MUST:
   1. Analyze the error output and the implementation attempt to understand the root cause.
   2. Break down the failed task into smaller, more manageable, and more specific subtasks that address the root cause of the failure.
   3. Generate hierarchical IDs for the new subtasks. For example, if task "2" failed, create subtasks like "2-1", "2-2", "2-3".

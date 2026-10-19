@@ -93,6 +93,15 @@ TIMED_OUT = "timeout"
 #: the sub-agent could never resolve by waiting.
 UNAVAILABLE = "unavailable"
 
+#: The broker proved the wait could never end: following holder -> its own
+#: wait -> that wait's holder came back to the requester. Distinct from
+#: :data:`TIMED_OUT` because the remedy differs — a timeout means "nobody
+#: arrived in time, try again", a deadlock means "this exact arrangement
+#: can never make progress, and no amount of waiting or retrying will
+#: change that". Folding them together would make the caller retry a
+#: configuration that is guaranteed to fail.
+DEADLOCK = "deadlock"
+
 
 class LockBrokerUnavailable(RuntimeError):
     """The broker could not be reached, or answered something unusable.
@@ -297,7 +306,7 @@ def acquire(
     """Ask the broker for ``target`` on behalf of ``task_id``.
 
     Returns one of :data:`ACQUIRED`, :data:`ALREADY_HELD`,
-    :data:`TIMED_OUT`.
+    :data:`TIMED_OUT`, :data:`DEADLOCK`.
 
     The socket timeout is ``timeout`` plus a margin: the broker holds the
     connection open for the whole queue wait, so a client that gave up
@@ -314,6 +323,8 @@ def acquire(
         reason = reply.get("reason") or "unknown"
         if reason == TIMED_OUT:
             return TIMED_OUT
+        if reason == DEADLOCK:
+            return DEADLOCK
         if reason == UNAVAILABLE:
             detail = reply.get("detail") or "broker cannot lock this path"
             raise LockBrokerUnavailable(str(detail))

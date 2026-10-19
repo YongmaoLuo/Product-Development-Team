@@ -40,11 +40,29 @@ keeps its place at the head of the queue and polls until its deadline.
 Known limitation
 ----------------
 A task that holds key A and waits for key B while another task holds B
-and waits for A will deadlock until the acquire timeout expires. Batch
+and waits for A used to deadlock until the acquire timeout expired. Batch
 acquisition at task start is sorted (``FileLockManager`` does this) to
-keep the common path ordered; incremental mid-task acquisition cannot be
-ordered in general. The timeout is the backstop, and the executor treats
-an unacquirable declared file as a task failure rather than hanging.
+keep the common path ordered, and the structural fix (2026-10-19) is that
+the *touched* set must be a subset of the *declared* set, so a task's
+lock set is fixed before it runs and there is no incremental acquisition
+to interleave. But that invariant is enforced at the write point by one
+guard script, not by this class: a directory declaration, a future
+sub-agent entry point that acquires on its own, or anything that reaches
+:meth:`acquire` mid-task can still build a cycle. So the broker also
+*detects* it: :meth:`_deadlock_cycle` walks holder -> its wait -> that
+wait's holder, and a request that closes the loop gets
+:data:`~file_lock_protocol.DEADLOCK` immediately instead of burning the
+full timeout.
+
+The detector only sees tasks *this broker* is serving. A cross-process
+holder reached through the raw ``flock`` exposes no waiting edge, so it
+cannot appear in the chain — but it does not need to: the same
+sorted-plus-atomic protocol that makes layer 1 hold applies to any
+process that follows it, because it needs no shared wait-for state, only
+the ordering and the all-or-nothing acquisition. A process that does not
+follow the protocol, or that this lock does not bound at all, is outside
+every scheme available here; guessing at a foreign process's intent from
+polling would be a fabrication, not a fix.
 
 Why this holds raw ``flock`` instead of reusing ``filelock``
 -----------------------------------------------------------
@@ -90,6 +108,7 @@ except ImportError:  # pragma: no cover - Windows
 from file_lock_protocol import (
     ACQUIRED,
     ALREADY_HELD,
+    DEADLOCK,
     TIMED_OUT,
     UNAVAILABLE,
     LockBrokerUnavailable,
@@ -157,6 +176,10 @@ class FileLockBroker:
         self._held: Dict[str, Dict[str, int]] = {}
         #: canonical key -> FIFO queue of task ids waiting for it
         self._waiting: Dict[str, List[str]] = {}
+        #: task id -> the key it is currently blocked on. The wait-for
+        #: edge the deadlock walk follows; absent for a task that is
+        #: holding locks and not waiting on anything.
+        self._waiting_for: Dict[str, str] = {}
 
         self._sock_path = socket_path(self.project_dir)
         self._server: Optional[socket.socket] = None
@@ -345,6 +368,7 @@ class FileLockBroker:
                     "ok": True,
                     "held": {t: sorted(k) for t, k in self._held.items()},
                     "waiting": {k: list(v) for k, v in self._waiting.items()},
+                    "waiting_for": dict(self._waiting_for),
                 }
         task_id = req.get("task_id")
         if not isinstance(task_id, str) or not task_id:
@@ -359,6 +383,8 @@ class FileLockBroker:
             state = self.acquire(task_id, target, timeout)
             if state == TIMED_OUT:
                 return {"ok": False, "reason": TIMED_OUT}
+            if state == DEADLOCK:
+                return {"ok": False, "reason": DEADLOCK}
             if state == UNAVAILABLE:
                 return {"ok": False, "reason": UNAVAILABLE}
             return {"ok": True, "state": state}
@@ -377,7 +403,8 @@ class FileLockBroker:
 
         Returns :data:`ACQUIRED`, :data:`ALREADY_HELD` (this task already
         holds it — the mid-task re-edit case, which must not deadlock on
-        its own lock), or :data:`TIMED_OUT`.
+        its own lock), :data:`DEADLOCK` (this wait provably can never end),
+        or :data:`TIMED_OUT`.
         """
         timeout = self.default_timeout if timeout is None else float(timeout)
         key = normalize_target(self.project_dir, target)
@@ -397,6 +424,7 @@ class FileLockBroker:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self._drop_waiter_locked(key, task_id)
+                    self._waiting_for.pop(task_id, None)
                     self._cond.notify_all()
                     self._emit(
                         "file_lock_timeout",
@@ -406,10 +434,48 @@ class FileLockBroker:
                     return TIMED_OUT
                 if not waited:
                     waited = True
+                    # Publish the edge BEFORE the first block, so the
+                    # holder of ``key`` sees a wait-for link to us and the
+                    # cycle walk can close a loop through it.
+                    self._waiting_for[task_id] = key
                     self._emit(
                         "file_lock_wait",
                         {"task_id": task_id, "key": key, "held_by": holder},
                     )
+                    cycle = self._deadlock_cycle(task_id, key)
+                    if cycle is not None:
+                        # Provably stuck: nobody in the chain will release
+                        # first, so the timeout would only convert a
+                        # certain failure into a 300-second one.
+                        self._drop_waiter_locked(key, task_id)
+                        self._waiting_for.pop(task_id, None)
+                        self._cond.notify_all()
+                        self._emit(
+                            "file_lock_deadlock",
+                            {"task_id": task_id, "key": key,
+                             "held_by": holder, "cycle": cycle,
+                             # The whole wait-for graph, not just the
+                             # one cycle. The cycle names the two tasks
+                             # that are wedged; these three say what
+                             # everything else in the run is holding and
+                             # queueing for, which is what an operator
+                             # needs to tell "this pair is deadlocked"
+                             # from "the whole plan is starved behind
+                             # them". Built here, under ``_cond``, and
+                             # copied (never aliased) so the JSON that
+                             # leaves this call cannot be mutated by the
+                             # next acquire.
+                             "held": {
+                                 t: sorted(k)
+                                 for t, k in self._held.items()
+                             },
+                             "waiting": {
+                                 k: list(v)
+                                 for k, v in self._waiting.items()
+                             },
+                             "waiting_for": dict(self._waiting_for)},
+                        )
+                        return DEADLOCK
                 # Notify-driven, with a poll backstop: a missed wake-up
                 # would otherwise park the task until its deadline.
                 self._cond.wait(min(remaining, _TURN_POLL_SECONDS))
@@ -437,6 +503,7 @@ class FileLockBroker:
                 # edit that nobody is competing for.
                 with self._cond:
                     self._drop_waiter_locked(key, task_id)
+                    self._waiting_for.pop(task_id, None)
                     self._cond.notify_all()
                 self._emit(
                     "file_lock_unavailable",
@@ -447,6 +514,7 @@ class FileLockBroker:
 
         with self._cond:
             self._drop_waiter_locked(key, task_id)
+            self._waiting_for.pop(task_id, None)
             if fd is not None:
                 self._held.setdefault(task_id, {})[key] = fd
             self._cond.notify_all()
@@ -484,6 +552,41 @@ class FileLockBroker:
             if key in locks:
                 return task_id
         return None
+
+    def _deadlock_cycle(self, task_id: str, key: str) -> Optional[List[str]]:
+        """Follow holder -> its waiting key -> that key's holder ...
+
+        Returns the closed chain when ``task_id``'s new wait makes the
+        wait-for graph cyclic, else ``None``.
+
+        The walk terminates on three conditions, and each one is a
+        genuine "no cycle": the key is unheld (its holder will release
+        and we are merely queued behind work that ends), the chain leads
+        back to the requester itself (that IS the cycle), or a task in
+        the chain is waiting for nothing — it is holding, or between
+        acquisitions, so it is not blocked and can still make progress.
+        A task repeated without closing the loop is the third case
+        arriving late; returning ``None`` for it is correct (that task's
+        upstream edge is the real terminator) and stops the walk from
+        running away on a long chain.
+        """
+        chain = [task_id]
+        seen = set()
+        cur_key = key
+        while True:
+            holder = self._holder_locked(cur_key)
+            if holder is None:
+                return None
+            if holder == task_id:
+                return chain + [task_id]
+            if holder in seen:
+                return None
+            seen.add(holder)
+            chain.append(holder)
+            nxt = self._waiting_for.get(holder)
+            if not nxt:
+                return None
+            cur_key = nxt
 
     def _drop_waiter_locked(self, key: str, task_id: str) -> None:
         waiters = self._waiting.get(key)

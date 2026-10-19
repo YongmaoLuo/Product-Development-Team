@@ -13,6 +13,7 @@ import json
 import time
 import threading
 import logging
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
@@ -47,6 +48,12 @@ from test_command_quality import find_vacuous_pass as _find_vacuous_pass
 from test_command_quality import check_falsifiable as _check_falsifiable
 from config import AgentConfig
 from config_registry import ConfigRegistry
+from failure_classification import (
+    REPORT_FORMAT,
+    Failure,
+    classify_failure,
+    is_split_allowed,
+)
 from retry_manager import RetryManager
 from background_manager import BackgroundManager
 from rollback_manager import RollbackManager
@@ -65,6 +72,7 @@ from file_lock_manager import FileLockManager
 from file_lock_protocol import (
     ACQUIRED,
     ALREADY_HELD,
+    DEADLOCK,
     TIMED_OUT,
     fallback_locks_dir,
     locks_dir_for_plan,
@@ -2006,6 +2014,23 @@ class AutonomousAgent:
         # surfaces, which is the right trade — an unbounded tail of
         # invented tasks is strictly worse than a plan that stops.
         self._refinement_count = 0
+
+        # 2026-10-19 — the split gate. ``_refinement_count`` above
+        # bounds HOW MANY times the run may refine; it says nothing
+        # about WHETHER a given failure deserves a refinement. This
+        # table is keyed ``"<lineage>:<signature>"`` and answers that
+        # question: the refiner only splits a task on the SECOND
+        # occurrence of one specific failure, the first occurrence
+        # buys the subagent one more iteration instead.
+        #
+        # The lineage prefix (the part of the id before the first "-")
+        # is what makes this survive a split: ``3`` -> ``3-1``/``3-2``
+        # are the SAME work, so the same rejected report shape
+        # recurred in a child is a repeat, not a fresh first
+        # occurrence. Keyed by raw task id it would reset on every
+        # level and the gate would never open — which is precisely the
+        # runaway this replaces.
+        self._failure_occurrences: Dict[str, int] = {}
 
         # Architecture decision points 1 & 2 — the dispatcher
         # only modifies runtime state fields, and writes go through
@@ -4228,8 +4253,9 @@ class AutonomousAgent:
 
         Raises:
             RuntimeError: If any target file is already recorded in
-                ``self._in_flight_files``, or if a declared file cannot be
-                locked within the acquire timeout.
+                ``self._in_flight_files``, if a declared path is a
+                directory, or if a declared file cannot be locked within
+                the acquire timeout (or deadlocks while trying).
         """
         files = self._extract_target_files(task)
         broker = self._active_lock_broker()
@@ -4251,6 +4277,28 @@ class AutonomousAgent:
             if broker is None:
                 return [], FileLockManager()
             return [], BrokerTaskHandle(broker, task.id)
+
+        # A directory is not a lock key and must not become one.
+        # ``files_to_modify`` is a list of FILES, and the guard hook
+        # (2026-10-19) matches declarations exactly — a directory can
+        # never match the concrete path the sub-agent ends up editing.
+        # So a directory entry is neither a usable lock nor a usable
+        # permission: it is a declaration the task cannot honour. Fail
+        # here, before acquiring anything, rather than lock a name that
+        # protects no file and refuse every write it should have allowed.
+        directories = [
+            f for f in files
+            if os.path.isdir(os.path.join(str(self.project_dir), f))
+        ]
+        if directories:
+            raise RuntimeError(
+                "files_to_modify must name files, not directories: "
+                + ", ".join(sorted(directories)[:5])
+                + ". A directory cannot be locked (a lock is taken on one "
+                "file) and cannot authorise a write (declarations are "
+                "matched exactly), so naming one silently grants nothing. "
+                "List every file the task will change instead."
+            )
 
         disable_in_flight_check = os.environ.get("PDT_DISABLE_IN_FLIGHT_CHECK") == "1"
         with self._in_flight_lock:
@@ -4275,6 +4323,17 @@ class AutonomousAgent:
                     state = broker.acquire(
                         task.id, file_path, self._lock_acquire_timeout()
                     )
+                    if state == DEADLOCK:
+                        # Kept apart from TIMED_OUT on purpose. A timeout
+                        # means "busy, and it may end"; a deadlock means the
+                        # broker proved the wait cannot end, so the two
+                        # demand different responses and the retry /
+                        # classification below must not see them as one.
+                        raise RuntimeError(
+                            f"File lock deadlock while acquiring {file_path}: "
+                            f"another task holds it and is itself waiting on "
+                            f"a file this task holds"
+                        )
                     if state == TIMED_OUT:
                         raise RuntimeError(
                             f"File lock timeout after "
@@ -4507,6 +4566,14 @@ class AutonomousAgent:
                 with plan_usage_context(
                     task_id=task.id,
                     task_read_only=not _declared_modification_files(task),
+                    # The same declaration, as a permission slip
+                    # (2026-10-19). ``task_read_only`` says "this task
+                    # may write nothing"; this says "this task may write
+                    # exactly these". Both come from ONE helper, so the
+                    # claim the conflict graph orders and the permission
+                    # the Edit/Write guard enforces cannot drift — which
+                    # is the drift that produced the AB-BA deadlock.
+                    task_allowed_files=_declared_modification_files(task),
                 ):
                     return self._execute_task_with_retry(
                         task,
@@ -4735,14 +4802,31 @@ class AutonomousAgent:
         # ~0.4s.
         task_session = JsonSession()
 
-        for attempt in range(max_retries):
+        # 2026-10-19 — the split gate's retry budget. The loop still
+        # runs ``max_retries`` attempts by default, exactly as before;
+        # the range simply leaves room for ONE extra iteration, granted
+        # by the tail only when a failure is seen for the first time in
+        # its lineage (see ``_note_failure``). A first occurrence means
+        # "this one answer was wrong", not "this task is too big", so
+        # the honest response is another shot at the answer. A second,
+        # identical occurrence is what a split may be weighed against.
+        #
+        # The bound below keeps the rendered "Attempt X/N" in step with
+        # the loop: once the extra attempt is granted the denominator
+        # grows with it, so the subagent is never told it is on attempt
+        # 3 of 2.
+        extra_attempt_granted = False
+        for attempt in range(max_retries + 1):
+            if attempt >= max_retries and not extra_attempt_granted:
+                break
+            attempt_bound = max_retries + (1 if extra_attempt_granted else 0)
             try:
-                print(f"\n--- Processing Task [{task.id}] (Attempt {attempt + 1}/{max_retries}): {task.title} ---")
+                print(f"\n--- Processing Task [{task.id}] (Attempt {attempt + 1}/{attempt_bound}): {task.title} ---")
                 if self.logger:
-                    self.logger.info("task_started", f"Processing Task [{task.id}] attempt {attempt + 1}/{max_retries}",
+                    self.logger.info("task_started", f"Processing Task [{task.id}] attempt {attempt + 1}/{attempt_bound}",
                                      task_id=task.id, phase="task_execution",
                                      data={"title": task.title, "attempt": attempt + 1,
-                                           "max_retries": max_retries})
+                                           "max_retries": attempt_bound})
                 self.task_manager.update_task_status(task.id, "in_progress")
 
                 # Get context and add retry modifier if this is a retry.
@@ -4783,7 +4867,7 @@ class AutonomousAgent:
                     # hard-coded 5 that disagreed with the 2 the loop
                     # actually runs.
                     retry_modifier = self.retry_manager.get_retry_prompt_modifier(
-                        task.id, max_retries
+                        task.id, attempt_bound
                     )
                     context += retry_modifier
 
@@ -5341,23 +5425,91 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                             if attempt < max_retries - 1:
                                 # The next loop iteration will call
                                 # ``get_retry_prompt_modifier(task.id,
-                                # max_retries)`` and inject the actionable
-                                # empty-diff hint into the subagent's
-                                # system prompt. We do NOT ``continue``
-                                # here because we're inside an inner
-                                # ``else`` — the outer ``for attempt in
-                                # range(max_retries)`` loop will iterate.
+                                # attempt_bound)`` and inject the
+                                # actionable empty-diff hint into the
+                                # subagent's system prompt. We do NOT
+                                # ``continue`` here because we're inside
+                                # an inner ``else`` — the outer ``for
+                                # attempt in range(...)`` loop will
+                                # iterate.
                                 continue
-                            # All in-run retries exhausted on the
-                            # empty-diff path — same downstream treatment
-                            # as the test-failed branch: refine the task
-                            # list once, mark as failed, return False.
+                            # The configured retries are spent on the
+                            # empty-diff path. 2026-10-19: before
+                            # splitting, find out whether this is the
+                            # FIRST time this task has produced
+                            # nothing. Producing an empty diff is a
+                            # report-shape problem — the subagent wrote
+                            # commentary instead of calling Edit — and
+                            # decomposing a task cannot make a
+                            # subagent start using its tools. Buy one
+                            # more iteration with an explicit
+                            # instruction instead.
+                            #
+                            # 2026-10-19: a refused undeclared write is
+                            # not an empty diff — it is a WRITE CONTRACT
+                            # failure, and reading it as "the subagent
+                            # wrote nothing" hides the only fact that can
+                            # fix it. Drain the guard's marker first so
+                            # the classification sees the real cause.
+                            refused = self._take_undeclared_writes(task.id)
+                            if refused:
+                                error_msg = "undeclared_write: " + ", ".join(
+                                    refused[:5]
+                                )
+                            failure, occurrence = self._note_failure(
+                                task, error_msg,
+                            )
+                            if occurrence == 1 and not extra_attempt_granted:
+                                extra_attempt_granted = True
+                                # Record the ORIGINAL sentinel, not a
+                                # ``report_format_retry:`` line. Both
+                                # tails share this gate, but only one of
+                                # them is right for the subagent:
+                                # ``get_retry_prompt_modifier`` matches on
+                                # the prefix, and ``report_format_retry:``
+                                # would overwrite the ``empty_diff_no_changes``
+                                # branch — the one hint that actually says
+                                # "use Edit/Write, then check
+                                # ``git diff --stat``" — with "this is not
+                                # a code problem, do not restructure the
+                                # task", which is the exact opposite of
+                                # what an empty diff needs. ``error_msg``
+                                # already carries the sentinel prefix, so
+                                # recording it verbatim keeps that chain
+                                # intact.
+                                self.retry_manager.record_attempt(
+                                    task.id, error_msg, False,
+                                )
+                                if self.logger:
+                                    self.logger.info(
+                                        "failure_first_occurrence_retry",
+                                        (
+                                            f"Task [{task.id}] produced an "
+                                            f"empty diff for the first time; "
+                                            f"granting one more attempt "
+                                            f"instead of splitting it."
+                                        ),
+                                        task_id=task.id,
+                                        data={
+                                            "kind": failure.kind,
+                                            "signature": failure.signature,
+                                            "occurrence": occurrence,
+                                        },
+                                    )
+                                continue
+
+                            # A repeat occurrence (or an exhausted extra
+                            # attempt): same downstream treatment as the
+                            # test-failed branch — refine once, mark as
+                            # failed, return False.
                             self._refine_after_failure(
                                 task=task,
                                 coder_response="",
                                 result_context=error_msg,
                                 file_context="",
                                 exit_code=1,
+                                failure=failure,
+                                occurrence=occurrence,
                             )
                             self.task_manager.record_task_failure(
                                 task.id, error_msg,
@@ -5555,7 +5707,83 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     # No-bulk-context contract: pass file_context=""
                     # to the refiner. The refiner is a planner and
                     # must never receive a repository-wide snapshot.
-                    self._refine_after_failure(task, coder_response, result_context, "", 1)
+                    #
+                    # 2026-10-19 — the split gate, same shape as the
+                    # empty-diff tail. ``test_reason`` is the
+                    # cross-verify verdict and is frequently a REPORT
+                    # rejection rather than a test failure —
+                    # ``audit_second_pass_failed: ...`` (evidence
+                    # refused) and ``Subagent test-report mismatch:
+                    # ...`` (a PASSED the run did not support) are both
+                    # produced here. Those cannot be fixed by
+                    # decomposing the task; the code may already be
+                    # correct. So classify first and, on a first
+                    # occurrence, hand the subagent one more iteration
+                    # with feedback that names the problem as the
+                    # ANSWER rather than the code.
+                    #
+                    # 2026-10-19: same marker drain as the empty-diff
+                    # tail. The cross-verify verdict for a task that hit
+                    # an undeclared write is usually a generic test or
+                    # report failure, which would be classified as a code
+                    # problem and — being a repeat — SPLIT. The refused
+                    # path is the whole diagnosis; splitting a task
+                    # because it tried to write a file it never declared
+                    # reproduces the same declaration mistake one level
+                    # deeper.
+                    refused = self._take_undeclared_writes(task.id)
+                    if refused:
+                        error_msg = "undeclared_write: " + ", ".join(
+                            refused[:5]
+                        )
+                    failure, occurrence = self._note_failure(
+                        task, error_msg,
+                    )
+                    if occurrence == 1 and not extra_attempt_granted:
+                        extra_attempt_granted = True
+                        # The extra attempt buys nothing if the feedback
+                        # names the wrong failure class. Only a genuine
+                        # REPORT rejection gets the "this is the shape of
+                        # your answer, do NOT rewrite working code" text:
+                        # for a real test failure that advice is backwards
+                        # — the code genuinely does not pass, and telling
+                        # the subagent not to change it sends it straight
+                        # back into the same failing run. Anything else
+                        # keeps ``error_msg`` verbatim, so the generic
+                        # "Previous attempt failed with error" branch of
+                        # ``get_retry_prompt_modifier`` reads as what it
+                        # is: a real failure to go and fix.
+                        retry_error = (
+                            f"report_format_retry: {failure.kind}: "
+                            f"{failure.label}"
+                            if failure.kind == REPORT_FORMAT
+                            else error_msg
+                        )
+                        self.retry_manager.record_attempt(
+                            task.id, retry_error, False,
+                        )
+                        if self.logger:
+                            self.logger.info(
+                                "failure_first_occurrence_retry",
+                                (
+                                    f"Task [{task.id}] failed with a "
+                                    f"{failure.kind} failure for the first "
+                                    f"time; granting one more attempt "
+                                    f"instead of splitting it."
+                                ),
+                                task_id=task.id,
+                                data={
+                                    "kind": failure.kind,
+                                    "signature": failure.signature,
+                                    "occurrence": occurrence,
+                                },
+                            )
+                        continue
+
+                    self._refine_after_failure(
+                        task, coder_response, result_context, "", 1,
+                        failure=failure, occurrence=occurrence,
+                    )
 
                     print("All retries exhausted for this run.")
                     self._record_failure_or_supersede(task, error_msg)
@@ -7235,8 +7463,123 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         self.task_manager.record_task_failure(task.id, error_msg)
         return "failed"
 
+    def _take_undeclared_writes(self, task_id: str) -> list[str]:
+        """Drain the refused-undeclared-write marker for ``task_id``.
+
+        The Edit/Write guard's refusal message only reaches the sub-agent.
+        The executor classifies a failure from ``test_reason`` /
+        ``coder_response``, and a sub-agent is free to paraphrase that
+        message, quote only part of it, or drop it entirely — so a
+        classification that depended on the message surviving would be a
+        classification of the sub-agent's prose, not of what happened.
+        The guard therefore also appends the refused path to a per-task
+        JSONL marker (best effort), and this reads it back.
+
+        Returns the deduplicated paths in first-seen order, and TRUNCATES
+        the file. Truncating is what makes it a take rather than a peek:
+        a later failure of the same task must report only its own refused
+        writes, and a stale marker from an earlier attempt would
+        otherwise re-appear in the refiner's input forever.
+
+        Never raises. A missing, unreadable or torn marker returns ``[]``:
+        losing this channel may cost the classification its specificity,
+        which is not worth failing a task over.
+        """
+        try:
+            safe = "".join(
+                ch if ch.isalnum() or ch in "-_" else "_" for ch in (task_id or "")
+            )
+            path = (
+                Path(tempfile.gettempdir()) / "pdt-undeclared-writes" / f"{safe}.jsonl"
+            )
+            if not path.exists():
+                return []
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = fh.read()
+            paths: list[str] = []
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                p = (entry or {}).get("path")
+                if isinstance(p, str) and p and p not in paths:
+                    paths.append(p)
+            # Truncate only after a full read, so a concurrent append
+            # during the read is not silently lost.
+            with open(path, "w", encoding="utf-8"):
+                pass
+            return paths
+        except Exception:
+            return []
+
+    def _lineage_id(self, task_id: str) -> str:
+        """Root task id of a (possibly already split) task.
+
+        ``"3"`` -> ``"3"``, ``"3-2"`` -> ``"3"``. The refiner's
+        children keep the parent's id as a prefix, so this is what
+        makes the split gate see through a breakdown.
+        """
+        return (task_id or "").split("-", 1)[0]
+
+    def _note_failure(self, task: SubTask, error: str) -> tuple[Failure, int]:
+        """Classify a failure and count it within its task lineage.
+
+        Returns:
+            ``(failure, occurrence)`` where ``occurrence`` counts how
+            many times *this exact failure* has now been seen in
+            this lineage. ``occurrence == 1`` is the first time — the
+            gate keeps the task whole and buys another iteration.
+            ``occurrence >= 2`` is a repeat — only then is a split
+            even a candidate.
+
+        The key is ``failure.fingerprint``, not ``failure.signature``:
+        the signature hashes the failure TEXT, and the same broken test
+        does not print the same words twice ("exit code 1" one attempt,
+        "exited with status 1" the next; a pytest tmpdir that moves every
+        run). Counting on the text reports both as first occurrences, so
+        the gate never opens and the runaway refiner is stopped by a
+        miscount rather than by the rule. The fingerprint keys on the
+        tool, exit code, exception classes, test ids and paths, which a
+        paraphrase cannot change.
+        """
+        failure = classify_failure(error, project_dir=self.project_dir)
+        key = f"{self._lineage_id(task.id)}:{failure.fingerprint}"
+        self._failure_occurrences[key] = (
+            self._failure_occurrences.get(key, 0) + 1
+        )
+        occurrence = self._failure_occurrences[key]
+        if self.logger:
+            self.logger.info(
+                "failure_classified",
+                (
+                    f"Task [{task.id}] failed with a {failure.kind} "
+                    f"failure (occurrence {occurrence} in lineage "
+                    f"{self._lineage_id(task.id)}): {failure.label[:120]}"
+                ),
+                task_id=task.id,
+                data={
+                    "kind": failure.kind,
+                    # Both, because they answer different questions and
+                    # an operator reading this row cannot tell them
+                    # apart: signature is "is this the same words",
+                    # fingerprint is "is this the same failure".
+                    "signature": failure.signature,
+                    "fingerprint": failure.fingerprint,
+                    "label": failure.label,
+                    "occurrence": occurrence,
+                    "lineage": self._lineage_id(task.id),
+                },
+            )
+        return failure, occurrence
+
     def _refine_after_failure(self, task: SubTask, coder_response: str, result_context: str,
-                              file_context: str, exit_code: int):
+                              file_context: str, exit_code: int,
+                              *, failure: Failure | None = None,
+                              occurrence: int = 0):
         """
         Refine task list after a task failure.
 
@@ -7250,6 +7593,14 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 the refiner; this argument is silently dropped and
                 the refiner is invoked with ``file_context=""``.
             exit_code: Exit code from test command
+            failure: The classified failure, when the caller has one.
+                ``None`` means "no classification available" and keeps
+                the historical behaviour (refine unconditionally) —
+                that is the correct default for the timeout tails,
+                which are unchanged by this gate.
+            occurrence: How many times ``failure``'s signature has been
+                seen in this task's lineage. Only a value ``>= 2``
+                permits a split.
         """
         if self._refinement_count >= EXECUTOR_MAX_REFINEMENTS:
             if self.logger:
@@ -7266,6 +7617,32 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                         "refinements": self._refinement_count,
                         "cap": EXECUTOR_MAX_REFINEMENTS,
                         "task_count": len(self.task_manager.tasks),
+                    },
+                )
+            return
+        # 2026-10-19 — the split gate. Placed AFTER the run-level cap
+        # check on purpose: a run that is out of refinement budget must
+        # report *that* it is out of budget, not silently report
+        # "deferred, first occurrence" and leave the operator with two
+        # plausible explanations for the same absence.
+        if failure is not None and occurrence < 2:
+            if self.logger:
+                self.logger.info(
+                    "refine_deferred_first_occurrence",
+                    (
+                        f"Task [{task.id}] failed with a {failure.kind} "
+                        f"failure for the first time in lineage "
+                        f"{self._lineage_id(task.id)}; not splitting it. A "
+                        f"first occurrence is not evidence that the task "
+                        f"is too large — it is evidence that one answer "
+                        f"was wrong."
+                    ),
+                    task_id=task.id,
+                    data={
+                        "kind": failure.kind,
+                        "signature": failure.signature,
+                        "occurrence": occurrence,
+                        "lineage": self._lineage_id(task.id),
                     },
                 )
             return
@@ -7338,6 +7715,24 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
             return
         self._refinement_count += 1
 
+        # 2026-10-19 — hand the refiner the classification, not just
+        # the raw output. Its prompt used to say "if the last task
+        # FAILED you MUST break it down", and the refiner had no way to
+        # tell a too-big task from a rejected report — so it split the
+        # latter too, which is what drove the depth-4 collapse. The
+        # block leads the context because the prompt tells it to read
+        # this block FIRST.
+        if failure is not None:
+            result_context = (
+                "[FAILURE CLASSIFICATION]\n"
+                f"kind: {failure.kind}\n"
+                f"signature: {failure.signature}\n"
+                f"label: {failure.label}\n"
+                + (f"detail: {failure.detail}\n" if failure.detail else "")
+                + f"occurrences_in_lineage: {occurrence}\n"
+                f"split_allowed: {'true' if occurrence >= 2 and is_split_allowed(failure) else 'false'}\n\n"
+            ) + result_context
+
         print("Refining task list...")
         if self.logger:
             self.logger.info("refine_started", f"Refining tasks after [{task.id}] failure",
@@ -7361,6 +7756,15 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 {
                     "kind": "refiner_result",
                     "exit_code": exit_code,
+                    # The classification block leads ``result_context``,
+                    # so it is already inside the preview below; the
+                    # fields are repeated explicitly because a
+                    # postmortem should never have to re-parse it out
+                    # of a truncated string.
+                    "failure_kind": failure.kind if failure else None,
+                    "failure_signature": failure.signature if failure else None,
+                    "failure_detail": failure.detail if failure else None,
+                    "failure_occurrences": occurrence,
                     "last_result_preview": result_context[:500],
                     "coder_response_chars": len(coder_response or ""),
                     "updated_tasks": updated_tasks,
@@ -7372,6 +7776,10 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 {
                     "kind": "refiner_error",
                     "exit_code": exit_code,
+                    "failure_kind": failure.kind if failure else None,
+                    "failure_signature": failure.signature if failure else None,
+                    "failure_detail": failure.detail if failure else None,
+                    "failure_occurrences": occurrence,
                     "last_result_preview": result_context[:500],
                     "error": str(e)[:1000],
                 },

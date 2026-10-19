@@ -221,10 +221,21 @@ CRITICAL RULES:
    the one being refined — and reduces every other task to
    id/title/status/depends_on. You cannot see the other tasks'
    descriptions, and you must not try to rewrite them.
-3. If the last task FAILED, replace it with smaller subtasks
-   (keeping the same ID prefix, e.g. "2" -> "2-1", "2-2"). When you do,
-   return the NEW subtasks and OMIT the parent — the parent is
-   replaced by its children, not kept beside them.
+3. The refinement context opens with a [FAILURE CLASSIFICATION]
+   block carrying `split_allowed`. You may replace the failed task
+   with smaller subtasks ONLY when `split_allowed` is true — that is,
+   when the same failure has now occurred at least twice in this
+   task's lineage. When you do split, keep the same ID prefix
+   (e.g. "2" -> "2-1", "2-2"), return the NEW subtasks and OMIT the
+   parent — the parent is replaced by its children, not kept beside
+   them. On a FIRST occurrence (`split_allowed: false`) do NOT split:
+   send the task back as a single item, with its description or
+   test_command clarified, and note in the description that an
+   operator should look at it. One rejected answer is evidence that
+   the answer was wrong, not evidence that the task is too big.
+   If the context carries no [FAILURE CLASSIFICATION] block, keep the
+   historical behaviour: replace the failed task with smaller subtasks when
+   that can plausibly help.
 4. Do NOT modify or remove tasks unrelated to the failure, and never
    change the status of a completed task.
 5. NEVER write a spec clause that forbids the framework's report trailer.
@@ -240,11 +251,15 @@ CRITICAL RULES:
    and the plan stalled for 5 hours with 24 failures.
    When you want raw evidence, ask for it POSITIVELY and never mention
    TEST_RESULT at all: e.g. "报告必须给出原始 EXIT_CODE=0 数值证据".
-6. Do not split a task whose failures all share the same cause. If the
-   previous attempt failed for a reason that more granularity cannot fix
-   (a contradictory requirement, a missing upstream deliverable, an
-   environment problem), splitting just replicates the same failure in the
-   children. Say so in the task description instead, and leave the task as
+6. RULE 6 OVERRIDES RULE 3. Where the two disagree, rule 6 wins and
+   you do NOT split. Do not split a task whose failures all share the
+   same cause: if the previous attempt failed for a reason that more
+   granularity cannot fix — a `report_format` failure (the evidence or
+   the report shape was refused; the code may already be correct), a
+   timeout or other `infra` / environment problem, a contradictory
+   requirement, a missing upstream deliverable — splitting just
+   replicates the same failure in the children, one level deeper each
+   time. Say so in the task description instead, and leave the task as
    a single item for an operator to look at.
 
 7. EVERY task you return MUST carry a "files_to_modify" field — it is the
@@ -260,6 +275,23 @@ CRITICAL RULES:
    list [], and do NOT write the placeholder "__UNKNOWN_MODIFICATIONS__":
    each of those is an undeclared list, which is rejected and costs you a
    correction round.
+8. `kind: lock_conflict` — two tasks contended for the same files, and one
+   could not get past the other's lock. Splitting the task does not remove
+   the contention: the children inherit the same declarations, so they
+   contend for the same files again. Do not split. The declaration or the
+   schedule has to change, and that is a decision to state in the task
+   description for an operator, not a decomposition.
+9. `kind: undeclared_write` — the task tried to write a path its
+   `files_to_modify` never named, and the write was REFUSED. Do NOT split
+   it into smaller versions of the same work; each child would carry the
+   same incomplete declaration and hit the same refusal. Instead add ONE
+   targeted task whose `files_to_modify` names exactly the refused path —
+   take that path from the classification block's `detail` field — and
+   whose description says the specific change it must make. Make it a
+   dependency of the original task if the original work cannot continue
+   until that file is touched; otherwise leave both pending and
+   independent. The original task may then run again with its unchanged
+   declaration.
 
 Output the COMPLETE updated list of tasks in the following JSON format:
 {

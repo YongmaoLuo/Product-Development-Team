@@ -19,6 +19,7 @@ can act on:
 0     granted / released / broker answered ``ping``
 3     timed out waiting for another holder (the file is *busy*)
 4     broker unreachable or answered something unusable
+5     the broker proved this wait can never end (a wait-for cycle)
 2     bad invocation (a programming error in the hook, not a
       condition the sub-agent can react to)
 ===== ==========================================================
@@ -28,6 +29,12 @@ else is editing this file, come back", 4 means "the lock layer is down".
 They demand opposite handling (block the edit vs. let it through with a
 warning), so collapsing them into one non-zero code would either brick
 every sub-agent when the executor dies or silently drop the guarantee.
+
+5 is a third answer again. 3 is "busy but it will end"; 5 is "busy and
+it will never end, and no amount of retrying in place changes that".
+It is reported separately so the caller can escalate to the executor
+instead of sending the sub-agent back to wait on a condition it cannot
+resolve by waiting — which is what a 300-second timeout used to do.
 
 Policy lives on the hook side; this stays a pure transport. That is also
 why it never prints anything on the success path — a hook's stdout is
@@ -47,6 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from file_lock_protocol import (  # noqa: E402
     ACQUIRED,
     ALREADY_HELD,
+    DEADLOCK,
     TIMED_OUT,
     LockBrokerUnavailable,
     acquire,
@@ -58,6 +66,7 @@ EXIT_OK = 0
 EXIT_BAD_USAGE = 2
 EXIT_BUSY = 3
 EXIT_UNAVAILABLE = 4
+EXIT_DEADLOCK = 5
 
 
 def _socket_path() -> str:
@@ -106,6 +115,8 @@ def main(argv=None) -> int:
                             args.timeout)
             if state == TIMED_OUT:
                 return EXIT_BUSY
+            if state == DEADLOCK:
+                return EXIT_DEADLOCK
             if state in (ACQUIRED, ALREADY_HELD):
                 return EXIT_OK
             return EXIT_UNAVAILABLE
