@@ -186,8 +186,12 @@ def boot_real_server(tmp_path: Path) -> Tuple[str, subprocess.Popen, Path]:
         "PDT_ALLOWED_HOSTS": "127.0.0.1,localhost,testserver",
         # Force the suite's provider mode so a developer with CC Switch
         # running does not make this test depend on whichever provider
-        # they happen to have selected.
-        "PDT_PROVIDER_MODE": "dry-run",
+        # they happen to have selected. ``inherit`` is the only value
+        # ``_detect_inherit_mode`` honours without probing: the suite's
+        # hermetic env seeds an empty CC Switch DB, the probe would call
+        # that a live fleet, and the lifespan would then reach for an
+        # HTTP chain at 127.0.0.1:4000 that nothing serves.
+        "PDT_PROVIDER_MODE": "inherit",
         # Provider capacity file: do not read the operator's.
         "PDT_PROVIDER_CAPACITY_FILE": str(tmp_path / "absent-capacity.yaml"),
         # Make sure the venv's site-packages wins over a stray PYTHONPATH.

@@ -185,7 +185,14 @@ def boot_real_server(tmp_path: Path) -> Tuple[str, subprocess.Popen, Path]:
         "PDT_PORT": str(port),
         "PDT_DEBUG_ROUTES": "1",
         "PDT_ALLOWED_HOSTS": "127.0.0.1,localhost,testserver",
-        "PDT_PROVIDER_MODE": "dry-run",
+        # Pinned rather than "dry-run": an unrecognised value falls
+        # through to ``cc_switch.probe()``, and the suite's hermetic env
+        # seeds an empty CC Switch database, so the probe reports an
+        # installed fleet that is not there and the server's lifespan
+        # then asks ``127.0.0.1:4000`` for a chain nobody serves. This
+        # server exists to serve the frontend, not to exercise provider
+        # routing, so the absence of a fleet is the honest setting.
+        "PDT_PROVIDER_MODE": "inherit",
         "PDT_PROVIDER_CAPACITY_FILE": str(tmp_path / "absent-capacity.yaml"),
         "PYTHONPATH": f"{BACKEND_DIR}{os.pathsep}{env.get('PYTHONPATH', '')}",
     })

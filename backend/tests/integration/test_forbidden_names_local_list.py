@@ -1133,13 +1133,18 @@ def test_pre_push_blocks_a_forbidden_name_in_a_commit(tmp_path) -> None:
     fire on; and the test must not put a private name in a tracked file in
     order to test the check for private names.
 
-    It is also chosen so it cannot collide with the operator's real list:
-    the list deliberately spells that project's private plan-id family
-    with a leading hyphen, because the bare spelling would match this
-    repository's own public identity in README, mkdocs and the changelog.
-    A needle without the leading hyphen is therefore a different string
-    from anything the real list holds, and this test stays valid whatever
-    the operator puts in theirs.
+    It is read from this test's own list under ``tmp_path``, so it cannot
+    collide with whatever the operator keeps in theirs -- the two are now
+    two files rather than one file written twice. (This test used to
+    borrow the operator's ``.config/forbidden-names`` and restore it, which
+    is what made the needle choice a hazard at all: the bare spelling of
+    the operator's plan-id family WOULD have matched this repository's own
+    public identity in README, mkdocs and the changelog. Handing over a
+    list path instead removes that coupling, but the bare spelling still
+    has to be a *different string* from anything the operator's list holds
+    for a different reason: the operator's real pre-push hook runs against
+    their own list in this same checkout, and this test must not leave that
+    hook disagreeing with its operator.)
     """
     needle = "Product-Development-Team"
     list_path = _write_list(tmp_path / "forbidden-names", needle)
@@ -1150,45 +1155,29 @@ def test_pre_push_blocks_a_forbidden_name_in_a_commit(tmp_path) -> None:
     ).stdout.strip()
     tip = _unpublished_tip(head)
 
-    # The forbidden-name step reads the list at <repo>/.config/forbidden-names,
-    # and the hook passes no --list. So the temporary list has to be at that
-    # path for this test, which is why it is backed up and restored.
-    real_list = REPO_ROOT / ".config" / "forbidden-names"
-    real_existed = real_list.exists()
-    real_bytes = real_list.read_bytes() if real_existed else None
-    try:
-        real_list.parent.mkdir(parents=True, exist_ok=True)
-        real_list.write_text(needle + "\n", encoding="utf-8")
-
-        got = subprocess.run(
-            [
-                "bash", str(RANGE_SCRIPT), "--stdin-pre-push",
-            ],
-            input=f"refs/heads/main {tip} refs/heads/main {head}\n",
-            capture_output=True,
-            text=True,
-            cwd=str(REPO_ROOT),
-            check=False,
-        )
-    finally:
-        if real_existed:
-            real_list.write_bytes(real_bytes)
-        else:
-            real_list.unlink(missing_ok=True)
-
-    # The restore is byte-exact and checked, not assumed: this test borrows
-    # the operator's real list path because the hook passes no --list, and
-    # silently leaving a different list behind would weaken their hooks
-    # without saying so.
-    if real_existed:
-        assert real_list.read_bytes() == real_bytes, (
-            "the test did not restore .config/forbidden-names byte-for-byte"
-        )
-    else:
-        assert not real_list.exists(), (
-            "the test left a .config/forbidden-names behind that was not "
-            "there before it ran"
-        )
+    # The list is this test's own file under tmp_path, handed over with
+    # --forbidden-list. It used to borrow the operator's real
+    # <repo>/.config/forbidden-names and put the bytes back afterwards,
+    # which is a checkout-wide mutable path shared with the two tests
+    # below -- and CI runs this file under `pytest -n 8`
+    # (.github/workflows/ci.yml), so three workers were writing, reading
+    # and unlinking one file at once. Each then read whatever needle a
+    # sibling had last written, or found the file a sibling's finally had
+    # already unlinked: 56 violations locally, 0 in CI, 20 runs out of 20
+    # red. Not writing the path at all is strictly stronger than writing
+    # it and restoring it: the operator's list is now untouchable by this
+    # suite rather than restored-if-nothing-crashed.
+    got = subprocess.run(
+        [
+            "bash", str(RANGE_SCRIPT), "--stdin-pre-push",
+            "--forbidden-list", list_path,
+        ],
+        input=f"refs/heads/main {tip} refs/heads/main {head}\n",
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        check=False,
+    )
 
     assert got.returncode == 1, (
         f"the pre-push hook did not block a commit carrying a listed name "
@@ -1207,9 +1196,31 @@ def test_pre_push_blocks_a_forbidden_name_in_a_commit(tmp_path) -> None:
         f"README.md carries the needle at HEAD and is not named in the "
         f"report:\n{combined}"
     )
-    assert needle not in combined, (
-        f"the pre-push hook reprinted the needle it exists to block:\n{combined}"
-    )
+    # What must not reprint the needle is a FINDING -- the scanner naming
+    # the text it found. That is the guarantee, and it is asserted over the
+    # finding lines specifically.
+    #
+    # It used to be asserted over the whole output, which is a different
+    # and untrue claim: the scanner prints
+    #   scanned N file(s) against <list path>
+    # on every clean run, so any needle that also happens to appear in the
+    # path it was read from fails the assertion no matter how well the
+    # redaction works. The needle here IS this repository's public name and
+    # GitHub checks the tree out under exactly that name, so the assertion
+    # was guaranteed to fire on CI and could never have passed there. The
+    # banner is not a disclosure of the needle -- it is the operator's own
+    # directory layout, which the same report already prints in full
+    # (``scanned N file(s) against ...``) whether or not anything matched.
+    #
+    # Narrowing to the findings is not a loosening: the HOWTO legend that
+    # made a loose ``needle in output`` assertion meaningless lives in the
+    # wrapper's block after a blocked push, and ``_discovery_lines``
+    # matches whole finding lines only, so a legend line cannot satisfy it.
+    for line in reported:
+        assert needle not in line.group(0), (
+            f"the pre-push hook reprinted the needle it exists to block, in "
+            f"a finding line:\n{line.group(0)}\n{combined}"
+        )
 
 
 def test_the_range_mode_finds_a_name_in_this_repository(tmp_path) -> None:
@@ -1321,6 +1332,52 @@ def test_pre_push_is_wired_into_the_range_script() -> None:
         "check that it does not run under --ci, where there is no local list"
     )
     assert "--range" in text, "the forbidden-name step is not given a range"
+
+
+def test_the_pre_push_hook_defaults_to_the_repository_list() -> None:
+    """Without ``--forbidden-list``, the hook reads the operator's own file.
+
+    The three pre-push tests above hand their list over by path
+    (``--forbidden-list``) instead of writing ``<repo>/.config/forbidden-names``
+    and restoring it. That removed the only thing pinning this default:
+    before, the *evidence* that the hook reads that path was those tests
+    putting a list there and getting it read back. With them no longer
+    writing it, a change that quietly repointed the default at somewhere
+    else would pass this whole file -- the operator's real pre-push hook
+    would consult a different list than the one they maintain, and every
+    test here would still be green.
+
+    Behavioural rather than a grep of the source, because the default lives
+    in two files that have to agree: the wrapper's ``LIST_PATH`` and the
+    scanner's ``DEFAULT_LIST_REL``. Asserted on the output rather than on
+    the exit code, because both branches name the resolved path -- a clean
+    scan prints ``scanned N file(s) against <path>``, and a checkout with
+    no operator list prints ``forbidden-name list not found: <path>``. So
+    this holds on a developer machine and on a runner, and it does not care
+    which of the two the reader is in.
+
+    It reads the operator's list and never writes it; the range script is
+    hard-wired to this checkout, so there is no throwaway repository to
+    point it at.
+    """
+    head = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    tip = _unpublished_tip(head)
+    default_list = REPO_ROOT / ".config" / "forbidden-names"
+
+    got = subprocess.run(
+        ["bash", str(RANGE_SCRIPT), "--stdin-pre-push"],
+        input=f"refs/heads/main {tip} refs/heads/main {head}\n",
+        capture_output=True, text=True, cwd=str(REPO_ROOT), check=False,
+    )
+    said = got.stdout + got.stderr
+    assert str(default_list) in said, (
+        f"the pre-push hook was run without --forbidden-list and never "
+        f"mentioned {default_list}, so the list it read was somewhere "
+        f"else:\n{said}"
+    )
 
 
 def test_the_wrapper_is_registered_for_both_hooks() -> None:
@@ -1690,34 +1747,24 @@ def test_the_pre_push_hook_receives_the_ref_names_it_is_pushing(tmp_path) -> Non
     """
     needle = _CLEAN_TREE_NEEDLE
     ref = f"refs/heads/feat/{needle}-work"
-    _write_list(tmp_path / "forbidden-names", needle)
+    list_path = _write_list(tmp_path / "forbidden-names", needle)
     head = subprocess.run(
         ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     tip = _unpublished_tip(head)
 
-    real_list = REPO_ROOT / ".config" / "forbidden-names"
-    real_existed = real_list.exists()
-    real_bytes = real_list.read_bytes() if real_existed else None
-    try:
-        real_list.parent.mkdir(parents=True, exist_ok=True)
-        real_list.write_text(needle + "\n", encoding="utf-8")
-        got = subprocess.run(
-            ["bash", str(RANGE_SCRIPT), "--stdin-pre-push"],
-            input=f"{ref} {tip} {ref} {head}\n",
-            capture_output=True, text=True, cwd=str(REPO_ROOT), check=False,
-        )
-    finally:
-        if real_existed:
-            real_list.write_bytes(real_bytes)
-        else:
-            real_list.unlink(missing_ok=True)
-
-    if real_existed:
-        assert real_list.read_bytes() == real_bytes, (
-            "the test did not restore .config/forbidden-names byte-for-byte"
-        )
+    # Its own list, handed over by path -- see the note on
+    # test_pre_push_blocks_a_forbidden_name_in_a_commit for why this file
+    # must not write <repo>/.config/forbidden-names.
+    got = subprocess.run(
+        [
+            "bash", str(RANGE_SCRIPT), "--stdin-pre-push",
+            "--forbidden-list", list_path,
+        ],
+        input=f"{ref} {tip} {ref} {head}\n",
+        capture_output=True, text=True, cwd=str(REPO_ROOT), check=False,
+    )
 
     said = got.stdout + got.stderr
     assert got.returncode == 1, (
@@ -1758,37 +1805,27 @@ def test_the_pre_push_hook_does_not_block_a_clean_ref_name(tmp_path) -> None:
     name was clean" as the only thing that could have blocked this push.
     """
     needle = _CLEAN_TREE_NEEDLE
-    _write_list(tmp_path / "forbidden-names", needle)
+    list_path = _write_list(tmp_path / "forbidden-names", needle)
     head = subprocess.run(
         ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     tip = _unpublished_tip(head)
 
-    real_list = REPO_ROOT / ".config" / "forbidden-names"
-    real_existed = real_list.exists()
-    real_bytes = real_list.read_bytes() if real_existed else None
-    try:
-        real_list.parent.mkdir(parents=True, exist_ok=True)
-        real_list.write_text(needle + "\n", encoding="utf-8")
-        got = subprocess.run(
-            ["bash", str(RANGE_SCRIPT), "--stdin-pre-push"],
-            input=(
-                f"refs/heads/work/an-ordinary-name {tip} "
-                f"refs/heads/work/an-ordinary-name {head}\n"
-            ),
-            capture_output=True, text=True, cwd=str(REPO_ROOT), check=False,
-        )
-    finally:
-        if real_existed:
-            real_list.write_bytes(real_bytes)
-        else:
-            real_list.unlink(missing_ok=True)
-
-    if real_existed:
-        assert real_list.read_bytes() == real_bytes, (
-            "the test did not restore .config/forbidden-names byte-for-byte"
-        )
+    # Its own list, handed over by path -- see the note on
+    # test_pre_push_blocks_a_forbidden_name_in_a_commit for why this file
+    # must not write <repo>/.config/forbidden-names.
+    got = subprocess.run(
+        [
+            "bash", str(RANGE_SCRIPT), "--stdin-pre-push",
+            "--forbidden-list", list_path,
+        ],
+        input=(
+            f"refs/heads/work/an-ordinary-name {tip} "
+            f"refs/heads/work/an-ordinary-name {head}\n"
+        ),
+        capture_output=True, text=True, cwd=str(REPO_ROOT), check=False,
+    )
 
     assert got.returncode == 0, (
         f"the pre-push hook blocked a push whose ref name and commits are "

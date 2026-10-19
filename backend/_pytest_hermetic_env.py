@@ -88,6 +88,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 # The database is named and redirected through the one resolver, exactly as
 # every other module that opens it does.  ``test_state_db_path_has_one_resolver``
@@ -99,17 +100,26 @@ from pathlib import Path
 # follows the resolver if either ever changes.
 from config_paths import STATE_DB, STATE_DB_ENV
 
+#: The home the process was *launched* with, recorded before
+#: :func:`install_hermetic_env` redirects ``$HOME``.  Named here rather than
+#: spelled at the call sites so the variable's name and its meaning cannot
+#: drift apart, which is the same reason this module imports ``STATE_DB_ENV``
+#: instead of writing ``"PDT_STATE_DB_PATH"`` twice.
+REAL_HOME_ENV = "PDT_TEST_REAL_HOME"
+
 __all__ = [
     "HermeticEnv",
+    "REAL_HOME_ENV",
     "install_hermetic_env",
     "install_request_guard_header",
+    "write_minimal_cc_switch_db",
     "xdist_worker_id",
 ]
 
 
 @dataclass(frozen=True)
 class HermeticEnv:
-    """The three scratch roots a pytest session owns.
+    """The four scratch roots a pytest session owns.
 
     Returned rather than re-derived so the caller tears down exactly what was
     created.  ``lock_root`` is deliberately NOT nested under
@@ -122,6 +132,26 @@ class HermeticEnv:
     state_db_dir: Path
     lock_root: Path
     subagent_root: Path
+    home_root: Path
+    home_root_owner_pid: int
+
+    #: PID that minted ``lock_root`` / ``state_db_dir`` in this process, or
+    #: ``None`` when this process merely inherited them.  Only the minter may
+    #: remove them: under xdist every worker inherits one shared
+    #: ``PDT_LOCK_ROOT``, and a worker that removes it deletes the broker
+    #: sockets of the workers still running.
+    lock_root_owner_pid: Optional[int]
+    state_root_owner_pid: Optional[int]
+
+
+#: The environment installed in *this* process.  Ownership of a scratch root
+#: is a fact about the process that minted it, so it has to be remembered
+#: rather than re-derived: a second call sees ``PDT_LOCK_ROOT`` already set
+#: and could only conclude "someone else minted it", losing the answer for
+#: the caller that did the minting.  The cache is per-process -- an xdist
+#: worker or a nested session re-enters with ``None`` and records its own
+#: (non-)ownership, which is exactly the case the rule is about.
+_INSTALLED_ENV: Optional[HermeticEnv] = None
 
 
 def install_request_guard_header() -> None:
@@ -155,6 +185,50 @@ def install_request_guard_header() -> None:
     _TestClient._pdt_guard_installed = True
 
 
+#: The stock CC Switch ``providers`` schema.  Every column is one
+#: ``cc_switch.REQUIRED_PROVIDERS_COLUMNS`` entry plus the two bookkeeping
+#: columns upstream also carries, so ``cc_switch.probe()`` -- the project's
+#: own "is this database usable" validator -- accepts what this writes
+#: rather than the file merely being openable.  A tenth private copy of this
+#: DDL would be the drift the ``STATE_DB_ENV`` note above exists to prevent.
+CC_SWITCH_PROVIDERS_DDL = (
+    "CREATE TABLE IF NOT EXISTS providers ("
+    "id TEXT PRIMARY KEY, app_type TEXT, name TEXT, "
+    "settings_config TEXT, created_at INTEGER, sort_index INTEGER, "
+    "is_current BOOLEAN DEFAULT 0)"
+)
+
+
+def write_minimal_cc_switch_db(cc_dir: Path) -> Path:
+    """Create CC Switch's ``cc-switch.db`` under *cc_dir*; return its path.
+
+    **Empty on purpose.**  The table exists but holds no row, which is what
+    makes this a fixture rather than a fake: ``cc_switch.get_provider(name)``
+    answers ``None`` for every name, ``server.load_providers`` logs "Skipping
+    unknown provider name" and starts with an empty provider list.  A row
+    here would hand the suite a provider config with an endpoint and a
+    (nonexistent) credential, and any test asserting a provider was resolved
+    would then be asserting against this file.  The absence of rows cannot be
+    mistaken for a resolved provider.
+
+    Present but empty is also the only state that satisfies both readers at
+    once: ``_connect_db`` raises ``CCSwitchDBNotFoundError`` for a missing or
+    zero-byte file, and ``load_providers`` re-raises that out of the lifespan,
+    so an absent database kills every test that boots the app.
+    """
+    import sqlite3
+
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    db_path = cc_dir / "cc-switch.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(CC_SWITCH_PROVIDERS_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
 def install_hermetic_env() -> HermeticEnv:
     """Install the process-global environment a pytest run must not inherit.
 
@@ -163,6 +237,10 @@ def install_hermetic_env() -> HermeticEnv:
     reasoning travelled with the rule when it was lifted out of
     ``backend/tests/conftest.py``.
     """
+    global _INSTALLED_ENV
+    if _INSTALLED_ENV is not None:
+        return _INSTALLED_ENV
+
     # Prevent a shell-provided CC Switch proxy URL from leaking into tests
     # that exercise provider-specific routing.
     os.environ.pop("ANTHROPIC_BASE_URL", None)
@@ -250,14 +328,17 @@ def install_hermetic_env() -> HermeticEnv:
     #   * a serial run, which has no worker id, mints once and reuses.
     xdist_worker = os.environ.get("PYTEST_XDIST_WORKER") or ""
     session_root_owner = "_PDT_TEST_SESSION_ROOT_OWNER"
+    state_root_owner_pid = None
     if not os.environ.get("PDT_TEST_SESSION_ROOT"):
         os.environ["PDT_TEST_SESSION_ROOT"] = tempfile.mkdtemp(prefix="ac-test-state-")
         os.environ[session_root_owner] = ""
+        state_root_owner_pid = os.getpid()
     elif xdist_worker and os.environ.get(session_root_owner) != xdist_worker:
         worker_state_db_dir = Path(os.environ["PDT_TEST_SESSION_ROOT"]) / xdist_worker
         worker_state_db_dir.mkdir(parents=True, exist_ok=True)
         os.environ["PDT_TEST_SESSION_ROOT"] = str(worker_state_db_dir)
         os.environ[session_root_owner] = xdist_worker
+        state_root_owner_pid = os.getpid()
     state_db_dir = Path(os.environ["PDT_TEST_SESSION_ROOT"])
 
     # ``setdefault`` rather than ``[...] = ...``: the sibling tree's conftest
@@ -309,6 +390,9 @@ def install_hermetic_env() -> HermeticEnv:
     # docstring exists to warn about.
     if not os.environ.get("PDT_LOCK_ROOT"):
         os.environ["PDT_LOCK_ROOT"] = tempfile.mkdtemp(prefix="lk-")
+        lock_root_owner_pid = os.getpid()
+    else:
+        lock_root_owner_pid = None
     lock_root = Path(os.environ["PDT_LOCK_ROOT"])
 
     # The broker socket is the second half of the pair above, and it needs the
@@ -356,11 +440,143 @@ def install_hermetic_env() -> HermeticEnv:
     subagent_root = state_db_dir / "private"
     os.environ.setdefault("PDT_SECRET_TEMP_ROOT", str(subagent_root))
 
-    return HermeticEnv(
+    # ---------------------------------------------------------------------
+    # CC Switch's own database, and the ``$HOME`` it is found under.
+    # ---------------------------------------------------------------------
+    #
+    # ``server._lifespan`` calls ``load_providers()``, which asks
+    # ``cc_switch.get_provider()`` for every name in the fallback chain, and
+    # ``load_providers`` **re-raises** ``CCSwitchError`` rather than degrade.
+    # So on a machine with no CC Switch -- which is every CI runner -- a test
+    # that boots the app dies in the lifespan, for an environment reason:
+    #
+    #   cc_switch.CCSwitchDBNotFoundError: CC Switch database not found:
+    #   ~/.cc-switch/cc-switch.db          (on a CI runner: the runner's home)
+    #
+    # and the suite's result depends on whether the operator happens to have
+    # the desktop app installed.  That is the same disease the rest of this
+    # file treats: state this repository does not own deciding a test's
+    # verdict.
+    #
+    # ``$HOME`` is the redirect rather than ``PDT_CC_SWITCH_DB``, and the
+    # alternatives were measured, not guessed:
+    #
+    #   * ``PDT_CC_SWITCH_DB`` -- the documented override, but
+    #     ``resolve_db_path`` consults it FIRST, so a session-wide value
+    #     outranks the ``CC_SWITCH_DB`` that ``tests/test_plan_usage.py`` sets
+    #     per test.  Measured: 12 of its 15 tests fail.
+    #   * ``CC_SWITCH_DB`` -- the compatibility alias, same outranking for
+    #     every test that ``monkeypatch.delenv("PDT_CC_SWITCH_DB")`` without
+    #     deleting the alias.  Measured: 4 of the path-resolution tests in
+    #     ``tests/unit/test_cc_switch_probe.py`` fail.
+    #
+    # ``$HOME`` loses neither: those tests all set their own ``HOME``, and a
+    # test that names a database through either variable still outranks this
+    # one, because ``resolve_db_path`` checks the override before it ever
+    # looks at a candidate path.
+    #
+    # The directory and the database are built in the same statement, in this
+    # function, so there is no window in which the database exists somewhere
+    # other than the home the resolver will be pointed at.  A per-test
+    # ``monkeypatch.setenv("HOME", ...)`` still wins for that test -- it is
+    # the test's own home, and it is undone with the test.
+    fake_home_env = "PDT_TEST_FAKE_HOME"
+    fake_home_owner_env = "PDT_TEST_FAKE_HOME_OWNER"
+    if not os.environ.get(fake_home_env):
+        fake_home = Path(tempfile.mkdtemp(prefix="home-"))
+        write_minimal_cc_switch_db(fake_home / ".cc-switch")
+        os.environ[fake_home_env] = str(fake_home)
+        os.environ[fake_home_owner_env] = str(os.getpid())
+        # Remember the home we were launched with, before the ``HOME``
+        # assignment below overwrites it.  A handful of tests need a target
+        # path that is provably **outside** tempdir, and the whole point of
+        # the redirect is that ``$HOME`` now names a ``mkdtemp`` directory
+        # under the temp root -- i.e. inside exactly the zone the Edit/Write
+        # containment guard treats as always-writable scratch:
+        #
+        #     in_tmp_scratch(x) = x.startswith("/tmp/")
+        #                        or x.startswith("/private/tmp/")
+        #                        or inside(x, tempfile.gettempdir())
+        #
+        # So a guard test that derives its target from ``Path.home()`` reads
+        # as "inside project_dir is fine" long before it reaches the branch
+        # it exists to exercise: it asserts rc=2, gets rc=0, and the
+        # containment rule it is the only coverage for is untested.  That is
+        # a green suite that stopped testing something, which is the failure
+        # mode this module exists to prevent elsewhere -- so the real home is
+        # published here for those cases to read instead.
+        #
+        # ``setdefault`` for the nested-session case the owner-pid check
+        # below describes: a child pytest inherits this variable *and* an
+        # already-redirected ``$HOME``, so an unconditional assignment would
+        # record the parent's fake home as the "real" one and make exactly
+        # the cases above vacuous again, in every nested run.
+        #
+        # ``os.environ.get("HOME") or ...`` rather than ``Path.home()``
+        # because that is the idiom ``state_machine/tests/conftest.py``
+        # already uses for this same capture, and ``Path.home()`` here would
+        # be the *redirected* value on any second call.
+        os.environ.setdefault(REAL_HOME_ENV, os.environ.get("HOME") or str(Path.home()))
+    home_root = Path(os.environ[fake_home_env])
+    home_root_owner_pid = int(os.environ[fake_home_owner_env])
+    # The owner pid is what keeps a *nested* pytest session from deleting this
+    # root.  ``tests/integration/test_reclaim_pairs_driver.py`` starts a second
+    # interpreter, which inherits ``PDT_TEST_FAKE_HOME`` through the
+    # environment and reuses this directory rather than minting its own -- and
+    # its ``pytest_sessionfinish`` would otherwise remove the database out
+    # from under the run that created it, which shows up much later as an
+    # unrelated ``CCSwitchDBNotFoundError``.  Measured: without the pid check,
+    # three tests here and ``test_plan_state_files_are_allowed_outside_scratch``
+    # fail as soon as that driver runs first.
+    #
+    # The state database above does not need this: it is created lazily by
+    # whichever module opens it next, so losing it costs nothing.
+    # Assigned rather than defaulted: ``HOME`` is always already set, so a
+    # ``setdefault`` would be a no-op and the whole point would be lost.  An
+    # ambient ``HOME`` is exactly the state in which ``Path.home()`` names the
+    # operator's real ``~/.cc-switch``, so it is overwritten rather than
+    # honoured -- the same reasoning as the ``PDT_LOCK_BROKER`` pop above.
+    os.environ["HOME"] = str(home_root)
+
+    # Rust's toolchain lives under the home that was just replaced: rustup
+    # resolves its default toolchain from ``$RUSTUP_HOME`` (default
+    # ``$HOME/.rustup``) and cargo's registry from ``$CARGO_HOME`` (default
+    # ``$HOME/.cargo``). Pointed at a bare ``mkdtemp`` directory, rustup
+    # answers "could not choose a version of cargo to run" instead of running
+    # the command. That changes a verdict, not just a log line:
+    # ``cargo test --lib <absent module>`` exits 0 with zero tests collected,
+    # which is exactly the shape
+    # ``AutonomousAgent._enforce_new_subtask_test_command`` exists to discard
+    # (a command that can never certify the work). Made to exit non-zero by
+    # the missing toolchain it looks falsifiable and is kept. Measured:
+    # ``tests/unit/test_new_subtask_test_command_gate.py::test_a_cargo_command_
+    # against_a_missing_module_is_discarded`` passes on 7ca1825 and fails with
+    # the bare redirect, and so did the ``unit-09`` CI shard.
+    #
+    # These two name *toolchain locations*, not user state -- the same class
+    # as the PATH the runner already has. Filling them in keeps the hermetic
+    # home without taking the compiler away. Only when unset and only when the
+    # directory exists, so an operator who already points them elsewhere is
+    # left alone.
+    launch_home = os.environ.get(REAL_HOME_ENV)
+    if launch_home:
+        for var, sub in (("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")):
+            if not os.environ.get(var):
+                candidate = Path(launch_home) / sub
+                if candidate.is_dir():
+                    os.environ[var] = str(candidate)
+
+    env = HermeticEnv(
         state_db_dir=state_db_dir,
         lock_root=lock_root,
         subagent_root=subagent_root,
+        home_root=home_root,
+        home_root_owner_pid=home_root_owner_pid,
+        lock_root_owner_pid=lock_root_owner_pid,
+        state_root_owner_pid=state_root_owner_pid,
     )
+    _INSTALLED_ENV = env
+    return env
 
 
 def xdist_worker_id() -> str:

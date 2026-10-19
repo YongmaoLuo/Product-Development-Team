@@ -24,6 +24,7 @@ import pytest
 from _pytest_hermetic_env import (
     install_hermetic_env,
     install_request_guard_header,
+    write_minimal_cc_switch_db,
     xdist_worker_id,
 )
 
@@ -54,6 +55,10 @@ _HERMETIC_ENV = install_hermetic_env()
 _TEST_STATE_DB_DIR = _HERMETIC_ENV.state_db_dir
 _LOCK_ROOT = _HERMETIC_ENV.lock_root
 _SUBAGENT_ROOT = _HERMETIC_ENV.subagent_root
+_HOME_ROOT = _HERMETIC_ENV.home_root
+_HOME_ROOT_OWNER_PID = _HERMETIC_ENV.home_root_owner_pid
+_LOCK_ROOT_OWNER_PID = _HERMETIC_ENV.lock_root_owner_pid
+_STATE_ROOT_OWNER_PID = _HERMETIC_ENV.state_root_owner_pid
 _XDIST_WORKER = xdist_worker_id()
 
 
@@ -148,10 +153,21 @@ def pytest_sessionfinish(session, exitstatus) -> None:
     # session fixture is ever instantiated in it, and its directory would
     # otherwise be the one directory per run that survives — which is the
     # leak the idempotency note above exists to prevent, reintroduced by the
-    # fix for it.
+    # fix for it.  Each removal is additionally gated on having minted the
+    # root: this block already runs only in the controller, but the guard is
+    # what makes "the process that owns it" the rule rather than "the process
+    # that got here first", which is what a nested session inherits from us.
     if not _XDIST_WORKER:
-        shutil.rmtree(_TEST_STATE_DB_DIR, ignore_errors=True)
-        shutil.rmtree(_LOCK_ROOT, ignore_errors=True)
+        if os.getpid() == _STATE_ROOT_OWNER_PID:
+            shutil.rmtree(_TEST_STATE_DB_DIR, ignore_errors=True)
+        if os.getpid() == _LOCK_ROOT_OWNER_PID:
+            shutil.rmtree(_LOCK_ROOT, ignore_errors=True)
+        # Only the process that minted this root removes it: a nested pytest
+        # session inherits ``PDT_TEST_FAKE_HOME`` and reuses this directory,
+        # so an unconditional removal here would delete the CC Switch database
+        # out from under the run that created it.
+        if os.getpid() == _HOME_ROOT_OWNER_PID:
+            shutil.rmtree(_HOME_ROOT, ignore_errors=True)
 
 
 _install_killpg_tripwire()
@@ -301,8 +317,17 @@ def _hermetic_state_db_dir():
     _TEST_STATE_DB_DIR.mkdir(parents=True, exist_ok=True)
     (_TEST_STATE_DB_DIR / "plans").mkdir(parents=True, exist_ok=True)
     yield _TEST_STATE_DB_DIR
-    shutil.rmtree(_TEST_STATE_DB_DIR, ignore_errors=True)
-    shutil.rmtree(_LOCK_ROOT, ignore_errors=True)
+    # Only the process that minted a root removes it.  Under xdist this
+    # fixture is instantiated once *per worker*, and every worker inherited
+    # one ``PDT_LOCK_ROOT`` from the controller -- so the unconditional
+    # removal this replaced deleted the live broker sockets of the workers
+    # still running, which surfaces as "[pdt-lock] broker unavailable
+    # (exit 4)".  A worker owns the state directory (it minted or scoped it
+    # to its own worker id) but not the lock root.
+    if os.getpid() == _STATE_ROOT_OWNER_PID:
+        shutil.rmtree(_TEST_STATE_DB_DIR, ignore_errors=True)
+    if os.getpid() == _LOCK_ROOT_OWNER_PID:
+        shutil.rmtree(_LOCK_ROOT, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -466,29 +491,20 @@ def fake_cc_switch_home(monkeypatch, tmp_path):
     ``list_provider_names`` resolve against while ``server
     .load_providers`` turns a chain's names into configs.
 
-    Opt-in rather than autouse: ``Path.home()`` is also how
-    ``tests/test_edit_write_containment_guard.py`` resolves its "foreign
-    checkout" fixtures, and redirecting it for the whole session would
-    quietly change what those tests exercise.
+    Opt-in rather than autouse: the session already runs against a throwaway
+    ``$HOME`` that carries its own CC Switch database
+    (``install_hermetic_env`` installs both).  What this fixture adds is that
+    the database *moves* -- into this test's own ``tmp_path``, redirected by
+    this test's ``monkeypatch`` and restored with it.  A test that needs a
+    database it can point at something other than the session home asks for
+    this; a test that merely needs *a* database already has one.
     """
-    import sqlite3
-
     fake_home = tmp_path / "home"
     cc_dir = fake_home / ".cc-switch"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    db_path = cc_dir / "cc-switch.db"
-
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS providers ("
-            "id TEXT PRIMARY KEY, app_type TEXT, name TEXT, "
-            "settings_config TEXT, created_at INTEGER, sort_index INTEGER, "
-            "is_current BOOLEAN DEFAULT 0)"
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    # The schema is defined once, in ``_pytest_hermetic_env``, and shared with
+    # the session-wide install there.  Two copies of this DDL would be free to
+    # drift and nothing in either tree would say so.
+    write_minimal_cc_switch_db(cc_dir)
 
     # ``resolve_db_path`` calls ``Path.home()`` on every call, so
     # redirecting the env var is enough — no module constant to patch.

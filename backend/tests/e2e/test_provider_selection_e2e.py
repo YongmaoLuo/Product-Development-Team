@@ -79,6 +79,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from coding_tool import ClaudeCodingTool  # noqa: E402
+from _pytest_hermetic_env import REAL_HOME_ENV  # noqa: E402
 
 
 # All tests in this file are e2e (full pipeline) and slow (real-DB
@@ -95,8 +96,14 @@ pytestmark = [
 # ---------------------------------------------------------------------------
 
 
-# Path to the real production database. Read-only via URI mode.
-PROD_DB_PATH = Path(os.path.expanduser("~/.cc-switch/cc-switch.db"))
+#: The home this test run was *launched* with. ``install_hermetic_env()``
+#: redirects ``$HOME`` to a temp dir and seeds it with an empty CC Switch
+#: database, so ``Path.home()`` names that fixture rather than the
+#: operator's installation -- and this test is about the *real* database.
+#: Resolving through ``PDT_TEST_REAL_HOME`` keeps the target honest and
+#: lets the "no CC Switch here" skip fire on a machine without one.
+_PROD_HOME = Path(os.environ.get(REAL_HOME_ENV) or Path.home())
+PROD_DB_PATH = _PROD_HOME / ".cc-switch" / "cc-switch.db"
 
 
 # Beijing timezone used by the vendor-b peak-hour window. Mirrors the

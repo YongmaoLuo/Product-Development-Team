@@ -247,6 +247,20 @@ CRITICAL RULES:
    children. Say so in the task description instead, and leave the task as
    a single item for an operator to look at.
 
+7. EVERY task you return MUST carry a "files_to_modify" field — it is the
+   task's write contract, not advice. The executor's file-lock hook and its
+   Edit/Write guard both read it, and a task whose declaration is not a
+   concrete list of paths is treated as READ-ONLY: its sub-agent is refused
+   every file write, and any file it really needed to change is never locked
+   against a sibling task that also reaches for it. Write the files the task
+   WILL modify, as paths relative to the project directory. A task that
+   genuinely only reads — investigation, audit, locating a symbol, settling a
+   question from code that already exists — MUST say so explicitly as
+   ["__NO_FILE_CHANGES__"]. Do NOT omit the field, do NOT emit an empty
+   list [], and do NOT write the placeholder "__UNKNOWN_MODIFICATIONS__":
+   each of those is an undeclared list, which is rejected and costs you a
+   correction round.
+
 Output the COMPLETE updated list of tasks in the following JSON format:
 {
   "tasks": [
@@ -255,6 +269,7 @@ Output the COMPLETE updated list of tasks in the following JSON format:
       "title": "Short title",
       "description": "Detailed description",
       "test_command": "Command to verify",
+      "files_to_modify": ["path/to/file.py", "path/to/another.py"],
       "status": "pending/completed/failed/in_progress",
       "updated_time": "ISO8601 timestamp or null"
     }
@@ -264,6 +279,10 @@ IMPORTANT: You MUST preserve these metadata fields from existing tasks:
 1. "status" - Do not change the status of completed tasks
 2. "updated_time" - Always preserve this field if it exists
 When returning the updated task list, include these fields for all existing tasks.
+"files_to_modify" is REQUIRED on every task above: a list of the relative
+paths that task will modify, or exactly ["__NO_FILE_CHANGES__"] when the task
+is read-only. An omitted field, an empty list [], and the placeholder
+"__UNKNOWN_MODIFICATIONS__" are all undeclared and are rejected.
 """,
     domain_knowledge="",
     file_patterns=["*.py", "*.js", "*.ts", "*.tsx", "*.java", "*.go", "*.rs", "*.c", "*.cpp", "*.h"],
