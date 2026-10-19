@@ -39,7 +39,11 @@ from quota_watchdog import get_shared_quota_watchdog as _shared_quota_watchdog
 # Per-plan LLM-call attribution registry (2026-09-21). Pure logging side
 # channel — record failures must never break a dispatch, so the registry
 # swallows its own errors and we never let them propagate either.
-from usage_registry import current_task_id, current_task_is_readonly
+from usage_registry import (
+    current_task_allowed_files,
+    current_task_id,
+    current_task_is_readonly,
+)
 from usage_registry import record_llm_call as _record_usage_entry
 from file_lock_protocol import socket_path
 
@@ -701,6 +705,30 @@ _PLANS_DIR = Path(os.environ.get(
 # that did declare its files — and, because the refusal happens before the
 # broker acquire, it leaves no lock row behind.
 #
+# Stage 4 — the declaration is the permission, not just the claim.
+# Stage 3 answers "may this task ever write"; this one answers "may it
+# write THIS file", and that is what makes the deadlock fix structural
+# rather than probabilistic.
+#
+# The production incident this closes: two sibling tasks each declared one
+# set of paths, and each set was disjoint, so the sorted pre-fetch at task
+# start — which is the only ordering the executor can apply — had nothing
+# to order. Both sub-agents then went on to write files OUTSIDE their
+# declarations, and each such write was acquired here, one at a time, in
+# the order the LLM happened to edit. That is textbook AB-BA, and it spun
+# for 26 minutes against a 300s timeout that no one was going to sit
+# through twice. Sorting cannot help: the executor only knows the declared
+# set, and the actual touched set is not a subset of it. What closes it is
+# making the touched set a SUBSET of the declared one — refuse the write
+# instead of locking it. A task's lock set is then fixed before it runs,
+# and there is no incremental acquisition left to interleave.
+#
+# ``PDT_ALLOWED_WRITE_FILES`` is stamped per task from the same context
+# as ``PDT_READONLY_TASK`` (``usage_registry.current_task_allowed_files``)
+# and holds the declaration verbatim. A task with no slip at all is not
+# checked, which is what keeps the refiner's own queries and the
+# verification agents — none of which run under a task scope — working.
+#
 # The hook script is written to a per-process tmpfile once and re-execed
 # via ``python3 <file>``. This avoids the multi-line-inside-``python3 -c``
 # quoting hazards that bit us in 2026-08-26 (newline-collapsed nested-if
@@ -756,6 +784,66 @@ if ro:
           'declaration out.', file=sys.stderr)
     sys.exit(2)
 
+# Stage 4 - the declaration is the PERMISSION. Stage 3 answers "may this
+# task ever write"; this one answers "may it write THIS file".
+#
+# The deadlock this removes: the sorted pre-fetch at task start orders
+# the *declared* set, but a sub-agent that goes on to touch an
+# UNDECLARED file makes the hook acquire it mid-task, one edit at a time,
+# in the order the LLM happened to edit. Two siblings that each declared
+# a disjoint set and then both reached outside it built an AB-BA and
+# spun for 26 minutes. Declaring is the only thing that fixes that: once
+# the touched set is a subset of the declared set, the lock set is fixed
+# before the task runs and no incremental acquisition can interleave.
+#
+# Exact match, never a directory prefix. A directory declaration would
+# silently "match" every file under it and hand back the very hole this
+# closes; failing loudly tells the task its declaration is incomplete,
+# which is the truth. Only writes INSIDE the project dir are checked:
+# plans/ and scratch space never went through the broker and still do
+# not. Deliberately BEFORE the broker acquire, so a refused write leaves
+# no broker row behind.
+af=os.environ.get("PDT_ALLOWED_WRITE_FILES","")
+if af and pdr and rp and inside(rp, pdr):
+    try: allowed=json.loads(af)
+    except Exception: allowed=None
+    if allowed is not None:
+        rel=os.path.normpath(os.path.relpath(rp, pdr))
+        norm=set()
+        for a in allowed:
+            a=str(a).replace("\\\\","/")
+            if a.startswith("./"): a=a[2:]
+            if os.path.isabs(a):
+                try: a=os.path.relpath(a, pdr)
+                except Exception: continue
+            norm.add(os.path.normpath(a))
+        if rel not in norm:
+            # The executor classifies failures from test_reason /
+            # coder_response, and this line is only ever seen by the
+            # sub-agent -- which is free to paraphrase or omit it. So the
+            # path is ALSO written to a per-task marker the executor reads
+            # at the failure tail; without that channel the classification
+            # would depend on the sub-agent relaying it faithfully.
+            d=os.environ.get("PDT_UNDECLARED_WRITE_DIR","")
+            if d:
+                try:
+                    os.makedirs(d, exist_ok=True)
+                    safe="".join(ch if ch.isalnum() or ch in "-_" else "_"
+                                 for ch in os.environ.get("PDT_LOCK_TASK_ID",""))
+                    with open(os.path.join(d, safe + ".jsonl"), "a",
+                              encoding="utf-8") as f:
+                        f.write(json.dumps({"task": os.environ.get("PDT_LOCK_TASK_ID",""),
+                                            "path": rp}) + "\\n")
+                except Exception:
+                    pass
+            print("[pdt] refusing to edit a file this task did not declare: "
+                  + rp + ". This is not a lock conflict and waiting will "
+                  "not clear it. The task's files_to_modify must list this "
+                  "path (relative to the project dir) if it really needs to "
+                  "change it; stop and report that the declaration is "
+                  "incomplete.", file=sys.stderr)
+            sys.exit(2)
+
 cli=os.environ.get("PDT_LOCK_CLI","")
 sock=os.environ.get("PDT_LOCK_BROKER","")
 task=os.environ.get("PDT_LOCK_TASK_ID","")
@@ -791,6 +879,13 @@ if proc.returncode == 0:
 if proc.returncode == 3:
     print("[pdt] another task is editing this file right now: " + rp
           + " -- wait for it to finish and retry this edit.", file=sys.stderr)
+    sys.exit(2)
+if proc.returncode == 5:
+    print("[pdt] file-lock deadlock detected on " + rp + "; refusing the "
+          "edit. Another task is waiting on a file this task holds (or "
+          "vice versa). This is not retryable in-place: report the "
+          "deadlock in your result so the executor can act on it.",
+          file=sys.stderr)
     sys.exit(2)
 print("[pdt-lock] broker unavailable (exit " + str(proc.returncode)
       + "); allowing the edit", file=sys.stderr)
@@ -869,6 +964,44 @@ def _stamp_readonly_task(settings_data: dict, lock_task_id: Optional[str]) -> No
         return
     if current_task_is_readonly():
         settings_data["env"]["PDT_READONLY_TASK"] = "1"
+
+
+def _stamp_allowed_write_files(
+    settings_data: dict, lock_task_id: Optional[str]
+) -> None:
+    """Hand this sub-agent the task's declaration as a permission slip
+    (2026-10-19).
+
+    ``PDT_READONLY_TASK`` answers "may this task ever write"; this answers
+    "may it write exactly these", and the guard enforces it before taking
+    any lock. Together they make the touched set a subset of the declared
+    set, which is what fixes a task's lock set before it runs — the
+    structural half of the deadlock fix (the other half being the
+    broker's wait-for cycle detector).
+
+    Extracted next to :func:`_stamp_readonly_task` for the same reason
+    that one was: the seam is otherwise only reachable by spawning a CLI,
+    and a seam that can only be tested end-to-end is a seam nobody tests.
+
+    Three guards, all deliberate:
+
+    * ``lock_task_id`` must be set, exactly as for the read-only stamp.
+      A slip is a task's permission; without a task there is nothing to
+      permit, and the refiner's own queries and the verification
+      sub-agents run without one.
+    * ``None`` (no slip issued) leaves the key ABSENT rather than
+      writing ``[]``. An empty list would read as "this task may touch
+      nothing" and refuse every write — including the ones a read-only
+      stamp is already there to explain properly.
+    * it never CLEARS the key, for the same reason the read-only stamp
+      does not: ``settings_data`` is rebuilt per dispatch from the
+      pristine template.
+    """
+    if not lock_task_id:
+        return
+    allowed = current_task_allowed_files()
+    if allowed is not None:
+        settings_data["env"]["PDT_ALLOWED_WRITE_FILES"] = json.dumps(allowed)
 
 
 def _build_guard_hook() -> Dict[str, str]:
@@ -2195,6 +2328,15 @@ class ClaudeCodingTool(CodingTool):
                 )
                 lock_task_id = current_task_id()
                 _stamp_readonly_task(settings_data, lock_task_id)
+                _stamp_allowed_write_files(settings_data, lock_task_id)
+                # Where the guard records refused undeclared paths. Best
+                # effort by design: the marker is a second, machine-readable
+                # channel for a message that otherwise only reaches the
+                # sub-agent, and a failure to write it must not turn a
+                # correct refusal into a silent pass.
+                settings_data["env"]["PDT_UNDECLARED_WRITE_DIR"] = str(
+                    Path(tempfile.gettempdir()) / "pdt-undeclared-writes"
+                )
                 if lock_task_id:
                     # Lock ownership is keyed by task id, so the executor
                     # can release everything the task acquired — including

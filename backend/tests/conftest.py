@@ -23,7 +23,9 @@ import pytest
 
 from _pytest_hermetic_env import (
     install_hermetic_env,
+    install_provider_chain_stub,
     install_request_guard_header,
+    real_provider_chain_from_api,
     write_minimal_cc_switch_db,
     xdist_worker_id,
 )
@@ -52,6 +54,7 @@ _BACKEND_DIR = Path(__file__).resolve().parents[1]
 # ``pytest_sessionfinish`` and by the session fixture, both at call time.
 install_request_guard_header()
 _HERMETIC_ENV = install_hermetic_env()
+install_provider_chain_stub()
 _TEST_STATE_DB_DIR = _HERMETIC_ENV.state_db_dir
 _LOCK_ROOT = _HERMETIC_ENV.lock_root
 _SUBAGENT_ROOT = _HERMETIC_ENV.subagent_root
@@ -343,13 +346,15 @@ def _hermetic_state_db_dir():
 # ``load_fallback_order()`` — for an environment reason rather than a
 # code one.
 #
-# The fixture below replaces the resolver's answer with a fixed chain,
-# so the suite runs the same whether or not the developer happens to
-# have CC Switch open. It is the replacement for the contract file this
-# suite used to materialise, and it carries the same warning that did:
-# without it the whole suite depends on the host's CC Switch, so a test
-# that fails only on a machine with CC Switch running is a hermeticity
-# bug, not a finding about the code under test.
+# The stub that answers it lives in ``_pytest_hermetic_env`` and is
+# installed by ``install_provider_chain_stub()`` at the top of this file.
+# It used to live here as the session fixture
+# ``_provider_chain_from_cc_switch``, which was the reason the two trees
+# disagreed: a fixture belongs to the conftest that declares it, so
+# ``state_machine/tests`` — which never collected this file — got no
+# chain at all and its route tests really dialled
+# ``http://127.0.0.1:4000``.  The installer belongs to no tree, so both
+# get it.  See that module's docstring for why one installer, not two.
 #
 # It stubs the reader the chain resolves through — ``_chain_from_api`` —
 # and leaves ``cc_switch`` untouched. That matters: ``cc_switch`` is
@@ -364,53 +369,12 @@ def _hermetic_state_db_dir():
 # ``cc_switch``'s own database reads at a throwaway store, for the
 # tests that exercise those directly.
 
-#: The resolver as it stands before any fixture touches it. Captured at
-#: import time on purpose: ``real_cc_switch`` has to be able to put back
-#: the genuine article, and it cannot ask a session fixture that may
-#: already have replaced it.
-try:  # pragma: no cover - import shape, not behaviour
-    import provider_order as _provider_order_module
-
-    _REAL_CHAIN_FROM_API = _provider_order_module._chain_from_api
-except Exception:  # pragma: no cover - a collection error will say so
-    _REAL_CHAIN_FROM_API = None
-
-
-#: Chain the session-wide stub reports. ``["parent"]`` is the sentinel
-#: the dispatch loop never draws from (``acquire_provider_with_dynamic_
-#: capacity`` skips it), so a chain built from it cannot hand a test a
-#: provider slot by accident. ``server.load_providers`` then resolves it
-#: to nothing and logs the skip — the same empty ``STARTUP_PROVIDERS``
-#: the old contract-file fixture produced.
-_STUB_PROVIDER_CHAIN = ["parent"]
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _provider_chain_from_cc_switch():
-    """Make CC Switch report a chain for the whole session.
-
-    The resolver is answered directly rather than over HTTP, which is
-    how the app behaves when no CC Switch is listening. Nothing asserts
-    on the value; the fixture exists so the stub is visible in
-    ``--fixtures`` and so the session has a chain that did not come off
-    this machine.
-    """
-    import provider_order
-
-    provider_order._chain_from_api = lambda: list(_STUB_PROVIDER_CHAIN)
-    provider_order.cache_clear()
-    try:
-        yield _STUB_PROVIDER_CHAIN
-    finally:
-        provider_order._chain_from_api = _REAL_CHAIN_FROM_API
-        provider_order.cache_clear()
-
 
 @pytest.fixture
 def real_cc_switch(monkeypatch):
     """Put the real chain resolver back for one test.
 
-    The session stub answers the resolver so that booting the app works
+    The shared stub answers the resolver so that booting the app works
     without a CC Switch on the machine. A test about the resolver itself
     needs the opposite, and this is how it says so — ``monkeypatch``
     restores the stub when the test ends. Such a test then has to give
@@ -420,7 +384,7 @@ def real_cc_switch(monkeypatch):
     import provider_order
 
     monkeypatch.setattr(
-        provider_order, "_chain_from_api", _REAL_CHAIN_FROM_API
+        provider_order, "_chain_from_api", real_provider_chain_from_api()
     )
     provider_order.cache_clear()
     yield provider_order

@@ -45,6 +45,7 @@ import pytest
 
 from _pytest_hermetic_env import (
     install_hermetic_env,
+    install_provider_chain_stub,
     install_request_guard_header,
     xdist_worker_id,
 )
@@ -80,6 +81,13 @@ _REAL_HOME = os.environ.get("HOME") or str(Path.home())
 
 install_request_guard_header()
 _HERMETIC_ENV = install_hermetic_env()
+# The provider chain stub is the SAME installer ``backend/tests/conftest.py``
+# calls, for the reason the note above gives.  It was the one piece of the
+# hermetic contract that had no home outside a tree: as a session fixture in
+# ``backend/tests/conftest.py`` it did not exist for this tree, so a CI lane
+# whose command line started here left the route tests dialling CC Switch's
+# ``http://127.0.0.1:4000`` and five of them raising ``ProviderOrderError``.
+install_provider_chain_stub()
 _XDIST_WORKER = xdist_worker_id()
 _XDIST_WORKER = xdist_worker_id()
 

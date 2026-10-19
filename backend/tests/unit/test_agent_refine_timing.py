@@ -160,6 +160,15 @@ def _build_mock_agent(max_retries: int = 2):
     # _execute_task_with_retry's loop break path raises AttributeError.
     agent._session_task_completed_counts = {}
 
+    # 2026-10-19: the refiner split gate. ``_note_failure`` reads and
+    # writes this table to decide whether a failure is a first
+    # occurrence in its lineage. ``__new__`` bypasses ``__init__``, so
+    # the real initialiser never runs and this attribute has to be
+    # mirrored here exactly as ``__init__`` creates it -- otherwise the
+    # failure tail raises AttributeError and every assertion below
+    # silently measures the exception path instead of the gate.
+    agent._failure_occurrences = {}
+
     return agent
 
 
@@ -205,8 +214,18 @@ def test_refine_only_after_retries_exhausted_cheat_path():
         f"Calls: {agent.refine_call_log}"
     )
 
-    # Sanity: cross_verify ran once per attempt (2 attempts in max_retries=2)
-    assert agent._cross_verify_test_result.call_count == 2
+    # Sanity: cross_verify ran once per attempt. This was 2 (== max_retries)
+    # until the 2026-10-19 split gate: a failure seen for the FIRST time
+    # in its lineage buys one extra attempt instead of a split, so a
+    # first-occurrence failure now costs 3 subagent runs at
+    # max_retries=2. The refine assertion above is unaffected — still
+    # exactly one refine — because the extra attempt is exactly what
+    # the gate spends instead of splitting.
+    assert agent._cross_verify_test_result.call_count == 3, (
+        "a first-occurrence failure gets max_retries + 1 subagent "
+        "attempts; the split gate, not the attempt count, is what "
+        "changed here"
+    )
 
     # The single refine call is the LAST action before the terminal write,
     # so the failure is properly recorded after the breakdown.

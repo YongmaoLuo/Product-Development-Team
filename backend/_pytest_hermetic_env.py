@@ -111,7 +111,9 @@ __all__ = [
     "HermeticEnv",
     "REAL_HOME_ENV",
     "install_hermetic_env",
+    "install_provider_chain_stub",
     "install_request_guard_header",
+    "real_provider_chain_from_api",
     "write_minimal_cc_switch_db",
     "xdist_worker_id",
 ]
@@ -183,6 +185,71 @@ def install_request_guard_header() -> None:
 
     _TestClient.__init__ = _init_with_guard
     _TestClient._pdt_guard_installed = True
+
+
+#: The chain the session-wide stub reports.  ``["parent"]`` is the sentinel
+#: the dispatch loop never draws from (``acquire_provider_with_dynamic_
+#: capacity`` skips it), so a chain built from it cannot hand a test a
+#: provider slot by accident.  ``server.load_providers`` then resolves it
+#: to nothing and logs the skip -- the same empty ``STARTUP_PROVIDERS`` a
+#: contract-file fixture produced.
+_STUB_PROVIDER_CHAIN = ["parent"]
+
+#: ``provider_order._chain_from_api`` as it stood before the first install.
+#: Captured once so ``real_provider_chain_from_api`` can hand back the
+#: genuine article: a test about where a chain comes from needs the real
+#: transport, and cannot ask a session fixture that already replaced it.
+_REAL_PROVIDER_CHAIN_FROM_API = None
+
+#: Whether the stub has been installed.  Both conftests call the installer
+#: and pytest may import either first, so the second call has to be a no-op
+#: -- and specifically must NOT overwrite ``_REAL_PROVIDER_CHAIN_FROM_API``
+#: with the stub it installed a moment earlier, which would leave
+#: ``real_provider_chain_from_api`` handing back the stub and every test
+#: about the real transport testing the stub instead.
+_PROVIDER_CHAIN_STUB_INSTALLED = False
+
+
+def install_provider_chain_stub() -> list:
+    """Make the provider-order resolver answer without CC Switch running.
+
+    ``provider_order.load_fallback_order()`` asks CC Switch's HTTP API for
+    the chain and RAISES ``ProviderOrderError`` when it does not answer.
+    That answer is runtime state of another application -- an HTTP server
+    this repository does not start -- so it is absent on a clean CI
+    checkout, and a test that boots the app dies in the lifespan for an
+    environment reason rather than a code one.
+
+    It stubs the reader the chain resolves through (``_chain_from_api``) and
+    leaves ``cc_switch`` untouched, which matters: ``cc_switch`` stays the
+    reader of record for endpoint and credentials, so the tests that
+    exercise those keep exercising the real lookup.
+
+    Idempotent, for the reason ``_PROVIDER_CHAIN_STUB_INSTALLED`` records.
+    The import is lazy so a slimmed test session that does not ship
+    ``provider_order`` still gets a usable module.
+    """
+    global _REAL_PROVIDER_CHAIN_FROM_API, _PROVIDER_CHAIN_STUB_INSTALLED
+    if _PROVIDER_CHAIN_STUB_INSTALLED:
+        return _STUB_PROVIDER_CHAIN
+
+    import provider_order
+
+    _REAL_PROVIDER_CHAIN_FROM_API = provider_order._chain_from_api
+    provider_order._chain_from_api = lambda: list(_STUB_PROVIDER_CHAIN)
+    provider_order.cache_clear()
+    _PROVIDER_CHAIN_STUB_INSTALLED = True
+    return _STUB_PROVIDER_CHAIN
+
+
+def real_provider_chain_from_api():
+    """The genuine ``_chain_from_api``, or ``None`` before any install.
+
+    ``None`` rather than a guess: a caller that gets ``None`` has not called
+    :func:`install_provider_chain_stub` yet, which is a different situation
+    from "the resolver does not exist" and must not be papered over.
+    """
+    return _REAL_PROVIDER_CHAIN_FROM_API
 
 
 #: The stock CC Switch ``providers`` schema.  Every column is one

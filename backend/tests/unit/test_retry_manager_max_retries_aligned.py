@@ -128,6 +128,16 @@ def test_call_site_passes_the_bound():
 
     The original bug was ``agent.py`` calling the renderer without a
     bound, so a renderer-only test would have stayed green through it.
+
+    2026-10-19: the assertion used to check that the literal identifier
+    ``max_retries`` appeared in the argument list. That pinned a NAME,
+    not the invariant. The split gate introduced ``attempt_bound`` —
+    ``max_retries + 1`` once the one-off extra attempt has been granted
+    — which is a strictly better answer to the same question, because a
+    subagent sitting on attempt 3 must not be told it is on attempt 3
+    of 2. The invariant is "a bound is always passed"; what it is
+    named is an implementation detail that should be free to change
+    when the loop changes.
     """
     src = (BACKEND_DIR / "agent.py").read_text(encoding="utf-8")
     # Only real code — several docstrings/comments quote the old
@@ -141,9 +151,10 @@ def test_call_site_passes_the_bound():
     )
     assert calls, "agent.py no longer calls get_retry_prompt_modifier"
     for args in calls:
-        assert "max_retries" in args, (
-            "get_retry_prompt_modifier called without a max_retries "
-            f"bound: get_retry_prompt_modifier({args.strip()})"
+        parts = [part.strip() for part in args.split(",")]
+        assert len(parts) >= 2 and parts[1], (
+            "get_retry_prompt_modifier called without a bound: "
+            f"get_retry_prompt_modifier({args.strip()})"
         )
 
 

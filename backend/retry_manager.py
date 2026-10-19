@@ -124,7 +124,40 @@ class RetryManager:
         # use and what to verify (``git diff --stat`` before claiming
         # done). The sentinel prefix is set in
         # ``backend/agent.py`` (the empty-diff hard-fail branch).
-        if state.last_error.startswith("empty_diff_no_changes"):
+        # 2026-10-19: the report-shape rejection is NOT a code
+        # failure. The executor classifies the failure and, when this
+        # is the first occurrence in the task's lineage, buys one more
+        # attempt instead of splitting the task (see
+        # ``AutonomousAgent._note_failure``). That extra attempt is
+        # only worth anything if the subagent is told what kind of
+        # thing it got wrong: a generic "try a different approach"
+        # reads as "your code is wrong", and the subagent's response is
+        # to rewrite working code. This branch names the problem as the
+        # ANSWER — the evidence or its shape — and forbids the one move
+        # that made this failure class expensive in the first place.
+        #
+        # Order matters: this sentinel is written by the executor, not
+        # produced by a subagent, so it must be matched before the
+        # generic attempt_count branches below.
+        if state.last_error.startswith("report_format_retry:"):
+            modifier_parts.append(
+                f"Previous attempt was rejected on the SHAPE OF YOUR ANSWER:\n"
+                f"{state.last_error}"
+            )
+            modifier_parts.append(
+                "\nACTION REQUIRED — this is a report/evidence problem, not "
+                "necessarily a code problem.\n"
+                "  1. Re-read the rejection reason above. It names what was "
+                "missing or wrong (truncated evidence, a claimed PASSED that "
+                "the test run did not support, a vacuous test command).\n"
+                "  2. Fix the ANSWER: paste raw command output / raw exit codes, "
+                "do not truncate tables, do not claim a result you did not "
+                "observe.\n"
+                "  3. Re-run the task's test command and report the real "
+                "TEST_RESULT line.\n"
+                "  4. Do NOT restructure the task or rewrite unrelated code."
+            )
+        elif state.last_error.startswith("empty_diff_no_changes"):
             modifier_parts.append(
                 f"Previous attempt produced no file changes:\n{state.last_error}"
             )

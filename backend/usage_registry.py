@@ -41,9 +41,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
 #: ``{"plan_id": Optional[str], "task_id": Optional[str],
-#: "task_read_only": Optional[bool]}`` — per-thread /
-#: per-async-task attribution context set by server middleware, background
-#: thread entries, and per-task scopes in the executor.
+#: "task_read_only": Optional[bool], "task_allowed_files": Optional[list]}``
+#: — per-thread / per-async-task attribution context set by server
+#: middleware, background thread entries, and per-task scopes in the
+#: executor.
 #:
 #: ``task_read_only`` (2026-10-17) rides here rather than in a module
 #: global because it is a property of ONE task and tasks run concurrently
@@ -51,6 +52,9 @@ from typing import Any, Dict, Iterator, Optional
 #: reason it must: the two are read at the same moment, by the same call,
 #: to decide the same task's sub-agent settings — and a global would have
 #: the last task to start silently re-scoping every other running task.
+#:
+#: ``task_allowed_files`` (2026-10-19) is that task's *declared* write
+#: set, for the same single-read-at-one-moment reason.
 _plan_ctx: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
     "pdt_plan_usage_ctx", default=None
 )
@@ -114,11 +118,33 @@ def current_task_is_readonly() -> bool:
     return bool((ctx or {}).get("task_read_only"))
 
 
+def current_task_allowed_files() -> Optional[list[str]]:
+    """The task in scope's declared write set, or ``None`` for none.
+
+    The second half of the declaration contract (2026-10-19). A
+    read-only task has ``None`` here — it keeps failing through
+    ``PDT_READONLY_TASK`` — and so does everything that runs outside a
+    task scope.
+
+    ``None`` deliberately fails OPEN at the consuming guard. The
+    asymmetry is the same one the read-only stamp uses and for the same
+    reason: a false refusal bricks a task that was going to succeed,
+    while a missed refusal is the status quo this change is meant to
+    remove one layer of. So the guard refuses only when a slip was
+    actually issued and this path is genuinely absent from it.
+    """
+    ctx = _plan_ctx.get()
+    if not ctx:
+        return None
+    return ctx.get("task_allowed_files")
+
+
 @contextmanager
 def plan_usage_context(
     plan_id: Optional[str] = None,
     task_id: Optional[str] = None,
     task_read_only: Optional[bool] = None,
+    task_allowed_files: Optional[list[str]] = None,
 ) -> Iterator[None]:
     """Bind LLM calls in this scope to ``plan_id`` / ``task_id``.
 
@@ -131,11 +157,19 @@ def plan_usage_context(
     "unknown", which :func:`current_task_is_readonly` reads as not
     read-only — so every pre-existing caller of this helper keeps its old
     behaviour without having to be edited.
+
+    ``task_allowed_files`` is the same declaration when it IS a concrete
+    list of paths, i.e. the task's permission slip as well as its claim
+    (2026-10-19). ``None`` means "no slip issued" and
+    :func:`current_task_allowed_files` propagates that, so every caller
+    outside a task scope — the refiner's own queries, the verification
+    agents — is unaffected.
     """
     token = _plan_ctx.set({
         "plan_id": plan_id,
         "task_id": task_id,
         "task_read_only": task_read_only,
+        "task_allowed_files": task_allowed_files,
     })
     try:
         yield
