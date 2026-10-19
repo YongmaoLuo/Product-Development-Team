@@ -9,9 +9,15 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 # Two-value sentinel scheme (2026-09-09). The single
 # ``UNKNOWN_MODIFICATIONS`` value is replaced by two distinct
@@ -129,8 +135,51 @@ class SubTask(BaseModel):
     # ``ValueError: object has no field commit_sha`` whenever the
     # executor tries to assign it.
     commit_sha: Optional[str] = None
+    # 2026-10-19 — what this task hands back.
+    #
+    # ``code`` (the default) is the historical shape: the deliverable is
+    # a diff in the project repo, and ``files_to_modify`` says which
+    # files that is. ``report`` is for the read-only / analysis tasks
+    # ("decide whether X is feasible", "assemble the evidence for Y"):
+    # their deliverable is ONE file under TMP, not a diff, so the
+    # empty-diff gate would otherwise read them as having produced
+    # nothing (see ``AutonomousAgent._execute_task_with_retry``).
+    #
+    # Default ``code`` is load-bearing, not cosmetic: ``SubTask`` is
+    # constructed from every row of every ``tasks.json`` in the field,
+    # so any other default would silently re-classify existing plans.
+    deliverable: Literal["code", "report"] = "code"
+    # Absolute, or relative to the task's ``project_dir``. Required iff
+    # ``deliverable == "report"`` — a report task with no path has no
+    # deliverable at all, and the executor would retry it forever
+    # because "write a report" with no address to write it to is not
+    # an instruction the sub-agent can satisfy.
+    report_path: Optional[str] = None
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    @model_validator(mode="after")
+    def _validate_report_pair(self) -> "SubTask":
+        """The deliverable and its address have to agree.
+
+        Both directions are enforced. A ``report`` task with no path
+        cannot be dispatched (nothing to check, nothing to read at
+        audit time), and a ``code`` task carrying a path is a task
+        whose author believes its output is a file somewhere — which
+        is exactly the belief that used to produce "completed" with an
+        empty diff and no artifact anywhere. Silent acceptance of
+        either would put the mismatch back exactly where it started.
+        """
+        if self.deliverable == "report":
+            if self.report_path is None or not str(self.report_path).strip():
+                raise ValueError(
+                    "deliverable='report' requires a non-empty report_path"
+                )
+        elif self.report_path is not None:
+            raise ValueError(
+                "report_path is only valid when deliverable='report'"
+            )
+        return self
 
     @staticmethod
     def _truncate(text: Optional[str], limit: int) -> str:
@@ -318,6 +367,17 @@ class SubTask(BaseModel):
         # repair-task guard would silently stop matching again.
         if self.task_group:
             result["task_group"] = self.task_group
+        # Same opt-in pattern, but this pair is NOT optional in the way
+        # the others are: a report task that lost its ``report_path``
+        # across a ``save_tasks`` round-trip would come back as
+        # ``deliverable="report", report_path=None``, which the model
+        # validator above REJECTS — so the plan would refuse to load
+        # after a single save. Both keys are therefore written for a
+        # report task and omitted entirely for a code task, so legacy
+        # ``tasks.json`` files stay byte-identical.
+        if self.deliverable != "code":
+            result["deliverable"] = self.deliverable
+            result["report_path"] = self.report_path
         return result
 
     def model_dump_json(self, *, indent: Optional[int] = None, **kwargs: Any) -> str:

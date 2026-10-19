@@ -1401,6 +1401,84 @@ def _declared_modification_files(task) -> Optional[list[str]]:
     return list(files)
 
 
+#: Hard ceiling on how much of a report file is handed to the reviewer.
+#: The second pass already truncates its input at 8000 chars; this is
+#: the same kind of bound, one order up because a report is the WHOLE
+#: deliverable rather than the tail of a chat answer. Past it the
+#: answer stops being evidence and starts being noise.
+REPORT_AUDIT_MAX_CHARS = 20000
+
+
+def is_report_task(task) -> bool:
+    """Whether ``task``'s deliverable is a report file rather than a diff.
+
+    ``getattr`` rather than ``task.deliverable`` on purpose: this
+    predicate is read on code tasks too (the executor's success path,
+    the second pass's audit gate), and every pre-2026-10-19 caller —
+    including the test stubs in this module's own suite — hands in an
+    object that has no such attribute.
+    """
+    return getattr(task, "deliverable", "code") == "report"
+
+
+def resolve_report_path(task, project_dir=None) -> Optional[Path]:
+    """The absolute path of ``task``'s report, or ``None``.
+
+    ``report_path`` is absolute, or relative to the task's
+    ``project_dir`` (falling back to the agent's own). Resolving here,
+    in one place, is what lets three different consumers compare the
+    same string: the executor's empty-diff check, the guard's exact-match
+    carve-out, and the second pass's read. Each of them resolving
+    independently would be three chances for them to disagree about
+    which file the task is supposed to produce.
+    """
+    raw = getattr(task, "report_path", None)
+    if not raw or not str(raw).strip():
+        return None
+    p = Path(str(raw).strip()).expanduser()
+    if not p.is_absolute():
+        base = getattr(task, "project_dir", None) or project_dir
+        if not base:
+            return None
+        p = Path(str(base)).expanduser() / p
+    # ``resolve`` without ``strict`` so a not-yet-created report still
+    # has a canonical path — the guard compares paths, and it has to
+    # compare them for a file that does not exist yet.
+    try:
+        return p.resolve()
+    except OSError:
+        return p
+
+
+def read_report_deliverable(task, project_dir=None) -> tuple[bool, str, str]:
+    """``(ok, text, resolved_path)`` for a report task's deliverable.
+
+    ``ok`` is the delivery contract: the file exists AND is non-empty.
+    A zero-byte file is not a deliverable — it is the Write tool's
+    output when the sub-agent opened a file and never filled it, and
+    accepting one would mark the task completed with nothing in it.
+
+    Reading is bounded and never raises: a report the executor cannot
+    read (permissions, a directory where a file was expected) is a
+    failed deliverable, not an executor crash, and the caller turns
+    ``ok=False`` into an actionable retry message that names the path.
+    """
+    path = resolve_report_path(task, project_dir)
+    if path is None:
+        return False, "", ""
+    try:
+        if not path.is_file():
+            return False, "", str(path)
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False, "", str(path)
+    if not text.strip():
+        return False, "", str(path)
+    if len(text) > REPORT_AUDIT_MAX_CHARS:
+        text = text[:REPORT_AUDIT_MAX_CHARS] + "\n...[truncated]"
+    return True, text, str(path)
+
+
 def _build_micro_layers(layer_tasks: list) -> list:
     """Split one dependency layer into serialised micro layers.
 
@@ -4574,6 +4652,21 @@ class AutonomousAgent:
                     # the Edit/Write guard enforces cannot drift — which
                     # is the drift that produced the AB-BA deadlock.
                     task_allowed_files=_declared_modification_files(task),
+                    # The ONE file a report-task may still write
+                    # (2026-10-19). Resolved HERE, once, from the task
+                    # about to run, for the same reason the other two
+                    # are computed here: the consumer (``coding_tool``
+                    # stamping ``PDT_REPORT_PATH`` into the spawned
+                    # CLI's settings) runs in another process and has no
+                    # access to this object. ``None`` for every code
+                    # task, so the guard's carve-out stays closed.
+                    task_report_path=(
+                        str(
+                            resolve_report_path(task, self.project_dir)
+                            or ""
+                        )
+                        or None
+                    ) if is_report_task(task) else None,
                 ):
                     return self._execute_task_with_retry(
                         task,
@@ -5347,8 +5440,146 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     # would be rejecting the exact state it demands.
                     # See :meth:`_expects_clean_tree`.
                     expects_clean_tree = self._expects_clean_tree(task)
+                    # 2026-10-19 — deliverable dispatch, BEFORE the
+                    # empty-diff verdict. A report task's deliverable
+                    # is one file under TMP, so "no diff in the project
+                    # repo" says nothing about whether it delivered. The
+                    # gate below would read it as "the sub-agent produced
+                    # nothing" and retry a task that is behaving exactly
+                    # as asked, so the deliverable is resolved first and
+                    # the gate is then routed by WHAT this task owes.
+                    is_report = is_report_task(task)
+                    report_ok = False
+                    report_text = ""
+                    report_abs = ""
+                    if is_report:
+                        report_ok, report_text, report_abs = (
+                            read_report_deliverable(task, self.project_dir)
+                        )
                     if not changed_files and not self._task_declared_files_exist(task):
-                        if is_audit or expects_clean_tree:
+                        if is_report:
+                            if report_ok:
+                                if self.logger:
+                                    self.logger.info(
+                                        "task_report_deliverable_present",
+                                        f"Task [{task.id}] is a report task; "
+                                        f"its deliverable is a file, not a "
+                                        f"diff. {report_abs} exists and is "
+                                        f"non-empty — empty diff accepted.",
+                                        task_id=task.id,
+                                        data={
+                                            "attempt": attempt + 1,
+                                            "report_path": report_abs,
+                                            "report_chars": len(report_text),
+                                        },
+                                    )
+                                print(
+                                    f"Empty diff accepted (report task): "
+                                    f"task [{task.id}] → {report_abs}"
+                                )
+                                # fall through to the completion path —
+                                # no continue, no retry, no commit
+                            else:
+                                # The report IS the deliverable, so a
+                                # missing one is not "no output", it is
+                                # "the one thing this task was asked for
+                                # is not there". Say so with the path,
+                                # because the retry hint is the only
+                                # channel the sub-agent gets: without
+                                # the address it cannot know where to
+                                # write, and the generic empty-diff hint
+                                # ("modify the files in files_to_modify")
+                                # points at a list it does not have.
+                                report_hint_path = report_abs or (
+                                    getattr(task, "report_path", "") or "<unset>"
+                                )
+                                error_msg = (
+                                    f"report file missing or empty at "
+                                    f"{report_hint_path}; use the Write tool "
+                                    f"to write the report to exactly that "
+                                    f"path"
+                                )
+                                self.retry_manager.record_attempt(
+                                    task.id, error_msg, False,
+                                )
+                                if self.logger:
+                                    self.logger.warning(
+                                        "task_report_deliverable_missing",
+                                        f"Task [{task.id}] owes a report at "
+                                        f"{report_hint_path} and it is "
+                                        f"missing or empty; recording attempt "
+                                        f"failure and forcing retry (attempt "
+                                        f"{attempt + 1}/{max_retries}).",
+                                        task_id=task.id,
+                                        data={
+                                            "attempt": attempt + 1,
+                                            "max_retries": max_retries,
+                                            "report_path": report_hint_path,
+                                        },
+                                    )
+                                print(
+                                    f"Report deliverable missing: task "
+                                    f"[{task.id}] → {report_hint_path}"
+                                )
+                                if attempt < max_retries - 1:
+                                    continue
+                                failure, occurrence = self._note_failure(
+                                    task, error_msg,
+                                )
+                                if occurrence == 1 and not extra_attempt_granted:
+                                    extra_attempt_granted = True
+                                    self.retry_manager.record_attempt(
+                                        task.id, error_msg, False,
+                                    )
+                                    if self.logger:
+                                        self.logger.info(
+                                            "failure_first_occurrence_retry",
+                                            (
+                                                f"Task [{task.id}] delivered no "
+                                                f"report for the first time; "
+                                                f"granting one more attempt "
+                                                f"instead of splitting it."
+                                            ),
+                                            task_id=task.id,
+                                            data={
+                                                "kind": failure.kind,
+                                                "signature": failure.signature,
+                                                "occurrence": occurrence,
+                                            },
+                                        )
+                                    continue
+                                self._refine_after_failure(
+                                    task=task,
+                                    coder_response="",
+                                    result_context=error_msg,
+                                    file_context="",
+                                    exit_code=1,
+                                    failure=failure,
+                                    occurrence=occurrence,
+                                )
+                                self.task_manager.record_task_failure(
+                                    task.id, error_msg,
+                                )
+                                duration = int(
+                                    time.monotonic() - task_start_time,
+                                )
+                                if self.logger:
+                                    self.logger.error(
+                                        "task_failed",
+                                        f"Task [{task.id}] failed after "
+                                        f"{max_retries} attempts without "
+                                        f"writing its report: "
+                                        f"{error_msg[:200]}",
+                                        task_id=task.id,
+                                        data={
+                                            "error": error_msg[:500],
+                                            "duration_sec": duration,
+                                            "attempts": max_retries,
+                                            "reason": "report_deliverable_missing",
+                                        },
+                                    )
+                                return False
+                        elif is_audit or expects_clean_tree:
                             if self.logger:
                                 self.logger.info(
                                     "task_audit_no_diff_accepted",
@@ -5663,9 +5894,56 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     )
                     self.retry_manager.reset_state(task.id)
 
-                    # Commit with task checkpoint format
-                    self._commit_task_changes(task, changed_files)
-                    print("Changes committed.")
+                    # Commit with task checkpoint format.
+                    #
+                    # 2026-10-19: skipped for a report task with no
+                    # in-repo changes, and ONLY then. ``git_manager.commit``
+                    # is ``git add -A`` + ``index.commit``, and with
+                    # nothing staged it does NOT raise — it writes a
+                    # commit whose tree equals its parent's (measured:
+                    # two commits, one tree, ``git log --format="%T"``
+                    # identical). So a report task reaching this call
+                    # would silently append an empty checkpoint commit to
+                    # the PROJECT's history, one per report task, and
+                    # ``_commit_task_changes`` would then write that
+                    # empty commit's SHA back as the task's
+                    # ``commit_sha`` — a task whose recorded commit
+                    # changes nothing. The report is deliberately NOT
+                    # staged either: the repo is the product, the report
+                    # is scratch, and committing scratch is how a
+                    # deliverable ends up in the project's history.
+                    # A report task that DID change project files still
+                    # commits them — the carve-out is "no diff to commit",
+                    # not "report tasks never commit".
+                    if is_report and not changed_files:
+                        print(
+                            f"No repo changes to commit (report task: "
+                            f"task [{task.id}] → {report_abs})"
+                        )
+                        # The deliverable's address is part of the plan's
+                        # record of what this task produced — without it
+                        # a reader of ``plan_tasks`` sees a completed task
+                        # and has to go looking for the artifact.
+                        # Best effort: the in-memory task status written
+                        # above is already correct, so a storage-layer
+                        # failure must not turn a delivered report into a
+                        # failed task.
+                        try:
+                            self.task_manager.runtime_overrides.setdefault(
+                                task.id, {}
+                            )["report_path"] = report_abs
+                        except Exception as store_exc:  # noqa: BLE001
+                            if self.logger:
+                                self.logger.warning(
+                                    "task_report_path_not_stored",
+                                    f"Could not record report_path for task "
+                                    f"[{task.id}]: {store_exc}",
+                                    task_id=task.id,
+                                    data={"error": str(store_exc)[:200]},
+                                )
+                    else:
+                        self._commit_task_changes(task, changed_files)
+                        print("Changes committed.")
                     duration = int(time.monotonic() - task_start_time)
                     if self.logger:
                         self.logger.info("task_completed",
@@ -5673,7 +5951,17 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                                          task_id=task.id,
                                          data={"changed_files": changed_files,
                                                "duration_sec": duration,
-                                               "attempts": attempt + 1})
+                                               "attempts": attempt + 1,
+                                               # None for every code task,
+                                               # so the field's presence is
+                                               # what says "this one owes a
+                                               # file" — an operator can
+                                               # grep the completed log for
+                                               # it without joining against
+                                               # tasks.json.
+                                               "report_path": (
+                                                   report_abs or None
+                                               ) if is_report else None})
                     return True
                 else:
                     print(f"Tests failed: {test_reason}")
@@ -6603,13 +6891,57 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         # this is the safety net that makes the gap loud instead of
         # silently trusting the subagent.
         has_runnable_command = bool(task.get_test_commands())
+        # 2026-10-19: a report task is always reviewed, even when it
+        # has a runnable command and reads like ordinary implementation
+        # work. Its deliverable is prose, so the thing that can be wrong
+        # is the prose — and a task with a passing command would
+        # otherwise sail through this gate on the strength of the
+        # command alone. The empty-diff branch already decided the file
+        # EXISTS; this decides whether it SAYS anything right.
+        is_report = is_report_task(task)
         is_audit = (
             getattr(task, "verification_only", False)
             or self._looks_like_audit_task(task)
             or not has_runnable_command
+            or is_report
         )
         if not is_audit:
             return True, ""
+
+        # 2026-10-19: the report FILE is the answer for a report task,
+        # not the chat reply that produced it. Reviewing the reply means
+        # reviewing whatever the sub-agent felt like summarising on its
+        # way out — which for a task told "write the report to this
+        # exact path" is routinely a one-line "done, report written to
+        # <path>", and a reviewer given that has nothing to judge. Read
+        # the artifact instead.
+        #
+        # A missing report is a FAILED second pass, not an inconclusive
+        # one and not a silent fall-through to the chat text. Silence
+        # here is what produced the original class of bug this feature
+        # exists to remove: a task marked completed whose deliverable
+        # exists nowhere.
+        if is_report:
+            report_ok, report_text, report_abs = read_report_deliverable(
+                task, self.project_dir
+            )
+            if not report_ok:
+                where = report_abs or getattr(task, "report_path", "") or "<unset>"
+                if self.logger:
+                    self.logger.error(
+                        "task_report_deliverable_unreadable",
+                        f"Task [{task.id}] owes a report at {where} and it "
+                        f"could not be read for review; refusing the "
+                        f"second pass rather than falling back to the "
+                        f"chat answer.",
+                        task_id=task.id,
+                        data={"report_path": where},
+                    )
+                return False, (
+                    f"report file missing or empty at {where}; use the "
+                    f"Write tool to write the report to exactly that path"
+                )
+            coder_response = report_text
 
         spec = (
             f"## Task title\n{getattr(task, 'title', '')}\n\n"
@@ -6637,18 +6969,32 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 "cites an exit code with no output — must be FAILED, "
                 "however plausible it reads."
             )
-        audit_prompt = (
-            "Compare the spec below to the subagent's final answer "
-            "below. Decide whether the answer actually satisfies the "
-            "spec's acceptance criteria.\n\n"
-            f"## SPEC\n{spec}{self_verification_note}\n\n"
+        # 2026-10-19: a report is handed over WHOLE (up to
+        # ``REPORT_AUDIT_MAX_CHARS``), not tail-truncated. The
+        # ``[-8000:]`` below exists because a chat answer's verdict is
+        # in its last few lines — the framework trailer and the final
+        # claim. A report has no such tail: keeping only its last 8000
+        # characters would routinely hand the reviewer a conclusion with
+        # the evidence it rests on cut off above, which is precisely the
+        # answer this pass exists to reject.
+        if is_report:
+            answer_block = f"## REPORT (the task's deliverable file)\n{coder_response}"
+        else:
             # 2026-09-22: strip the framework's mandatory ``TEST_RESULT:``
             # trailer before the reviewer sees it. It is machine protocol,
             # not evidence, and a spec clause forbidding it would otherwise
             # make every answer fail (see
             # ``strip_framework_result_trailer``).
-            f"## SUBAGENT ANSWER\n"
-            f"{strip_framework_result_trailer(coder_response)[-8000:]}"
+            answer_block = (
+                "## SUBAGENT ANSWER\n"
+                f"{strip_framework_result_trailer(coder_response)[-8000:]}"
+            )
+        audit_prompt = (
+            "Compare the spec below to the subagent's final answer "
+            "below. Decide whether the answer actually satisfies the "
+            "spec's acceptance criteria.\n\n"
+            f"## SPEC\n{spec}{self_verification_note}\n\n"
+            f"{answer_block}"
         )
 
         try:

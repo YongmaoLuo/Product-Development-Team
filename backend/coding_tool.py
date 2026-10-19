@@ -44,6 +44,7 @@ from usage_registry import (
     current_task_allowed_files,
     current_task_id,
     current_task_is_readonly,
+    current_task_report_path,
 )
 from usage_registry import record_llm_call as _record_usage_entry
 from file_lock_protocol import socket_path
@@ -749,6 +750,25 @@ def inside(x, root):
     return bool(root) and (x == root or x.startswith(root + os.sep))
 def in_tmp_scratch(x):
     return x.startswith("/tmp/") or x.startswith("/private/tmp/") or inside(x, tmp)
+
+# A task whose deliverable is a REPORT (2026-10-19) declares no
+# files_to_modify, so the read-only refusal below blocks every Edit /
+# Write it attempts -- including the one Write that IS its entire
+# deliverable. That makes the task unsatisfiable rather than read-only:
+# the executor retries it to the budget limit and it dies having produced
+# nothing. So the report path is let through here, BEFORE both the
+# containment refusal and the read-only refusal.
+#
+# Exact match on the resolved path, never a directory prefix. A prefix
+# rule would hand the read-only exemption to every file under TMP --
+# which is the same class of hole as the directory declaration this
+# guard already refuses (see the PDT_ALLOWED_WRITE_FILES block below):
+# the permission is for one file the plan named, and anything wider is
+# an undeclared write wearing a different name.
+rp_env=os.environ.get("PDT_REPORT_PATH","")
+if rp_env and rp and rp == R(rp_env):
+    sys.exit(0)
+
 blocked = False
 if rp:
     if pdr:
@@ -979,6 +999,44 @@ def _stamp_readonly_task(settings_data: dict, lock_task_id: Optional[str]) -> No
         return
     if current_task_is_readonly():
         settings_data["env"]["PDT_READONLY_TASK"] = "1"
+
+
+def _stamp_report_path(
+    settings_data: dict, lock_task_id: Optional[str]
+) -> None:
+    """Hand this sub-agent the ONE file it is still allowed to write (2026-10-19).
+
+    The report deliverable. A report task declares no ``files_to_modify``,
+    so ``_stamp_readonly_task`` marks it read-only and the guard refuses
+    every Edit / Write -- the exact Write that produces its report
+    included. This stamp is the other half: the single path the guard
+    lets through before the read-only refusal, so "read-only" means
+    "changes no source file", not "cannot do its job".
+
+    Sits next to ``_stamp_readonly_task`` and ``_stamp_allowed_write_files``
+    for the same reason they do — the seam is otherwise only reachable by
+    spawning a CLI, and a seam nobody can reach is a seam nobody tests.
+
+    The same two guards apply, and for the same reasons:
+
+    * ``lock_task_id`` must be set. The path is a task's permission; the
+      refiner's own queries and the verification sub-agents run without a
+      task and must keep the plain read-only refusal.
+    * it never CLEARS the key: ``settings_data`` is rebuilt per dispatch
+      from the pristine template, so one report task cannot leak its
+      carve-out onto the next task sharing this process.
+
+    ``None`` (a code task) leaves the key ABSENT rather than writing
+    ``""``. An empty string would be read by the guard as "no report
+    path issued" anyway, but an absent key is what makes "this sub-agent
+    was never told about a report" distinguishable from "the report
+    path happened to be blank".
+    """
+    if not lock_task_id:
+        return
+    report_path = current_task_report_path()
+    if report_path:
+        settings_data["env"]["PDT_REPORT_PATH"] = report_path
 
 
 def _stamp_allowed_write_files(
@@ -2363,6 +2421,7 @@ class ClaudeCodingTool(CodingTool):
                 lock_task_id = current_task_id()
                 _stamp_readonly_task(settings_data, lock_task_id)
                 _stamp_allowed_write_files(settings_data, lock_task_id)
+                _stamp_report_path(settings_data, lock_task_id)
                 # Where the guard records refused undeclared paths. Best
                 # effort by design: the marker is a second, machine-readable
                 # channel for a message that otherwise only reaches the
