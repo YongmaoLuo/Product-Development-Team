@@ -27,6 +27,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
@@ -57,11 +58,114 @@ _STARTUP_DEADLINE_SECONDS = 30.0
 #: conflating the two is what made one late response fatal.
 _POLL_TIMEOUT_SECONDS = 1.0
 
+#: The endpoint both halves of the comparison measure.
+#:
+#: It has to be the *same* endpoint on both sides — the current tree and
+#: the ``git archive HEAD`` baseline are only comparable if they were
+#: asked the same question. ``/health`` is the liveness endpoint the
+#: module docstring names, and it is the one half of the comparison that
+#: was already using it. ``/api/plans`` — the endpoint the baseline half
+#: used — is a *guarded* route: :mod:`backend.request_guard` answers every
+#: ``/api/*`` request that arrives without the ``X-PDT-Request`` header
+#: with a 403, so that half of the comparison was polling a server that
+#: was perfectly healthy and would have answered 200 all along.
+_STARTUP_ENDPOINT = "/health"
+
+#: The request guard's header. The poll is a local script, which is
+#: exactly the caller the guard allows ("This API is driven by the
+#: bundled UI or by a local script"), so the poll sends it — without it
+#: an ``/api/*`` endpoint answers 403 and the poll would burn its whole
+#: deadline on a healthy server.
+_REQUEST_HEADERS = {"X-PDT-Request": "1"}
+
 
 def _venv_python(project_root: Path) -> Path:
     """Return the project's venv interpreter, falling back to sys.executable."""
     venv = project_root / "backend" / ".venv" / "bin" / "python"
     return venv if venv.exists() else Path(sys.executable)
+
+
+def _child_pythonpath() -> str:
+    """``PYTHONPATH`` for the server subprocess.
+
+    The server is started with a swapped ``HOME`` (the fake CC Switch
+    database lives there), and the test session itself runs under a
+    redirected ``HOME``. On macOS the interpreter's *user*
+    site-packages live under ``$HOME`` — ``site.USER_BASE`` is derived
+    from it — so a swapped ``HOME`` hides every dependency installed
+    with ``pip install --user``. The server then dies at
+    ``import anyio`` long before it can bind a port, and the
+    measurement reports "could not determine server port" for a reason
+    that has nothing to do with startup latency.
+
+    The paths are taken from *this* process, whose ``sys.path`` was
+    computed at interpreter start-up — i.e. before any ``HOME``
+    redirect — and handed to the child through ``PYTHONPATH``. Paths
+    inside this work tree are dropped: the baseline half runs from a
+    ``git archive`` copy and must not import this tree's modules.
+    """
+    entries: list[str] = []
+    root = str(_PROJECT_ROOT)
+    for entry in sys.path:
+        if not entry or not os.path.isabs(entry):
+            continue
+        entry = os.path.abspath(entry)
+        if entry == root or entry.startswith(root + os.sep):
+            continue
+        if entry not in entries:
+            entries.append(entry)
+    return os.pathsep.join(entries)
+
+
+class _ServerOutput:
+    """Drains the server's stdout in a background thread.
+
+    Two jobs. The pipe has to be read *continuously*: a server whose
+    pipe buffer fills up blocks in the middle of its own startup, and
+    the tail of the log is what a failure has to report — "the server
+    never answered" is not a diagnosis.
+    """
+
+    def __init__(self, proc: subprocess.Popen, maxlen: int = 200) -> None:
+        self._proc = proc
+        self._lines: deque[str] = deque(maxlen=maxlen)
+        self._port: int | None = None
+        self._port_found = threading.Event()
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        assert self._proc.stdout is not None
+        for line in self._proc.stdout:
+            line = line.rstrip()
+            self._lines.append(line)
+            # Host-agnostic on purpose. This used to match the literal
+            # ``Starting uvicorn on 0.0.0.0:``, which pinned the test to
+            # a wildcard bind. Once the default became ``127.0.0.1`` the
+            # marker stopped matching, the loop drained stdout to EOF and
+            # the test hung until ``--timeout`` killed it — a startup
+            # perf test that fails because it cannot *find* the server it
+            # started. Match the prefix, read the port; whether the bind
+            # is localhost-only is a separate contract, asserted by
+            # ``tests/static_gates/test_no_wildcard_bind_in_production.py``.
+            if "Starting uvicorn on " in line:
+                try:
+                    self._port = int(line.rsplit(":", 1)[-1].strip())
+                except ValueError:
+                    self._port = None
+                else:
+                    self._port_found.set()
+        # EOF: the process is gone and no port will ever be announced.
+        self._port_found.set()
+
+    def wait_for_port(self, timeout: float) -> int | None:
+        """Return the port the server announced, or ``None`` if it never did."""
+        self._port_found.wait(timeout)
+        return self._port
+
+    def tail(self, count: int = 30) -> str:
+        """The last ``count`` lines the server wrote."""
+        return "\n".join(list(self._lines)[-count:])
 
 
 def _make_order_file(tmp_path: Path) -> Path:
@@ -162,6 +266,11 @@ def _measure_startup(
         scratch_plans = home_dir / "perf-plans"
         scratch_plans.mkdir(parents=True, exist_ok=True)
         env["PDT_PLANS_DIR"] = str(scratch_plans)
+    # The swapped HOME above hides the interpreter's user site-packages
+    # (they live under $HOME on macOS), so the child is handed this
+    # process's import paths explicitly. Without it the server dies at
+    # ``import anyio`` and the measurement cannot even start.
+    env["PYTHONPATH"] = _child_pythonpath()
 
     # 2026-09-13: module mode, matching ~/scripts/ac-backend-launch.sh.
     # Script mode (``python backend/server.py``) puts backend/ alone on
@@ -179,30 +288,19 @@ def _measure_startup(
         text=True,
     )
     start = time.monotonic()
-    port: int | None = None
+    output = _ServerOutput(proc)
     try:
-        for line in proc.stdout:
-            # Host-agnostic on purpose. This used to match the literal
-            # ``Starting uvicorn on 0.0.0.0:``, which pinned the test to
-            # a wildcard bind. Once the default became ``127.0.0.1`` the
-            # marker stopped matching, the loop drained stdout to EOF and
-            # the test hung until ``--timeout`` killed it — a startup
-            # perf test that fails because it cannot *find* the server it
-            # started. Match the prefix, read the port; whether the bind
-            # is localhost-only is a separate contract, asserted by
-            # ``tests/static_gates/test_no_wildcard_bind_in_production.py``.
-            if "Starting uvicorn on " in line:
-                try:
-                    port = int(line.rsplit(":", 1)[-1].strip())
-                except ValueError:
-                    pass
-                break
-
+        port = output.wait_for_port(_STARTUP_DEADLINE_SECONDS)
         if port is None:
-            raise RuntimeError("Could not determine server port from startup logs")
+            raise RuntimeError(
+                "Could not determine server port from startup logs "
+                f"(process exit code {proc.poll()}) — last stdout:\n"
+                f"{output.tail()}"
+            )
 
         return _poll_until_ready(
-            f"http://127.0.0.1:{port}{endpoint}", endpoint, start
+            f"http://127.0.0.1:{port}{endpoint}", endpoint, start,
+            server_output=output,
         )
     finally:
         proc.terminate()
@@ -213,7 +311,12 @@ def _measure_startup(
             proc.wait(timeout=5.0)
 
 
-def _poll_until_ready(url: str, endpoint: str, start: float) -> float:
+def _poll_until_ready(
+    url: str,
+    endpoint: str,
+    start: float,
+    server_output: "_ServerOutput | None" = None,
+) -> float:
     """Poll ``url`` until it answers 200; returns seconds since ``start``.
 
     Split out of ``_measure_startup`` so the retry contract can be tested
@@ -235,20 +338,44 @@ def _poll_until_ready(url: str, endpoint: str, start: float) -> float:
     ``TimeoutError`` is an ``OSError``, as is ``URLError``; both land
     here and the loop tries again until the deadline, which is the
     behaviour the poll was written for.
+
+    The status the server last answered with is kept, because "it never
+    answered" is not a diagnosis: a 403 from the request guard and a
+    connection refused are different failures with different fixes, and
+    the poll used to swallow both.
     """
     deadline = start + _STARTUP_DEADLINE_SECONDS
+    last_status: int | None = None
+    last_error: str | None = None
     while time.monotonic() < deadline:
         try:
+            request = urllib.request.Request(url, headers=dict(_REQUEST_HEADERS))
             with urllib.request.urlopen(
-                url, timeout=_POLL_TIMEOUT_SECONDS
+                request, timeout=_POLL_TIMEOUT_SECONDS
             ) as resp:
+                last_status = resp.status
                 if resp.status == 200:
                     return time.monotonic() - start
-        except (urllib.error.URLError, TimeoutError):
-            pass
+        except urllib.error.HTTPError as exc:
+            # A subclass of URLError, so it has to be caught first.
+            last_status = exc.code
+            last_error = f"HTTPError {exc.code} {exc.reason}"
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
         time.sleep(0.01)
 
-    raise RuntimeError(f"Server endpoint {endpoint} did not return 200")
+    detail = ""
+    if server_output is not None:
+        tail = server_output.tail(30)
+        if tail:
+            detail = (
+                "\n--- last 30 lines of the server's stdout ---\n" + tail
+            )
+    raise RuntimeError(
+        f"Server endpoint {endpoint} did not return 200 "
+        f"(last status={last_status!r}, last error={last_error!r})"
+        f"{detail}"
+    )
 
 
 def _median(values: list[float]) -> float:
@@ -275,7 +402,7 @@ def test_backend_startup_latency_within_10ms(tmp_path: Path) -> None:
     with _cc_switch_serving(chain) as cc_switch_base:
         current_times = [
             _measure_startup(
-                _PROJECT_ROOT, "/health", order_file,
+                _PROJECT_ROOT, _STARTUP_ENDPOINT, order_file,
                 home_dir=tmp_path, cc_switch_base=cc_switch_base,
             )
             for _ in range(3)
@@ -298,26 +425,22 @@ def test_backend_startup_latency_within_10ms(tmp_path: Path) -> None:
         # processes ask the same stand-in CC Switch, so the comparison is
         # not measuring which copy found a file.
 
-        # Baseline is extracted from ``git archive HEAD``. On a feature
-        # branch with uncommitted fixes, HEAD may be temporarily broken
-        # (e.g. the provider-config consumer bug that prevents the server
-        # from starting). In that case there is no valid baseline to
-        # compare against, so we degrade gracefully instead of failing
-        # the perf test.
-        try:
-            baseline_times = [
-                _measure_startup(
-                    baseline_dir, "/api/plans", order_file,
-                    home_dir=tmp_path, cc_switch_base=cc_switch_base,
-                )
-                for _ in range(3)
-            ]
-            baseline_median = _median(baseline_times)
-        except RuntimeError as exc:
-            pytest.skip(
-                f"HEAD baseline server failed to start ({exc}); "
-                "cannot measure regression against a broken baseline"
+        # Baseline is extracted from ``git archive HEAD``. It is measured
+        # on the same endpoint as the current tree — a comparison between
+        # two different endpoints is not a comparison — and a baseline
+        # that cannot boot is a *failure* of this test, not a skip: the
+        # skip that used to be here is what let the endpoint mismatch
+        # (and a broken baseline) pass unnoticed. ``_measure_startup``
+        # reports the server's exit code and the tail of its stdout, so
+        # a failure says what went wrong.
+        baseline_times = [
+            _measure_startup(
+                baseline_dir, _STARTUP_ENDPOINT, order_file,
+                home_dir=tmp_path, cc_switch_base=cc_switch_base,
             )
+            for _ in range(3)
+        ]
+        baseline_median = _median(baseline_times)
 
     # The contract is that the upgrade does not *slow* startup by more
     # than 10 ms. Being faster is acceptable (and expected here because
@@ -499,10 +622,11 @@ def test_a_server_that_never_answers_raises_runtime_error(
     """The counterweight: retrying must not turn into waiting forever.
 
     The baseline half of the comparison depends on this. A
-    ``RuntimeError`` from the baseline measurement is caught and turned
-    into a skip ("cannot measure regression against a broken baseline"),
-    so a runner that cannot boot ``HEAD`` degrades instead of reporting a
-    false regression in the current tree.
+    ``RuntimeError`` from the baseline measurement now fails the test
+    instead of skipping it — a runner that cannot boot ``HEAD`` has to
+    say so rather than report a green perf lane. The error carries the
+    last HTTP status the server answered with and the tail of its
+    stdout, so the failure says *why* the server never came up.
     """
     monkeypatch.setattr(
         sys.modules[__name__], "_STARTUP_DEADLINE_SECONDS", 0.05

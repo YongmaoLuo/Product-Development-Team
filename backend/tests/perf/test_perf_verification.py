@@ -28,16 +28,22 @@ the regression alarms for the runtime:
    bridge UI's progress card and the log parser's
    per-group event timeline both depend on.
 
-3. ``test_perf_no_memory_leak_3_rounds`` — running 3
-   sequential rounds with 9 VPs each, with
-   ``tracemalloc`` snapshotting peak memory at the end of
-   each round, must not see a monotonically increasing peak.
-   The check allows a one-time warmup bump from round 1 to
-   round 2 (the persistence layer's first round opens a new
-   log file, registers a logger, etc.) of up to 2× the round-1
-   peak, and then requires round 3 to be within 10% of round
-   2 (stability). Real leaks (which grow unboundedly) would
-   blow past the 2× warmup bound.
+3. ``test_perf_no_memory_leak_3_rounds`` — running one
+   warmup round and then 3 measured sequential rounds with 9
+   VPs each, with ``tracemalloc`` snapshotting peak memory at
+   the end of each measured round, must not see a
+   monotonically increasing peak. The check allows a one-time
+   bump from the first measured round to the second (the
+   persistence layer's first round opens a new log file,
+   registers a logger, etc.) of up to 2× the first measured
+   peak, and then requires the third measured round to be
+   within 10% of the second (stability). Real leaks (which
+   grow unboundedly) would blow past the 2× warmup bound.
+   The warmup round exists so that the pipeline's lazy
+   imports are paid before the measurement starts; without
+   it the import cost lands on whichever round runs first
+   and the comparison is made between two rounds that did
+   different work.
 
 Marker isolation
 ----------------
@@ -529,39 +535,59 @@ def test_perf_parallelism_observed_via_timestamps(
 # =============================================================================
 
 
-@pytest.mark.skip(
-    reason="flaky on the full backend/ test suite: warmup-round peak "
-    "is dominated by lazy imports (e.g. sqlite3 via "
-    "_load_provider_info's CC Switch DB fallback) which the second "
-    "round skips, causing the 2× warmup tolerance to fail "
-    "non-deterministically. Re-enable once tracemalloc is reset "
-    "between rounds with explicit gc + warmup iteration."
-)
+#: Round number used for the *warmup* round — the one that pays the
+#: pipeline's lazy imports and is therefore NOT measured.
+#:
+#: ``VerificationAgent.start_verification_round`` numbers rounds from 1
+#: (``verification_agent.py``: "Current round number (1-indexed)") and
+#: asserts nothing about the value, so 1 is the warmup and 2/3/4 are the
+#: measured rounds. The persistence layer names the log file after the
+#: round number and keeps the last 3 rounds, so the numbering costs
+#: nothing.
+_WARMUP_ROUND = 1
+
+#: How many rounds are measured (after the warmup).
+_MEASURED_ROUNDS = 3
+
+
 def test_perf_no_memory_leak_3_rounds(
     dry_run_env, temp_plan_dir, temp_project_dir, mock_coding_tool
 ):
     """3 sequential verification rounds (9 VPs each) must
     not exhibit monotonically increasing peak memory.
 
-    The test runs 3 rounds, snapshotting the peak Python
-    heap at the end of each round via :mod:`tracemalloc`.
+    The test runs one **warmup** round and then 3 measured rounds,
+    snapshotting the peak Python heap at the end of each *measured*
+    round via :mod:`tracemalloc`.
+
+    Why the warmup round exists: the pipeline's lazy imports (sqlite3
+    via ``_load_provider_info``'s CC Switch DB fallback, the
+    persistence layer's logger, ...) are paid by whichever round
+    happens to run first. Comparing that round against a later round
+    that no longer pays the import is what made this test flaky — the
+    import cost landed on one side of the comparison and not the
+    other, non-deterministically. The warmup round runs the *same*
+    9-VP workload, so every lazy import is already paid for before
+    the first measured round, and the measured rounds are compared
+    against each other on equal footing.
+
     The acceptance criterion is:
 
-    * Sanity floor: every round's peak is ≥ 0.01 MB (10 KB).
+    * Sanity floor: every measured round's peak is ≥ 0.01 MB (10 KB).
       A 9-VP dry-run round with 0.05s sleep allocates only
       ~50-80 KB of Python objects, so a sub-MB floor is
       realistic. Below 10 KB the snapshot would be empty
       and the test would be measuring nothing.
-    * ``peak[round_2]`` ≤ ``peak[round_1]`` × 2.0 — a
-      one-time warmup bump is allowed. The persistence
+    * ``peak[measured_2]`` ≤ ``peak[measured_1]`` × 2.0 — a
+      one-time bump is allowed. The persistence
       layer's first round opens a new log file, registers
       a logger handler, and primes the asyncio event loop
       state — these get reused (not re-allocated) on
-      rounds 2 and 3, so a real leak would still grow past
+      the later rounds, so a real leak would still grow past
       the warmup floor.
-    * ``peak[round_3]`` ≤ ``peak[round_2]`` × 1.10 — round 3
-      must be stable relative to round 2. Anything larger
-      is a per-round leak (e.g. a growing list of completed
+    * ``peak[measured_3]`` ≤ ``peak[measured_2]`` × 1.10 — the third
+      measured round must be stable relative to the second. Anything
+      larger is a per-round leak (e.g. a growing list of completed
       VPs not freed between rounds, or a logger holding a
       reference to old round contexts).
 
@@ -612,8 +638,51 @@ def test_perf_no_memory_leak_3_rounds(
     # the next round's peak is measured in isolation.
     tracemalloc.start()
     try:
+        # ---- warmup round: NOT measured -------------------------
+        # Same 9-VP workload as the measured rounds, so the lazy
+        # imports the pipeline pays on its first real round are
+        # already paid for here. Without it the import cost lands
+        # on whichever round runs first and the 2× tolerance
+        # compares an import-paying round against one that does not
+        # pay it — non-deterministically, because the import is
+        # only paid when this process has not paid it before.
+        agent.start_verification_round(_WARMUP_ROUND)
+        asyncio.run(
+            agent.execute_verification_plan_async(
+                {"verification_points": vps}
+            )
+        )
+        # Drop the warmup round's garbage and re-base the peak
+        # counter on what is still retained, so the first measured
+        # round starts from a clean baseline.
+        gc.collect()
+        tracemalloc.reset_peak()
+
+        # Retire the warmup round's log file before measuring.
+        #
+        # ``VerificationPersistenceManager._cleanup_old_rounds``
+        # archives the round logs older than ``current_round - 2``,
+        # and that archive is not free: ``gzip.open`` builds zlib's
+        # deflate state through PyMem, which ``tracemalloc`` *does*
+        # see — a ~360 KB transient per archived file, on top of the
+        # round's own allocations. With the warmup round's log in the
+        # plan directory the measured rounds would hold four round
+        # logs, so exactly one measured round would archive one and
+        # its peak would be ~5x the other two — the three measured
+        # rounds would no longer be comparable, and the comparison
+        # would be measuring zlib instead of the pipeline. The
+        # pre-warmup test (rounds 1-3) never archived anything, so
+        # the measured rounds are kept in that same state: the
+        # warmup's own log is dropped, and rounds 2/3/4 leave at
+        # most three logs behind, none of them old enough to be
+        # archived.
+        for _warmup_log in (temp_plan_dir / "logs").glob("verification_*.log"):
+            _warmup_log.unlink()
+
+        # ---- measured rounds ------------------------------------
         peaks_mb: List[float] = []
-        for round_number in range(1, 4):
+        first_measured = _WARMUP_ROUND + 1
+        for round_number in range(first_measured, first_measured + _MEASURED_ROUNDS):
             agent.start_verification_round(round_number)
             asyncio.run(
                 agent.execute_verification_plan_async(
@@ -631,13 +700,18 @@ def test_perf_no_memory_leak_3_rounds(
     finally:
         tracemalloc.stop()
 
-    # 1. Every round produced real allocations (sanity
-    # check: the test is not measuring an empty heap).
-    # The 9-VP dry-run workload with fake_sleep=0.05s
+    # 1. Every measured round produced real allocations
+    # (sanity check: the test is not measuring an empty
+    # heap). The 9-VP dry-run workload with fake_sleep=0.05s
     # allocates only ~50-80 KB of Python objects, so the
     # sanity floor is 0.01 MB (10 KB). Below this the
     # snapshot would be effectively empty and the test
     # would pass trivially.
+    assert len(peaks_mb) == _MEASURED_ROUNDS, (
+        f"expected {_MEASURED_ROUNDS} measured rounds, "
+        f"got {len(peaks_mb)} — the warmup round must not be "
+        f"counted as a measured one"
+    )
     assert all(p >= 0.01 for p in peaks_mb), (
         f"expected each round's peak to be ≥ 0.01 MB, "
         f"got peaks_mb={peaks_mb!r} — the test is not "
@@ -645,20 +719,21 @@ def test_perf_no_memory_leak_3_rounds(
     )
 
     # 2. The peak must not grow monotonically. The
-    # first round's peak is the warmup floor; round 2
-    # is allowed to bump up to 2× round 1 (persistence
-    # layer's first round opens a new log file, primes
-    # asyncio state, etc.). Round 3 must then be stable
-    # (within 10% of round 2) — anything larger is a
-    # per-round leak that accumulates over time.
+    # first *measured* round is the floor (the warmup
+    # round already paid the lazy imports); the second
+    # measured round is allowed to bump up to 2× the
+    # first (persistence layer opens a new log file, primes
+    # asyncio state, etc.). The third measured round must
+    # then be stable (within 10% of the second) — anything
+    # larger is a per-round leak that accumulates over time.
     p1, p2, p3 = peaks_mb
     assert p2 <= p1 * 2.0, (
-        f"peak memory grew from {p1:.3f} MB (round 1) "
-        f"to {p2:.3f} MB (round 2): +{100 * (p2 - p1) / p1:.1f}%, "
+        f"peak memory grew from {p1:.3f} MB (measured round 1) "
+        f"to {p2:.3f} MB (measured round 2): +{100 * (p2 - p1) / p1:.1f}%, "
         f"expected ≤ 2× warmup tolerance (possible leak)"
     )
     assert p3 <= p2 * 1.10, (
-        f"peak memory grew from {p2:.3f} MB (round 2) "
-        f"to {p3:.3f} MB (round 3): +{100 * (p3 - p2) / p2:.1f}%, "
+        f"peak memory grew from {p2:.3f} MB (measured round 2) "
+        f"to {p3:.3f} MB (measured round 3): +{100 * (p3 - p2) / p2:.1f}%, "
         f"expected ≤ +10% (per-round leak)"
     )
