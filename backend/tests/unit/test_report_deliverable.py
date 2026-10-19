@@ -859,3 +859,182 @@ def test_the_two_field_lists_agree_on_the_deliverable_fields():
     for field in ("deliverable", "report_path"):
         assert field in static, f"{field} is dropped on load"
         assert f'"{field}"' in dump_src, f"{field} is never written"
+
+
+# ---------------------------------------------------------------------------
+# 7 — the EXECUTOR's own loader
+# ---------------------------------------------------------------------------
+#
+# Section 6 pins ``TaskManager.load_tasks``. It is not the only reader:
+# ``AutonomousAgent._load_tasks`` re-reads ``tasks.json`` through its own
+# ``_TASK_FIELDS`` allow-list (agent.py), and that is the one the executor
+# actually runs on — ``run()`` → ``asyncio.run(self._run_async())`` →
+# ``_load_tasks()``. PR #5 added the two names to ``_STATIC_TASK_FIELDS``
+# and left this second list alone, so a plan file could carry the
+# deliverable and the executor still would not see it.
+#
+# The failure was silent and self-concealing. ``is_report_task`` reads
+# ``getattr(task, "deliverable", "code")``, so a dropped field does not
+# raise — it yields ``"code"`` and the task takes the ordinary
+# empty-diff path. On a live plan (20261015-perpetual-tests-perp,
+# 2026-10-19) task ``37-8-3-4-1`` therefore completed with
+# ``"report_path": null`` and ``changed_files`` pointing at a markdown
+# file written into the PROJECT repo: it passed the empty-diff check by
+# producing an unwanted commit, and the report mechanism never ran.
+
+
+class _DummyCodingTool:
+    """Only ``AutonomousAgent.__init__``'s signature is consumed — these
+    tests stop at the load, so no LLM call is ever made."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+def _load_agent_for(tmp_path, monkeypatch, rows):
+    """Build an agent over a real ``tasks.json`` and return its loaded tasks.
+
+    This drives the production entry: the agent reads the plan through
+    the same ``TaskRepository`` / ``_TASK_FIELDS`` path the executor
+    does. ``PDT_STATE_DB_PATH`` is repointed so Phase 2's orphan
+    reconcile cannot merge in rows from the canonical repo-root
+    ``state.db`` — ``plan_id`` is derived from the tasks.json parent
+    dir, so a real plan sharing this repo could otherwise leak into
+    the assertion.
+    """
+    from agent import AutonomousAgent
+
+    monkeypatch.setenv(
+        "PDT_STATE_DB_PATH", str(tmp_path / "test_state.db")
+    )
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    # GitManager binds with search_parent_directories=True; without a
+    # repo here it would walk up to this checkout.
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=str(project_dir), capture_output=True, text=True, check=True,
+    )
+
+    (project_dir / "tasks.json").write_text(
+        json.dumps({"requirement": "deliverable load", "tasks": rows}),
+        encoding="utf-8",
+    )
+
+    agent = AutonomousAgent(
+        requirement="deliverable load",
+        project_dir=project_dir,
+        coding_tool=_DummyCodingTool(),
+        logger=None,
+    )
+    return agent, agent._load_tasks()
+
+
+def test_a_report_task_loaded_by_the_executor_is_still_a_report_task(
+    tmp_path, monkeypatch
+):
+    """The executor's loader must not degrade a report task to a code task.
+
+    Asserted through ``is_report_task`` — the predicate the executor's
+    dispatch actually branches on — rather than through the attribute
+    alone, because the attribute can be present while a consumer reads
+    it through a different path. Before the fix this loaded a perfectly
+    well-formed ``SubTask`` whose ``deliverable`` was the ``"code"``
+    default, and ``is_report_task`` answered ``False``.
+    """
+    from agent import is_report_task
+    from task import NO_FILE_CHANGES_SENTINEL
+
+    report_path = "/tmp/pdt-perp-reports/37-8-3-4-1.md"
+    _, loaded = _load_agent_for(
+        tmp_path, monkeypatch,
+        [{
+            "id": "37-8-3-4-1",
+            "title": "Write the CI attribution report",
+            "description": "d",
+            "test_command": "echo ok",
+            "status": "pending",
+            "depends_on": [],
+            # A report task is read-only: its one deliverable lives
+            # outside the project, so the model must modify nothing
+            # in-repo. (That is exactly how the degraded run got a
+            # stray markdown file committed under reports/ci/ — it
+            # had no report path to write and wrote here instead.)
+            "files_to_modify": list(NO_FILE_CHANGES_SENTINEL),
+            "deliverable": "report",
+            "report_path": report_path,
+        }],
+    )
+
+    assert len(loaded) == 1
+    task = loaded[0]
+    assert task.deliverable == "report"
+    assert task.report_path == report_path
+    assert is_report_task(task) is True
+
+
+def test_a_code_task_loaded_by_the_executor_keeps_the_defaults(
+    tmp_path, monkeypatch
+):
+    """The other half: adding the names must not invent a deliverable.
+
+    A plan written before 2026-10-19 carries neither key. Widening an
+    allow-list cannot manufacture a value, but it must be pinned: a
+    loader that defaulted ``deliverable`` to ``"report"``, or hydrated a
+    stray ``report_path`` onto a code task, would silently send every
+    ordinary task down the report branch.
+    """
+    from agent import is_report_task
+
+    _, loaded = _load_agent_for(
+        tmp_path, monkeypatch,
+        [{
+            "id": "1",
+            "title": "an ordinary code task",
+            "description": "d",
+            "test_command": "echo ok",
+            "status": "pending",
+            "depends_on": [],
+            "files_to_modify": ["src/a.py"],
+        }],
+    )
+
+    assert len(loaded) == 1
+    task = loaded[0]
+    assert task.deliverable == "code"
+    assert task.report_path is None
+    assert is_report_task(task) is False
+
+
+def test_the_two_loaders_agree_on_the_deliverable_fields():
+    """Both allow-lists must name the same deliverable fields.
+
+    Two independent lists, edited separately, with nothing tying them
+    together: that is the whole bug. Section 6 pins the
+    ``_STATIC_TASK_FIELDS`` side; this pins the executor's
+    ``_TASK_FIELDS``, which lives inside a function body and so cannot
+    be imported — it is read out of the source, the same way the
+    ``model_dump`` pairing is checked above.
+
+    Comments are stripped before matching. The block above the literal
+    explains the failure in prose and necessarily mentions
+    ``"deliverable"``; a naive substring search over the raw slice
+    finds THAT and passes with the field removed, which is exactly what
+    a negative control is for.
+    """
+    import inspect
+
+    import agent as agent_module
+
+    src = inspect.getsource(agent_module.AutonomousAgent._load_tasks)
+    body = src.split("_TASK_FIELDS = {", 1)[1].split("}", 1)[0]
+    code_only = "\n".join(
+        line for line in body.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    for field in ("deliverable", "report_path"):
+        assert f'"{field}"' in code_only, (
+            f"{field} is dropped by _load_tasks, so a report task "
+            f"degrades to a code task on the executor's path"
+        )
