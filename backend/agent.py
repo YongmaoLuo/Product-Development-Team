@@ -2446,6 +2446,20 @@ class AutonomousAgent:
             #     audit-task exemption in the dual-criterion completion
             #     rule. Dropping it left only the keyword heuristic.
             "task_group", "verification_only",
+            # 2026-10-19: the deliverable contract, dropped here exactly
+            # as it had been dropped from ``TaskManager._STATIC_TASK_FIELDS``
+            # until PR #5. This is the loader the EXECUTOR uses, and it is
+            # a second, independent allow-list — fixing the TaskManager one
+            # left this one untouched, so ``deliverable`` was discarded here
+            # and ``is_report_task``'s ``getattr(task, "deliverable",
+            # "code")`` fell through to the code branch: a report task ran
+            # as a code task, and passed the empty-diff check by writing a
+            # file into the PROJECT repo, with the report mechanism never
+            # invoked. Both fields are static — the planner declares them
+            # at write time and nothing rewrites them at runtime. Code
+            # tasks omit them from the dump, so they stay absent on disk
+            # rather than materialising as explicit defaults here.
+            "deliverable", "report_path",
         }
 
         # Detect legacy tasks: entries whose on-disk JSON omitted
