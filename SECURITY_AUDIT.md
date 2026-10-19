@@ -742,6 +742,26 @@ backend/.venv/bin/python3 -m pytest backend/tests/static_gates/test_dependency_m
 backend/.venv/bin/python3 -m pytest backend/tests/unit/test_credentials_switch.py backend/tests/unit/test_credentials_locked_keychain.py backend/tests/unit/test_cli_secrets_command.py backend/tests/integration/test_credentials_security_lookup.py backend/tests/integration/test_credentials_cache_invariants.py -q
 ```
 
+### Finding ENTRY-042
+
+档位: should-fix
+
+问题: **只读/分析类任务只有"diff"一种交付形态。** 判定一个任务是否交付,执行器问的问题始终是「项目仓里有没有改动」。对代码任务这个问题是对的 —— diff 就是交付物;对只读任务(裁定某个可行性、装配某份证据)它问的是另一个文件,而那个文件按定义就不在仓里。于是两处契约互相把这类任务堵死:交付侧,空 diff 被 `empty_diff_no_changes` 记为「子代理什么都没产出」并强制重试到预算耗尽;写入侧,只读任务按其 `files_to_modify` 声明不完整而被盖上只读标记,而该标记的 guard 拒绝它发起的**每一次** Edit/Write,包含那唯一一次本该产出报告的写入。任务不是被限制成只读,是被变成无法完成。
+
+影响: 这类任务以必然失败告终,并连带卡住依赖它的下游任务 —— 调度器按依赖顺序推进,上游不完成,整条链停在那里。更糟的是失败信息指向错误的方向:重试提示说的是「去改 `files_to_modify` 里声明的源文件」,而只读任务根本没有这个列表,子代理照着提示无法把任何一条指令变成可执行动作。评审层读到的同样是错的材料 —— 二次审核喂进去的是聊天回答,而「把报告写到该路径」这类任务的聊天回答通常只有一句「已完成,报告写在 <路径>」,评审拿到一个无从判定的对象。报告若真的落在仓外,框架没有任何一个环节读它:文件存在即交付完成这条契约在此之前不存在。
+
+另一个后果落在仓库历史上。只读任务若走完成功路径,提交环节执行的是「暂存全部改动后提交」,仓内没有改动时它并不报错,而是写出一个树与父提交相同的空提交,并把这个空提交的 SHA 回写为该任务的提交号 —— 一次没有改动任何内容的交付,在产品仓的历史里留下一个条目。
+
+攻击路径: 前置条件 — 计划中存在 `files_to_modify` 未声明具体文件、而交付物是一个文件而非一次 diff 的任务;触发步骤 — 该任务被派发,子代理按要求把交付物写到仓外路径;可观测后果 — 写入被只读 guard 拒绝(退出码 2),任务在空 diff 分支上被反复重试直至预算耗尽,状态落为失败,依赖它的下游任务不再被调度,而全过程的失败信息把成因指认为「没有修改声明过的源文件」。
+
+修复: 交付物成为任务模型上的显式字段,四个文件各承担契约的一环。`backend/task.py` 的 `SubTask` 新增 `deliverable`(取值 `code` / `report`,默认 `code`)与 `report_path`,由模型校验器双向约束(报告任务必须给出非空路径,代码任务不得携带路径)—— 少了这条约束,「输出是某个文件」这个错误判断仍会以「无 diff、无产物」的形式回到原点;旧计划文件按默认值解析、默认任务序列化时不写出这两个字段,既有计划文件保持不变。`backend/agent.py` 在空 diff 判定之前先按交付类型分流:报告任务解析其路径(绝对路径,或相对 `project_dir`),文件存在且非空即视为交付完成,不再走「无产出」的重试分支;缺失或为空则记录一条带路径的失败,明确指出应写入的确切位置 —— 缺了地址,子代理无从知道该往哪里写,而通用的空 diff 提示指向的是它并不持有的文件列表。交付成功且仓内确无改动时跳过提交,避免空提交进入产品仓历史;该任务若同时改动了项目内文件则提交照旧 —— 豁免的条件是「没有可提交的改动」,不是「报告任务从不提交」。交付路径同时写入完成事件与计划状态。`backend/coding_tool.py` 的写入 guard 在两处拒绝之前增加一条精确放行:当前任务的报告路径存在且与被写路径解析后完全相等时放行 —— 完全相等而非目录前缀匹配,前缀规则会把豁免扩大到整个暂存目录,而权限属于计划点名的那个文件;只读标记对其余一切写入的拒绝保持不变。`backend/usage_registry.py` 的任务上下文新增报告路径这一项,与既有的只读判定、声明文件列表走同一套绑定与读取路径 —— 三者都属于「当前这个任务」的性质、在同一时刻被同一次调用读取、且任务并发执行,新造一套传参会绕开这个约束。解析在执行器侧一次完成,守卫、审核与完成判定三方比较的是同一个绝对路径字符串。`backend/task_manager.py` 的 `_STATIC_TASK_FIELDS` 收录这两个键。落盘与加载走的是两份独立的字段名单:`save_tasks` 按 `model_dump` 的输出写,`load_tasks` 只保留该集合里的名字 —— 交付字段曾只在前一份里,于是计划文件写下它、加载时再丢掉它,report 任务活不过一次落盘与重载,而执行器正是从磁盘加载计划,交付物在生产路径上不可恢复。代码任务仍不写出这两个键,默认任务不会因此多出两列。
+
+验证方式:
+
+```bash
+backend/.venv/bin/python3 -m pytest backend/tests/unit/test_report_deliverable.py backend/tests/unit/test_task_file_declaration_contract.py backend/tests/integration/test_readonly_task_guard_hook.py -q
+```
+
 ## Appendix A — modified tests
 
 The audit policy permits modifying existing tests that encoded

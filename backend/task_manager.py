@@ -251,6 +251,21 @@ class TaskManager:
             # write time and nothing rewrites them at runtime.
             "task_group",
             "verification_only",
+            # 2026-10-19: the deliverable contract, and previously
+            # dropped here. ``SubTask.model_dump`` writes both keys for a
+            # report task, so ``save_tasks`` already put them in the
+            # file; ``load_tasks`` filtered them out on the way back and
+            # a report task silently degraded to a code task after a
+            # single save/load cycle. The executor loads the plan from
+            # disk, so on the production path the deliverable was
+            # unrecoverable: the task looked like it had no report and
+            # fell into the empty-diff verdict. Both are static — the
+            # planner declares them at write time and nothing rewrites
+            # them at runtime. Code tasks omit them from the dump, so
+            # they stay absent on disk rather than materialising as
+            # explicit defaults.
+            "deliverable",
+            "report_path",
         }
     )
 

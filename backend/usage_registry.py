@@ -41,7 +41,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
 #: ``{"plan_id": Optional[str], "task_id": Optional[str],
-#: "task_read_only": Optional[bool], "task_allowed_files": Optional[list]}``
+#: "task_read_only": Optional[bool], "task_allowed_files": Optional[list],
+#: "task_report_path": Optional[str]}``
 #: — per-thread / per-async-task attribution context set by server
 #: middleware, background thread entries, and per-task scopes in the
 #: executor.
@@ -55,6 +56,13 @@ from typing import Any, Dict, Iterator, Optional
 #:
 #: ``task_allowed_files`` (2026-10-19) is that task's *declared* write
 #: set, for the same single-read-at-one-moment reason.
+#:
+#: ``task_report_path`` (2026-10-19) is that task's report deliverable,
+#: already resolved to an absolute path by the caller. It rides here for
+#: the same single-read-at-one-moment reason as the other two: it is read
+#: at the moment the sub-agent's ``--settings`` payload is assembled, by
+#: the same call that reads ``task_read_only``, and a global would let the
+#: last report task to start re-scope every other running task.
 _plan_ctx: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
     "pdt_plan_usage_ctx", default=None
 )
@@ -139,12 +147,38 @@ def current_task_allowed_files() -> Optional[list[str]]:
     return ctx.get("task_allowed_files")
 
 
+def current_task_report_path() -> Optional[str]:
+    """The task in scope's report deliverable, or ``None`` for none.
+
+    The third leg of the declaration contract (2026-10-19): a task
+    whose deliverable is a report file has to be able to write exactly
+    that one file even though it declares no source files and is
+    therefore stamped read-only. Without this, the report task's only
+    way to produce its deliverable is the Write tool, and the guard
+    refuses that write — so the executor retries it until the budget
+    runs out and the task dies having produced nothing.
+
+    ``None`` for a code task and for anything outside a task scope,
+    which is what keeps the carve-out from widening: the consuming
+    guard only lets a write through when a path was actually issued
+    for THIS task.
+    """
+    ctx = _plan_ctx.get()
+    if not ctx:
+        return None
+    rp = ctx.get("task_report_path")
+    if not rp or not str(rp).strip():
+        return None
+    return str(rp)
+
+
 @contextmanager
 def plan_usage_context(
     plan_id: Optional[str] = None,
     task_id: Optional[str] = None,
     task_read_only: Optional[bool] = None,
     task_allowed_files: Optional[list[str]] = None,
+    task_report_path: Optional[str] = None,
 ) -> Iterator[None]:
     """Bind LLM calls in this scope to ``plan_id`` / ``task_id``.
 
@@ -164,12 +198,20 @@ def plan_usage_context(
     :func:`current_task_allowed_files` propagates that, so every caller
     outside a task scope — the refiner's own queries, the verification
     agents — is unaffected.
+
+    ``task_report_path`` (2026-10-19) is the ONE file a report-task is
+    still permitted to write, for the same reason as the other two: it
+    is a property of the task being dispatched, it is read at the same
+    moment, and ``None`` (a code task, or no task at all) means "no
+    carve-out issued", which :func:`current_task_report_path`
+    propagates unchanged.
     """
     token = _plan_ctx.set({
         "plan_id": plan_id,
         "task_id": task_id,
         "task_read_only": task_read_only,
         "task_allowed_files": task_allowed_files,
+        "task_report_path": task_report_path,
     })
     try:
         yield
