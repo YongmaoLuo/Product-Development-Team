@@ -31,7 +31,10 @@ too big for one subagent.
 
 from dataclasses import dataclass
 import hashlib
+import os
+import pathlib
 import re
+import tempfile
 
 #: The answer's shape was rejected -- truncated evidence, a claimed
 #: ``TEST_RESULT: PASSED`` the run did not support, a vacuous test
@@ -123,6 +126,101 @@ def _extract_detail(text: str) -> str:
 #: prompt, so it must stay one readable line.
 _LABEL_MAX_CHARS = 120
 
+# ---------------------------------------------------------------------------
+# The structured identity of a failure (2026-10-19)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. ``signature`` hashes the failure TEXT. That is the
+# right thing to show a human and the wrong thing to count on. Two
+# attempts at the same broken test are not two copies of one string: the
+# first run reports "pytest exited 1" and the second reports "process
+# exited with status 1", the pytest root differs because the tmpdir
+# differs, the attempt number differs. Text-keyed counting therefore
+# reports those as two FIRST occurrences forever, the gate never reaches
+# 2, and the runaway refiner this module exists to stop is stopped for
+# the wrong reason — by never splitting rather than by splitting once.
+#
+# WHAT A FINGERPRINT IS. Five token classes that a re-worded but
+# otherwise identical failure shares: the tool that failed, the exit
+# code it returned, the exception classes named, the failing test ids,
+# and the paths involved. Deliberately narrow — these are the facts a
+# paraphrase cannot change. Anything wider would make two genuinely
+# different failures collide, which is the failure mode this gate fears
+# more than the one it fixes.
+_TOOL_RE = re.compile(r"\b(claude|vendor-c|opencode)\b", re.IGNORECASE)
+_EXIT_CODE_RE = re.compile(
+    r"(?:exit(?:ed)?\s*code|exit_code|returncode|rc)\s*[=:]?\s*(\d+)",
+    re.IGNORECASE,
+)
+_EXCEPTION_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]*(?:Error|Exception|Timeout))\b")
+_TEST_ID_RE = re.compile(
+    r"\b((?:tests?|backend)/[\w./-]+\.py::[\w.:\[\]-]+)"
+)
+_PATH_TOKEN_RE = re.compile(
+    r"(?:/[\w.@+-]+){2,}|(?:[\w.@+-]+/)+[\w.@+-]+\.[A-Za-z0-9]+"
+)
+
+#: The unit separator, not a space and not a comma: ``"a b" + "c"`` and
+#: ``"a" + "b c"`` must not produce the same input to the hash.
+_TOKEN_SEP = chr(0x1F)
+
+
+def _normalize_path_token(token: str, project_dir=None) -> str:
+    """One path, spelled the same way every run.
+
+    The tmpdir is the reason a project-relative spelling matters: pytest
+    hands every test a fresh root under ``/private/var/folders/...``, so
+    an absolute-path fingerprint is different on every run and counts as
+    a new failure every time. Relativizing against the project dir (and
+    prefixing a leftover absolute tmpdir with ``<tmp>``) keeps the token
+    to the thing the failure is actually about.
+    """
+    token = str(token)
+    if project_dir is not None and os.path.isabs(token):
+        try:
+            # ``relative_to`` and not ``os.path.relpath``: relpath never
+            # fails, so an out-of-project path comes back as ``../..``
+            # and the ``<tmp>`` rule below stops matching it. A path
+            # that is NOT under the project has to keep its absolute
+            # spelling to stay comparable at all.
+            token = str(
+                pathlib.PurePath(os.path.realpath(token)).relative_to(
+                    os.path.realpath(str(project_dir))
+                )
+            )
+        except ValueError:
+            token = os.path.normpath(token)
+    else:
+        token = os.path.normpath(token)
+    tmp = os.path.normpath(tempfile.gettempdir())
+    if token == tmp or token.startswith(tmp + os.sep):
+        token = "<tmp>" + token[len(tmp):]
+    return token
+
+
+def _structured_tokens(error, project_dir=None) -> dict:
+    """The paraphrase-invariant identity of ``error``.
+
+    Returns a dict with ``tool``, ``exit_code``, ``exceptions``,
+    ``test_ids`` and ``paths``. ``tool`` and ``exit_code`` are strings
+    (the FIRST occurrence of each, since a re-worded tail often quotes
+    the same code twice); the rest are sorted, de-duplicated lists, so
+    two mentions of one test id cannot look like two tests.
+    """
+    text = error or ""
+    m_tool = _TOOL_RE.search(text)
+    m_code = _EXIT_CODE_RE.search(text)
+    return {
+        "tool": (m_tool.group(1).lower() if m_tool else ""),
+        "exit_code": (m_code.group(1) if m_code else ""),
+        "exceptions": sorted({m for m in _EXCEPTION_RE.findall(text)}),
+        "test_ids": sorted({m for m in _TEST_ID_RE.findall(text)}),
+        "paths": sorted({
+            _normalize_path_token(p, project_dir)
+            for p in _PATH_TOKEN_RE.findall(text)
+        }),
+    }
+
 
 @dataclass(frozen=True)
 class Failure:
@@ -130,12 +228,22 @@ class Failure:
 
     Attributes:
         kind: One of the module-level constants above.
-        signature: Stable, short identity of the *error*, scoped by
-            kind. Two occurrences of the same error always produce the
-            same signature; two different errors never do. This is the
-            key the executor counts occurrences on, so it must survive
-            incidental churn (attempt numbers, hashes, ids) in the
-            error text and must not collapse distinct errors together.
+        signature: Stable, short identity of the *error text*, scoped
+            by kind. Shown in the logs, carried in the refiner block and
+            persisted in the run record, and kept for compatibility with
+            every existing reader of it. It hashes the words, so it is
+            NOT what occurrence counting keys on — two re-wordings of
+            one failure have two signatures. See ``fingerprint``.
+        fingerprint: The key the executor counts occurrences on: the
+            same identity, derived from the structured tokens (tool,
+            exit code, exception classes, test ids, paths) rather than
+            from the prose, so a paraphrase of one failure keeps one key
+            and the split gate can actually reach 2. Falls back to
+            ``signature`` when the text carries no structured token at
+            all, so a failure with nothing to key on behaves exactly as
+            it did before. Both properties still hold: the same failure
+            twice gives the same fingerprint, two different failures
+            never do.
         label: One human-readable line, at most ``_LABEL_MAX_CHARS``
             chars, for the prompt and the logs. Readability lives HERE
             rather than in the signature: a readable slug such as
@@ -157,6 +265,7 @@ class Failure:
     signature: str
     label: str
     detail: str = ""
+    fingerprint: str = ""
 
 
 # A run of hex characters. After lower-casing, a maximal run of >= 8
@@ -247,11 +356,15 @@ def _build_label(kind, error):
     return f"{kind}: {flat}"[:_LABEL_MAX_CHARS]
 
 
-def classify_failure(error):
-    """Classify a failure reason into kind + stable signature.
+def classify_failure(error, project_dir=None):
+    """Classify a failure reason into kind + stable signature + fingerprint.
 
     Args:
         error: The failure text the executor recorded for a task.
+        project_dir: The run's project dir, when known. Used only to
+            spell paths relatively in the fingerprint — a pytest tmpdir
+            differs on every run, so an absolute path would make one
+            failure count as a new one each time.
 
     Returns:
         A frozen :class:`Failure`. Never raises: an empty or odd-shaped
@@ -260,11 +373,31 @@ def classify_failure(error):
     text = error or ""
     kind = _classify_kind(text)
     digest = hashlib.sha256(_normalize(text).encode("utf-8")).hexdigest()[:12]
+    signature = f"{kind}:{digest}"
+    tokens = _structured_tokens(text, project_dir)
+    if not any(tokens.values()):
+        # Nothing structured to key on: the text signature IS the best
+        # available identity, and inventing a hash of five empty strings
+        # would collapse every such failure in a lineage onto one key.
+        fingerprint = signature
+    else:
+        payload = _TOKEN_SEP.join([
+            kind,
+            tokens["tool"],
+            tokens["exit_code"],
+            ",".join(tokens["exceptions"]),
+            ",".join(tokens["paths"]),
+            ",".join(tokens["test_ids"]),
+        ])
+        fingerprint = (
+            f"{kind}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:12]}"
+        )
     return Failure(
         kind=kind,
-        signature=f"{kind}:{digest}",
+        signature=signature,
         label=_build_label(kind, text),
         detail=_extract_detail(text),
+        fingerprint=fingerprint,
     )
 
 

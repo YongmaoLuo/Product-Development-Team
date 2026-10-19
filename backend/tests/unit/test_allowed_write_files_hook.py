@@ -22,6 +22,7 @@ produce it — same reason as ``test_readonly_task_guard_hook.py``.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -348,13 +349,43 @@ def test_a_refused_write_records_the_path_in_the_task_marker(workspace, broker):
     describe what happened rather than what the model reported.
     """
     rogue = workspace["project"] / "backend" / "rogue.py"
-    code, _ = _run_hook(workspace, rogue, allowed=["backend/a.py"])
+    code, _ = _run_hook(
+        workspace, rogue, allowed=["backend/a.py"], task_id="7-2",
+        extra_env={"PDT_DECLARED_MANIFEST_HASH": "deadbeefdeadbeef"},
+    )
     assert code == 2
 
-    lines = _marker_lines(workspace)
+    lines = _marker_lines(workspace, "7-2")
     assert len(lines) == 1, lines
     assert lines[0]["path"] == str(rogue), lines
-    assert lines[0]["task"] == "t1", lines
+    assert lines[0]["task"] == "7-2", lines
+    # ``path`` is the field every historical reader of this marker
+    # knows; it must keep carrying the same value under its own name.
+    assert lines[0]["attempted_path"] == str(rogue), lines
+    assert lines[0]["attempted_path"] == lines[0]["path"], lines
+    # The declaration that was in force when the task reached outside
+    # it, and the lineage the attempt belongs to. A split child writing
+    # "7-2" must not be counted as a sibling of "7"'s own attempts.
+    assert lines[0]["declared_manifest_hash"] == "deadbeefdeadbeef", lines
+    assert lines[0]["lineage"] == "7", lines
+
+
+def test_a_task_with_no_declaration_hash_still_gets_the_marker_fields(workspace, broker):
+    """The new fields are present even when the stamp is absent.
+
+    A missing env var means ``""``, not a missing key: a reader that
+    distinguishes "the declaration was empty" from "we were never told"
+    has to be able to, and a marker whose shape changes with the
+    environment is a marker every reader has to guard for.
+    """
+    code, _ = _run_hook(
+        workspace, workspace["project"] / "backend" / "rogue.py",
+        allowed=["backend/a.py"],
+    )
+    assert code == 2
+    entry = _marker_lines(workspace)[0]
+    assert entry["declared_manifest_hash"] == "", entry
+    assert entry["lineage"] == "t1", entry
 
 
 def test_an_allowed_write_records_nothing(workspace, broker):
@@ -460,6 +491,48 @@ def test_the_seam_stamps_the_declaration_of_a_bound_task():
     assert json.loads(s["env"]["PDT_ALLOWED_WRITE_FILES"]) == ["backend/a.py"]
 
 
+def test_the_marker_hash_matches_the_sorted_declaration():
+    """The declaration is a SET; its hash must not read its order.
+
+    Two attempts at the same task would otherwise carry two different
+    ``declared_manifest_hash`` values for one declaration — the planner
+    emitted the files in a different order, or the context rebuilt the
+    list — and the executor would conclude the declaration changed under
+    the task when nothing about the permission did. Conversely a
+    declaration that really did change must hash differently, or "the
+    same declaration reached for another file" and "a new declaration
+    also cannot stop it" are indistinguishable.
+    """
+    import hashlib
+
+    from coding_tool import _stamp_allowed_write_files
+    from usage_registry import plan_usage_context
+
+    def _hash_for(declaration):
+        with plan_usage_context(task_id="7", task_allowed_files=declaration):
+            s = {"env": {}}
+            _stamp_allowed_write_files(s, "7")
+        return s["env"]["PDT_DECLARED_MANIFEST_HASH"]
+
+    reordered = _hash_for(["b.py", "a.py"])
+    assert reordered == _hash_for(["a.py", "b.py"]), (
+        "the same declaration hashed two ways purely because of the order "
+        "the planner emitted it in"
+    )
+    assert reordered != _hash_for(["a.py", "c.py"]), (
+        "a declaration naming a different file must not hash the same"
+    )
+    # And it is the documented function of the declaration, not an
+    # opaque tag: 16 hex chars of sha256 over the sorted, newline-joined
+    # strings, taken verbatim (no resolve — the guard matches lexically,
+    # so resolving here would hash something never compared).
+    expected = hashlib.sha256("a.py\nb.py".encode()).hexdigest()[:16]
+    assert reordered == expected
+    assert len(reordered) == 16 and all(
+        c in "0123456789abcdef" for c in reordered
+    )
+
+
 def test_a_read_only_task_gets_no_slip():
     """No declaration, no slip — the read-only stamp is the right answer.
 
@@ -526,6 +599,113 @@ def test_the_env_var_is_the_one_the_guard_reads():
     assert "PDT_ALLOWED_WRITE_FILES" in inspect.getsource(
         coding_tool._stamp_allowed_write_files
     )
+
+
+# ---------------------------------------------------------------------------
+# symlinks: the declaration is lexical, the guard is resolved
+# ---------------------------------------------------------------------------
+#
+# ``R(p)`` in the guard resolves the path BEFORE any rule looks at it.
+# That is what makes the containment rule and the declaration check
+# agree on one file — and it is also what a symlink can attack. These
+# two cases are the whole surface: a link that leaves the project, and a
+# link that stays inside it while naming something else.
+def _real_home() -> Path:
+    """The home this run was launched with — not the redirected one.
+
+    Same helper, same reason and same env var as
+    ``tests/integration/test_edit_write_lock_hook.py``. The guard allows
+    all temp scratch space unconditionally, and WHERE pytest puts
+    ``tmp_path`` is a property of the machine, not of this code: on Linux
+    ``TMPDIR`` is unset, so the basetemp IS ``/tmp`` and a ``tmp_path``
+    target is *legitimately* allowed there. A "symlink to a file outside
+    the project" built under ``tmp_path`` would therefore assert nothing
+    about the containment rule and pass on macOS while failing on Linux.
+    ``$HOME`` is outside every allowed root on both platforms; the
+    *launch* home is used because ``install_hermetic_env()`` redirects
+    ``$HOME`` at a tempdir path, which the scratch clause allows.
+    """
+    value = os.environ.get("PDT_TEST_REAL_HOME")
+    if not value:
+        raise RuntimeError(
+            "PDT_TEST_REAL_HOME is unset; install_hermetic_env() must run "
+            "before this module derives a path. Falling back to Path.home() "
+            "would return the redirected tempdir home, which the guard "
+            "allows unconditionally."
+        )
+    return Path(value)
+
+
+def test_a_symlink_to_outside_the_project_is_refused(workspace, broker):
+    """A link inside the workspace cannot launder a write out of it.
+
+    The declaration names a path INSIDE the project, so a purely lexical
+    check reads this as an authorised edit — and the bytes land wherever
+    the link points. The refusal therefore has to come from the
+    containment rule, resolved, before the declaration is consulted at
+    all; the lock must not be taken on the way out.
+    """
+    outside = _real_home() / "pdt-symlink-probe" / "secret.txt"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        outside.write_text("not yours")
+        link = workspace["project"] / "backend" / "sneaky.py"
+        link.symlink_to(outside)
+
+        code, stderr = _run_hook(workspace, link, allowed=["backend/sneaky.py"])
+        assert code == 2, (
+            f"a symlink pointing out of the workspace was allowed: {stderr!r}"
+        )
+        assert "outside the project dir" in stderr, stderr
+        assert broker.held("t1") == [], (
+            "an out-of-project write left a lock row behind"
+        )
+    finally:
+        outside.unlink(missing_ok=True)
+        outside.parent.rmdir()
+
+
+def test_a_symlink_inside_the_project_does_not_authorize_its_target_spelling(
+    workspace, broker
+):
+    """The declaration is checked against the RESOLVED path.
+
+    The check is exact-match on a path the guard has already resolved,
+    so what the declaration has to name is the file the write will
+    actually land in. Both directions are asserted, because only
+    asserting the refusing one would leave a rule that refuses every
+    symlink write — including the legitimate one, which is what a
+    fail-closed slip looks like when it is wrong.
+    """
+    real = workspace["project"] / "real.txt"
+    real.write_text("payload")
+    link = workspace["project"] / "link.txt"
+    link.symlink_to(real)
+
+    # Declared as the link, written as the link: resolves to real.txt,
+    # which the declaration never named. Fail closed, loudly.
+    code, stderr = _run_hook(
+        workspace, link, allowed=["link.txt"], task_id="t1"
+    )
+    assert code == 2, (
+        f"a declaration of 'link.txt' authorised the write it resolves to: "
+        f"{stderr!r}"
+    )
+    assert "did not declare" in stderr, stderr
+    assert broker.held("t1") == [], (
+        "a refused symlink write left a lock row behind"
+    )
+
+    # Declared as the file it actually is, written as the link: the
+    # resolved path matches, so this is the ordinary authorised edit and
+    # must not be refused.
+    code, stderr = _run_hook(
+        workspace, link, allowed=["real.txt"], task_id="t2"
+    )
+    assert code == 0, (
+        f"declaring the resolved path must authorise the write: {stderr!r}"
+    )
+    assert broker.held("t2") == ["real.txt"], broker.held("t2")
 
 
 # ---------------------------------------------------------------------------

@@ -7530,14 +7530,24 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
 
         Returns:
             ``(failure, occurrence)`` where ``occurrence`` counts how
-            many times *this exact signature* has now been seen in
+            many times *this exact failure* has now been seen in
             this lineage. ``occurrence == 1`` is the first time — the
             gate keeps the task whole and buys another iteration.
             ``occurrence >= 2`` is a repeat — only then is a split
             even a candidate.
+
+        The key is ``failure.fingerprint``, not ``failure.signature``:
+        the signature hashes the failure TEXT, and the same broken test
+        does not print the same words twice ("exit code 1" one attempt,
+        "exited with status 1" the next; a pytest tmpdir that moves every
+        run). Counting on the text reports both as first occurrences, so
+        the gate never opens and the runaway refiner is stopped by a
+        miscount rather than by the rule. The fingerprint keys on the
+        tool, exit code, exception classes, test ids and paths, which a
+        paraphrase cannot change.
         """
-        failure = classify_failure(error)
-        key = f"{self._lineage_id(task.id)}:{failure.signature}"
+        failure = classify_failure(error, project_dir=self.project_dir)
+        key = f"{self._lineage_id(task.id)}:{failure.fingerprint}"
         self._failure_occurrences[key] = (
             self._failure_occurrences.get(key, 0) + 1
         )
@@ -7553,7 +7563,12 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 task_id=task.id,
                 data={
                     "kind": failure.kind,
+                    # Both, because they answer different questions and
+                    # an operator reading this row cannot tell them
+                    # apart: signature is "is this the same words",
+                    # fingerprint is "is this the same failure".
                     "signature": failure.signature,
+                    "fingerprint": failure.fingerprint,
                     "label": failure.label,
                     "occurrence": occurrence,
                     "lineage": self._lineage_id(task.id),

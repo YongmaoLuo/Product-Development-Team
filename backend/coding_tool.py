@@ -6,6 +6,7 @@ Abstract base class for AI coding tools and implementations.
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -824,6 +825,17 @@ if af and pdr and rp and inside(rp, pdr):
             # path is ALSO written to a per-task marker the executor reads
             # at the failure tail; without that channel the classification
             # would depend on the sub-agent relaying it faithfully.
+            #
+            # ``attempted_path``/``path`` are the SAME spelling on
+            # purpose (``rp`` is already the resolved path): two fields,
+            # one value, so the reader can switch to the name that means
+            # "the write that was refused" without every historical
+            # reader of ``path`` breaking. The two that are NEW answer
+            # questions the path alone cannot: which DECLARATION was in
+            # force (same hash across attempts means one task slowly
+            # repairing one declaration; a different hash means the
+            # executor re-declared under it), and which LINEAGE the
+            # attempt belongs to, so a marker's counters survive a split.
             d=os.environ.get("PDT_UNDECLARED_WRITE_DIR","")
             if d:
                 try:
@@ -833,7 +845,10 @@ if af and pdr and rp and inside(rp, pdr):
                     with open(os.path.join(d, safe + ".jsonl"), "a",
                               encoding="utf-8") as f:
                         f.write(json.dumps({"task": os.environ.get("PDT_LOCK_TASK_ID",""),
-                                            "path": rp}) + "\\n")
+                                            "path": rp,
+                                            "attempted_path": rp,
+                                            "declared_manifest_hash": os.environ.get("PDT_DECLARED_MANIFEST_HASH",""),
+                                            "lineage": os.environ.get("PDT_LOCK_TASK_ID","").split("-",1)[0]}) + "\\n")
                 except Exception:
                     pass
             print("[pdt] refusing to edit a file this task did not declare: "
@@ -996,12 +1011,31 @@ def _stamp_allowed_write_files(
     * it never CLEARS the key, for the same reason the read-only stamp
       does not: ``settings_data`` is rebuilt per dispatch from the
       pristine template.
+    * ``PDT_DECLARED_MANIFEST_HASH`` rides along with the slip and is
+      gated by exactly the same ``allowed is not None``: a hash of
+      nothing would claim a declaration that was never issued, and the
+      guard would stamp it into every refusal marker.
     """
     if not lock_task_id:
         return
     allowed = current_task_allowed_files()
     if allowed is not None:
         settings_data["env"]["PDT_ALLOWED_WRITE_FILES"] = json.dumps(allowed)
+        # The declaration's own identity, so a refusal can name WHICH
+        # declaration was in force when the task reached outside it. Two
+        # attempts that reach for two different files may be two halves
+        # of one slowly-repaired declaration, or two unrelated sloppiness
+        # — and today the marker's path is the only thing recorded, so
+        # the executor cannot tell them apart. Sorted so the hash is a
+        # function of the declaration as a SET: the declaration is a set
+        # of files, so the order the planner happened to emit them in
+        # must not read as a different declaration. NOT resolved: the
+        # guard's matching is lexical, so resolving here would hash
+        # something the guard never compared against.
+        manifest = "\n".join(sorted(str(x) for x in allowed))
+        settings_data["env"]["PDT_DECLARED_MANIFEST_HASH"] = (
+            hashlib.sha256(manifest.encode()).hexdigest()[:16]
+        )
 
 
 def _build_guard_hook() -> Dict[str, str]:

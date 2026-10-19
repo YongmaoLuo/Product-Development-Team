@@ -453,7 +453,27 @@ class FileLockBroker:
                         self._emit(
                             "file_lock_deadlock",
                             {"task_id": task_id, "key": key,
-                             "held_by": holder, "cycle": cycle},
+                             "held_by": holder, "cycle": cycle,
+                             # The whole wait-for graph, not just the
+                             # one cycle. The cycle names the two tasks
+                             # that are wedged; these three say what
+                             # everything else in the run is holding and
+                             # queueing for, which is what an operator
+                             # needs to tell "this pair is deadlocked"
+                             # from "the whole plan is starved behind
+                             # them". Built here, under ``_cond``, and
+                             # copied (never aliased) so the JSON that
+                             # leaves this call cannot be mutated by the
+                             # next acquire.
+                             "held": {
+                                 t: sorted(k)
+                                 for t, k in self._held.items()
+                             },
+                             "waiting": {
+                                 k: list(v)
+                                 for k, v in self._waiting.items()
+                             },
+                             "waiting_for": dict(self._waiting_for)},
                         )
                         return DEADLOCK
                 # Notify-driven, with a poll backstop: a missed wake-up

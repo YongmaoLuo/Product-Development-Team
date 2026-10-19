@@ -41,6 +41,7 @@ not there — which is how a backstop becomes a source of false failures.
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
@@ -211,6 +212,31 @@ def test_the_reported_cycle_names_the_chain(broker):
         f"a wait-for cycle must return to its start, got {cycle!r}"
     )
     assert set(cycle) == {"A", "B"}, cycle
+
+    # The cycle names the wedged pair; the wait-for graph is what an
+    # operator reads to decide whether anything ELSE in the run is
+    # merely queued behind them (which unblocks itself the moment A
+    # releases) or holding something they need. One of those two is a
+    # five-minute wait and the other is a hang, and "file_lock_deadlock
+    # on b.py" alone does not say which.
+    event = deadlock_events[0]
+    assert event.get("held") == {"A": ["a.py"], "B": ["b.py"]}, (
+        f"the event does not carry who holds what: {event.get('held')!r}"
+    )
+    assert event.get("waiting") == {"a.py": ["B"]}, (
+        f"the event does not carry who is queued for what: "
+        f"{event.get('waiting')!r}"
+    )
+    # B is still blocked on a live holder at the moment A is refused, so
+    # its edge must be visible in the snapshot rather than dropped.
+    assert event.get("waiting_for", {}).get("B") == "a.py", (
+        f"the surviving waiter's edge is missing from the snapshot: "
+        f"{event.get('waiting_for')!r}"
+    )
+    # It has to survive a JSON round trip: the broker's only way out is
+    # the run log, and a graph that cannot be serialised is a graph an
+    # operator never sees.
+    assert json.loads(json.dumps(event))["waiting_for"]["B"] == "a.py"
 
 
 def test_a_detected_deadlock_leaves_no_bookkeeping_behind(broker):
