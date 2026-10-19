@@ -38,7 +38,18 @@ from config_paths import DEFAULT_SERVER_HOST, resolve_server_host  # noqa: E402
 REPO_ROOT = _BACKEND_DIR.parent
 
 #: Docs an operator reads before starting the server.
-DOCS = ("README.md", "CLAUDE.md", "SKILL.md")
+#:
+#: Every entry is a document this repository actually tracks
+#: (``git ls-files``). The list used to carry ``CLAUDE.md`` and
+#: ``SKILL.md``, which are per-operator files that no checkout is
+#: obliged to have: the two cases skipped forever and the guard ran
+#: against the README alone, in every container and on every runner.
+DOCS = (
+    "README.md",
+    "SECURITY_AUDIT.md",
+    "CHANGELOG.md",
+    "CHANGELOG.zh.md",
+)
 
 WILDCARD = "0.0.0.0"
 

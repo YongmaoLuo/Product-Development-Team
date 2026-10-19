@@ -37,7 +37,7 @@ _LLM_MODULES = (
     "verification_executor.py",
     "verification_subagent.py",
     "repair_generator.py",
-    "orchestrator.py",
+    "verification/orchestrator.py",
     "server.py",
 )
 

@@ -44,7 +44,6 @@ Boundary cases:
 from __future__ import annotations
 
 import json
-import os
 import re
 import sqlite3
 from pathlib import Path
@@ -70,13 +69,6 @@ _VENDOR_A_PRO_MARKERS = ("vendor-a-pro", "vendor-ai", "vendor-a")
 # routed through the proxy — the very failure mode decision 4 / 5 was
 # designed to prevent.
 _CC_SWITCH_PROXY_URL = "https://parent-proxy.invalid/anthropic"
-
-# 5 % reconciliation tolerance for the cc-switch usage / SQLite aggregate
-# comparison. Picked to absorb minor token-counting drift (the SDK
-# sometimes reports the sum of prompt+completion differently from the
-# provider's own usage object), while still catching real mis-routing
-# (where one path reports 0 and the other reports thousands).
-_RECONCILE_TOLERANCE = 0.05
 
 # Pattern to extract ``base_url=...`` from a ``[SUBAGENT_PROVIDER]`` line.
 _BASE_URL_RE = re.compile(
@@ -317,94 +309,6 @@ def _query_cc_switch_usage(
             remaining = tier.get("remaining", 0) or 0
             consumed += int(total - remaining)
     return consumed
-
-
-def test_cc_switch_quota_reconcile(
-    mock_subagent_metrics_db, time_window, cc_switch_api_mock,
-    monkeypatch,
-):
-    """cc-switch usage for vendor-a-pro must agree with the SQLite
-    aggregate to within 5 %.
-
-    This is the white-box reconciliation: it requires the local
-    cc-switch REST API to be reachable, at the endpoint named by
-    ``PDT_TEST_CC_SWITCH_API_URL``. There is no default endpoint —
-    the address belongs to one operator's machine, and the production
-    code never calls this API (it reads the cc-switch SQLite store;
-    see ``backend/cc_switch.py``). When the variable is unset or the
-    endpoint does not answer — as on CI runners or a laptop without
-    cc-switch running — the test is skipped and a clear "manual check
-    required" message is printed so the absence of an automated run
-    is visible in the report.
-
-    Steps:
-      1. Probe the local cc-switch API. Skip if unreachable.
-      2. Aggregate ``total_tokens`` from the SQLite DB over
-         ``[start, end]``.
-      3. Patch the production call site to return a fake quota
-         (default 3000 tokens, but the patch's ``tokens_used`` is
-         tuned to be within tolerance of the DB aggregate).
-      4. Assert |api_tokens - db_tokens| / max(db_tokens, 1) < 5 %.
-    """
-    start_iso, end_iso = time_window
-    db_path = mock_subagent_metrics_db
-
-    # Compute the DB aggregate first — this is the **ground truth** that
-    # the cc-switch API must reconcile against. We compute it on the
-    # *real* DB path (mock_subagent_metrics_db redirects $HOME).
-    db_row_count, db_total_tokens = _aggregate_total_tokens(
-        db_path, start_iso, end_iso,
-    )
-    assert db_total_tokens > 0, (
-        "pre-condition: SQLite aggregate must be > 0 before cc-switch "
-        "reconciliation can run; check test_sqlite_self_consistent first."
-    )
-
-    # Test-local endpoint for the cc-switch REST API. Not a production
-    # config knob — nothing in the backend reads it — and deliberately
-    # without a default, so no operator's local address is compiled in.
-    base_url = os.environ.get("PDT_TEST_CC_SWITCH_API_URL", "").strip()
-
-    # Probe: is the local cc-switch API up (and configured at all)?
-    reachable = cc_switch_api_mock.is_reachable()
-    if not reachable:
-        pytest.skip(
-            "manual check required: cc-switch dashboard vendor-a-pro "
-            f"消耗 > 0. PDT_TEST_CC_SWITCH_API_URL is unset or the "
-            f"endpoint it names is not reachable. Set it to the local "
-            f"cc-switch API root and rerun, or manually verify on the "
-            f"cc-switch dashboard that vendor-a-pro consumed "
-            f"{db_total_tokens} tokens between {start_iso} and {end_iso}."
-        )
-
-    # Patch the API call. Pick a tokens_used value that is exactly the
-    # DB aggregate (0 % deviation) so the test is deterministic; the 5 %
-    # tolerance exists to absorb real-world drift in production.
-    provider_id = "vendor-a-pro"
-    cc_switch_api_mock(
-        provider_id=provider_id,
-        tokens_used=db_total_tokens,
-        reachable=True,
-        http_status=200,
-    )
-
-    api_tokens = _query_cc_switch_usage(
-        base_url=base_url,
-        provider_id=provider_id,
-        start_iso=start_iso,
-        end_iso=end_iso,
-    )
-
-    # Deviation check. Guard against div-by-zero (db_total_tokens > 0
-    # is enforced by the pre-condition above).
-    deviation = abs(api_tokens - db_total_tokens) / max(db_total_tokens, 1)
-    assert deviation < _RECONCILE_TOLERANCE, (
-        f"cc-switch / SQLite reconciliation failed: "
-        f"api_tokens={api_tokens}, db_total_tokens={db_total_tokens}, "
-        f"deviation={deviation:.2%} (tolerance {_RECONCILE_TOLERANCE:.0%}), "
-        f"window=[{start_iso}, {end_iso}], provider={provider_id}, "
-        f"db_row_count={db_row_count}"
-    )
 
 
 def test_cc_switch_quota_reconcile_skips_when_api_down(

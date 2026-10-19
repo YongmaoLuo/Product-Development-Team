@@ -20,6 +20,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -1416,3 +1417,93 @@ def test_handle_stuck_bumps_skipped_counter_on_second_kill(
     assert handle.watchdog_kill_count == 2
     assert server._WATCHDOG_STATS["sub_agent_killed_total"] == pre_killed + 1
     assert server._WATCHDOG_STATS["sub_agent_skipped_total"] == pre_skipped + 1
+
+
+# ----------------------------------------------------------------------------
+# 2026-10-19: a worker-thread failure that cannot be set on the loop's
+# Future must not become an unbounded wait (CI: worker died on --timeout
+# with ``vp-output-pump-*`` at the top of the faulthandler dump).
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_iteration_on_worker_thread_fails_instead_of_hanging(
+    tmp_path, monkeypatch
+):
+    """A tool call that dies with ``StopIteration`` must return a verdict.
+
+    ``asyncio.to_thread`` returns the callable's outcome through
+    ``asyncio.futures._chain_future`` → ``Future.set_exception``, and
+    that setter refuses ``StopIteration``: it raises ``TypeError``
+    inside the loop's callback instead of resolving the future. The
+    awaiting task therefore stays pending for good, and
+    ``_await_under_work_clock`` — bounded only by the 3600 s work
+    clock, never by wall time — waits all of it with the output pump
+    thread still parked on ``stop_event.wait``. That is what took the
+    worker out at ``--timeout=60``.
+
+    What raises it in practice is an exhausted ``Mock.side_effect``
+    list, so the fake below is that: a one-shot iterator.
+
+    Driven through ``run()`` rather than ``_execute_attempt`` so the
+    test enters where production enters. ``asyncio.wait_for`` is the
+    test's own guard, not the fix: without the normalisation the wait
+    never completes and this line raises ``TimeoutError`` instead of
+    hanging the whole suite.
+    """
+    from verification_subagent import VerificationSubAgent
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class ExhaustedSideEffectTool:
+        def __init__(self):
+            self._process_lock = threading.Lock()
+            self._current_process = None
+            self._last_output_ts = time.monotonic()
+            # A ``Mock(side_effect=...)`` list that is already dry on
+            # its first call: the same "exhausted side_effect" this
+            # module's own history records, reached without needing a
+            # second attempt.
+            self._responses = iter(())
+
+        def query_json(self, *args, **kwargs):
+            return next(self._responses)
+
+    class MinimalSubAgent(VerificationSubAgent):
+        def __init__(self):
+            self.max_retries = 0
+            self.plan_id = "t-stop-iteration-worker"
+            self.registry = None
+            self.model_complexity = "test"
+            self.method = "code_review"
+            self.template = ""
+
+        async def _self_heal(self, *args, **kwargs):
+            return "noop"
+
+        def _build_prompt(self, vp_node, attempt):
+            return "prompt"
+
+        def _write_log(self, log_path, event, payload):
+            pass
+
+    sub = MinimalSubAgent()
+    tool = ExhaustedSideEffectTool()
+    vp_node = {"id": "VP-SI", "title": "test"}
+
+    verdict = await asyncio.wait_for(
+        sub.run(
+            vp_node=vp_node,
+            coding_tool=tool,
+            log_dir=tmp_path / "logs",
+            project_dir=tmp_path,
+            plan_id="t-stop-iteration-worker",
+        ),
+        timeout=30,
+    )
+
+    assert verdict.verdict == "FAILED"
+    assert any("StopIteration" in r for r in verdict.reasons), verdict.reasons
+    assert any(
+        "normalised to RuntimeError" in r for r in verdict.reasons
+    ), verdict.reasons

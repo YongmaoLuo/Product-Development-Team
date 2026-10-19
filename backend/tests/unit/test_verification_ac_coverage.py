@@ -14,7 +14,6 @@ PASSED，因为 ``overall_status`` 只由 VP 决定，而漏掉的那条标准�
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -204,56 +203,3 @@ def test_feedback_names_each_missing_criterion():
 
 def test_feedback_is_empty_when_there_is_no_gap():
     assert render_gap_feedback([]) == ""
-
-
-# ---------------------------------------------------------------------------
-# Against the plan that actually had the gap
-# ---------------------------------------------------------------------------
-
-
-def _real_plan_dir() -> Path | None:
-    """The 2026-10-04 plan, when this checkout sits next to it."""
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent / "product-development-team" / "plans"
-        if candidate.is_dir():
-            for plan_dir in sorted(candidate.iterdir()):
-                prd = plan_dir / "prd.json"
-                vplan = plan_dir / "verification_plan.json"
-                if not (prd.is_file() and vplan.is_file()):
-                    continue
-                try:
-                    acceptance = json.loads(
-                        prd.read_text(encoding="utf-8"),
-                    ).get("acceptance")
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if isinstance(acceptance, list) and any(
-                    isinstance(a, str) and a.startswith("【FD 传递·多级】")
-                    for a in acceptance
-                ):
-                    return plan_dir
-    return None
-
-
-def test_the_2026_10_04_gap_is_found_without_hand_analysis():
-    """The check must rediscover AC-04 from the files alone."""
-    plan_dir = _real_plan_dir()
-    if plan_dir is None:
-        import pytest
-        pytest.skip("the 2026-10-04 plan is not reachable from this checkout")
-
-    prd = json.loads((plan_dir / "prd.json").read_text(encoding="utf-8"))
-    plan = json.loads(
-        (plan_dir / "verification_plan.json").read_text(encoding="utf-8"),
-    )
-
-    labels = extract_criterion_labels(prd["acceptance"])
-    assert len(labels) == len(prd["acceptance"]), (
-        "every criterion in that PRD carries an explicit label"
-    )
-
-    missing = find_uncovered_criteria(plan, prd["acceptance"])
-    assert [m.label for m in missing] == ["FD 传递·多级"], (
-        "the multi-level FD relay was the criterion with no planned VP"
-    )

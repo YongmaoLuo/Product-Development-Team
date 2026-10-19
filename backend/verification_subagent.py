@@ -29,6 +29,7 @@ it before a PASSED is honoured.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -56,6 +57,53 @@ from coding_tool import (
     WorkClock,
 )
 from utils.secret_files import private_dir, write_private_json
+
+
+def _marshal_safe_on_worker_thread(func: Any) -> Any:
+    """Wrap ``func`` so every failure it can have can cross back to the loop.
+
+    :func:`asyncio.to_thread` hands the callable's outcome back through
+    ``asyncio.futures._chain_future``, which ends in
+    ``asyncio.Future.set_exception``. That setter rejects ``StopIteration``
+    outright — it cannot tell a generator that ran dry from a real error —
+    and instead of setting anything it raises ``TypeError`` *inside the
+    loop's own callback*. The callback dies before the future is
+    resolved, so the exception is never set, the awaiting task stays
+    pending forever, and :func:`_await_under_work_clock` — whose only
+    bound is the work clock — sits on it for the whole
+    ``HARD_WALL_CLOCK_CAP_SECONDS`` budget with the output pump thread
+    still parked on ``stop_event.wait``. The observable shape of that is
+    a test worker that dies on its own ``--timeout`` mid-attempt with a
+    ``vp-output-pump-*`` thread at the top of the faulthandler dump.
+
+    An exhausted ``Mock.side_effect`` list raises ``StopIteration`` in
+    whatever code runs inside the worker, so "the mock ran out" was
+    enough to trigger it; ``GeneratorExit`` is refused the same way and
+    is handled here for the same reason.
+
+    The normalisation belongs on this side of the thread rather than at
+    each call site: what does the damage is the *awaiting* side's
+    unbounded wait, not the worker, so any callable that can raise one
+    of these reaches the same hang whatever it is. The result is a
+    plain ``RuntimeError`` — the type ``asyncio`` itself uses for a
+    ``StopIteration`` that lands on a coroutine — which the caller's
+    ``except Exception`` can turn into a verdict instead of a wait that
+    never ends.
+    """
+
+    @functools.wraps(func)
+    def _wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except (StopIteration, GeneratorExit) as exc:
+            name = getattr(func, "__name__", repr(func))
+            raise RuntimeError(
+                f"{name} ended with {type(exc).__name__}({exc!r}) on a "
+                f"worker thread; it cannot be set on an asyncio.Future, "
+                f"so it is normalised to RuntimeError here"
+            ) from exc
+
+    return _wrapper
 
 
 async def _await_under_work_clock(awaitable: Any, clock: WorkClock) -> Any:
@@ -1230,7 +1278,9 @@ class VerificationSubAgent:
                 try:
                     response_dict = await _await_under_work_clock(
                         asyncio.to_thread(
-                            scoped_tool.query_json,
+                            _marshal_safe_on_worker_thread(
+                                scoped_tool.query_json,
+                            ),
                             prompt=prompt,
                             system_instruction=self.template,
                             timeout=None,

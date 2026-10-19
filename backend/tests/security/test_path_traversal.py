@@ -57,25 +57,33 @@ def test_allows_normal_absolute_path_in_tmp(tmp_path):
     }
 
 
-def test_allows_normal_absolute_path_under_the_project(tmp_path):
+def test_allows_normal_absolute_path_under_the_project(monkeypatch, tmp_path):
     """The project root is the other allowed root.
 
     ``_PROJECT_ROOT`` is allowed because the default config directory
     lives there, so a deployment pointing ``PDT_PROVIDER_USAGE_FILE``
     at a sibling config tree has to keep working.
+
+    The tree is built under ``tmp_path`` and ``_PROJECT_ROOT`` is
+    pointed at it, rather than writing into the real checkout. What is
+    under test is the guard's decision, not whether this particular
+    working copy happens to carry a ``.config`` directory — and the old
+    arrangement skipped outright whenever it did not, which is what kept
+    this assertion from running in a clean container. The root is
+    resolved because production resolves it
+    (``_PROJECT_ROOT = Path(__file__).parent.parent.resolve()``) and
+    ``_is_under`` compares the resolved child against the root as given.
     """
     import provider_order
 
-    root = provider_order._PROJECT_ROOT
-    target = root / ".config" / "provider-order.json"
-    if target.parent.exists():
-        target.write_text(json.dumps(SAMPLE_USAGE), encoding="utf-8")
-        try:
-            assert load_provider_5h_usage(target)["Vendor A Pro"] == 90.0
-        finally:
-            target.unlink(missing_ok=True)
-    else:
-        pytest.skip("no .config directory in this checkout")
+    config_dir = tmp_path / ".config"
+    config_dir.mkdir()
+    target = config_dir / "provider-order.json"
+    target.write_text(json.dumps(SAMPLE_USAGE), encoding="utf-8")
+
+    monkeypatch.setattr(provider_order, "_PROJECT_ROOT", tmp_path.resolve())
+
+    assert load_provider_5h_usage(target)["Vendor A Pro"] == 90.0
 
 
 def test_a_traversing_path_is_refused_before_it_is_read(monkeypatch):

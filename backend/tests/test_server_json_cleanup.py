@@ -92,12 +92,14 @@ from __future__ import annotations
 import ast
 import json
 import re
+import socket
 import sqlite3
 import subprocess
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -525,7 +527,7 @@ def test_pattern_pathlib_join() -> None:
 # The grep gate above pins the *source* layer: production code MUST NOT
 # reference the five forbidden JSON state filenames.  This complement pins
 # the *filesystem* layer: after a real ``/api/execution/{plan_id}/start``
-# lifecycle (driven against a live EXEC_PORT=8001 instance), the plans/
+# lifecycle (driven against a live ephemeral-port instance), the plans/
 # directory tree MUST NOT contain any of the five forbidden JSON sidecars.
 #
 # Why a separate test?
@@ -672,24 +674,127 @@ def _collect_teardown_hits(plans_root: Path) -> list[tuple[Path, str]]:
     return hits
 
 
+# ---------------------------------------------------------------------------
+# Ephemeral ports for the two real-server fixtures below.
+# ---------------------------------------------------------------------------
+#
+# 2026-10-19: both fixtures used to bind the FIXED port 8001, and that is
+# what made the ``root`` shard red at random. The health probe cannot tell
+# "my server answered" from "something else answered": a stale listener on
+# :8001 — a previous test's uvicorn that has not been reaped, a
+# SIGTERM-swallowing zombie, a listener the runner image starts — returns
+# 200 /health instantly while writing to a DIFFERENT ``state.db``. The
+# probe then passes, the fixture proceeds, and three tests later the schema
+# layer reports an empty ``sqlite_master``, which reads like a schema
+# regression and is not one. Under ``-n 8`` the three tests sharing
+# ``exec_instance_setup`` also race each other for the same fixed port, so
+# the victim is different on every seed — which is exactly the "fails once
+# per seed, a different test each time" signature.
+#
+# A port handed out by the kernel for port 0 and released before the spawn
+# is the fix: nothing else on the machine knows it, so a 200 on
+# ``/health`` is evidence about THIS process. The release-before-bind race
+# is real and unavoidable without SO_REUSEPORT, so the spawn is retried
+# once on a fresh port rather than trusted once.
+
+
+class ExecInstance(NamedTuple):
+    """What ``exec_instance_setup`` hands its test.
+
+    The port is part of the contract now: a test that issues its own HTTP
+    request against the live instance (``test_repository_api_contract``
+    re-drives ``/start`` a second time) used to spell ``127.0.0.1:8001``
+    inline, which is the same fixed-port assumption one layer down and
+    fails the same way — the request lands on whichever stale listener
+    owns 8001 and the assertion is made against the wrong server.
+    """
+
+    plans_root: Path
+    port: int
+
+
+def _free_port() -> int:
+    """Ask the kernel for an unused loopback port, then let it go.
+
+    ``bind(("127.0.0.1", 0))`` is the only allocation that cannot collide
+    with a port some other checkout, container or stray listener already
+    holds. The socket is closed before the number is returned — the caller
+    has to win the race against its own ``Popen``, and holding the socket
+    open would make losing it certain.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_port_released(port: int, timeout: float = 10.0) -> bool:
+    """True once ``port`` can be bound again, False if it is still held."""
+    deadline = time.monotonic() + timeout
+    while True:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+        finally:
+            probe.close()
+
+
+def _stop_server(proc: subprocess.Popen, port: int, timeout: float = 10.0) -> None:
+    """Stop a spawned uvicorn deterministically and confirm the port is free.
+
+    ``terminate → wait(timeout) → kill → wait``, then check that ``port``
+    is actually released. Two things are load-bearing here and both used to
+    be wrong:
+
+    * the sequence is ordered, not best-effort. ``proc.wait()`` reaps, so a
+      port check that runs before the reap can see a socket the kernel has
+      not finished tearing down;
+    * nothing is swallowed. The previous ``except Exception: pass`` around
+      this block is what let a SIGTERM-swallowing zombie outlive the test
+      that spawned it and answer the next run's health probe — the failure
+      this whole port change exists to remove. A teardown that cannot
+      account for its child fails loudly instead.
+    """
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=timeout)
+    if not _wait_port_released(port):
+        raise AssertionError(
+            f"the spawned server (pid={proc.pid}, rc={proc.returncode}) was "
+            f"killed but :{port} is still bound {timeout}s later. A listener "
+            f"this fixture started would outlive the test that spawned it "
+            f"and answer a later run's health probe."
+        )
+
+
 @pytest.fixture
 def exec_instance_setup(tmp_path, monkeypatch):
-    """Spawn a real FastAPI instance on ``EXEC_PORT=8001`` and drive
+    """Spawn a real FastAPI instance on an ephemeral port and drive
     one ``/api/execution/{plan_id}/start`` lifecycle.
 
     The fixture:
       * redirects ``server.PLANS_DIR`` to ``tmp_path / "plans"`` so
         the scan in ``test_teardown_guard`` sees only this run's
         artifacts (no cross-run leakage);
-      * spawns ``uvicorn server:app`` on port 8001 in a background
-        subprocess;
+      * spawns ``uvicorn server:app`` on a kernel-assigned ephemeral port
+        in a background subprocess (retrying once on a fresh port if the
+        first one does not come up — see ``_free_port``);
       * waits for ``GET /health`` to return 2xx;
       * plants an interview.json + tasks.json artifact (the brief's
         allowlisted product JSON files) so the scan can prove the
         allowlist is honoured and is non-vacuous;
       * drives ``POST /api/execution/{plan_id}/start`` so the
         execution sidecar write path is exercised end-to-end;
-      * yields the plans root to the test;
+      * yields the plans root and the ephemeral port to the test;
       * on teardown: stops the uvicorn subprocess, then returns —
         the test itself walks plans/ to assert the post-teardown
         state.
@@ -717,18 +822,26 @@ def exec_instance_setup(tmp_path, monkeypatch):
     )
     (plan_dir / "tasks.json").write_text("[]", encoding="utf-8")
 
-    # Verify ``uvicorn`` is on PATH; skip gracefully otherwise.
+    # Verify ``uvicorn`` is available; skip gracefully otherwise.
     import shutil
+    import sys
 
     uvicorn_path = shutil.which("uvicorn")
     if uvicorn_path is None:
+        # A Linux container / hosted CI image often has no uvicorn on
+        # PATH at all, while the venv *running these tests* does have one
+        # sitting next to its own interpreter. Falling back to that copy
+        # is what keeps this gate running there, instead of reporting a
+        # skip that reads exactly like "the layer is covered".
+        uvicorn_path = str(Path(sys.executable).parent / "uvicorn")
+    if not Path(uvicorn_path).exists():
         pytest.skip(
             "uvicorn is not on PATH in this environment; "
-            "the teardown guard requires a live EXEC_PORT=8001 instance "
+            "the teardown guard requires a live server instance "
             "to exercise the full /api/execution lifecycle."
         )
 
-    # Spawn the FastAPI app on port 8001.
+    # Spawn the FastAPI app on an ephemeral port.
     # ``PDT_STATE_DB_PATH`` redirects ``server._state_db_path`` to a
     # per-test tmp file so the schema/API contract tests inspect only
     # the fixture's own state.db (no cross-run leakage onto the
@@ -737,7 +850,6 @@ def exec_instance_setup(tmp_path, monkeypatch):
     tmp_state_db = tmp_path / "state.db"
     server_log = open(tmp_path / "uvicorn.log", "w+b")  # noqa: SIM115
     env = {
-        "EXEC_PORT": "8001",
         "PDT_STATE_DB_PATH": str(tmp_state_db),
         # The monkeypatch above redirects PLANS_DIR in THIS process. The
         # spawned uvicorn is a separate process with its own PLANS_DIR
@@ -774,72 +886,99 @@ def exec_instance_setup(tmp_path, monkeypatch):
         # with "sqlite_master 含 []".
         "PYTHONPATH": str(_BACKEND_ROOT.parent),
     }
-    proc = subprocess.Popen(  # noqa: S603
-        [
-            uvicorn_path,
-            "server:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "8001",
-            "--log-level",
-            "warning",
-        ],
-        cwd=str(_BACKEND_ROOT),
-        env=env,
-        # NOT DEVNULL. The server is the only thing that knows why it
-        # failed to bring the database up, and every consumer of this
-        # fixture reads the database afterwards -- so with the output
-        # discarded, "the server never wrote state.db" is
-        # indistinguishable from "the server wrote a state.db with no
-        # tables in it", and the second reading is the one the schema
-        # assertions go on to report as an empty ``sqlite_master``.
-        stdout=server_log,
-        stderr=subprocess.STDOUT,
-    )
-    try:
+    def _server_log_tail() -> str:
+        try:
+            server_log.flush()
+            server_log.seek(0)
+            return server_log.read().decode("utf-8", "replace")[-2000:]
+        except OSError:
+            return "<server log unavailable>"
+
+    port = _free_port()
+    proc = None
+    ready = False
+    # Two attempts, not one: ``_free_port`` releases the socket before the
+    # spawn, so between the two the kernel is free to hand the same number
+    # to something else. Retrying on a fresh port turns that rare loss into
+    # a second chance instead of a 30 s health timeout and a skip.
+    for _spawn_try in range(2):
+        if _spawn_try:
+            port = _free_port()
+        env["EXEC_PORT"] = str(port)
+        proc = subprocess.Popen(  # noqa: S603
+            [
+                uvicorn_path,
+                "server:app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--log-level",
+                "warning",
+            ],
+            cwd=str(_BACKEND_ROOT),
+            env=env,
+            # NOT DEVNULL. The server is the only thing that knows why it
+            # failed to bring the database up, and every consumer of this
+            # fixture reads the database afterwards -- so with the output
+            # discarded, "the server never wrote state.db" is
+            # indistinguishable from "the server wrote a state.db with no
+            # tables in it", and the second reading is the one the schema
+            # assertions go on to report as an empty ``sqlite_master``.
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
+        )
         # Wait for the server to come up.  30 s budget.
         deadline = time.time() + 30
-        ready = False
         while time.time() < deadline:
             try:
                 with urllib.request.urlopen(  # noqa: S310
-                    "http://127.0.0.1:8001/health", timeout=2
+                    f"http://127.0.0.1:{port}/health", timeout=2
                 ) as resp:
                     if 200 <= resp.status < 300:
                         ready = True
                         break
             except (urllib.error.URLError, ConnectionResetError, OSError):
                 pass
+            # A server that died on startup cannot come up. Without this
+            # the loop spends the whole 30 s budget on a corpse, then a
+            # second time over on the retry.
+            if proc.poll() is not None:
+                break
             time.sleep(0.25)
-        def _server_log_tail() -> str:
-            try:
-                server_log.flush()
-                server_log.seek(0)
-                return server_log.read().decode("utf-8", "replace")[-2000:]
-            except OSError:
-                return "<server log unavailable>"
+        if ready and proc.poll() is None:
+            break
+        # This attempt did not produce a live server. Stop it for real and
+        # take a fresh port; leaving it behind is how the next attempt ends
+        # up racing the child we just abandoned.
+        _stop_server(proc, port)
+        proc = None
+        ready = False
 
+    try:
         if not ready:
             pytest.skip(
-                "EXEC_PORT=8001 server did not become healthy within 30s; "
+                f"the server on :{port} did not become healthy within 30s "
+                f"on either of 2 ephemeral ports; "
                 "teardown guard cannot exercise the live lifecycle. "
                 f"Server output:\n{_server_log_tail()}"
             )
-        # A healthy 8001 is not evidence that THIS server is the one
-        # answering. The port is fixed, so anything else that ever bound
-        # it -- a previous test's server that has not been reaped yet, or
-        # a listener this runner image starts by default -- answers the
-        # health probe instantly while writing to a DIFFERENT state.db.
-        # That is the failure this whole fixture has been silently
-        # producing: a healthy check, a foreign server, and an empty
-        # ``sqlite_master`` three tests later with nothing in between
-        # saying so.
+        # A healthy probe is still not evidence that THIS server is the one
+        # answering — that used to be true, because the port was fixed and
+        # anything else that ever bound it (a previous test's server that
+        # had not been reaped, a SIGTERM-swallowing zombie, a listener the
+        # runner image starts) answered instantly while writing to a
+        # DIFFERENT state.db. On a kernel-assigned port nothing else knows
+        # the number, so a 2xx is about this process. What is left is the
+        # weaker and still-true claim: the process may have died between the
+        # probe and this check, and a dead server's absence of state.db
+        # would read as a schema regression. So the liveness check stays.
         if proc.poll() is not None:
             pytest.skip(
-                f"the spawned server exited (rc={proc.returncode}) before "
-                f"the health probe succeeded, so another process is "
-                f"serving :8001. Server output:\n{_server_log_tail()}"
+                f"the spawned server exited (rc={proc.returncode}) on "
+                f":{port} before the rest of the lifecycle ran, so this "
+                f"test would read nothing at all. "
+                f"Server output:\n{_server_log_tail()}"
             )
 
         # Drive /api/execution/{plan_id}/start.  We accept either
@@ -857,7 +996,7 @@ def exec_instance_setup(tmp_path, monkeypatch):
         fixture_project_dir.mkdir(parents=True, exist_ok=True)
         body = json.dumps({"project_dir": str(fixture_project_dir)}).encode("utf-8")
         req = urllib.request.Request(  # noqa: S310
-            f"http://127.0.0.1:8001/api/execution/{plan_id}/start",
+            f"http://127.0.0.1:{port}/api/execution/{plan_id}/start",
             data=body,
             headers={
                 "Content-Type": "application/json",
@@ -895,41 +1034,36 @@ def exec_instance_setup(tmp_path, monkeypatch):
         # regression and is not one.
         if not tmp_state_db.exists() or tmp_state_db.stat().st_size == 0:
             pytest.fail(
-                f"the spawned server never created {tmp_state_db}. The "
+                f"the server we spawned on :{port} answered /health but "
+                f"never created {tmp_state_db}. The "
                 f"schema assertions in this file will otherwise report an "
                 f"empty sqlite_master, which looks like a schema "
                 f"regression and is not one. Server output:\n"
                 f"{_server_log_tail()}"
             )
 
-        yield plans_root
+        yield ExecInstance(plans_root=plans_root, port=port)
     finally:
-        # Stop the spawned server.  Best-effort: if terminate fails
-        # we escalate to kill so the teardown is non-blocking.
-        try:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-        except Exception:
-            pass
-        try:
-            server_log.close()
-        except OSError:
-            pass
+        # Deterministic stop: terminate → wait → kill → wait, then confirm
+        # :port is free. ``_stop_server`` raises rather than swallowing if
+        # the port is still held — a listener this fixture started would
+        # outlive the test and answer a later run's health probe, which is
+        # the cross-test contamination the ephemeral port removes.
+        if proc is not None:
+            _stop_server(proc, port)
+        server_log.close()
 
 
 @pytest.mark.unit
 def test_e2e_teardown_guard(exec_instance_setup) -> None:
-    """Filesystem-layer guard: after the EXEC_PORT=8001 lifecycle, the
+    """Filesystem-layer guard: after the ephemeral-port lifecycle, the
     plans/ tree MUST NOT contain any of the five forbidden JSON
     state filenames.
 
     Strategy:
       1. Use the ``exec_instance_setup`` fixture (which spawns the
-         8001 instance and drives ``/api/execution/{plan_id}/start``).
+         ephemeral-port instance and drives
+         ``/api/execution/{plan_id}/start``).
       2. After the fixture teardown stops the server, walk
          ``$PDT_DATA_DIR/plans/`` recursively via
          ``pathlib.Path.rglob('*.json')``.
@@ -948,7 +1082,7 @@ def test_e2e_teardown_guard(exec_instance_setup) -> None:
       * Failures are NOT downgraded to warnings: ``pytest.fail``
         aborts the run.
     """
-    plans_root: Path = exec_instance_setup
+    plans_root: Path = exec_instance_setup.plans_root
     hits = _collect_teardown_hits(plans_root)
 
     if hits:
@@ -956,7 +1090,7 @@ def test_e2e_teardown_guard(exec_instance_setup) -> None:
         basenames = sorted({b for _, b in hits})
         pytest.fail(
             f"teardown guard: {len(hits)} forbidden JSON sidecar(s) "
-            f"present under plans/ after EXEC_PORT=8001 teardown: "
+            f"present under plans/ after the server teardown: "
             f"rel={rel_paths!r} basenames={basenames!r}. "
             f"The five forbidden filenames are "
             f"{sorted(_TEARDOWN_TARGETS)!r} — every write path must "
@@ -988,7 +1122,7 @@ def test_e2e_teardown_guard(exec_instance_setup) -> None:
 #
 #   test_repository_api_contract
 #     After driving the live ``POST /api/execution/{plan_id}/start``
-#     endpoint against an EXEC_PORT=8001 instance, the SQLite database
+#     endpoint against a live ephemeral-port instance, the SQLite db
 #     schema MUST remain stable — i.e. no NEW tables were created by
 #     the lifecycle.  This is the runtime companion to the source-layer
 #     grep gate: even if a runtime path bypasses the repositories and
@@ -996,7 +1130,7 @@ def test_e2e_teardown_guard(exec_instance_setup) -> None:
 #
 # Both tests consume the ``exec_instance_setup`` fixture (which the
 # filesystem-layer test above already defines) so we share the same
-# isolated tmp_path + 8001 lifecycle.  The fixture's yield is the
+# isolated tmp_path + ephemeral-port lifecycle.  The fixture's yield is
 # ``plans_root`` — the schema tests compute ``state.db`` as
 # ``plans_root.parent / "state.db"`` to match the production layout
 # (``<PLANS_DIR.parent> / state.db``).
@@ -1096,7 +1230,7 @@ def test_sqlite_master_whitelist(exec_instance_setup) -> None:
 
     The fixture (``exec_instance_setup``) drives one
     ``POST /api/execution/{plan_id}/start`` call against the live
-    EXEC_PORT=8001 instance; after teardown we open the SQLite
+    ephemeral-port instance; after teardown we open the SQLite
     database the fixture configured and inspect ``sqlite_master``.
 
     Why the SQLite layer matters (not just the source grep gate):
@@ -1105,11 +1239,11 @@ def test_sqlite_master_whitelist(exec_instance_setup) -> None:
       creates a table via raw SQL.  This test catches that class of
       regression at the storage layer.
     """
-    plans_root: Path = exec_instance_setup
+    plans_root: Path = exec_instance_setup.plans_root
     # The fixture sets PDT_STATE_DB_PATH to point at a per-test tmp
     # SQLite file (see exec_instance_setup below).  We resolve it the
     # same way so the assertion targets the same file the live
-    # EXEC_PORT=8001 server wrote into.
+    # the ephemeral-port server wrote into.
     db_path = plans_root.parent / "state.db"
 
     actual = _read_sqlite_master_table_names(db_path)
@@ -1159,7 +1293,7 @@ def test_e2e_sqlite_master(exec_instance_setup) -> None:
 
     The fixture (exec_instance_setup) drives one
     POST /api/execution/{plan_id}/start call against the live
-    EXEC_PORT=8001 instance; after teardown we open the SQLite
+    ephemeral-port instance; after teardown we open the SQLite
     database the fixture configured and inspect sqlite_master.
 
     Why the SQLite layer matters (not just the source grep gate):
@@ -1168,11 +1302,11 @@ def test_e2e_sqlite_master(exec_instance_setup) -> None:
       creates a table via raw SQL.  This test catches that class of
       regression at the storage layer.
     """
-    plans_root: Path = exec_instance_setup
+    plans_root: Path = exec_instance_setup.plans_root
     # The fixture sets PDT_STATE_DB_PATH to point at a per-test tmp
     # SQLite file (see exec_instance_setup below).  We resolve it the
     # same way so the assertion targets the same file the live
-    # EXEC_PORT=8001 server wrote into.
+    # the ephemeral-port server wrote into.
     db_path = plans_root.parent / "state.db"
 
     actual = _read_sqlite_master_table_names(db_path)
@@ -1233,7 +1367,7 @@ def test_repository_api_contract(exec_instance_setup) -> None:
 
     Strategy:
       1. Use the ``exec_instance_setup`` fixture (which spawns the
-         8001 instance and plants an ``interview.json`` /
+         ephemeral-port instance and plants an ``interview.json`` /
          ``tasks.json`` for the fixture plan).
       2. Snapshot ``sqlite_master`` BEFORE the lifecycle via a
          direct ``urllib`` call to ``/api/execution/{plan_id}/start``
@@ -1256,7 +1390,8 @@ def test_repository_api_contract(exec_instance_setup) -> None:
     dynamically creates a table during /start will surface as
     ``actual > (core ∪ migration)`` after the fixture teardown.
     """
-    plans_root: Path = exec_instance_setup
+    plans_root: Path = exec_instance_setup.plans_root
+    live_port: int = exec_instance_setup.port
     db_path = plans_root.parent / "state.db"
 
     actual = _read_sqlite_master_table_names(db_path)
@@ -1322,7 +1457,10 @@ def test_repository_api_contract(exec_instance_setup) -> None:
         {"project_dir": str(project_dir), "sync_targets": ["telegram"]}
     ).encode("utf-8")
     req = urllib.request.Request(  # noqa: S310
-        f"http://127.0.0.1:8001/api/execution/{plan_id}/start",
+        # The port the fixture actually bound, not the 8001 this used to
+        # hardcode — a second call against a fixed port is the same
+        # cross-file contamination one layer down.
+        f"http://127.0.0.1:{live_port}/api/execution/{plan_id}/start",
         data=body,
         headers={
             "Content-Type": "application/json",
@@ -1826,7 +1964,7 @@ def test_no_assertion_swallowing() -> None:
 # This section adds:
 #
 #   * ``exec_instance_lifecycle`` — a fixture that subprocess.Popen-
-#     spawns ``server.py`` on ``EXEC_PORT=8001``, plants an interview.json
+#     spawns ``server.py`` on an ephemeral port, plants an interview.json
 #     + tasks.json fixture pair, drives ``/api/execution/{plan_id}/start``
 #     against the live instance, waits for progress, and on teardown
 #     first terminates the server then ``shutil.rmtree``s the temp dir.
@@ -1853,7 +1991,7 @@ def test_no_assertion_swallowing() -> None:
 # Boundary conditions (per the task brief):
 #
 #   - subprocess.Popen launches a real ``uvicorn server:app`` process
-#     on EXEC_PORT=8001 — NO mock, NO monkeypatch of ``server.app``.
+#     on an ephemeral port — NO mock, NO monkeypatch of ``server.app``.
 #   - Fixture teardown order: ``proc.terminate()`` FIRST, then
 #     ``shutil.rmtree(temp_dir)`` (so the server has fully released
 #     its state.db handle before we delete the parent directory).
@@ -1870,9 +2008,12 @@ import shutil as _shutil  # for shutil.rmtree in fixture teardown
 
 
 _E2E_FIXTURE_PLAN_ID = "20260101-cleanup-sample"
-_E2E_PORT = 8001
-_E2E_HEALTH_URL = f"http://127.0.0.1:{_E2E_PORT}/health"
-_E2E_START_URL_TEMPLATE = f"http://127.0.0.1:{_E2E_PORT}/api/execution/{{plan_id}}/start"
+# 2026-10-19: there is no longer a module-level port here. The three
+# constants that used to sit on this line (``_E2E_PORT``,
+# ``_E2E_HEALTH_URL``, ``_E2E_START_URL_TEMPLATE``) were all derived from
+# a fixed 8001, so the URLs could not follow the server onto an ephemeral
+# port — they are built inside the fixture now, per spawn. See
+# ``_free_port``.
 
 
 def _child_path() -> str:
@@ -1937,7 +2078,7 @@ def _find_uvicorn_path() -> str | None:
 
 @pytest.fixture
 def exec_instance_lifecycle(tmp_path, monkeypatch):
-    """Drive a full EXEC_PORT=8001 lifecycle (spawn → /start → teardown).
+    """Drive a full server lifecycle (spawn → /start → teardown).
 
     Steps performed:
 
@@ -1952,7 +2093,7 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
       3. Redirect ``server.PLANS_DIR`` to the per-test tmp tree so the
            teardown walk in ``test_e2e_three_layer_defense`` scans
            only this run's artifacts (no cross-run leakage).
-      4. Spawn ``uvicorn server:app`` on EXEC_PORT=8001 via
+      4. Spawn ``uvicorn server:app`` on an ephemeral port via
            ``subprocess.Popen`` (real process — NOT a mock).
       5. Poll ``GET /health`` for up to 30 s, waiting for the server
            to come up.
@@ -2014,14 +2155,13 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
         pytest.skip(
             "uvicorn is not on PATH in this environment; "
             "the e2e three-layer defense test requires a live "
-            "EXEC_PORT=8001 instance."
+            "server instance."
         )
 
-    # Spawn the real uvicorn process on EXEC_PORT=8001.
+    # Spawn the real uvicorn process on a kernel-assigned ephemeral port.
     tmp_state_db = tmp_path / "state.db"
     server_log = open(tmp_path / "uvicorn.log", "w+b")  # noqa: SIM115
     env = {
-        "EXEC_PORT": str(_E2E_PORT),
         "PDT_STATE_DB_PATH": str(tmp_state_db),
         # Two symptoms, one variable, and neither is where the other is.
         #
@@ -2073,98 +2213,98 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
         # (``from backend.framework...``) and the e2e layer SKIPs.
         "PYTHONPATH": str(_BACKEND_ROOT.parent),
     }
-    proc = subprocess.Popen(  # noqa: S603
-        [
-            uvicorn_path,
-            "server:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(_E2E_PORT),
-            "--log-level",
-            "warning",
-        ],
-        cwd=str(_BACKEND_ROOT),
-        env=env,
-        # NOT DEVNULL. The server is the only thing that knows why it
-        # failed to bring the database up, and every consumer of this
-        # fixture reads the database afterwards -- so with the output
-        # discarded, "the server never wrote state.db" is
-        # indistinguishable from "the server wrote a state.db with no
-        # tables in it", and the second reading is the one the schema
-        # assertions go on to report as an empty ``sqlite_master``.
-        stdout=server_log,
-        stderr=subprocess.STDOUT,
-    )
+    def _server_log_tail() -> str:
+        try:
+            server_log.flush()
+            server_log.seek(0)
+            return server_log.read().decode("utf-8", "replace")[-2000:]
+        except OSError:
+            return "<server log unavailable>"
 
+    port = _free_port()
+    proc = None
     server_started = False
-    try:
+    # Same two-attempt shape as ``exec_instance_setup``: the ephemeral port
+    # is released before the spawn, so losing the bind race is possible and
+    # a second try is cheaper than a 30 s health timeout plus a skip.
+    for _spawn_try in range(2):
+        if _spawn_try:
+            port = _free_port()
+        env["EXEC_PORT"] = str(port)
+        proc = subprocess.Popen(  # noqa: S603
+            [
+                uvicorn_path,
+                "server:app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--log-level",
+                "warning",
+            ],
+            cwd=str(_BACKEND_ROOT),
+            env=env,
+            # NOT DEVNULL. The server is the only thing that knows why it
+            # failed to bring the database up, and every consumer of this
+            # fixture reads the database afterwards -- so with the output
+            # discarded, "the server never wrote state.db" is
+            # indistinguishable from "the server wrote a state.db with no
+            # tables in it", and the second reading is the one the schema
+            # assertions go on to report as an empty ``sqlite_master``.
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
+        )
         # Wait for /health to come up (30 s budget).
         deadline = time.time() + 30
         while time.time() < deadline:
             try:
                 with urllib.request.urlopen(  # noqa: S310
-                    _E2E_HEALTH_URL, timeout=2
+                    f"http://127.0.0.1:{port}/health", timeout=2
                 ) as resp:
                     if 200 <= resp.status < 300:
                         server_started = True
                         break
             except (urllib.error.URLError, ConnectionResetError, OSError):
                 pass
+            # A server that died on startup cannot come up; waiting out the
+            # rest of the budget on a corpse just delays the retry.
+            if proc.poll() is not None:
+                break
             time.sleep(0.25)
-        def _server_log_tail() -> str:
-            try:
-                server_log.flush()
-                server_log.seek(0)
-                return server_log.read().decode("utf-8", "replace")[-2000:]
-            except OSError:
-                return "<server log unavailable>"
+        if server_started and proc.poll() is None:
+            break
+        _stop_server(proc, port)
+        proc = None
+        server_started = False
 
+    try:
         if not server_started:
             pytest.skip(
-                f"EXEC_PORT={_E2E_PORT} server did not become healthy "
-                "within 30s; e2e three-layer defense cannot run. "
-                f"Server output:\n{_server_log_tail()}"
+                f"the server on :{port} did not become healthy within 30s "
+                f"on either of 2 ephemeral ports; e2e three-layer defense "
+                f"cannot run. Server output:\n{_server_log_tail()}"
             )
 
-        # A healthy :8001 is not evidence that THIS server is the one
-        # answering. The port is fixed, so anything else that ever bound
-        # it — a previous test's server that has not been reaped, or a
-        # listener the runner image starts — answers the probe instantly
-        # while writing to a DIFFERENT state.db. This fixture has no
-        # `PDT_STATE_DB_PATH` in the picture, so the consequence is a
-        # health check that passes, a foreign server, and an empty
-        # ``sqlite_master`` in the schema layer with nothing in between
-        # saying so.
-        #
-        # `exec_instance_setup` has had this guard since it was written;
-        # this fixture was a later copy that did not bring it along. That
-        # is why the failure looked like a schema regression: the schema
-        # assertion is the first thing to *report* it, and it is nowhere
-        # near the cause.
-        # A healthy :8001 is not evidence that THIS server is the one
-        # answering. The port is fixed, so anything else that ever bound
-        # it — a previous test's server not yet reaped, or a listener the
-        # runner image starts — answers the probe instantly while writing
-        # to a DIFFERENT state.db. `exec_instance_setup` has guarded
-        # against this since it was written; this fixture was a later
-        # copy that did not bring the guard along.
-        #
-        # A *live* server is the distinguishing evidence, and the process
-        # outlives the bind failure: when the port is taken it starts,
-        # writes its boot lines, and only then fails the bind, so
-        # `proc.poll()` has to be read after a beat rather than at the
-        # instant the probe succeeds.
+        # A 2xx on /health used to be no evidence at all about THIS
+        # server: the port was fixed, so anything that ever bound 8001 —
+        # a previous test's uvicorn that had not been reaped, a listener
+        # the runner image starts — answered the probe instantly while
+        # writing to a DIFFERENT state.db, and the schema layer reported
+        # an empty ``sqlite_master`` with nothing in between saying so.
+        # On a kernel-assigned port nothing else knows the number. What is
+        # left is the weaker claim that the process outlived the probe,
+        # and it is still worth checking: a server that is not alive cannot
+        # have written this test's state.db, and saying so here beats
+        # saying it three assertions later as a schema regression.
         for _ in range(20):                      # up to 5s at 0.25s
             if proc.poll() is not None:
                 break
             time.sleep(0.25)
         if proc.poll() is not None:
             pytest.skip(
-                f"the spawned server exited (rc={proc.returncode}) before "
-                f"the health probe succeeded, so another process is "
-                f"serving :{_E2E_PORT} and this test would read that "
-                f"server's database. Server output:\n{_server_log_tail()}"
+                f"the spawned server exited (rc={proc.returncode}) on "
+                f":{port} before this test read its database. "
+                f"Server output:\n{_server_log_tail()}"
             )
 
         # Drive the /api/execution/{plan_id}/start endpoint.  We
@@ -2176,7 +2316,7 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
             {"project_dir": str(fixture_project_dir)}
         ).encode("utf-8")
         req = urllib.request.Request(  # noqa: S310
-            _E2E_START_URL_TEMPLATE.format(plan_id=_E2E_FIXTURE_PLAN_ID),
+            f"http://127.0.0.1:{port}/api/execution/{_E2E_FIXTURE_PLAN_ID}/start",
             data=body,
             headers={
                 "Content-Type": "application/json",
@@ -2239,7 +2379,7 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
         if not (tmp_state_db.exists() and tmp_state_db.stat().st_size > 0):
             pytest.fail(
                 f"the spawned server answered /health on "
-                f":{_E2E_PORT} but never created {tmp_state_db}.\n"
+                f":{port} but never created {tmp_state_db}.\n"
                 f"  start endpoint: status={status} error={start_error or 'none'}\n"
                 f"  start body: {start_body}\n"
                 f"  state.db: exists={tmp_state_db.exists()} size="
@@ -2257,35 +2397,28 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
         yield tmp_path
     finally:
         # Teardown order (per the task brief):
-        #   1. proc.terminate() — graceful SIGTERM
-        #   2. wait up to 5 s for exit; escalate to proc.kill() if it
-        #      does not exit cleanly
-        #   3. ONLY after the server has released its state.db
+        #   1. terminate → wait → kill → wait, and confirm :port is free
+        #      (``_stop_server``; nothing is swallowed — see its docstring)
+        #   2. ONLY after the server has released its state.db
         #      handle, shutil.rmtree(tmp_path) the temp tree
-        try:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-        except Exception:
-            pass
+        if proc is not None:
+            _stop_server(proc, port)
+        # Close the log before the tree goes away — nothing else reads it
+        # past this point, and the previous version left the handle open
+        # across the rmtree.
+        server_log.close()
         # Finally, garbage-collect the per-test tree.  We do NOT wrap
         # this in try/except so that a rmtree failure surfaces
         # (the test runner can decide whether to retry).  The brief
         # pins the order: terminate first, THEN rmtree.
-        try:
-            _shutil.rmtree(tmp_path, ignore_errors=True)
-        except OSError:
-            pass
+        _shutil.rmtree(tmp_path, ignore_errors=True)
 
 
 @pytest.mark.e2e
 def test_e2e_three_layer_defense(exec_instance_lifecycle) -> None:
     """E2E end-to-end three-defense verification on a real server.
 
-    Drives a complete EXEC_PORT=8001 lifecycle via the
+    Drives a complete server lifecycle via the
     ``exec_instance_lifecycle`` fixture (subprocess.Popen spawn +
     /api/execution/{plan_id}/start + teardown) and asserts that all
     three layers of the defense are satisfied in the live system:

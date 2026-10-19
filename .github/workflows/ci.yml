@@ -2153,6 +2153,20 @@ jobs:
           PDT_REQUIRE_CREDENTIAL_CHAIN_E2E: "1"
         run: ./.venv/bin/python3 -m pytest tests/e2e/test_credential_chain_acceptance.py --tb=short --timeout=300
 
+      # These three need a macOS host to mean anything — a real
+      # Keychain, `sandbox-exec`, the `security` binary — so they skip
+      # on the Linux lanes and the macOS-specific behaviour behind them
+      # ships untested. This job already has the macOS runner, the keychain
+      # and the venv, so the gate runs here rather than adding a lane.
+      - name: Unit tests that require macOS
+        working-directory: backend
+        run: |
+          ./.venv/bin/python3 -m pytest \
+            tests/unit/test_claude_sandbox.py \
+            tests/unit/notifications/test_feishu_notifier_secret_source.py \
+            tests/unit/notifications/test_credential_source_isolation.py \
+            --tb=short --timeout=300
+
       - name: Upload keychain E2E report
         if: always()
         uses: actions/upload-artifact@v4
