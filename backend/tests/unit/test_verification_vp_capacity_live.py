@@ -613,7 +613,15 @@ class TestNoneIsNotZero:
 
         asyncio.run(executor.run(gate=gate))
 
-        assert executor.completed_vps == [
+        # Completion order is not the plan's order and must not be
+        # asserted: ``completed_vps`` is appended by ``_record_result`` as
+        # each VP finishes, and every VP's runner starts with
+        # ``await asyncio.to_thread(check_binary_freshness, ...)`` in
+        # ``_build_verification_executor._sub_agent_runner``. The default
+        # executor is a thread pool, so which of 12 admitted VPs returns
+        # first is the pool's choice, not the plan's. The claim here is
+        # "every VP ran", which is what the sorted comparison pins.
+        assert sorted(executor.completed_vps) == [
             "VP-%03d" % i for i in range(1, 13)
         ], (
             "an unbounded gate should have run every VP; got %s"

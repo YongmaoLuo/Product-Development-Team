@@ -69,6 +69,15 @@ from _pytest_hermetic_env import (
 # This is deliberately the SAME installer, not a second copy of the same env
 # vars: two copies would drift, and the drift would again only show up in
 # whichever tree was run alone.
+#
+# ``install_hermetic_env`` below redirects ``$HOME`` at a throwaway
+# directory, so the real home is read FIRST and kept: the 8000 guard below
+# compares a test's data_dir against the *running instance's* directory, and
+# after the redirect ``Path.home()`` names a scratch directory that no
+# instance is serving.  Reading it after would leave the guard comparing
+# against a path nothing owns, i.e. passing vacuously.
+_REAL_HOME = os.environ.get("HOME") or str(Path.home())
+
 install_request_guard_header()
 _HERMETIC_ENV = install_hermetic_env()
 _XDIST_WORKER = xdist_worker_id()
@@ -88,6 +97,10 @@ def pytest_sessionfinish(session, exitstatus) -> None:
     if not _XDIST_WORKER:
         shutil.rmtree(_HERMETIC_ENV.state_db_dir, ignore_errors=True)
         shutil.rmtree(_HERMETIC_ENV.lock_root, ignore_errors=True)
+        # Owner-scoped for the reason in ``backend/tests/conftest.py``: a
+        # nested pytest session inherits this root and must not delete it.
+        if os.getpid() == _HERMETIC_ENV.home_root_owner_pid:
+            shutil.rmtree(_HERMETIC_ENV.home_root, ignore_errors=True)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -338,7 +351,11 @@ def _resolve_eight_thousand_data_dir(
         # Default to the production layout (~/.pdt) so a stray test
         # that points at the real instance is caught even without
         # explicit env-var setup.
-        data_dir = Path.home() / ".pdt"
+        # ``Path.home()`` is the throwaway home ``install_hermetic_env``
+        # installed above, so it no longer names the operator's real
+        # ``~/.pdt``; ``_REAL_HOME`` is that path, captured before the
+        # redirect.
+        data_dir = Path(_REAL_HOME) / ".pdt"
 
     return data_dir, env_port
 

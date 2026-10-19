@@ -101,6 +101,10 @@ RANGE_SPECS=()
 #: on: a run on any other path reads it, and an unset array would abort the
 #: script before it could say anything.
 PUSH_REF_NAMES=()
+#: Where the forbidden-name list is read from, when the caller overrides
+#: it. Empty means "do not override": the wrapper then falls back to its
+#: own default, <repo>/.config/forbidden-names. See --forbidden-list.
+FORBIDDEN_LIST_PATH=""
 
 usage() {
     cat <<'USAGE'
@@ -117,6 +121,9 @@ Options:
   --stdin-pre-push   Resolve the range from the ref lines git feeds a pre-push hook
   --range SPEC       Scan SPEC (repeatable), e.g. origin/main..HEAD
   --max-commits N    Fail when the range holds more than N commits
+  --forbidden-list P Read the forbidden-name list from P
+                     (--stdin-pre-push only; default is the repository's
+                     own .config/forbidden-names)
   --help             This text
 
 Exit codes:
@@ -152,6 +159,14 @@ while [ $# -gt 0 ]; do
             MAX_COMMITS="$2"
             shift 2
             ;;
+        --forbidden-list)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                echo "ERROR: --forbidden-list requires a path" >&2
+                exit 2
+            fi
+            FORBIDDEN_LIST_PATH="$2"
+            shift 2
+            ;;
         --help|-h)
             usage
             exit 0
@@ -166,6 +181,19 @@ done
 
 if [ ! -f "$SCANNER" ]; then
     echo "ERROR: scanner module not found: $SCANNER" >&2
+    exit 2
+fi
+
+# --forbidden-list only has a consumer on the pre-push path, because the
+# forbidden-name check only runs there (see the section that builds
+# FORBIDDEN_ARGS). Accepting it silently on --range/--ci would be the one
+# thing this script must not do: the caller asked where the list is, got
+# no error, and had no way to tell that no forbidden-name scan ran at all.
+# That is the "check that quietly did not run" shape, so it is exit 2.
+if [ -n "$FORBIDDEN_LIST_PATH" ] && [ "$USE_STDIN" -ne 1 ]; then
+    echo "ERROR: --forbidden-list is only meaningful with --stdin-pre-push;" >&2
+    echo "ERROR: the forbidden-name check runs on the pre-push path only, so" >&2
+    echo "ERROR: there is nothing for it to point at here." >&2
     exit 2
 fi
 
@@ -395,6 +423,14 @@ if [ "$USE_STDIN" -eq 1 ]; then
         for ref in "${PUSH_REF_NAMES[@]}"; do
             FORBIDDEN_ARGS+=(--ref "$ref")
         done
+        # The list override, when one was given. Left out entirely when it
+        # was not, so that the common case -- an operator's real pre-push
+        # hook, which passes nothing -- reaches the wrapper with exactly
+        # the argv it always did, and the wrapper's own default
+        # (<repo>/.config/forbidden-names) applies unchanged.
+        if [ -n "$FORBIDDEN_LIST_PATH" ]; then
+            FORBIDDEN_ARGS+=(--list "$FORBIDDEN_LIST_PATH")
+        fi
         FORBIDDEN_NAMES_RC=0
         FORBIDDEN_NAMES_OUTPUT=$(bash "$FORBIDDEN_NAMES_SCRIPT" "${FORBIDDEN_ARGS[@]}" 2>&1) || FORBIDDEN_NAMES_RC=$?
     fi

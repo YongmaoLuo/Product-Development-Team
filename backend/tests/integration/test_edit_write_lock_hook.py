@@ -20,6 +20,7 @@ Exit codes (see ``backend/file_lock_cli.py``):
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,38 @@ if str(_BACKEND_DIR) not in sys.path:
 
 from file_lock_broker import FileLockBroker  # noqa: E402
 from file_lock_protocol import socket_path  # noqa: E402
+
+_REAL_HOME_ENV = "PDT_TEST_REAL_HOME"
+
+
+def _real_home() -> Path:
+    """The home this run was launched with -- not the redirected one.
+
+    Both cases below hang off this for the same reason: the guard allows
+    temp scratch unconditionally, so any path under the temp root is allowed
+    for a reason that has nothing to do with the branch under test.  The
+    refusal case would then get ``rc=0`` and fail, and the plans case would
+    get ``rc=0`` **for the wrong reason** -- the temp clause, not the plans
+    clause -- which is the exact vacuity its docstring says it exists to
+    rule out.  Measured on the redirected home: removing ``PDT_PLANS_DIR``
+    from that case leaves ``rc=0``, so the plans allow-list is not what is
+    allowing the write.
+
+    ``install_hermetic_env()`` points ``$HOME`` at ``mkdtemp(prefix="home-")``,
+    which is under the temp root, so ``Path.home()`` can no longer supply a
+    path outside it.  The real home is published by that same function
+    before the redirect.  Raises rather than falling back: a silent fallback
+    to ``Path.home()`` would restore the vacuous version of both cases.
+    """
+    value = os.environ.get(_REAL_HOME_ENV)
+    if not value:
+        raise RuntimeError(
+            f"{_REAL_HOME_ENV} is unset; install_hermetic_env() must run before "
+            f"this module derives a path. Falling back to Path.home() would "
+            f"return the redirected tempdir home, which the guard allows "
+            f"unconditionally."
+        )
+    return Path(value)
 
 
 @pytest.fixture
@@ -102,8 +135,11 @@ def test_edit_outside_the_project_is_still_refused(workspace):
     # ``TMPDIR`` is the ``/var/folders`` sandbox the guard does not allow.
     # ``$HOME`` is outside every allowed root on both platforms, which is the
     # same idiom the sibling suite already uses
-    # (tests/test_edit_write_containment_guard.py).
-    outside = Path.home() / "work" / "other-repo" / "notes.md"
+    # (tests/test_edit_write_containment_guard.py).  The *launch* home, not
+    # ``Path.home()`` -- see ``_real_home()``: the redirected one is a
+    # tempdir path, and a target there is allowed by the scratch clause, so
+    # this case would fail while asserting nothing about refusal.
+    outside = _real_home() / "work" / "other-repo" / "notes.md"
     code, stderr = _run_hook(workspace, outside, broker_on=True)
 
     assert code == 2
@@ -222,11 +258,14 @@ def test_plan_state_files_are_allowed_outside_scratch(workspace):
 
     ``$HOME`` for the same reason as the refusal case above — it is
     outside every allowed root regardless of where the machine keeps its
-    temporary files.
+    temporary files.  The *launch* home, via ``_real_home()``; under the
+    redirected one this dir sits in tempdir and the scratch clause would
+    allow the write whether or not the plans clause existed, which is the
+    vacuity this case is written to exclude.
     """
     import shutil
 
-    plans = Path.home() / ".pdt-plans-allow"
+    plans = _real_home() / ".pdt-plans-allow"
     if plans.exists():
         shutil.rmtree(plans)
     plans.mkdir()
