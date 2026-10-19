@@ -2657,6 +2657,22 @@ from routes.plans import (  # noqa: E402,F401
 app.include_router(_routes_plans.router)
 
 
+# --- routes/fast_lane.py -----------------------------------------
+# Mounted here for the same reason the routers above are: this block
+# runs before the frontend catch-all at the bottom of the file, so
+# ``POST /api/plan/import`` is reachable rather than swallowed. It is a
+# POST and the catch-all is a GET, so the ordering is belt-and-braces
+# rather than load-bearing today - it stops being that the moment
+# someone adds the GET that reads an import back.
+from routes import fast_lane as _routes_fast_lane  # noqa: E402
+from routes.fast_lane import (  # noqa: E402,F401
+    ImportPlanRequest,
+    import_plan,
+)
+
+app.include_router(_routes_fast_lane.router)
+
+
 # --- routes/execution.py -----------------------------------------
 from routes import execution as _routes_execution  # noqa: E402
 from routes.execution import (  # noqa: E402,F401
