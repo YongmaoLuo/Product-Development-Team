@@ -55,6 +55,12 @@ _refiner_failure_rules: |
   - User-added tasks (introduced after the initial plan was generated) represent explicit user requirements and MUST be preserved.
   - When in doubt: PRESERVE rather than delete. Cleaning up "redundant" tasks is a destructive operation that loses user intent; defer that judgment to a human reviewer.
 
+  FILE DECLARATION RULES (READ THESE FIRST):
+  - EVERY task you return MUST carry a "files_to_modify" field. It is the task's write contract, not advice: the executor's file-lock hook and its Edit/Write guard both read it, and a task whose declaration is not a concrete list of paths is treated as READ-ONLY — its sub-agent is refused every file write, and the files it really needed to change are never locked against a sibling task that also reaches for them.
+  - Write the files the task WILL modify, as paths relative to the project directory.
+  - A task that genuinely only reads — investigation, audit, locating a symbol, settling a question from code that already exists — MUST say so explicitly as ["__NO_FILE_CHANGES__"].
+  - Do NOT omit the field, do NOT emit an empty list [], and do NOT write the placeholder "__UNKNOWN_MODIFICATIONS__". Each of those is an undeclared list: it is rejected, and you pay a correction round for it.
+
 # Common refiner JSON format
 _refiner_json_format: |
   Return ONLY the tasks you changed or added, in this JSON format. Every task you do not mention is preserved exactly as it is by the framework, so you neither need to copy unrelated tasks back nor should you — echoing them is wasted output and a chance to corrupt one. (A reply that does contain the whole table is still accepted and still means "this is the task list", so an echo is never an error.)
@@ -65,6 +71,7 @@ _refiner_json_format: |
         "title": "Short title",
         "description": "Detailed description",
         "test_command": "Command to verify",
+        "files_to_modify": ["path/to/file.py", "path/to/another.py"],
         "model_type": "complex | medium",
         "status": "pending/completed/failed/in_progress",
         "updated_time": "ISO8601 timestamp or null"
@@ -75,6 +82,7 @@ _refiner_json_format: |
   1. "status" - Do not change the status of completed tasks
   2. "updated_time" - Always preserve this field if it exists
   3. "model_type" - Preserve if set; for new/replacement tasks choose by complexity
+  "files_to_modify" is REQUIRED on every task above: a list of the relative paths that task will modify, or exactly ["__NO_FILE_CHANGES__"] when the task is read-only. An omitted field, an empty list [], and the placeholder "__UNKNOWN_MODIFICATIONS__" are all undeclared and are rejected.
   When splitting a task, return the new subtasks and OMIT the parent — the parent is replaced by its children, not kept beside them.
 
 # Common task JSON format for execution tasks (planner + repair generator)
