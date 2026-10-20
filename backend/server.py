@@ -1630,6 +1630,19 @@ class ExecutionStatusResponse(BaseModel):
     # ``ExecutionProgressResponse.stop_reason`` was already ``str``.
     stop_reason: Optional[str] = None
     sync_targets: Optional[List[str]] = None
+    # The pause half of the answer (2026-10-20). ``status`` alone
+    # cannot tell a plan that finished from one that was interrupted
+    # and is waiting to be resumed — both are ``stopped`` on disk, and
+    # after a restart neither is in ``_execution_state`` at all. These
+    # three fields are read from the plan's checkpoint file, which is
+    # the only part of that record that survives the restart.
+    #
+    # Defaults, not required fields: every other construction site of
+    # this model (notably ``POST /start``, which returns a four-key
+    # dict) must keep working without a pause to report.
+    paused: bool = False
+    paused_at: Optional[str] = None
+    interrupted_task_count: int = 0
 
 
 class ExecutionProgressResponse(BaseModel):
@@ -2103,29 +2116,97 @@ def _get_project_dir(plan_id: str) -> Optional[Path]:
     return None
 
 
-def _kill_process_tree(proc: subprocess.Popen) -> None:
+# Grace window between SIGTERM and the SIGKILL escalation in
+# ``_kill_process_tree``.  Hard-coded before, so a deployment that wanted
+# a shorter stop could only edit source; the env var is the config entry
+# point.  Read per call (not at import time) so tests and a restarted
+# deployment see the same value the operator configured.
+_STOP_GRACE_ENV = "PDT_STOP_GRACE_SECONDS"
+_STOP_GRACE_DEFAULT_SECONDS = 10.0
+
+
+def _resolve_stop_grace_seconds(grace_seconds: Optional[float]) -> float:
+    """Resolve how long to wait after SIGTERM before escalating to SIGKILL.
+
+    Priority: explicit argument > ``PDT_STOP_GRACE_SECONDS`` > 10s.
+    A non-numeric or negative value at *either* level falls back to the
+    default rather than to the next level down: an invalid explicit
+    argument means the caller got its own value wrong, and silently
+    inheriting the env var would hide that.  More importantly, a negative
+    grace would mean "don't wait at all" — i.e. skipping SIGTERM's grace
+    entirely, the opposite of the contract this function exists to
+    enforce — so it must never reach ``proc.wait()``.
+    """
+    if grace_seconds is not None:
+        try:
+            explicit = float(grace_seconds)
+        except (TypeError, ValueError):
+            return _STOP_GRACE_DEFAULT_SECONDS
+        # NaN fails the >= 0 comparison, so it falls back too.
+        return explicit if explicit >= 0 else _STOP_GRACE_DEFAULT_SECONDS
+
+    raw_env = os.environ.get(_STOP_GRACE_ENV)
+    if raw_env is not None and raw_env.strip():
+        try:
+            from_env = float(raw_env)
+        except ValueError:
+            return _STOP_GRACE_DEFAULT_SECONDS
+        return from_env if from_env >= 0 else _STOP_GRACE_DEFAULT_SECONDS
+
+    return _STOP_GRACE_DEFAULT_SECONDS
+
+
+def _kill_process_tree(
+    proc: subprocess.Popen, grace_seconds: Optional[float] = None
+) -> bool:
     """Kill an entire process tree by sending SIGTERM to the process group.
 
     Processes started with ``start_new_session=True`` get their own session
     (and thus process group). Killing the group ensures all descendant
     processes (shells, child commands, etc.) are terminated together.
+
+    ``grace_seconds`` is how long to wait after SIGTERM before escalating
+    to SIGKILL (explicit argument > ``PDT_STOP_GRACE_SECONDS`` > 10s).
+    Callers that ignore the return value keep the previous behaviour; the
+    bool is for callers that need to distinguish a cooperative shutdown
+    from one that had to be forced:
+
+    * ``False`` — the process was already gone, or it exited inside the
+      grace window.
+    * ``True``  — the grace window expired and SIGKILL was issued. The
+      post-kill reap failing does not make this ``False``: the tree *was*
+      hard-killed, and a caller acting on this value must hear about it.
     """
     if proc.poll() is not None:
-        return
+        return False
+    grace = _resolve_stop_grace_seconds(grace_seconds)
     try:
         pgid = os.getpgid(proc.pid)
         if _signallable_pgid(pgid) is not None:
             os.killpg(pgid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
+        # The group is already gone, or we may not signal it. Either way
+        # the child still gets the SIGTERM-shaped chance to exit below via
+        # proc.wait(); we must not turn a signal failure into "give up".
         pass
     try:
-        proc.wait(timeout=10)
+        proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
-        try:
-            proc.kill()
-            proc.wait(timeout=5)
-        except Exception:
-            pass
+        pass
+    else:
+        return False
+
+    # Grace expired: the child ignored SIGTERM, so escalate.
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+    except Exception:
+        logger.warning(
+            "SIGKILL escalation for pid=%s did not reap cleanly; "
+            "the process tree may still have descendants",
+            getattr(proc, "pid", "<unknown>"),
+        )
+    return True
 
 
 def _shutdown_all_executions() -> None:

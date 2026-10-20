@@ -89,7 +89,13 @@ def test_start_verification_succeeds_from_executing(verification_env):
     response = TestClient(app).post(f"/api/verification/{plan_id}/start")
 
     assert response.status_code == 200
-    assert response.json() == {"plan_id": plan_id, "status": "started"}
+    # 2026-10-20: /start 新增 round/resumed，暂停/续跑需要
+    assert response.json() == {
+        "plan_id": plan_id,
+        "status": "started",
+        "round": 1,
+        "resumed": False,
+    }
     assert RoutingRepository(conn).current(plan_id)["current_phase"] == "verification_running"
     row = VerificationRepository(conn).current(plan_id)
     assert row["verification_status"] == "running"
