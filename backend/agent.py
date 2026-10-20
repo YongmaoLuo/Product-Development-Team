@@ -1938,6 +1938,76 @@ def is_repair_task(task: object) -> bool:
         return False
 
 
+#: Environment variable carrying the interrupted tasks' session ids when
+#: a paused execution is continued — arch decision point 4 / core
+#: contract 3. A JSON object of ``{"<task id>": "<session id>"}``, set on
+#: the executor process by the start-continuation path.
+RESUME_SESSIONS_ENV = "PDT_RESUME_SESSIONS"
+
+
+def _load_resume_sessions() -> Dict[str, str]:
+    """The task id → session id map the continuation path handed us.
+
+    Read from the environment per call rather than cached, for the same
+    reason :meth:`AutonomousAgent._lock_acquire_timeout` reads its
+    setting per call: an operator can seed a mapping after the executor
+    is up without restarting it.
+
+    Every failure degrades to ``{}`` — no variable, an empty one, JSON
+    that does not parse, JSON that parses to something other than an
+    object. A resume id we cannot use must cost the run nothing worse
+    than a fresh session; raising here would abort a plan that is
+    perfectly runnable.
+
+    Values are filtered to non-empty strings, so a hand-edited mapping
+    carrying ``{"3": 42}`` cannot reach ``JsonSession`` as a non-string.
+    """
+    raw = os.environ.get(RESUME_SESSIONS_ENV, "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        # ``json.JSONDecodeError`` is a ``ValueError``; this is the
+        # "not-json" path.
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        str(task_id): session_id
+        for task_id, session_id in parsed.items()
+        if isinstance(session_id, str) and session_id
+    }
+
+
+def _resume_session_id_for(task_id: str) -> Optional[str]:
+    """The session id ``task_id`` should resume, or ``None``.
+
+    ``None`` means "no recovery point for this task" and yields a fresh
+    session — the pre-pause/resume behaviour, and the correct answer for
+    every task that was never interrupted. A mapping entry whose value
+    is not a usable string is a miss for the same reason: resuming an id
+    the CLI never wrote fails in under a second, and a run that dies
+    there has lost the whole task.
+    """
+    session_id = _load_resume_sessions().get(str(task_id))
+    return session_id if isinstance(session_id, str) and session_id else None
+
+
+def _make_task_session(task_id: str) -> JsonSession:
+    """The executor's per-task session, seeded from the recovery point.
+
+    A seeded handle makes ``coding_tool`` take its ``resume=True`` entry
+    path on the FIRST dispatch (``entry_resume`` is non-``None``), so the
+    subagent re-opens the interrupted transcript with ``--resume`` instead
+    of re-reading the files it already read. Only that first binding is
+    seeded: from then on ``_remember`` rewrites ``session_id`` after every
+    dispatch, so attempt 2 of the same task keeps reusing attempt 1's
+    session whether or not the recovery map mentioned this task.
+    """
+    return JsonSession(session_id=_resume_session_id_for(task_id))
+
+
 class AutonomousAgent:
     """Configurable autonomous agent for various task types."""
 
@@ -4936,6 +5006,15 @@ class AutonomousAgent:
         # back, and resuming that would describe the past. A retry inside
         # one run is unambiguously the same work.
         #
+        # 2026-10-20 — the one exception to that scope, and it is an
+        # explicit opt-in rather than a default. Continuing a *paused*
+        # execution (arch decision point 4 / core contract 3) means the
+        # operator is saying "that transcript is still the work", and
+        # the recovery point says which task held which session. The
+        # mapping rides in on ``PDT_RESUME_SESSIONS`` and seeds the handle
+        # here; with no mapping in the environment this is exactly the
+        # old ``JsonSession()``, so every other run is untouched.
+        #
         # The empty-response edge (``EmptyResponseError``): the handle is
         # only bound once a dispatch returns a real session id, and
         # ``_remember`` skips unbound ids. An attempt that produced no
@@ -4944,7 +5023,7 @@ class AutonomousAgent:
         # fresh session — which is the only correct move, since
         # ``--resume``-ing a session that was never written fails in
         # ~0.4s.
-        task_session = JsonSession()
+        task_session = _make_task_session(task.id)
 
         # 2026-10-19 — the split gate's retry budget. The loop still
         # runs ``max_retries`` attempts by default, exactly as before;

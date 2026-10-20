@@ -92,6 +92,139 @@ def _conflict_reason(exc: Exception) -> str:
     return "stage_mismatch" if "predicate mismatch" in str(exc) else "version_mismatch"
 
 
+def _read_verification_checkpoint(plan_dir: Path) -> Optional[dict]:
+    """The plan's pause checkpoint, when it is a *verification* one.
+
+    ``pause_state`` owns the file's shape; this reader only answers the
+    question the start endpoint asks: "is there an interrupted
+    verification round that this start should resume?".
+
+    A checkpoint of another kind — an interrupted *execution* — is not
+    ours. It must survive untouched, or the execution resume would lose
+    the trace it was written for.
+    """
+    try:
+        from pause_state import read_pause_checkpoint
+
+        checkpoint = read_pause_checkpoint(plan_dir)
+    except Exception:  # noqa: BLE001 — an unreadable checkpoint is "no checkpoint"
+        return None
+    if not isinstance(checkpoint, dict):
+        return None
+    if checkpoint.get("kind") != "verification":
+        return None
+    return checkpoint
+
+
+def _resolve_start_round(
+    current_row: Optional[dict], checkpoint: Optional[dict],
+) -> Tuple[int, bool]:
+    """The round this start runs, and whether it resumes an interrupted one.
+
+    An interrupted round must be **resumed, not replaced**: the round
+    number is the contract a plan's verdicts, report and repair tasks
+    are written against, and starting "round N+1" for work that was
+    already half-done in round N loses that work and mislabels it.
+
+    Two independent traces say "there is an interrupted round":
+
+    * a ``kind="verification"`` checkpoint — the operator pressed stop,
+      and the stop wrote the round, the verdicts and the VPs it cut
+      short (``_write_verification_checkpoint``);
+    * a ``plan_verification`` row whose status is still ``running`` or
+      ``loop_stopped`` with a round > 0 — the process was killed before
+      it could write anything, so the row is all that is left.
+
+    Either one is enough. When neither is there the plan's last round
+    really did finish, and the next round is the next one.
+
+    Returns ``(next_round, resumed)``.
+    """
+    row = current_row or {}
+    current_round = int(row.get("round") or 0)
+    status = str(row.get("verification_status") or "").lower()
+    checkpoint_round = int((checkpoint or {}).get("verification_round") or 0)
+
+    interrupted = checkpoint is not None or (
+        status in ("running", "loop_stopped") and current_round > 0
+    )
+    if not interrupted:
+        return current_round + 1, False
+
+    # The DB row is the authority on which round was in flight; the
+    # checkpoint is the fallback for the case where the row was never
+    # written (or was written with round 0).
+    resume_round = current_round or checkpoint_round
+    if resume_round <= 0:
+        # Nothing identifies the interrupted round — there is no round
+        # to resume, so this is an ordinary fresh start.
+        return current_round + 1, False
+    return resume_round, True
+
+
+def _rebuild_round_report(
+    plan_id: str, plan_dir: Path, round_n: int, verification_repo,
+) -> None:
+    """Rebuild ``verification_report.json`` from the DB verdicts.
+
+    A round that was killed never closed, so it never wrote a report —
+    the file the repair chain reads (``verification_results``) simply
+    was not there, and the plan looked as if it had never been
+    verified. The verdicts themselves did survive: the executor appends
+    them to the ``plan_verification`` row as it goes, one VP at a time.
+
+    So the report is rebuilt from that row. The write merges into
+    whatever the report already holds (see ``_persist_round_snapshot``),
+    which makes this safe to run on a plan whose report is already
+    there.
+    """
+    try:
+        row = verification_repo.current(plan_id) or {}
+    except Exception:  # noqa: BLE001 — a report we cannot rebuild is not fatal
+        _server.logger.warning(
+            "[verification_start] could not read the round's verdicts "
+            "plan=%s — the report is left as it is", plan_id,
+        )
+        return
+    verdicts = [
+        verdict for verdict in (row.get("verdicts") or [])
+        if isinstance(verdict, dict)
+    ]
+    if not verdicts:
+        return
+    try:
+        _persist_round_snapshot(plan_id, plan_dir, round_n, verdicts)
+    except Exception:  # noqa: BLE001 — a report we cannot write is not fatal
+        _server.logger.warning(
+            "[verification_start] could not rebuild the round report "
+            "plan=%s round=%s", plan_id, round_n,
+        )
+
+
+def _consume_verification_checkpoint(plan_dir: Path) -> None:
+    """Retire the verification checkpoint this start has honoured.
+
+    Only a ``kind="verification"`` checkpoint is consumed, and only
+    after it has been read again: a checkpoint of another kind (an
+    interrupted execution) belongs to a different resume and must not
+    be deleted by a verification start.
+    """
+    try:
+        from pause_state import consume_pause_checkpoint, read_pause_checkpoint
+
+        checkpoint = read_pause_checkpoint(plan_dir)
+        if not isinstance(checkpoint, dict):
+            return
+        if checkpoint.get("kind") != "verification":
+            return
+        consume_pause_checkpoint(plan_dir)
+    except Exception:  # noqa: BLE001 — a checkpoint we cannot retire is not fatal
+        _server.logger.warning(
+            "[verification_start] could not consume the verification "
+            "checkpoint — it stays on disk and may be consumed again",
+        )
+
+
 def _verification_status_from_db(plan_id: str) -> dict:
     """Build status solely from the routing and verification tables."""
     conn, routing, verification = _server._open_verification_state()
@@ -346,7 +479,18 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
     # (``...rejects_already_running_with_409``).
     _live = _server._verification_state.get(plan_id) or {}
     _live_status = str(_live.get("verification_status") or "").lower()
-    if _live_status in ("running", "verification_running"):
+    # 2026-10-20: a RECOVERED entry is not a running round. The process
+    # that owned it is gone — the backend was killed — so the in-memory
+    # state still says "running" while nothing is running, and the
+    # guard turned every subsequent ``/start`` into a permanent 409.
+    # The ``recovered`` marker (set by ``_recover_verification_states``,
+    # in memory only, never persisted) is what tells the two apart, and
+    # the missing thread is the second half of the proof: a live round
+    # always owns one.
+    _recovered = (
+        _live.get("recovered") is True and _live.get("thread") is None
+    )
+    if _live_status in ("running", "verification_running") and not _recovered:
         return JSONResponse(
             status_code=409,
             content={
@@ -358,6 +502,12 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
             },
         )
 
+    # 2026-10-20: the pause checkpoint, read before anything is
+    # written. It is one of the two traces of an interrupted round (the
+    # other is the ``plan_verification`` row's own status) and it is
+    # what this start retires once it has honoured it.
+    _checkpoint = _read_verification_checkpoint(plan_dir)
+
     from state_machine.repositories.routing_repository import ConflictError, PlanNotFoundError
 
     conn = None
@@ -368,7 +518,12 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
 
     try:
         current = verification.current(plan_id)
-        next_round = (current.get("round", 0) if current else 0) + 1
+        # 2026-10-20: an interrupted round is RESUMED, not replaced.
+        # ``_resolve_start_round`` answers "is there a round to pick up?"
+        # from the two traces that survive an interruption — the
+        # pause checkpoint and the row's own status — and returns the
+        # round to run plus whether this start is a resume.
+        next_round, resumed = _resolve_start_round(current, _checkpoint)
 
         # Implicit budget: keep the plan's own, else the project default.
         max_rounds = requested_max_rounds
@@ -448,10 +603,26 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
                 "completed",
                 "failed",
                 "stopped",
-            ),
+            )
+            # 2026-10-20: a recovered plan is still parked at
+            # ``verification_running`` — the process died before it
+            # could move the routing row. Its own recovered in-memory
+            # state is the only evidence that nothing is running, so
+            # in exactly that case the current phase is an acceptable
+            # source. Every other plan keeps the old source set: a
+            # round that is genuinely running must not be re-entered.
+            + (("verification_running",) if _recovered else ()),
             "verification_running",
         )
         verification.init_round(plan_id, round_n=next_round, max_rounds=max_rounds)
+        if resumed:
+            # 2026-10-20: the interrupted round's work is in the DB
+            # row, not in the report (a killed round never wrote one)
+            # and the checkpoint is still on disk. Rebuild the report
+            # from the row, then retire the checkpoint — this start
+            # has honoured it, and a resume must be single-shot.
+            _rebuild_round_report(plan_id, plan_dir, next_round, verification)
+            _consume_verification_checkpoint(plan_dir)
     except ConflictError as exc:
         try:
             conn.rollback()
@@ -532,6 +703,18 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
             _fresh_vs["repair_tasks"] = []
             _fresh_vs.pop("stop_reason", None)
             _fresh_vs.pop("repair_generation_error", None)
+            # 2026-10-20: a RECOVERED entry still says "running" — the
+            # process that was running it is gone, but the field did
+            # not change with it. The auto-loop's duplicate-start guard
+            # reads exactly that field, so leaving it would make the
+            # resume a no-op: the loop would see a running round,
+            # skip, and the plan would stay stuck where the crash left
+            # it. The round this start is about to run IS the running
+            # one, so the field is demoted to "pending" — the state
+            # the plan is in between the request and the loop's own
+            # initialisation.
+            if _recovered:
+                _fresh_vs["verification_status"] = "pending"
             try:
                 _round_row = verification.current(plan_id)
                 if _round_row is not None:
@@ -637,10 +820,18 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
             # failed. Round 2 burned ~5 minutes and ~600k tokens
             # re-running 20 already-passed VPs before the user
             # noticed.
+            #
+            # 2026-10-20: a RESUMED round asks for the verdict cache
+            # too, even when it is round 1. The verdicts in the cache
+            # are the interrupted round's own — the VPs it had already
+            # judged — so keeping them is what makes the resume pick
+            # up where the interruption left off instead of redoing
+            # the round from scratch. A round that is NOT a resume
+            # keeps the old rule: only round > 1 inherits the cache.
             report = orch.start_verification_cycle(
                 round_number=next_round,
                 force=force_verify,
-                resume=(next_round > 1),
+                resume=(resumed or next_round > 1),
             )
             result = orch.check_cycle_conditions(report, round_number=next_round)
             v_state = _server._verification_state[plan_id]
@@ -717,7 +908,22 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
     )
     verification_thread.start()
     _server._verification_state[plan_id]["thread"] = verification_thread
-    return {"plan_id": plan_id, "status": "started"}
+    # 2026-10-20: the recovery marker has done its job. From here on
+    # the live thread is what keeps a second ``/start`` out — and the
+    # marker must not survive, or a later start would treat a plan
+    # whose thread has died as a recoverable one.
+    _server._verification_state[plan_id].pop("recovered", None)
+    return {
+        "plan_id": plan_id,
+        "status": "started",
+        # 2026-10-20: the round this start runs and whether it picked
+        # an interrupted round up (``resumed``) instead of starting
+        # the next one. The round number is the contract a plan's
+        # verdicts and report are written against, so a client that
+        # polls the status must be able to see which round it is on.
+        "round": next_round,
+        "resumed": resumed,
+    }
 
 
 @router.post("/api/verification/{plan_id}/reset")
@@ -2366,6 +2572,233 @@ def get_verification_repair_tasks(plan_id: str):
     return {"tasks": formatted}
 
 
+# ---------------------------------------------------------------------------
+# What a stop leaves behind (2026-10-20)
+# ---------------------------------------------------------------------------
+
+#: The report the repair chain reads. Its per-VP key is
+#: ``verification_results`` — NOT ``verification_points``, which belongs
+#: to ``verification_plan.json`` (see
+#: ``verification/verification_report_reader.py``, which reads this key
+#: and nothing else).
+_REPORT_FILENAME = "verification_report.json"
+
+#: The plan's VP list — the universe a round's verdicts are drawn from.
+_VP_PLAN_FILENAME = "verification_plan.json"
+
+
+def _load_report(plan_dir: Path) -> Dict[str, Any]:
+    """The plan's verification report, or ``{}`` when it is unusable.
+
+    A missing report is the NORMAL case for a round that has not closed
+    yet (the report is written at round close); a corrupt one is the
+    abnormal case. Both degrade to ``{}`` — the snapshot's job is to
+    ADD the round's verdicts, and it can do that on top of an empty
+    document. A torn report must not cost the round its verdicts.
+    """
+    report_path = Path(plan_dir) / _REPORT_FILENAME
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, UnicodeDecodeError):
+        # ``ValueError`` covers ``json.JSONDecodeError``.
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _verdict_vp_id(verdict: Any) -> str:
+    """The VP a verdict belongs to (``""`` when it names none).
+
+    The executor writes ``vp_id`` (``verification_executor.py``);
+    older rows and hand-written fixtures use ``id``. Both spellings are
+    accepted so a snapshot never drops a verdict over a key name.
+    """
+    if not isinstance(verdict, dict):
+        return ""
+    for key in ("vp_id", "id"):
+        value = verdict.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _round_vp_ids(
+    plan_dir: Path, extra: Optional[List[str]] = None,
+) -> List[str]:
+    """Every VP the round was working on, in plan order.
+
+    The VP list in ``verification_plan.json`` is the universe; the
+    in-flight sub-agents (``extra``) are folded in because a plan whose
+    VP list has not been written yet can still have VPs running.
+    """
+    ids: List[str] = []
+    seen = set()
+    try:
+        with open(
+            Path(plan_dir) / _VP_PLAN_FILENAME, "r", encoding="utf-8",
+        ) as f:
+            plan_data = json.load(f)
+    except (OSError, ValueError, UnicodeDecodeError):
+        plan_data = {}
+    if isinstance(plan_data, dict):
+        for vp in plan_data.get("verification_points") or []:
+            vp_id = str(vp.get("id") or "") if isinstance(vp, dict) else ""
+            if vp_id and vp_id not in seen:
+                seen.add(vp_id)
+                ids.append(vp_id)
+    for vp_id in extra or []:
+        if vp_id and vp_id not in seen:
+            seen.add(vp_id)
+            ids.append(vp_id)
+    return ids
+
+
+def _persist_round_snapshot(
+    plan_id: str,
+    plan_dir: Path,
+    round_n: int,
+    verdicts: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Write the round's verdicts into ``verification_report.json``.
+
+    Why this exists
+    ---------------
+    The report was written only when a round closed NORMALLY. A round
+    that the operator stopped never wrote one, so the two consumers of
+    the report saw nothing: the repair chain
+    (``verification/verification_report_reader.py`` → ``extract_failed_vps``)
+    found no failures to repair, and the plan's directory looked exactly
+    like a plan that had never been verified. The stop threw the round's
+    verdicts away.
+
+    The snapshot closes that gap by writing the verdicts the round had
+    already reached — the ones the executor persisted per VP — into the
+    report, under the key the reader actually reads.
+
+    It MERGES, it does not rewrite:
+
+    * ``verification_results`` is merged by VP id. An entry that is
+      already there keeps its place and its ``title`` (the report's own
+      copy of the VP title is better than anything this function could
+      invent) while its verdict is refreshed; a VP with no entry yet is
+      appended.
+    * ``execution_profile`` / ``rounds`` / ``requirement_deviations`` /
+      ``round1_stable_vps`` are left exactly as they were — they belong
+      to the round that wrote them, and the snapshot knows nothing about
+      them.
+    * ``_metadata`` is refreshed: ``current_round`` names the round the
+      verdicts belong to, ``generated_at`` says when the snapshot was
+      taken.
+
+    The write is atomic (tempfile + ``os.replace``), so a reader never
+    sees a half-written report — and a write that fails leaves the
+    previous report intact rather than a truncated one.
+    """
+    report = _load_report(plan_dir)
+
+    existing = report.get("verification_results")
+    results: List[Any] = list(existing) if isinstance(existing, list) else []
+    index_by_id: Dict[str, int] = {}
+    for position, entry in enumerate(results):
+        if isinstance(entry, dict) and entry.get("id"):
+            index_by_id[str(entry["id"])] = position
+
+    for verdict in verdicts or []:
+        vp_id = _verdict_vp_id(verdict)
+        if not vp_id:
+            continue
+        reasons = verdict.get("reasons") or []
+        if isinstance(reasons, str):
+            reasons = [reasons]
+        evidence = verdict.get("evidence")
+        entry: Dict[str, Any] = {
+            "id": vp_id,
+            "status": str(verdict.get("status") or ""),
+            "title": "",
+            "actual_result": "; ".join(str(reason) for reason in reasons),
+            "evidence": json.dumps(
+                evidence if evidence is not None else {},
+                ensure_ascii=False,
+            ),
+        }
+        position = index_by_id.get(vp_id)
+        if position is None:
+            index_by_id[vp_id] = len(results)
+            results.append(entry)
+            continue
+        previous = results[position]
+        if isinstance(previous, dict):
+            entry["title"] = str(previous.get("title") or "")
+        results[position] = entry
+
+    report["verification_results"] = results
+
+    metadata = report.get("_metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    metadata["current_round"] = int(round_n)
+    metadata["generated_at"] = datetime.now().isoformat()
+    report["_metadata"] = metadata
+
+    # ``verification_persistence.update_report`` injects an empty
+    # ``execution_profile`` when a writer omits it, because the bridge
+    # UI keys on the field being present. A snapshot that creates the
+    # report from scratch must not produce a shape the other writer
+    # would never produce.
+    if not isinstance(report.get("execution_profile"), dict):
+        report["execution_profile"] = {}
+
+    from utils.atomic_io import atomic_write_json
+    atomic_write_json(
+        Path(plan_dir) / _REPORT_FILENAME, report, logger=_server.logger,
+    )
+    _server.logger.info(
+        "[stop_verification] persisted round snapshot plan=%s round=%s "
+        "verdicts=%d", plan_id, round_n, len(results),
+    )
+    return report
+
+
+def _write_verification_checkpoint(
+    plan_dir: Path,
+    *,
+    project_dir: Optional[str],
+    round_n: int,
+    verdicts: List[Dict[str, Any]],
+    interrupted_tasks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Record the interrupted verification round in ``pause_state.json``.
+
+    ``pause_state.write_pause_checkpoint`` owns the document shape (and
+    the fixed key set of an interrupted-task entry); the verdict list is
+    verification-specific, so it is added on top of the document the
+    module wrote and the file is rewritten atomically. Two writes, one
+    of them a superset: a crash between them leaves a checkpoint
+    without the verdicts — still a valid checkpoint, just a poorer one.
+
+    The verdict list is what makes the pause worth anything: it is the
+    round's work, already done, that a resume must not redo.
+    """
+    from pause_state import checkpoint_path, write_pause_checkpoint
+    from utils.atomic_io import atomic_write_json
+
+    checkpoint = write_pause_checkpoint(
+        plan_dir,
+        kind="verification",
+        project_dir=project_dir,
+        reason="user_stopped",
+        interrupted_tasks=interrupted_tasks,
+        unfinished_tasks=[],
+        verification_round=int(round_n),
+    )
+    checkpoint["verdicts"] = list(verdicts or [])
+    atomic_write_json(
+        checkpoint_path(plan_dir), checkpoint, logger=_server.logger,
+    )
+    return checkpoint
+
+
 @router.post("/api/verification/{plan_id}/stop")
 def stop_verification(plan_id: str):
     """Stop a verification cycle by CASing the routing row to idle."""
@@ -2430,6 +2863,19 @@ def stop_verification(plan_id: str):
         if not owned_conn:
             conn.close()
         return JSONResponse(status_code=404, content={"error": "Plan not found", "detail": "The requested plan does not exist."})
+
+    # 2026-10-20 — read the round BEFORE the connection is closed.
+    # The row is the only place the round's verdicts live: the executor
+    # appends them per VP, and nothing else keeps them. A stop that
+    # does not read them here throws the round's work away (this is
+    # what made a stopped round indistinguishable from a plan that had
+    # never been verified).
+    row = verification.current(plan_id) or {}
+    verdicts = [
+        verdict for verdict in (row.get("verdicts") or [])
+        if isinstance(verdict, dict)
+    ]
+
     # Only close the fallback connection; thread-owned conn lives
     # until the verification thread terminates.
     if not owned_conn:
@@ -2438,6 +2884,70 @@ def stop_verification(plan_id: str):
     state = _server._verification_state.get(plan_id)
     if state:
         state.update({"verification_status": "loop_stopped", "stop_reason": "user_stopped", "updated_at": datetime.now().isoformat()})
+
+    # The round the stop interrupted. The DB row is authoritative (it
+    # survives a backend restart); the in-memory state is the fallback
+    # for a plan whose row has no round yet.
+    round_n = int(row.get("round") or 0) or int(
+        (state or {}).get("verification_round") or 0
+    )
+
+    # The in-flight VPs are read BEFORE the snapshot: the stop's own
+    # hard kill removes them, and the snapshot must describe the round
+    # as it was when the operator pressed stop.
+    try:
+        _running_vp_ids = [
+            getattr(_h, "vp_id", "") or ""
+            for _h in _server.sub_agent_registry.all_handles(plan_id)
+        ]
+    except Exception:  # noqa: BLE001
+        _running_vp_ids = []
+
+    # The VPs the stop cut short: every VP of the round that never
+    # reached a verdict. This is what a resume still owes, so it is
+    # what the checkpoint records.
+    _judged_vp_ids = {vid for vid in (_verdict_vp_id(v) for v in verdicts) if vid}
+    _interrupted_vp_ids = [
+        vp_id for vp_id in _round_vp_ids(plan_dir, _running_vp_ids)
+        if vp_id not in _judged_vp_ids
+    ]
+
+    # 2026-10-20 — the snapshot is written BEFORE the process cleanup
+    # below. The cleanup kills the in-flight sub-agents, and a verdict
+    # that lands after this point would never reach the report; a
+    # snapshot taken after the kill would describe a round that no
+    # longer exists.
+    _persist_round_snapshot(plan_id, plan_dir, round_n, verdicts)
+
+    # Where the round was verifying. Best-effort: the checkpoint is
+    # still a valid checkpoint without it, and a project_dir lookup
+    # that fails (a state.db that cannot be opened) must not take the
+    # stop down with it.
+    _project_dir: Optional[str] = None
+    try:
+        _resolved_project_dir = _server._get_project_dir(plan_id)
+    except Exception:  # noqa: BLE001
+        _resolved_project_dir = None
+    if _resolved_project_dir:
+        _project_dir = str(_resolved_project_dir)
+
+    _write_verification_checkpoint(
+        plan_dir,
+        project_dir=_project_dir,
+        round_n=round_n,
+        verdicts=verdicts,
+        interrupted_tasks=[
+            {
+                "task_id": vp_id,
+                "status": "interrupted",
+                "phase": "verification",
+                "session_id": None,
+                "strategy": "verification_round_resume",
+                "reason": "user_stopped",
+            }
+            for vp_id in _interrupted_vp_ids
+        ],
+    )
 
     # 2026-09-15 — a stop must actually STOP the work.
     #
@@ -2461,10 +2971,6 @@ def stop_verification(plan_id: str):
             "[stop_verification] cancel flag failed plan=%s", plan_id,
         )
     try:
-        _running_vp_ids = [
-            getattr(_h, "vp_id", "") or ""
-            for _h in _server.sub_agent_registry.all_handles(plan_id)
-        ]
         _server._cleanup_dead_verification_processes(
             plan_id, [vp for vp in _running_vp_ids if vp],
         )
@@ -2486,7 +2992,17 @@ def stop_verification(plan_id: str):
     return {
         "stopped_at": datetime.now().isoformat(),
         "reason": "user_stopped",
-        "current_round": (state or {}).get("verification_round", 0),
+        "current_round": round_n,
+        # 2026-10-20 — the stop is a PAUSE: the round, the verdicts it
+        # reached and the VPs it cut short are on disk (see
+        # ``_persist_round_snapshot`` / ``_write_verification_checkpoint``),
+        # so the response says so. ``paused`` is the flag a caller
+        # polls for; ``round`` and ``interrupted_vp_count`` say what
+        # the resume would pick up.
+        "status": "stopped",
+        "paused": True,
+        "round": round_n,
+        "interrupted_vp_count": len(_interrupted_vp_ids),
     }
 
 

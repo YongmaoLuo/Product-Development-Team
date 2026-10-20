@@ -835,6 +835,9 @@ main#app > .loading {
 .exec-badge.completed { background: var(--success-bg); color: var(--success); }
 .exec-badge.failed { background: var(--danger-bg); color: var(--danger); }
 .exec-badge.stopped { background: var(--warning-bg); color: var(--warning); }
+/* Paused is deliberately not the stopped amber: the plan is waiting to
+   be continued, and the two should not read the same at a glance. */
+.exec-badge.paused { background: var(--primary-bg); color: var(--primary); }
 .exec-badge.skipped { background: var(--warning-bg); color: var(--warning); }
 .exec-badge.in_progress { background: var(--primary-bg); color: var(--primary); }
 .exec-badge.pending { background: var(--surface3); color: var(--text-dim); }

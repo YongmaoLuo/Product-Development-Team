@@ -389,6 +389,60 @@ def _plan_summary_section(plan_id: str) -> Optional[Dict[str, Any]]:
             _server._close_state_machine(sm)
 
 
+def _paused_executions() -> List[Dict[str, Any]]:
+    """Every plan carrying an un-consumed pause checkpoint.
+
+    The counterpart to the two in-memory registries below, and the one
+    that survives a restart: ``_execution_state`` /
+    ``_verification_state`` die with the process that populated them,
+    while a checkpoint on disk is exactly the record a resume needs.
+    So this is read from the plan directories, not from memory.
+
+    Every entry has the same four keys — a consumer should never have
+    to branch on which kind of interruption it is looking at. A plan
+    with no checkpoint is simply absent from the list; a checkpoint
+    that cannot be read is treated as absent too, so a torn file can
+    never turn this read-only listing into an error.
+    """
+    from pause_state import checkpoint_path, checkpoint_summary
+
+    plans_dir = _server.PLANS_DIR
+    entries: List[Dict[str, Any]] = []
+    try:
+        plan_dirs = sorted(plans_dir.iterdir())
+    except OSError:
+        # No plans directory yet (fresh install), or one that vanished
+        # under us. Either way there is nothing paused in it.
+        return entries
+
+    for plan_dir in plan_dirs:
+        if not plan_dir.is_dir():
+            continue
+        # Existence first: this listing is polled by the supervisor on
+        # every tick, and the common answer is "no checkpoint".
+        try:
+            if not checkpoint_path(plan_dir).exists():
+                continue
+            summary = checkpoint_summary(plan_dir)
+        except OSError:
+            _server.logger.warning(
+                "[system_active] could not read a pause checkpoint dir=%s",
+                plan_dir, exc_info=True,
+            )
+            continue
+        if not summary:
+            continue
+        entries.append({
+            "plan_id": plan_dir.name,
+            "kind": summary.get("kind"),
+            "paused_at": summary.get("paused_at"),
+            "interrupted_task_count": int(
+                summary.get("interrupted_task_count") or 0
+            ),
+        })
+    return entries
+
+
 @router.get("/api/system/active")
 def get_active_tasks():
     """
@@ -398,6 +452,7 @@ def get_active_tasks():
       - _execution_state: per-plan execution subprocess status
       - _verification_state: per-plan verification cycle status
       - Heartbeat check on subprocess poll() to detect "running" state
+      - pause checkpoints on disk: plans interrupted but not resumed
 
     Returns:
       {
@@ -407,21 +462,37 @@ def get_active_tasks():
         "details": [
           {"plan_id": ..., "type": "execution"|"verification", "status": ..., ...},
           ...
+        ],
+        "paused_executions": [
+          {"plan_id": ..., "kind": ..., "paused_at": ..., "interrupted_task_count": ...},
+          ...
         ]
       }
+
+    ``paused_executions`` is computed BEFORE the empty-state
+    short-circuit below and returned from every path. The short-circuit
+    is exactly the state of a freshly-restarted server — which is the
+    one moment the pause list matters most, since a plan that was
+    paused before the restart has no in-memory state left to report.
+    A response that carried the list only on the non-empty path would
+    answer "nothing is paused" at precisely the moment a resume is
+    waiting to be found.
     """
     details: list = []
+    paused_executions = _paused_executions()
     # Hot-path optimization B-03: short-circuit when both state dicts are
     # empty. This is the common case in a freshly-started server and
     # after every completed cycle; iterating two dicts + building two
     # detail dicts to return "0 / 0 / 0 / []" is wasted work on every
-    # supervisor poll.
+    # supervisor poll. The pause list is read above it and travels with
+    # the short-circuit's answer.
     if not _server._execution_state and not _server._verification_state:
         return {
             "execution_running": 0,
             "verification_running": 0,
             "total_active": 0,
             "details": [],
+            "paused_executions": paused_executions,
         }
     # Check execution_state for running subprocesses. ``_is_execution_in_flight``
     # rather than a bare membership test — the dict also holds records for
@@ -458,7 +529,269 @@ def get_active_tasks():
         "verification_running": verification_running,
         "total_active": len(details),
         "details": details,
+        "paused_executions": paused_executions,
     }
+
+
+# ---------------------------------------------------------------------------
+# System-wide stop / start
+# ---------------------------------------------------------------------------
+#
+# Restarting the backend is a two-step operation: stop everything that is
+# running, then start everything that was paused. Done per plan, that is N
+# calls and N chances to forget one — and the plan that was forgotten
+# either keeps a subprocess alive across the restart or is never resumed,
+# leaving the operator with a plan that "quietly stopped doing something".
+
+#: The two kinds of work the system-wide endpoints know how to stop and
+#: start. ``get_active_tasks`` names them in ``details[*]["type"]`` and a
+#: pause checkpoint names them in ``kind`` — the same two words, which is
+#: what lets one dispatcher serve both endpoints.
+_EXECUTION_TYPE = "execution"
+_VERIFICATION_TYPE = "verification"
+
+
+def _failure_text(exc: BaseException) -> str:
+    """A short reason for a plan that could not be stopped or started.
+
+    ``HTTPException`` carries a ``detail`` that is often a dict whose
+    ``error`` key is the machine-readable reason ("conflict",
+    "not_found"). That dict is the operator's own answer, so it is what
+    the result row repeats.
+    """
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        error = detail.get("error")
+        if error:
+            return str(error)
+        return str(detail.get("detail") or detail)
+    if detail:
+        return str(detail)
+    text = str(exc).strip()
+    return text or type(exc).__name__
+
+
+def _response_error(outcome: Any) -> Optional[str]:
+    """The error an outcome carries, or ``None`` when it carries none.
+
+    Not every failure raises: the verification routes answer a CAS
+    conflict with a 409 *response*. Both shapes have to reach the
+    operator as the same ``ok: false`` row, or a conflicting plan would
+    be reported as a successful stop — the one answer that must never be
+    wrong.
+    """
+    status = getattr(outcome, "status_code", None)
+    if status is None:
+        return None
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return None
+    if status < 400:
+        return None
+    body = getattr(outcome, "body", None)
+    if body:
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if error:
+                return str(error)
+            reason = payload.get("reason")
+            if reason:
+                return str(reason)
+    return f"http_{status}"
+
+
+def _run_for_plan(plan_id: str, kind: str, action: Any) -> Dict[str, Any]:
+    """One plan's stop/start, isolated: a failure is a row, not a 500.
+
+    A global stop that gives up half way through is worse than one that
+    reports what it could not do — the operator has to be able to see
+    which plans are still running.
+    """
+    try:
+        outcome = action(plan_id)
+    except Exception as exc:  # noqa: BLE001 — one plan must not stop the rest
+        _server.logger.warning(
+            "[system_stop_start] %s failed plan=%s", kind, plan_id,
+            exc_info=True,
+        )
+        return {
+            "plan_id": plan_id,
+            "type": kind,
+            "ok": False,
+            "error": _failure_text(exc),
+        }
+    error = _response_error(outcome)
+    if error:
+        return {
+            "plan_id": plan_id,
+            "type": kind,
+            "ok": False,
+            "error": error,
+        }
+    return {"plan_id": plan_id, "type": kind, "ok": True}
+
+
+@router.post("/api/system/stop_all")
+def stop_all_tasks():
+    """Stop every plan that is running, in one call.
+
+    The first half of a backend restart, and the counterpart of
+    :func:`start_all_tasks`. The operator asks for one stop instead of
+    one stop per plan, and the answer says what happened to each of
+    them.
+
+    The list of plans comes from :func:`get_active_tasks` — the same
+    read the supervisor polls — so "what is running" has one answer in
+    this codebase and not two that can disagree.
+
+    Each plan is stopped by the route that owns its kind: an execution
+    through ``stop_execution``, a verification through
+    ``stop_verification``. Both are imported *inside* the function: the
+    route modules import ``server``, which imports this one, so a
+    module-level import here would be circular.
+
+    One plan's failure is one row. The others are still stopped.
+    """
+    from routes.execution import stop_execution
+    from routes.verification import stop_verification
+
+    actions = {
+        _EXECUTION_TYPE: stop_execution,
+        _VERIFICATION_TYPE: stop_verification,
+    }
+
+    results: List[Dict[str, Any]] = []
+    handled: set = set()
+    for detail in (get_active_tasks() or {}).get("details") or []:
+        plan_id = str(detail.get("plan_id") or "")
+        kind = str(detail.get("type") or "")
+        action = actions.get(kind)
+        # A plan is handled once: the two registries are independent, so
+        # the same plan can be listed as an execution *and* as a
+        # verification, and stopping it twice would report a conflict
+        # for a plan that is in fact fine.
+        if not plan_id or action is None or plan_id in handled:
+            continue
+        handled.add(plan_id)
+        results.append(_run_for_plan(plan_id, kind, action))
+    return {"results": results}
+
+
+def _start_targets() -> List[Tuple[str, str]]:
+    """Every plan that has something to resume, and how to resume it.
+
+    Two sources, unioned:
+
+    * a **pause checkpoint on disk** — the durable half of a stop, and
+      the one that survives the restart this endpoint exists for. The
+      checkpoint's ``kind`` says which start owns the plan.
+    * a **recovered verification whose thread is gone** — the backend
+      was killed mid-round, so the round is in the database but nothing
+      is running it. Such a plan has no checkpoint (it was killed, not
+      stopped), and without this source it could never be started
+      again: its recovered state still says "running", so the start
+      endpoint would answer 409 forever.
+
+    A checkpoint that cannot be read is treated as absent — the same
+    degradation every other reader of it makes, so a torn file can
+    never turn this listing into an error.
+    """
+    from pause_state import checkpoint_path, read_pause_checkpoint
+
+    targets: List[Tuple[str, str]] = []
+    seen: set = set()
+    try:
+        plan_dirs = sorted(_server.PLANS_DIR.iterdir())
+    except OSError:
+        # No plans directory yet (fresh install), or one that vanished
+        # under us. Either way there is nothing paused in it.
+        plan_dirs = []
+    for plan_dir in plan_dirs:
+        if not plan_dir.is_dir():
+            continue
+        try:
+            if not checkpoint_path(plan_dir).exists():
+                continue
+            checkpoint = read_pause_checkpoint(plan_dir)
+        except OSError:
+            continue
+        if not isinstance(checkpoint, dict):
+            continue
+        plan_id = plan_dir.name
+        if plan_id in seen:
+            continue
+        seen.add(plan_id)
+        targets.append((plan_id, str(checkpoint.get("kind") or "")))
+
+    for plan_id, state in (_server._verification_state or {}).items():
+        if not isinstance(state, dict):
+            continue
+        # The recovered marker is what makes a hard-killed plan
+        # resumable; a round that is genuinely running owns a live
+        # thread and must be left alone, or two rounds would run over
+        # one plan.
+        if state.get("recovered") is not True or state.get("thread") is not None:
+            continue
+        if plan_id in seen:
+            continue
+        seen.add(plan_id)
+        targets.append((str(plan_id), _VERIFICATION_TYPE))
+    return targets
+
+
+@router.post("/api/system/start_all")
+def start_all_tasks():
+    """Resume every paused plan, in one call.
+
+    The second half of a backend restart, and the counterpart of
+    :func:`stop_all_tasks`.
+
+    The targets are the plans that have something to resume: a pause
+    checkpoint on disk, and the verification a hard kill left without a
+    thread. Each is started by the route that owns its kind.
+
+    The execution start is handed an explicitly empty request: the
+    checkpoint carries the project directory the work was happening in,
+    and a request that named one would redirect the resumed work to a
+    directory it was never written for.
+
+    One plan's failure is one row. The others are still started.
+    """
+    from routes.execution import start_execution
+    from routes.verification import start_verification
+
+    def _start_execution(plan_id: str) -> Any:
+        return start_execution(plan_id, _server.StartExecutionRequest())
+
+    def _start_verification(plan_id: str) -> Any:
+        return start_verification(plan_id)
+
+    actions = {
+        _EXECUTION_TYPE: _start_execution,
+        _VERIFICATION_TYPE: _start_verification,
+    }
+
+    results: List[Dict[str, Any]] = []
+    for plan_id, kind in _start_targets():
+        action = actions.get(kind)
+        if action is None:
+            # A checkpoint nobody can resume. Reported rather than
+            # dropped: silence would leave the operator believing the
+            # whole fleet was resumed.
+            results.append({
+                "plan_id": plan_id,
+                "type": kind or "unknown",
+                "ok": False,
+                "error": "unsupported_kind",
+            })
+            continue
+        results.append(_run_for_plan(plan_id, kind, action))
+    return {"results": results}
 
 
 @router.get("/api/plans")

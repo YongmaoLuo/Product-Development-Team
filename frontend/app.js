@@ -972,9 +972,24 @@ function showExecutionPanel() {
 
 function setExecBadge(status) {
     const badge = $("#execution-status-badge");
-    const labels = { running: "执行中", completed: "已完成", failed: "失败", stopped: "已停止", not_started: "未开始" };
+    const labels = { running: "执行中", completed: "已完成", failed: "失败", stopped: "已停止", paused: "已暂停", not_started: "未开始" };
     badge.textContent = labels[status] || status;
     badge.className = `exec-badge ${status}`;
+}
+
+// What the badge should show for one status payload.
+//
+// `paused` outranks `status` because the two do not agree. A plan that
+// was stopped and left alone reports `status: "stopped"` — the same
+// value a plan that finished gets — and one that outlived a backend
+// restart is not in the execution state at all, so it reports
+// `not_started`. Only the checkpoint says whether the work is waiting
+// to be continued, so it gets the last word. The poller and
+// `resumeExecutionPanel` both go through here; letting them pick their
+// own rule is how the badge ends up flickering between 已暂停 and
+// 已停止 every two seconds.
+function execBadgeState(data) {
+    return data.paused ? "paused" : data.status;
 }
 
 function appendExecLogs(lines) {
@@ -986,19 +1001,21 @@ function appendExecLogs(lines) {
 
 async function startExecution() {
     const projectDir = $("#project-dir-input").value.trim();
-    if (!projectDir) {
-        alert("请输入目标项目目录路径");
-        return;
-    }
     if (!currentPlanId) {
         alert("尚未选择计划");
         return;
     }
+    // An empty directory is not an error here. The backend reads
+    // `project_dir` off the resume point first and only falls back to
+    // this body, so continuing a paused plan must not make the
+    // operator retype a path the checkpoint already carries. A start
+    // with neither — no box filled in and no resume point — is answered
+    // with a 400, which the catch below already puts in an alert.
     showLoading("正在启动执行...");
     try {
         await api(`/execution/${currentPlanId}/start`, {
             method: "POST",
-            body: JSON.stringify({ project_dir: projectDir }),
+            body: JSON.stringify(projectDir ? { project_dir: projectDir } : {}),
         });
         $("#execution-setup").classList.add("hidden");
         $("#execution-controls").classList.remove("hidden");
@@ -1025,7 +1042,15 @@ function startExecutionPolling() {
         try {
             const data = await api(`/execution/${currentPlanId}/status`);
             appendExecLogs(data.logs);
-            setExecBadge(data.status);
+            setExecBadge(execBadgeState(data));
+            if (data.paused) {
+                // Nothing moves until the operator continues the plan,
+                // so polling it only re-reads the same checkpoint. It
+                // starts again from startExecution() once the resume
+                // succeeds.
+                stopExecutionPolling();
+                return;
+            }
             if (data.status !== "running") {
                 stopExecutionPolling();
                 if (data.status === "completed") {
@@ -1046,12 +1071,19 @@ function stopExecutionPolling() {
 async function resumeExecutionPanel(planId) {
     try {
         const data = await api(`/execution/${planId}/status`);
-        if (data.status === "not_started") return;
+        // `not_started` is where a paused plan lands once the backend
+        // has restarted — the in-memory execution state is gone, the
+        // checkpoint is not — so the early return has to let a paused
+        // plan through or the pause is invisible until the next start.
+        if (data.status === "not_started" && !data.paused) return;
         showExecutionPanel();
-        setExecBadge(data.status);
+        setExecBadge(execBadgeState(data));
         appendExecLogs(data.logs);
         $("#project-dir-input").value = data.project_dir || "";
-        $("#execution-setup").classList.add("hidden");
+        // A paused plan keeps the setup row: that row's button is the
+        // existing 开始执行, which is the continue affordance — no new
+        // control is introduced for pausing.
+        $("#execution-setup").classList.toggle("hidden", !data.paused);
         $("#execution-controls").classList.remove("hidden");
         $("#execution-logs").classList.remove("hidden");
         if (data.status === "running") startExecutionPolling();
