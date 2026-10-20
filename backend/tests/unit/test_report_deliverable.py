@@ -1038,3 +1038,109 @@ def test_the_two_loaders_agree_on_the_deliverable_fields():
             f"{field} is dropped by _load_tasks, so a report task "
             f"degrades to a code task on the executor's path"
         )
+
+
+# ---------------------------------------------------------------------------
+# 8 — the FIRST prompt must carry the report's address
+# ---------------------------------------------------------------------------
+#
+# The report path reached the sub-agent by exactly one channel:
+# ``PDT_REPORT_PATH`` stamped into the spawned CLI's settings by
+# ``coding_tool``. The prompt never named it. So a sub-agent had no way
+# to know the file existed until the retry hint told it — and the retry
+# hint arrives on the LAST attempt, which is the attempt after the one
+# that was supposed to succeed. Task 37-8-3-5-3 failed that way.
+#
+# This section pins the fix at the production entry: the real
+# ``_execute_task_with_retry``, with the LLM call stubbed. The prompt
+# is read off ``coding_tool.query``'s first positional argument, which
+# is the assembled ``context`` — the same string the sub-agent receives.
+
+
+def _prompt_sent_to_subagent(agent) -> str:
+    """The ``context`` string handed to the sub-agent on the first ask.
+
+    ``query_in_session(tool, session, context, system_instruction=...)``
+    forwards positionally to ``tool.query``, so the assembled prompt is
+    arg 0 of the first call.
+    """
+    assert agent.coding_tool.query.call_args_list, (
+        "the task never asked the sub-agent anything, so no prompt "
+        "was assembled — the assertion below would be vacuous"
+    )
+    return agent.coding_tool.query.call_args_list[0].args[0]
+
+
+def test_the_first_prompt_names_the_report_file(tmp_path):
+    """A report task's FIRST attempt must be told where to write.
+
+    Asserted through the real executor entry, not through a helper:
+    the helper could be wired into the prompt while the prompt itself
+    stayed silent, and only the assembled ``context`` proves the two
+    are actually connected.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    report = tmp_path / "reports" / "verdict.md"
+    report.parent.mkdir()
+    report.write_text("# 裁定\n可行。\n", encoding="utf-8")
+
+    agent = _executor_agent(project)
+    task = _report_task(report, project)
+
+    assert agent._execute_task_with_retry(task, max_retries=1) is True
+
+    prompt = _prompt_sent_to_subagent(agent)
+    assert str(report.resolve()) in prompt, (
+        "the first prompt never named the report's absolute path, so "
+        "the sub-agent had no address to write to until the retry "
+        f"hint — which is usually the last attempt:\n{prompt}"
+    )
+    assert "交付物" in prompt, (
+        "the hint must state that the deliverable is one file rather "
+        f"than a code diff:\n{prompt}"
+    )
+    assert "Write" in prompt, (
+        "the hint must name the tool that performs the delivery:\n"
+        f"{prompt}"
+    )
+    assert "二次审查" in prompt, (
+        "the hint must say the file is re-read downstream, which is "
+        f"what makes an unwritten report a failure:\n{prompt}"
+    )
+
+
+def test_a_code_task_says_nothing_about_a_report(tmp_path):
+    """The negative control: an ordinary code task gains no hint.
+
+    Scoped to the same prompt builder, so a hint that leaks onto every
+    task would show up here as noise spent on diff-oriented sub-agents.
+
+    The verdict is deliberately not asserted. The prompt is assembled
+    and handed to the tool BEFORE any gate runs, so reading it back off
+    the first call is both sufficient and stable — asserting on the
+    completed-vs-retried outcome would pin this fixture's git stubs
+    rather than the hint's reach.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+
+    agent = _executor_agent(project)
+    task = SubTask(
+        id="1-1",
+        title="an ordinary code task",
+        description="改一行代码。",
+        test_command="echo ok",
+        files_to_modify=["src/a.py"],
+        project_dir=str(project),
+    )
+
+    agent._execute_task_with_retry(task, max_retries=1)
+
+    prompt = _prompt_sent_to_subagent(agent)
+    assert "交付物" not in prompt, (
+        "the report hint leaked onto a code task:\n" + prompt
+    )
+    assert "Write 工具" not in prompt, (
+        "a code task was told to Write a report file:\n" + prompt
+    )

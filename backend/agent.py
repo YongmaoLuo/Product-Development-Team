@@ -4735,6 +4735,43 @@ class AutonomousAgent:
         bullets = "\n".join(f"  - {f}" for f in files)
         return f"\nFiles likely in scope:\n{bullets}\n"
 
+    def _build_report_hint(self, task: SubTask) -> str:
+        """Name the report task's deliverable, its address, and its stakes.
+
+        A report task's only channel naming its output was
+        ``PDT_REPORT_PATH``, stamped into the spawned CLI's settings by
+        ``coding_tool`` — invisible in the prompt. So the sub-agent had
+        no way to learn the file existed until the retry hint told it,
+        and the retry hint arrives on the LAST attempt: the one after
+        the attempt that was supposed to succeed. Task 37-8-3-5-3
+        failed that way.
+
+        Three things have to be in the first prompt, not the last:
+        that the deliverable is a file rather than a diff (otherwise
+        the empty-diff gate judges it by the wrong question), the
+        absolute address to Write it to, and that an absent or empty
+        file IS the failure — the second pass re-reads this file, so
+        silence is not a pass.
+
+        Empty string for every code task and for a report task whose
+        path does not resolve, so no hint is spent on a sub-agent
+        that has nothing to write.
+        """
+        if not is_report_task(task):
+            return ""
+        resolved = resolve_report_path(task, self.project_dir)
+        if not resolved:
+            return ""
+        return (
+            "\nReport deliverable (本任务的交付物是一个文件，不是代码 diff):\n"
+            "  - 你必须用 Write 工具把【完整报告】写到下面这个绝对路径：\n"
+            f"      {resolved}\n"
+            "  - 不要修改项目代码，也不要提交 git diff；"
+            "这份文件本身就是本任务的全部交付物。\n"
+            "  - 不写这个文件，或者写成空文件，都等于任务失败："
+            "系统会读这个文件做二次审查。\n"
+        )
+
     #: Cap on how much of a task's persisted ``failure_reason`` reaches
     #: the prompt. ``record_task_failure`` already truncates to 1000
     #: chars; this second cap keeps an aggregated parent reason (which
@@ -4948,6 +4985,9 @@ class AutonomousAgent:
                 # literal; an explicit empty list emits no hint.
                 context = f"Subtask: {task.description}\n"
                 context += self._build_files_to_modify_hint(task)
+                # The report deliverable's address, on the FIRST attempt
+                # rather than the retry hint — see _build_report_hint.
+                context += self._build_report_hint(task)
                 context += "\nUse Read/Grep/Glob tools to discover the codebase as needed.\n"
 
                 # Failure context, from two different carriers covering

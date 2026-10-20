@@ -443,16 +443,28 @@ class PlanState:
         required_indices = {dp.get("index") for dp in decision_points}
         return required_indices.issubset(accepted_indices)
 
-    def _save_state(self):
+    def _save_state(self, completed_phases_mode: str = "merge"):
         # task #3.7: persist to ``plan_routing`` instead of writing
         # the legacy ``plan_state.json`` file. Falls back to no-op
         # when SQLite is unavailable (the legacy file is preserved
         # as a read-only cache and will be picked up by ``_load_state``
         # on the next access).
+        #
+        # ``completed_phases_mode`` is forwarded verbatim to
+        # :meth:`_save_state_to_sqlite`.  The default ``"merge"`` keeps
+        # the phase history append-only; only :meth:`reset_to` asks
+        # for ``"replace"``, because rewinding a plan is exactly the
+        # one case where history must be dropped.
         self._state["last_updated"] = datetime.utcnow().isoformat() + "Z"
-        self._save_state_to_sqlite(self._state)
+        self._save_state_to_sqlite(
+            self._state, completed_phases_mode=completed_phases_mode,
+        )
 
-    def _save_state_to_sqlite(self, state: dict) -> None:
+    def _save_state_to_sqlite(
+        self,
+        state: dict,
+        completed_phases_mode: str = "merge",
+    ) -> None:
         """Write the plan-state fields into ``plan_routing``.
 
         Delegates the column ownership to
@@ -481,6 +493,17 @@ class PlanState:
         column and this class owned only ``current_phase``.  With one
         column the guard has to be here, and stated as the honest rule:
         write the phase when you changed it, otherwise leave it alone.
+
+        The same honesty rule applies to ``completed_phases``, and for
+        the same reason: this instance's ``state`` is a *cached
+        snapshot* of the row, so it may be older than an append another
+        writer made in the meantime.  ``completed_phases_mode``
+        therefore defaults to ``"merge"`` — the write adds the phases
+        this instance knows about and keeps the ones already recorded
+        on the row (the routing CAS maintains the very same ledger, so
+        the two must not fight).  Only :meth:`reset_to` passes
+        ``"replace"``: rewinding the plan is the one operation whose
+        purpose is to *forget* the phases after the target.
         """
         try:
             from state_machine.db.connection import open as _open_db
@@ -509,6 +532,7 @@ class PlanState:
                 flags=state.get("flags", {}),
                 verification=state.get("verification", {}),
                 last_updated=state.get("last_updated"),
+                completed_phases_mode=completed_phases_mode,
             )
             self._persisted_phase = current_phase
         except Exception:  # noqa: BLE001
@@ -662,7 +686,10 @@ class PlanState:
         ]
 
         self._state["current_phase"] = phase
-        self._save_state()
+        # ``replace`` — rewinding the plan is the ONE operation whose
+        # purpose is to forget the history after the target phase.
+        # Every other write merges (see ``_save_state_to_sqlite``).
+        self._save_state(completed_phases_mode="replace")
 
     # --- Review Rounds ---
 

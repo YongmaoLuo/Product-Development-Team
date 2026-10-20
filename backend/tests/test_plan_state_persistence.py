@@ -227,3 +227,43 @@ class TestPhaseSurvivesMetadataWrites:
             f"a real phase change must still drive the value, got "
             f"{row['current_phase']!r}"
         )
+
+
+class TestResetToTrimsTheHistory:
+    """``reset_to`` is the ONE write that may drop recorded history.
+
+    Every other ``PlanState`` write MERGES ``completed_phases`` — a
+    stale snapshot may only add the phases it knows about, never
+    delete the ones somebody else recorded (the routing CAS maintains
+    the very same ledger).
+
+    Rewinding the plan is the deliberate exception: "reset to phase
+    X" means "forget everything after X".  That is only possible if
+    the write REPLACES the column — under the merge the trimmed
+    entries would be merged straight back in and the plan would keep
+    a history it just asked to discard.
+    """
+
+    def test_reset_to_trims_the_recorded_history(
+        self, sample_plan_factory, state_db,
+    ):
+        plan_dir = sample_plan_factory(phase="prd_review")
+        ps = PlanState(plan_dir)
+        ps.mark_phase_complete("interview")
+        ps.mark_phase_complete("prd_generation")
+
+        before = read_plan_routing_state(plan_dir.name, state_db)
+        assert before["completed_phases"] == ["interview", "prd_generation"], (
+            f"precondition: the history must be on the row; got "
+            f"{before['completed_phases']!r}"
+        )
+
+        ps.reset_to("prd_generation")
+
+        after = read_plan_routing_state(plan_dir.name, state_db)
+        assert after["completed_phases"] == ["interview"], (
+            "reset_to must TRIM the history (replace), not merge the "
+            "trimmed entries back in; got "
+            f"{after['completed_phases']!r}"
+        )
+        assert after["current_phase"] == "prd_generation"

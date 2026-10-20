@@ -51,10 +51,27 @@ TDD spec (these are the tests the contract above pins):
       insert → find returns the same fields
   * test_current_returns_none_for_missing_plan
       current(missing) returns None (not raising)
+
+completed_phases contract (the phase history must not drift away
+from the phase):
+
+  * test_try_mark_phase_records_completed_phases_executing_to_verification
+      executing → verification ⇒ ["executing", "execution"]
+  * test_try_mark_phase_records_completed_phases_executing_to_completed
+      executing → completed ⇒ ["executing", "execution"]
+  * test_try_mark_phase_records_completed_phases_ready_to_executing
+      ready → executing ⇒ ["ready"]
+  * test_try_mark_phase_conflict_leaves_completed_phases_untouched
+      a rejected CAS leaves the column byte-for-byte identical
+  * test_try_mark_phase_completed_phases_dedup
+      a phase already recorded is not recorded twice
+  * test_try_mark_phase_version_still_increments_with_completed_phases
+      the version CAS is unchanged by the history bookkeeping
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Iterator
@@ -370,3 +387,318 @@ def test_concurrent_try_mark_phase_one_winner(
     assert row is not None
     assert row["current_phase"] == "executing"
     assert row["substage"] == "task_1"
+
+
+# ---------------------------------------------------------------------------
+# completed_phases: the phase history travels with the phase CAS
+# ---------------------------------------------------------------------------
+
+
+def _read_completed_phases(
+    repo: RoutingRepository,
+    plan_id: str,
+) -> list:
+    """Read ``completed_phases`` off the row, decoded from its JSON text."""
+    row = repo.find(plan_id)
+    assert row is not None, f"row for {plan_id!r} must exist"
+    raw = row["completed_phases"]
+    if not raw:
+        return []
+    return json.loads(raw)
+
+
+def _read_completed_phases_raw(
+    repo: RoutingRepository,
+    plan_id: str,
+) -> str:
+    """Read the ``completed_phases`` column verbatim (no decoding)."""
+    row = repo.find(plan_id)
+    assert row is not None, f"row for {plan_id!r} must exist"
+    return row["completed_phases"]
+
+
+def test_try_mark_phase_records_completed_phases_executing_to_verification(
+    conn: sqlite3.Connection,
+) -> None:
+    """executing → verification records ["executing", "execution"].
+
+    The phase history is maintained by the SAME statement that moves
+    the phase, so a plan that leaves ``executing`` for a verification
+    phase carries both the phase it left and the ``execution`` marker
+    ``PlanState.transition_to`` would have appended (plan_state.py:608).
+    """
+    repo = RoutingRepository(conn)
+    repo.insert(plan_id="p1", phase="executing")
+
+    ok = repo.try_mark_phase(
+        "p1",
+        expected_phases=("executing",),
+        new_phase="verification",
+    )
+    assert ok is True
+
+    assert _read_completed_phases(repo, "p1") == ["executing", "execution"]
+
+
+def test_try_mark_phase_records_completed_phases_executing_to_completed(
+    conn: sqlite3.Connection,
+) -> None:
+    """executing → completed records ["executing", "execution"].
+
+    A terminal phase completes ``execution`` too (plan_state.py:612).
+    """
+    repo = RoutingRepository(conn)
+    repo.insert(plan_id="p1", phase="executing")
+
+    ok = repo.try_mark_phase(
+        "p1",
+        expected_phases=("executing",),
+        new_phase="completed",
+    )
+    assert ok is True
+
+    assert _read_completed_phases(repo, "p1") == ["executing", "execution"]
+
+
+def test_try_mark_phase_records_completed_phases_ready_to_executing(
+    conn: sqlite3.Connection,
+) -> None:
+    """ready → executing records ["ready"] and nothing else.
+
+    ``executing`` is neither a terminal phase nor a verification phase,
+    so only the phase we left is completed.
+    """
+    repo = RoutingRepository(conn)
+    repo.insert(plan_id="p1", phase="ready")
+
+    ok = repo.try_mark_phase(
+        "p1",
+        expected_phases=("ready",),
+        new_phase="executing",
+    )
+    assert ok is True
+
+    assert _read_completed_phases(repo, "p1") == ["ready"]
+
+
+def test_try_mark_phase_conflict_leaves_completed_phases_untouched(
+    conn: sqlite3.Connection,
+) -> None:
+    """A rejected CAS must not write ``completed_phases`` at all.
+
+    The seed is written as NON-canonical JSON text on purpose: a
+    re-serialization of the same list would produce different bytes, so
+    this assertion can tell "nothing was written" apart from "the
+    column was rewritten with the same content".
+    """
+    repo = RoutingRepository(conn)
+    repo.insert(plan_id="p1", phase="executing")
+    conn.execute(
+        "UPDATE plan_routing SET completed_phases = ? WHERE plan_id = ?",
+        ('["ready","executing"]', "p1"),
+    )
+
+    before = _read_completed_phases_raw(repo, "p1")
+    assert before == '["ready","executing"]'
+
+    with pytest.raises(ConflictError):
+        repo.try_mark_phase(
+            "p1",
+            expected_phases=("ready",),
+            new_phase="completed",
+        )
+
+    after = _read_completed_phases_raw(repo, "p1")
+    assert after == before, (
+        f"a failed CAS must not touch completed_phases; "
+        f"got {before!r} -> {after!r}"
+    )
+
+    # The next successful CAS builds on exactly the seeded value — the
+    # rejected attempt neither wrote nor corrupted it.
+    repo.try_mark_phase(
+        "p1",
+        expected_phases=("executing",),
+        new_phase="verification",
+    )
+    assert _read_completed_phases(repo, "p1") == [
+        "ready",
+        "executing",
+        "execution",
+    ]
+
+
+def test_try_mark_phase_completed_phases_dedup(
+    conn: sqlite3.Connection,
+) -> None:
+    """A phase already recorded is not recorded a second time."""
+    repo = RoutingRepository(conn)
+    repo.insert(plan_id="p1", phase="executing")
+    repo.write_plan_state(
+        "p1",
+        phase=None,
+        completed_phases=["executing"],
+        review_rounds={},
+        flags={},
+        verification={},
+        last_updated=None,
+    )
+
+    ok = repo.try_mark_phase(
+        "p1",
+        expected_phases=("executing",),
+        new_phase="verification",
+    )
+    assert ok is True
+
+    completed = _read_completed_phases(repo, "p1")
+    assert completed == ["executing", "execution"]
+    assert completed.count("executing") == 1, (
+        f"completed_phases must not contain duplicates; got {completed!r}"
+    )
+
+
+def test_try_mark_phase_version_still_increments_with_completed_phases(
+    conn: sqlite3.Connection,
+) -> None:
+    """The version CAS is untouched by the history bookkeeping."""
+    repo = RoutingRepository(conn)
+    repo.insert(plan_id="p1", phase="executing")
+
+    v0 = repo.current_version("p1")
+    assert v0 is not None
+
+    repo.try_mark_phase(
+        "p1",
+        expected_phases=("executing",),
+        new_phase="verification",
+    )
+
+    v1 = repo.current_version("p1")
+    assert v1 == v0 + 1, f"version must advance by 1; got {v0} -> {v1}"
+    assert _read_completed_phases(repo, "p1") == ["executing", "execution"]
+
+
+# ---------------------------------------------------------------------------
+# completed_phases: the PlanState write path MERGES the history
+# ---------------------------------------------------------------------------
+#
+# ``write_plan_state`` is the write path of ``PlanState``, whose
+# ``completed_phases`` is a CACHED SNAPSHOT of the row.  A snapshot
+# that predates an append somebody else made (the phase CAS in
+# :meth:`RoutingRepository.try_mark_phase` maintains the very same
+# ledger) may only ADD the phases it knows about — it must never
+# delete history somebody else recorded.  Hence ``"merge"`` is the
+# default and ``"replace"`` is reserved for the explicit rewind
+# (``PlanState.reset_to``).
+
+
+def _seed_completed_phases(
+    conn: sqlite3.Connection,
+    plan_id: str,
+    phases: list,
+) -> None:
+    """Put ``phases`` into the row's ``completed_phases`` column.
+
+    Seeded with a direct UPDATE — NOT through ``write_plan_state`` —
+    so the test does not depend on the code path it is testing.
+    """
+    conn.execute(
+        "UPDATE plan_routing SET completed_phases = ? WHERE plan_id = ?",
+        (json.dumps(phases), plan_id),
+    )
+
+
+def _write_metadata(
+    repo: RoutingRepository,
+    plan_id: str,
+    completed_phases: list,
+    mode: str = "merge",
+) -> None:
+    """A metadata-only ``write_plan_state`` (no phase argument)."""
+    repo.write_plan_state(
+        plan_id,
+        phase=None,
+        completed_phases=completed_phases,
+        review_rounds={},
+        flags={},
+        verification={},
+        last_updated=None,
+        completed_phases_mode=mode,
+    )
+
+
+def test_write_plan_state_merge_keeps_the_recorded_history(
+    conn: sqlite3.Connection,
+) -> None:
+    """A metadata write that knows nothing must not erase the history.
+
+    This is the exact shape of the bug the merge fixes: a
+    ``PlanState`` instance holding a stale snapshot (its
+    ``completed_phases`` is empty) writes it back and, under the old
+    whole-column overwrite, the entries the CAS had just appended were
+    gone.
+    """
+    repo = RoutingRepository(conn)
+    repo.insert(plan_id="p1", phase="executing")
+    _seed_completed_phases(conn, "p1", ["executing", "execution"])
+
+    _write_metadata(repo, "p1", [])
+
+    assert _read_completed_phases(repo, "p1") == ["executing", "execution"], (
+        "the merge must keep the history already recorded on the row"
+    )
+
+
+def test_write_plan_state_merge_appends_in_order_without_duplicates(
+    conn: sqlite3.Connection,
+) -> None:
+    """merge keeps the existing order and appends the new entries once.
+
+    ``["a", "b"]`` + ``["b", "c"]`` → ``["a", "b", "c"]``: the existing
+    entries keep their positions, the new one is appended, and the
+    entry both sides know about is not recorded twice.
+    """
+    repo = RoutingRepository(conn)
+    repo.insert(plan_id="p1", phase="executing")
+    _seed_completed_phases(conn, "p1", ["a", "b"])
+
+    _write_metadata(repo, "p1", ["b", "c"])
+
+    assert _read_completed_phases(repo, "p1") == ["a", "b", "c"]
+
+
+def test_write_plan_state_replace_overwrites_the_history(
+    conn: sqlite3.Connection,
+) -> None:
+    """``replace`` keeps the old whole-column-overwrite semantics.
+
+    This is the mode ``PlanState.reset_to`` uses: rewinding a plan
+    means forgetting the phases after the target.
+    """
+    repo = RoutingRepository(conn)
+    repo.insert(plan_id="p1", phase="executing")
+    _seed_completed_phases(conn, "p1", ["a", "b", "c"])
+
+    _write_metadata(repo, "p1", ["a"], mode="replace")
+
+    assert _read_completed_phases(repo, "p1") == ["a"], (
+        "replace must overwrite the column verbatim"
+    )
+
+
+def test_write_plan_state_rejects_an_unknown_mode(
+    conn: sqlite3.Connection,
+) -> None:
+    """An unknown mode is a programmer error → ValueError.
+
+    Silently falling back to one of the two modes would hide the
+    mistake: the difference between "append-only history" and
+    "overwrite the history" is exactly the kind of thing that must
+    never be guessed.
+    """
+    repo = RoutingRepository(conn)
+    repo.insert(plan_id="p1", phase="executing")
+
+    with pytest.raises(ValueError):
+        _write_metadata(repo, "p1", ["a"], mode="append")
