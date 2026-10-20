@@ -142,7 +142,7 @@ class TestEmptyTasksRaises(unittest.TestCase):
         #   1. raise TasksGenerationError (not fall through to a
         #      synthesised plan)
         #   2. write a well-formed error JSON to tasks.json
-        source = inspect.getsource(TasksGenerator.generate)
+        source = inspect.getsource(TasksGenerator._generate_with_prompt)
         # 1. Find the empty-tasks branch and confirm it raises.
         empty_branch_start = source.find(
             "if not tasks_data[\"tasks\"]:"
@@ -172,7 +172,7 @@ class TestEmptyTasksRaises(unittest.TestCase):
         import inspect
         from tasks_generator import TasksGenerator
 
-        source = inspect.getsource(TasksGenerator.generate)
+        source = inspect.getsource(TasksGenerator._generate_with_prompt)
         self.assertNotIn(
             "由 fallback 调度生成",
             source,
@@ -184,6 +184,31 @@ class TestEmptyTasksRaises(unittest.TestCase):
             source,
             "the old fallback rationale comment was removed; the "
             "new fail-loud path does not synthesise any task",
+        )
+
+    def test_generate_delegates_to_generate_with_prompt(self):
+        """Anchor the introspection target itself.
+
+        The two guards above introspect
+        ``TasksGenerator._generate_with_prompt``. If a future refactor
+        moves that pipeline back into ``generate()`` (or into some
+        third method), ``inspect.getsource`` on the stale target would
+        either raise ``OSError`` or — worse — keep returning a source
+        that no longer contains the guard, leaving the ``assertNotIn``
+        checks silently vacuous. Assert the live call edge so the
+        target cannot drift away from the production path.
+        """
+        import inspect
+        from tasks_generator import TasksGenerator
+
+        source = inspect.getsource(TasksGenerator.generate)
+        self.assertIn(
+            "_generate_with_prompt(",
+            source,
+            "generate() must delegate to _generate_with_prompt(); "
+            "the guards in this class introspect that method, so if "
+            "the pipeline moves the introspection target must move "
+            "with it",
         )
 
 

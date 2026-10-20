@@ -578,6 +578,48 @@ NO_WORKSPACE_PROMPT = """
 - 工作目录由操作者在启动执行时指定
 """
 
+#: The plan-directory member the fast lane hands the model in place of an
+#: interview / PRD / architecture / test-design set. Lives here rather than
+#: in ``fast_lane`` so the generator has no import edge into the route's
+#: module: the route writes the file, the generator names it, and neither
+#: has to know the other exists.
+IMPORT_PAYLOAD_FILENAME = "import.json"
+
+#: Prepended to ``TASKS_SYSTEM_PROMPT`` in import mode. The rules that
+#: follow it are unchanged on purpose — schema, description format,
+#: dependency shape, ``files_to_modify``, ``test_command`` are properties of
+#: the product, not of where the requirement came from, and an import that
+#: answered to a weaker schema is a plan the executor cannot schedule.
+IMPORT_MODE_SYSTEM_PREAMBLE = """
+## 输入模式：导入材料（CRITICAL）
+
+上游输入**不是 PRD**，也不要要求 PRD、访谈纪要、架构设计或测试设计文档。
+
+- 唯一的上游材料是 `import.json`：调用方（外部系统）已经完成的调研 / 需求 /
+  粗粒度任务清单。它**同时承担 interview + PRD + 架构设计 + 测试设计的角色**，
+  是本次任务的唯一需求来源。
+- `import.json` 可能是字符串、数组、对象或任意 JSON，格式没有约定，也不要
+  假设某种字段名。以其**内容**为准，不要因为它"看起来不像 PRD"而拒绝它或
+  追问缺失文档。
+- 如果材料不够写出合格任务，按材料推断合理拆分并明确标注假设；不要编造
+  材料里没有的业务需求。
+- 下方所有规则（JSON schema、description 格式、depends_on、files_to_modify、
+  test_command、任务时长与拆分、端到端验收 Task 等）**全部照常生效**，一字
+  不减地适用于导入模式。
+"""
+
+#: The import mode's user prompt. Its only job is the same one the
+#: generated path's user prompt has: say where the upstream material is and
+#: what it is. Keeping it short is deliberate — the schema lives in the
+#: system prompt, and repeating it in the user prompt gives the model two
+#: places to misread it.
+IMPORT_MODE_USER_PROMPT = (
+    "Read the upstream material in the order listed above and emit a valid "
+    "JSON task plan.\n\n"
+    "该材料已由调用方完成，它承担 interview + PRD + 架构设计 + 测试设计的角色；"
+    "以它为唯一需求来源，不要索要或假设存在其它上游文档。"
+)
+
 
 TASKS_SYSTEM_PROMPT = """你是一位资深技术架构师。根据 PRD 文档生成开发任务列表。
 ## 时间预算规则（CRITICAL）
@@ -918,17 +960,39 @@ class TasksGenerator:
         coding_tool: CodingTool,
         plan_dir: Path,
         self_review_enabled: bool = True,
+        import_mode: bool = False,
+        import_project_dir: Optional[str] = None,
     ):
         self.coding_tool = coding_tool
         self.plan_dir = plan_dir
         self.self_review_enabled = self_review_enabled
+        #: Fast lane. ``True`` means this plan has no interview, PRD,
+        #: architecture or test design — the caller brought its own
+        #: upstream material and named it ``import.json``. It changes
+        #: *what the model is shown*, never the pipeline that runs after
+        #: the model answers: see :meth:`_generate_with_prompt`.
+        self.import_mode = import_mode
+        #: The checkout every task must land in, supplied by the import
+        #: request. Only read in import mode; a generated plan takes its
+        #: workspaces from the PRD/interview constraints instead.
+        self.import_project_dir = import_project_dir
         self.prd_json = plan_dir / "prd.json"
         self.prd_md = plan_dir / "prd.md"
         self.review_file = plan_dir / "review.json"
+        self.import_file = plan_dir / IMPORT_PAYLOAD_FILENAME
         self.tasks_file = plan_dir / "tasks.json"
 
     def generate(self) -> dict:
-        """Generate tasks.json from PRD + review results + optional arch/test design.
+        """Generate tasks.json, from the PRD or from imported material.
+
+        Two front doors, one pipeline. The generated plan runs the DP2
+        preflight cross-document gate and then shows the model its
+        interview / PRD / architecture / test-design docs; an imported plan
+        has none of those, so the gate is skipped and the model is shown
+        the caller's ``import.json`` instead. Past that point the two are
+        the same code — :meth:`_generate_with_prompt` — because the
+        constraints a task list must satisfy do not depend on where its
+        requirement came from.
 
         Writes the result to ``self.tasks_file`` (i.e.
         ``plans/{plan_id}/tasks.json``). This is the SINGLE source of
@@ -948,110 +1012,70 @@ class TasksGenerator:
                 tasks file is NOT written in that case — callers must
                 surface the findings back to the user and re-run after
                 fixing the underlying doc mismatches.
+            TasksGenerationError: when the model returned no tasks, or a
+                post-generation gate rejected the list.
         """
-        # DP2 — preflight cross-document consistency check. Runs before
-        # any LLM call so we don't burn tokens generating tasks from a
-        # broken spec. ``preflight_enabled`` defaults to True for new
-        # plans; toggle via ``plan_state.flags.preflight_enabled = False``.
-        self._run_preflight_gate()
-
-        prd_content = self._summarise_prd()
-        review_context = self._load_review_context()
-        domain_knowledge = self._load_domain_knowledge()
-        arch_content = self._summarise_arch_design()
-        test_content = self._summarise_test_design()
-        workspace_context = self._load_workspace_context()
-        # Always include the user's original requirement (from
-        # interview.json's dimensions) as a leading, unambiguous
-        # requirement block. Smoke v11/v12 surfaced a non-determinism
-        # where the LLM sometimes hallucinated "no PRD provided" even
-        # with the PRD/arch/test docs inlined (12 KB+ of upstream
-        # content). The fix was to pin the user-stated requirement
-        # at the very top of the prompt as a JSON block.
-        #
-        # v15 (path-only with M1) reverts this: interview.json is
-        # also referenced by path, not inlined. The LLM in
-        # interactive mode can Read it itself. (interview.json is
-        # the smallest upstream doc — ~3 KB — so this is a
-        # negligible cost.) All three upstream docs + interview
-        # follow the same path-only contract.
-        interview_path = self.plan_dir / "interview.json"
-        prompt_parts = []
-        if interview_path.exists():
-            prompt_parts.append(self._format_doc_reference(
-                "interview.json (用户原始需求)",
-                interview_path,
-            ))
-        if workspace_context:
-            prompt_parts.append(f"工作区配置（CRITICAL）：\n{workspace_context}")
-        if domain_knowledge:
-            prompt_parts.append(f"领域知识：\n{domain_knowledge}")
-        if test_content:
-            prompt_parts.append(f"测试设计文档（最高优先级）：\n{test_content}")
-        if arch_content:
-            prompt_parts.append(f"架构设计文档：\n{arch_content}")
-        if prd_content:
-            prompt_parts.append(prd_content)
-        if review_context:
-            prompt_parts.append(f"审阅批注（rejected 的决策点需调整方案）：\n{review_context}")
-        skip_notice = self._load_skip_notice()
-        if skip_notice:
-            prompt_parts.append(skip_notice)
-
-        prompt = "\n\n".join(prompt_parts)
-        # v15.2 minimal user prompt: the giant footer was confusing
-        # the LLM into thinking I wanted test commands or step-by-step
-        # instructions. Smoke v15.1 emitted `["python3 -c ..."]`
-        # consistently. The fix is to KEEP THE PROMPT SMALL — the
-        # TASKS_SYSTEM_PROMPT (passed via system_instruction) already
-        # has the full JSON schema + rules. Repeating it in the user
-        # prompt just gives the LLM more text to misread.
-        #
-        # The user prompt's only responsibility is now: tell the LLM
-        # WHERE the upstream docs are and WHICH ONE to start with.
-        prompt += (
-            "\n\nRead the upstream docs in the order listed above and emit a valid JSON task plan."
-        )
-
-        # Append the JSON output contract to the system prompt so
-        # the LLM sees "your reply must be a JSON object" as the
-        # very last instruction. Smoke v5 surfaced silent empty
-        # replies from tasks_generator — this is the lowest-cost
-        # mitigation.
-        #
-        from llm_prompts import append_json_output_contract
-
-        system_instruction = TASKS_SYSTEM_PROMPT
-        # Workspace ownership is declared by the plan, never guessed by the
-        # framework: ask for `project_dir` only when the plan actually named
-        # a workspace, and give the model exactly those paths. A plan that
-        # named none is told to omit the field — see the constants' docs.
-        declared_dirs = self._declared_workspace_dirs()
-        if declared_dirs:
-            system_instruction = (
-                f"{system_instruction}\n\n"
-                + MULTI_WORKSPACE_PROMPT_TEMPLATE.format(
-                    workspaces="\n".join(f"- `{d}`" for d in declared_dirs)
-                )
-            )
+        if self.import_mode:
+            prompt, system_instruction = self._build_import_prompts()
         else:
-            system_instruction = f"{system_instruction}\n\n{NO_WORKSPACE_PROMPT}"
-        system_instruction = append_json_output_contract(system_instruction)
+            # DP2 — preflight cross-document consistency check. Runs
+            # before any LLM call so we don't burn tokens generating tasks
+            # from a broken spec. ``preflight_enabled`` defaults to True
+            # for new plans; toggle via
+            # ``plan_state.flags.preflight_enabled = False``. Import mode
+            # has no cross-document set to disagree, so there is nothing
+            # for this gate to read.
+            self._run_preflight_gate()
+            prompt, system_instruction = self._build_plan_prompts()
 
-        # One handle for the whole of this ``generate()``. Three steps
-        # below ask about the same subject — this synthesis, the
-        # mandatory self-review that audits it, and the falsifiability
-        # rounds that re-ask the review with probe results it did not
-        # act on — so they run in one conversation instead of each
-        # re-reading the upstream architecture / test design that every
-        # one of their prompts names. The falsifiability loop used to
-        # open its own handle for its rounds only; lifting it to the
-        # whole ``generate()`` is what closes the gap between the
-        # synthesis and the first review. Created before the first
+        # One handle for the whole run. Three steps below ask about the
+        # same subject — this synthesis, the mandatory self-review that
+        # audits it, and the falsifiability rounds that re-ask the review
+        # with probe results it did not act on — so they run in one
+        # conversation instead of each re-reading the upstream material
+        # that every one of their prompts names. Created before the first
         # dispatch, and scoped to this call: a later regeneration of the
         # same plan is a different conversation.
         session = JsonSession()
 
+        tasks_data = self._generate_with_prompt(
+            prompt, system_instruction, session,
+        )
+
+        if self.import_mode:
+            # Backfill, not parsing: the model's list is the deliverable,
+            # but the checkout came from the request and a task that left
+            # ``project_dir`` out must still target it, or
+            # ``harden_for_execution`` reports it as a task with no
+            # resolvable directory.
+            self._backfill_import_project_dir(tasks_data)
+
+        return tasks_data
+
+    def _generate_with_prompt(
+        self,
+        prompt: str,
+        system_instruction: str,
+        session: "JsonSession",
+    ) -> Dict[str, Any]:
+        """Ask the model for a task list and take it all the way to disk.
+
+        Everything after the prompt exists lives here, and it does not
+        know or care whether the prompt pointed at a PRD or at imported
+        material: the shape coercion, the ``depends_on`` fallbacks, the
+        ``files_to_modify`` backfill and split, the RED probe, the
+        zero-task hard failure, the write, the E2E gate and the mandatory
+        self-review are the same obligations for both doors.
+
+        Args:
+            prompt: the user-side prompt (which docs to read, and in what
+                order).
+            system_instruction: the system-side prompt (schema + rules).
+            session: the reusable conversation handle for this run.
+
+        Returns:
+            The ``tasks.json`` dict, after every gate has passed.
+        """
         tasks_data = query_json_in_session(
             self.coding_tool, session,
             prompt=prompt,
@@ -1153,8 +1177,8 @@ class TasksGenerator:
         #   2. The new children don't need a second pass through the
         #      depends_on post-processor — their id is hierarchical
         #      (``<parent>-N``) so ``_postprocess_infer_from_id`` would
-        #      anyway want to set ``depends_on = [parent_id]``, which
-        #      is wrong: children run in parallel with their siblings,
+        #      anyway want to set ``depends_on = [parent_id]``, which is
+        #      wrong: children run in parallel with their siblings,
         #      so they must depend on the parent's upstream deps, not
         #      on the parent itself.
         # Principle 2 (2026-08-19 audit): BEFORE the limit split,
@@ -1276,6 +1300,158 @@ class TasksGenerator:
             )
 
         return tasks_data
+
+    def _backfill_import_project_dir(self, tasks_data: Dict[str, Any]) -> None:
+        """Give every imported task the checkout the request named.
+
+        A backfill, not a constraint on the input: a task that left
+        ``project_dir`` out is given the request's, and a task that named a
+        *different* one keeps it — silently rewriting that would turn a
+        real mistake (one task aimed at the wrong checkout) into a plan
+        that runs the wrong command, so the disagreement is left visible
+        for ``fast_lane.validate_tasks`` to report instead.
+        """
+        target = (self.import_project_dir or "").strip()
+        if not target:
+            return
+        for task in tasks_data.get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            own = task.get("project_dir")
+            if own is None or not str(own).strip():
+                task["project_dir"] = target
+
+    def _build_import_prompts(self) -> Tuple[str, str]:
+        """Prompt pair for the fast lane: imported material, no PRD.
+
+        Same path-only contract as every other upstream doc here — the
+        caller handed PDT a document, the model reads it, and PDT does not
+        inline it. The difference is what the document *is*: one file
+        standing where interview, PRD, architecture and test design
+        normally stand, written by the caller rather than generated here.
+        So the user prompt says exactly that, and the system prompt
+        reuses ``TASKS_SYSTEM_PROMPT`` unchanged — every rule about
+        descriptions, dependencies, ``files_to_modify`` and
+        ``test_command`` applies identically, because the constraints are a
+        property of the product and not of where the requirement came from
+        — with an import preamble in front of it and the import checkout
+        named where the generated path names declared workspaces.
+        """
+        prompt_parts: List[str] = []
+        if self.import_file.exists():
+            prompt_parts.append(self._format_doc_reference(
+                "import.json（调用方提供的上游材料）",
+                self.import_file,
+            ))
+        prompt_parts.append(IMPORT_MODE_USER_PROMPT.strip())
+        prompt = "\n\n".join(prompt_parts)
+
+        from llm_prompts import append_json_output_contract
+
+        system_instruction = f"{IMPORT_MODE_SYSTEM_PREAMBLE}\n\n{TASKS_SYSTEM_PROMPT}"
+        workspace_dir = (self.import_project_dir or "").strip()
+        if workspace_dir:
+            system_instruction = (
+                f"{system_instruction}\n\n"
+                + MULTI_WORKSPACE_PROMPT_TEMPLATE.format(
+                    workspaces=f"- `{workspace_dir}`"
+                )
+            )
+        else:
+            system_instruction = f"{system_instruction}\n\n{NO_WORKSPACE_PROMPT}"
+        system_instruction = append_json_output_contract(system_instruction)
+        return prompt, system_instruction
+
+    def _build_plan_prompts(self) -> Tuple[str, str]:
+        """Prompt pair for a generated plan: PRD + arch + test design.
+
+        Split out of :meth:`generate` so the two front doors can differ in
+        their prompt and share their pipeline; the wording here is the one
+        the ``/api/tasks/{plan_id}/generate`` endpoint has always sent.
+        """
+        prd_content = self._summarise_prd()
+        review_context = self._load_review_context()
+        domain_knowledge = self._load_domain_knowledge()
+        arch_content = self._summarise_arch_design()
+        test_content = self._summarise_test_design()
+        workspace_context = self._load_workspace_context()
+        # Always include the user's original requirement (from
+        # interview.json's dimensions) as a leading, unambiguous
+        # requirement block. Smoke v11/v12 surfaced a non-determinism
+        # where the LLM sometimes hallucinated "no PRD provided" even
+        # with the PRD/arch/test docs inlined (12 KB+ of upstream
+        # content). The fix was to pin the user-stated requirement
+        # at the very top of the prompt as a JSON block.
+        #
+        # v15 (path-only with M1) reverts this: interview.json is
+        # also referenced by path, not inlined. The LLM in
+        # interactive mode can Read it itself. (interview.json is
+        # the smallest upstream doc — ~3 KB — so this is a
+        # negligible cost.) All three upstream docs + interview
+        # follow the same path-only contract.
+        interview_path = self.plan_dir / "interview.json"
+        prompt_parts = []
+        if interview_path.exists():
+            prompt_parts.append(self._format_doc_reference(
+                "interview.json (用户原始需求)",
+                interview_path,
+            ))
+        if workspace_context:
+            prompt_parts.append(f"工作区配置（CRITICAL）：\n{workspace_context}")
+        if domain_knowledge:
+            prompt_parts.append(f"领域知识：\n{domain_knowledge}")
+        if test_content:
+            prompt_parts.append(f"测试设计文档（最高优先级）：\n{test_content}")
+        if arch_content:
+            prompt_parts.append(f"架构设计文档：\n{arch_content}")
+        if prd_content:
+            prompt_parts.append(prd_content)
+        if review_context:
+            prompt_parts.append(f"审阅批注（rejected 的决策点需调整方案）：\n{review_context}")
+        skip_notice = self._load_skip_notice()
+        if skip_notice:
+            prompt_parts.append(skip_notice)
+
+        prompt = "\n\n".join(prompt_parts)
+        # v15.2 minimal user prompt: the giant footer was confusing
+        # the LLM into thinking I wanted test commands or step-by-step
+        # instructions. Smoke v15.1 emitted `["python3 -c ..."]`
+        # consistently. The fix is to KEEP THE PROMPT SMALL — the
+        # TASKS_SYSTEM_PROMPT (passed via system_instruction) already
+        # has the full JSON schema + rules. Repeating it in the user
+        # prompt just gives the LLM more text to misread.
+        #
+        # The user prompt's only responsibility is now: tell the LLM
+        # WHERE the upstream docs are and WHICH ONE to start with.
+        prompt += (
+            "\n\nRead the upstream docs in the order listed above and emit a valid JSON task plan."
+        )
+
+        # Append the JSON output contract to the system prompt so
+        # the LLM sees "your reply must be a JSON object" as the
+        # very last instruction. Smoke v5 surfaced silent empty
+        # replies from tasks_generator — this is the lowest-cost
+        # mitigation.
+        from llm_prompts import append_json_output_contract
+
+        system_instruction = TASKS_SYSTEM_PROMPT
+        # Workspace ownership is declared by the plan, never guessed by the
+        # framework: ask for `project_dir` only when the plan actually named
+        # a workspace, and give the model exactly those paths. A plan that
+        # named none is told to omit the field — see the constants' docs.
+        declared_dirs = self._declared_workspace_dirs()
+        if declared_dirs:
+            system_instruction = (
+                f"{system_instruction}\n\n"
+                + MULTI_WORKSPACE_PROMPT_TEMPLATE.format(
+                    workspaces="\n".join(f"- `{d}`" for d in declared_dirs)
+                )
+            )
+        else:
+            system_instruction = f"{system_instruction}\n\n{NO_WORKSPACE_PROMPT}"
+        system_instruction = append_json_output_contract(system_instruction)
+
+        return prompt, system_instruction
 
     def _iterate_on_falsifiability(
         self,
@@ -1630,7 +1806,16 @@ class TasksGenerator:
         The LLM uses the upstream to verify task 13's API endpoint
         ownership, task 7's indicator scope, etc. Each section is
         optional — missing files are skipped silently.
+
+        Import mode has neither of those documents. It does have the
+        caller's ``import.json``, which stands in their place, so the
+        review pass is shown that instead: a review that audits the task
+        list against an upstream the reader cannot see is the model
+        agreeing with itself.
         """
+        if self.import_mode:
+            return self._load_import_upstream_block()
+
         chunks: List[str] = []
         for label, path in (
             ("架构设计 arch-design.md", self.plan_dir / "arch-design.md"),
@@ -1646,6 +1831,21 @@ class TasksGenerator:
                 f"## {label}\n{body[:6000]}\n"
             )
         return "\n".join(chunks)
+
+    def _load_import_upstream_block(self) -> str:
+        """The caller's material, as the review pass's upstream.
+
+        Same truncation as the generated path's block — the first pass
+        already read the whole file through ``Read``, and this pass only
+        needs enough to check the rewrite against.
+        """
+        if not self.import_file.exists():
+            return ""
+        try:
+            body = self.import_file.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        return f"## 导入材料 import.json\n{body[:6000]}\n"
 
     def _collect_upstream_decisions(self) -> List[Tuple[str, int, str]]:
         """Instance method that walks the plan dir for arch / test
