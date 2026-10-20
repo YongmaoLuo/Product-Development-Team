@@ -350,6 +350,127 @@ def test_begin_verification_no_op_when_already_in_verification(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# TDD spec 6: ``begin_verification`` maintains the completed_phases
+#              invariant that ``transition_to`` refuses without
+# ---------------------------------------------------------------------------
+#
+# ``transition_to`` (plan_state.py:596) refuses any edge into a
+# verification phase unless ``"execution"`` is already in
+# ``completed_phases``. ``begin_verification`` exists precisely because
+# a plan can arrive at that edge from a source ``transition_to`` would
+# reject — and it is the only one of the two that also *writes* the
+# invariant, appending both the source phase and the ``execution``
+# marker.
+#
+# The import-shaped plan is the case that breaks without it: a plan
+# brought in from an existing repo has an empty ``completed_phases``,
+# so ``execution`` is not there for ``transition_to`` to find.
+
+
+def test_begin_verification_maintains_the_completed_phases_invariant(tmp_path):
+    """``executing`` + empty ``completed_phases`` → both markers appended.
+
+    Seeded with ``completed_phases=[]`` — the import-shaped plan — because
+    that is the only shape where the ``execution`` marker is genuinely
+    absent rather than merely stale.
+    """
+    plan_dir = _seed_illegal_phase_plan(
+        tmp_path, "begin-verify-invariant", "executing",
+    )
+    ps = PlanState(plan_dir)
+
+    assert ps.get_completed_phases() == [], (
+        "precondition: the import-shaped plan starts with no "
+        "completed_phases at all"
+    )
+
+    ps.begin_verification()
+
+    completed = ps.get_completed_phases()
+    assert "executing" in completed, (
+        "the source phase must be recorded, or the plan loses the "
+        f"record of having executed: {completed!r}"
+    )
+    assert "execution" in completed, (
+        "begin_verification must append the 'execution' marker; "
+        "without it every later transition_to('verification_*') "
+        f"refuses on this plan: {completed!r}"
+    )
+    assert ps.get_current_phase() == "verification", (
+        "and the plan must actually be in the verification phase"
+    )
+
+
+def test_the_auto_verification_entry_preserves_the_invariant(
+    tmp_path, monkeypatch
+):
+    """The production entry, not the library call.
+
+    ``_run_auto_verification_loop_inner`` used to leave the plan at
+    ``current_phase=executing`` with ``completed_phases=[]``: the
+    routing CAS wrote only ``current_phase`` and never the companion
+    list, so the first ``transition_to("verification_running")`` inside
+    the loop was refused on the ``execution`` marker and the round was
+    recorded failed in the same second it started.
+
+    Driven through the real function. The round loop exits at its
+    first statement via ``verification_cancel.is_cancelled`` — after
+    the phase entry under test, before any VP runs — so this costs one
+    no-op round and proves the entry, not a re-implementation of it.
+    """
+    import server
+    import verification_cancel
+    import verification_loop
+    from plan_state import _state_db_path
+
+    plan_id = "auto-verify-invariant"
+    plan_dir = _seed_illegal_phase_plan(tmp_path, plan_id, "executing")
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(exist_ok=True)
+
+    # The routing CAS opens the state db; point it at a hermetic one so
+    # a dev state.db is neither read nor written.
+    db = tmp_path / "state.db"
+    from state_machine.db.connection import open as _open_db
+    from state_machine.db.schema import migrate as _migrate
+    _c = _open_db(db)
+    _migrate(_c)
+    _c.close()
+    monkeypatch.setattr(server, "_state_db_path", lambda: db)
+    monkeypatch.setattr(server, "_plan_dir", lambda pid: plan_dir)
+
+    # Orchestrator construction is real; the VP cycle never runs.
+    monkeypatch.setattr(server, "create_coding_tool", lambda *a, **k: None)
+    monkeypatch.setattr(verification_cancel, "is_cancelled", lambda pid: True)
+
+    before = dict(server._verification_state)
+    try:
+        verification_loop._run_auto_verification_loop_inner(
+            plan_id, plan_dir, project_dir, max_rounds=1,
+        )
+    finally:
+        with server._verification_lock:
+            server._verification_state.clear()
+            server._verification_state.update(before)
+
+    ps = PlanState(plan_dir)
+    completed = ps.get_completed_phases()
+    assert "execution" in completed, (
+        "the auto-verification entry left the plan without the "
+        "'execution' marker, so transition_to('verification_running') "
+        "is refused and the round fails immediately: "
+        f"current_phase={ps.get_current_phase()!r} "
+        f"completed_phases={completed!r}"
+    )
+    assert "executing" in completed, (
+        f"the source phase was dropped: {completed!r}"
+    )
+    assert ps.get_current_phase() == "verification", (
+        f"the plan never entered verification: {ps.get_current_phase()!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # TDD spec 4: ``_persist_verification_terminal`` mid-loop guard
 # ---------------------------------------------------------------------------
 

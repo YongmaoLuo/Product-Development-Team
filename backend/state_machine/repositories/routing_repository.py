@@ -75,6 +75,63 @@ __all__ = [
 _MISSING = object()
 
 
+# Terminal phases — the same set as ``plan_state.TERMINAL_PHASES``;
+# deliberately duplicated here to avoid a circular import (plan_state
+# sits above the state-machine layer, which imports this repository).
+_TERMINAL_PHASES = {"completed", "failed", "stopped"}
+
+
+def _decode_completed_phases(raw: Any) -> list[str]:
+    """Decode the ``completed_phases`` column into a list of phases.
+
+    The column is free-form TEXT (whatever JSON the last writer left
+    behind), so an empty string / NULL / unparsable text all degrade
+    to ``[]`` — the same fallback ``PlanState._sqlite_row_to_state``
+    uses (plan_state.py:312).
+    """
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
+def _next_completed_phases(
+    current_phase: Optional[str],
+    new_phase: str,
+    completed: list[str],
+) -> list[str]:
+    """Return the ``completed_phases`` list after a phase transition.
+
+    Mirrors ``PlanState.transition_to`` (plan_state.py:602-613) rule
+    for rule and in the same order, so the routing row and the state
+    layer agree on the history:
+
+      1. the phase we are leaving is completed;
+      2. leaving ``executing`` for a ``verification*`` phase completes
+         ``execution``;
+      3. entering a terminal phase completes ``execution``.
+
+    Every append is idempotent — the list never gains a duplicate.
+    """
+    result = list(completed)
+    if current_phase and current_phase not in result:
+        result.append(current_phase)
+    if (
+        current_phase == "executing"
+        and new_phase.startswith("verification")
+        and "execution" not in result
+    ):
+        result.append("execution")
+    if new_phase in _TERMINAL_PHASES and "execution" not in result:
+        result.append("execution")
+    return result
+
+
 class ConflictError(Exception):
     """Raised by :meth:`RoutingRepository.try_mark_phase` on CAS failure.
 
@@ -429,6 +486,7 @@ class RoutingRepository:
         flags: dict,
         verification: dict,
         last_updated: Optional[str],
+        completed_phases_mode: str = "merge",
     ) -> None:
         """Write the ``PlanState``-owned columns.
 
@@ -468,58 +526,136 @@ class RoutingRepository:
         yet (a plan bootstrapped by a code path that skipped
         :meth:`insert`); it seeds ``version = 0`` and, when no ``phase``
         is given, the column default.
+
+        ``completed_phases`` is written as a MERGE by default
+        ------------------------------------------------
+        ``completed_phases_mode`` selects how the incoming list is
+        combined with what is already on the row:
+
+          * ``"merge"`` (the default) — the row keeps its existing
+            entries and gains the incoming entries it does not have
+            yet, in the incoming order, without duplicates.  The
+            existing entries keep their positions.
+          * ``"replace"`` — the incoming list overwrites the column
+            verbatim (the historical whole-column-overwrite
+            behaviour).
+
+        Why ``merge`` is the default: ``completed_phases`` is the
+        phase *history*, and a history is append-only.  The caller
+        here is a :class:`PlanState` instance, which caches the row it
+        loaded — so its in-memory ``completed_phases`` can be a stale
+        snapshot that predates an append another writer just made
+        (e.g. the routing CAS in :meth:`try_mark_phase`, which
+        maintains the very same ledger atomically with the phase it
+        moves).  A stale snapshot may only *add* the phases it knows
+        about; it must never delete history somebody else recorded.
+        Overwriting the column would silently drop those entries and
+        re-open the exact bug the CAS was introduced to close: a plan
+        whose ``execution`` marker disappears makes
+        ``PlanState.transition_to("verification_running")`` refuse the
+        transition and the round fail in the same second it started.
+
+        ``replace`` therefore exists only for the explicit
+        roll-back path (:meth:`plan_state.PlanState.reset_to`), where
+        dropping history is the *point* — the plan is being rewound to
+        an earlier phase and everything after it must be forgotten.
+        Every other caller keeps the default.
+
+        The read of the current value and the write that follows it
+        happen in the SAME ``_txn()`` transaction, so the merge is
+        computed against the committed state, not against a value
+        another writer could change underneath us.
         """
-        params = (
-            plan_id,
-            json.dumps(completed_phases),
-            json.dumps(review_rounds),
-            json.dumps(flags),
-            json.dumps(verification),
-            last_updated,
-            self._now_iso(),
-        )
-        _updates = (
-            " completed_phases = excluded.completed_phases,"
-            " review_rounds = excluded.review_rounds,"
-            " flags = excluded.flags,"
-            " verification = excluded.verification,"
-            " last_updated = excluded.last_updated,"
-            " updated_at = excluded.updated_at"
-        )
-        if phase is None:
-            # Metadata-only write: ``current_phase`` is absent from both
-            # the INSERT column list (the NOT NULL DEFAULT covers the
-            # bootstrap case) and the conflict arm.
-            sql = (
-                "INSERT INTO plan_routing ("
-                " plan_id, completed_phases, review_rounds, flags,"
-                " verification, last_updated, version, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, 0, ?) "
-                "ON CONFLICT(plan_id) DO UPDATE SET" + _updates
+        if completed_phases_mode not in ("merge", "replace"):
+            raise ValueError(
+                "completed_phases_mode must be 'merge' or 'replace'; "
+                f"got {completed_phases_mode!r}"
             )
-        else:
-            sql = (
-                "INSERT INTO plan_routing ("
-                " plan_id, completed_phases, review_rounds, flags,"
-                " verification, last_updated, version, current_phase,"
-                " updated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?) "
-                "ON CONFLICT(plan_id) DO UPDATE SET"
-                " current_phase = excluded.current_phase,"
-                + _updates
+        with self._txn():
+            merged = self._merge_completed_phases(
+                plan_id,
+                completed_phases,
+                completed_phases_mode,
             )
             params = (
                 plan_id,
-                json.dumps(completed_phases),
+                json.dumps(merged),
                 json.dumps(review_rounds),
                 json.dumps(flags),
                 json.dumps(verification),
                 last_updated,
-                phase,
                 self._now_iso(),
             )
-        with self._txn():
+            _updates = (
+                " completed_phases = excluded.completed_phases,"
+                " review_rounds = excluded.review_rounds,"
+                " flags = excluded.flags,"
+                " verification = excluded.verification,"
+                " last_updated = excluded.last_updated,"
+                " updated_at = excluded.updated_at"
+            )
+            if phase is None:
+                # Metadata-only write: ``current_phase`` is absent from
+                # both the INSERT column list (the NOT NULL DEFAULT
+                # covers the bootstrap case) and the conflict arm.
+                sql = (
+                    "INSERT INTO plan_routing ("
+                    " plan_id, completed_phases, review_rounds, flags,"
+                    " verification, last_updated, version, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, 0, ?) "
+                    "ON CONFLICT(plan_id) DO UPDATE SET" + _updates
+                )
+            else:
+                sql = (
+                    "INSERT INTO plan_routing ("
+                    " plan_id, completed_phases, review_rounds, flags,"
+                    " verification, last_updated, version, current_phase,"
+                    " updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?) "
+                    "ON CONFLICT(plan_id) DO UPDATE SET"
+                    " current_phase = excluded.current_phase,"
+                    + _updates
+                )
+                params = (
+                    plan_id,
+                    json.dumps(merged),
+                    json.dumps(review_rounds),
+                    json.dumps(flags),
+                    json.dumps(verification),
+                    last_updated,
+                    phase,
+                    self._now_iso(),
+                )
             self._conn.execute(sql, params)
+
+    def _merge_completed_phases(
+        self,
+        plan_id: str,
+        incoming: list,
+        mode: str,
+    ) -> list:
+        """Combine the on-disk history with ``incoming`` per ``mode``.
+
+        Must be called INSIDE the caller's ``_txn()`` — the read and
+        the write that uses its result have to see the same
+        transaction, otherwise the merge would be computed against a
+        value another writer could change in between.
+
+        A missing row reads as ``[]`` (the plan has no history yet).
+        """
+        cur = self._conn.execute(
+            "SELECT completed_phases FROM plan_routing WHERE plan_id = ?",
+            (plan_id,),
+        )
+        row = cur.fetchone()
+        existing = _decode_completed_phases(row[0]) if row is not None else []
+        if mode == "replace":
+            return list(incoming)
+        merged = list(existing)
+        for item in incoming:
+            if item not in merged:
+                merged.append(item)
+        return merged
 
     def try_mark_phase(
         self,
@@ -537,6 +673,13 @@ class RoutingRepository:
         ``version`` is incremented by 1.  On any failure mode
         (missing plan, predicate mismatch, version mismatch) the
         row is left untouched and an exception is raised.
+
+        The same statement also maintains ``completed_phases`` — the
+        phase history is derived from ``(current_phase, new_phase)``
+        with ``PlanState.transition_to``'s rules (plan_state.py:602
+        -613), so the routing row and the state layer cannot drift
+        apart.  A failed CAS writes nothing at all: ``completed_phases``
+        is left byte-for-byte identical.
 
         Returns
         -------
@@ -569,14 +712,15 @@ class RoutingRepository:
                 # ``BEGIN IMMEDIATE`` no other writer can sneak in
                 # between this SELECT and the UPDATE below.
                 cur = c.execute(
-                    "SELECT current_phase, version FROM plan_routing "
-                    "WHERE plan_id = ?",
+                    "SELECT current_phase, version, completed_phases "
+                    "FROM plan_routing WHERE plan_id = ?",
                     (plan_id,),
                 )
                 row = cur.fetchone()
                 if row is None:
                     raise PlanNotFoundError(plan_id)
                 current_phase, current_version = row[0], int(row[1])
+                completed_phases = _decode_completed_phases(row[2])
 
                 # Step 2: predicate check.
                 if current_phase not in expected_phases:
@@ -607,16 +751,28 @@ class RoutingRepository:
                 # a future refactor drops ``BEGIN IMMEDIATE`` the row
                 # is still safe.
                 new_version = current_version + 1
+                # The phase history is maintained in the SAME
+                # transaction and the SAME statement as the phase CAS,
+                # so "the phase moved" and "the history was recorded"
+                # can no longer diverge.  The rules are
+                # ``PlanState.transition_to``'s (plan_state.py:602-613),
+                # copied verbatim so the two layers cannot disagree.
+                new_completed_phases = _next_completed_phases(
+                    current_phase,
+                    new_phase,
+                    completed_phases,
+                )
                 cur = c.execute(
                     "UPDATE plan_routing "
                     "SET current_phase = ?, substage = ?, version = ?, "
-                    "updated_at = ? "
+                    "updated_at = ?, completed_phases = ? "
                     "WHERE plan_id = ? AND version = ?",
                     (
                         new_phase,
                         substage,
                         new_version,
                         self._now_iso(),
+                        json.dumps(new_completed_phases),
                         plan_id,
                         current_version,
                     ),

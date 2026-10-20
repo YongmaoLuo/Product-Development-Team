@@ -3809,6 +3809,21 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
             return
         _init_verification_state(plan_id, max_rounds)
 
+    # Materialise the plan state BEFORE the routing CAS below.
+    #
+    # The CAS operates on the ``plan_routing`` row, and that row comes
+    # into existence through the PlanState write path (the INSERT arm
+    # of ``RoutingRepository.write_plan_state``).  A plan that only
+    # has a legacy ``plan_state.json`` — an imported plan — has no
+    # routing row until a PlanState writes one, and the CAS would then
+    # find nothing to move (``PlanNotFoundError``) and the phase
+    # history would go unmaintained.
+    #
+    # The history itself is NOT maintained here: the CAS below owns it
+    # and writes ``completed_phases`` in the SAME statement that moves
+    # the phase.  This call only makes the row exist.
+    _server.PlanState(plan_dir)
+
     # 2026-09-11 plan v9 (Bug 2 fix): CAS ``plan_routing.current_phase``
     # from ``executing`` (or ``ready`` for the partial-completion
     # edge case) into ``verification``. Without this CAS the routing
