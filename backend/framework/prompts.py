@@ -13,9 +13,9 @@ import it. Both shapes create coupling problems:
 * **Duplicate copies** drift. The pre-2026-09-04 status quo had two
   copies of the spec/code-review prompt — one in ``agent.py`` (used
   by ``agent._inline_spec_code_review``) and one in
-  ``verification_agent.py`` (used by
-  ``verification_agent._supplement_spec_code_review``). They were
-  supposed to be identical but were prone to drift.
+  ``verification_agent.py`` (a judgment-phase per-VP supplement
+  review that has since been removed). They were supposed to be
+  identical but were prone to drift.
 
 * **Sideways imports** form hidden cycles. The previous mitigation
   was a lazy ``from agent import INLINE_SPEC_CODE_REVIEW_PROMPT``
@@ -34,9 +34,8 @@ because ``framework.prompts`` depends on neither.
 Contents
 --------
 * :data:`INLINE_SPEC_CODE_REVIEW_PROMPT` — the spec/code-review
-  prompt used by both ``agent._inline_spec_code_review`` (pre-commit
-  hook) and ``verification_agent._supplement_spec_code_review``
-  (DP3 action item 2). Format placeholders are
+  prompt used by ``agent._inline_spec_code_review`` (pre-commit
+  hook). Format placeholders are
   ``{task_desc}`` and ``{git_diff_stat}``.
 
 Adding new shared prompts
@@ -56,11 +55,8 @@ __all__ = ["INLINE_SPEC_CODE_REVIEW_PROMPT"]
 
 #: Inline spec / code review prompt (DP3).
 #:
-#: Used by both ``agent._inline_spec_code_review`` (pre-commit
-#: adversarial self-check) and
-#: ``verification_agent._supplement_spec_code_review`` (DP3 action
-#: item 2: judgment-phase per-VP supplement review). The two call
-#: sites format it with the same two kwargs::
+#: Used by ``agent._inline_spec_code_review`` (pre-commit
+#: adversarial self-check). It is formatted with two kwargs::
 #:
 #:     INLINE_SPEC_CODE_REVIEW_PROMPT.format(
 #:         task_desc=...,

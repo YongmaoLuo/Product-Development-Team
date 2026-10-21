@@ -8,7 +8,7 @@ becomes both the adaptive-silence cap and the wall-clock guard for that
 call). So a magic number written at a call site silently overrides the
 900s-silence / 1800s-idle / 1-hour-ceiling design.
 
-Live damage this rule prevents: ``timeout=60`` on the per-VP supplement
+Live damage this rule prevents: ``timeout=60`` on the old per-VP supplement
 review turned healthy Vendor A responses into 17/30 silent degradations
 on a production plan — each failure burned ~3 minutes across the provider
 failover while CC Switch recorded 100% success on the provider side

@@ -1132,7 +1132,7 @@ class CodingTool(ABC):
     # ``query(..., timeout=N)`` REPLACES these windows rather than nesting
     # inside them: N becomes both the adaptive silence cap and the
     # wall-clock guard for that call. That is how healthy-but-slow calls
-    # died early — e.g. ``timeout=60`` on the VP supplement review turned
+    # died early — e.g. ``timeout=60`` on the old per-VP supplement review turned
     # a working Vendor A response into 17/30 silent degradations on the
     # a production plan (CC Switch logged 100% provider success throughout: we
     # were aborting our own requests). Callers should therefore OMIT

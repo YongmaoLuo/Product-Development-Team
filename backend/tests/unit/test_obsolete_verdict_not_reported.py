@@ -4,7 +4,7 @@
 round 4). The plan marked VP-009 ``obsolete: true`` / ``obsoleted_round: 3``.
 The execution side honoured that — ``_build_items_from_plan`` drops retired
 VPs, and round 4's log contains **no** execution event for VP-009, only one
-``judgment_heartbeat`` from the Phase-3 supplement review.
+``judgment_heartbeat`` from the (since-removed) Phase-3 supplement review.
 
 The verdict side did not. The round-3 verdict map lives in SQLite
 (``plan_verification.verdicts``), and ``VerificationAgent.
