@@ -5,7 +5,7 @@ Architecture context
 --------------------
 Architecture review finding (2026-09-04): ``verification_agent.py`` did a
 lazy ``from agent import INLINE_SPEC_CODE_REVIEW_PROMPT`` inside
-``_supplement_spec_code_review`` to avoid a hard coupling. That cycle
+its own review helper to avoid a hard coupling. That cycle
 breaks if ``agent`` is imported before ``verification_agent`` registers
 the symbol, and it forces every test that touches the prompt to import
 ``agent`` (and all of its transitive imports).
@@ -21,9 +21,8 @@ These tests pin the contract for the new module:
      ``INLINE_SPEC_CODE_REVIEW_PROMPT``.
   2. The constant is a non-empty ``str``.
   3. The constant contains both ``{task_desc}`` and ``{git_diff_stat}``
-     placeholders that ``.format(...)`` consumes at call sites in
-     ``agent._inline_spec_code_review`` and
-     ``verification_agent._supplement_spec_code_review``.
+     placeholders that ``.format(...)`` consumes at the call site in
+     ``agent._inline_spec_code_review``.
   4. ``format(task_desc=..., git_diff_stat=...)`` returns a ``str``
      that does NOT still contain any leftover ``{...}`` placeholder.
   5. The constant's body references the four envelope fields the LLM
@@ -117,8 +116,7 @@ def test_inline_spec_code_review_prompt_enumerates_envelope_fields():
     """The prompt lists the four envelope fields the LLM must emit.
 
     This protects against a refactor that drops one of them (the LLM
-    parser in ``agent._inline_spec_code_review`` and
-    ``verification_agent._supplement_spec_code_review`` reads exactly
+    parser in ``agent._inline_spec_code_review`` reads exactly
     these four keys).
     """
     mod = _import_fresh_prompts_module()

@@ -1,8 +1,8 @@
 """2026-09-14 裁决阶段心跳 —— 让"在工作"这件事对看门狗可见。
 
 现象（round 3）: 最后一个 VP 报完
-``vp_complete`` 之后，round 进入 Phase 3 裁决（一次报告判定 LLM 调用 +
-逐 VP 的补充 spec/code review），**整个阶段不写 plan 目录任何日志**。
+``vp_complete`` 之后，round 进入 Phase 3 裁决（一次报告判定 LLM 调用），
+**整个阶段不写 plan 目录任何日志**。
 于是 3600s 阈值的 stale 检查会把一个健康、正在干活的 round 判成
 ``verification_log_stale`` 并终结。看门狗的陈旧信号只和它读的日志一样
 可靠 —— 所以裁决阶段现在自己保持那份日志新鲜。
@@ -10,8 +10,7 @@
 覆盖:
   * 心跳事件真的写进 round log（event_type=judgment_heartbeat）；
   * 写入失败（persistence 未 start_round）绝不抛，不拖垮裁决；
-  * 报告判定重试循环每次尝试前都打心跳；
-  * 逐 VP 的补充审查每个 VP 都打心跳。
+  * 报告判定重试循环每次尝试前都打心跳。
 """
 
 from __future__ import annotations
@@ -126,29 +125,3 @@ def test_report_judgment_heartbeats_every_attempt(tmp_path):
     assert beats.count("report_judgment") >= 2, (
         f"one heartbeat per judgment attempt expected; got {beats}"
     )
-
-
-def test_supplement_review_heartbeats_per_vp(tmp_path):
-    agent = _make_real_agent(tmp_path)
-    beats: list = []
-    original = agent._judgment_heartbeat
-
-    def _spy(stage, vp_id=""):
-        beats.append((stage, vp_id))
-        return original(stage, vp_id)
-
-    agent._judgment_heartbeat = _spy  # type: ignore[method-assign]
-    agent.coding_tool.query.side_effect = RuntimeError("provider down")
-    agent.logger = Mock()
-
-    agent._supplement_spec_code_review({
-        "verification_points": [
-            {"id": "VP-001", "title": "a"},
-            {"id": "VP-002", "title": "b"},
-        ],
-    })
-
-    stages = [s for s, _ in beats]
-    vps = [v for _, v in beats]
-    assert stages.count("supplement_review") == 2
-    assert vps == ["VP-001", "VP-002"]
