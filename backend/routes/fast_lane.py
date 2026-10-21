@@ -63,12 +63,16 @@ from pydantic import BaseModel
 
 from fast_lane import (
     import_payload_summary,
+    read_import_session,
     store_import_payload,
+    store_import_session,
     validate_tasks,
 )
+from coding_tool import JsonSession
 from framework.ids import derive_plan_id
+from framework.task_graph import DanglingTaskDependency
 from task import SubTask
-from task_manager import TaskManager
+from task_manager import CycleInTaskGraph, TaskManager
 from tasks_generator import TasksGenerationError, TasksGenerator
 
 # Late binding into the application module: ``server`` owns the shared
@@ -102,6 +106,24 @@ class ImportPlanRequest(BaseModel):
     tasks: Any = None
     raw: Any = None
     requirement: Any = None
+
+
+class RevisePlanRequest(BaseModel):
+    """Body of ``POST /api/plan/{plan_id}/revise``.
+
+    ``feedback`` is the caller's note about the task list as a whole —
+    the reason this door exists. It is required and must not be empty:
+    a revision with nothing to say is not a revision, and treating it as
+    one would ask the model to redo the list for no reason and charge
+    the caller for the answer.
+
+    ``content`` optionally replaces the imported material, so a caller
+    who also has new upstream material hands it over in the same round
+    trip. It is stored verbatim, exactly as the import stores its own.
+    """
+
+    feedback: Optional[str] = None
+    content: Any = None
 
 
 #: Order in which the aliases are consulted. First one that is not ``None``
@@ -274,8 +296,13 @@ def import_plan(req: ImportPlanRequest):
         import_mode=True,
         import_project_dir=project_dir,
     )
+    # The conversation this import runs in. Created here rather than
+    # inside the generator because the lane has to remember it: a later
+    # revision of this plan is a follow-up question in the same
+    # conversation, not a fresh interview of the same material.
+    session = JsonSession()
     try:
-        tasks_data = generator.generate()
+        tasks_data = generator.generate(session=session)
     except TimeoutError as exc:
         _server.logger.warning("Fast lane import timed out: %s", exc)
         raise HTTPException(
@@ -350,12 +377,272 @@ def import_plan(req: ImportPlanRequest):
 
     written = _persist_tasks(plan_dir, seed, tasks_data)
     _mark_ready(plan_id, plan_dir)
+    # Remember the conversation the import ran in, so a later revision
+    # of this plan resumes it instead of starting over. Written last:
+    # a plan that never reached ``ready`` has nothing to revise.
+    store_import_session(plan_dir, session.session_id)
 
     return {
         "plan_id": plan_id,
         "source_field": payload_field,
         "tasks": written,
         "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The lane's second door: revise an imported plan's whole task list
+# ---------------------------------------------------------------------------
+
+
+def _read_tasks_file(tasks_file: Path) -> Dict[str, Any]:
+    """The plan's stored task list, as the revision's starting point.
+
+    Read defensively: a file that is not a JSON object has no list to
+    revise, and the caller is told the same thing a plan without a
+    ``tasks.json`` is told — there is nothing here to revise.
+    """
+    try:
+        data = json.loads(tasks_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            409,
+            {
+                "error": "this plan has no tasks to revise",
+                "detail": str(exc),
+            },
+        )
+    if not isinstance(data, dict):
+        raise HTTPException(
+            409,
+            {"error": "this plan has no tasks to revise"},
+        )
+    return data
+
+
+def _plan_project_dir(tasks_data: Dict[str, Any]) -> str:
+    """The checkout this plan's tasks target, read off the stored list.
+
+    The revise request carries no ``project_dir``: the plan already has
+    one, and a revision that retargeted the plan at a different checkout
+    would be a change nobody asked for. The audit below then checks the
+    revised list against exactly this directory, so a task that points
+    somewhere else is reported rather than quietly accepted.
+    """
+    tasks = tasks_data.get("tasks")
+    if not isinstance(tasks, list):
+        return ""
+    for task in tasks:
+        if isinstance(task, dict):
+            own = str(task.get("project_dir") or "").strip()
+            if own:
+                return own
+    return ""
+
+
+def _persist_revised_tasks(
+    plan_dir: Path,
+    tasks_data: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Write the revised list back through the writer the import used.
+
+    ``TaskManager`` is built on the plan directory, so it loads the
+    envelope the plan already has — ``requirement`` / ``stop_reason`` /
+    ``reason_detail`` — and only the task list is replaced. The caller
+    gave feedback about the tasks, not about the plan's identity, so
+    the requirement stays what the import wrote.
+
+    The response payload is read back off disk rather than rebuilt from
+    the in-memory models, for the same reason the import route reads it
+    back: ``save_tasks`` strips the runtime fields on its way out, and
+    rebuilding that strip list here would be a second copy of a rule
+    that already lives in the writer.
+    """
+    manager = TaskManager(plan_dir)
+    manager.tasks = [SubTask(**item) for item in tasks_data.get("tasks", [])]
+    manager.save_tasks()
+    saved = json.loads((plan_dir / "tasks.json").read_text(encoding="utf-8"))
+    return list(saved.get("tasks", []))
+
+
+@router.post("/api/plan/{plan_id}/revise")
+def revise_plan(plan_id: str, req: RevisePlanRequest):
+    """Revise an imported plan's whole task list, in place.
+
+    The lane's second door. ``POST /api/plan/import`` is the way in;
+    this is the way to say "not quite" about what came out. The plan
+    keeps its directory, its phase and its execution state — only the
+    task list is replaced, and only after the replacement passes the
+    same audit the import applied. A rejected revision leaves the plan
+    exactly as it was: the generator's writes are deferred until the
+    result has been audited and accepted.
+    """
+    feedback = (req.feedback or "").strip()
+    if not feedback:
+        raise HTTPException(
+            400,
+            {
+                "error": "Invalid revise request",
+                "problems": [
+                    "feedback is required: send a non-empty note about the "
+                    "task list you want changed"
+                ],
+            },
+        )
+
+    plan_dir = _server._plan_dir(plan_id)
+    if not plan_dir.exists():
+        raise HTTPException(
+            404,
+            {"error": "Plan not found", "plan_id": plan_id},
+        )
+
+    tasks_file = plan_dir / "tasks.json"
+    if not tasks_file.exists():
+        raise HTTPException(
+            409,
+            {
+                "error": "this plan has no tasks to revise",
+                "plan_id": plan_id,
+            },
+        )
+
+    # New upstream material, if the caller sent any: the revision is
+    # audited against the same ``import.json`` the import was, so it has
+    # to be replaced before the model is asked.
+    if req.content is not None:
+        store_import_payload(plan_dir, req.content)
+
+    existing = _read_tasks_file(tasks_file)
+    project_dir = _plan_project_dir(existing)
+
+    # The conversation the import ran in, if there was one. A revision
+    # in the same session is a follow-up question about a list the model
+    # has already seen; a revision in a new one is a fresh interview
+    # that has to be told what the list looks like.
+    session_id = read_import_session(plan_dir)
+    session = JsonSession(session_id)
+    session_reused = bool(session_id)
+
+    coding_tool = _server.create_coding_tool(scene="tasks_generation")
+    generator = TasksGenerator(
+        coding_tool, plan_dir,
+        self_review_enabled=True,
+        import_mode=True,
+        import_project_dir=project_dir,
+    )
+    try:
+        tasks_data = generator.revise_from_feedback(session, feedback)
+    except TimeoutError as exc:
+        _server.logger.warning("Fast lane revise timed out: %s", exc)
+        raise HTTPException(
+            504,
+            {
+                "error": "Fast lane revise timed out",
+                "detail": str(exc),
+                "plan_id": plan_id,
+                "retry_after": 60,
+            },
+        )
+    except TasksGenerationError as exc:
+        # Same mapping as the import: the model mis-fired (0 tasks) or a
+        # post-generation gate rejected the list. The plan's own list is
+        # untouched — the generator's writes are deferred.
+        _server.logger.warning(
+            "Fast lane revise generation failed for plan %s: %s", plan_id, exc
+        )
+        raise HTTPException(
+            422,
+            {
+                "error": "Tasks revision failed",
+                "detail": str(exc),
+                "error_payload": exc.error_payload,
+                "plan_id": plan_id,
+                "retry_hint": (
+                    "Re-run POST /api/plan/{plan_id}/revise with the same "
+                    "feedback; the plan's task list is unchanged."
+                ),
+            },
+        )
+    except RuntimeError as exc:
+        # The mandatory self-review could not produce an applicable
+        # rewrite. Same class of failure as above, and the same
+        # consequence: the plan still runs the list it ran before.
+        _server.logger.warning(
+            "Fast lane revise self-review failed for plan %s: %s", plan_id, exc
+        )
+        raise HTTPException(
+            422,
+            {
+                "error": "Tasks revision failed",
+                "detail": str(exc),
+                "plan_id": plan_id,
+            },
+        )
+
+    problems = validate_tasks(tasks_data, project_dir)
+    if problems:
+        raise HTTPException(
+            400,
+            {
+                "error": "Revised task list is not a runnable plan",
+                "problems": problems,
+                "plan_id": plan_id,
+            },
+        )
+
+    # The two gates the import route runs, on the same terms: the
+    # revised list has to be as runnable as an imported one, or the
+    # caller is told why instead of finding out at dispatch time.
+    try:
+        tasks_data = generator.validate_workspace(
+            tasks_data, search_dirs=None,
+            formal_repo_dir=_server._PROJECT_ROOT,
+        )
+        tasks_data = generator.harden_for_execution(tasks_data)
+    except TasksGenerationError as exc:
+        _server.logger.warning(
+            "Fast lane revise hardening failed for plan %s: %s", plan_id, exc
+        )
+        raise HTTPException(
+            400,
+            {
+                "error": "Revised tasks are not runnable",
+                "detail": str(exc),
+                "problems": [str(exc)],
+                "plan_id": plan_id,
+            },
+        )
+
+    try:
+        written = _persist_revised_tasks(plan_dir, tasks_data)
+    except (CycleInTaskGraph, DanglingTaskDependency) as exc:
+        # The writer's own graph guard, which the audit above already
+        # applies — a disagreement between the two is a bug, and the
+        # plan's list is still the old one either way.
+        _server.logger.warning(
+            "Fast lane revise refused by the task graph guard for plan %s: %s",
+            plan_id, exc,
+        )
+        raise HTTPException(
+            400,
+            {
+                "error": "Revised task list is not a runnable plan",
+                "problems": [str(exc)],
+                "plan_id": plan_id,
+            },
+        )
+
+    # The conversation may have moved (a provider fallback can switch
+    # sessions mid-answer), so what is remembered is the id the last
+    # answer actually came from.
+    store_import_session(plan_dir, session.session_id)
+
+    return {
+        "plan_id": plan_id,
+        "tasks": written,
+        "revised": True,
+        "session_reused": session_reused,
     }
 
 

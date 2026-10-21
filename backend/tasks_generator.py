@@ -620,6 +620,35 @@ IMPORT_MODE_USER_PROMPT = (
     "以它为唯一需求来源，不要索要或假设存在其它上游文档。"
 )
 
+#: The fast lane's revision prompt — the second door, where the question
+#: is not "what should the plan be" but "this plan, changed this way".
+#:
+#: It names the list as it stands and the caller's note about it, and asks
+#: for the **whole** list back. The two things it forbids are the two
+#: ways a revision goes wrong: a diff (which is not a task list) and a
+#: partial list (which silently drops the tasks the caller did not
+#: complain about, and the executor schedules by id).
+#:
+#: The system side is not repeated here — it is the import system's, and
+#: the schema a revised list obeys is the schema the first one obeyed.
+REVISION_USER_PROMPT_TEMPLATE = """你正在修订一份已经生成好的任务列表（同一个 plan 的 tasks.json）。
+
+## 现有任务列表（JSON）
+{existing_json}
+
+## 调用方对整篇任务列表的反馈
+{feedback}
+
+## 修订要求（CRITICAL）
+- 按上面的反馈修改任务列表；反馈没有提到的部分保持原样。
+- 输出**完整的**修订后任务列表：一个 JSON 对象，schema 与系统提示里的完全一致
+  （requirement + tasks[]）。
+- 不要只输出 diff / 变更片段，不要省略未改动的任务，不要用"其余不变"之类的省略写法。
+- 任务的 id 保持稳定：未改动的任务沿用原来的 id；只有反馈明确要求删除的任务才可以去掉。
+- depends_on / files_to_modify / test_command 必须自洽：被引用的 id 必须在列表里。
+- 只输出 JSON，不要输出解释文字。
+"""
+
 
 TASKS_SYSTEM_PROMPT = """你是一位资深技术架构师。根据 PRD 文档生成开发任务列表。
 ## 时间预算规则（CRITICAL）
@@ -981,8 +1010,15 @@ class TasksGenerator:
         self.review_file = plan_dir / "review.json"
         self.import_file = plan_dir / IMPORT_PAYLOAD_FILENAME
         self.tasks_file = plan_dir / "tasks.json"
+        #: When True, the pipeline's writes to ``tasks.json`` are skipped
+        #: and only the in-memory dict moves. The revise path sets it:
+        #: the plan's list is what the plan runs, so a revision that
+        #: fails its audit must leave the file exactly as it was — the
+        #: caller writes the accepted result instead, through
+        #: ``TaskManager.save_tasks``.
+        self._defer_tasks_writes = False
 
-    def generate(self) -> dict:
+    def generate(self, session: Optional["JsonSession"] = None) -> dict:
         """Generate tasks.json, from the PRD or from imported material.
 
         Two front doors, one pipeline. The generated plan runs the DP2
@@ -1005,6 +1041,16 @@ class TasksGenerator:
 
         Returns:
             Generated tasks dict.
+
+        Args:
+            session: the reusable conversation handle to run in. ``None``
+                — the default, and what every pre-existing caller gets —
+                means "make a fresh one", which is what this method
+                always did on its own. A caller that wants the
+                conversation to outlive the call (the fast lane's revise
+                path, which resumes the session the import ran in)
+                passes its own handle; the id the run actually used is
+                left on it, so the caller can persist it.
 
         Raises:
             PreflightFailedError: when the cross-document preflight
@@ -1035,8 +1081,12 @@ class TasksGenerator:
         # conversation instead of each re-reading the upstream material
         # that every one of their prompts names. Created before the first
         # dispatch, and scoped to this call: a later regeneration of the
-        # same plan is a different conversation.
-        session = JsonSession()
+        # same plan is a different conversation — unless the caller
+        # brought a handle, in which case this run *is* that
+        # conversation (the fast lane's revise path hands over the
+        # session its import ran in).
+        if session is None:
+            session = JsonSession()
 
         tasks_data = self._generate_with_prompt(
             prompt, system_instruction, session,
@@ -1051,6 +1101,159 @@ class TasksGenerator:
             self._backfill_import_project_dir(tasks_data)
 
         return tasks_data
+
+    def revise_from_feedback(
+        self,
+        session: "JsonSession",
+        feedback: str,
+    ) -> Dict[str, Any]:
+        """Revise the whole task list, in the caller's own session.
+
+        The fast lane's second door. :meth:`generate` asks a model to
+        turn upstream material into a task list; this asks the same
+        model to turn a *note about the list it already produced* into a
+        new one. Same constraints, same gates, same pipeline — only the
+        question differs, so the model is shown the list as it stands
+        plus the note, and is asked for the **whole** list back. A diff
+        is not a task list, and a partial list would silently drop the
+        tasks the caller did not complain about.
+
+        The conversation is the caller's: ``session`` is the handle the
+        import ran in, so the model already has the material and the
+        list in front of it and the revision is a follow-up question
+        rather than a fresh interview.
+
+        Nothing is written to ``tasks.json`` here. The plan's list is
+        what the plan runs, and a revision that failed its audit must
+        leave it exactly as it was — so the pipeline's writes are
+        deferred and the caller writes the accepted result through
+        ``TaskManager.save_tasks``, the same writer the import used.
+
+        Args:
+            session: the reusable conversation handle. Required: a
+                revision without the original conversation would have to
+                re-read everything the import already read, and the
+                whole point of the lane is that it does not.
+            feedback: the caller's note about the list as a whole.
+
+        Returns:
+            The revised tasks dict, after every gate has passed.
+
+        Raises:
+            TasksGenerationError: when there is no list to revise, or a
+                post-generation gate rejected the revision.
+        """
+        existing = self._read_existing_tasks()
+        prompt, system_instruction = self._build_revision_prompts(
+            existing, feedback,
+        )
+
+        # Defer every write the pipeline would make. The on-disk list is
+        # the plan's, and only the caller — after it has audited the
+        # result — may replace it.
+        self._defer_tasks_writes = True
+        try:
+            tasks_data = self._generate_with_prompt(
+                prompt, system_instruction, session,
+            )
+        finally:
+            self._defer_tasks_writes = False
+
+        if self.import_mode:
+            # The same backfill the import path applies: a revised task
+            # that left ``project_dir`` out still has to target the
+            # plan's checkout, or the plan runs against the wrong
+            # directory.
+            self._backfill_import_project_dir(tasks_data)
+
+        return tasks_data
+
+    def _read_existing_tasks(self) -> Dict[str, Any]:
+        """The plan's current task list, as the revision's starting point.
+
+        Read from ``self.tasks_file`` — the same file the executor reads
+        — rather than from a caller-supplied copy, so the revision is
+        always about the list that is actually on disk.
+        """
+        try:
+            raw = self.tasks_file.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise TasksGenerationError(
+                f"no tasks to revise: {self.tasks_file} does not exist"
+            ) from exc
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise TasksGenerationError(
+                f"tasks.json is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise TasksGenerationError(
+                "tasks.json is not a JSON object — nothing to revise"
+            )
+        return data
+
+    def _build_revision_prompts(
+        self,
+        existing: Dict[str, Any],
+        feedback: str,
+    ) -> Tuple[str, str]:
+        """Prompt pair for a whole-list revision.
+
+        The system side is the import system's, unchanged: the schema a
+        revised list must obey is the schema the first list obeyed, and
+        a revision answered to a weaker schema would be a plan the
+        executor cannot schedule. The user side carries the two things
+        the model cannot guess — the list as it stands, and the note
+        about it — and asks for the whole list back.
+        """
+        existing_json = json.dumps(existing, ensure_ascii=False, indent=2)
+        prompt = REVISION_USER_PROMPT_TEMPLATE.format(
+            existing_json=existing_json,
+            feedback=feedback,
+        )
+        return prompt, self._import_system_instruction()
+
+    def _import_system_instruction(self) -> str:
+        """The import mode's system prompt: schema + rules, unchanged.
+
+        Split out of :meth:`_build_import_prompts` so the revision path
+        asks for the *same* constraints rather than a paraphrase of
+        them: a revised list is a task list, and the rules that make a
+        task list schedulable do not depend on how it came to be.
+        """
+        from llm_prompts import append_json_output_contract
+
+        system_instruction = f"{IMPORT_MODE_SYSTEM_PREAMBLE}\n\n{TASKS_SYSTEM_PROMPT}"
+        workspace_dir = (self.import_project_dir or "").strip()
+        if workspace_dir:
+            system_instruction = (
+                f"{system_instruction}\n\n"
+                + MULTI_WORKSPACE_PROMPT_TEMPLATE.format(
+                    workspaces=f"- `{workspace_dir}`"
+                )
+            )
+        else:
+            system_instruction = f"{system_instruction}\n\n{NO_WORKSPACE_PROMPT}"
+        return append_json_output_contract(system_instruction)
+
+    def _write_tasks_file(
+        self,
+        payload: Dict[str, Any],
+        encoding: Optional[str] = None,
+    ) -> None:
+        """Write ``payload`` to ``self.tasks_file`` — unless deferred.
+
+        Every write of the plan's task list goes through here, so the
+        revise path has exactly one switch to turn: with
+        ``_defer_tasks_writes`` set, the file is left alone and only the
+        in-memory dict moves, which is what lets a failed revision leave
+        the plan's list byte-for-byte as it was.
+        """
+        if self._defer_tasks_writes:
+            return
+        with open(self.tasks_file, "w", encoding=encoding) as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
 
     def _generate_with_prompt(
         self,
@@ -1240,8 +1443,7 @@ class TasksGenerator:
                 "tasks": [],
             }
             self.plan_dir.mkdir(parents=True, exist_ok=True)
-            with open(self.tasks_file, "w") as f:
-                json.dump(error_payload, f, indent=2, ensure_ascii=False)
+            self._write_tasks_file(error_payload)
             raise TasksGenerationError(
                 "LLM returned 0 tasks; re-run the endpoint to retry. "
                 "See tasks.json's `error` field for the raw LLM "
@@ -1250,8 +1452,7 @@ class TasksGenerator:
 
         # Save to plan directory (CANONICAL — single source of truth)
         self.plan_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.tasks_file, "w") as f:
-            json.dump(tasks_data, f, indent=2, ensure_ascii=False)
+        self._write_tasks_file(tasks_data)
 
         # -- DP0: end-to-end verification task gate (CRITICAL) ----------
         # Trigger: this plan touches data sources, UI, or API surface
@@ -1280,8 +1481,7 @@ class TasksGenerator:
                 "raw_llm_response_preview": json.dumps(tasks_data, ensure_ascii=False)[:2000],
                 "tasks": tasks_data.get("tasks", []),
             }
-            with open(self.tasks_file, "w") as f:
-                json.dump(error_payload, f, indent=2, ensure_ascii=False)
+            self._write_tasks_file(error_payload)
             raise
 
         # -- DP1: mandatory second-pass self-review on tasks.json ---------
@@ -1346,21 +1546,7 @@ class TasksGenerator:
         prompt_parts.append(IMPORT_MODE_USER_PROMPT.strip())
         prompt = "\n\n".join(prompt_parts)
 
-        from llm_prompts import append_json_output_contract
-
-        system_instruction = f"{IMPORT_MODE_SYSTEM_PREAMBLE}\n\n{TASKS_SYSTEM_PROMPT}"
-        workspace_dir = (self.import_project_dir or "").strip()
-        if workspace_dir:
-            system_instruction = (
-                f"{system_instruction}\n\n"
-                + MULTI_WORKSPACE_PROMPT_TEMPLATE.format(
-                    workspaces=f"- `{workspace_dir}`"
-                )
-            )
-        else:
-            system_instruction = f"{system_instruction}\n\n{NO_WORKSPACE_PROMPT}"
-        system_instruction = append_json_output_contract(system_instruction)
-        return prompt, system_instruction
+        return prompt, self._import_system_instruction()
 
     def _build_plan_prompts(self) -> Tuple[str, str]:
         """Prompt pair for a generated plan: PRD + arch + test design.
@@ -2053,8 +2239,7 @@ class TasksGenerator:
         if "requirement" in rewritten and rewritten["requirement"]:
             merged["requirement"] = rewritten["requirement"]
 
-        with open(self.tasks_file, "w", encoding="utf-8") as f:
-            json.dump(merged, f, indent=2, ensure_ascii=False)
+        self._write_tasks_file(merged, encoding="utf-8")
 
         # Reflect the rewrite in the in-memory dict so the caller
         # of ``generate()`` sees the post-fix tasks.
