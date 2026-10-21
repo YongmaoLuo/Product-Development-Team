@@ -4680,7 +4680,8 @@ class ClaudeCodingTool(CodingTool):
                               data={"tool": "claude", "prompt_len": prompt_len, "timeout": timeout,
                                     "model": self.model, "model_type": self.model_type, "mode": "interactive"})
 
-        def _call(excluded=None, total_timeout=None, resume=False):
+        def _call(excluded=None, total_timeout=None, resume=False,
+                   switch=False):
             """One dispatch of this prompt; returns the assistant text.
 
             ``resume=False`` opens a fresh session under a pinned id;
@@ -4688,10 +4689,21 @@ class ClaudeCodingTool(CodingTool):
             was using. Either way ``pinned_session_id`` names the
             session this dispatch ran in, because the timeout handler
             below can only resume a session whose id it has.
+
+            ``switch=True`` marks the dispatch as a *provider switch*
+            rather than a *re-ask*. The two look alike from here — both
+            re-open a session — but they differ in what the restored
+            conversation already contains: a re-ask carries a prompt the
+            transcript has never seen, while a switch carries the very
+            prompt the failed attempt already sent. On the switch the
+            prompt is therefore already in the conversation, and
+            re-sending it would pay for the same tokens twice. The
+            switch says "continue" and lets the transcript supply the
+            ask; the re-ask says "here is the new request" and sends it.
             """
             nonlocal pinned_session_id
             if resume:
-                if from_handle:
+                if from_handle and not switch:
                     # Re-ask: the caller's loop ran here last round and
                     # the prompt has moved on since (the user's reply,
                     # the reason the last answer was rejected). Send the
@@ -4921,7 +4933,25 @@ class ClaudeCodingTool(CodingTool):
                             "excluded_after_failure": new_excluded,
                         },
                     )
-                return _call(excluded=new_excluded)
+                # Same contract as the timeout arm above: the retry
+                # resumes the session this attempt was using instead of
+                # paying for the whole prompt again from the top. A
+                # capacity error (429/402/503/529) is the case where
+                # this matters most — the sub-agent may be tens of
+                # turns into the task (observed: 52 rounds / 38 min),
+                # and re-sending the prompt from nothing burns every
+                # one of those tokens a second time.
+                #
+                # ``switch=True``: the prompt this dispatch carries is
+                # the very prompt the failed attempt already sent, so
+                # the restored conversation contains it and re-sending
+                # it would pay for it twice. Without this the switch
+                # inherited the caller's *re-ask* text, and a caller
+                # holding a reusable session (the executor's
+                # ``query_in_session``) had its whole task prompt
+                # re-sent on every capacity error — the exact waste
+                # this switch exists to avoid.
+                return _call(excluded=new_excluded, resume=True, switch=True)
             raise
         except Exception as e:
             duration = int(time.monotonic() - start_time)
@@ -5039,13 +5069,22 @@ class ClaudeCodingTool(CodingTool):
         pinned: List[Optional[str]] = [None]
 
         def _query_json_internal(excluded=None, total_timeout=None,
-                                 resume_session=None):
+                                 resume_session=None, switch=False):
             # Try the first call. If the reply is unparseable (LLM
             # returned empty / plain prose / truncated JSON), retry
             # once with a follow-up hint that surfaces the actual
             # error. This is the same pattern self_review uses
             # (commit 96247f3) — the first-pass generation should
             # be just as resilient as the audit step.
+            #
+            # ``switch=True`` marks the dispatch as a *provider switch*
+            # rather than a *re-ask*. Both re-open a session, but the
+            # switch's prompt is the very prompt the failed attempt
+            # already sent, so the restored conversation already carries
+            # it and re-sending it would pay for the same tokens twice.
+            # The switch says "continue" and lets the transcript supply
+            # the ask; the re-ask says "here is the new request" and
+            # sends it. See ``_call`` for the same contract.
             #
             # M1 migration (2026-08-11): both attempts now use
             # ``_run_claude_interactive`` so the LLM can Read the
@@ -5067,7 +5106,7 @@ class ClaudeCodingTool(CodingTool):
             pinned[0] = session_id
             _remember(session_id)
             if resume_session:
-                if from_handle:
+                if from_handle and not switch:
                     # Re-ask: the previous round of a caller-owned loop
                     # ran here and the prompt has moved on since (the
                     # validator's objection, the reason the last answer
@@ -5342,7 +5381,25 @@ class ClaudeCodingTool(CodingTool):
                             "parked_sec": parked_sec,
                         },
                     )
-                return _query_json_internal(excluded=new_excluded)
+                # Same contract as ``_query_internal_m1`` and the
+                # timeout arm above: the retry resumes the session this
+                # attempt was using rather than opening a new one. The
+                # session id is already pinned in ``pinned[0]``, and a
+                # resume that cannot be honoured degrades to a fresh
+                # session inside ``_resume_or_fresh_session`` — so this
+                # is safe even when the failure happened before the
+                # session ever produced output.
+                #
+                # ``switch=True``: the prompt this dispatch carries is
+                # the very prompt the failed attempt already sent, so
+                # the restored conversation contains it and re-sending
+                # it would pay for it twice. Without this the switch
+                # inherited the caller's *re-ask* text, and a caller
+                # holding a reusable session had its whole prompt
+                # re-sent on every capacity error.
+                return _query_json_internal(excluded=new_excluded,
+                                            resume_session=pinned[0],
+                                            switch=True)
             raise
         except Exception as e:
             duration = int(time.monotonic() - start_time)
