@@ -19,8 +19,8 @@ reached over a real socket and a real clock passes.
 
 So this module does the one thing the unit tests cannot: it points
 ``PDT_PROVIDER_ORDER_API_URL`` at a server started here, hands it a
-window that closes in a fixed number of seconds, and lets the dispatch
-sleep through a real wake before it dispatches.
+window that closes the moment the dispatch first looks, and lets the
+dispatch sleep through a real wake before it dispatches.
 
 What the wait is, and what it is not
 ------------------------------------
@@ -53,6 +53,12 @@ different behaviour:
   * it is *longer* than the window the fake switch serves, so one beat
     carries past the window's reopening and the read that follows it
     sees the window open.
+
+Neither of those has to be reconciled with how long the setup before
+the first read takes. The window is stamped by the first read rather
+than by the start of the test, so the first read finds it shut by
+construction instead of by schedule, and the case keeps covering a
+closed window on a loaded machine as faithfully as on an idle one.
 
 The CC Switch here is a stand-in started on an ephemeral port for the
 life of the module. Nothing in this file reads or writes the real
@@ -115,10 +121,10 @@ pytestmark = pytest.mark.e2e
 #: ten minutes out and a stamp ten seconds out travel identical code.
 #: What it has to be is *shorter* than the probe beat below, so that one
 #: beat carries past the moment the reading flips and the read that
-#: follows it sees the window open — and comfortably *longer* than the
-#: setup between the server starting and the first read reaching it, so
-#: the first read is the one that finds the window shut.
-WINDOW_SEC = 8.0
+#: follows it sees the window open. It does not have to be *longer*
+#: than the setup before the first read, because the window is stamped
+#: by the first read itself — see :class:`_Usage`.
+WINDOW_SEC = 1.0
 
 #: The beat this file drives the wake at. Production's is
 #: ``dynamic_provider_concurrency.DEFAULT_COOLDOWN_SEC`` (five minutes),
@@ -129,7 +135,13 @@ WINDOW_SEC = 8.0
 #: It is shorter than the quota cache TTL (60s), so the read after the
 #: sleep still has a warm cache entry to bypass, and longer than
 #: :data:`WINDOW_SEC`, so one beat carries past the window's reopening.
-PROBE_SEC = 10.0
+#:
+#: It is also what this file charges the suite: a beat is a sleep the
+#: whole run waits out, so the figure is the shortest one that still
+#: separates the two reads the case is about. Three seconds leaves a
+#: margin of two over the window, and keeps this file's own cost to a
+#: few seconds of a suite that is already long.
+PROBE_SEC = 3.0
 
 CHAIN = ["Vendor A Pro", "Vendor A", "Vendor A API"]
 
@@ -155,11 +167,25 @@ class _Usage:
     genuinely have served at that moment: still full before the stamp,
     funded after it. A payload the test toggled would let the two clocks
     drift apart and the assertion below would stop meaning what it says.
+
+    The window is stamped when the *first* read arrives, not when the
+    test starts the server. That is the point of the class: the case
+    is about a dispatch that finds a shut window, and the only way to
+    be sure the first read found one is to make the first read the
+    moment the window closes. A window stamped when the server starts
+    would instead have to outlast the setup between the two — the
+    tool's construction and the selection ahead of the read — and that
+    is a race the case would lose on a loaded machine and win on an
+    idle one. It would lose it by covering nothing: the dispatch would
+    find the window open, sail straight through, and the case would
+    still pass.
     """
 
-    def __init__(self, resets_at: datetime):
-        self.resets_at = resets_at
+    def __init__(self, window_sec: float):
+        self.window_sec = window_sec
+        self.resets_at: datetime | None = None
         self.requests = 0
+        self.served_closed: list[bool] = []
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
 
@@ -168,10 +194,14 @@ class _Usage:
         return "127.0.0.1:{0}".format(self._server.server_address[1])
 
     def open_now(self) -> bool:
+        if self.resets_at is None:
+            return False
         return datetime.now(self.resets_at.tzinfo) >= self.resets_at
 
     def payload(self) -> dict:
-        used = 4.0 if self.open_now() else 100.0
+        closed = not self.open_now()
+        self.served_closed.append(closed)
+        used = 100.0 if closed else 4.0
         rows = []
         for name in CHAIN:
             rows.append({
@@ -208,6 +238,12 @@ class _Usage:
             def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's name
                 with usage._lock:
                     usage.requests += 1
+                    if usage.resets_at is None:
+                        # The window closes now, on the first read, and
+                        # reopens a window's length from here.
+                        usage.resets_at = datetime.now(timezone.utc) + timedelta(
+                            seconds=usage.window_sec
+                        )
                 body = json.dumps(usage.payload()).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -287,18 +323,21 @@ def test_a_closed_window_is_slept_through_and_then_dispatched(
 ):
     """Nothing dispatches, the wait is real, and afterwards it does.
 
-    The assertions are one argument in four parts. The dispatch could
-    not happen first because the reading says every window is empty.
-    The elapsed time could not be short because the wait is a whole
-    probe beat — the sleep is the code's own, and the reader is
-    reached over a socket rather than stubbed, so a run that came back
-    inside a fraction of the beat did not sleep through it. It could
-    not have been many beats either, because one beat carries past the
-    window's reopening. And the dispatch could not have happened
-    without a fresh reading, because the reading that reported the
-    window shut was taken before the sleep, and the beat is shorter
-    than the cache TTL that would otherwise have served that same
-    reading again.
+    The assertions are one argument in six parts. The first read has to
+    find the window shut, or the case was not about a closed window at
+    all. The dispatch could not happen first because the reading says
+    every window is empty. The elapsed time could not be short because
+    the wait is a whole probe beat — the sleep is the code's own, and
+    the reader is reached over a socket rather than stubbed, so a run
+    that came back inside a fraction of the beat did not sleep through
+    it. It could not have been many beats either, because one beat
+    carries past the window's reopening. The read that followed the
+    sleep has to find the window open, because a beat that did not
+    carry past the reopening would have had to go round again. And the
+    dispatch could not have happened without a fresh reading, because
+    the reading that reported the window shut was taken before the
+    sleep, and the beat is shorter than the cache TTL that would
+    otherwise have served that same reading again.
     """
     # The two numbers this file drives are a premise, not a detail, and
     # they are checked before anything is started so a violation costs a
@@ -342,9 +381,7 @@ def test_a_closed_window_is_slept_through_and_then_dispatched(
         "dynamic_provider_concurrency.DEFAULT_COOLDOWN_SEC", PROBE_SEC
     )
 
-    usage = _Usage(
-        datetime.now(timezone.utc) + timedelta(seconds=WINDOW_SEC)
-    ).start()
+    usage = _Usage(WINDOW_SEC).start()
     try:
         monkeypatch.setenv(
             "PDT_PROVIDER_ORDER_API_URL", usage.base_url
@@ -363,6 +400,11 @@ def test_a_closed_window_is_slept_through_and_then_dispatched(
     finally:
         usage.stop()
 
+    assert usage.served_closed[0] is True, (
+        "the first read has to find the window shut; a read that found it "
+        "open would mean this case had stopped covering a closed window "
+        "at all, and nothing else below would have noticed"
+    )
     assert result == "ok"
     assert tool.current_call_provider in CHAIN, (
         "the dispatch has to come from the ordinary selection once the "
@@ -382,5 +424,11 @@ def test_a_closed_window_is_slept_through_and_then_dispatched(
         f"{usage.requests} request(s) reached the usage endpoint; the wake "
         f"has to ask again, because the reading that said 'full' was "
         f"taken before the sleep and the cache TTL is longer than the beat"
+    )
+    assert usage.served_closed[1] is False, (
+        "the read that followed the sleep has to find the window open; a "
+        "read that still found it shut would mean the beat did not carry "
+        "past the window's reopening, and the wake would have had to go "
+        "round again"
     )
     assert tracker.total() == 0, "the slot the dispatch took came back"
