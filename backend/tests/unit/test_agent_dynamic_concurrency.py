@@ -692,9 +692,9 @@ class TestReserveSlot:
         it and it contributes nothing. Drop the caps to 5 each and the
         same fixture tops out at 10 — which is the property this pins.
 
-        Dispatch ROTATES between the two pools, so this asserts the total
-        and each pool's share rather than a fixed order; the order itself
-        is pinned in ``test_provider_round_robin``.
+        Dispatch fills the first pool before the second, so this asserts
+        the total and each pool's share rather than a fixed order; the
+        order itself is pinned in ``test_provider_strict_priority``.
         """
         from agent import _load_provider_info
 
