@@ -675,6 +675,19 @@ def _recover_verification_states(plans_dir: Path) -> None:
             "repair_tasks": [],
             "orchestrator": None,
             "thread": None,
+            # 2026-10-20: mark the entry as RECOVERED. The persisted
+            # state says "running", but the process that was running
+            # it is gone — this entry was rebuilt from disk at
+            # startup. Without the marker the ``/start`` endpoint's
+            # "already running" guard reads the status alone and
+            # answers 409 forever, so a plan whose backend was killed
+            # mid-round could never be started again.
+            #
+            # The marker is in-memory only: it is never persisted, and
+            # the start handler drops it as soon as the round it
+            # authorised owns a live thread — from then on the thread
+            # itself is the guard.
+            "recovered": True,
         }
         _server.logger.info(
             "Recovered verification runtime state for plan %s (round=%s, status=%s)",

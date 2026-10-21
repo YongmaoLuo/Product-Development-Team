@@ -281,6 +281,182 @@ def _spawn_executor_subprocess(
     return process, log_path
 
 
+# ---------------------------------------------------------------------------
+# The resume point — a paused execution continued
+# ---------------------------------------------------------------------------
+#
+# A stop is a pause: it leaves a checkpoint on disk (see ``pause_state``
+# and ``_stop_running_execution``). The start is the other half — the
+# one that *continues* the paused work instead of re-running it from
+# scratch.
+#
+# Three things follow from the checkpoint being the record of an
+# interruption:
+#
+# * **The project directory comes from the checkpoint.** The operator
+#   stopped a run that was working in a particular tree; a resume that
+#   ran somewhere else would continue a task in a directory it was
+#   never written for. So the checkpoint wins over the request body,
+#   and a start *without* a checkpoint still has to name the directory
+#   (the 2026-07-16 audit guard).
+# * **Only the tasks that can continue in their session do.** A task
+#   the interruption invalidated (``full_rerun``) is re-run whole, and
+#   handing the executor its old session id would resume a
+#   conversation that can no longer be trusted.
+# * **The checkpoint is retired only once the work actually started.**
+#   A spawn that failed continued nothing, so the interruption is
+#   still the truth about what was interrupted.
+
+#: The variable the executor reads the session mapping under
+#: (``agent.RESUME_SESSIONS_ENV``). Spelled out here so the route does
+#: not have to import the executor module to name one variable.
+_RESUME_SESSIONS_ENV = "PDT_RESUME_SESSIONS"
+
+#: The two ways a checkpointed task can be continued.
+_RESUME_SESSION = "session_resume"
+_RESUME_FULL_RERUN = "full_rerun"
+
+
+def _read_execution_checkpoint(plan_dir: Path) -> Optional[Dict[str, Any]]:
+    """The plan's pause checkpoint, when it is an *execution* one.
+
+    ``pause_state`` owns the file's shape; this reader only answers the
+    question the start endpoint asks: "is there an interrupted execution
+    that this start should continue?".
+
+    A checkpoint of another kind — an interrupted *verification* round —
+    is not ours. It belongs to a different resume and must survive
+    untouched.
+
+    A checkpoint with no ``kind`` at all is treated as an execution one:
+    that is the kind the execution stop has always written, and a
+    resume that refused to honour it would strand the very plan it was
+    written for.
+    """
+    try:
+        from pause_state import read_pause_checkpoint
+
+        checkpoint = read_pause_checkpoint(plan_dir)
+    except Exception:  # noqa: BLE001 — an unreadable checkpoint is "no checkpoint"
+        return None
+    if not isinstance(checkpoint, dict):
+        return None
+    kind = checkpoint.get("kind")
+    if kind and kind != "execution":
+        return None
+    return checkpoint
+
+
+def _resume_entry_decision(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """How one interrupted task continues, and why.
+
+    A checkpoint written before the ``strategy`` field existed carries
+    no strategy: a session id is then the only evidence that there is
+    something to re-open, and without one the task runs again from the
+    beginning. The same fallback covers the reason, so a decision is
+    never reported without one.
+    """
+    raw_session = entry.get("session_id")
+    session_id = (
+        raw_session if isinstance(raw_session, str) and raw_session else None
+    )
+
+    strategy = entry.get("strategy")
+    if strategy not in (_RESUME_SESSION, _RESUME_FULL_RERUN):
+        strategy = _RESUME_SESSION if session_id else _RESUME_FULL_RERUN
+
+    reason = entry.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        reason = "session_id_available" if session_id else "no_session_id"
+
+    raw_task_id = entry.get("task_id")
+    task_id = str(raw_task_id) if raw_task_id is not None else ""
+
+    return {"task_id": task_id, "strategy": strategy, "reason": reason}
+
+
+def _resolve_resume_plan(
+    checkpoint: Dict[str, Any],
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, str]]:
+    """The strategy, the per-task plan, and the session mapping.
+
+    Returns ``(resume_strategy, resume_plan, sessions)``:
+
+    * ``resume_strategy`` — ``"session_resume"`` when every interrupted
+      task continues in its own session, ``"full_rerun"`` when none of
+      them can, ``"mixed"`` when the two are mixed;
+    * ``resume_plan`` — one decision per interrupted task: the task id,
+      the strategy, and the reason;
+    * ``sessions`` — the task id → session id mapping for the tasks
+      that continue *in* a session. A ``full_rerun`` task is
+      deliberately absent: the executor re-runs it from the beginning,
+      and handing it a session id would resume a conversation the
+      interruption invalidated.
+    """
+    plan: List[Dict[str, Any]] = []
+    sessions: Dict[str, str] = {}
+
+    for entry in checkpoint.get("interrupted_tasks") or []:
+        if not isinstance(entry, dict):
+            continue
+        decision = _resume_entry_decision(entry)
+        plan.append(decision)
+        if decision["strategy"] != _RESUME_SESSION:
+            continue
+        session_id = entry.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        if decision["task_id"]:
+            sessions[decision["task_id"]] = session_id
+
+    strategies = {decision["strategy"] for decision in plan}
+    if _RESUME_SESSION in strategies and _RESUME_FULL_RERUN in strategies:
+        overall = "mixed"
+    elif _RESUME_SESSION in strategies:
+        overall = _RESUME_SESSION
+    else:
+        overall = _RESUME_FULL_RERUN
+    return overall, plan, sessions
+
+
+def _resume_env(sessions: Dict[str, str]) -> Dict[str, str]:
+    """The environment the executor needs to continue in its sessions.
+
+    ``PDT_RESUME_SESSIONS`` carries a JSON object of task id → session
+    id. Only the tasks that continue *in* a session are in it — see
+    :func:`_resolve_resume_plan`.
+    """
+    return {_RESUME_SESSIONS_ENV: json.dumps(sessions)}
+
+
+def _consume_execution_checkpoint(plan_dir: Path) -> None:
+    """Retire the execution checkpoint this start has honoured.
+
+    Called only *after* the executor has been spawned: a start that
+    could not spawn continued nothing, and the resume point must
+    survive it — otherwise the interruption is lost and the plan can
+    only be re-run from scratch.
+
+    Only an execution checkpoint is consumed. A checkpoint of another
+    kind belongs to a different resume and must not be deleted here.
+    """
+    try:
+        from pause_state import consume_pause_checkpoint, read_pause_checkpoint
+
+        checkpoint = read_pause_checkpoint(plan_dir)
+        if not isinstance(checkpoint, dict):
+            return
+        kind = checkpoint.get("kind")
+        if kind and kind != "execution":
+            return
+        consume_pause_checkpoint(plan_dir)
+    except Exception:  # noqa: BLE001 — a checkpoint we cannot retire is not fatal
+        _server.logger.warning(
+            "execution_start: could not consume the execution checkpoint — "
+            "it stays on disk and may be consumed again",
+        )
+
+
 @router.post("/api/execution/{plan_id}/start")
 def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.StartExecutionRequest()):
     """Start autonomous task execution as a background subprocess.
@@ -301,6 +477,21 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
          wrapped in the repository's own
          ``BEGIN IMMEDIATE`` transaction so partial writes are
          impossible.
+
+    Resume contract (architecture decision point 4):
+
+      4. A plan that was *stopped* has a pause checkpoint on disk. The
+         start continues it: the checkpoint carries the project
+         directory the work was happening in (so the operator does not
+         have to repeat it, and the request body cannot redirect it),
+         and it says per task whether that task continues in its own
+         session or is re-run whole. Only the tasks that continue in a
+         session are handed to the executor, through
+         ``PDT_RESUME_SESSIONS``. A resumed start answers with
+         ``resumed`` / ``resume_strategy`` / ``resume_plan`` on top of
+         the four fields every start answers with; a fresh start keeps
+         the response it has always published. The checkpoint is
+         retired only once the executor has been spawned.
     """
     from datetime import datetime
     from state_machine.db.archive_scan import CUTOFF_2026_08_05, classify_plan
@@ -330,6 +521,39 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
             content={"error": "archived"},
         )
 
+    # --- The resume point ---------------------------------------------
+    # 2026-10-20: a plan that was stopped has a checkpoint on disk. It
+    # is read before anything is written, because it decides two things
+    # this start has to get right: where the work continues (the
+    # checkpoint's project directory) and which tasks continue *in*
+    # their own session (the ones the interruption left usable).
+    checkpoint = _read_execution_checkpoint(plan_dir)
+    resumed = checkpoint is not None
+    resume_strategy = _RESUME_FULL_RERUN
+    resume_plan: List[Dict[str, Any]] = []
+    resume_sessions: Dict[str, str] = {}
+    if resumed:
+        (
+            resume_strategy,
+            resume_plan,
+            resume_sessions,
+        ) = _resolve_resume_plan(checkpoint)
+
+    # The three resume fields are part of the answer *when there was a
+    # resume point to answer about*. A fresh start keeps the response
+    # it has always published — the four-key contract the endpoint's
+    # own field-contract test pins — and a resumed start adds what it
+    # continued and why.
+    resume_fields: Dict[str, Any] = (
+        {
+            "resumed": True,
+            "resume_strategy": resume_strategy,
+            "resume_plan": resume_plan,
+        }
+        if resumed
+        else {}
+    )
+
     # project_dir is REQUIRED (audit 2026-07-16): the previous
     # default of ``<plan_dir>/project`` silently created empty
     # commits in this repository, because that subdirectory lives
@@ -347,7 +571,19 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
     #
     # Fix: refuse the request when ``project_dir`` is missing. The
     # operator must explicitly point at the real project location.
-    if not req.project_dir or not req.project_dir.strip():
+    #
+    # 2026-10-20: a *paused* plan is the one case where the operator
+    # does not have to say it again. The resume point carries the
+    # directory the work was happening in, and it wins over the request
+    # body — a resume that ran somewhere else would continue a task in
+    # a directory it was never written for. Without a resume point the
+    # guard below is unchanged.
+    _requested_project_dir = (req.project_dir or "").strip()
+    _checkpoint_project_dir = str(
+        (checkpoint or {}).get("project_dir") or ""
+    ).strip()
+    _raw_project_dir = _checkpoint_project_dir or _requested_project_dir
+    if not _raw_project_dir:
         raise HTTPException(
             400,
             "project_dir is required. Provide the absolute path to "
@@ -356,7 +592,6 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
             "silently produces empty commits in the wrong git "
             "repo (audit 2026-07-16)."
         )
-    _raw_project_dir = req.project_dir.strip()
     project_dir = Path(_raw_project_dir).expanduser().resolve()
 
     # Refuse to execute inside the backend/ directory to prevent modifying
@@ -507,6 +742,11 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
             project_dir=project_dir,
             tasks_file=tasks_file,
             tool=req.tool,
+            # Only a resumed plan carries sessions: a fresh start has
+            # nothing to continue, and an empty mapping would say so
+            # just as well — but passing nothing keeps the fresh
+            # executor's environment exactly as it was.
+            extra_env=_resume_env(resume_sessions) if resumed else None,
         )
         state["log_path"] = str(log_path)
     except OSError as exc:
@@ -544,9 +784,24 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
             _server.PlanState(plan_dir).transition_to("failed")
         except Exception:
             pass
-        return {"status": state["status"], "pid": None}
+        # The resume point is deliberately NOT consumed here: nothing was
+        # continued, so the interruption is still the truth about what
+        # was interrupted.
+        return {
+            "status": state["status"],
+            "pid": None,
+            **resume_fields,
+        }
     state["process"] = process
     state["pid"] = process.pid
+
+    # 2026-10-20: the executor is up — the resume point has been
+    # honoured, so it is retired. A resume is single-shot: without the
+    # delete, a restart loop would re-consume the same interruption on
+    # every attempt and the plan would never move past it.
+    if resumed:
+        _consume_execution_checkpoint(plan_dir)
+
     # NOTE: the immediate "running" persist that used to live here is
     # redundant with the ``update_fields(exec_status="running", exec_pid=...)``
     # call below — that single write covers both fields atomically. The
@@ -942,6 +1197,46 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
         "status": "started",
         "pid": state["pid"],
         "project_dir": str(project_dir),
+        # 2026-10-20: what this start did with the resume point. Only a
+        # resumed start has a resume point to report; a fresh start
+        # keeps the response it has always published.
+        **resume_fields,
+    }
+
+
+def _pause_fields(plan_id: str) -> Dict[str, Any]:
+    """The pause half of a status answer, read from the checkpoint.
+
+    The in-memory state cannot carry this: ``stop`` writes the
+    checkpoint to the plan directory precisely because the process that
+    held the in-memory record is the process that goes away. A plan
+    paused and then left alone across a restart has no entry in
+    ``_execution_state`` at all, so this read is the only way the
+    endpoint can still say "paused, and this is when".
+
+    A checkpoint that cannot be read — torn by a crash, written by a
+    newer PDT — degrades to "not paused" rather than failing the
+    status poll: ``checkpoint_summary`` already answers ``None`` for
+    every unusable file, and an operator watching a plan is better
+    served by a missing pause than by a 500 on a read-only endpoint.
+    """
+    from pause_state import checkpoint_summary
+
+    try:
+        summary = checkpoint_summary(_server._plan_dir(plan_id))
+    except Exception:  # noqa: BLE001 — observability must not 500 a poll
+        _server.logger.exception(
+            "[execution_status] could not read the pause checkpoint plan=%s",
+            plan_id,
+        )
+        summary = None
+
+    if not summary:
+        return {"paused": False, "paused_at": None, "interrupted_task_count": 0}
+    return {
+        "paused": True,
+        "paused_at": summary.get("paused_at"),
+        "interrupted_task_count": int(summary.get("interrupted_task_count") or 0),
     }
 
 
@@ -955,6 +1250,11 @@ def get_execution_status(plan_id: str):
     ``execution.json`` was removed because writes already flow through
     the repository layer — there is no canonical on-disk JSON to
     read from at this point.
+
+    The pause fields come from the plan directory rather than from
+    that state, and are filled in on **both** branches: after a
+    restart, the branch a paused plan lands in is ``not_started``,
+    which is exactly where the checkpoint has to still be reported.
     """
     _server._validated_plan_id(plan_id)   # uniform contract — see that function
     _server._lazy_check_execution(plan_id)
@@ -973,6 +1273,7 @@ def get_execution_status(plan_id: str):
             "ended_at": None,
             "stop_reason": None,
             "sync_targets": None,
+            **_pause_fields(plan_id),
         }
     return {
         "plan_id": plan_id,
@@ -984,6 +1285,7 @@ def get_execution_status(plan_id: str):
         "ended_at": s.get("ended_at"),
         "stop_reason": s.get("stop_reason"),
         "sync_targets": s.get("sync_targets"),
+        **_pause_fields(plan_id),
     }
 
 
@@ -1087,9 +1389,219 @@ def apply_execution_task_delta(plan_id: str, req: _server.TaskDeltaRequest):
     }
 
 
-@router.post("/api/execution/{plan_id}/stop")
-def stop_execution(plan_id: str):
-    """Terminate running execution."""
+# ---------------------------------------------------------------------------
+# stop = pause
+# ---------------------------------------------------------------------------
+#
+# A stop used to be a pure "stop the work" switch: it killed the
+# executor subprocess and flipped a flag. Nothing was written down, so
+# a stopped plan and a plan that had never run looked exactly the same
+# on disk — no record that task 2 was in flight, no record of the
+# session id a resume could re-open, and no record of *which kind* of
+# interruption happened (a cooperative exit and a hard kill need
+# different resume strategies).
+#
+# A stop is therefore a pause: it leaves a resumable trace behind. The
+# four steps below are ordered, and the order is the contract.
+
+#: Task statuses that mean "this task will not run again".
+_EXECUTION_TERMINAL_TASK_STATUSES = frozenset({
+    "completed", "failed", "skipped", "superseded", "voided", "obsolete",
+})
+
+#: Task statuses that mean "this task is running right now".
+_EXECUTION_IN_PROGRESS_TASK_STATUSES = frozenset({
+    "in_progress", "breakdown_in_progress",
+})
+
+
+def _resolve_stop_grace() -> Optional[float]:
+    """The SIGTERM grace window this stop gets.
+
+    Read through ``server`` so the deployment's
+    ``PDT_STOP_GRACE_SECONDS`` applies — the window is configurable
+    (task 3), and a stop that hard-coded it would ignore the
+    operator's setting. ``None`` means "let the killer decide", which
+    is the same default the killer would have picked.
+    """
+    resolver = getattr(_server, "_resolve_stop_grace_seconds", None)
+    if resolver is None:
+        return None
+    try:
+        return float(resolver(None))
+    except Exception:  # noqa: BLE001 — a bad grace must not stop the stop
+        return None
+
+
+def _execution_log_paths(plan_id: str, plan_dir: Path) -> List[Path]:
+    """Where the executor's log may live.
+
+    The executor writes it under the *resolved* plans directory
+    (``PDT_PLANS_DIR`` wins), while this route resolves the plan
+    directory through ``server.PLANS_DIR``. The two are the same in a
+    normal deployment, but a deployment that exports only one of them
+    would otherwise lose the session bindings — and with them the
+    ability to resume a task in its own session.
+    """
+    candidates = [plan_dir / "execution.log"]
+    try:
+        from config_paths import resolve_plans_dir
+
+        resolved = resolve_plans_dir() / plan_id / "execution.log"
+    except Exception:  # noqa: BLE001 — the primary candidate still works
+        resolved = None
+    if resolved is not None and resolved not in candidates:
+        candidates.append(resolved)
+    return candidates
+
+
+def _execution_task_statuses(plan_id: str, plan_dir: Path) -> Dict[str, str]:
+    """Every task of a plan, with the status it last reached.
+
+    Two sources, merged: the static task list on disk (``tasks.json``)
+    and the runtime overlay in SQLite (``plan_tasks``). The overlay
+    wins — it is what the executor writes to, and what a resume will
+    read back.
+
+    A plan whose state store cannot be opened still gets its on-disk
+    list: a stop that recorded nothing because the database was busy
+    would be a stop that lost the interruption.
+    """
+    statuses: Dict[str, str] = {}
+    order: List[str] = []
+
+    def _remember(task_id: str, status: str) -> None:
+        if task_id not in statuses:
+            order.append(task_id)
+        statuses[task_id] = status
+
+    try:
+        data = json.loads((plan_dir / "tasks.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        data = None
+    if data is not None:
+        tasks = data if isinstance(data, list) else (data.get("tasks") or [])
+        for task in tasks:
+            if not isinstance(task, dict) or task.get("id") is None:
+                continue
+            _remember(str(task["id"]), str(task.get("status") or "").lower())
+
+    try:
+        from state_machine.db.connection import open as open_db
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.plan_task_repository import (
+            PlanTaskRepository,
+        )
+
+        conn = open_db(_server._state_db_path())
+        try:
+            migrate(conn)
+            runtime = PlanTaskRepository(conn).load_all(plan_id) or {}
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — the on-disk list is the fallback
+        runtime = {}
+
+    for task_id, row in runtime.items():
+        key = str(task_id)
+        status = str((row or {}).get("status") or "").lower()
+        if key in statuses:
+            if status:
+                statuses[key] = status
+        else:
+            _remember(key, status)
+
+    return {task_id: statuses[task_id] for task_id in order}
+
+
+def _stop_interruption(
+    plan_id: str,
+    plan_dir: Path,
+    *,
+    hard_killed: bool,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """The tasks a stop interrupted, and the tasks a resume still owes.
+
+    A task was *interrupted* when it was running when the stop landed
+    (``in_progress``), or when it had a session bound in the execution
+    log and had not finished — a task that ran in a session and did
+    not reach a terminal state is a task with work to resume, even if
+    the status it last wrote was not ``in_progress``.
+
+    The strategy says how a resume should treat each one:
+
+    * ``full_rerun`` / ``sigkill_after_grace`` — the tree had to be
+      hard-killed, so the conversation may have been cut mid-write
+      and the task cannot be trusted to continue in it;
+    * ``session_resume`` / ``session_id_available`` — the task ran in
+      a session that is still there, so the resume re-opens it;
+    * ``full_rerun`` / ``no_session_id`` — nothing to re-open, so the
+      task runs again from the beginning.
+    """
+    from pause_state import collect_task_sessions
+
+    sessions: Dict[str, str] = {}
+    for log_path in _execution_log_paths(plan_id, plan_dir):
+        sessions.update(collect_task_sessions(log_path))
+
+    statuses = _execution_task_statuses(plan_id, plan_dir)
+
+    interrupted: List[Dict[str, Any]] = []
+    unfinished: List[Dict[str, Any]] = []
+    for task_id, status in statuses.items():
+        finished = status in _EXECUTION_TERMINAL_TASK_STATUSES
+        if not finished:
+            unfinished.append({"task_id": task_id, "status": status})
+
+        session_id = sessions.get(task_id)
+        was_running = status in _EXECUTION_IN_PROGRESS_TASK_STATUSES
+        if not (was_running or (session_id and not finished)):
+            continue
+
+        if hard_killed:
+            strategy, reason = "full_rerun", "sigkill_after_grace"
+        elif session_id:
+            strategy, reason = "session_resume", "session_id_available"
+        else:
+            strategy, reason = "full_rerun", "no_session_id"
+
+        interrupted.append({
+            "task_id": task_id,
+            "status": status,
+            "phase": "execution",
+            "session_id": session_id,
+            # Filled in by ``write_pause_checkpoint`` with the
+            # checkpoint's own stamp, so every entry carries the same
+            # "when was this caught" answer.
+            "paused_at": None,
+            "strategy": strategy,
+            "reason": reason,
+        })
+
+    return interrupted, unfinished
+
+
+def _stop_response(
+    *, paused: bool, paused_at: Optional[str], interrupted: int
+) -> Dict[str, Any]:
+    """The answer ``POST /stop`` gives, whichever path it took."""
+    return {
+        "status": "stopped",
+        "paused": paused,
+        "paused_at": paused_at,
+        "interrupted_task_count": interrupted,
+    }
+
+
+def _stop_running_execution(
+    plan_id: str,
+    plan_dir: Path,
+    state: Dict[str, Any],
+    proc: Any,
+    *,
+    discard: bool,
+) -> Dict[str, Any]:
+    """Mark, terminate, checkpoint, transition — in that order."""
     from datetime import datetime
     from state_machine.db.connection import open as open_db
     from state_machine.db.schema import migrate
@@ -1097,49 +1609,198 @@ def stop_execution(plan_id: str):
         ExecutionRepository,
         PlanNotFoundError as ExecPlanNotFoundError,
     )
+    from pause_state import clear_pause_checkpoint, write_pause_checkpoint
 
+    # --- 1. mark ------------------------------------------------------
+    # The plan is marked BEFORE anything is killed. The executor's
+    # watcher thread and the heartbeat watchdog both act on
+    # ``status == "running"``: if the kill landed first, the executor
+    # could wake up, find a process that is gone and stamp the plan
+    # ``failed`` — the one outcome a pause must never produce.
+    #
+    # ``stop_reason`` says ``pausing`` while the pause is in progress:
+    # the process is still alive at this point, and the plan is not
+    # merely stopped, it is being paused. It becomes
+    # ``user_requested`` once the pause has completed.
+    state["status"] = "stopped"
+    state["stop_reason"] = "pausing"
+    state["ended_at"] = datetime.now().isoformat()
+
+    project_dir = state.get("project_dir")
+    if not project_dir:
+        try:
+            resolved = _server._get_project_dir(plan_id)
+        except Exception:  # noqa: BLE001 — a lookup failure is not a stop
+            resolved = None
+        project_dir = str(resolved) if resolved else None
+
+    try:
+        persist_conn = open_db(_server._state_db_path())
+        try:
+            migrate(persist_conn)
+            fields: Dict[str, Any] = {"exec_status": "stopped"}
+            if project_dir:
+                fields["project_dir"] = str(project_dir)
+            ExecutionRepository(persist_conn).update_fields(
+                plan_id, create_if_missing=True, **fields
+            )
+        finally:
+            persist_conn.close()
+    except ExecPlanNotFoundError:
+        pass
+    except Exception:  # noqa: BLE001 — the checkpoint matters more
+        _server.logger.exception(
+            "stop_execution: could not persist the stopped state "
+            "plan=%s", plan_id,
+        )
+
+    # --- 2. terminate -------------------------------------------------
+    # Only THIS plan's process group. Another plan's executor is none
+    # of this stop's business.
+    hard_killed = False
+    if proc is not None and proc.poll() is None:
+        try:
+            hard_killed = bool(
+                _server._kill_process_tree(
+                    proc, grace_seconds=_resolve_stop_grace()
+                )
+            )
+        except Exception:  # noqa: BLE001 — a failed kill still pauses
+            _server.logger.exception(
+                "stop_execution: could not terminate the executor "
+                "plan=%s", plan_id,
+            )
+
+    # --- 3. checkpoint ------------------------------------------------
+    # Written AFTER the termination completed, so it describes the
+    # interruption as it actually ended: a hard kill is a different
+    # kind of interruption than a cooperative exit, and the resume
+    # strategy follows from it.
+    interrupted, unfinished = _stop_interruption(
+        plan_id, plan_dir, hard_killed=hard_killed
+    )
+    if discard:
+        # "Throw it away" — the resume point goes with the work.
+        clear_pause_checkpoint(plan_dir)
+        checkpoint = None
+    else:
+        checkpoint = write_pause_checkpoint(
+            plan_dir,
+            kind="execution",
+            project_dir=project_dir,
+            reason="user_requested",
+            interrupted_tasks=interrupted,
+            unfinished_tasks=unfinished,
+        )
+
+    # --- 4. transition ------------------------------------------------
+    try:
+        _server.PlanState(plan_dir).transition_to("stopped")
+    except ValueError:
+        pass
+
+    # The pause is over: the reason for it is no longer "a pause is in
+    # progress" but the stop that was asked for.
+    state["stop_reason"] = "user_requested"
+
+    if checkpoint is None:
+        return _stop_response(paused=False, paused_at=None, interrupted=0)
+    return _stop_response(
+        paused=True,
+        paused_at=checkpoint.get("paused_at"),
+        interrupted=len(interrupted),
+    )
+
+
+def _stop_idle_execution(
+    plan_id: str, plan_dir: Path, *, discard: bool
+) -> Dict[str, Any]:
+    """A stop against a plan that is not running.
+
+    Two cases, one answer shape:
+
+    * the plan already has a checkpoint — a previous stop paused it
+      and this is a repeat of that stop. The checkpoint on disk IS the
+      answer, so it is returned unchanged. Rewriting it would move
+      ``paused_at`` and lose the record of when the interruption
+      actually happened.
+    * there is no checkpoint — nothing was interrupted, so there is
+      nothing to pause and nothing to record.
+    """
+    from pause_state import clear_pause_checkpoint, read_pause_checkpoint
+
+    existing = read_pause_checkpoint(plan_dir)
+    if discard:
+        clear_pause_checkpoint(plan_dir)
+        return _stop_response(paused=False, paused_at=None, interrupted=0)
+    if existing is not None:
+        return _stop_response(
+            paused=True,
+            paused_at=existing.get("paused_at"),
+            interrupted=len(existing.get("interrupted_tasks") or []),
+        )
+    return _stop_response(paused=False, paused_at=None, interrupted=0)
+
+
+@router.post("/api/execution/{plan_id}/stop")
+def stop_execution(plan_id: str, discard: bool = False):
+    """Stop a running execution — and leave a resume point behind.
+
+    A stop is a pause (core contract 1 / 2 / 6): the plan keeps
+    whatever it had achieved, and the next start picks it up instead
+    of re-running the whole round.
+
+    The order of the four steps is the contract, not an implementation
+    detail:
+
+      1. **Mark** — the in-memory state says ``stopped`` /
+         ``pausing`` and ``exec_status`` is persisted, *before*
+         anything is killed. The executor's watcher thread and the
+         heartbeat watchdog both act on ``status == "running"``, so a
+         kill that landed first could let the executor stamp the
+         plan ``failed`` — the one outcome a pause must never
+         produce.
+      2. **Terminate** — only this plan's own process group is
+         signalled; another plan's executor is never touched.
+      3. **Checkpoint** — the resume point is written *after* the
+         termination completed, so it describes the interruption as
+         it actually ended.
+      4. **Transition** — the plan state moves to ``stopped``.
+
+    ``?discard=true`` is the escape hatch: the work is thrown away
+    instead of paused, the checkpoint is removed, and the answer says
+    ``paused: false``.
+    """
     # VP-020: an archived plan is read-only — refuse before touching
     # ``_execution_state`` or any SQLite row. This endpoint had no
     # archived guard at all, so a stop against a pre-2026-08-05 plan
     # answered 200 and mutated the row.
-    archived = _server._archived_plan_response(_server._plan_dir(plan_id))
+    plan_dir = _server._plan_dir(plan_id)
+    archived = _server._archived_plan_response(plan_dir)
     if archived is not None:
         return archived
 
-    s = _server._execution_state.get(plan_id)
-    if s:
-        proc = s.get("process")
-        if proc and proc.poll() is None:
-            _server._kill_process_tree(proc)
-        # Only update if not already in a terminal state from the _run thread
-        if s.get("status") == "running":
-            s["status"] = "stopped"
-            s["stop_reason"] = "user_requested"
-            s["ended_at"] = datetime.now().isoformat()
-            try:
-                persist_conn = open_db(_server._state_db_path())
-                try:
-                    migrate(persist_conn)
-                    ExecutionRepository(persist_conn).update_status(
-                        plan_id, "stopped"
-                    )
-                finally:
-                    persist_conn.close()
-            except ExecPlanNotFoundError:
-                pass
-            try:
-                _server.PlanState(_server._plan_dir(plan_id)).transition_to("stopped")
-            except ValueError:
-                pass
+    state = _server._execution_state.get(plan_id)
+    proc = state.get("process") if state else None
+    proc_alive = bool(proc is not None and proc.poll() is None)
+    in_flight = bool(state) and (state.get("status") == "running" or proc_alive)
+
+    if in_flight:
+        response = _stop_running_execution(
+            plan_id, plan_dir, state, proc, discard=discard,
+        )
+    else:
+        response = _stop_idle_execution(plan_id, plan_dir, discard=discard)
+
     # 2026-09-18 C3: stopping the execution phase is also an exit from
     # the workflow. The execution phase does not itself start declared
     # services (only verification's preflight does), but a plan that
     # was re-executed after a verification cycle can still have a
     # ledger from that cycle, and this is the last exit point that
     # would otherwise leave it behind.
-    _server._reap_managed_services(plan_id, _server._plan_dir(plan_id), "execution_stopped")
+    _server._reap_managed_services(plan_id, plan_dir, "execution_stopped")
 
-    return {"status": "stopped"}
+    return response
 
 
 @router.get("/api/execution/{plan_id}/progress")
