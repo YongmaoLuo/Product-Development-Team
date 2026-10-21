@@ -56,8 +56,11 @@ from utils.atomic_io import atomic_write_json
 
 __all__ = [
     "IMPORT_PAYLOAD_FILENAME",
+    "IMPORT_SESSION_FILENAME",
     "import_payload_summary",
+    "read_import_session",
     "store_import_payload",
+    "store_import_session",
     "validate_tasks",
 ]
 
@@ -66,6 +69,20 @@ __all__ = [
 #: only path the import prompt names. Same "path-only" contract the other
 #: generators use for ``interview.json`` -- the model reads it itself.
 IMPORT_PAYLOAD_FILENAME = "import.json"
+
+#: The plan-directory member that remembers the model conversation the
+#: import ran in: one line, the session id.
+#:
+#: It exists so a revision can be a *follow-up question* rather than a
+#: fresh interview. The model that produced the list already has the
+#: upstream material and the list in front of it; a revision that starts
+#: a new conversation has to earn all of that again, and answers
+#: differently because it never saw what the first answer looked like.
+#:
+#: A dotfile because it is bookkeeping, not plan content: nothing reads
+#: it but this lane, and it must not be mistaken for a document the
+#: model is shown.
+IMPORT_SESSION_FILENAME = ".import_session"
 
 #: ``NO_FILE_CHANGES_SENTINEL`` means "read-only by author intent": a code
 #: task that claims it is declaring nothing it will change, so it fails.
@@ -97,6 +114,44 @@ def store_import_payload(plan_dir: Path, payload: Any) -> Path:
     json.dumps(payload, ensure_ascii=False)
     atomic_write_json(target, payload, reraise=True)
     return target
+
+
+def store_import_session(plan_dir: Path, session_id: Optional[str]) -> Optional[Path]:
+    """Remember the model conversation the import ran in; return the path.
+
+    One line — the session id — in ``plans/<id>/.import_session``. The
+    id is written *after* the run, because that is when it is known: a
+    provider fallback can switch sessions mid-answer, and the id the
+    model actually answered under is the one a later revision has to
+    resume.
+
+    A run that produced no id (no session was ever opened) writes
+    nothing: there is no conversation to resume, and an empty file
+    would only be a thing a later reader has to special-case. The
+    return value says which happened — a path, or ``None``.
+    """
+    if not session_id:
+        return None
+    target = Path(plan_dir) / IMPORT_SESSION_FILENAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"{session_id}\n", encoding="utf-8")
+    return target
+
+
+def read_import_session(plan_dir: Path) -> Optional[str]:
+    """The session id to resume for this plan, or ``None``.
+
+    ``None`` means "no conversation to resume" — the file was never
+    written, or it is empty, or it cannot be read. A plan in that state
+    is revised in a fresh conversation, which is worse but not broken:
+    the revision still works, it just re-reads what the import read.
+    """
+    target = Path(plan_dir) / IMPORT_SESSION_FILENAME
+    try:
+        text = target.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text or None
 
 
 def import_payload_summary(payload: Any, limit: int = 60) -> str:
