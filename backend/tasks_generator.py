@@ -538,6 +538,33 @@ def _topological_sort_task_ids(tasks: List[Dict[str, Any]]) -> List[str]:
     return result
 
 
+def _is_test_path(path: str) -> bool:
+    """Return True when ``path`` points at a test file.
+
+    The E2E gate's surface heuristic must not fire on test files. A
+    test that lives under ``backend/tests/integration/api/`` contains the
+    substring ``/api/`` — but the *product* has no such user-facing API
+    yet; the test is only describing the surface it wishes existed.
+    Treating a test path as a product surface forced pure-backend plans
+    to end with a Playwright task they cannot possibly satisfy.
+
+    A path counts as a test path when its lowercased, slash-normalised
+    form:
+        * contains ``/tests/`` or starts with ``tests/``;
+        * contains ``/test_`` or starts with ``test_``;
+        * ends with ``_test.py`` / ``.test.ts`` / ``.test.tsx`` /
+          ``.spec.ts``.
+    """
+    p = str(path or "").strip().lower().replace("\\", "/")
+    if not p:
+        return False
+    if "/tests/" in p or p.startswith("tests/"):
+        return True
+    if "/test_" in p or p.startswith("test_"):
+        return True
+    return p.endswith(("_test.py", ".test.ts", ".test.tsx", ".spec.ts"))
+
+
 #: Appended to the tasks prompt ONLY when the plan declared workspaces.
 #:
 #: Before 2026-09-22 this block lived inside ``TASKS_SYSTEM_PROMPT``
@@ -1725,6 +1752,11 @@ class TasksGenerator:
             * OR: any task's files_to_modify touches frontend/, api/, routes,
               page.tsx, app.py, api_server, routes/, etc.
 
+        Test paths (``tests/``, ``test_*``, ``*_test.py``, etc.) never
+        participate in the surface decision — a test says nothing about
+        whether the *product* has a user-facing surface; where the test
+        file happens to live does not decide that.
+
         When triggered, the last task (by id) must be an E2E task whose
         description contains ALL of these keyword groups:
             * "端到端" / "end-to-end" / "E2E"
@@ -1770,6 +1802,10 @@ class TasksGenerator:
             )
             for t in tasks:
                 for f in (t.get("files_to_modify") or []):
+                    if _is_test_path(f):
+                        # A test file is not a product surface — skip it
+                        # before matching the hints below.
+                        continue
                     fl = str(f).lower()
                     if any(h in fl for h in surface_path_hints):
                         plan_touches_surface = True
