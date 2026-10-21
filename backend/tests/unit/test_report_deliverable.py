@@ -512,6 +512,15 @@ def _run_hook(workspace, target, *, read_only=True, report_path=None):
         "PDT_PLANS_DIR": str(workspace["plans"]),
         "PDT_FORMAL_REPO_PATH": str(workspace["project"]),
         "PDT_LOCK_CLI": str(workspace["cli"]),
+        # The guard decides "is this scratch space?" with
+        # ``tempfile.gettempdir()``, which reads ``$TMPDIR`` first and
+        # falls back to ``/tmp`` without it.  This env is built by hand,
+        # so the child would look for scratch in a DIFFERENT root than
+        # ``workspace["scratch"]`` -- the very directory these cases write
+        # their probes into -- and a scratch write would be refused as
+        # "outside the project dir" instead of reaching the read-only
+        # refusal these cases are about.  The two must be the same string.
+        "TMPDIR": str(workspace["scratch"]),
     }
     if read_only:
         env["PDT_READONLY_TASK"] = "1"

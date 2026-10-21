@@ -2801,7 +2801,23 @@ def _write_verification_checkpoint(
 
 @router.post("/api/verification/{plan_id}/stop")
 def stop_verification(plan_id: str):
-    """Stop a verification cycle by CASing the routing row to idle."""
+    """Stop the running verification round and leave a resumable pause behind.
+
+    The order is load-bearing:
+
+    1. mark the routing row (verification_running -> verification) and the
+       plan_verification row (loop_stopped / user_stopped);
+    2. read the round's verdicts before the connection is released -- they
+       live only in that row;
+    3. snapshot the interrupted round (_persist_round_snapshot);
+    4. write the pause checkpoint: _write_verification_checkpoint records
+       the round, its verdicts and the interrupted VPs in pause_state.json;
+    5. cancel and kill the in-flight VP sub-agents, then reap their services.
+
+    The response is a pause, not a discard: it reports paused, round and
+    interrupted_vp_count, and a later /start reads that checkpoint through
+    _resolve_start_round and resumes this round. The plan is left stopped.
+    """
     plan_dir = _server._plan_dir(plan_id)
     if not plan_dir.exists():
         raise HTTPException(404, {"error": "Plan not found", "detail": "The requested plan does not exist."})
@@ -2849,7 +2865,33 @@ def stop_verification(plan_id: str):
         routing = RoutingRepository(conn)
 
     try:
-        routing.try_mark_phase(plan_id, ("verification_running",), "verification")
+        # 2026-10-21: the source set is the three phases a verification
+        # round can actually be *in flight* at — not just
+        # ``verification_running``. A round that reached
+        # ``verification_repairing`` / ``verification_rerunning`` still
+        # has a running ``plan_verification`` row, and the operator's
+        # stop is exactly as legitimate there. With only
+        # ``verification_running`` the CAS raises ``ConflictError`` on
+        # those two phases and the endpoint answers 409, leaving the
+        # routing row parked where it was; ``/start`` (:597-614) does
+        # not accept them as a source either, so it answers 409
+        # ``stage_mismatch`` too. Both doors refuse, so the plan was
+        # stuck forever — unrecoverable through the API. (Measured, not
+        # inferred: ``tests/integration/api/
+        # test_verification_stop_from_repair_phase.py`` pins both.) The
+        # same three-phase set is already used by
+        # ``force_verification_terminal`` (:3070) and by the dead-end
+        # rollback in ``verification_loop.py`` (:2993), so this is the
+        # recognised vocabulary for "verification work stopped halfway",
+        # not a new one. The TARGET phase stays ``verification``: the
+        # round is paused, not finished. ``/start``'s own source
+        # whitelist is deliberately left alone — a plan that is genuinely
+        # still running must not become re-enterable.
+        routing.try_mark_phase(
+            plan_id,
+            ("verification_running", "verification_repairing", "verification_rerunning"),
+            "verification",
+        )
         verification.mark_stopped(plan_id, "user_stopped")
     except ConflictError as exc:
         try:

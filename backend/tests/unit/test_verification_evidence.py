@@ -498,6 +498,35 @@ def test_the_command_runs_in_the_project_dir(project: Path):
     assert str(project) in checked["evidence"]["evidence_command"]["stdout"]
 
 
+def test_the_command_reports_the_project_dir_even_when_the_parent_pwd_is_relative(
+    project: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A relative ``$PWD`` inherited from the parent must not be reported.
+
+    ``/bin/sh`` answers ``pwd`` with ``$PWD`` verbatim when the variable is
+    set -- it does not re-derive it from the working directory the process
+    was handed.  A parent that exports ``PWD=.`` (the executor runs its
+    tasks from its own directory) therefore makes the command answer
+    ``.``, and the evidence claims a directory that is not the project dir
+    at all.  The command runs with ``cwd=project_dir``, so the directory it
+    reports has to agree with that -- otherwise the evidence is a report
+    about somewhere else.
+    """
+    monkeypatch.setenv("PWD", ".")
+
+    vp = {"id": "VP-001", "evidence_command": "pwd"}
+
+    checked = attach_evidence_command(
+        {"status": "PASSED", "reasons": [], "evidence": {}}, vp, project,
+    )
+
+    stdout = checked["evidence"]["evidence_command"]["stdout"]
+    assert str(project) in stdout, (
+        f"the command ran in {project} but reported {stdout!r} -- the "
+        f"parent's relative $PWD was inherited instead of the project dir"
+    )
+
+
 def test_a_failing_evidence_command_is_reported_not_raised(project: Path):
     vp = {"id": "VP-001", "evidence_command": "definitely-not-a-command-xyz"}
 
