@@ -27,6 +27,12 @@ The contract these tests hold in place:
 7. **A capacity error switches providers the same way a timeout does.**
    429 / 402 / 503 / 529 land in the ``except ApiError`` arm, which used
    to re-dispatch into a brand-new session and re-send the whole prompt.
+8. **A capacity error does not re-send the prompt.** A caller that holds
+   a reusable session (the executor's ``query_in_session``) used to have
+   its *whole* prompt re-sent on every 429, because the switch
+   inherited the re-ask text. The prompt the failed attempt already
+   sent is already in the restored transcript, so the switch says
+   "continue" and nothing more.
 
 Why (4) and (5) are not the same thing
 --------------------------------------
@@ -41,6 +47,18 @@ guaranteed failure. The two are told apart by which path raises: an empty
 reply is caught inside ``_run_interactive_resilient`` and retried on a fresh
 session without ever reaching the provider switch, while a resume failure is
 caught by the provider-switch helper and logged.
+
+Why a switch and a re-ask are not the same thing either
+-------------------------------------------------------
+Both re-open a session, and both were decided by the same ``from_handle``
+flag — but they carry different text, because the restored conversation
+holds different things. A *re-ask* is a new ask the transcript has never
+seen (the validator's objection, the reason the last answer was rejected),
+so it has to travel with the turn: ``RESUME_REASK_PROMPT + prompt``. A
+*switch* is the same ask on another provider, and that ask is already the
+last thing in the transcript — the failed attempt sent it. Re-sending it
+pays for the same tokens twice and leaves the model guessing which copy is
+current, so the switch sends the continuation cue alone.
 """
 
 from __future__ import annotations
@@ -63,7 +81,12 @@ from coding_tool import (  # noqa: E402
     ApiError,
     ClaudeCodingTool,
     EmptyResponseError,
+    JSON_ONLY_SUFFIX,
+    JsonSession,
     RESUME_CONTINUATION_PROMPT,
+    RESUME_REASK_PROMPT,
+    query_in_session,
+    query_json_in_session,
 )
 
 
@@ -572,3 +595,147 @@ def test_the_capacity_error_degradation_is_logged(monkeypatch):
     assert data["fallback"] == "fresh_session"
     assert data["resume"] is True
     assert data["error"]
+
+
+# ---------------------------------------------------------------------------
+# 7. A capacity error must not re-send the prompt to a caller holding a session
+# ---------------------------------------------------------------------------
+#
+# The executor drives one task per session (``query_in_session``), so the
+# dispatch that hits the rate limit is a caller's *own* ask inside a
+# session it holds. The switch that follows re-opens that session — and
+# the prompt the failed attempt already sent is already the last thing in
+# the restored transcript.
+#
+# Before the fix the switch inherited the caller's *re-ask* text
+# (``RESUME_REASK_PROMPT + prompt``), so every 429 re-sent the whole task
+# prompt. The re-ask is right for the caller's own next round (a new ask
+# the transcript has never seen) and wrong for the switch (the same ask,
+# already in the transcript), and the two used to be told apart by a flag
+# that could not tell them apart.
+
+#: A prompt long enough to be unmistakable in a transcript, and short
+#: enough that ``_compact_prompt`` leaves it alone.
+_TASK_PROMPT = "implement the whole task, reading every file it names"
+
+
+def _ok_then(text="done", sid="sid-1"):
+    """Every dispatch answers, in the session it was asked for."""
+
+    def _side(n, tool):
+        return (text, sid, {})
+
+    return _side
+
+
+def test_a_capacity_error_does_not_resend_the_prompt_to_a_caller_holding_a_session(
+    monkeypatch,
+):
+    """The interactive path: a 429 switch continues, it does not re-ask.
+
+    The whole task prompt is the expensive thing here — it names every
+    file the sub-agent has to read — and it was already sent by the
+    attempt that hit the rate limit. Sending it again pays for it twice
+    and leaves the model working out which copy is current.
+    """
+    tool = _tool(monkeypatch, _capacity_error_then(status="429"))
+    session = JsonSession()
+
+    query_in_session(tool, session, _TASK_PROMPT)
+
+    assert len(tool._calls) == 2, "attempt + provider switch"
+    first, second = tool._calls
+
+    assert first["prompt"] == _TASK_PROMPT, (
+        "the first attempt sends the caller's prompt as written"
+    )
+    assert second["resume"] is True, (
+        "the switch still resumes the session the failed attempt used"
+    )
+    assert second["prompt"] == RESUME_CONTINUATION_PROMPT, (
+        "the switch continues the ask the transcript already carries; "
+        "it must not re-ask, because a re-ask re-sends the prompt"
+    )
+    assert _TASK_PROMPT not in second["prompt"], (
+        "the prompt is already in the restored conversation; re-sending "
+        "it pays for the whole task twice"
+    )
+
+
+def test_a_json_capacity_error_does_not_resend_the_prompt_to_a_caller_holding_a_session(
+    monkeypatch,
+):
+    """The JSON path: same switch, same contract, plus the format cue."""
+
+    def _side(n, tool):
+        tool.current_call_provider = "vendor-a-pro"
+        if n == 1:
+            return ApiError("rate limited", status="429")
+        return (json.dumps({"verdict": "pass"}), "sid-2", {})
+
+    tool = _tool(monkeypatch, _side)
+    session = JsonSession()
+
+    result = query_json_in_session(tool, session, _TASK_PROMPT)
+
+    assert result == {"verdict": "pass"}
+    assert len(tool._calls) == 2, "attempt + provider switch"
+    first, second = tool._calls
+
+    assert second["resume"] is True
+    assert second["prompt"] == RESUME_CONTINUATION_PROMPT + JSON_ONLY_SUFFIX, (
+        "the continuation cue still carries the JSON-only instruction: "
+        "the restored context ends on the previous attempt's own turn"
+    )
+    assert _TASK_PROMPT not in second["prompt"], (
+        "the prompt is already in the restored conversation; re-sending "
+        "it pays for the whole task twice"
+    )
+
+
+def test_the_callers_own_next_round_still_reasks_with_the_prompt(monkeypatch):
+    """The other side of the fix: the caller's own re-ask is unchanged.
+
+    The caller's next round is a *new* ask — the prompt has moved on
+    since the last one (the validator's objection, the reason the last
+    answer was rejected) — and that text exists nowhere in the
+    transcript. The switch cue alone would make this round answer the
+    previous round's question again, which is the one outcome reuse
+    must never produce.
+    """
+    tool = _tool(monkeypatch, _ok_then())
+    session = JsonSession()
+
+    query_in_session(tool, session, "round one")
+    query_in_session(tool, session, "round two asks something new")
+
+    first, second = tool._calls
+    assert first["resume"] is False, "round one opens the session"
+    assert second["resume"] is True, "round two re-opens it"
+    assert second["prompt"] == RESUME_REASK_PROMPT + "round two asks something new", (
+        "the caller's own next round is a re-ask: the new request has to "
+        "travel with the turn"
+    )
+
+
+def test_the_callers_own_next_json_round_still_reasks_with_the_prompt(monkeypatch):
+    """The JSON twin of the test above."""
+
+    def _side(n, tool):
+        return (json.dumps({"ok": True}), "sid-1", {})
+
+    tool = _tool(monkeypatch, _side)
+    session = JsonSession()
+
+    query_json_in_session(tool, session, "round one")
+    query_json_in_session(tool, session, "round two asks something new")
+
+    first, second = tool._calls
+    assert first["resume"] is False
+    assert second["resume"] is True
+    assert second["prompt"] == (
+        RESUME_REASK_PROMPT + "round two asks something new" + JSON_ONLY_SUFFIX
+    ), (
+        "the caller's own next round is a re-ask: the new request has to "
+        "travel with the turn, and the format instruction with it"
+    )
