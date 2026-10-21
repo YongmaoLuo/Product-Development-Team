@@ -1701,7 +1701,7 @@ def _lazy_check_verification(plan_id: str) -> None:
             # very different situations, distinguished by the thread:
             #   * thread DEAD        → T1 above already fired this tick;
             #   * thread ALIVE       → the round is in a POST-EXECUTION
-            #     phase (report judgment + per-VP supplementary review)
+            #     phase (report judgment)
             #     which runs entirely in-process and writes nothing to
             #     the plan dir. Give it the hard cap before stamping —
             #     this exact case terminalises a round while its

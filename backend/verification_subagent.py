@@ -1625,6 +1625,9 @@ class VerificationSubAgent:
             f"Priority: {vp_node.get('priority', 'medium')}",
             f"Expected result: {vp_node.get('expected_result', '')}",
         ]
+        prd_criteria = str(vp_node.get("related_prd_criteria") or "").strip()
+        if prd_criteria:
+            parts.append(f"PRD criterion: {prd_criteria}")
         # 2026-09-18: a ui_validation VP is *required* to declare a
         # target_url, but it never reached this prompt — the sub-agent had
         # to infer the page from prose. Emit it up front.
@@ -1661,6 +1664,21 @@ class VerificationSubAgent:
             "basis of your conclusion. For code_review and ui_validation "
             "the framework checks a specific artifact (see the EVIDENCE "
             "CONTRACT below) and will refuse a PASSED it cannot verify.",
+            "",
+            "ADVERSARIAL SELF-CHECK (MANDATORY — do this before you settle on a verdict):",
+            "1. Write down at least two concrete counter-hypotheses for how this "
+            "verification point could still be FAILED despite surface appearances "
+            "(e.g. the asserted path is dead code, the cited test is skipped or "
+            "xfail, the evidence command passes vacuously, a related PRD "
+            "requirement is only partially met).",
+            "2. Test each counter-hypothesis against evidence you gather yourself "
+            "(read the actual lines, run the command, inspect the assertion).",
+            "3. Report PASSED only when every counter-hypothesis is refuted by "
+            "evidence. If any counter-hypothesis survives, report FAILED and put "
+            "the surviving one first in `reasons`, with the evidence that "
+            "supports it.",
+            "4. In `reasons`, name the counter-hypotheses you tested and how each "
+            "was refuted — a bare 'all checks passed' is not acceptable.",
             "",
             "PROGRESS REPORTING (if the work is long-running): The "
             "orchestrator's staleness watchdog force-terminates plans whose "

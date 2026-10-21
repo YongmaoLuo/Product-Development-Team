@@ -191,7 +191,7 @@ def test_no_signal_past_hard_cap_flags_and_kills(plan_env):
 
 def test_no_running_vp_with_live_thread_holds(plan_env):
     """Newest round log has NO in-flight VP — the round is in a
-    post-execution phase (report judgment / supplement review) that runs
+    post-execution phase (report judgment) that runs
     in-process and writes nothing to the plan dir. A LIVE thread there is
     healthy: hold until the hard cap instead of terminalising it.
 

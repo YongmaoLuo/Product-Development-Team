@@ -8,8 +8,7 @@ strings to the LLM. Historically these were scattered:
 
   * ``framework.prompts.INLINE_SPEC_CODE_REVIEW_PROMPT`` — the
     adversarial self-review template invoked by
-    :meth:`agent.AutonomousAgent._inline_spec_code_review` and
-    :meth:`verification_agent.VerificationAgent._supplement_spec_code_review`.
+    :meth:`agent.AutonomousAgent._inline_spec_code_review`.
     Already centralised in :mod:`framework.prompts` (cycle-breaking
     leaf module) by the 2026-09-04 architecture review.
 
@@ -105,7 +104,7 @@ def test_inline_spec_code_review_prompt_matches_framework_prompts():
 
     Single source of truth — the two access paths must point to the
     exact same string. A future edit to one without the other would
-    silently let the inline review and the supplement review drift
+    silently let the access paths drift
     apart, defeating the entire point of consolidating them.
     """
     backend_mod = _import_fresh_prompts_module()

@@ -8,8 +8,7 @@ Historically these were scattered across the codebase:
 
   * :data:`framework.prompts.INLINE_SPEC_CODE_REVIEW_PROMPT` — the
     adversarial self-review template invoked by
-    :meth:`agent.AutonomousAgent._inline_spec_code_review` and
-    :meth:`verification_agent.VerificationAgent._supplement_spec_code_review`.
+    :meth:`agent.AutonomousAgent._inline_spec_code_review`.
     Already centralised in :mod:`framework.prompts` (cycle-breaking
     leaf module) by the 2026-09-04 architecture review.
 

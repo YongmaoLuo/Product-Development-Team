@@ -4000,31 +4000,6 @@ class Orchestrator:
                 # Save report using persistence manager
                 self.persistence.update_report(report_data)
 
-                # DP3 (2): post-judgment supplement spec/code review.
-                # Runs AFTER the main PASSED/FAILED verdict is settled
-                # and is purely advisory — its findings never modify
-                # ``overall_status`` or per-VP statuses. Best-effort:
-                # any failure degrades to an empty list so the main
-                # verdict is unaffected.
-                try:
-                    report_data["supplement_findings"] = (
-                        self._supplement_spec_code_review(execution_results)
-                    )
-                except Exception as sup_exc:  # noqa: BLE001 — best-effort
-                    logging.getLogger(__name__).warning(
-                        "supplement_review_error: %s", sup_exc,
-                    )
-                    report_data["supplement_findings"] = []
-                # Re-persist with the supplement attached so on-disk
-                # report consumers (bridge UI, downstream tooling) see
-                # the same shape as the in-memory return value.
-                try:
-                    self.persistence.update_report(report_data)
-                except Exception as persist_exc:  # noqa: BLE001
-                    logging.getLogger(__name__).warning(
-                        "supplement_persist_error: %s", persist_exc,
-                    )
-
                 print(f"[Verification] Generated report: {report_data['overall_status']}")
                 return report_data
 
@@ -4097,139 +4072,6 @@ class Orchestrator:
             )
         except Exception:
             pass
-
-    def _supplement_spec_code_review(self, execution_results: dict) -> list:
-        """DP3 (2): run a per-VP adversarial spec/code review at judgment time.
-
-        For every verification point, re-prompts the LLM with
-        :data:`framework.prompts.INLINE_SPEC_CODE_REVIEW_PROMPT` and parses the
-        same ``{spec_compliance, code_quality, should_block, reason}``
-        envelope the agent-level pre-commit review uses. The findings
-        are appended to the verification report as
-        ``supplement_findings``; the main ``overall_status`` is NEVER
-        touched — this is an advisory layer only.
-
-        Output shape::
-
-            [
-              {
-                "vp_id":          "VP-001",
-                "spec_findings":  [{"severity": "low", "reason": "..."}],
-                "quality_findings":[{"severity": "low", "reason": "..."}],
-              },
-              ...
-            ]
-
-        Boundary conditions:
-
-          * ``verification_points`` is empty -> return ``[]`` without
-            calling the LLM at all. The bridge UI relies on this so
-            empty plans never burn tokens on a no-op review.
-          * Any single VP call fails (network blip, ApiError, JSON
-            parse error, empty response) -> that VP is silently
-            skipped; the rest are still processed. If every VP
-            fails, the returned list is empty.
-          * This method itself never raises; callers can rely on the
-            contract "always returns a list" for safe post-merge
-            decoration of ``report_data``.
-        """
-        # Import the prompt template directly from the framework leaf
-        # module. The historical lazy ``from agent import ...`` cycle
-        # was broken by moving the constant to ``framework/prompts.py``;
-        # neither ``verification_agent`` nor ``agent`` need to import
-        # the other for this template.
-        from framework.prompts import INLINE_SPEC_CODE_REVIEW_PROMPT
-
-        import re as _re
-
-        verification_points = execution_results.get("verification_points", []) or []
-        if not verification_points:
-            return []
-
-        def _degraded(reason: str) -> dict:
-            return {
-                "spec_compliance": "low",
-                "code_quality": "low",
-                "should_block": False,
-                "reason": reason,
-            }
-
-        findings: list = []
-        for vp in verification_points:
-            vp_id = vp.get("id", "unknown")
-            task_desc = (
-                vp.get("related_prd_criteria")
-                or vp.get("title")
-                or vp.get("expected_result")
-                or ""
-            )
-            git_diff_stat = "(verification judgment phase — no per-VP git diff available)"
-
-            # 2026-09-14: per-VP supplement reviews are sequential LLM
-            # calls — heartbeat so the watchdog keeps seeing a live round
-            # instead of a silent plan directory.
-            #
-            # NO explicit ``timeout``. This call used to pass
-            # ``timeout=60``, which REPLACES the unified 900s silence
-            # window with 60s — and a healthy provider answering slowly
-            # then looks like a dead one: every VP that overran the 60s
-            # was aborted, the abort burned the failover budget across
-            # all three providers, and the failure surfaced as a provider
-            # fault while CC Switch logged a 100% success rate. The
-            # requests we were aborting were our own. Inheriting the
-            # unified rules is both safer and faster in aggregate.
-            self._judgment_heartbeat("supplement_review", vp_id=vp_id)
-
-            prompt = INLINE_SPEC_CODE_REVIEW_PROMPT.format(
-                task_desc=task_desc,
-                git_diff_stat=git_diff_stat,
-            )
-
-            # -- LLM call (best-effort) -----------------------------
-            try:
-                response = self.coding_tool.query(
-                    prompt=prompt,
-                )
-            except Exception as exc:  # noqa: BLE001 — best-effort
-                logging.getLogger(__name__).warning(
-                    "supplement_review_llm_error vp=%s err=%s",
-                    vp_id, exc,
-                )
-                continue
-
-            if not isinstance(response, str) or not response.strip():
-                continue
-
-            # -- Parse JSON (mirrors ``_inline_spec_code_review``) ---
-            text = response.strip()
-            text = _re.sub(r"^```(?:json)?\s*", "", text)
-            text = _re.sub(r"\s*```$", "", text)
-            match = _re.search(r"\{.*\}", text, _re.DOTALL)
-            candidate = match.group(0) if match else text
-
-            try:
-                verdict = json.loads(candidate)
-            except (ValueError, TypeError):
-                continue
-
-            if not isinstance(verdict, dict):
-                continue
-
-            spec = str(verdict.get("spec_compliance", "low")).lower()
-            if spec not in ("high", "medium", "low"):
-                spec = "low"
-            quality = str(verdict.get("code_quality", "low")).lower()
-            if quality not in ("high", "medium", "low"):
-                quality = "low"
-            reason = str(verdict.get("reason", "") or "")[:500]
-
-            findings.append({
-                "vp_id": vp_id,
-                "spec_findings": [{"severity": spec, "reason": reason}],
-                "quality_findings": [{"severity": quality, "reason": reason}],
-            })
-
-        return findings
 
     def _generate_minimal_report(self, execution_results: dict) -> dict:
         """Generate minimal verification report when LLM fails."""
@@ -5290,10 +5132,7 @@ class Orchestrator:
         # 原样列成「## 验证计划」。一个只有计划条目、没有任何执行结果的
         # 作废 VP 对判定 LLM 来说是一张空白支票——它会替它编一个状态出来
         # （同一个计划的第 4 轮里，判定 LLM 给被门禁延后的 VP-028 编了
-        # "记为 FAILED" 的散文，框架随后才把它强制还原成 DEFERRED）。顺带
-        # 也不再为作废 VP 白烧一次 ``_supplement_spec_code_review`` 的
-        # LLM 调用（2026-10-14 第 4 轮日志里 VP-009 唯一的一条记录就是这条
-        # ``judgment_heartbeat``）。
+        # "记为 FAILED" 的散文，框架随后才把它强制还原成 DEFERRED）。
         #
         # 计划文件本身保留作废标记（打标记、不删除），审计痕迹不受影响。
         retired = executor._plan_retired_vps()
