@@ -938,41 +938,63 @@ def test_the_evidence_gate_still_defines_every_check_it_exists_to_provide() -> N
 #: The commit-hygiene gate, named here rather than imported, for the reason
 #: the evidence gate above is: a checker that imports its subject is
 #: checking a copy, and the copy passes identically when the file is gone.
-_TRAILER_NAME = "test_commit_messages_are_not_ai_attributed.py"
-_TRAILER_PATH = _REPO_ROOT / "backend" / "tests" / "static_gates" / _TRAILER_NAME
+_AI_MODEL_NAME = "test_commit_messages_do_not_name_an_ai_model.py"
+_AI_MODEL_PATH = _REPO_ROOT / "backend" / "tests" / "static_gates" / _AI_MODEL_NAME
 
 #: The same remedy in the same shape as the two above, for this file. A
 #: literal, so the equality against the path is asserted below rather
 #: than assumed.
-_TRAILER_RECOVERY_COMMAND = (
-    f"git checkout HEAD -- backend/tests/static_gates/{_TRAILER_NAME}"
+_AI_MODEL_RECOVERY_COMMAND = (
+    f"git checkout HEAD -- backend/tests/static_gates/{_AI_MODEL_NAME}"
 )
 
 #: The checks that gate has to keep defining, by name. They are the
 #: module's own module-level cases as this tree holds them, walked with
-#: ``ast`` — nine of them, which is fewer than the cases pytest collects
-#: because two are parametrized, the same gap the floor above records.
+#: ``ast`` — seventeen of them, which is fewer than the cases pytest
+#: collects because five are parametrized, the same gap the floor above
+#: records.
 #:
 #: What each one carries, so a later deletion is legible as the loss it
-#: is rather than as a name that stopped appearing: the two parametrized
-#: cases are the catch and its narrowness, the next three are the three
-#: entry points the single implementation is reached through, and the
-#: last four are the history walk, the declared-ref subset, the push
-#: rule, and the negative control that says the sweep can fail at all.
+#: is rather than as a name that stopped appearing: the parametrized cases
+#: are the catch and its narrowness for each of the two rules, the next
+#: one is the CLI contract, the next three are the three entry points the
+#: single implementation is reached through, and the last five are the
+#: history walk, the ref sweep, the push rule, and the two negative
+#: controls that say the sweep can fail at all.
+#:
+#: The set was rewritten on 2026-10-21, twice. The AI-attribution rule
+#: was withdrawn and this gate's file was renamed from
+#: ``test_commit_messages_are_not_ai_attributed.py`` to
+#: ``test_commit_messages_carry_no_plan_ids.py``; the same day the rule
+#: came back in narrowed form — a trailer may name the tool, not the
+#: model — and the file was renamed again to
+#: ``test_commit_messages_do_not_name_an_ai_model.py``. The names below
+#: are the ones the renamed file defines; the ones it used to define are
+#: gone because the rule they pinned is gone, and a required set that
+#: named them would have made the next deletion of that rule look like a
+#: defect.
 #:
 #: A subset and not an equality, for the reason the evidence set above
 #: gives: a check a later commit adds is a gain, and reporting it would
 #: make the next legitimate addition a red test nobody can act on.
-_REQUIRED_TRAILER_CHECKS: frozenset[str] = frozenset({
+_REQUIRED_AI_MODEL_CHECKS: frozenset[str] = frozenset({
     "test_ci_wires_the_checker_over_the_pushed_range",
-    "test_flags_an_ai_attribution",
-    "test_leaves_legitimate_messages_alone",
-    "test_no_commit_in_this_history_carries_an_ai_trailer",
-    "test_no_remote_tracking_ref_retains_the_trailer",
-    "test_only_the_declared_refs_retain_the_trailer",
+    "test_flags_a_plan_id",
+    "test_flags_an_ai_model_name",
+    "test_leaves_ordinary_messages_alone",
+    "test_leaves_tool_names_alone",
+    "test_no_commit_in_this_history_carries_a_plan_id",
+    "test_no_publishable_ref_carries_a_plan_id",
+    "test_no_remote_tracking_ref_carries_a_plan_id",
+    "test_the_checker_enforces_exactly_two_rules",
+    "test_the_cli_exit_code_follows_the_rule",
+    "test_the_cli_exit_contract_is_preserved",
+    "test_the_false_positive_the_model_rule_costs_is_pinned",
+    "test_the_model_scan_matches_on_word_boundaries_only",
     "test_the_native_installer_covers_the_commit_msg_hook",
+    "test_the_narrowed_sweep_still_finds_a_pushed_ref",
     "test_the_pre_commit_config_wires_the_hook",
-    "test_the_ref_sweep_reports_a_planted_trailer",
+    "test_the_ref_sweep_reports_a_planted_plan_id",
 })
 
 #: Names no required set above mentions, standing in for a check a later
@@ -980,16 +1002,16 @@ _REQUIRED_TRAILER_CHECKS: frozenset[str] = frozenset({
 #: the negative control below builds its sample from this union rather
 #: than from the required set alone: a specimen holding only the required
 #: names cannot tell a subset from an equality.
-_LATER_TRAILER_CHECKS: tuple[str, ...] = (
+_LATER_AI_MODEL_CHECKS: tuple[str, ...] = (
     "test_a_check_added_after_this_shape_gate_was_written",
-    "test_another_check_added_later_to_the_trailer_gate",
+    "test_another_check_added_later_to_the_ai_model_gate",
     "test_a_third_check_added_later",
     "test_a_fourth_check_added_later",
     "test_a_fifth_check_added_later",
 )
 
 
-def _trailer_gate_report(tree: ast.Module) -> str:
+def _ai_model_gate_report(tree: ast.Module) -> str:
     """Every check *tree* no longer defines, as one report.
 
     A subset, because the question is whether the file still provides
@@ -1005,24 +1027,24 @@ def _trailer_gate_report(tree: ast.Module) -> str:
     that says nothing ever.
     """
     missing = sorted(
-        _REQUIRED_TRAILER_CHECKS - _module_test_function_names(tree)
+        _REQUIRED_AI_MODEL_CHECKS - _module_test_function_names(tree)
     )
     if not missing:
         return ""
     return (
-        f"{_TRAILER_NAME} no longer defines {len(missing)} of the "
-        f"{len(_REQUIRED_TRAILER_CHECKS)} checks it has to keep defining: "
+        f"{_AI_MODEL_NAME} no longer defines {len(missing)} of the "
+        f"{len(_REQUIRED_AI_MODEL_CHECKS)} checks it has to keep defining: "
         + ", ".join(missing)
         + ". No floor above can see this — that gate is a parse-and-floor "
         "check, and a file that keeps its docstring, clears every floor "
         "and keeps its first case passes all of them with the enforcement "
         "gone. Restore the gate rather than editing the required set "
         "above, or the next deletion is declared correct:\n\n"
-        f"    {_TRAILER_RECOVERY_COMMAND}\n"
+        f"    {_AI_MODEL_RECOVERY_COMMAND}\n"
     )
 
 
-def test_the_trailer_gate_still_defines_every_check_it_exists_to_provide() -> None:
+def test_the_ai_model_gate_still_defines_every_check_it_exists_to_provide() -> None:
     """The same half of the shape, for the gate that polices commit messages.
 
     That gate is a parse-and-floor check like the ones above, and that is
@@ -1032,18 +1054,18 @@ def test_the_trailer_gate_still_defines_every_check_it_exists_to_provide() -> No
     a check a later commit adds is a gain, and an equality would turn the
     next legitimate addition into a red test nobody can act on.
     """
-    relative = _TRAILER_PATH.relative_to(_REPO_ROOT).as_posix()
-    assert _TRAILER_RECOVERY_COMMAND == f"git checkout HEAD -- {relative}", (
-        f"the recovery command names {_TRAILER_RECOVERY_COMMAND!r} rather "
+    relative = _AI_MODEL_PATH.relative_to(_REPO_ROOT).as_posix()
+    assert _AI_MODEL_RECOVERY_COMMAND == f"git checkout HEAD -- {relative}", (
+        f"the recovery command names {_AI_MODEL_RECOVERY_COMMAND!r} rather "
         f"than the path this gate reads ({relative}). A remedy pointing at a "
         f"renamed file is worse than no remedy, because it is a command that "
         f"restores nothing and reads as a fix."
     )
 
-    report = _trailer_gate_report(
+    report = _ai_model_gate_report(
         ast.parse(
-            _TRAILER_PATH.read_text(encoding="utf-8"),
-            filename=str(_TRAILER_PATH),
+            _AI_MODEL_PATH.read_text(encoding="utf-8"),
+            filename=str(_AI_MODEL_PATH),
         )
     )
     assert report == "", report
@@ -1053,14 +1075,14 @@ def test_the_trailer_gate_still_defines_every_check_it_exists_to_provide() -> No
     # plus names no required set mentions. Reporting the extras would make
     # the subset an equality; failing to report the deletion would make the
     # pin above decoration.
-    dropped = "test_no_remote_tracking_ref_retains_the_trailer"
+    dropped = "test_no_remote_tracking_ref_carries_a_plan_id"
     sample = (
         _as_docstring(_FILLER)
         + "".join(
             f"\ndef {name}() -> None:\n    return None\n"
             for name in sorted(
-                set(_REQUIRED_TRAILER_CHECKS - {dropped})
-                | set(_LATER_TRAILER_CHECKS)
+                set(_REQUIRED_AI_MODEL_CHECKS - {dropped})
+                | set(_LATER_AI_MODEL_CHECKS)
             )
         )
         + "x = 1\n" * _E2E_MIN_LINES
@@ -1094,24 +1116,24 @@ def test_the_trailer_gate_still_defines_every_check_it_exists_to_provide() -> No
         "missing"
     )
 
-    sample_report = _trailer_gate_report(parsed)
+    sample_report = _ai_model_gate_report(parsed)
     assert dropped in sample_report, (
         f"a module that clears every floor and is missing {dropped!r} was "
         f"not reported by name, so the pin above cannot fail and is "
         f"decoration. Report was: {sample_report!r}"
     )
-    assert _TRAILER_RECOVERY_COMMAND in sample_report, (
+    assert _AI_MODEL_RECOVERY_COMMAND in sample_report, (
         f"the report names the missing check but carries no recovery "
         f"command, so a reader is told the symptom and not the repair. "
         f"Report was: {sample_report!r}"
     )
-    for name in _REQUIRED_TRAILER_CHECKS - {dropped}:
+    for name in _REQUIRED_AI_MODEL_CHECKS - {dropped}:
         assert name not in sample_report, (
             f"{name!r} is present in the sample and is being reported "
             f"anyway, so the required set is being compared for equality. "
             f"Report was: {sample_report!r}"
         )
-    for name in _LATER_TRAILER_CHECKS:
+    for name in _LATER_AI_MODEL_CHECKS:
         assert name not in sample_report, (
             f"{name!r} is not in the required set and is being reported "
             f"anyway, so a check added by a later commit would go red here. "

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Reject commit messages that attribute a commit to an AI model.
+"""Reject commit messages that name an AI model.
 
 Why this exists
 ---------------
-Commit messages in this repository routinely ended with a trailer like::
+Commit messages in this repository used to end with a trailer like::
 
     Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
@@ -13,6 +13,24 @@ decision made elsewhere, varies between sessions, and is not recorded in
 the commit. Naming one specific model is therefore a guess written in the
 grammar of a fact — and it is a guess that lands in permanent, public
 history where it cannot be corrected.
+
+The rule, as of 2026-10-21
+--------------------------
+**A trailer may name the tool; it may not name the model.** The tool is a
+program the committer ran and can vouch for. The model is a routing
+decision made elsewhere, so naming one writes a guess into permanent,
+public history in the grammar of a fact. Hence::
+
+    Co-Authored-By: Claude Code <noreply@anthropic.com>     ← allowed
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>    ← rejected
+
+How the two are told apart is the whole implementation: **the tool
+phrases are stripped out first, and only what is left is searched for a
+model name.** A tool name may contain a model-family word — ``Gemini
+CLI`` contains ``gemini`` — and naming the tool must not trip the model
+check. A value that names both, ``Claude Code (Opus 5)``, still fails,
+because after the tool phrase has been taken out the model name is still
+there.
 
 The second reason is proportionality. A co-author trailer exists to give
 credit to a *person* who shares authorship. An assistant that ran the
@@ -24,11 +42,12 @@ A commit message is free to discuss Claude Code, models, providers, or AI
 in general — this script only rejects the two shapes that make an
 attribution claim:
 
-  * a ``Co-Authored-By:`` trailer whose value names an AI system;
+  * a ``Co-Authored-By:`` trailer whose value names an AI **model**;
   * a ``Generated with <AI tool>`` line, with or without the 🤖.
 
-A human co-author's trailer passes. So does a message that merely says
-"wire the Claude Code CLI".
+A human co-author's trailer passes. So does a trailer naming the tool
+alone (``Co-Authored-By: Cursor``), and so does a message that merely
+says "wire the Claude Code CLI".
 
 The privacy rule, added 2026-10-14
 ----------------------------------
@@ -70,7 +89,7 @@ Usage
 
 Exit contract
 -------------
-  * ``0`` — no attribution trailer found
+  * ``0`` — no violation found
   * ``1`` — at least one violation (the message is printed with the fix)
   * ``2`` — usage / setup error (missing file, unreadable input)
 """
@@ -116,71 +135,84 @@ except ImportError as exc:  # pragma: no cover - broken checkout
 _TRAILER_RE = re.compile(r"^\s*co-authored-by\s*:\s*(?P<value>.+?)\s*$", re.IGNORECASE)
 _GENERATED_WITH_RE = re.compile(r"\bgenerated\s+with\b", re.IGNORECASE)
 
-#: Tokens that mark a value as naming an AI system rather than a person.
-#: Matched case-insensitively as substrings, so ``claude-opus-5[1m]`` and
-#: ``Claude Opus 5`` both hit.
+#: The **tools** — the programs a person ran. A trailer may name one of
+#: these: the committer knows which program they ran, and that is a fact
+#: about the work rather than a guess about it.
 #:
-#: The product names (claude, anthropic, openai, …) are the reliable half.
-#: The family names (opus, sonnet, haiku, gpt) are here because the exact
-#: trailer this script exists to reject named a *model*, and a future
-#: variant might name only that. They are ordinary words, so a human
-#: co-author with one of them in their name would false-positive — which
-#: is the right way round: a two-second rewrite beats a permanent
-#: misattribution.
+#: These are stripped out of the value *before* the model scan, and that
+#: ordering is the rule rather than an implementation detail. A tool name
+#: can contain a model-family word — ``gemini cli`` contains ``gemini``,
+#: and ``github copilot`` is a tool that a reader might otherwise expect
+#: to be caught — so a tool name that was still in the text when the model
+#: scan ran would make the tool half of the rule unsayable.
 #:
-#: ``agent``, ``assistant`` and ``bot`` were added 2026-10-14, and they
-#: are the reason the rule can be talked about as covering "an AI system"
-#: rather than "one of these product names". The trailer that got through
-#: read ``Co-Authored-By: Autonomous Agent <agent@…>``: no vendor name, no
-#: model family, nothing any of the tokens above match — and a gate that
-#: only catches leaks spelled the way the last leak was spelled is a gate
-#: waiting for the next spelling. Every vendor now ships something whose
-#: name is one of those three words, so they are the high-value half.
-#:
-#: Deliberately *not* here, though it looks like it belongs: ``ai``. These
-#: are substring matches, and ``ai`` is inside ``email``, ``maintain``,
-#: ``chain``, ``detail`` and most of the English a commit message is made
-#: of. Adding it would not narrow the rule, it would delete it. A token
-#: has to be specific enough that the word cannot occur by accident.
-#:
-#: ``bot`` and ``agent`` are ordinary words in their own right, and this
-#: is a real cost: a human co-author called Abbot, or a team called
-#: "Support Agents", trips the gate. That trade is deliberate and is
-#: pinned by a test rather than left hypothetical — see
-#: ``test_commit_messages_are_not_ai_attributed.py``. It is the same
-#: trade ``opus`` and ``gpt`` already make, and it is the cheaper
-#: direction: the failure mode
-#: of a false positive is a rewritten co-author line, and the failure mode
-#: of a false negative is permanent, public, uncorrectable history.
-_AI_TOKENS: tuple[str, ...] = (
-    "claude",
-    "anthropic",
-    "openai",
-    "gemini",
+#: Multi-word phrases come before the single words that are their tails,
+#: so ``gemini cli`` is removed whole rather than leaving a ``cli`` behind.
+#: The order of the tuple is the order the replacements are made in.
+_TOOL_PHRASES: tuple[str, ...] = (
+    "claude code",
+    "gemini cli",
+    "github copilot",
     "copilot",
-    "codex",
-    "aider",
-    "devin",
     "cursor",
+    "windsurf",
+    "codeium",
+    "tabnine",
+    "aider",
+    "opencode",
+    "codex",
+)
+
+#: The **models** — the families and product names a commit message must
+#: not name, because the model behind a given commit is a routing decision
+#: made elsewhere and is not recorded in the commit.
+#:
+#: Matched on **word boundaries**, not as substrings: ``(?<![a-z0-9])``
+#: before and ``(?![a-z0-9])`` after. A substring match would have
+#: ``opus`` hit inside an unrelated word, and the boundary is what keeps
+#: the rule about model names instead of about letter sequences. The
+#: hyphen in ``command-r`` is not a word character, so ``GPT-5`` and
+#: ``claude-opus-5[1m]`` both hit while ``gpt4``-style fragments inside a
+#: longer word do not.
+#:
+#: These are ordinary words in a few cases — ``sonnet`` is one, and
+#: ``ernie`` and ``mistral`` are names — so a human co-author with one of
+#: them in their name would false-positive. That trade is deliberate and
+#: is pinned by a test rather than left hypothetical: the failure mode of
+#: a false positive is a rewritten co-author line, and the failure mode
+#: of a false negative is permanent, public, uncorrectable history.
+#:
+#: Deliberately *not* here: ``claude``. On its own, "claude" is a product
+#: family name and not a model name, and the tool phrase ``claude code``
+#: is removed before this scan runs — so a trailer that says only
+#: ``Co-Authored-By: Claude Code`` is exactly the case the rule is
+#: written to allow.
+_MODEL_TOKENS: tuple[str, ...] = (
     "opus",
     "sonnet",
     "haiku",
     "gpt",
-    # Product names that are also ordinary English. See above.
-    "agent",
-    "assistant",
-    "bot",
-    # Coding agents that are neither a vendor nor a model family.
-    "codeium",
-    "windsurf",
-    "tabnine",
-    "opencode",
-    # Model families absent from the list above.
+    "gemini",
     "llama",
     "mistral",
     "deepseek",
     "qwen",
     "grok",
+    "kimi",
+    "glm",
+    "ernie",
+    "doubao",
+    "minimax",
+    "command-r",
+)
+
+#: One compiled pattern per model token, so the word-boundary rule is
+#: stated once. Built at import time: the hook runs this script on every
+#: commit, and a regex compiled 16 times per message is 16 times more
+#: work than it needs to be.
+_MODEL_TOKEN_RES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (token, re.compile(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])"))
+    for token in _MODEL_TOKENS
 )
 
 #: Shown when a plan id is found. A commit message is the one surface where
@@ -198,13 +230,16 @@ _PLAN_ID_FIX_HINT = (
 )
 
 #: Shown on failure. The point is to make the fix obvious without a
-#: discussion: delete the line.
+#: discussion: name the tool, not the model.
 _FIX_HINT = (
-    "Drop the trailer. The tool is not the author, and the model behind a "
-    "given commit is not knowable from the commit — naming one writes a "
-    "guess into permanent history. If you need to record how a commit was "
-    "produced, put it in the commit *body* as prose, where it reads as a "
-    "statement about the process rather than as a false authorship claim."
+    "Name the tool, not the model. The tool is the program that ran, and "
+    "that part is true; the model behind a given commit is a routing "
+    "decision made elsewhere and is not knowable from the commit, so "
+    "naming one writes a guess into permanent, public history in the "
+    "grammar of a fact. Rewrite the line as 'Co-Authored-By: Claude Code' "
+    "— or drop it, and record how the commit was produced in the commit "
+    "*body* as prose, where it reads as a statement about the process "
+    "rather than as an authorship claim."
 )
 
 
@@ -239,11 +274,18 @@ class Violation:
         return f"Violation(lineno={self.lineno}, rule={self.rule!r}, reason={self.reason!r})"
 
 
-def _has_ai_token(value: str) -> str | None:
-    """Return the token that matched, or ``None``."""
+def _model_token_in(value: str) -> str | None:
+    """Return the model token *value* names, or ``None``.
+
+    The tool phrases are removed first and the model names are looked for
+    in what is left, so a value that names the tool and nothing else comes
+    back clean while a value that names the tool *and* a model does not.
+    """
     lowered = value.lower()
-    for token in _AI_TOKENS:
-        if token in lowered:
+    for phrase in _TOOL_PHRASES:
+        lowered = lowered.replace(phrase, " ")
+    for token, pattern in _MODEL_TOKEN_RES:
+        if pattern.search(lowered):
             return token
     return None
 
@@ -253,11 +295,11 @@ def find_violations(message: str) -> list[Violation]:
 
     This enforces **two** independent rules, and each finding says which
     one it came from in :attr:`Violation.rule`: :data:`RULE_TRAILER` (a
-    ``Co-Authored-By:`` or "Generated with" line naming an AI system) and
-    :data:`RULE_PLAN_ID` (a date-prefixed plan id anywhere in the message).
-    The two have different remedies and different exemptions, so a caller
-    that reports on them as one thing reports the wrong fix for half of
-    what it found.
+    ``Co-Authored-By:`` or "Generated with" line naming an AI **model**)
+    and :data:`RULE_PLAN_ID` (a date-prefixed plan id anywhere in the
+    message). The two have different remedies and different exemptions, so
+    a caller that reports on them as one thing reports the wrong fix for
+    half of what it found.
 
     Line numbers are 1-based so the failure message can be pasted into an
     editor. Blank lines and comments (``#``) are skipped — git strips them
@@ -277,28 +319,32 @@ def find_violations(message: str) -> list[Violation]:
 
         trailer = _TRAILER_RE.match(line)
         if trailer is not None:
-            token = _has_ai_token(trailer.group("value"))
+            token = _model_token_in(trailer.group("value"))
             if token is not None:
+                # The token is written out, not redacted: it is a member of
+                # this file's own published list, not a span lifted out of
+                # the message being checked, so nothing private is echoed.
+                # The plan-id reason below is the one that has to redact.
                 found.append(
                     Violation(
                         lineno,
                         stripped,
-                        "co-author trailer names an AI system: "
-                        f"{redact_span(token)}",
+                        "co-author trailer names an AI model: "
+                        f"{token}",
                         RULE_TRAILER,
                     )
                 )
             continue
 
         if _GENERATED_WITH_RE.search(line):
-            token = _has_ai_token(line)
+            token = _model_token_in(line)
             if token is not None:
                 found.append(
                     Violation(
                         lineno,
                         stripped,
-                        "'generated with' line names an AI system: "
-                        f"{redact_span(token)}",
+                        "'generated with' line names an AI model: "
+                        f"{token}",
                         RULE_TRAILER,
                     )
                 )
@@ -375,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
     # construction a message that quotes a private plan name. The reason
     # already names the rule, and the line number already says where.
     if attribution:
-        print("commit message carries an AI attribution trailer:\n", file=sys.stderr)
+        print("commit message names an AI model:\n", file=sys.stderr)
         for v in attribution:
             print(f"  line {v.lineno}: {v.reason}", file=sys.stderr)
         print(f"\n{_FIX_HINT}", file=sys.stderr)

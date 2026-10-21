@@ -94,10 +94,14 @@ MARKER="# installed by scripts/install_git_hooks.sh"
 # own exit contract, so neither is reimplemented and both stay runnable
 # from a shell.
 #
-# ``commit-msg`` keeps pointing at the same script it always did; that
-# script grew the plan-id rule, so the hook entry did not have to change.
+# ``commit-msg`` keeps pointing at the same script it always did. That
+# script enforces the plan-id rule and, since 2026-10-21, a narrowed
+# AI-attribution rule: a trailer may name the tool that produced the work
+# but not the model behind it, because the model is a routing decision made
+# elsewhere and is not knowable from the commit. The description names
+# both rules it is left with.
 HOOKS=(
-    "commit-msg	scripts/check_commit_msg.py	rejects AI attribution trailers and plan ids in the message"
+    "commit-msg	scripts/check_commit_msg.py	rejects AI model names and plan ids in the message"
     "pre-commit	scripts/pre_commit_gate.sh	forbidden-filename sweep, then the staged-content privacy scan"
     "pre-push	scripts/scan_commit_range.sh	scans the commits being pushed for private info"
 )
