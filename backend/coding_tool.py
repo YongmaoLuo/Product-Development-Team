@@ -4921,7 +4921,15 @@ class ClaudeCodingTool(CodingTool):
                             "excluded_after_failure": new_excluded,
                         },
                     )
-                return _call(excluded=new_excluded)
+                # Same contract as the timeout arm above: the retry
+                # resumes the session this attempt was using instead of
+                # paying for the whole prompt again from the top. A
+                # capacity error (429/402/503/529) is the case where
+                # this matters most — the sub-agent may be tens of
+                # turns into the task (observed: 52 rounds / 38 min),
+                # and re-sending the prompt from nothing burns every
+                # one of those tokens a second time.
+                return _call(excluded=new_excluded, resume=True)
             raise
         except Exception as e:
             duration = int(time.monotonic() - start_time)
@@ -5342,7 +5350,16 @@ class ClaudeCodingTool(CodingTool):
                             "parked_sec": parked_sec,
                         },
                     )
-                return _query_json_internal(excluded=new_excluded)
+                # Same contract as ``_query_internal_m1`` and the
+                # timeout arm above: the retry resumes the session this
+                # attempt was using rather than opening a new one. The
+                # session id is already pinned in ``pinned[0]``, and a
+                # resume that cannot be honoured degrades to a fresh
+                # session inside ``_resume_or_fresh_session`` — so this
+                # is safe even when the failure happened before the
+                # session ever produced output.
+                return _query_json_internal(excluded=new_excluded,
+                                            resume_session=pinned[0])
             raise
         except Exception as e:
             duration = int(time.monotonic() - start_time)

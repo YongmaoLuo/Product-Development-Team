@@ -24,6 +24,9 @@ The contract these tests hold in place:
    call falls back to a fresh session, says so in the log, and still
    returns a result.
 6. **The JSON path resumes too**, and its reply stays parseable.
+7. **A capacity error switches providers the same way a timeout does.**
+   429 / 402 / 503 / 529 land in the ``except ApiError`` arm, which used
+   to re-dispatch into a brand-new session and re-send the whole prompt.
 
 Why (4) and (5) are not the same thing
 --------------------------------------
@@ -420,3 +423,152 @@ def test_the_launcher_builds_resume_with_the_first_session_id(
     assert "--session-id" not in argv, (
         "a resumed dispatch must not also pin a new session id"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. A capacity error switches providers the same way a timeout does
+# ---------------------------------------------------------------------------
+#
+# 429 / 402 / 503 / 529 land in the ``except ApiError`` arm of the
+# provider-fallback handlers. That arm used to re-dispatch into a
+# brand-new session (``_call(excluded=...)`` / ``_query_json_internal(
+# excluded=...)``), which re-sent the whole prompt from nothing.
+#
+# The timeout arm above already had the right answer — hand the retry the
+# session the previous attempt was using — and this is the same switch, so
+# it gets the same answer. The case that makes it expensive is the
+# observed one: a sub-agent that ran 52 rounds over 38 minutes and then
+# hit a rate limit. Re-sending the prompt from zero pays for every one of
+# those rounds a second time.
+#
+# The session that died may never have produced a token (the 429 arrived
+# before the first one), and that is fine: the resume is best-effort and
+# degrades to a fresh session by itself, so a switch on a session that
+# does not exist costs one failed resume, not a dead task.
+
+#: The statuses that mean "this provider has no capacity right now".
+_CAPACITY_STATUSES = ("429", "402", "503", "529")
+
+
+def _capacity_error_then(text="done", sid="sid-2", status="429"):
+    """First dispatch dies on a capacity error; the next one succeeds."""
+
+    def _side(n, tool):
+        tool.current_call_provider = "vendor-a-pro"
+        if n == 1:
+            return ApiError("rate limited", status=status)
+        return (text, sid, {})
+
+    return _side
+
+
+@pytest.mark.parametrize("status", _CAPACITY_STATUSES)
+def test_a_capacity_error_switch_resumes_the_pinned_session(monkeypatch, status):
+    """The interactive path: a 429/402/503/529 switch must resume."""
+    tool = _tool(monkeypatch, _capacity_error_then(status=status))
+    assert tool.query("do the task", timeout=10) == "done"
+
+    assert len(tool._calls) == 2, "one attempt + one provider switch"
+    first, second = tool._calls
+
+    assert second["resume"] is True, (
+        f"a {status} must switch providers by resuming the session the "
+        "failed attempt was using, not by opening a new one"
+    )
+    assert second["session_id"] == first["session_id"], (
+        "it must resume THAT session — a fresh id restarts the task from "
+        "nothing and re-pays for every round already done"
+    )
+    assert "vendor-a-pro" in (second["excluded_providers"] or []), (
+        "the switch must still exclude the provider that failed; a resume "
+        "is not a reason to keep using the dead one"
+    )
+
+
+@pytest.mark.parametrize("status", _CAPACITY_STATUSES)
+def test_json_capacity_error_switch_resumes_the_pinned_session(
+    monkeypatch, status
+):
+    """The JSON path: same switch, same contract."""
+
+    def _side(n, tool):
+        tool.current_call_provider = "vendor-a-pro"
+        if n == 1:
+            return ApiError("rate limited", status=status)
+        return (json.dumps({"verdict": "pass"}), "sid-2", {})
+
+    tool = _tool(monkeypatch, _side)
+    result = tool.query_json("produce a verdict", timeout=10)
+
+    assert result == {"verdict": "pass"}
+    assert len(tool._calls) == 2, "one attempt + one provider switch"
+    first, second = tool._calls
+
+    assert second["resume"] is True, (
+        f"a {status} must switch providers by resuming the session the "
+        "failed attempt was using, not by opening a new one"
+    )
+    assert second["session_id"] == first["session_id"], (
+        "it must resume THAT session — a fresh id restarts the task from "
+        "nothing and re-pays for every round already done"
+    )
+
+
+def test_a_capacity_error_whose_resume_fails_still_returns_the_answer(
+    monkeypatch,
+):
+    """The degradation, reached through the ApiError entry.
+
+    The switch resumes; the re-open is refused (the session was never
+    written, or was pruned). That must cost one failed resume, not the
+    task: the call falls back to a fresh session and still answers.
+    """
+
+    def _side(n, tool):
+        tool.current_call_provider = "vendor-a-pro"
+        if n == 1:
+            return ApiError("rate limited", status="429")
+        if tool._calls[n - 1]["resume"]:
+            # A session with no transcript re-opens like this.
+            return ApiError("No conversation found", status="unknown")
+        return ("recovered", tool._calls[n - 1]["session_id"], {})
+
+    tool = _tool(monkeypatch, _side)
+    assert tool.query("do the task", timeout=10) == "recovered"
+
+    assert len(tool._calls) == 3, "attempt + resume attempt + fresh fallback"
+    resumed = [c for c in tool._calls if c["resume"]]
+    assert len(resumed) == 1, "the switch tried to resume once"
+    fallback = tool._calls[-1]
+    assert fallback["resume"] is False, "and then fell back to a fresh session"
+    assert fallback["session_id"] != resumed[0]["session_id"], (
+        "the fallback needs its own session — resuming the same dead id "
+        "again would fail the same way"
+    )
+
+
+def test_the_capacity_error_degradation_is_logged(monkeypatch):
+    """A silent degradation is indistinguishable from a resume that worked."""
+
+    def _side(n, tool):
+        tool.current_call_provider = "vendor-a-pro"
+        if n == 1:
+            return ApiError("rate limited", status="429")
+        if tool._calls[n - 1]["resume"]:
+            return ApiError("No conversation found", status="unknown")
+        return ("recovered", tool._calls[n - 1]["session_id"], {})
+
+    tool = _tool(monkeypatch, _side)
+    tool.query("do the task", timeout=10)
+
+    events = [
+        call for call in tool.logger.warning.call_args_list
+        if call[0] and call[0][0] == "coding_resume_fallback"
+    ]
+    assert events, (
+        "a resume that could not be honoured has to leave a trace"
+    )
+    data = events[0][1]["data"]
+    assert data["fallback"] == "fresh_session"
+    assert data["resume"] is True
+    assert data["error"]
