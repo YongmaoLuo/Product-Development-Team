@@ -250,10 +250,6 @@ class ActiveConcurrencyTracker:
     def __init__(self) -> None:
         self._counts: Dict[str, int] = {}
         self._lock = threading.Lock()
-        # Round-robin cursor (2026-09-22). Monotonic; readers take it
-        # modulo the live candidate count, so a changing pool size does
-        # not have to be coordinated with the counter.
-        self._rotation_cursor = 0
 
     def acquire(self, provider: str) -> int:
         """Increment the active count for ``provider`` by 1.
@@ -339,24 +335,6 @@ class ActiveConcurrencyTracker:
         """
         with self._lock:
             return dict(self._counts)
-
-    def next_rotation_index(self, count: int) -> int:
-        """Return this call's starting slot in a round-robin of ``count``.
-
-        Fetch-and-advance under the tracker's lock, so two dispatchers
-        racing here get DIFFERENT slots and the work spreads across the
-        pool instead of both aiming at the first entry.
-
-        The cursor is monotonic and only reduced modulo ``count`` at
-        read time, so a candidate set that shrinks or grows (a provider
-        parked, another recovering) needs no coordination with it.
-        """
-        if count <= 0:
-            return 0
-        with self._lock:
-            start = self._rotation_cursor % count
-            self._rotation_cursor += 1
-            return start
 
 
 # ---------------------------------------------------------------------------
@@ -685,23 +663,31 @@ def acquire_provider_with_dynamic_capacity(
     delivered slowly: a window that does not open for hours cannot be
     waited out by a poll whose unit is half a second.
 
-    Round-robin across the EFFECTIVE candidates
-    -------------------------------------------
-    Work is spread in proportion to how many providers are actually
-    callable in the current tier, so one provider's quota is not drained
-    before the next one is tried at all — without the rotation, a tier
-    whose first entry has cap 10 takes the first ten dispatches before
-    the second entry sees one.
+    Strict priority across the EFFECTIVE candidates
+    ----------------------------------------------
+    2026-10-21 — user contract: a tier is consumed **in ranking
+    order**. The first provider that still has a free slot takes the
+    dispatch, and it keeps taking dispatches for as long as it has
+    room. Only a full (or unusable) pool hands over to the next one in
+    the chain.
 
-    The walk therefore STARTS at a rotating slot instead of always at
-    index 0, and the rotation is taken over the candidates that are
-    actually callable — parked providers and quota-exhausted ones are
-    filtered out first, so "3 declared, 1 unreachable" rotates over the
-    2 real ones rather than leaving a dead slot in the cycle.
+    The previous behaviour (2026-09-22) was an average rotation: work
+    was spread in proportion to how many providers a tier could
+    actually call. That wasted quota in two ways — every account's
+    weekly allowance was left partly unspent when its window reset,
+    and a lower-ranked account was drawn down while the higher-ranked
+    ones still had budget left. Spending the highest-ranked quota
+    first is what the ranking was for.
 
-    Concretely, with two effective providers: dispatch 1 → provider A,
-    2 → B, 3 → A, 4 → B. Without the rotation, dispatches 1..10 would
-    all land on A (at cap 10) and only dispatch 11 reach B.
+    The candidate set is still filtered **first** — a parked provider, a
+    quota-exhausted one, or one whose computed cap is 0 occupies no
+    slot — and a saturated pool still falls through to the next one
+    rather than blocking the fleet. The walk never waits on a provider
+    that cannot serve at all; only a held slot is worth waiting for.
+
+    Concretely, with two effective providers of cap 10 each, 12
+    concurrent dispatches put the first 10 in the first pool and the
+    remaining 2 in the second.
 
     Contrast with :func:`select_provider_with_dynamic_capacity`, which
     only *reports* the first provider with room and leaves the slot
@@ -746,10 +732,9 @@ def acquire_provider_with_dynamic_capacity(
 
     while True:
         # 1. The EFFECTIVE candidate set — what can actually be called.
-        #    Filtering first (rather than skipping inside the walk) is
-        #    what makes the rotation divide work by the number of usable
-        #    providers: a chain of three with one dead provider rotates
-        #    over two, with no empty slot in the cycle.
+        #    Filtering first (rather than skipping inside the walk) keeps
+        #    a dead provider out of the chain: a chain of three with one
+        #    unreachable provider is walked as a chain of two.
         #
         #    Every reason a provider cannot serve *at all* is applied
         #    here, ahead of anything that waits: a refusal earlier in
@@ -760,7 +745,7 @@ def acquire_provider_with_dynamic_capacity(
         for name in providers:
             if name == "parent":
                 # ``parent`` is the caller's explicit fallback, not a
-                # pool, and it must never occupy a rotation slot.
+                # pool, and it must never occupy a candidate slot.
                 continue
             if park.is_parked(name):
                 # Answered "quota exhausted" earlier in this run. It is
@@ -791,12 +776,10 @@ def acquire_provider_with_dynamic_capacity(
             # nobody can shorten. This is the "do not dispatch" answer.
             return None
 
-        # 2. Start the walk at this dispatch's rotation slot and fall
-        #    through to the rest, so a full pool still hands over rather
-        #    than blocking the fleet.
-        start = tracker.next_rotation_index(len(candidates))
-        for offset in range(len(candidates)):
-            name = candidates[(start + offset) % len(candidates)]
+        # 2. Walk the candidates in chain order. The chain IS the ranking:
+        #    the first provider with room takes the dispatch, and only a
+        #    full (or unusable) pool hands over to the next.
+        for name in candidates:
             limit = compute_dynamic_limit(
                 name, provider_headroom_pct(name, usage_map, quota_map)
             )
