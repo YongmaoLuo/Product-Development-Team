@@ -449,6 +449,22 @@ class TestClaudeCodingToolProviderSelection:
             staticmethod(lambda: None),
         )
 
+    @pytest.fixture(autouse=True)
+    def _clean_cooldown(self):
+        """The cooldown list is process-global; leave it as it was found.
+
+        A provider that answered "my budget is gone" is parked for its
+        window, and the park outlives the test that caused it — the
+        walk skips a parked provider, so a leftover park would take the
+        NEXT test's provider out of the pool and make it look broken.
+        """
+        from dynamic_provider_concurrency import get_shared_cooldown
+
+        cooldown = get_shared_cooldown()
+        cooldown.clear()
+        yield cooldown
+        cooldown.clear()
+
     def _write_cc_switch_db(
         self,
         tmp_path: Path,
@@ -947,8 +963,21 @@ class TestClaudeCodingToolProviderSelection:
     # ------------------------------------------------------------------
 
     @patch("coding_tool.subprocess.Popen")
-    def test_query_fallback_to_parent_when_provider_api_error(self, mock_popen):
-        """Selected provider fails → fall back to the parent config for the retry."""
+    def test_rate_limit_retries_the_same_provider_before_switching(
+        self, mock_popen, monkeypatch,
+    ):
+        """A rate limit is waited out on the SAME provider, not rotated away from.
+
+        The refusal clears itself in seconds, so rotating away from the
+        provider throws away a healthy one and re-sends the whole prompt
+        to somebody else. The dispatch waits — and the wait is what the
+        dispatch has to do before it asks again — and the second ask
+        goes to the same provider, because it is still the one that can
+        serve the work.
+        """
+        waits: list[float] = []
+        monkeypatch.setattr(ct, "_rate_limit_sleep", waits.append)
+
         fail_proc = MagicMock()
         fail_proc.stdout = iter([
             json.dumps({
@@ -956,6 +985,80 @@ class TestClaudeCodingToolProviderSelection:
                 "result": "Rate limit exceeded",
                 "is_error": True,
                 "api_error_status": "rate_limit",
+            }),
+        ])
+        fail_proc.stderr.read.return_value = ""
+        fail_proc.wait.return_value = 0
+
+        ok_proc = MagicMock()
+        ok_proc.stdout = iter([
+            json.dumps({"type": "result", "result": "fallback-ok", "is_error": False}),
+        ])
+        ok_proc.stderr.read.return_value = ""
+        ok_proc.wait.return_value = 0
+
+        mock_popen.side_effect = [fail_proc, ok_proc]
+
+        with patch.object(
+            ClaudeCodingTool,
+            "_check_provider_availability",
+            staticmethod(lambda name: (
+                True,
+                {
+                    "base_url": "https://api.vendor-b.example/anthropic",
+                    "api_key": "vendor-b-key",
+                    "models": {"sonnet": "b-pro-5.1"},
+                },
+            )),
+        ):
+            # Run with a clean parent env so the fallback is distinguishable.
+            with patch.dict(
+                os.environ,
+                {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")},
+                clear=True,
+            ):
+                tool = ClaudeCodingTool(provider_priority=["Vendor B Pro"])
+                result = tool.query("test")
+
+        assert result == "fallback-ok"
+        assert mock_popen.call_count == 2
+        assert waits, (
+            "a rate limit is waited out before the provider is asked "
+            "again — the dispatch must not rotate away from a provider "
+            "whose refusal clears itself in seconds"
+        )
+
+        # First call used the routed provider's endpoint.
+        _, kwargs1 = mock_popen.call_args_list[0]
+        assert kwargs1["env"]["ANTHROPIC_BASE_URL"] == "https://api.vendor-b.example/anthropic"
+
+        # Second call asked the SAME provider again: the wait answered
+        # the rate limit, so the provider never left the pool.
+        _, kwargs2 = mock_popen.call_args_list[1]
+        assert kwargs2["env"].get("ANTHROPIC_BASE_URL") == "https://api.vendor-b.example/anthropic"
+
+    @patch("coding_tool.subprocess.Popen")
+    def test_exhausted_falls_back_to_parent(self, mock_popen):
+        """A spent plan is not waited out — the retry falls back to the parent config.
+
+        This is the contract the old test held: a provider that cannot
+        serve the call must not be asked again, and the parent process
+        config is the answer. What changed is the REASON the provider
+        is not asked again: a spent plan is a window, so the provider is
+        parked for that window rather than written into the permanent
+        exclusion set — and the park is what keeps it out of the pool
+        until the window rolls.
+        """
+        fail_proc = MagicMock()
+        fail_proc.stdout = iter([
+            json.dumps({
+                "type": "result",
+                "result": (
+                    "已达到 Token Plan 用量上限："
+                    "请升级 Token Plan 套餐或购买积分补充用量。(2056)"
+                ),
+                "is_error": True,
+                "api_error_status": "429",
             }),
         ])
         fail_proc.stderr.read.return_value = ""
