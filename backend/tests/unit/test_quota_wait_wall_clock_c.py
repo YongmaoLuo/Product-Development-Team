@@ -673,3 +673,324 @@ class TestTheBudgetStillBoundsWork:
             assert "idle_sec" not in payload, payload
             assert payload["layer2_budget_sec"] == budget, payload
             assert payload["timeout_error"], payload
+
+
+# ---------------------------------------------------------------------------
+# The path that had no cap at all
+# ---------------------------------------------------------------------------
+#
+# ``timeout=None`` used to mean "no cap at all", and it is the figure
+# the execution phase actually arrives with: ``agent.py`` calls
+# ``query`` without a ``timeout``, so the task dispatch took the
+# ``timeout is None`` branch of ``_query_internal_m1`` and got NEITHER
+# layer of the cap.
+#
+# Layer 1 — the watcher inside ``_run_claude_interactive`` — measures
+# SILENCE, so a dispatch that keeps printing (thinking deltas, a live
+# pytest, a chatty tool) is never killed by it. Layer 2 was only
+# installed on the ``timeout is not None`` branch, so the call ran
+# inline and unbounded: a wedged dispatch could hold its thread for
+# ten hours. ``HARD_WALL_CLOCK_TIMEOUT_SECONDS`` was written for
+# exactly this ceiling (2026-09-08) and nothing read it.
+#
+# The tests below drive the production entry — ``ClaudeCodingTool.query``
+# with no ``timeout`` — and pin three things:
+#
+#   * the cap ends a call that layer 1 cannot;
+#   * the cap IS the constant, not a number written down beside it;
+#   * a quota wait is still free: the cap is spent on WORK time, so a
+#     dispatch that slept through an hour of closed window and then did
+#     no work at all is not killed.
+
+
+class _Clock:
+    """A monotonic clock the test drives.
+
+    ``WorkClock`` takes its ``monotonic`` as an argument precisely so
+    that a test can drive an hour-long bound in a millisecond, and this
+    is that argument: a clock that only moves when the test says so.
+    """
+
+    def __init__(self, now: float = 10_000.0):
+        self.now = float(now)
+
+    def advance(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _work_clock_on(clock, log):
+    """``WorkClock`` on the test's clock; ``log`` records what happened.
+
+    ``_dispatch_work_clock`` looks the class up in the module namespace
+    at call time, so replacing it here replaces the clock the hard cap
+    is spent on — and only that clock. Everything else in the dispatch
+    (the silence watcher, the slot wait) keeps reading the real wall
+    clock, which is what a test that fakes a quota wait wants: the wait
+    has to be long in the *budget's* units and short in the *suite's*.
+    """
+    real = coding_tool.WorkClock
+
+    class _On(real):
+        def __init__(self, budget_seconds, monotonic=None):
+            super().__init__(budget_seconds, monotonic=clock.monotonic)
+            self.parks = 0
+            log.append(self)
+
+        def park(self):
+            self.parks += 1
+            return super().park()
+
+    return _On
+
+
+def _serve_readings(monkeypatch, readings, clock, *, advance=3600.0, clocks=None):
+    """Answer the quota reader with a queue; each wait advances ``clock``.
+
+    The wait is served on the *budget's* clock rather than on the wall
+    clock: the property under test is measured in the budget's unit,
+    and a real hour-long sleep is not something a test may spend. The
+    queue is read one entry per probe, and the last entry is repeated
+    forever — that is how "the meters have not caught up yet" is
+    described from the dispatch's side.
+
+    Each wait records whether the cap's clock was parked at that
+    moment, which is what makes "the wait was free" a statement about
+    the wait rather than about the clock's arithmetic.
+    """
+    queue = list(readings)
+    reads = []
+    served = []
+
+    def _load(*_a, **kw):
+        reads.append(1)
+        return queue[min(len(reads) - 1, len(queue) - 1)]
+
+    monkeypatch.setattr(provider_order, "load_provider_quota_map", _load)
+
+    def _wake(seconds: float) -> None:
+        parked = bool(clocks) and clocks[0].is_parked
+        served.append((seconds, parked))
+        clock.advance(advance)
+        time.sleep(0.05)
+
+    monkeypatch.setattr(coding_tool, "_quota_wake_sleep", _wake)
+    return served
+
+
+class TestTheHardCapOnThePathThatHadNone:
+    def test_a_call_that_keeps_printing_is_killed_by_the_cap(
+        self, tmp_path, monkeypatch, scene, _fresh_cooldown,
+    ):
+        """The gap, in miniature.
+
+        The CLI answers and then keeps printing, so layer 1 — the
+        silence watcher — cannot end this call, and before the cap
+        nothing else could either. The budget is one second, so the
+        call must die there.
+
+        It must die with ``HardTimeoutError``: the upper layers route
+        that one to auto-split, and a plain ``TimeoutError`` would be
+        read as a provider outage and retried against the next provider
+        instead.
+        """
+        cap = 1.0
+        monkeypatch.setattr(
+            ClaudeCodingTool, "HARD_WALL_CLOCK_TIMEOUT_SECONDS", cap
+        )
+        launches = _install_fake_claude(tmp_path, monkeypatch, mode="streaming")
+        _Reads(monkeypatch).serve(monkeypatch, [_fleet_open()])
+        tool = _tool()
+
+        started = time.monotonic()
+        with pytest.raises(HardTimeoutError):
+            tool.query("say ok")
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0, (
+            f"the call ran {elapsed:.1f}s against a {cap}s cap — it waited "
+            f"the CLI out (which prints for six seconds) instead of being "
+            f"capped"
+        )
+        assert _launches(launches) >= 1, _launches(launches)
+
+    def test_the_cap_is_the_constant_and_not_a_number_written_down(
+        self, tmp_path, monkeypatch, scene, _fresh_cooldown,
+    ):
+        """The cap must be the CONSTANT.
+
+        Two halves, and both are needed. With the constant at its real
+        value (3600) a call that works for six seconds must come back
+        with its answer — any cap written down as "5 seconds" would
+        have killed it. With the constant changed, the cap must follow
+        it: the error the call dies with carries the figure that was
+        spent, and that figure is the constant.
+
+        The two halves together cannot be satisfied by a hardcoded
+        number: one needs a cap above six seconds, the other needs a
+        cap of one.
+        """
+        # Half one: the real constant, and a CLI that works for six
+        # seconds. The call has to come back with its answer.
+        _install_fake_claude(tmp_path, monkeypatch, mode="streaming")
+        _Reads(monkeypatch).serve(monkeypatch, [_fleet_open()])
+        tool = _tool()
+
+        text = tool.query("say ok")
+
+        assert text == '{"rebuilt": true}', text
+
+        # Half two: the constant moved, so the cap moves with it — and
+        # the error says which figure was spent.
+        cap = 1.0
+        monkeypatch.setattr(
+            ClaudeCodingTool, "HARD_WALL_CLOCK_TIMEOUT_SECONDS", cap
+        )
+        _install_fake_claude(tmp_path, monkeypatch, mode="streaming")
+        _Reads(monkeypatch).serve(monkeypatch, [_fleet_open()])
+        tool = _tool()
+
+        started = time.monotonic()
+        with pytest.raises(HardTimeoutError) as caught:
+            tool.query("say ok")
+        elapsed = time.monotonic() - started
+
+        assert caught.value.total_sec == cap, (
+            f"the error carries {caught.value.total_sec!r} as the cap that "
+            f"was spent; the constant says {cap!r}"
+        )
+        assert elapsed < 5.0, (
+            f"the call ran {elapsed:.1f}s against a {cap}s cap — it waited "
+            f"the CLI out instead of being capped"
+        )
+
+    def test_a_parked_call_is_not_charged(
+        self, tmp_path, monkeypatch, scene, _fresh_cooldown,
+    ):
+        """An hour of closed quota window is not an hour of work.
+
+        The cap is spent on WORK time: a dispatch parked on somebody
+        else's quota meter is asleep, and the clock stops while it is.
+        So a call that parks through an hour of window, wakes up, does
+        its work, and parks again — with hours gone from the wall clock
+        and nothing spent against the budget — must come back with its
+        answer and must NOT be killed by the cap.
+
+        The clock is the test's, so the "hour" is a number the test
+        advances rather than a number the suite spends.
+        """
+        clock = _Clock()
+        installed = []
+        monkeypatch.setattr(coding_tool, "WorkClock", _work_clock_on(clock, installed))
+        cap = ClaudeCodingTool.HARD_WALL_CLOCK_TIMEOUT_SECONDS
+
+        _install_fake_claude(tmp_path, monkeypatch)
+        served = _serve_readings(
+            monkeypatch,
+            [_starved_fleet(), _starved_fleet(), _starved_fleet(), _fleet_open()],
+            clock,
+            clocks=installed,
+        )
+        tool = _tool()
+
+        result = tool.query("say ok")
+
+        assert result == '{"rebuilt": true}', result
+        assert len(served) >= 2, (
+            f"only {len(served)} probe(s); the call never parked, so this "
+            f"test proves nothing about a wait"
+        )
+        assert installed, (
+            "no work clock was installed — the call is not spent on a "
+            "clock at all, so there is no budget for a park to be free "
+            "against"
+        )
+        for _seconds, parked in served:
+            assert parked, (
+                "the clock was not parked while the dispatch waited on a "
+                "closed quota window — the wait was charged to the budget"
+            )
+        assert installed[0].parks >= 1, (
+            "the clock the cap is spent on was never parked"
+        )
+        assert installed[0].remaining() == cap, (
+            f"{cap - installed[0].remaining():.1f}s of the budget was "
+            f"charged; the waits are not free"
+        )
+
+
+def _dispatch_that_times_out_on_its_own(monkeypatch, provider="Vendor A Pro"):
+    """A dispatch that fails with a timeout of its own.
+
+    ``_run_claude_interactive`` is the seam. Everything the dispatch
+    does to a provider happens inside it -- the provider is chosen
+    there, so the label the fallback arm reads
+    (``current_call_provider``) is stamped there too -- and a provider
+    that gives up on its own is exactly what it raises. Replacing it is
+    the honest way to produce that error without waiting for a real
+    one: a real one takes minutes, and what is under test here is
+    WHICH error comes out, not how long a provider takes.
+
+    The dispatch's own timeout is not a hypothetical. It is the signal
+    the provider-fallback ladder is built on: on the ``timeout is not
+    None`` branch the layer-2 budget expiry is turned into exactly
+    this error, and the arm at the bottom of ``_query_internal_m1``
+    acts on it by trying the next provider.
+    """
+    def _fake(self, prompt, system_instruction, **kwargs):
+        self.current_call_provider = provider
+        raise TimeoutError(f"{provider} timed out on its own")
+
+    monkeypatch.setattr(ClaudeCodingTool, "_run_claude_interactive", _fake)
+
+
+class TestTheDispatchsOwnTimeoutKeepsItsOwnShape:
+    def test_a_dispatch_that_times_out_on_its_own_is_not_the_cap(
+        self, monkeypatch, scene, _fresh_cooldown,
+    ):
+        """The cap's error and the dispatch's own error are two errors.
+
+        The hard cap says "this task is too big" and is routed to
+        auto-split. A provider that times out on its own says "that
+        provider is bad" and is routed to the next provider. Both
+        arrive at the same ``except`` -- ``concurrent.futures.TimeoutError``
+        IS ``builtins.TimeoutError`` on this Python -- so the cap has
+        to tell them apart rather than swallow both into one.
+
+        It tells them apart by the clock: a budget that ran out has no
+        time left in it, and one that did not still has plenty. So the
+        dispatch's own timeout has to arrive as a plain
+        ``TimeoutError``, the provider fallback has to run, and the hard
+        cap must not have fired.
+        """
+        installed = []
+        monkeypatch.setattr(
+            coding_tool, "WorkClock", _work_clock_on(_Clock(), installed)
+        )
+        _dispatch_that_times_out_on_its_own(monkeypatch)
+        log = _Log()
+        tool = _tool(log=log)
+
+        with pytest.raises(TimeoutError) as caught:
+            tool.query("say ok")
+
+        assert not isinstance(caught.value, HardTimeoutError), (
+            f"the dispatch's own timeout was turned into a hard timeout: "
+            f"{caught.value!r} -- that would spend a task split on a bad "
+            f"provider"
+        )
+        assert installed, (
+            "no work clock was installed -- the call is not spent on a "
+            "clock at all, so there is nothing that could tell the two "
+            "timeouts apart"
+        )
+        assert "coding_query_hard_timeout" not in log.names(), (
+            f"the hard cap fired on a dispatch that had budget to spare "
+            f"({sorted(log.names())})"
+        )
+        assert log.of("provider_timeout_fallback"), (
+            f"the provider fallback did not run ({sorted(log.names())}) -- "
+            f"the dispatch's own timeout was swallowed on the way out"
+        )
