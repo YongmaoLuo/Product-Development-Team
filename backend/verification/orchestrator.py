@@ -18,6 +18,9 @@ from config_paths import resolve_state_db_path
 from plan_state import PlanState
 from verification_agent import VerificationAgent
 from repair_generator import RepairTaskGenerator
+# 2026-10-22: the type a cancelled round raises. Dependency-free, so a
+# top-level import carries no cycle risk.
+from verification_cancel import VerificationCancelled
 
 
 def _state_db_path_for_orchestrator() -> Path:
@@ -680,6 +683,15 @@ class VerificationOrchestrator:
                     previous_failure_feedback=previous_failure_feedback,
                     repair_outcomes=repair_outcomes,
                 )
+            except VerificationCancelled:
+                # 2026-10-22 — the operator stopped this plan while the
+                # repair-content call was in flight. This is NOT a
+                # generation failure: the arm below would record it as
+                # one, and the auto-loop would then park the plan on a
+                # "the generator broke" verdict for a round the
+                # operator paused on purpose. Let it out untouched — no
+                # repair tasks, no failure record, no retry.
+                raise
             except RepairGenerationError as gen_exc:
                 repair_generation_error = str(gen_exc)
                 print(

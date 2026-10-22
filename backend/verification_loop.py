@@ -33,6 +33,11 @@ import time
 # effective. ``server`` seeds ``sys.modules['server']`` before importing
 # this module (see the wiring at the bottom of server.py).
 import server as _server
+# 2026-10-22: the type a cancelled round raises. Dependency-free (stdlib
+# only), so a top-level import carries no cycle risk — and the auto-loop
+# has to be able to name it in an ``except`` clause, which a lazy
+# import inside a hot path could not do cheaply.
+from verification_cancel import VerificationCancelled
 
 
 def _verification_event_logger(plan_dir: Path):
@@ -5234,6 +5239,44 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                 plan_id, project_dir, tool=tool,
                 on_complete=_on_repair_complete,
                 outcome=outcome,
+            )
+            return
+        except VerificationCancelled as cancelled:
+            # 2026-10-22 — the operator stopped this plan while the
+            # round was judging / generating repair tasks.
+            #
+            # This is NOT a failed round, so it must not be recorded as
+            # one. The arm below would call ``_record_terminal
+            # ("failed", …)``, which advances the plan to
+            # ``verification_failed`` — a terminal verdict on a round
+            # the operator paused on purpose, and the exact thing the
+            # 2026-09-15 rework was about ("the verification thread
+            # kept going … re-stamping the stage the operator had just
+            # parked").
+            #
+            # So: no terminal record, no failure record, no repair
+            # tasks, no retry. The phase is left exactly where the
+            # stop left it — the stop route parks a verification-half
+            # stop at ``verification`` ("the round is paused, not
+            # finished"), and a stop during the repair executor at
+            # ``verification_repairing``. Moving it from here would
+            # fight that CAS, which this module is not allowed to do
+            # (``routes/verification.py`` owns the stop's target
+            # phase).
+            #
+            # What the operator gets from ``/start`` is the ordinary
+            # path: the round is picked up again, and the repair
+            # generation re-opens the session the stopped round was
+            # using (see ``repair_generator.repair_content_session``),
+            # so the interrupted work is not paid for twice.
+            _server.logger.warning(
+                "[Auto-Verification] Round %d cancelled by the operator "
+                "stop plan=%s — no terminal record, no repair tasks",
+                round_num, plan_id,
+            )
+            print(
+                f"[Auto-Verification] Round {round_num}: cancelled by the "
+                f"operator stop — {cancelled}"
             )
             return
         except Exception as e:

@@ -37,11 +37,13 @@ import json
 import re
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 from coding_tool import CodingTool, JsonSession, query_json_in_session
 from test_command_quality import check_falsifiable, inspect_command
+from verification_cancel import VerificationCancelled
 from verification_persistence import VerificationPersistenceManager
 
 
@@ -71,6 +73,31 @@ _MAX_REPAIR_PROMPT_CHARS = 8000
 #: generated repairs for, and live until the process ends.
 _REPAIR_CONTENT_SESSIONS: Dict[str, JsonSession] = {}
 
+#: Sidecar key for the repair-content session (see ``plan_sessions``).
+#: The sidecar is ``<plan_dir>/.pdt-sessions.json`` — the per-plan file
+#: this codebase already uses to carry a session id across a request
+#: boundary, which is exactly what a ``/stop`` + ``/start`` pair is.
+_REPAIR_CONTENT_SESSION_KEY = "repair_content"
+
+
+def stable_session_id(plan_id: str, step: str) -> str:
+    """A deterministic session id for ``plan_id``'s ``step``.
+
+    2026-10-22. The id has to be *stable* — the same plan and the same
+    step must always land on the same session — so that a ``/start``
+    after a ``/stop`` can re-open the conversation the stopped round
+    was having, instead of starting a new one and paying for the whole
+    context again.
+
+    The CLI constrains the shape: ``--session-id`` wants a canonical
+    dashed UUID (8-4-4-4-12 hex). A readable ``f"{plan_id}-{step}"`` is
+    rejected with ``Error: Invalid session ID``, so the readable part
+    is hashed into one — ``uuid.uuid5`` is deterministic (the same name
+    always gives the same id), and it produces exactly the shape the
+    CLI accepts.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"pdt:{plan_id}:{step}"))
+
 
 def repair_content_session(plan_dir: Path) -> JsonSession:
     """The resumable session for ``plan_dir``'s repair-content calls.
@@ -79,13 +106,60 @@ def repair_content_session(plan_dir: Path) -> JsonSession:
     session the dispatch actually answered in — including one a provider
     fallback switched to — so the next round resumes a session that
     exists rather than one the caller guessed at.
+
+    2026-10-22 — the handle also has to survive a PROCESS. A ``/stop``
+    ends the round in one process and a ``/start`` begins the next one
+    in another, and the in-process cache above cannot carry an id
+    across that boundary. So the id is written to the plan's session
+    sidecar and read back here: a plan whose sidecar carries an id
+    resumes that session, a plan whose sidecar does not (or cannot be
+    read) starts a session under the id derived from the plan and the
+    step — the same id every time, so two processes that both start
+    this step for this plan land in the same session rather than in
+    two.
     """
     key = str(Path(plan_dir).resolve())
     session = _REPAIR_CONTENT_SESSIONS.get(key)
     if session is None:
-        session = JsonSession()
+        persisted = None
+        try:
+            from plan_sessions import load_session_id
+            persisted = load_session_id(
+                plan_dir, _REPAIR_CONTENT_SESSION_KEY,
+            )
+        except Exception:  # noqa: BLE001 — a missing sidecar is not an error
+            persisted = None
+        if persisted:
+            # The session exists (or did): re-open it rather than
+            # creating a new one under the derived id.
+            session = JsonSession(persisted)
+        else:
+            session = JsonSession(
+                pinned_session_id=stable_session_id(
+                    Path(plan_dir).name, _REPAIR_CONTENT_SESSION_KEY,
+                )
+            )
         _REPAIR_CONTENT_SESSIONS[key] = session
     return session
+
+
+def persist_repair_content_session(plan_dir: Path, session: JsonSession) -> None:
+    """Record the repair-content session id in the plan's sidecar.
+
+    Called after the dispatch, not before: the id worth resuming is the
+    one that produced the answer. Best-effort — a plan whose sidecar
+    cannot be written loses the cross-process resume, which costs a
+    fresh session and nothing else.
+    """
+    try:
+        from plan_sessions import persist_session
+        persist_session(plan_dir, _REPAIR_CONTENT_SESSION_KEY, session)
+    except Exception:  # noqa: BLE001 — persistence is an optimisation
+        print(
+            f"[Repair] could not record the repair-content session id "
+            f"for {Path(plan_dir).name}; the next round will start a "
+            f"fresh session"
+        )
 
 
 def _clamp_for_prompt(text: Any, limit: int = _MAX_REPAIR_PROMPT_CHARS,
@@ -502,6 +576,13 @@ class RepairTaskGenerator:
                     prompt=prompt,
                     system_instruction=TEST_COMMAND_FILL_SYSTEM_PROMPT,
                 )
+            except VerificationCancelled:
+                # 2026-10-22 — the operator stopped this plan. The
+                # ``break`` below would swallow it and let the round
+                # carry on to the assembler, which would then build
+                # repair tasks out of a round the operator had just
+                # paused. A cancelled round produces no tasks at all.
+                raise
             except Exception as exc:  # noqa: BLE001
                 # A failed re-ask is not a failed repair. The rows keep
                 # whatever they had (nothing) and the assembler labels
@@ -2124,13 +2205,26 @@ class _RepairContentGeneratorMixin:
             previous_failure_feedback=previous_failure_feedback,
             repair_outcomes=repair_outcomes,
         )
+        # 2026-10-22 — the session handle is bound before the dispatch so
+        # the id can be recorded afterwards, whether the call answered or
+        # not: a call that died after dispatching still leaves behind a
+        # session that exists and is worth re-asking in.
+        session = repair_content_session(self.plan_dir)
         try:
             response = query_json_in_session(
                 self.coding_tool,
-                repair_content_session(self.plan_dir),
+                session,
                 prompt=prompt,
                 system_instruction=REPAIR_CONTENT_SYSTEM_PROMPT,
             )
+        except VerificationCancelled:
+            # 2026-10-22 — the operator stopped this plan. This is not a
+            # generation failure: there is nothing to repair *because the
+            # round was cancelled*, and turning it into a
+            # ``RepairGenerationError`` would have the caller record a
+            # failure for a round the operator paused on purpose. Let it
+            # through untouched.
+            raise
         except Exception as exc:  # noqa: BLE001 — re-raised as a typed error
             print(
                 f"[Repair] generate_repair_contents LLM call failed "
@@ -2142,6 +2236,10 @@ class _RepairContentGeneratorMixin:
                 round_number=round_number,
                 failed_vp_ids=failed_vp_ids,
             ) from exc
+        # 2026-10-22 — record the session id in the plan's sidecar so a
+        # ``/start`` in another process can re-open this conversation
+        # instead of paying for the whole context again.
+        persist_repair_content_session(self.plan_dir, session)
         contents = _parse_repair_contents_response(response, failed_vps)
         if not contents:
             # The model answered, but with nothing we can turn into a
