@@ -5131,8 +5131,21 @@ class ClaudeCodingTool(CodingTool):
         session_handle = _JSON_SESSION.get()
         entry_resume = resume_session
         from_handle = entry_resume is None and session_handle is not None
+        # A handle that carries a PINNED id but no live id yet is asking
+        # for its session to be CREATED under that id, not re-opened: the
+        # CLI's ``--session-id`` creates, its ``--resume`` re-opens, and
+        # only the second one can fail on a session that does not exist
+        # yet. Those are two different meanings of "the same session",
+        # so ``JsonSession`` carries them in two fields — the pinned id
+        # says which id a session should have, the live id says which
+        # session to re-open.
+        pinned_fresh: Optional[str] = None
         if entry_resume is None and session_handle is not None:
             entry_resume = session_handle.session_id
+            if not entry_resume:
+                pinned_fresh = getattr(
+                    session_handle, "pinned_session_id", None,
+                ) or None
 
         def _remember(sid: Optional[str]) -> None:
             """Hand the live session id back to the caller's loop.
@@ -5222,7 +5235,10 @@ class ClaudeCodingTool(CodingTool):
                 return text
             # ``str(uuid4())``: ``--session-id`` rejects the 32-char
             # undashed ``uuid4().hex`` form with "Invalid session ID".
-            pinned_session_id = str(uuid.uuid4())
+            # A pinned id wins over a random one: the caller chose it so
+            # that the session this dispatch creates is the one a later
+            # dispatch — in this process or the next — re-opens by name.
+            pinned_session_id = pinned_fresh or str(uuid.uuid4())
             text, _sid = self._run_interactive_resilient(
                 compacted_prompt, system_instruction,
                 session_id=pinned_session_id, resume=False,
@@ -5238,7 +5254,7 @@ class ClaudeCodingTool(CodingTool):
         # is what makes a provider switch resumable at all: without it
         # the CLI picks the id, the id is never returned on the failure
         # path, and the retry has nothing to resume.
-        pinned_session_id = entry_resume or str(uuid.uuid4())
+        pinned_session_id = entry_resume or pinned_fresh or str(uuid.uuid4())
 
         try:
             if timeout is None:

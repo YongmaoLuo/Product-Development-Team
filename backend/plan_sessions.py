@@ -67,6 +67,13 @@ behaviour the caller had before this module existed:
 
 A revise that cannot resume is no worse than a revise that never tried;
 that is the whole design, and it is why none of these paths raise.
+
+The one thing that needs no sidecar
+-----------------------------------
+:func:`stable_session_id` derives a session id from the plan and the
+step alone. There is nothing to persist — the same inputs always give
+the same id — so it lives here, next to the sidecar code that shares
+its subject, and the modules that need it import it from here.
 """
 
 from __future__ import annotations
@@ -74,6 +81,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -228,3 +236,31 @@ def persist_session(
     if session is None:
         return
     save_session_id(plan_dir, key, getattr(session, "session_id", None))
+
+
+def stable_session_id(plan_id: str, step: str) -> str:
+    """A deterministic session id for ``plan_id``'s ``step``.
+
+    2026-10-22. The id has to be *stable* — the same plan and the same
+    step must always land on the same session — so that a ``/start``
+    after a ``/stop`` can re-open the conversation the stopped round
+    was having, instead of starting a new one and paying for the whole
+    context again.
+
+    The CLI constrains the shape: ``--session-id`` wants a canonical
+    dashed UUID (8-4-4-4-12 hex). A readable ``f"{plan_id}-{step}"`` is
+    rejected with ``Error: Invalid session ID``, so the readable part
+    is hashed into one — ``uuid.uuid5`` is deterministic (the same name
+    always gives the same id), and it produces exactly the shape the
+    CLI accepts.
+
+    Why it lives here
+    -----------------
+    A session id is this module's subject, and the task-execution path
+    needs the same id: ``agent`` must be able to ask for "the session
+    for this plan's task 9" without importing ``repair_generator``,
+    which would drag the verification and test-quality stack into every
+    task. So the function lives here and ``repair_generator`` re-exports
+    it — one object, two import paths, no drift.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"pdt:{plan_id}:{step}"))

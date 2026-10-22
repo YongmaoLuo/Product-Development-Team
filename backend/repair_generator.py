@@ -37,11 +37,15 @@ import json
 import re
 import os
 import sys
-import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 from coding_tool import CodingTool, JsonSession, query_json_in_session
+# ``stable_session_id`` is re-exported from ``plan_sessions`` rather than
+# defined here: the id belongs to the session, and the task-execution
+# path needs it without importing this module's verification stack. The
+# name stays importable from here for the callers that already use it.
+from plan_sessions import stable_session_id
 from test_command_quality import check_falsifiable, inspect_command
 from verification_cancel import VerificationCancelled
 from verification_persistence import VerificationPersistenceManager
@@ -78,25 +82,6 @@ _REPAIR_CONTENT_SESSIONS: Dict[str, JsonSession] = {}
 #: this codebase already uses to carry a session id across a request
 #: boundary, which is exactly what a ``/stop`` + ``/start`` pair is.
 _REPAIR_CONTENT_SESSION_KEY = "repair_content"
-
-
-def stable_session_id(plan_id: str, step: str) -> str:
-    """A deterministic session id for ``plan_id``'s ``step``.
-
-    2026-10-22. The id has to be *stable* — the same plan and the same
-    step must always land on the same session — so that a ``/start``
-    after a ``/stop`` can re-open the conversation the stopped round
-    was having, instead of starting a new one and paying for the whole
-    context again.
-
-    The CLI constrains the shape: ``--session-id`` wants a canonical
-    dashed UUID (8-4-4-4-12 hex). A readable ``f"{plan_id}-{step}"`` is
-    rejected with ``Error: Invalid session ID``, so the readable part
-    is hashed into one — ``uuid.uuid5`` is deterministic (the same name
-    always gives the same id), and it produces exactly the shape the
-    CLI accepts.
-    """
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"pdt:{plan_id}:{step}"))
 
 
 def repair_content_session(plan_dir: Path) -> JsonSession:

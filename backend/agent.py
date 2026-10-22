@@ -78,6 +78,12 @@ from file_lock_protocol import (
     locks_dir_for_plan,
 )
 from task_repository import TaskRepository, ConflictError, ValidationError
+from plan_sessions import (
+    load_session_id,
+    persist_session,
+    save_session_id,
+    stable_session_id,
+)
 from utils.atomic_io import atomic_write_json
 from framework.task_graph import DanglingTaskDependency, find_dangling_references
 from framework.prompts import INLINE_SPEC_CODE_REVIEW_PROMPT
@@ -1994,8 +2000,20 @@ def _resume_session_id_for(task_id: str) -> Optional[str]:
     return session_id if isinstance(session_id, str) and session_id else None
 
 
-def _make_task_session(task_id: str) -> JsonSession:
-    """The executor's per-task session, seeded from the recovery point.
+def _task_session_key(task_id: str) -> str:
+    """The sidecar key a task's session id is recorded under.
+
+    One key per task, prefixed so it cannot collide with the planning
+    phases' keys (``interview``, ``prd``, ``arch``, ``test_design``) —
+    they all live in the same per-plan sidecar.
+    """
+    return f"task:{task_id}"
+
+
+def _make_task_session(
+    task_id: str, plan_dir: Optional[Path], plan_id: str
+) -> JsonSession:
+    """The executor's per-task session, recovered in three stages.
 
     A seeded handle makes ``coding_tool`` take its ``resume=True`` entry
     path on the FIRST dispatch (``entry_resume`` is non-``None``), so the
@@ -2004,8 +2022,126 @@ def _make_task_session(task_id: str) -> JsonSession:
     seeded: from then on ``_remember`` rewrites ``session_id`` after every
     dispatch, so attempt 2 of the same task keeps reusing attempt 1's
     session whether or not the recovery map mentioned this task.
+
+    The three stages, in the order they are consulted:
+
+    1. **The recovery mapping** (``PDT_RESUME_SESSIONS``) — what the
+       ``/start`` continuation path hands the executor. It names the
+       session the interrupted task was really running in, so nothing
+       else may override it.
+    2. **The plan's sidecar** — a session id recorded by an earlier
+       round of this same plan. That session exists, so it is re-opened.
+    3. **A deterministic id** — derived from the plan and the task, so
+       the same task always lands on the same session. There is nothing
+       to re-open yet, so the id is *pinned*: the first dispatch CREATES
+       the session under it (``--session-id``), and the id is written
+       into the sidecar before that dispatch, so the process that comes
+       next finds it and re-opens the same session.
+
+    Stage 3 is what a task stopped before its first dispatch returned
+    needs: it had no id anywhere, so the ``/start`` that followed it
+    used to fall back to a full re-run.
+
+    Nothing here raises. A missing plan directory, an unreadable
+    sidecar or a sidecar that cannot be written costs the *record* of
+    the id, never the task.
     """
-    return JsonSession(session_id=_resume_session_id_for(task_id))
+    # 1. The recovery mapping wins outright.
+    mapped = _resume_session_id_for(task_id)
+    if mapped:
+        return JsonSession(session_id=mapped)
+
+    key = _task_session_key(task_id)
+
+    # 2. The sidecar: a recorded id names a session that exists.
+    recorded = None
+    if plan_dir is not None:
+        try:
+            recorded = load_session_id(plan_dir, key)
+        except Exception as exc:  # noqa: BLE001 — a bad record is not a bad task
+            log.warning(
+                "task_session_sidecar_read_failed: ignoring unreadable "
+                "session sidecar for task %s (%s)",
+                task_id, type(exc).__name__,
+            )
+            recorded = None
+    if recorded:
+        return JsonSession(session_id=recorded)
+
+    # 3. The deterministic id — pinned, and recorded before the first
+    #    dispatch so that the next process finds it.
+    if not plan_id:
+        # Without a plan id there is nothing to derive an id from, and
+        # an id shared by two plans would resume the wrong session.
+        return JsonSession()
+    pinned = stable_session_id(plan_id, key)
+    if plan_dir is not None:
+        try:
+            save_session_id(plan_dir, key, pinned)
+        except Exception as exc:  # noqa: BLE001 — a bad record is not a bad task
+            log.warning(
+                "task_session_sidecar_write_failed: could not record the "
+                "session id for task %s (%s); the session is still created "
+                "under it, but a later process will not find it here",
+                task_id, type(exc).__name__,
+            )
+    return JsonSession(pinned_session_id=pinned)
+
+
+def _persist_task_session(
+    plan_dir: Optional[Path],
+    task_id: str,
+    session: Optional[JsonSession],
+    logger=None,
+) -> None:
+    """Record the session id a task's dispatch *actually* used.
+
+    2026-10-22. The id :func:`_make_task_session` hands out is the one
+    the first dispatch is *asked* for — the pinned one, when there was
+    nothing recorded. It is not necessarily the id the dispatch ends up
+    using: a provider fallback may switch it, and a resume that fell back
+    to a fresh session reports the new one. Only the dispatch knows which
+    id answered, so only the dispatch can record it.
+
+    Writing it back is what lets the *next* process open the session
+    that produced the answer instead of the session that was merely
+    asked for. Without it, the sidecar keeps the pinned id and the next
+    round re-opens a conversation that never said anything.
+
+    This never raises. The write happens after the dispatch has already
+    produced an answer, so an unwritable plan directory must not be able
+    to fail a task that has already succeeded — it costs the *record* of
+    the id, never the task.
+
+    ``logger`` is the execution logger, when there is one. It is used to
+    put the failure into the execution log; the module log gets it too,
+    so the warning survives a run with no execution log at all.
+    """
+    if plan_dir is None:
+        # No plan directory names no sidecar — there is nowhere to record
+        # the id, and a task whose tasks file is not a real path is not
+        # a task whose failure worth reporting.
+        return
+    try:
+        persist_session(plan_dir, _task_session_key(task_id), session)
+    except Exception as exc:  # noqa: BLE001 — a bad record is not a bad task
+        log.warning(
+            "task_session_persist_failed: could not record the session id "
+            "for task %s (%s); the session itself is unaffected, but a "
+            "later process will not find its id here",
+            task_id, type(exc).__name__,
+        )
+        if logger is not None:
+            try:
+                logger.warning(
+                    "task_session_persist_failed",
+                    f"Could not record the session id for task [{task_id}]: "
+                    f"{exc}",
+                    task_id=task_id,
+                    data={"error": str(exc)[:200]},
+                )
+            except Exception:  # noqa: BLE001 — a bad logger is not a bad task
+                pass
 
 
 class AutonomousAgent:
@@ -5023,7 +5159,21 @@ class AutonomousAgent:
         # fresh session — which is the only correct move, since
         # ``--resume``-ing a session that was never written fails in
         # ~0.4s.
-        task_session = _make_task_session(task.id)
+        #
+        # 2026-10-22 — the plan directory and the plan id, which is
+        # where the session id is recorded and what it is derived from.
+        # The canonical layout is ``plans/{plan_id}/tasks.json``, so the
+        # plan directory is the tasks file's parent and the plan id is
+        # its name. A tasks file that is not a real path — a test
+        # double — names no plan directory, and the sidecar lookup then
+        # simply misses; a missing plan costs the lookup, never the task.
+        tasks_file = getattr(self.task_manager, "tasks_file", None)
+        if isinstance(tasks_file, (str, Path)) and str(tasks_file):
+            plan_dir = Path(tasks_file).parent
+        else:
+            plan_dir = None
+        plan_id = getattr(self, "plan_id", "") or ""
+        task_session = _make_task_session(task.id, plan_dir, plan_id)
 
         # 2026-10-19 — the split gate's retry budget. The loop still
         # runs ``max_retries`` attempts by default, exactly as before;
@@ -5264,6 +5414,21 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                                 "reused": attempt > 0,
                             },
                         )
+                    # 2026-10-22 — write the id the dispatch ACTUALLY used
+                    # back to the plan's sidecar, so the next process
+                    # re-opens the session that produced the answer rather
+                    # than the one that was merely asked for. A provider
+                    # fallback may have switched it.
+                    #
+                    # This sits OUTSIDE the ``if ... and self.logger:``
+                    # block above on purpose: the write is not a log
+                    # line, and a run with no execution logger must still
+                    # record the id it just used. It is best-effort —
+                    # ``_persist_task_session`` never raises, so an
+                    # unwritable sidecar costs the record, not the task.
+                    _persist_task_session(
+                        plan_dir, task.id, task_session, self.logger
+                    )
                 except HardTimeoutError as e:
                     # 2026-09-08: inner or outer cap fired on the task.
                     # Same auto-split policy as VPs: any task that hits the
