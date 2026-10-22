@@ -205,15 +205,22 @@ def test_confirm_repair_and_rerun_calls_start_repair_execution(tmp_path):
     plan_dir = _seed_repairing_plan(tmp_path, "confirm-repair-reroute")
     ps = PlanState(plan_dir)
 
+    # 2026-10-22: ``start_verification_rerun`` was DELETED from
+    # ``PlanState`` together with the ``verification_rerunning`` phase
+    # (that phase was a dead state — nothing ever entered it). The
+    # "MUST NOT call the shortcut" half of this test is therefore now
+    # a structural assertion instead of a spy on a deleted method.
+    assert not hasattr(PlanState, "start_verification_rerun"), (
+        "the verification_rerunning shortcut must stay deleted — "
+        "confirm_repair_and_rerun routes verification_repairing → "
+        "executing"
+    )
+
     # Spy on PlanState: capture which method was called.
     with patch.object(
         PlanState, "start_repair_execution",
         autospec=True,
-    ) as mock_start_repair, \
-         patch.object(
-             PlanState, "start_verification_rerun",
-             autospec=True,
-         ) as mock_start_rerun:
+    ) as mock_start_repair:
         # Construct an orchestrator and call confirm_repair_and_rerun.
         # The orchestrator's __init__ wires up PlanState internally —
         # patch the class attribute so PlanState(plan_dir) returns
@@ -232,10 +239,6 @@ def test_confirm_repair_and_rerun_calls_start_repair_execution(tmp_path):
     assert mock_start_repair.called, (
         "confirm_repair_and_rerun MUST call start_repair_execution() "
         "to route verification_repairing → executing"
-    )
-    assert not mock_start_rerun.called, (
-        "confirm_repair_and_rerun MUST NOT call start_verification_rerun() "
-        "(the shortcut that bypasses executing)"
     )
 
 

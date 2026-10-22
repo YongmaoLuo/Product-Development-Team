@@ -11,7 +11,7 @@ the plan's failed card (the "卡片一直处于失败状态" report).
 
 ``server._reconcile_orphaned_verification_stages`` (invoked from the
 lifespan right after ``_recover_verification_states``) sweeps routing
-rows at ``verification_running`` / ``verification_rerunning`` whose
+rows at ``verification_running`` whose
 verification row is terminal and re-emits
 ``_persist_verification_terminal(..., chain_ending=True)``, which
 CASes the routing stage to ``completed`` / ``failed`` and
@@ -21,8 +21,9 @@ Contract pins:
 
   * stranded ``verification_running`` + terminal ``failed`` →
     ``failed``;
-  * stranded ``verification_rerunning`` + terminal ``passed`` →
-    ``completed``;
+  * a RESIDUAL ``verification_rerunning`` row (a historical value —
+    that phase was a dead state) is NOT swept; it reads back as
+    ``verification_repairing``;
   * ``verification_repairing`` (user-gated pause) is NOT touched even
     with a terminal verification status from the previous round;
   * a genuinely-running row (``verification_status = 'running'``) is
@@ -106,16 +107,22 @@ def test_stranded_verification_running_cas_to_failed(
         conn.close()
 
 
-def test_stranded_verification_rerunning_passed_cas_to_completed(
+def test_stranded_verification_rerunning_residual_is_left_alone(
     seeded_stalled_plan, monkeypatch
 ):
-    """routing stage 'verification_rerunning' + terminal 'passed' →
-    'completed'."""
+    """A RESIDUAL 'verification_rerunning' row is a historical value.
+
+    2026-10-22: that phase left the vocabulary (it was a dead state),
+    so the reconciler no longer sweeps it. The row reads back as
+    ``verification_repairing`` — the user-gated pause that this
+    reconciler deliberately does not touch.
+    """
     import server
+    from plan_state import normalize_phase
     from state_machine.repositories.routing_repository import RoutingRepository
 
     plan_id, _routing, verif, conn = seeded_stalled_plan
-    # Re-stage: rerunning + passed.
+    # Re-stage: the historical value + a terminal verdict.
     RoutingRepository(conn).try_mark_phase(
         plan_id, ("verification_running",), "verification_rerunning"
     )
@@ -125,9 +132,17 @@ def test_stranded_verification_rerunning_passed_cas_to_completed(
 
         row = RoutingRepository(conn).find(plan_id)
         assert row is not None
-        assert row["current_phase"] == "completed", (
-            f"stranded verification_rerunning row with passed verdict "
-            f"must CAS to completed, got {row['stage']!r}"
+        assert row["current_phase"] == "verification_rerunning", (
+            f"the residual value must survive the reconciler untouched, "
+            f"got {row['current_phase']!r}"
+        )
+        # Read-path compatibility: the historical value maps onto the
+        # phase that replaced it, and reading it must not raise.
+        assert normalize_phase(row["current_phase"]) == (
+            "verification_repairing"
+        ), (
+            "the residual verification_rerunning value must read back as "
+            "verification_repairing"
         )
     finally:
         conn.close()

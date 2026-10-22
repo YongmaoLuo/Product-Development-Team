@@ -384,17 +384,31 @@ def test_round_failed_vp_ids_degrades_to_revival_off():
     assert verification_loop._round_failed_vp_ids(Broken(), "not-a-dict") is None
 
 
-def test_call_sites_pass_the_rounds_failure_set():
-    """Pin the wiring. The revival rule is inert unless the auto-loop hands
-    the round's failure set to the selector, and the two are edited far
-    apart — this is the assertion that fails if only the helper changes."""
+def _production_repair_dispatch_source() -> str:
+    """The source of every production site that dispatches repair work.
+
+    2026-10-22: the post-repair callback used to be a closure nested
+    inside ``_run_auto_verification_loop_inner``. It is now the
+    module-level factory ``_make_repair_on_complete`` — shared with the
+    ``/start`` repair-resume path. The call sites did not move between
+    the two in any meaningful sense: they were one chain before and they
+    are one chain now, so the pins below count the pair.
+    """
     import inspect
 
     import verification_loop
 
-    source = inspect.getsource(
-        verification_loop._run_auto_verification_loop_inner,
+    return (
+        inspect.getsource(verification_loop._run_auto_verification_loop_inner)
+        + inspect.getsource(verification_loop._make_repair_on_complete)
     )
+
+
+def test_call_sites_pass_the_rounds_failure_set():
+    """Pin the wiring. The revival rule is inert unless the auto-loop hands
+    the round's failure set to the selector, and the two are edited far
+    apart — this is the assertion that fails if only the helper changes."""
+    source = _production_repair_dispatch_source()
     calls = source.count("_get_pending_repair_tasks(")
     assert calls == 5, f"expected the 5 production call sites, found {calls}"
     # Four of them sit after a round verdict exists and must carry it; the
@@ -417,8 +431,10 @@ def test_read_only_probe_sites_pass_no_failure_set():
 
     import verification_loop
 
+    # 2026-10-22: the guard lives in the post-repair callback, which
+    # is now the module-level factory ``_make_repair_on_complete``.
     source = inspect.getsource(
-        verification_loop._run_auto_verification_loop_inner,
+        verification_loop._make_repair_on_complete,
     )
     guard = source.split("def _on_repair_complete", 1)[1]
     assert "_get_pending_repair_tasks(plan_id)" in guard, (

@@ -1068,8 +1068,8 @@ async def _lifespan(app):
     # reset to round=0.
     _recover_verification_states(PLANS_DIR)
     # 2026-09-13: after recovery, roll stranded verification stages
-    # forward.  Rows at verification_running / verification_rerunning
-    # whose plan_verification row is already terminal are invisible to
+    # forward.  Rows at verification_running whose
+    # plan_verification row is already terminal are invisible to
     # the in-memory watchdog: the card sticks at
     # "failed" while the routing stage still says "running".
     _reconcile_orphaned_verification_stages()
@@ -2835,6 +2835,10 @@ from verification_loop import (  # noqa: E402,F401
     _release_verification_state_conn,
     _run_repair_execution,
     _run_repair_execution_async,
+    # 2026-10-22: the post-repair callback is a module-level factory
+    # now, so the ``/start`` repair-resume path and the auto-loop share
+    # ONE implementation of the post-repair chain.
+    _make_repair_on_complete,
     _persist_verification_terminal,
     _count_unfinished_execution_tasks,
     _rollback_dead_end_to_ready,
