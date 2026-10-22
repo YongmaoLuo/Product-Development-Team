@@ -1097,7 +1097,9 @@ class TestClaudeCodingToolProviderSelection:
             p.wait.return_value = 0
             return p
 
-        mock_popen.side_effect = [_make_fail_proc(), _make_fail_proc()]
+        mock_popen.side_effect = [
+            _make_fail_proc(), _make_fail_proc(), _make_fail_proc(),
+        ]
 
         with patch.object(
             ClaudeCodingTool,
@@ -1120,8 +1122,12 @@ class TestClaudeCodingToolProviderSelection:
                 with pytest.raises(ApiError):
                     tool.query("test")
 
-        # Selected-provider attempt + exactly one fallback.
-        assert mock_popen.call_count == 2
+        # Selected-provider attempt + exactly one provider switch + the
+        # resume attempt that could not be honoured (it degrades to a
+        # fresh session, which is the third spawn). The provider switch
+        # still happens exactly once: the ApiError the parent attempt
+        # raises is propagated, not retried again.
+        assert mock_popen.call_count == 3
 
 
 def test_interactive_dispatch_has_no_hardcoded_provider_branches():
@@ -1403,8 +1409,23 @@ def test_query_timeout_fallback_resumes_the_same_session(
 
 @patch("coding_tool.ClaudeCodingTool._check_provider_availability")
 @patch("coding_tool.subprocess.Popen")
-def test_query_api_error_fallback_uses_new_session(mock_popen, mock_check_provider):
-    """On ApiError, query() retries with a fresh subprocess (no session resume)."""
+def test_query_api_error_fallback_resumes_the_same_session(
+    mock_popen, mock_check_provider
+):
+    """On ApiError, query() switches provider by RESUMING the old session.
+
+    2026-10-21: this used to assert the opposite — "a fresh subprocess
+    (no session resume)" — on the reasoning that a provider which errored
+    out never ran the turn, so there was no conversation to continue. That
+    reasoning only holds for an error raised *before* the model produced
+    anything. A capacity error (429/402/503/529) is raised *after* the
+    sub-agent has been working: the observed one came 52 rounds and 38
+    minutes into the task. Re-sending the prompt into a brand-new
+    session paid for every one of those rounds twice.
+
+    So the provider switch resumes now, the same way the timeout switch
+    already did.
+    """
     mock_check_provider.return_value = (
         True,
         {
@@ -1441,14 +1462,16 @@ def test_query_api_error_fallback_uses_new_session(mock_popen, mock_check_provid
     assert call_count["n"] == 2
     first_kwargs = fake_mock.call_args_list[0].kwargs
     second_kwargs = fake_mock.call_args_list[1].kwargs
-    assert second_kwargs.get("resume") is False, (
-        "a provider that errored out never ran the turn, so there is no "
-        "conversation worth continuing — unlike a timeout, this retry "
-        "starts fresh"
+    assert second_kwargs.get("resume") is True, (
+        "the switch must resume the session the failed attempt was using — "
+        "a fresh session re-sends the whole prompt and re-pays for every "
+        "round the sub-agent already did"
     )
-    assert second_kwargs.get("session_id") != first_kwargs.get("session_id"), (
-        "the fresh attempt needs its own id; re-pinning the failed "
-        "attempt's id is not a new session"
+    assert second_kwargs.get("session_id") == first_kwargs.get("session_id"), (
+        "it must resume THAT session; re-pinning a new id is not a resume"
+    )
+    assert "vendor-b-pro" in (second_kwargs.get("excluded_providers") or []), (
+        "the switch must still exclude the provider that failed"
     )
 
 
