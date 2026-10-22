@@ -823,22 +823,108 @@ DEFAULT_COOLDOWN_SEC: float = 300.0
 #: seconds, so re-probing inside a run is wasted work.
 DEFAULT_QUOTA_COOLDOWN_SEC: float = 1800.0
 
-#: Substrings that mark a 429 as "out of budget" rather than "slow
+#: Substrings that mark a failure as "out of budget" rather than "slow
 #: down". Matched case-insensitively against the provider's error text.
 #: The list spans languages because CC Switch surfaces vendor text
 #: verbatim, and vendors do not answer in one.
-QUOTA_ERROR_MARKERS: tuple[str, ...] = (
+#:
+#: The vendor's plan name is deliberately not among them. Both of that
+#: vendor's refusals name the plan — the spent-plan one, which carries
+#: the code ``2056``, and the rate-limit one, which carries ``2062`` —
+#: so the plan name cannot tell the two apart. What separates them is
+#: the wording the vendor puts next to it, and that wording is what
+#: this set and :data:`RATE_LIMIT_ERROR_MARKERS` hold.
+EXHAUSTION_ERROR_MARKERS: tuple[str, ...] = (
     "用量上限",
+    "2056",
     "quota",
     "insufficient",
     "balance",
     "billing",
     "payment",
     "credit",
-    "token plan",
     "plan limit",
     "exceeded your current quota",
 )
+
+#: Substrings that mark a failure as "slow down, ask again shortly".
+#: A rate limit clears on its own in minutes, so it earns the short
+#: park rather than the quota window.
+RATE_LIMIT_ERROR_MARKERS: tuple[str, ...] = (
+    "速率限制",
+    "2062",
+    "rate limit",
+    "too many requests",
+)
+
+#: The previous name of :data:`EXHAUSTION_ERROR_MARKERS`. Kept because
+#: the name is part of this module's exported surface; the set behind
+#: it is the exhaustion set and nothing else.
+QUOTA_ERROR_MARKERS: tuple[str, ...] = EXHAUSTION_ERROR_MARKERS
+
+#: Statuses that mean "this provider cannot serve the call right now".
+#: 429 is the rate-limit / quota case, 402 is a billing rejection, and
+#: 503 / 529 are the upstream-overloaded answers that
+#: Anthropic-compatible gateways return.
+CAPACITY_ERROR_STATUSES: frozenset[str] = frozenset({"429", "402", "503", "529"})
+
+#: Statuses that mean "the request is wrong". No other provider can
+#: fix a malformed request, so these are fatal rather than a reason to
+#: rotate. Authentication (401 / 403), not-found (404) and conflict
+#: (409) are deliberately absent: a bad credential is worth one more
+#: provider, not a dead task.
+FATAL_ERROR_STATUSES: frozenset[str] = frozenset(
+    {"400", "405", "406", "413", "414", "415", "422", "501"}
+)
+
+
+def classify_capacity_failure(
+    text: str,
+    status: str = "",
+    *,
+    live_exhausted: bool = False,
+) -> str:
+    """Classify a provider failure into one of four buckets.
+
+    Returns ``"exhausted"`` (the budget is gone), ``"rate_limited"``
+    (slow down, ask again shortly), ``"fatal"`` (the request itself is
+    wrong) or ``"other"`` (anything the caller should keep handling the
+    way it did before — including rotating to the next provider).
+
+    The order of the checks is the contract, and it never changes:
+
+      1. ``live_exhausted`` — a live usage reading that says the budget
+         is gone. The meter is not a guess, so it outranks the prose
+         the provider sent alongside it.
+      2. text that reads as an exhaustion (the code ``2056``, the phrase
+         for a usage cap, or one of the English budget phrases).
+      3. text that reads as a rate limit (the code ``2062``, the phrase
+         for a rate limit).
+      4. a capacity status — 429 / 402 / 503 / 529 — with no text to
+         read.
+      5. a fatal status — 400 / 405 / 406 / 413 / 414 / 415 / 422 / 501.
+      6. everything else.
+
+    The text checks come before the status checks because the provider
+    says more than its status does: a 429 that reads as a spent plan
+    and a 429 that reads as a rate limit are different failures, and
+    only the text tells them apart.
+    """
+    if live_exhausted:
+        return "exhausted"
+
+    lowered = (text or "").casefold()
+    if any(marker in lowered for marker in EXHAUSTION_ERROR_MARKERS):
+        return "exhausted"
+    if any(marker in lowered for marker in RATE_LIMIT_ERROR_MARKERS):
+        return "rate_limited"
+
+    normalized = str(status or "").strip()
+    if normalized in CAPACITY_ERROR_STATUSES:
+        return "rate_limited"
+    if normalized in FATAL_ERROR_STATUSES:
+        return "fatal"
+    return "other"
 
 
 def looks_like_quota_exhaustion(text: str) -> bool:
@@ -849,11 +935,12 @@ def looks_like_quota_exhaustion(text: str) -> bool:
     only costs a short park; a false positive parks a healthy provider
     for 30 minutes, so the markers are specific phrases rather than the
     bare word "limit".
+
+    The answer comes from :func:`classify_capacity_failure`, so this
+    question and the four-way classification can never disagree about
+    what a given error text means.
     """
-    if not text:
-        return False
-    lowered = text.casefold()
-    return any(marker in lowered for marker in QUOTA_ERROR_MARKERS)
+    return classify_capacity_failure(text) == "exhausted"
 
 
 class ProviderCooldown:
@@ -1048,16 +1135,21 @@ def acquired_provider_slot(
 
 
 __all__ = [
+    "CAPACITY_ERROR_STATUSES",
     "DEFAULT_COOLDOWN_SEC",
     "DEFAULT_MAX_CONCURRENCY_AT_FULL",
     "DEFAULT_QUOTA_COOLDOWN_SEC",
+    "EXHAUSTION_ERROR_MARKERS",
+    "FATAL_ERROR_STATUSES",
     "QUOTA_ERROR_MARKERS",
+    "RATE_LIMIT_ERROR_MARKERS",
     "ActiveConcurrencyTracker",
     "DynamicProviderSelectionError",
     "ProviderCooldown",
     "acquire_provider_with_dynamic_capacity",
     "acquired_provider_slot",
     "canonical_capacity_key",
+    "classify_capacity_failure",
     "compute_dynamic_limit",
     "get_shared_cooldown",
     "get_shared_tracker",

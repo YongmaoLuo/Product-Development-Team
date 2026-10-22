@@ -1709,6 +1709,26 @@ def _quota_wake_sleep(seconds: float) -> None:
         time.sleep(seconds)
 
 
+def _rate_limit_sleep(seconds: float) -> None:
+    """Wait out one step of a provider's rate-limit backoff.
+
+    Its own function so the wait can be replaced rather than served,
+    for the same reason :func:`_quota_wake_sleep` is one: the numbers
+    this path deals in are tens of seconds, so a test that let them
+    through would test nothing but the patience of the suite. A test
+    that wants the decision instead patches this name and reads back
+    what was asked for.
+
+    The production body is the ordinary blocking sleep and there is no
+    flag, mode or keyword that makes it behave differently, so the
+    substitution cannot leak into a run: the seam is the module-level
+    name, resolved at call time, and replacing it is something a test
+    does on purpose.
+    """
+    if seconds > 0:
+        time.sleep(seconds)
+
+
 #: Shortest and longest single step of the "wait for this tier to come
 #: back" loop.
 #:
@@ -1851,6 +1871,76 @@ def _park_provider_after_error(provider: str, exc: BaseException) -> float:
     return seconds
 
 
+def _provider_is_parked(provider: str) -> bool:
+    """True when ``provider`` is inside its cooldown window right now.
+
+    The park IS the record of "this provider is not to be used at the
+    moment", and it is the only record of it that expires: a cooldown
+    entry carries its own deadline, so a provider that was parked comes
+    back by itself when the window rolls. The exclusion set is the other
+    record of the same fact, and it does not expire — it rides down the
+    retry chain and is only rebuilt when the chain is rebuilt, so a
+    provider written into it stays out of the candidate set until
+    something else rebuilds the set. One fact, two books, and only one
+    of them can let a provider come back.
+
+    So the question is asked of the cooldown, which is the ledger that
+    can answer it. The answer is read from the cooldown's ACTUAL state
+    rather than from what a parking call reported: a parking call that
+    only returns a number has parked nothing, and a provider that was
+    not parked still has to be excluded by hand.
+
+    Returns ``False`` when the cooldown module cannot be reached or
+    cannot answer. An unreadable ledger is not a claim that anything is
+    parked, and treating it as one would drop providers out of the pool
+    for a reason nobody can name.
+    """
+    if not provider:
+        return False
+    try:
+        from dynamic_provider_concurrency import get_shared_cooldown
+    except Exception:  # pragma: no cover - import cycle guard
+        return False
+    try:
+        return bool(get_shared_cooldown().is_parked(provider))
+    except Exception:
+        return False
+
+
+def _classify_provider_failure(exc: BaseException, provider: str = "") -> str:
+    """Which kind of provider failure ``exc`` is.
+
+    Four answers, in the order
+    :func:`dynamic_provider_concurrency.classify_capacity_failure`
+    fixes: ``"exhausted"`` (the budget is gone), ``"rate_limited"``
+    (slow down, ask again shortly), ``"fatal"`` (the request itself is
+    wrong, so no other provider will fix it) and ``"other"`` (anything
+    else — the bucket that keeps the old rotate-to-the-next-provider
+    behaviour).
+
+    The live usage reading is folded in here, and it outranks the prose
+    the provider sent: a meter that says the budget is gone is not a
+    guess, while the wording of a 429 is. A reading that cannot be
+    fetched is not a reading that says "exhausted" — it leaves the prose
+    in charge, so an unreachable CC Switch can only ever make the
+    classification *less* aggressive, never more.
+    """
+    from dynamic_provider_concurrency import classify_capacity_failure
+
+    exhausted = False
+    try:
+        from provider_order import load_provider_quota_map
+        quota = load_provider_quota_map().get(provider)
+        exhausted = bool(getattr(quota, "exhausted", False))
+    except Exception:
+        exhausted = False
+    return classify_capacity_failure(
+        str(exc),
+        str(getattr(exc, "status", "") or ""),
+        live_exhausted=exhausted,
+    )
+
+
 class ClaudeCodingTool(CodingTool):
     """Claude Code CLI tool using stdin/stdout stream-json protocol.
 
@@ -1867,6 +1957,22 @@ class ClaudeCodingTool(CodingTool):
     # ``CodingTool`` (2026-09-15) so every tool class shares one budget —
     # do not re-declare them here.
     MAX_TIMEOUT_RETRIES = 2      # max provider fallback retries on timeout
+    # 2026-10-22 — how long a rate-limited provider is waited out before
+    # the dispatch gives up on it and rotates to the next one.
+    #
+    # A 429 that reads as a *rate limit* (the vendor's code ``2062``)
+    # is not a dead provider: the window reopens in seconds, and the
+    # old behaviour — park the provider for the quota window, exclude
+    # it and re-dispatch elsewhere — threw away a healthy provider
+    # over a refusal that a coffee break would have cleared. So the
+    # wait comes first, on the SAME provider, growing as the provider
+    # keeps saying no: 10s, 20s, 40s, 80s. Only when the last of those
+    # is also refused does the provider get parked and swapped.
+    #
+    # The growing figures are the point: a provider that answers a
+    # refusal after 10 seconds is being asked too fast, and the wait
+    # that clears it grows with the number of refusals already spent.
+    RATE_LIMIT_BACKOFF_SEC = (10.0, 20.0, 40.0, 80.0)
     # 2026-09-17 — an empty reply (subprocess exited, no assistant text)
     # is retried on a FRESH session, not with ``--resume``: the session
     # id we asked for was never created, so resuming it can only fail
@@ -3426,6 +3532,47 @@ class ClaudeCodingTool(CodingTool):
                             scene=effective_scene,
                             logger=self.logger,
                         )
+                        # The candidate set is rebuilt, not reused.
+                        #
+                        # It was collected before the wait began, and a
+                        # wait can easily outlast what it was built
+                        # from: a provider parked by a refusal earlier
+                        # in this run is in the chain the whole time
+                        # and comes back when its cooldown expires.
+                        # The reading is the only thing this loop
+                        # watches, and the reading does not carry the
+                        # park — so a set collected before the wait
+                        # could not contain a provider that had come
+                        # back, and the fleet sat on a provider it had
+                        # already stopped believing in until some
+                        # unrelated dispatch happened to arrive.
+                        #
+                        # The rebuild is the same collection, under the
+                        # same rules: same chain, same exclusions,
+                        # same park state read fresh. Nothing is
+                        # patched into the list by hand, and no rule is
+                        # bent for the sake of getting out of the wait.
+                        _collect_scene_candidates()
+                        _scene_diag["candidates"] = list(scene_candidates)
+                        if not scene_candidates and not _tier_awaiting_park():
+                            # Nothing left to wait with, and nothing on
+                            # a clock to wait for: every member of the
+                            # chain is gone for good (excluded,
+                            # unreachable, or its park already
+                            # expired). The wait has no round budget --
+                            # the limit on a closed window belongs to
+                            # the provider, not to the dispatcher -- so
+                            # continuing would spin towards an answer
+                            # that is already known, until the
+                            # caller's own timeout ended it. This is
+                            # the fail-closed answer instead.
+                            #
+                            # A tier that IS parked is the other case:
+                            # a park expires by itself, and the next
+                            # round's rebuild finds it. So the wait
+                            # continues, on the probe's cadence.
+                            _scene_diag["reason"] = "all_candidates_skipped"
+                            break
                         _scene_diag["wake_rounds"] = _wake_rounds
                         chosen = acquire_provider_with_dynamic_capacity(
                             scene_candidates,
@@ -3605,6 +3752,17 @@ class ClaudeCodingTool(CodingTool):
                 # call that already has its provider.
                 break
             if prov_name in excluded:
+                continue
+            # A parked provider is out of the pool, and the cooldown is
+            # where that is recorded. The park and the exclusion set are
+            # the same fact written down twice — "this provider is not
+            # to be used right now" — and only one of the two can let
+            # the provider come back: a park expires on its own, while
+            # the exclusion set does not. So the walk reads the park as
+            # well, exactly as the scene-candidate walk does, and a
+            # provider that is only parked is skipped here rather than
+            # picked and refused again.
+            if _provider_is_parked(prov_name):
                 continue
             available, provider_config = (
                 ClaudeCodingTool._check_provider_availability(prov_name)
@@ -4852,6 +5010,7 @@ class ClaudeCodingTool(CodingTool):
         total_timeout: Optional[int],
         allowed_tools: Optional[list],
         scene: Optional[str],
+        fallback_on_capacity_error: bool = True,
     ) -> tuple:
         """Re-open ``prev_session_id`` where the previous attempt left off.
 
@@ -4873,6 +5032,18 @@ class ClaudeCodingTool(CodingTool):
         call it replaces, which is what would have happened anyway, and
         says so in the log so the degradation is visible rather than
         silent.
+
+        ``fallback_on_capacity_error=False`` turns that degradation off
+        for the errors that are the PROVIDER's doing: a capacity error
+        is raised instead of being answered with a second dispatch.
+        The rate-limit backoff needs that, because its question is
+        "what did the provider say this time?" and a fallback would
+        answer it with a fresh session and the whole prompt re-sent —
+        to a provider that has just refused. That question has to be
+        asked of ONE dispatch, or the backoff counts refusals it never
+        received. An error that is NOT the provider's doing still
+        degrades: a session that cannot be re-opened is exactly what
+        the fallback is for.
 
         Returns the same ``(text, session_id)`` pair as
         ``_run_interactive_resilient``. On the fallback path the id is
@@ -4903,6 +5074,13 @@ class ClaudeCodingTool(CodingTool):
             # on another provider is exactly what a stop request forbids.
             raise
         except Exception as exc:
+            if not fallback_on_capacity_error and is_capacity_error(exc):
+                # The provider is the one saying no, and the caller is
+                # counting the refusals. A fresh-session fallback would
+                # answer with a second dispatch — the whole prompt
+                # re-sent — so the count would be of refusals the
+                # provider never gave. See the docstring.
+                raise
             if self.logger:
                 self.logger.warning(
                     "coding_resume_fallback",
@@ -4982,7 +5160,7 @@ class ClaudeCodingTool(CodingTool):
                                     "model": self.model, "model_type": self.model_type, "mode": "interactive"})
 
         def _call(excluded=None, total_timeout=None, resume=False,
-                   switch=False):
+                   switch=False, fallback_on_capacity_error=True):
             """One dispatch of this prompt; returns the assistant text.
 
             ``resume=False`` opens a fresh session under a pinned id;
@@ -5001,6 +5179,12 @@ class ClaudeCodingTool(CodingTool):
             re-sending it would pay for the same tokens twice. The
             switch says "continue" and lets the transcript supply the
             ask; the re-ask says "here is the new request" and sends it.
+
+            ``fallback_on_capacity_error=False`` says a resume refused
+            by the PROVIDER must be reported as a failure rather than
+            degraded into a fresh-session dispatch. The rate-limit
+            backoff needs that: it is asking the provider a question,
+            and the answer has to come from one dispatch.
             """
             nonlocal pinned_session_id
             if resume:
@@ -5027,6 +5211,7 @@ class ClaudeCodingTool(CodingTool):
                     total_timeout=total_timeout,
                     allowed_tools=None,
                     scene=scene,
+                    fallback_on_capacity_error=fallback_on_capacity_error,
                 )
                 if used_sid:
                     # A resume that fell back to a fresh session
@@ -5285,18 +5470,144 @@ class ClaudeCodingTool(CodingTool):
                     self._current_process = None
                 if proc is not None:
                     kill_process_group(proc)
-                new_excluded = list(excluded_providers or [])
-                if failed_provider not in new_excluded:
-                    new_excluded.append(failed_provider)
+                # 2026-10-22 — a 429 is not one failure but four, and
+                # the old arm treated all of them as "this provider is
+                # out of budget": park it for the quota window, exclude
+                # it and re-dispatch somewhere else. That is right for
+                # a spent plan and wrong for a rate limit — the vendor's
+                # ``2062`` refusal clears itself in seconds, and
+                # answering it by throwing the provider away for half an
+                # hour is how a healthy provider disappears from the
+                # pool.
+                #
+                # So the failure is classified first (one function, one
+                # order — see :func:`_classify_provider_failure`), and
+                # the class decides what happens:
+                #
+                #   * ``fatal`` — the request itself is wrong. No
+                #     provider and no wait will fix it, so the error
+                #     goes straight back to the caller.
+                #   * ``rate_limited`` — slow down. The SAME provider is
+                #     waited out (10s / 20s / 40s / 80s) and asked
+                #     again; nothing is parked and nothing is excluded
+                #     until the last wait is refused too.
+                #   * ``exhausted`` — the budget is gone. Park for the
+                #     quota window and move on.
+                #   * ``other`` — unchanged from before: exclude the
+                #     provider and move on.
+                kind = _classify_provider_failure(exc, failed_provider)
+                if kind == "fatal":
+                    if self.logger:
+                        self.logger.error(
+                            "provider_failure_fatal",
+                            f"{failed_provider} rejected the request "
+                            f"({exc.status}); not retrying",
+                            data={
+                                "from_provider": failed_provider,
+                                "error_status": exc.status,
+                                "failure_kind": kind,
+                            },
+                        )
+                    raise
+                if kind == "rate_limited":
+                    round_no = 0
+                    while (
+                        kind == "rate_limited"
+                        and round_no < len(self.RATE_LIMIT_BACKOFF_SEC)
+                    ):
+                        delay = self.RATE_LIMIT_BACKOFF_SEC[round_no]
+                        round_no += 1
+                        # The wait is not work: the provider is being
+                        # asked to slow down, and the budget that bounds
+                        # the dispatch must not be spent on it.
+                        clock = getattr(self, "_work_clock", None)
+                        if clock is not None:
+                            clock.park()
+                        try:
+                            _rate_limit_sleep(delay)
+                        finally:
+                            if clock is not None:
+                                clock.resume()
+                        if self.logger:
+                            self.logger.warning(
+                                "provider_rate_limit_backoff",
+                                f"{failed_provider} rate limited "
+                                f"(round {round_no}/"
+                                f"{len(self.RATE_LIMIT_BACKOFF_SEC)}); "
+                                f"waiting {delay:.0f}s and asking the same "
+                                f"provider again",
+                                data={
+                                    "from_provider": failed_provider,
+                                    "error_status": exc.status,
+                                    "failure_kind": kind,
+                                    "round": round_no,
+                                    "delay_sec": delay,
+                                },
+                            )
+                        try:
+                            # The same provider, the same session: the
+                            # failed attempt's conversation is worth
+                            # keeping, and the provider is not excluded
+                            # yet, so the retry may land on it again.
+                            # ``fallback_on_capacity_error=False`` keeps
+                            # this to ONE dispatch — a fresh-session
+                            # fallback would re-send the whole prompt
+                            # to a provider that has just refused, and
+                            # the backoff would be counting a refusal
+                            # it never received.
+                            return _call(
+                                excluded=excluded_providers,
+                                resume=True,
+                                switch=True,
+                                fallback_on_capacity_error=False,
+                            )
+                        except ApiError as retry_exc:
+                            exc = retry_exc
+                            kind = _classify_provider_failure(
+                                retry_exc, failed_provider,
+                            )
+                            if kind == "fatal":
+                                raise
                 # 2026-09-22 — remember that this provider has no budget
                 # so the NEXT dispatch does not re-select it. Without
                 # this, a quota-exhausted provider is re-picked on every
                 # call: it is reachable, so every availability probe
                 # says yes, and the run pays a failed round-trip each
                 # time (observed 12 times in 0921).
+                #
+                # The park is taken FIRST, and the exclusion set is
+                # decided from the cooldown's actual state afterwards.
+                # The order is the whole point: the question "is this
+                # provider parked?" is answered by the cooldown, so a
+                # decision taken before the park exists would read a
+                # ledger that does not have the entry yet and answer
+                # "no" every time.
+                #
+                # And the two records are not both written down. The
+                # park expires by itself, so a provider whose half-hour
+                # window rolls comes back on its own. The exclusion set
+                # does not expire — it rides down the retry chain and is
+                # only rebuilt when the chain is rebuilt — so a provider
+                # written into it stayed out of the candidate set long
+                # after its cooldown had run out, and the scene-candidate
+                # walk (which reads ``excluded`` first) never offered it
+                # again. One fact, two books, and only one of them can
+                # let a provider come back: so the park is the whole
+                # record for a provider that was parked.
+                #
+                # A failure that parked NOTHING — not a capacity error,
+                # or a cooldown module that is not there — is still
+                # excluded, because that exclusion is the only thing
+                # keeping it out of this retry.
                 parked_sec = _park_provider_after_error(
                     failed_provider, exc,
                 )
+                new_excluded = list(excluded_providers or [])
+                if (
+                    not _provider_is_parked(failed_provider)
+                    and failed_provider not in new_excluded
+                ):
+                    new_excluded.append(failed_provider)
                 if self.logger:
                     self.logger.warning(
                         "provider_fallback",
@@ -5305,6 +5616,11 @@ class ClaudeCodingTool(CodingTool):
                             "from_provider": failed_provider,
                             "error_status": exc.status,
                             "parked_sec": parked_sec,
+                            # Which of the four failures this was — the
+                            # backoff above has already been tried and
+                            # run out, so the reason the provider is
+                            # being dropped has to be in the log.
+                            "failure_kind": kind,
                             # 2026-09-23: this used to compute
                             # ``remaining_after_exclusion`` from
                             # ``scene_chain`` — a local of
@@ -5472,7 +5788,8 @@ class ClaudeCodingTool(CodingTool):
         pinned: List[Optional[str]] = [None]
 
         def _query_json_internal(excluded=None, total_timeout=None,
-                                 resume_session=None, switch=False):
+                                 resume_session=None, switch=False,
+                                 fallback_on_capacity_error=True):
             # Try the first call. If the reply is unparseable (LLM
             # returned empty / plain prose / truncated JSON), retry
             # once with a follow-up hint that surfaces the actual
@@ -5488,6 +5805,17 @@ class ClaudeCodingTool(CodingTool):
             # The switch says "continue" and lets the transcript supply
             # the ask; the re-ask says "here is the new request" and
             # sends it. See ``_call`` for the same contract.
+            #
+            # ``fallback_on_capacity_error=False`` turns off the
+            # degradation a refused resume normally gets (see
+            # :meth:`_resume_or_fresh_session`): a capacity error is
+            # raised instead of being answered with a second dispatch.
+            # The rate-limit backoff needs that, because its question
+            # is "what did the provider say this time?" and a fallback
+            # would answer it with a fresh session and the whole prompt
+            # re-sent — to a provider that has just refused. That
+            # question has to be asked of ONE dispatch, or the backoff
+            # counts refusals it never received.
             #
             # M1 migration (2026-08-11): both attempts now use
             # ``_run_claude_interactive`` so the LLM can Read the
@@ -5534,6 +5862,7 @@ class ClaudeCodingTool(CodingTool):
                     total_timeout=total_timeout,
                     allowed_tools=allowed_tools,
                     scene=scene,
+                    fallback_on_capacity_error=fallback_on_capacity_error,
                 )
                 if used_sid:
                     session_id = used_sid
@@ -5799,14 +6128,126 @@ class ClaudeCodingTool(CodingTool):
                     kill_process_group(proc)
                     with self._process_lock:
                         self._current_process = None
-                new_excluded = list(excluded_providers or [])
-                if failed_provider not in new_excluded:
-                    new_excluded.append(failed_provider)
+                # 2026-10-22 — a 429 is not one failure but four, and
+                # this arm treated all of them as "this provider is out
+                # of budget": park it for the quota window, exclude it
+                # and re-dispatch somewhere else. That is right for a
+                # spent plan and wrong for a rate limit — the vendor's
+                # ``2062`` refusal clears itself in seconds, and
+                # answering it by throwing the provider away for half an
+                # hour is how a healthy provider disappears from the
+                # pool.
+                #
+                # So the failure is classified first (one function, one
+                # order — see :func:`_classify_provider_failure`), and
+                # the class decides what happens — the same contract the
+                # text path follows in ``_query_internal_m1``:
+                #
+                #   * ``fatal`` — the request itself is wrong. No
+                #     provider and no wait will fix it, so the error
+                #     goes straight back to the caller.
+                #   * ``rate_limited`` — slow down. The SAME provider is
+                #     waited out (10s / 20s / 40s / 80s) and asked
+                #     again; nothing is parked and nothing is excluded
+                #     until the last wait is refused too.
+                #   * ``exhausted`` — the budget is gone. Park for the
+                #     quota window and move on.
+                #   * ``other`` — unchanged from before: exclude the
+                #     provider and move on.
+                kind = _classify_provider_failure(exc, failed_provider)
+                if kind == "fatal":
+                    if self.logger:
+                        self.logger.error(
+                            "provider_failure_fatal",
+                            f"{failed_provider} rejected the request "
+                            f"({exc.status}); not retrying",
+                            data={
+                                "from_provider": failed_provider,
+                                "error_status": exc.status,
+                                "failure_kind": kind,
+                            },
+                        )
+                    raise
+                if kind == "rate_limited":
+                    round_no = 0
+                    while (
+                        kind == "rate_limited"
+                        and round_no < len(self.RATE_LIMIT_BACKOFF_SEC)
+                    ):
+                        delay = self.RATE_LIMIT_BACKOFF_SEC[round_no]
+                        round_no += 1
+                        # The wait is not work: the provider is being
+                        # asked to slow down, and the budget that bounds
+                        # the dispatch must not be spent on it.
+                        clock = getattr(self, "_work_clock", None)
+                        if clock is not None:
+                            clock.park()
+                        try:
+                            _rate_limit_sleep(delay)
+                        finally:
+                            if clock is not None:
+                                clock.resume()
+                        if self.logger:
+                            self.logger.warning(
+                                "provider_rate_limit_backoff",
+                                f"{failed_provider} rate limited "
+                                f"(round {round_no}/"
+                                f"{len(self.RATE_LIMIT_BACKOFF_SEC)}); "
+                                f"waiting {delay:.0f}s and asking the same "
+                                f"provider again",
+                                data={
+                                    "from_provider": failed_provider,
+                                    "error_status": exc.status,
+                                    "failure_kind": kind,
+                                    "round": round_no,
+                                    "delay_sec": delay,
+                                },
+                            )
+                        try:
+                            # The same provider, the same session: the
+                            # failed attempt's conversation is worth
+                            # keeping, and the provider is not excluded
+                            # yet, so the retry may land on it again.
+                            # ``fallback_on_capacity_error=False`` keeps
+                            # this to ONE dispatch — a fresh-session
+                            # fallback would re-send the whole prompt to
+                            # a provider that has just refused, and the
+                            # backoff would be counting a refusal it
+                            # never received.
+                            return _query_json_internal(
+                                excluded=excluded_providers,
+                                resume_session=pinned[0],
+                                switch=True,
+                                fallback_on_capacity_error=False,
+                            )
+                        except ApiError as retry_exc:
+                            exc = retry_exc
+                            kind = _classify_provider_failure(
+                                retry_exc, failed_provider,
+                            )
+                            if kind == "fatal":
+                                raise
                 # Same quota-cooldown contract as the interactive path —
                 # see ``_park_provider_after_error`` for the 0921 story.
+                #
+                # And the same one-ledger rule: the park is taken first,
+                # and the exclusion set is decided from the cooldown's
+                # actual state afterwards. A provider that IS parked is
+                # recorded by the cooldown alone — the exclusion set
+                # does not expire, so a provider written into it would
+                # stay out of the candidate set long after its park had
+                # run out. A failure that parked nothing is still
+                # excluded, because that exclusion is the only thing
+                # keeping it out of this retry.
                 parked_sec = _park_provider_after_error(
                     failed_provider, exc,
                 )
+                new_excluded = list(excluded_providers or [])
+                if (
+                    not _provider_is_parked(failed_provider)
+                    and failed_provider not in new_excluded
+                ):
+                    new_excluded.append(failed_provider)
                 if self.logger:
                     self.logger.warning(
                         "provider_fallback",
@@ -5815,6 +6256,11 @@ class ClaudeCodingTool(CodingTool):
                             "from_provider": failed_provider,
                             "error_status": exc.status,
                             "parked_sec": parked_sec,
+                            # Which of the four failures this was — the
+                            # backoff above has already been tried and
+                            # run out, so the reason the provider is
+                            # being dropped has to be in the log.
+                            "failure_kind": kind,
                         },
                     )
                 # Same contract as ``_query_internal_m1`` and the

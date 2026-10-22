@@ -24,9 +24,13 @@ The contract these tests hold in place:
    call falls back to a fresh session, says so in the log, and still
    returns a result.
 6. **The JSON path resumes too**, and its reply stays parseable.
-7. **A capacity error switches providers the same way a timeout does.**
-   429 / 402 / 503 / 529 land in the ``except ApiError`` arm, which used
-   to re-dispatch into a brand-new session and re-send the whole prompt.
+7. **A capacity error is answered on the same provider.** 429 / 402 /
+   503 / 529 land in the ``except ApiError`` arm, which used to
+   re-dispatch into a brand-new session and re-send the whole prompt.
+   A refusal that reads as a *rate limit* is now waited out on the
+   provider that gave it (10s / 20s / 40s / 80s) and asked again
+   there; only a provider that refuses every one of those waits is
+   parked and dropped.
 8. **A capacity error does not re-send the prompt.** A caller that holds
    a reusable session (the executor's ``query_in_session``) used to have
    its *whole* prompt re-sent on every 429, because the switch
@@ -77,6 +81,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 import coding_tool as ct  # noqa: E402
+import provider_order  # noqa: E402
 from coding_tool import (  # noqa: E402
     ApiError,
     ClaudeCodingTool,
@@ -88,6 +93,25 @@ from coding_tool import (  # noqa: E402
     query_in_session,
     query_json_in_session,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_rate_limit_waits(monkeypatch):
+    """The rate-limit backoff's waits are replaced, not served.
+
+    A dispatch whose provider answers 429 now waits that provider out
+    (10s / 20s / 40s / 80s) and asks again on the SAME provider before
+    it gives up and rotates. Those waits are replaced here so a test
+    reads the decision rather than the patience of the suite.
+
+    The live usage reading is stubbed for the same reason a unit test
+    does not ask CC Switch anything: the answer would depend on the
+    machine the test runs on, and it is not what these cases are about.
+    """
+    monkeypatch.setattr(ct, "_rate_limit_sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        provider_order, "load_provider_quota_map", lambda *a, **k: {},
+    )
 
 
 def _tool(monkeypatch, side_effect, *, calls=None):
@@ -449,7 +473,7 @@ def test_the_launcher_builds_resume_with_the_first_session_id(
 
 
 # ---------------------------------------------------------------------------
-# 6. A capacity error switches providers the same way a timeout does
+# 6. A rate limit is waited out on the same provider
 # ---------------------------------------------------------------------------
 #
 # 429 / 402 / 503 / 529 land in the ``except ApiError`` arm of the
@@ -468,6 +492,14 @@ def test_the_launcher_builds_resume_with_the_first_session_id(
 # before the first one), and that is fine: the resume is best-effort and
 # degrades to a fresh session by itself, so a switch on a session that
 # does not exist costs one failed resume, not a dead task.
+#
+# What changed in 2026-10-22 is WHICH provider the retry goes to. A
+# refusal that reads as a rate limit is not a spent budget: the provider
+# is waited out (10s / 20s / 40s / 80s) and asked again on the SAME
+# provider, and only a provider that refuses every one of those waits is
+# parked and dropped. So the retry here is NOT a provider switch any
+# more: it resumes the same session, on the same provider, and the
+# provider is not excluded while the wait is still working.
 
 #: The statuses that mean "this provider has no capacity right now".
 _CAPACITY_STATUSES = ("429", "402", "503", "529")
@@ -486,33 +518,36 @@ def _capacity_error_then(text="done", sid="sid-2", status="429"):
 
 
 @pytest.mark.parametrize("status", _CAPACITY_STATUSES)
-def test_a_capacity_error_switch_resumes_the_pinned_session(monkeypatch, status):
-    """The interactive path: a 429/402/503/529 switch must resume."""
+def test_a_rate_limit_backoff_retry_resumes_the_pinned_session(
+    monkeypatch, status,
+):
+    """The interactive path: a rate-limited retry must resume."""
     tool = _tool(monkeypatch, _capacity_error_then(status=status))
     assert tool.query("do the task", timeout=10) == "done"
 
-    assert len(tool._calls) == 2, "one attempt + one provider switch"
+    assert len(tool._calls) == 2, "one attempt + one backoff retry"
     first, second = tool._calls
 
     assert second["resume"] is True, (
-        f"a {status} must switch providers by resuming the session the "
+        f"a {status} must be answered by resuming the session the "
         "failed attempt was using, not by opening a new one"
     )
     assert second["session_id"] == first["session_id"], (
         "it must resume THAT session — a fresh id restarts the task from "
         "nothing and re-pays for every round already done"
     )
-    assert "vendor-a-pro" in (second["excluded_providers"] or []), (
-        "the switch must still exclude the provider that failed; a resume "
-        "is not a reason to keep using the dead one"
+    assert "vendor-a-pro" not in (second["excluded_providers"] or []), (
+        "the provider is not excluded while the backoff is still working: "
+        "a rate limit clears itself, and excluding the provider here is "
+        "how a healthy one disappeared from the pool for half an hour"
     )
 
 
 @pytest.mark.parametrize("status", _CAPACITY_STATUSES)
-def test_json_capacity_error_switch_resumes_the_pinned_session(
+def test_json_rate_limit_backoff_retry_resumes_the_pinned_session(
     monkeypatch, status
 ):
-    """The JSON path: same switch, same contract."""
+    """The JSON path: same backoff retry, same contract."""
 
     def _side(n, tool):
         tool.current_call_provider = "vendor-a-pro"
@@ -524,16 +559,21 @@ def test_json_capacity_error_switch_resumes_the_pinned_session(
     result = tool.query_json("produce a verdict", timeout=10)
 
     assert result == {"verdict": "pass"}
-    assert len(tool._calls) == 2, "one attempt + one provider switch"
+    assert len(tool._calls) == 2, "one attempt + one backoff retry"
     first, second = tool._calls
 
     assert second["resume"] is True, (
-        f"a {status} must switch providers by resuming the session the "
+        f"a {status} must be answered by resuming the session the "
         "failed attempt was using, not by opening a new one"
     )
     assert second["session_id"] == first["session_id"], (
         "it must resume THAT session — a fresh id restarts the task from "
         "nothing and re-pays for every round already done"
+    )
+    assert "vendor-a-pro" not in (second["excluded_providers"] or []), (
+        "the provider is not excluded while the backoff is still working: "
+        "a rate limit clears itself, and excluding the provider here is "
+        "how a healthy one disappeared from the pool for half an hour"
     )
 
 
