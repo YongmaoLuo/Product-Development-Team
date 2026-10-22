@@ -70,15 +70,109 @@ UNDECLARED_WRITE = "undeclared_write"
 #: No error text, or text that matches no rule above.
 UNKNOWN = "unknown"
 
-#: Kinds that must never be split, whatever their occurrence count.
+#: The verifier did not finish inside its budget (2026-10-22).
 #:
-#: The gate's premise is "the same failure twice means the task is too big
-#: for one subagent". That premise does not hold for a contention or a
-#: contract violation: repeating them only repeats the same mistake. The
-#: executor asks this question separately (``occurrence >= 2 and
-#: failure.kind != 'infra'``); these two extend that to the failures that
-#: arrived with the write contract.
-_UNSPLITTABLE_KINDS = frozenset({LOCK_CONFLICT, UNDECLARED_WRITE})
+#: This is NOT an infrastructure hiccup, and the difference is the whole
+#: point of the kind. A verifier timeout means there is NO evidence about
+#: what the subagent did — neither that it worked nor that it lied. Filed
+#: as ``infra`` it would be "retry the same thing", which with the same
+#: budget produces the same non-answer; filed as a split candidate it
+#: would be broken into children that cannot be verified either. What it
+#: calls for is a re-verification with a bigger budget.
+VERIFIER_TIMEOUT = "verifier_timeout"
+
+#: The executor's own spelling, carrying the free-text reason after the
+#: colon. Only this exact prefix buys the kind: a generic timeout in the
+#: middle of a message stays ``infra``.
+VERIFIER_TIMEOUT_PREFIX = VERIFIER_TIMEOUT + ":"
+
+# ---------------------------------------------------------------------------
+# The remedy: what to DO about a failure (2026-10-22)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. The kinds answered "WHAT went wrong?" and the split
+# gate answered "MAY we split?" from a SECOND, parallel list. Two lists
+# drift: a kind added to the first is silently absent from the second, and
+# the answer for that kind becomes whatever the code happened to default
+# to — which is how a failure nobody thought about ends up splittable.
+#
+# The remedy table collapses the two into one. Every kind names the action
+# it calls for; the split gate asks a single question of that action. The
+# table is the single source of truth, so a new kind cannot be splittable
+# in one place and un-splittable in another.
+
+#: Retry the task as it is. If it fails the SAME way again, splitting is
+#: a legitimate next move — the task really may be too big for one
+#: subagent.
+RETRY_THEN_SPLIT = "retry_then_split"
+
+#: Do not split: the failure carries a machine-readable ``detail`` and
+#: the fix is a targeted refinement (declare this path, use this tool).
+#: The children of a split would inherit the same incomplete declaration
+#: and all reach for the same undeclared path.
+REFINE_WITH_DETAIL = "refine_with_detail"
+
+#: Do not split, whatever the occurrence count. The gate's premise —
+#: "the same failure twice means the task is too big" — does not hold for
+#: these: repeating them only repeats the same mistake. A contention
+#: reproduces itself in the children; an infrastructure problem is not a
+#: decomposition problem at all.
+NEVER_SPLIT = "never_split"
+
+#: Do not split: re-verify the same work with a bigger budget. The
+#: verification did not produce a verdict, so there is nothing to
+#: decompose — there is a missing measurement.
+REVERIFY_WITH_MORE_BUDGET = "reverify_with_more_budget"
+
+#: The remedy for every kind the module owns. TOTAL on purpose: a kind
+#: with no row raises instead of defaulting, so a newly added kind that
+#: forgets to register its remedy is RED rather than silently inheriting
+#: whatever the old code did for an unknown kind.
+REMEDY_BY_KIND = {
+    # A rejected report may be a shape problem (fix the report) or a
+    # genuinely too-big task (split it). The occurrence rule decides,
+    # and the occurrence rule is the executor's.
+    REPORT_FORMAT: RETRY_THEN_SPLIT,
+    # Nothing changed. A second attempt with the same instructions
+    # changes nothing either — but a split, whose children each carry
+    # their own instructions, may.
+    EMPTY_DIFF: RETRY_THEN_SPLIT,
+    # The one case where a smaller subtask is a plausible next move.
+    TEST_FAILURE: RETRY_THEN_SPLIT,
+    # No evidence at all. Splitting on an absence of information
+    # authorises a split on nothing; retrying gathers the information.
+    UNKNOWN: RETRY_THEN_SPLIT,
+    # One path, precisely named, is missing from the declaration.
+    UNDECLARED_WRITE: REFINE_WITH_DETAIL,
+    # Timeouts and provider/environment problems are not decomposition
+    # problems at all.
+    INFRA: NEVER_SPLIT,
+    # Two tasks wanted the same file. The children inherit their
+    # parents' declarations and want it again.
+    LOCK_CONFLICT: NEVER_SPLIT,
+    # No verdict was reached at all — the verification needs a bigger
+    # budget, not a smaller task.
+    VERIFIER_TIMEOUT: REVERIFY_WITH_MORE_BUDGET,
+}
+
+
+def remedy_for(kind: str) -> str:
+    """The remedy registered for ``kind``.
+
+    Raises:
+        ValueError: ``kind`` has no registered remedy. Deliberate: a
+            kind nobody registered has no answer, and returning a
+            default here is exactly the silent behaviour this table
+            exists to remove.
+    """
+    try:
+        return REMEDY_BY_KIND[kind]
+    except KeyError:
+        raise ValueError(
+            f"no remedy registered for failure kind {kind!r}; "
+            f"known kinds: {sorted(REMEDY_BY_KIND)}"
+        ) from None
+
 
 #: ``undeclared_write: <path>[, <path>...]`` — the executor's own
 #: spelling, carrying the paths the guard refused.
@@ -99,10 +193,14 @@ _GUARD_REFUSAL_RE = re.compile(
 def _split_allowed(failure: "Failure") -> bool:
     """Whether the refiner may break this task down.
 
-    Kept next to the kinds it depends on rather than spelled out at the
-    call site, so a new un-splittable kind cannot be forgotten there.
+    Derived from the failure's REMEDY rather than from a second list of
+    kinds: one table is the single source of truth, so a new kind cannot
+    be splittable in one place and un-splittable in another. The only
+    remedy that opens the gate is ``retry_then_split`` — the others each
+    name a more specific action (refine with the detail, re-verify with
+    a bigger budget, never split).
     """
-    return failure.kind not in _UNSPLITTABLE_KINDS and failure.kind != INFRA
+    return failure.remedy == RETRY_THEN_SPLIT
 
 
 def _extract_detail(text: str) -> str:
@@ -267,6 +365,20 @@ class Failure:
     detail: str = ""
     fingerprint: str = ""
 
+    @property
+    def remedy(self) -> str:
+        """What to DO about this failure, derived from its kind.
+
+        Read-only and DERIVED, not stored: the remedy table is the
+        single source of truth, and a stored copy could disagree with
+        it. It is also computed on ACCESS rather than at construction
+        time, so building a ``Failure`` never raises — the contract
+        ``classify_failure`` promises — while reading ``remedy`` for a
+        kind nobody registered does raise ``ValueError`` rather than
+        inventing a default.
+        """
+        return remedy_for(self.kind)
+
 
 # A run of hex characters. After lower-casing, a maximal run of >= 8
 # ``[0-9a-f]`` characters is treated as a digest / uuid fragment.
@@ -312,9 +424,21 @@ def _classify_kind(error):
     contains the word "timeout", so without this the contention would be
     filed as a generic infrastructure hiccup — a failure the refiner is
     told is fine to keep retrying, which is precisely what it must not do.
+    The verifier timeout (2026-10-22) sits ahead of all of them, prefix
+    and all, for the same reason: a message that says the run "timed
+    out" is not a verdict, and filing it as ``infra`` would have the
+    refiner retry what needs a bigger budget.
     """
     if not error:
         return UNKNOWN
+    # The verifier did not finish inside its budget. Checked FIRST, and
+    # ahead of the audit/mismatch rules below: the executor spells this
+    # as an explicit prefix, and the message behind it says "timed out",
+    # so a check placed after the generic timeout rule would file every
+    # verifier timeout as ``infra`` — a failure the refiner is told to
+    # keep retrying, when in truth there is no verdict to act on at all.
+    if error.startswith(VERIFIER_TIMEOUT_PREFIX):
+        return VERIFIER_TIMEOUT
     # A refusal by the second-pass audit: the evidence was rejected.
     if error.startswith("audit_second_pass_failed"):
         return REPORT_FORMAT
@@ -407,5 +531,12 @@ def is_split_allowed(failure: Failure) -> bool:
     Exported so the executor asks the module that OWNS the kinds, rather
     than re-encoding the rule at the one call site that uses it (where a
     future kind would be added to neither).
+
+    Raises:
+        ValueError: ``failure.kind`` has no registered remedy. A failure
+            that ``classify_failure`` produced never triggers this — every
+            kind it can produce is registered — but a hand-built failure
+            with a kind nobody registered has no answer, and a default
+            here would be a guess.
     """
     return _split_allowed(failure)
