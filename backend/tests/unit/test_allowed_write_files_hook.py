@@ -79,6 +79,17 @@ def _run_hook(workspace, target, *, broker_on=True, task_id="t1",
         "PDT_FORMAL_REPO_PATH": str(workspace["project"]),
         "PDT_LOCK_CLI": str(workspace["cli"]),
         "PDT_LOCK_TIMEOUT": "3",
+        # The guard decides "is this scratch space?" with
+        # ``tempfile.gettempdir()``, which reads ``$TMPDIR`` first and
+        # falls back to ``/tmp`` without it.  This env is built by hand,
+        # so the child would look for scratch in a DIFFERENT root than the
+        # one this test writes its probes into (on macOS the caller's is
+        # ``/var/folders/.../T``; the child's would be ``/tmp``) -- and a
+        # scratch write would be refused as "outside the project dir".
+        # The guard's subprocess legitimately may not inherit ``TMPDIR``
+        # in production (see ``utils/secret_files.py``); here the caller
+        # knows which root it is using, so it has to say so.
+        "TMPDIR": tempfile.gettempdir(),
     }
     if broker_on:
         env["PDT_LOCK_BROKER"] = str(socket_path(workspace["project"]))

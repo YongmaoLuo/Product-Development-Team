@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -450,6 +451,18 @@ def run_evidence_command(
 
     Bounded and never-raising: a timeout or a missing binary is reported,
     not escalated.
+
+    The command runs **in the project dir**, and ``$PWD`` is set to that
+    same directory rather than inherited.  A shell answers ``pwd`` with
+    ``$PWD`` verbatim when the variable is set -- it does not re-derive it
+    from the working directory the process was handed -- so an inherited
+    relative ``$PWD`` (``.``, which is what a parent process running from
+    its own directory exports) makes the command report a directory that is
+    not the project dir at all.  The evidence would then describe somewhere
+    else, which is the one thing an evidence command must not do.  The
+    variable is normalised here rather than in ``run_bounded``, which is
+    shared by every caller and has no opinion about where its command is
+    supposed to run.
     """
     result = EvidenceCommandResult(command=command)
     start = time.monotonic()
@@ -457,6 +470,7 @@ def run_evidence_command(
         completed = run_bounded(
             command,
             cwd=str(project_dir),
+            env=dict(os.environ, PWD=str(project_dir)),
             text=True,
             timeout=timeout_seconds,
         )

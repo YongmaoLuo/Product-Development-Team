@@ -489,6 +489,60 @@ def install_hermetic_env() -> HermeticEnv:
     # and the gap was suite-side environment ownership, not the override.
     os.environ.pop("PDT_LOCK_BROKER", None)
 
+    # ---------------------------------------------------------------------
+    # The executor's per-task stamps.
+    # ---------------------------------------------------------------------
+    #
+    # ``PDT_ALLOWED_WRITE_FILES`` (the task's declaration),
+    # ``PDT_UNDECLARED_WRITE_DIR`` (where the guard writes refusal
+    # markers), ``PDT_READONLY_TASK``, ``PDT_REPORT_PATH``,
+    # ``PDT_LOCK_TASK_ID``, ``PDT_DECLARED_MANIFEST_HASH`` and
+    # ``PDT_LOCK_TIMEOUT`` are stamped into the environment of the process
+    # the executor runs ONE task in (see ``coding_tool.py``'s
+    # ``_stamp_readonly_task`` / ``_stamp_report_path`` /
+    # ``_stamp_allowed_write_files`` and the guard hook script).  A pytest
+    # run launched by that executor inherits every one of them, and the
+    # suite's own guard tests then answer to a declaration that is not
+    # theirs:
+    #
+    #   * ``tests/test_edit_write_containment_guard.py`` starts the guard
+    #     with ``os.environ.copy()`` and pops only the project/plans
+    #     variables, so the inherited declaration is still in force.  The
+    #     guard refuses the test's own probe file as "this task did not
+    #     declare that file" -- and, because ``PDT_UNDECLARED_WRITE_DIR``
+    #     is inherited too, writes the refusal marker into the EXECUTOR's
+    #     marker directory.
+    #   * The executor reads that marker back and classifies the run as an
+    #     undeclared write by the agent.  The refusal was the test's and
+    #     the marker was aimed at the test's scratch file, but the marker
+    #     channel carries no owner, so the run is reported as an agent
+    #     violation on the strength of the suite's own negative control.
+    #     That is not hypothetical: it is how the 2026-10-21 repair task
+    #     was reported as an ``undeclared_write`` -- with a marker path
+    #     under the pytest tmp root, named after this suite's own
+    #     ``test_allows_edit_inside_project_dir`` case.
+    #
+    # This is the same disease as ``PDT_LOCK_BROKER`` above and more
+    # dangerous: a task-level variable must not decide the suite's result,
+    # and here it does not merely fail a test -- it manufactures an
+    # accusation against the agent that is being judged.
+    #
+    # Cleared unconditionally, with no suite-owned fallback: there is no
+    # suite meaning for any of these names.  A case that genuinely wants
+    # one (the guard tests, which need a declaration to check against)
+    # sets it in the environment it hands to the guard itself, which
+    # outranks this and is undone with the case.
+    for _task_scope_var in (
+        "PDT_ALLOWED_WRITE_FILES",
+        "PDT_UNDECLARED_WRITE_DIR",
+        "PDT_READONLY_TASK",
+        "PDT_REPORT_PATH",
+        "PDT_LOCK_TASK_ID",
+        "PDT_DECLARED_MANIFEST_HASH",
+        "PDT_LOCK_TIMEOUT",
+    ):
+        os.environ.pop(_task_scope_var, None)
+
     # Credential-payload scratch directories.  Every dispatch mints one
     # ``pdt-subagent-*`` directory through ``secret_files.private_dir``, and
     # the suite dispatches constantly, so left at the default root the suite

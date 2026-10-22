@@ -2195,6 +2195,16 @@ def _plan_next_round(
     Extracted from the ``_on_repair_complete`` closure so the decision is
     reachable from tests — the closure itself needs a whole running
     verification loop to exercise.
+
+    Scope -- read this before reusing the function:
+
+    _plan_next_round answers "which round comes after a round that REALLY
+    finished": it always returns current.round + 1. It is NOT the resume
+    decision. POST /api/verification/{id}/start asks _resolve_start_round
+    instead, which returns the interrupted round itself when the plan
+    carries a pause checkpoint or a running / loop_stopped row. The two are
+    deliberately separate: a finished round advances, an interrupted round
+    does not.
     """
     if not current_row:
         # No row yet: the plan starts at round 1 against the default cap.
