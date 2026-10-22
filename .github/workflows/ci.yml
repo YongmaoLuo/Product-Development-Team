@@ -515,22 +515,29 @@ jobs:
   # ---------------------------------------------------------------------------
   # Commit-message hygiene
   # ---------------------------------------------------------------------------
-  # Rejects three shapes, enforced as two independent rules. The attribution
-  # rule covers the two shapes that make a claim about *who wrote this*: a
-  # ``Co-Authored-By:`` trailer naming an AI system, and a "Generated with
-  # <tool>" line naming one. The plan-id rule covers the third shape on its
-  # own: a date-prefixed plan id anywhere in the message, which this job also
-  # refuses. The two rules are reported separately and are not exempt from
-  # each other — the rules and their rationale live in
-  # scripts/check_commit_msg.py. This job exists so that ``git commit
-  # --no-verify``, or a clone with no hooks installed, still cannot land any
-  # of the three on main.
+  # Rejects two shapes. A ``Co-Authored-By:`` or "Generated with <tool>"
+  # line may name the *tool* that produced the work and may not name the
+  # *model* behind it — the model is a routing decision made elsewhere, so
+  # naming one writes a guess into permanent public history in the grammar
+  # of a fact. And a date-prefixed plan id anywhere in the message — the
+  # private, dated name a plan is known by inside this project. That rule
+  # has no exemptions, because nothing under ``tests/`` is reachable from
+  # a commit message, so a date-prefixed id in one was typed by hand.
+  # The rules and their rationale live in scripts/check_commit_msg.py.
+  #
+  # This job used to refuse any AI attribution trailer at all. The rule
+  # was narrowed on 2026-10-21 to "name the tool, not the model", and the
+  # job name follows it. The job key is unchanged: it is the merge gate's
+  # dependency, and a renamed key is a renamed gate.
+  #
+  # The job exists so that ``git commit --no-verify``, or a clone with no
+  # hooks installed, still cannot land a model name or a plan id on main.
   #
   # No venv and no dependency install: the checker is stdlib-only, so the
   # job costs a deep checkout and a few milliseconds.
   # ---------------------------------------------------------------------------
   commit-hygiene:
-    name: Commit messages carry no AI attribution trailer
+    name: Commit messages do not name an AI model
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:

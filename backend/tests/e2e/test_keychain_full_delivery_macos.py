@@ -343,19 +343,20 @@ back on its own record.
 
 The number above is worth more for having been recorded honestly while it was
 *not* what it is now. On the day these four readings were taken this line read
-``1 failed, 257 passed`` / ``exit 1``: the failure was
-``tests/static_gates/test_commit_messages_are_not_ai_attributed.py``, which
-reads this repository's own commit *history* and objects to an AI attribution
-trailer on it. That red was recorded as a red rather than quietly restated as
-the all-green line the same command would have printed had the trailer not been
-there, because a number a reader cannot reproduce is not evidence of anything
-and a quoted green that the tree does not produce is worse than a quoted red.
-The trailer is gone as of 2026-10-05 — the gate that objects to one passes on
-this tree now — so the green above is that day's reading of the suite, not a
-claim about the suite as it stands now. Re-running the command later the same
-day collected 269 cases where the green above quotes 258, and a re-run after
-that did not finish at all: one file in the suite was no longer valid Python —
-a diff report had been committed in place of a gate's source — so pytest
+``1 failed, 257 passed`` / ``exit 1``: the failure was the commit-message
+gate, ``tests/static_gates/test_commit_messages_carry_no_plan_ids.py``, which
+reads this repository's own commit *history* and objects to what that gate
+rejects. That red was recorded as a red rather than quietly restated as
+the all-green line the same command would have printed had the offending
+commit not been there, because a number a reader cannot reproduce is not
+evidence of anything and a quoted green that the tree does not produce is
+worse than a quoted red. The offending commit was gone as of 2026-10-05 — the
+gate passed on this tree from that day — so the green above is that day's
+reading of the suite, not a claim about the suite as it stands now. Re-running
+the command later the same day collected 269 cases where the green above
+quotes 258, and a re-run after that did not finish at all: one file in the
+suite was no longer valid Python — a diff report had been committed in place
+of a gate's source — so pytest
 stopped on it during collection, before a single case was reached, and
 reported a collection error rather than a count. That was a defect in the
 tree and not a reading about the code, and it is recorded here rather than

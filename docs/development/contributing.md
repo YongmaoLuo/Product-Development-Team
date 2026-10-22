@@ -41,21 +41,49 @@ to.
 
 ## Commit messages
 
-A commit message may say **what changed and why**. It may not claim an AI
-system as a co-author:
+A commit message may say **what changed and why**, and it may name the
+**tool** that produced the work. It may not name the **model** behind it,
+and it may not carry a **plan id**.
 
 ```
+Co-Authored-By: Claude Code <noreply@anthropic.com>    ← allowed
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>    ← rejected
 ```
 
-The committer cannot know that. The tool may have been Claude Code, but the
-*model* behind any given commit is a routing decision made elsewhere and is
-not recorded in the commit — so naming one writes a guess into permanent,
+The committer cannot know which model produced a given commit. The
+*model* behind it is a routing decision made elsewhere, and it is not
+recorded in the commit — so naming one writes a guess into permanent,
 public history, in the grammar of a fact, where it cannot be corrected.
+The *tool* is different: it is the program that ran, and that is a fact
+about the work.
 
-Writing *about* the tool is fine. The checker inspects the attribution
-trailer, not the prose, so a body may discuss Claude Code, providers or
-models freely — and a human co-author's trailer passes.
+So the rule is: **name the tool, not the model.** The checker takes the
+tool phrases out of the trailer first and then looks for a model name in
+what is left, so a trailer that names both —
+`Co-Authored-By: Claude Code (Opus 5)` — is still refused.
+
+A commit message may also not carry a **plan id** — the private, dated
+name a plan is known by inside this project. The shape is
+`20[0-9]{6}-<slug>`:
+
+```
+see <plan id> for the rewrite    ← rejected
+```
+
+There are no exemptions there either. Nothing under `tests/` is reachable
+from a commit message, so a date-prefixed id in one was typed by hand,
+every time, on purpose.
+
+Rewrite the id rather than quoting it. A plan id in a commit message lands
+in permanent public history through GitHub's merge commit, where a
+force-push cannot remove it — deleting a ref does not delete objects.
+Describe the work instead: the plan's date and name are private, the
+behaviour change is not.
+
+Writing *about* models is fine. The checker inspects the attribution
+trailer and the "Generated with" line, not the prose, so a body may
+discuss Claude Code, providers or models freely — and a human co-author's
+trailer passes.
 
 `scripts/check_commit_msg.py` is the single implementation, and it is
 reached three ways: `.git/hooks/commit-msg` (installed by
