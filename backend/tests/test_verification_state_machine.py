@@ -413,8 +413,12 @@ class TestStateMachineLegalTransitionsReachable:
 
     def test_verification_failed_and_repair_edges(self, temp_plan_dir):
         """``verification_running`` → ``verification_failed`` →
-        ``verification_repairing`` → ``verification_rerunning`` →
-        ``verification_running`` is the canonical repair loop.
+        ``verification_repairing`` → ``executing`` is the canonical
+        repair loop.
+
+        2026-10-22: the loop no longer goes through
+        ``verification_rerunning`` — that phase was a dead state and
+        was removed; the repair executor runs in ``executing``.
         """
         _write_plan_state(temp_plan_dir, phase="verification_running")
         ps = PlanState(temp_plan_dir)
@@ -426,8 +430,8 @@ class TestStateMachineLegalTransitionsReachable:
         ps.start_verification_repair()
         assert ps.get_current_phase() == "verification_repairing"
 
-        ps.start_verification_rerun()
-        assert ps.get_current_phase() == "verification_rerunning"
+        ps.start_repair_execution()
+        assert ps.get_current_phase() == "executing"
         assert ps.get_verification_round() == 1, (
             "confirm_repair_and_rerun must bump round 0 -> 1"
         )

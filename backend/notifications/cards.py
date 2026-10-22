@@ -142,7 +142,12 @@ VERIFICATION_PHASES = frozenset({
     "verification",
     "verification_running",
     "verification_repairing",
-    "verification_rerunning",
+    # 2026-10-22: ``verification_rerunning`` left the phase
+    # vocabulary — it was a dead state (its only writer had no
+    # callers). A row that still holds that historical value is read
+    # back as ``verification_repairing`` (see
+    # ``plan_state.normalize_phase``), so the card shows the phase
+    # that replaced it.
     # 2026-09-10: use the FULLY-qualified verification-* terminal
     # phase names so we do not collide with the generic execution
     # terminologies ``"failed"`` / ``"completed"`` (which are
@@ -204,7 +209,8 @@ _PHASE_LABEL = {
     "verification_running": "🔍 初次验证",
     "verify_first_pass": "🔍 初次验证",
     "verification_repairing": "🔧 正在生成修复任务",
-    "verification_rerunning": "🔁 重跑验证",
+    # 2026-10-22: ``verification_rerunning`` is gone (dead state); a
+    # residual row reads back as ``verification_repairing``.
     "verify_recheck": "🔁 重跑验证",
     # Terminal vocabulary.
     "verification_passed": "✅ 验证通过",
@@ -405,7 +411,6 @@ def _unified_phase_section(
     if (phase or "").startswith("verification") or phase in {
         "verification", "verify_first_pass", "verify_recheck",
         "verification_running", "verification_repairing",
-        "verification_rerunning",
     }:
         round_n = verification_round or 0
         round_max = verification_max_rounds or 0
@@ -940,7 +945,13 @@ def _resolve_header(
             "title": f"🔧 正在生成修复任务 · {plan_id}{_round_suffix}",
             "color": "orange",
         }
-    if phase == "verification_rerunning":
+    # 2026-10-22: ``verification_rerunning`` is gone (dead state); a
+    # residual row reads back as ``verification_repairing`` and is
+    # rendered by the branch above. The "🔁 重跑验证" header moves to
+    # ``verify_recheck`` — the LIVE phase that already carries that
+    # label in ``_PHASE_LABEL`` and that the orchestrator really
+    # enters (unstable-VP recheck).
+    if phase == "verify_recheck":
         return {
             "title": f"🔁 重跑验证 · {plan_id}{_round_suffix}",
             "color": "blue",

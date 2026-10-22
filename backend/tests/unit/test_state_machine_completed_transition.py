@@ -251,25 +251,23 @@ def test_other_phase_transitions_unchanged():
         # retry cannot push a verified-passed plan further into
         # ``completed`` via ``transition_to``.
         "verification_passed": [],
+        # 2026-10-22: ``verification_rerunning`` was removed from the
+        # table (it was a dead state — nothing ever entered it). The
+        # residual rows that still hold that historical value are read
+        # back as ``verification_repairing`` via
+        # ``plan_state.LEGACY_PHASE_ALIASES``, so the live table names
+        # only phases that exist.
         "verification_failed": [
             "verification_repairing",
-            "verification_rerunning",
             "verification_passed",
             "verification_loop_stopped",
         ],
         "verification_repairing": [
             "verification",
-            "verification_rerunning",
             "verification_passed",
             "verification_loop_stopped",
             "verification_failed",
             "executing",
-        ],
-        "verification_rerunning": [
-            "verification_running",
-            "verification_passed",
-            "verification_failed",
-            "verification_loop_stopped",
         ],
         # 2026-09-13: production added the ``verification_passed``
         # recovery edge (operator force-pass after the loop stopped;

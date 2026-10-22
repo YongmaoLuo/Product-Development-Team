@@ -16,6 +16,8 @@ from fastapi.responses import JSONResponse
 from pathlib import Path
 from datetime import datetime
 import json
+import os
+import signal
 import sqlite3
 import threading
 
@@ -414,6 +416,185 @@ def _get_verification_status(plan_id: str) -> dict:
     }
 
 
+def _live_non_repair_execution(plan_id: str) -> bool:
+    """True when a NON-repair executor is running this plan right now.
+
+    The repair executor and the main executor share
+    ``_execution_state``; only the repair one stamps
+    ``_source="repair_execution"``. A live MAIN execution owns the
+    plan's task queue — the pending repair tasks are its work, not a
+    repair round's — so a start must not spawn a second executor over
+    the same plan.
+
+    A plan whose in-memory record is empty (the backend restarted) is
+    NOT a live main execution: the process that owned it is gone, and
+    that is exactly the case the repair resume exists for.
+    """
+    try:
+        state = _server._execution_state.get(plan_id) or {}
+    except Exception:  # noqa: BLE001 — an unreadable record is not a live one
+        return False
+    if state.get("_source") == "repair_execution":
+        return False
+    return state.get("status") == "running"
+
+
+def _sigterm_repair_executor(plan_id: str) -> Optional[int]:
+    """SIGTERM the repair executor subprocess; return the pid signalled.
+
+    2026-10-22: the repair executor is a SEPARATE subprocess
+    (``cli.py --recover``) and ``stop_verification`` used to leave it
+    running — the stop killed the VERIFICATION sub-agents (the
+    ``_running_vp_ids`` registry), never the repair executor, so an
+    operator's stop did not stop the repair.
+
+    The pid comes from ``plan_execution.exec_pid``: it is the DURABLE
+    record (the in-memory ``_execution_state`` entry is gone after a
+    backend restart, and the pid is exactly what has to survive that).
+    The kill is the plain ``os.kill(pid, SIGTERM)`` the rest of the
+    codebase uses; the executor's own watcher thread notices the exit.
+
+    Returns the pid that was signalled, or ``None`` when there was
+    nothing to signal. Never raises — a stop must not fail on the kill.
+    """
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+    )
+
+    pid = None
+    try:
+        conn = open_db(_server._state_db_path())
+        try:
+            migrate(conn)
+            row = ExecutionRepository(conn).summary(plan_id) or {}
+            pid = row.get("exec_pid")
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — a stop must not fail on a read
+        _server.logger.exception(
+            "[stop_verification] could not read the repair executor pid "
+            "plan=%s", plan_id,
+        )
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return None
+    except Exception:  # noqa: BLE001
+        _server.logger.exception(
+            "[stop_verification] could not SIGTERM the repair executor "
+            "plan=%s pid=%s", plan_id, pid,
+        )
+        return None
+    return pid
+
+
+def _repair_resume_response(plan_id, plan_dir, conn, req):
+    """Resume the REPAIR half of the loop instead of starting a round.
+
+    2026-10-22. The repair executor is a stateless scanner: it
+    re-reads ``tasks.json`` + ``state.db`` and runs whatever is still
+    pending. So "continue the repair" is "spawn it once more" — there
+    is nothing to attach to.
+
+    Two shapes, decided by the routing row's phase:
+
+    * ``verification_repairing`` — the round finished and its repair
+      tasks are waiting to be confirmed. The start routes the plan
+      into ``executing`` (round+1) and spawns the executor.
+    * ``executing`` with pending repair tasks — the executor was
+      already spawned (or died mid-flight) and the phase is already
+      ``executing``. The round was already counted, so this start only
+      spawns the executor again; bumping the round a second time would
+      count the same repair twice.
+
+    Returns the response body, or ``None`` when this start is an
+    ordinary verification start (the caller then runs the normal
+    path).
+    """
+    from plan_state import normalize_phase as _normalize_phase
+    from state_machine.repositories.routing_repository import RoutingRepository
+
+    try:
+        row = RoutingRepository(conn).current(plan_id)
+    except Exception:  # noqa: BLE001 — no routing row means no repair shape
+        row = None
+    phase = _normalize_phase((row or {}).get("current_phase"))
+    if phase not in ("verification_repairing", "executing"):
+        return None
+
+    tool = req.tool if req else None
+    bump_round = True
+
+    if phase == "executing":
+        # Branch B — a pure resume. The pending-repair-task probe is
+        # the condition: without queued repair work there is nothing
+        # to resume, and this start is an ordinary verification start.
+        pending = _server._get_pending_repair_tasks(plan_id)
+        if not pending:
+            return None
+        if _live_non_repair_execution(plan_id):
+            # A main executor owns this plan right now — its queue
+            # already holds the repair tasks.
+            return None
+        # The phase is already ``executing`` and the round was already
+        # counted; ``start_repair_execution`` would add a second round.
+        bump_round = False
+
+    project_dir = _server._get_project_dir(plan_id)
+    if not project_dir:
+        raise HTTPException(
+            400,
+            {
+                "error": "Missing project directory",
+                "detail": "No project directory configured for this plan.",
+            },
+        )
+
+    # 2026-09-15: a fresh start clears any stop flag left by a
+    # previous ``/stop`` — otherwise the new executor would treat
+    # every task as "cancelled".
+    try:
+        import verification_cancel
+        verification_cancel.clear(plan_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+    ps = _server.PlanState(plan_dir)
+    ps.reload()
+    if bump_round:
+        try:
+            ps.start_repair_execution()
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "conflict",
+                    "reason": "repair_resume_failed",
+                    "detail": str(exc),
+                },
+            )
+    round_n = ps.get_verification_round()
+
+    _server._run_repair_execution_async(
+        plan_id, project_dir, tool=tool,
+        on_complete=_server._make_repair_on_complete(
+            plan_id, project_dir, tool,
+        ),
+    )
+    return {
+        "status": "started",
+        "mode": "repair_resume",
+        "round": round_n,
+    }
+
+
 @router.post("/api/verification/{plan_id}/start")
 def start_verification(plan_id: str, req: _server.StartVerificationRequest = None):
     """Start verification via the routing/verification repositories."""
@@ -516,6 +697,30 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
     except (sqlite3.OperationalError, OSError) as exc:
         raise HTTPException(404, {"error": "Plan not found", "detail": str(exc)})
 
+    # -----------------------------------------------------------------
+    # 2026-10-22: a plan parked in the REPAIR half of the loop is
+    # RESUMED, not re-verified.
+    #
+    # The repair executor is a stateless scanner: it re-reads
+    # tasks.json + state.db and runs whatever is still pending. So
+    # "continue the repair" is "spawn it once more" — no attach, no
+    # replay of what already ran. Starting a VERIFICATION round here
+    # instead would measure code the repair never touched.
+    #
+    # Two shapes, both decided by the routing row's phase:
+    #   A. ``verification_repairing`` — the round finished and its
+    #      repair tasks are waiting to be confirmed. The start routes
+    #      the plan into ``executing`` (round+1) and spawns the
+    #      executor.
+    #   B. ``executing`` with pending repair tasks — the executor was
+    #      already spawned (or died mid-flight) and the phase is
+    #      already ``executing``. The round was already counted, so
+    #      this start only spawns the executor again.
+    # -----------------------------------------------------------------
+    _repair_resume = _repair_resume_response(plan_id, plan_dir, conn, req)
+    if _repair_resume is not None:
+        return _repair_resume
+
     try:
         current = verification.current(plan_id)
         # 2026-10-20: an interrupted round is RESUMED, not replaced.
@@ -603,6 +808,14 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
                 "completed",
                 "failed",
                 "stopped",
+                # 2026-10-22: a plan parked in the REPAIR half of the
+                # loop is resumed by the branches above (the repair
+                # executor is a stateless scanner — "continue" is
+                # "spawn it once more"). This entry is the safety net
+                # for the case where those branches do not apply: the
+                # plan is still re-enterable as a verification round
+                # instead of being refused with 409 stage_mismatch.
+                "verification_repairing",
             )
             # 2026-10-20: a recovered plan is still parked at
             # ``verification_running`` — the process died before it
@@ -796,7 +1009,7 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
             current = ps.get_current_phase()
             if current not in (
                 "verification", "verification_running",
-                "verification_repairing", "verification_rerunning",
+                "verification_repairing",
                 "verification_passed", "verification_failed",
                 "verification_loop_stopped",
             ):
@@ -2865,34 +3078,81 @@ def stop_verification(plan_id: str):
         routing = RoutingRepository(conn)
 
     try:
-        # 2026-10-21: the source set is the three phases a verification
+        # 2026-10-21: the source set is the phases a verification
         # round can actually be *in flight* at — not just
         # ``verification_running``. A round that reached
-        # ``verification_repairing`` / ``verification_rerunning`` still
-        # has a running ``plan_verification`` row, and the operator's
-        # stop is exactly as legitimate there. With only
+        # ``verification_repairing`` still has a running
+        # ``plan_verification`` row, and the operator's stop is
+        # exactly as legitimate there. With only
         # ``verification_running`` the CAS raises ``ConflictError`` on
-        # those two phases and the endpoint answers 409, leaving the
+        # that phase and the endpoint answers 409, leaving the
         # routing row parked where it was; ``/start`` (:597-614) does
-        # not accept them as a source either, so it answers 409
+        # not accept it as a source either, so it answers 409
         # ``stage_mismatch`` too. Both doors refuse, so the plan was
         # stuck forever — unrecoverable through the API. (Measured, not
         # inferred: ``tests/integration/api/
         # test_verification_stop_from_repair_phase.py`` pins both.) The
-        # same three-phase set is already used by
-        # ``force_verification_terminal`` (:3070) and by the dead-end
-        # rollback in ``verification_loop.py`` (:2993), so this is the
-        # recognised vocabulary for "verification work stopped halfway",
-        # not a new one. The TARGET phase stays ``verification``: the
-        # round is paused, not finished. ``/start``'s own source
-        # whitelist is deliberately left alone — a plan that is genuinely
-        # still running must not become re-enterable.
-        routing.try_mark_phase(
-            plan_id,
-            ("verification_running", "verification_repairing", "verification_rerunning"),
-            "verification",
+        # same set is already used by ``force_verification_terminal``
+        # (:3070) and by the dead-end rollback in
+        # ``verification_loop.py`` (:2993), so this is the recognised
+        # vocabulary for "verification work stopped halfway", not a new
+        # one. The TARGET phase stays ``verification``: the round is
+        # paused, not finished. ``/start``'s own source whitelist is
+        # deliberately left alone — a plan that is genuinely still
+        # running must not become re-enterable.
+        #
+        # 2026-10-22: the source set no longer spells out
+        # ``verification_rerunning`` — that phase left the vocabulary
+        # (it was a dead state). A row that still holds the historical
+        # value is matched through the alias table, so a stop on such a
+        # row still lands; the literal itself is not in the source set
+        # any more.
+        from plan_state import LEGACY_PHASE_ALIASES
+
+        _source_phases = ("verification_running", "verification_repairing")
+        _row = routing.current(plan_id) or {}
+        _row_phase = _row.get("current_phase")
+        if (
+            isinstance(_row_phase, str)
+            and _row_phase in LEGACY_PHASE_ALIASES
+        ):
+            _source_phases = _source_phases + (_row_phase,)
+
+        # 2026-10-22: the REPAIR EXECUTOR is a separate subprocess
+        # (``cli.py --recover``) and this stop used to leave it
+        # running: the hard kill below only reaches the VERIFICATION
+        # sub-agents registered in ``sub_agent_registry``. So a stop
+        # request parked the plan at ``verification`` while the repair
+        # kept running — the plan kept changing code after the stop was
+        # asked for.
+        #
+        # The repair executor is identified by ``_source ==
+        # "repair_execution"`` on the shared ``_execution_state``
+        # record; the MAIN executor never sets ``_source``, so an
+        # ``executing`` plan with any other source is NOT a repair
+        # execution and keeps its old behaviour (409 — this stop only
+        # ever owned verification work).
+        _exec_state = _server._execution_state.get(plan_id) or {}
+        _repair_execution_stop = (
+            _row_phase == "executing"
+            and _exec_state.get("_source") == "repair_execution"
         )
-        verification.mark_stopped(plan_id, "user_stopped")
+        if _repair_execution_stop:
+            # The plan is parked in the REPAIR half of the loop, not
+            # in the verification half: the target phase is
+            # ``verification_repairing`` (the repair tasks are waiting
+            # to be confirmed / resumed), NOT ``verification`` (which
+            # means "a verification round was paused").
+            routing.try_mark_phase(
+                plan_id, ("executing",), "verification_repairing",
+            )
+        else:
+            routing.try_mark_phase(
+                plan_id,
+                _source_phases,
+                "verification",
+            )
+            verification.mark_stopped(plan_id, "user_stopped")
     except ConflictError as exc:
         try:
             conn.rollback()
@@ -2905,6 +3165,49 @@ def stop_verification(plan_id: str):
         if not owned_conn:
             conn.close()
         return JSONResponse(status_code=404, content={"error": "Plan not found", "detail": "The requested plan does not exist."})
+
+    if _repair_execution_stop:
+        # 2026-10-22: what is being stopped here is the REPAIR
+        # EXECUTOR, not a verification round. The round already ended
+        # (it failed and produced the repair tasks); the executor
+        # subprocess is what is still running.
+        #
+        # So this branch does NOT write a verification checkpoint: a
+        # checkpoint says "this verification round was interrupted,
+        # resume it", and no round was interrupted here. A stale
+        # checkpoint would make the NEXT ordinary ``/start`` resume
+        # that old round instead of starting a new one.
+        #
+        # The cancel flag is requested BEFORE the kill: the killed
+        # executor fires ``on_complete`` immediately, and that
+        # callback re-enters verification unless the flag is already
+        # set.
+        try:
+            import verification_cancel
+            verification_cancel.request_cancel(plan_id)
+        except Exception:  # noqa: BLE001
+            _server.logger.exception(
+                "[stop_verification] cancel flag failed plan=%s", plan_id,
+            )
+        killed_pid = _sigterm_repair_executor(plan_id)
+        _server.logger.warning(
+            "[stop_verification] stopped the repair executor plan=%s "
+            "pid=%s", plan_id, killed_pid,
+        )
+        _repair_row = verification.current(plan_id) or {}
+        round_n = int(_repair_row.get("round") or 0)
+        if not owned_conn:
+            conn.close()
+        _server._reap_managed_services(plan_id, plan_dir, "verification_stopped")
+        return {
+            "stopped_at": datetime.now().isoformat(),
+            "reason": "user_stopped_at_repair_execution",
+            "current_round": round_n,
+            "status": "stopped",
+            "paused": True,
+            "round": round_n,
+            "interrupted_vp_count": 0,
+        }
 
     # 2026-10-20 — read the round BEFORE the connection is closed.
     # The row is the only place the round's verdicts live: the executor
@@ -3093,13 +3396,26 @@ def force_verification_terminal(plan_id: str):
         migrate_schema(conn)
         repo = RoutingRepository(conn)
         try:
+            # 2026-10-22: ``verification_rerunning`` left the phase
+            # vocabulary (it was a dead state), so it is no longer
+            # spelled out here. A row that still holds the historical
+            # value is matched through the alias table, so the escape
+            # hatch still reaches it.
+            from plan_state import LEGACY_PHASE_ALIASES
+
+            _source_phases = (
+                "verification_running",
+                "verification_repairing",
+            )
+            _raw_phase = (repo.current(plan_id) or {}).get("current_phase")
+            if (
+                isinstance(_raw_phase, str)
+                and _raw_phase in LEGACY_PHASE_ALIASES
+            ):
+                _source_phases = _source_phases + (_raw_phase,)
             repo.try_mark_phase(
                 plan_id,
-                (
-                    "verification_running",
-                    "verification_rerunning",
-                    "verification_repairing",
-                ),
+                _source_phases,
                 "failed",
             )
         except RoutingPlanNotFoundError:

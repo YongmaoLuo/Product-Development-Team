@@ -1,6 +1,6 @@
 """Regression test for build_verification_card intermediate-state headers.
 
-The card must distinguish verification_repairing / verification_rerunning /
+The card must distinguish verification_repairing / verify_recheck /
 verify_first_pass from generic "🔄 验证中".
 
 Each test exercises one header branch by passing ``current_phase`` (and a
@@ -34,7 +34,10 @@ def _progress(verification_status: str = "running") -> Dict[str, Any]:
     "current_phase,expected_header_substr",
     [
         ("verification_repairing", "🔧 正在生成修复任务"),
-        ("verification_rerunning", "🔁 重跑验证"),
+        # 2026-10-22: ``verification_rerunning`` was removed from the
+        # phase vocabulary (dead state); the "🔁 重跑验证" label now
+        # belongs to ``verify_recheck``.
+        ("verify_recheck", "🔁 重跑验证"),
         ("verify_first_pass", "🔍 初次验证"),
         # Unknown / None phase falls back to the generic "验证中" header.
         (None, "🔄 验证中"),
@@ -79,7 +82,7 @@ def test_build_verification_card_terminal_status_wins_over_phase() -> None:
     card_passed = build_verification_card(
         plan_id="20260101-test",
         progress=_progress(verification_status="passed"),
-        current_phase="verification_rerunning",
+        current_phase="verify_recheck",
     )
     header_passed = card_passed.get("header", {}).get("title", {}).get("content", "")
     assert "✅ 验证通过" in header_passed

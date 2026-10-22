@@ -33,6 +33,11 @@ import time
 # effective. ``server`` seeds ``sys.modules['server']`` before importing
 # this module (see the wiring at the bottom of server.py).
 import server as _server
+# 2026-10-22: the type a cancelled round raises. Dependency-free (stdlib
+# only), so a top-level import carries no cycle risk — and the auto-loop
+# has to be able to name it in an ``except`` clause, which a lazy
+# import inside a hot path could not do cheaply.
+from verification_cancel import VerificationCancelled
 
 
 def _verification_event_logger(plan_dir: Path):
@@ -696,9 +701,9 @@ def _recover_verification_states(plans_dir: Path) -> None:
 
 
 def _reconcile_orphaned_verification_stages() -> None:
-    """CAS routing rows stranded at ``verification_running`` /
-    ``verification_rerunning`` whose ``plan_verification`` row is
-    already terminal (2026-09-13 飞书卡片 split-brain fix).
+    """CAS routing rows stranded at ``verification_running`` whose
+    ``plan_verification`` row is already terminal (2026-09-13 飞书卡片
+    split-brain fix).
 
     Root cause: :func:`_lazy_check_verification` only inspects plans
     present in the in-memory ``_verification_state`` dict.  A plan
@@ -712,7 +717,7 @@ def _reconcile_orphaned_verification_stages() -> None:
 
     The reconciliation runs once at startup, right after
     :func:`_recover_verification_states`: for every routing row still
-    at ``verification_running`` / ``verification_rerunning`` whose
+    at ``verification_running`` whose
     verification row is terminal (``passed`` / ``failed`` /
     ``loop_stopped``), re-emit :func:`_persist_verification_terminal`
     with ``chain_ending=True``.  That helper is idempotent by
@@ -776,8 +781,12 @@ def _reconcile_orphaned_verification_stages() -> None:
             "       v.verification_stop_reason "
             "FROM plan_routing r "
             "JOIN plan_verification v ON v.plan_id = r.plan_id "
-            "WHERE r.current_phase IN ('verification_running', "
-            "'verification_rerunning')"
+            # 2026-10-22: ``verification_rerunning`` left the phase
+            # vocabulary (it was a dead state). A row that still holds
+            # that historical value reads as ``verification_repairing``
+            # — the user-gated phase, which this sweep deliberately
+            # does NOT touch.
+            "WHERE r.current_phase IN ('verification_running')"
         ).fetchall()
         # Dead-ended user-gated rows: verification_repairing with a
         # no_repair_tasks stop reason has an empty repair list and no
@@ -2601,8 +2610,7 @@ def _persist_verification_terminal(
     * anything else → ``"failed"`` (defensive default).
 
     Routing phase transitions (CAS ``plan_routing.current_phase`` from
-    one of {``verification_running``, ``verification_rerunning``,
-    ``verification_repairing``}):
+    one of {``verification_running``, ``verification_repairing``}):
 
     * ``sqlite_status == "passed"`` → ``"completed"``
     * everything else → ``"failed"`` (re-startable from this state;
@@ -2777,7 +2785,6 @@ def _persist_verification_terminal(
                         plan_id,
                         (
                             "verification_running",
-                            "verification_rerunning",
                             "verification_repairing",
                             # ``executing`` is included so a watchdog that
                             # fires before the auto-verification loop won
@@ -2994,7 +3001,6 @@ def _rollback_dead_end_to_ready(
                 plan_id,
                 (
                     "verification_running",
-                    "verification_rerunning",
                     "verification_repairing",
                 ),
                 "ready",
@@ -3611,8 +3617,8 @@ def _handle_passed_round(
     when a round passes AND there are no pending RP-* tasks to run.
 
     Steps:
-    1. Advance routing phase from ``verification_running`` /
-       ``verification_rerunning`` to ``completed`` so the status
+    1. Advance routing phase from ``verification_running`` to
+       ``completed`` so the status
        endpoint reports the round as finished instead of
        ``verification_running`` (audit fix from 2026-08-19).
     2. Force-set phase to ``completed`` (with transition_to fallback)
@@ -3633,7 +3639,7 @@ def _handle_passed_round(
         try:
             _routing.try_mark_phase(
                 plan_id,
-                ("verification_running", "verification_rerunning"),
+                ("verification_running",),
                 "completed",
             )
         except (_RoutingConflict, _RoutingNotFound):
@@ -3787,6 +3793,523 @@ def _settle_phase_after_verification_loop(
     ps = _server.PlanState(plan_dir)
     if ps.get_current_phase() == "executing":
         ps.transition_to("completed")
+
+
+def _make_repair_on_complete(
+    plan_id: str,
+    project_dir: Path,
+    tool: Optional[str] = None,
+) -> Callable[[int], None]:
+    """Build the callback that re-enters verification after a repair.
+
+    2026-10-22: the callback used to be a closure nested inside
+    :func:`_run_auto_verification_loop_inner`. It became a factory so
+    that the auto-loop and the ``/start`` endpoint's repair-resume path
+    share ONE implementation of the post-repair chain — the resume path
+    is the same chain, and a second copy of it is a second thing that
+    can drift.
+
+    The body below is the closure's body, unchanged: only the binding
+    moved. ``_record_terminal`` is the same helper the loop had — it is
+    ``_server._record_verification_terminal`` for this plan.
+    """
+
+    def _record_terminal(status: str, stop_reason: str):
+        """Persist a terminal verification outcome for this plan.
+
+        The loop's own ``_record_terminal`` (a closure over the same
+        two arguments) does exactly this; it is re-bound here because
+        this factory must not reach into the loop's scope.
+        """
+        _server._record_verification_terminal(plan_id, status, stop_reason)
+
+    def _on_repair_complete(returncode: int) -> None:
+        """Re-enter verification after repair execution finishes.
+
+        Fires from the background thread spawned by
+        :func:`_run_repair_execution_async`. Leaves ``max_rounds``
+        alone (it is the plan's immutable budget since 2026-09-15;
+        it used to be bumped by 1 per re-entry, which meant the cap
+        never bound), stops the chain once the next round would
+        exceed it, CASes routing.stage back to ``verification``,
+        invokes a fresh ``start_verification_cycle`` with
+        ``resume=True`` to skip already-PASSED VPs, then branches on
+        the result:
+        still failing → another async repair; passed →
+        ``_record_terminal("passed", None)``; loop_stopped →
+        ``_record_terminal("loop_stopped", stop_reason)``.
+
+        Why a fresh orchestrator instance: ``_previous_failed_ids``
+        is checked at the start of every ``check_cycle_conditions``
+        call to detect ``same_failure_repeated``. A new
+        orchestrator resets that state, which is correct after
+        a real executor pass — the prior failures may
+        genuinely be fixed and we shouldn't auto-loop-stop on
+        the fresh set's first occurrence.
+
+        2026-10-11: a fourth branch, checked first — if the repair
+        path recorded ``repair_exited_with_unfinished_tasks:N``
+        and repair work is still queued, the chain stops with
+        ``loop_stopped`` instead of starting another
+        verification round. Bounded by its own
+        :data:`_MAX_REPAIR_NOT_DRAINED_GUARDS` counter, which is
+        unrelated to the round budget: this bounds "repair never
+        drains", not "too many verification rounds".
+        """
+        _server.logger.info(
+            "[Auto-Verification] Repair execution finished plan=%s "
+            "rc=%d — re-entering verification",
+            plan_id, returncode,
+        )
+        # 2026-09-15: if the operator stopped the
+        # plan while this repair was running, do NOT re-enter
+        # verification — the chain would restart work the operator
+        # explicitly halted (and re-stamp the parked routing row).
+        try:
+            import verification_cancel as _vc_mod2
+            if _vc_mod2.is_cancelled(plan_id):
+                _server.logger.warning(
+                    "[Auto-Verification] stop requested — not "
+                    "re-entering verification plan=%s", plan_id,
+                )
+                return
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ------------------------------------------------------------------
+        # 2026-10-11 — do not re-verify over an undrained repair batch.
+        #
+        # ``_run_repair_execution_async`` now cross-checks the runtime
+        # overlay before calling a 0 return code a completion (see the
+        # ``repair_exited_with_unfinished_tasks`` branch). This is the
+        # consumer of that fact. Previously the return code was turned
+        # into one log line and dropped, and the callback went on to
+        # ``start_verification_cycle(..., resume=True)`` no matter
+        # what — so a round whose repair executor bailed out at the
+        # first micro-layer was immediately followed by a fresh
+        # verification of code that was never repaired. Each such round
+        # re-measures the same untouched tree, so the VP it
+        # re-measures is guaranteed to fail again and buy the
+        # next one — a loop that spends its whole round budget
+        # without ever touching the defect.
+        #
+        # Two signals must agree before we stop, so a benign
+        # bookkeeping hiccup cannot strand a plan:
+        #   1. the repair path recorded an unfinished-task stop
+        #      reason, AND
+        #   2. ``_get_pending_repair_tasks`` still finds queued
+        #      repair work.
+        # ------------------------------------------------------------------
+        _repair_stop_reason = _repair_path_stop_reason(plan_id)
+        if _repair_stop_reason:
+            _still_pending = _get_pending_repair_tasks(plan_id)
+            if _still_pending:
+                _guard_hits = _bump_repair_not_drained_guard(plan_id)
+                if _guard_hits >= _MAX_REPAIR_NOT_DRAINED_GUARDS:
+                    _reason = (
+                        f"repair_never_drained:"
+                        f"{_repair_stop_reason}:"
+                        f"{_guard_hits}x"
+                    )
+                else:
+                    _reason = (
+                        f"repair_batch_not_drained:"
+                        f"{_repair_stop_reason}:"
+                        f"{len(_still_pending)}_pending"
+                    )
+                _server.logger.error(
+                    "[Auto-Verification] repair round did not "
+                    "drain — NOT starting the next verification "
+                    "round plan=%s: %d repair task(s) still "
+                    "pending (repair stop_reason=%s, guard hit "
+                    "%d/%d). Re-verifying now would only "
+                    "re-measure unrepaired code and buy a known "
+                    "FAIL.",
+                    plan_id, len(_still_pending),
+                    _repair_stop_reason, _guard_hits,
+                    _MAX_REPAIR_NOT_DRAINED_GUARDS,
+                )
+                _record_terminal("loop_stopped", _reason)
+                return
+            # The overlay disagrees with the reason string — the
+            # queue is empty after all. Reset the guard and fall
+            # through to the normal re-entry.
+            _clear_repair_not_drained_guard(plan_id)
+        else:
+            _clear_repair_not_drained_guard(plan_id)
+
+        try:
+            # 2026-09-12 (state machine closed-loop fix):
+            # ``executing → verification`` is the proper
+            # state-machine transition for the post-repair
+            # re-entry. ``begin_verification`` (plan_state.py:884+)
+            # handles idempotency and bookkeeping. Pass
+            # ``round_n=_next_round`` so the bumped round is
+            # preserved (the executor completed round N; the
+            # next verification must start at round N+1, not
+            # round 0 — the original ``begin_verification``
+            # signature clobbered the round counter to 0 which
+            # broke the monotonic invariant).
+            # 2026-09-13: ``open_db`` and ``migrate`` are
+            # NOT in scope at the callback's enclosing closure
+            # (imports are localised to other helper functions
+            # in this file). Import here so the callback
+            # doesn't NameError on the very first line that
+            # touches the DB.
+            from state_machine.db.connection import open as open_db
+            from state_machine.db.schema import migrate as _migrate
+            plan_dir = _server._plan_dir(plan_id)
+            if plan_dir.exists():
+                ps = _server.PlanState(plan_dir)
+                ps.reload()  # pick up executor's state writes
+                # Will be overwritten below once _next_round
+                # is computed, so begin_verification with
+                # default round_n=0 is safe.
+                ps.begin_verification()
+
+            # 2026-09-15: ``max_rounds`` is the
+            # plan's BUDGET and this path must not touch it.
+            #
+            # It used to do ``min(_cur_max + 1, 10)`` on every
+            # re-entry — "so the chain has one more iteration of
+            # headroom". The effect was that the cap never bound:
+            # ``_next_round`` was computed as ``round + 1`` and the
+            # cap grew in lockstep, so a plan whose rounds kept
+            # failing could never reach ``max_rounds_reached``. The
+            # a production plan showed the fingerprint (``plan_state.json``
+            # said 4, ``plan.db`` said 5). The cap must not be
+            # raised on every iteration.
+            #
+            # So: keep the cap exactly as the plan was set up with,
+            # and when the next round would exceed it, stop the
+            # chain the same way the main loop does. Removing only
+            # the bump would have been worse than leaving it — the
+            # "still failing → spawn next repair" branch below has
+            # no ceiling check of its own, so the chain would have
+            # re-entered round N+1 forever.
+            _v_conn = open_db(_server._state_db_path())
+            try:
+                _migrate(_v_conn)
+                from state_machine.repositories.verification_repository import (
+                    VerificationRepository as _VR2,
+                )
+                _vr = _VR2(_v_conn)
+                _cur = _vr.current(plan_id)
+                (
+                    _next_round,
+                    _new_max,
+                    _round_budget_exhausted,
+                ) = _plan_next_round(_cur)
+                if not _round_budget_exhausted:
+                    _vr.init_round(
+                        plan_id,
+                        round_n=_next_round,
+                        max_rounds=_new_max,
+                    )
+            finally:
+                _v_conn.close()
+
+            if _round_budget_exhausted:
+                _server.logger.warning(
+                    "[Auto-Verification] round budget exhausted "
+                    "plan=%s — round %d would exceed max_rounds=%d; "
+                    "stopping the chain (the cap is immutable "
+                    "since 2026-09-15)",
+                    plan_id, _next_round, _new_max,
+                )
+                _record_terminal(
+                    "loop_stopped", "max_rounds_reached",
+                )
+                return
+
+            # 2026-09-12: replace the raw routing CAS
+            # (lines 6223-6260 below in the OLD version) with
+            # ``begin_verification(round_n=_next_round)`` so
+            # the post-repair re-entry goes through the
+            # proper state-machine edge
+            # ``executing → verification``. ``begin_verification``
+            # is a no-op when the plan is already in a
+            # ``verification_*`` state (idempotent re-entry),
+            # so this is safe even when the executor subprocess
+            # raced ahead and CAS'd the phase to
+            # ``verification``.
+            if plan_dir.exists():
+                ps = _server.PlanState(plan_dir)
+                ps.reload()
+                ps.begin_verification(round_n=_next_round)
+
+            # Invoke a fresh verification round.
+            try:
+                _coding_tool = _server.create_coding_tool(
+                    tool, cwd=str(project_dir), scene="verification",
+                    logger=_verification_event_logger(plan_dir),
+                )
+                _verif_repo = None
+                try:
+                    _vc, _vr2, _vv = _server._open_verification_state()
+                    _verif_repo = _vv
+                    # 2026-09-15 FIX — do NOT close ``_vc`` here.
+                    # The repository is BOUND to this connection;
+                    # closing it left the freshly-started round
+                    # writing through a dead handle (see
+                    # ``_bind_verification_state_conn``).
+                    _bind_verification_state_conn(plan_id, _vc)
+                except Exception:
+                    _verif_repo = None
+                _new_orch = _server.VerificationOrchestrator(
+                    plan_dir, project_dir,
+                    coding_tool=_coding_tool,
+                    verif_repo=_verif_repo,
+                )
+                # 2026-09-15 FIX — flip the in-memory entry to
+                # ``running`` BEFORE the cycle starts. This
+                # callback only wrote the result AFTER the round
+                # finished, so for the entire duration of the
+                # re-entered round the map still held the
+                # PREVIOUS round's terminal status: /api/system/
+                # active reported ``total_active: 0`` and the card
+                # showed the old verdict while VPs were actively
+                # running (observed live through round 2).
+                _mark_verification_round_running(
+                    plan_id, _next_round,
+                )
+                _report = _new_orch.start_verification_cycle(
+                    round_number=_next_round,
+                    force=False,
+                    resume=True,
+                )
+                _result = _new_orch.check_cycle_conditions(
+                    _report, round_number=_next_round,
+                )
+
+                # Persist the result into the in-memory
+                # ``_verification_state`` so /progress reads
+                # it. This runs on a background thread, not
+                # the FastAPI request thread, so we use the
+                # lock-protected dict mutation path.
+                with _server._verification_lock:
+                    _v_state = _server._verification_state.setdefault(
+                        plan_id, {},
+                    )
+                    _v_state["verification_round"] = _next_round
+                    _v_state["verification_status"] = _result.get(
+                        "status", "running",
+                    )
+                    _v_state["repair_tasks"] = _result.get(
+                        "repair_tasks", [],
+                    )
+                    _v_state["stop_reason"] = _result.get(
+                        "stop_reason",
+                    )
+                    # 2026-09-14: keep the split record on the
+                    # in-memory state too — the card reads
+                    # ``vp_splits`` from the progress payload.
+                    _v_state["vp_splits"] = (
+                        _result.get("vp_splits") or []
+                    )
+                    _v_state["updated_at"] = (
+                        datetime.now().isoformat()
+                    )
+
+                # Persist repair_tasks.json to disk so the
+                # next server restart sees the new round /
+                # status. Mirrors the
+                # _run_auto_verification_loop body at
+                # server.py:5516.
+                try:
+                    _rt_payload = _result.get(
+                        "repair_tasks", [],
+                    ) or []
+                    if not isinstance(_rt_payload, list):
+                        _rt_payload = []
+                    _rt_path = (
+                        _server._plan_dir(plan_id)
+                        / "verification_repair_tasks.json"
+                    )
+                    _rt_path.parent.mkdir(
+                        parents=True, exist_ok=True,
+                    )
+                    with _rt_path.open(
+                        "w", encoding="utf-8",
+                    ) as _rtf:
+                        json.dump(
+                            {
+                                "plan_id": plan_id,
+                                "round": _next_round,
+                                "generated_at": (
+                                    datetime.now().isoformat()
+                                ),
+                                "tasks": _rt_payload,
+                            },
+                            _rtf,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                except Exception:
+                    _server.logger.exception(
+                        "[repair_async] repair_tasks.json write "
+                        "failed plan=%s",
+                        plan_id,
+                    )
+
+                # Branch on result.
+                # 2026-09-12: also check DB for pending
+                # RP-* tasks — same  as the
+                # main loop fix. If executor produced new
+                # tasks OR DB has pending tasks from prior
+                # rounds, run the executor.
+                _new_repair = _result.get("repair_tasks") or []
+                _pending_in_db = _get_pending_repair_tasks(
+                    plan_id,
+                    _round_failed_vp_ids(_new_orch, _report),
+                )
+                if _pending_in_db and not _new_repair:
+                    _server.logger.info(
+                        "[Auto-Verification] Post-repair round "
+                        "%d: orchestrator returned %d new tasks "
+                        "but %d pending in DB — running DB queue",
+                        _next_round, len(_new_repair),
+                        len(_pending_in_db),
+                    )
+                    _new_repair = _pending_in_db
+                if _new_repair:
+                    _server.logger.info(
+                        "[Auto-Verification] Post-repair round %d "
+                        "still failing plan=%s — spawning next "
+                        "repair",
+                        _next_round, plan_id,
+                    )
+                    # 2026-10-22: the operator stopped the plan while
+                    # this round was running. The repair tasks are
+                    # already written, but dispatching the executor now
+                    # would restart work the operator explicitly halted
+                    # — the same reason the round-boundary check above
+                    # skips the judgment / repair chain.
+                    import verification_cancel as _vc_dispatch
+                    if _vc_dispatch.is_cancelled(plan_id):
+                        _server.logger.warning(
+                            "[Auto-Verification] stop requested — not "
+                            "dispatching repair plan=%s", plan_id,
+                        )
+                        return
+                    _server._run_repair_execution_async(
+                        plan_id, project_dir, tool=tool,
+                        on_complete=_on_repair_complete,
+                    )
+                elif _result.get("status") == "passed":
+                    _record_terminal("passed", None)
+                elif _result.get("status") == "loop_stopped":
+                    _record_terminal(
+                        "loop_stopped",
+                        _result.get("stop_reason"),
+                    )
+                elif _round_is_pure_split(_result):
+                    # 2026-09-14: this round's only
+                    # forward work is a VP split — nothing for the
+                    # executor to do, so chain straight into the next
+                    # verification round, which runs the children.
+                    # Guarded by the round cap so a
+                    # split→verify→split chain cannot recurse forever.
+                    if _next_round >= _new_max:
+                        _server.logger.warning(
+                            "[Auto-Verification] pure split at the "
+                            "round cap (%d/%d) — stopping; split "
+                            "children were not verified",
+                            _next_round, _new_max,
+                        )
+                        _record_terminal(
+                            "loop_stopped", "max_rounds_reached",
+                        )
+                    else:
+                        _server.logger.warning(
+                            "[Auto-Verification] Post-repair round %d "
+                            "is a pure split — re-entering "
+                            "verification without executing",
+                            _next_round,
+                        )
+                        _on_repair_complete(0)
+                else:
+                    # 2026-09-17 — same treatment as
+                    # the main loop's dead end: "原本就已经跳到了
+                    # taskready，你直接去跳到那个 executing 状态…
+                    # 如果发现没有任务，那不就跳转到 verification
+                    # 吗？"
+                    #
+                    # An empty repair queue is not convergence, it is
+                    # "go drain whatever execution work remains". The
+                    # round already left the plan in
+                    # ``verification_repairing``, so this is the
+                    # declared ``verification_repairing → executing``
+                    # edge. The executor decides whether there is
+                    # work; finding none just exits and hands the
+                    # chain back here.
+                    #
+                    # The round budget still bounds this: the guard
+                    # at the top of this callback stops the recursion
+                    # once ``_next_round`` would exceed the cap.
+                    _dead_end_terminal(
+                        plan_id,
+                        _result.get("stop_reason")
+                        or "no_repair_tasks",
+                        chain_ending=False,
+                        rollback_to_ready=False,
+                    )
+                    _server.logger.warning(
+                        "[Auto-Verification] Post-repair round %d: no "
+                        "repair tasks — routing to executing to drain "
+                        "remaining work plan=%s",
+                        _next_round, plan_id,
+                    )
+                    # 2026-10-22: the operator stopped the plan — do
+                    # not route it to ``executing`` and do not dispatch
+                    # the executor. The check sits BEFORE the routing
+                    # call so the plan is not moved into a phase that
+                    # says "work is about to run".
+                    import verification_cancel as _vc_dispatch
+                    if _vc_dispatch.is_cancelled(plan_id):
+                        _server.logger.warning(
+                            "[Auto-Verification] stop requested — not "
+                            "dispatching repair plan=%s", plan_id,
+                        )
+                        return
+                    try:
+                        _new_orch.confirm_repair_and_rerun()
+                    except Exception:  # noqa: BLE001
+                        _server.logger.exception(
+                            "[Auto-Verification] could not route the "
+                            "post-repair dead end to executing "
+                            "plan=%s — stopping", plan_id,
+                        )
+                        _record_terminal(
+                            "failed", "post_repair_reroute_failed",
+                        )
+                    else:
+                        _server._run_repair_execution_async(
+                            plan_id, project_dir, tool=tool,
+                            on_complete=_on_repair_complete,
+                        )
+            except Exception:
+                _server.logger.exception(
+                    "[repair_async] post-repair verification "
+                    "crashed plan=%s",
+                    plan_id,
+                )
+                _record_terminal(
+                    "failed", "post_repair_verification_crashed",
+                )
+        except Exception:
+            _server.logger.exception(
+                "[repair_async] _on_repair_complete crashed "
+                "plan=%s",
+                plan_id,
+            )
+            try:
+                _record_terminal(
+                    "failed", "repair_callback_crashed",
+                )
+            except Exception:
+                pass
+    return _on_repair_complete
 
 
 def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir: Path, max_rounds: int = _server.DEFAULT_MAX_VERIFICATION_ROUNDS, tool: Optional[str] = None, start_round: int = 1, outcome: Optional[_VerificationLoopOutcome] = None):
@@ -4482,468 +5005,14 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
             # fresh ``start_verification_cycle`` here, then chains
             # another repair if the cycle still fails, or records
             # terminal if it passes / loops out.
-            def _on_repair_complete(returncode: int) -> None:
-                """Re-enter verification after repair execution finishes.
-
-                Fires from the background thread spawned by
-                :func:`_run_repair_execution_async`. Leaves ``max_rounds``
-                alone (it is the plan's immutable budget since 2026-09-15;
-                it used to be bumped by 1 per re-entry, which meant the cap
-                never bound), stops the chain once the next round would
-                exceed it, CASes routing.stage back to ``verification``,
-                invokes a fresh ``start_verification_cycle`` with
-                ``resume=True`` to skip already-PASSED VPs, then branches on
-                the result:
-                still failing → another async repair; passed →
-                ``_record_terminal("passed", None)``; loop_stopped →
-                ``_record_terminal("loop_stopped", stop_reason)``.
-
-                Why a fresh orchestrator instance: ``_previous_failed_ids``
-                is checked at the start of every ``check_cycle_conditions``
-                call to detect ``same_failure_repeated``. A new
-                orchestrator resets that state, which is correct after
-                a real executor pass — the prior failures may
-                genuinely be fixed and we shouldn't auto-loop-stop on
-                the fresh set's first occurrence.
-
-                2026-10-11: a fourth branch, checked first — if the repair
-                path recorded ``repair_exited_with_unfinished_tasks:N``
-                and repair work is still queued, the chain stops with
-                ``loop_stopped`` instead of starting another
-                verification round. Bounded by its own
-                :data:`_MAX_REPAIR_NOT_DRAINED_GUARDS` counter, which is
-                unrelated to the round budget: this bounds "repair never
-                drains", not "too many verification rounds".
-                """
-                _server.logger.info(
-                    "[Auto-Verification] Repair execution finished plan=%s "
-                    "rc=%d — re-entering verification",
-                    plan_id, returncode,
-                )
-                # 2026-09-15: if the operator stopped the
-                # plan while this repair was running, do NOT re-enter
-                # verification — the chain would restart work the operator
-                # explicitly halted (and re-stamp the parked routing row).
-                try:
-                    import verification_cancel as _vc_mod2
-                    if _vc_mod2.is_cancelled(plan_id):
-                        _server.logger.warning(
-                            "[Auto-Verification] stop requested — not "
-                            "re-entering verification plan=%s", plan_id,
-                        )
-                        return
-                except Exception:  # noqa: BLE001
-                    pass
-
-                # ------------------------------------------------------------------
-                # 2026-10-11 — do not re-verify over an undrained repair batch.
-                #
-                # ``_run_repair_execution_async`` now cross-checks the runtime
-                # overlay before calling a 0 return code a completion (see the
-                # ``repair_exited_with_unfinished_tasks`` branch). This is the
-                # consumer of that fact. Previously the return code was turned
-                # into one log line and dropped, and the callback went on to
-                # ``start_verification_cycle(..., resume=True)`` no matter
-                # what — so a round whose repair executor bailed out at the
-                # first micro-layer was immediately followed by a fresh
-                # verification of code that was never repaired. Each such round
-                # re-measures the same untouched tree, so the VP it
-                # re-measures is guaranteed to fail again and buy the
-                # next one — a loop that spends its whole round budget
-                # without ever touching the defect.
-                #
-                # Two signals must agree before we stop, so a benign
-                # bookkeeping hiccup cannot strand a plan:
-                #   1. the repair path recorded an unfinished-task stop
-                #      reason, AND
-                #   2. ``_get_pending_repair_tasks`` still finds queued
-                #      repair work.
-                # ------------------------------------------------------------------
-                _repair_stop_reason = _repair_path_stop_reason(plan_id)
-                if _repair_stop_reason:
-                    _still_pending = _get_pending_repair_tasks(plan_id)
-                    if _still_pending:
-                        _guard_hits = _bump_repair_not_drained_guard(plan_id)
-                        if _guard_hits >= _MAX_REPAIR_NOT_DRAINED_GUARDS:
-                            _reason = (
-                                f"repair_never_drained:"
-                                f"{_repair_stop_reason}:"
-                                f"{_guard_hits}x"
-                            )
-                        else:
-                            _reason = (
-                                f"repair_batch_not_drained:"
-                                f"{_repair_stop_reason}:"
-                                f"{len(_still_pending)}_pending"
-                            )
-                        _server.logger.error(
-                            "[Auto-Verification] repair round did not "
-                            "drain — NOT starting the next verification "
-                            "round plan=%s: %d repair task(s) still "
-                            "pending (repair stop_reason=%s, guard hit "
-                            "%d/%d). Re-verifying now would only "
-                            "re-measure unrepaired code and buy a known "
-                            "FAIL.",
-                            plan_id, len(_still_pending),
-                            _repair_stop_reason, _guard_hits,
-                            _MAX_REPAIR_NOT_DRAINED_GUARDS,
-                        )
-                        _record_terminal("loop_stopped", _reason)
-                        return
-                    # The overlay disagrees with the reason string — the
-                    # queue is empty after all. Reset the guard and fall
-                    # through to the normal re-entry.
-                    _clear_repair_not_drained_guard(plan_id)
-                else:
-                    _clear_repair_not_drained_guard(plan_id)
-
-                try:
-                    # 2026-09-12 (state machine closed-loop fix):
-                    # ``executing → verification`` is the proper
-                    # state-machine transition for the post-repair
-                    # re-entry. ``begin_verification`` (plan_state.py:884+)
-                    # handles idempotency and bookkeeping. Pass
-                    # ``round_n=_next_round`` so the bumped round is
-                    # preserved (the executor completed round N; the
-                    # next verification must start at round N+1, not
-                    # round 0 — the original ``begin_verification``
-                    # signature clobbered the round counter to 0 which
-                    # broke the monotonic invariant).
-                    # 2026-09-13: ``open_db`` and ``migrate`` are
-                    # NOT in scope at the callback's enclosing closure
-                    # (imports are localised to other helper functions
-                    # in this file). Import here so the callback
-                    # doesn't NameError on the very first line that
-                    # touches the DB.
-                    from state_machine.db.connection import open as open_db
-                    from state_machine.db.schema import migrate as _migrate
-                    plan_dir = _server._plan_dir(plan_id)
-                    if plan_dir.exists():
-                        ps = _server.PlanState(plan_dir)
-                        ps.reload()  # pick up executor's state writes
-                        # Will be overwritten below once _next_round
-                        # is computed, so begin_verification with
-                        # default round_n=0 is safe.
-                        ps.begin_verification()
-
-                    # 2026-09-15: ``max_rounds`` is the
-                    # plan's BUDGET and this path must not touch it.
-                    #
-                    # It used to do ``min(_cur_max + 1, 10)`` on every
-                    # re-entry — "so the chain has one more iteration of
-                    # headroom". The effect was that the cap never bound:
-                    # ``_next_round`` was computed as ``round + 1`` and the
-                    # cap grew in lockstep, so a plan whose rounds kept
-                    # failing could never reach ``max_rounds_reached``. The
-                    # a production plan showed the fingerprint (``plan_state.json``
-                    # said 4, ``plan.db`` said 5). The cap must not be
-                    # raised on every iteration.
-                    #
-                    # So: keep the cap exactly as the plan was set up with,
-                    # and when the next round would exceed it, stop the
-                    # chain the same way the main loop does. Removing only
-                    # the bump would have been worse than leaving it — the
-                    # "still failing → spawn next repair" branch below has
-                    # no ceiling check of its own, so the chain would have
-                    # re-entered round N+1 forever.
-                    _v_conn = open_db(_server._state_db_path())
-                    try:
-                        _migrate(_v_conn)
-                        from state_machine.repositories.verification_repository import (
-                            VerificationRepository as _VR2,
-                        )
-                        _vr = _VR2(_v_conn)
-                        _cur = _vr.current(plan_id)
-                        (
-                            _next_round,
-                            _new_max,
-                            _round_budget_exhausted,
-                        ) = _plan_next_round(_cur)
-                        if not _round_budget_exhausted:
-                            _vr.init_round(
-                                plan_id,
-                                round_n=_next_round,
-                                max_rounds=_new_max,
-                            )
-                    finally:
-                        _v_conn.close()
-
-                    if _round_budget_exhausted:
-                        _server.logger.warning(
-                            "[Auto-Verification] round budget exhausted "
-                            "plan=%s — round %d would exceed max_rounds=%d; "
-                            "stopping the chain (the cap is immutable "
-                            "since 2026-09-15)",
-                            plan_id, _next_round, _new_max,
-                        )
-                        _record_terminal(
-                            "loop_stopped", "max_rounds_reached",
-                        )
-                        return
-
-                    # 2026-09-12: replace the raw routing CAS
-                    # (lines 6223-6260 below in the OLD version) with
-                    # ``begin_verification(round_n=_next_round)`` so
-                    # the post-repair re-entry goes through the
-                    # proper state-machine edge
-                    # ``executing → verification``. ``begin_verification``
-                    # is a no-op when the plan is already in a
-                    # ``verification_*`` state (idempotent re-entry),
-                    # so this is safe even when the executor subprocess
-                    # raced ahead and CAS'd the phase to
-                    # ``verification``.
-                    if plan_dir.exists():
-                        ps = _server.PlanState(plan_dir)
-                        ps.reload()
-                        ps.begin_verification(round_n=_next_round)
-
-                    # Invoke a fresh verification round.
-                    try:
-                        _coding_tool = _server.create_coding_tool(
-                            tool, cwd=str(project_dir), scene="verification",
-                            logger=_verification_event_logger(plan_dir),
-                        )
-                        _verif_repo = None
-                        try:
-                            _vc, _vr2, _vv = _server._open_verification_state()
-                            _verif_repo = _vv
-                            # 2026-09-15 FIX — do NOT close ``_vc`` here.
-                            # The repository is BOUND to this connection;
-                            # closing it left the freshly-started round
-                            # writing through a dead handle (see
-                            # ``_bind_verification_state_conn``).
-                            _bind_verification_state_conn(plan_id, _vc)
-                        except Exception:
-                            _verif_repo = None
-                        _new_orch = _server.VerificationOrchestrator(
-                            plan_dir, project_dir,
-                            coding_tool=_coding_tool,
-                            verif_repo=_verif_repo,
-                        )
-                        # 2026-09-15 FIX — flip the in-memory entry to
-                        # ``running`` BEFORE the cycle starts. This
-                        # callback only wrote the result AFTER the round
-                        # finished, so for the entire duration of the
-                        # re-entered round the map still held the
-                        # PREVIOUS round's terminal status: /api/system/
-                        # active reported ``total_active: 0`` and the card
-                        # showed the old verdict while VPs were actively
-                        # running (observed live through round 2).
-                        _mark_verification_round_running(
-                            plan_id, _next_round,
-                        )
-                        _report = _new_orch.start_verification_cycle(
-                            round_number=_next_round,
-                            force=False,
-                            resume=True,
-                        )
-                        _result = _new_orch.check_cycle_conditions(
-                            _report, round_number=_next_round,
-                        )
-
-                        # Persist the result into the in-memory
-                        # ``_verification_state`` so /progress reads
-                        # it. This runs on a background thread, not
-                        # the FastAPI request thread, so we use the
-                        # lock-protected dict mutation path.
-                        with _server._verification_lock:
-                            _v_state = _server._verification_state.setdefault(
-                                plan_id, {},
-                            )
-                            _v_state["verification_round"] = _next_round
-                            _v_state["verification_status"] = _result.get(
-                                "status", "running",
-                            )
-                            _v_state["repair_tasks"] = _result.get(
-                                "repair_tasks", [],
-                            )
-                            _v_state["stop_reason"] = _result.get(
-                                "stop_reason",
-                            )
-                            # 2026-09-14: keep the split record on the
-                            # in-memory state too — the card reads
-                            # ``vp_splits`` from the progress payload.
-                            _v_state["vp_splits"] = (
-                                _result.get("vp_splits") or []
-                            )
-                            _v_state["updated_at"] = (
-                                datetime.now().isoformat()
-                            )
-
-                        # Persist repair_tasks.json to disk so the
-                        # next server restart sees the new round /
-                        # status. Mirrors the
-                        # _run_auto_verification_loop body at
-                        # server.py:5516.
-                        try:
-                            _rt_payload = _result.get(
-                                "repair_tasks", [],
-                            ) or []
-                            if not isinstance(_rt_payload, list):
-                                _rt_payload = []
-                            _rt_path = (
-                                _server._plan_dir(plan_id)
-                                / "verification_repair_tasks.json"
-                            )
-                            _rt_path.parent.mkdir(
-                                parents=True, exist_ok=True,
-                            )
-                            with _rt_path.open(
-                                "w", encoding="utf-8",
-                            ) as _rtf:
-                                json.dump(
-                                    {
-                                        "plan_id": plan_id,
-                                        "round": _next_round,
-                                        "generated_at": (
-                                            datetime.now().isoformat()
-                                        ),
-                                        "tasks": _rt_payload,
-                                    },
-                                    _rtf,
-                                    ensure_ascii=False,
-                                    indent=2,
-                                )
-                        except Exception:
-                            _server.logger.exception(
-                                "[repair_async] repair_tasks.json write "
-                                "failed plan=%s",
-                                plan_id,
-                            )
-
-                        # Branch on result.
-                        # 2026-09-12: also check DB for pending
-                        # RP-* tasks — same  as the
-                        # main loop fix. If executor produced new
-                        # tasks OR DB has pending tasks from prior
-                        # rounds, run the executor.
-                        _new_repair = _result.get("repair_tasks") or []
-                        _pending_in_db = _get_pending_repair_tasks(
-                            plan_id,
-                            _round_failed_vp_ids(_new_orch, _report),
-                        )
-                        if _pending_in_db and not _new_repair:
-                            _server.logger.info(
-                                "[Auto-Verification] Post-repair round "
-                                "%d: orchestrator returned %d new tasks "
-                                "but %d pending in DB — running DB queue",
-                                _next_round, len(_new_repair),
-                                len(_pending_in_db),
-                            )
-                            _new_repair = _pending_in_db
-                        if _new_repair:
-                            _server.logger.info(
-                                "[Auto-Verification] Post-repair round %d "
-                                "still failing plan=%s — spawning next "
-                                "repair",
-                                _next_round, plan_id,
-                            )
-                            _server._run_repair_execution_async(
-                                plan_id, project_dir, tool=tool,
-                                on_complete=_on_repair_complete,
-                            )
-                        elif _result.get("status") == "passed":
-                            _record_terminal("passed", None)
-                        elif _result.get("status") == "loop_stopped":
-                            _record_terminal(
-                                "loop_stopped",
-                                _result.get("stop_reason"),
-                            )
-                        elif _round_is_pure_split(_result):
-                            # 2026-09-14: this round's only
-                            # forward work is a VP split — nothing for the
-                            # executor to do, so chain straight into the next
-                            # verification round, which runs the children.
-                            # Guarded by the round cap so a
-                            # split→verify→split chain cannot recurse forever.
-                            if _next_round >= _new_max:
-                                _server.logger.warning(
-                                    "[Auto-Verification] pure split at the "
-                                    "round cap (%d/%d) — stopping; split "
-                                    "children were not verified",
-                                    _next_round, _new_max,
-                                )
-                                _record_terminal(
-                                    "loop_stopped", "max_rounds_reached",
-                                )
-                            else:
-                                _server.logger.warning(
-                                    "[Auto-Verification] Post-repair round %d "
-                                    "is a pure split — re-entering "
-                                    "verification without executing",
-                                    _next_round,
-                                )
-                                _on_repair_complete(0)
-                        else:
-                            # 2026-09-17 — same treatment as
-                            # the main loop's dead end: "原本就已经跳到了
-                            # taskready，你直接去跳到那个 executing 状态…
-                            # 如果发现没有任务，那不就跳转到 verification
-                            # 吗？"
-                            #
-                            # An empty repair queue is not convergence, it is
-                            # "go drain whatever execution work remains". The
-                            # round already left the plan in
-                            # ``verification_repairing``, so this is the
-                            # declared ``verification_repairing → executing``
-                            # edge. The executor decides whether there is
-                            # work; finding none just exits and hands the
-                            # chain back here.
-                            #
-                            # The round budget still bounds this: the guard
-                            # at the top of this callback stops the recursion
-                            # once ``_next_round`` would exceed the cap.
-                            _dead_end_terminal(
-                                plan_id,
-                                _result.get("stop_reason")
-                                or "no_repair_tasks",
-                                chain_ending=False,
-                                rollback_to_ready=False,
-                            )
-                            _server.logger.warning(
-                                "[Auto-Verification] Post-repair round %d: no "
-                                "repair tasks — routing to executing to drain "
-                                "remaining work plan=%s",
-                                _next_round, plan_id,
-                            )
-                            try:
-                                _new_orch.confirm_repair_and_rerun()
-                            except Exception:  # noqa: BLE001
-                                _server.logger.exception(
-                                    "[Auto-Verification] could not route the "
-                                    "post-repair dead end to executing "
-                                    "plan=%s — stopping", plan_id,
-                                )
-                                _record_terminal(
-                                    "failed", "post_repair_reroute_failed",
-                                )
-                            else:
-                                _server._run_repair_execution_async(
-                                    plan_id, project_dir, tool=tool,
-                                    on_complete=_on_repair_complete,
-                                )
-                    except Exception:
-                        _server.logger.exception(
-                            "[repair_async] post-repair verification "
-                            "crashed plan=%s",
-                            plan_id,
-                        )
-                        _record_terminal(
-                            "failed", "post_repair_verification_crashed",
-                        )
-                except Exception:
-                    _server.logger.exception(
-                        "[repair_async] _on_repair_complete crashed "
-                        "plan=%s",
-                        plan_id,
-                    )
-                    try:
-                        _record_terminal(
-                            "failed", "repair_callback_crashed",
-                        )
-                    except Exception:
-                        pass
-
+            # 2026-10-22: the callback is a module-level factory now
+            # (``_make_repair_on_complete``) so the ``/start`` repair
+            # resume path and the auto-loop run the SAME
+            # implementation. The body is unchanged — only the binding
+            # moved.
+            _on_repair_complete = _make_repair_on_complete(
+                plan_id, project_dir, tool,
+            )
 
             if not repair_tasks and not _pure_split:
                 # 2026-09-14 — check for a generation FAILURE before
@@ -5041,6 +5110,18 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                     f"routing to executing so the executor can drain any "
                     f"remaining work, then back to verification"
                 )
+                # 2026-10-22: the operator stopped the plan — do not
+                # route it to ``executing`` and do not dispatch the
+                # executor. The check sits BEFORE the routing call so
+                # the plan is not moved into a phase that says "work is
+                # about to run".
+                import verification_cancel as _vc_dispatch
+                if _vc_dispatch.is_cancelled(plan_id):
+                    _server.logger.warning(
+                        "[Auto-Verification] stop requested — not "
+                        "dispatching repair plan=%s", plan_id,
+                    )
+                    return
                 try:
                     orch.confirm_repair_and_rerun()
                 except Exception as _reroute_exc:  # noqa: BLE001
@@ -5070,6 +5151,18 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                 print(f"[Auto-Verification] Round {round_num}: Generated {len(repair_tasks)} repair tasks, re-executing...")
 
             # Auto-confirm repair and run re-execution via CLI
+            #
+            # 2026-10-22: the operator stopped the plan — do not route
+            # it to ``executing`` and do not dispatch the executor. The
+            # check sits BEFORE the routing call so the plan is not
+            # moved into a phase that says "work is about to run".
+            import verification_cancel as _vc_dispatch
+            if _vc_dispatch.is_cancelled(plan_id):
+                _server.logger.warning(
+                    "[Auto-Verification] stop requested — not "
+                    "dispatching repair plan=%s", plan_id,
+                )
+                return
             orch.confirm_repair_and_rerun()
 
             # 2026-09-08: single-writer refactor. The previous
@@ -5146,6 +5239,44 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                 plan_id, project_dir, tool=tool,
                 on_complete=_on_repair_complete,
                 outcome=outcome,
+            )
+            return
+        except VerificationCancelled as cancelled:
+            # 2026-10-22 — the operator stopped this plan while the
+            # round was judging / generating repair tasks.
+            #
+            # This is NOT a failed round, so it must not be recorded as
+            # one. The arm below would call ``_record_terminal
+            # ("failed", …)``, which advances the plan to
+            # ``verification_failed`` — a terminal verdict on a round
+            # the operator paused on purpose, and the exact thing the
+            # 2026-09-15 rework was about ("the verification thread
+            # kept going … re-stamping the stage the operator had just
+            # parked").
+            #
+            # So: no terminal record, no failure record, no repair
+            # tasks, no retry. The phase is left exactly where the
+            # stop left it — the stop route parks a verification-half
+            # stop at ``verification`` ("the round is paused, not
+            # finished"), and a stop during the repair executor at
+            # ``verification_repairing``. Moving it from here would
+            # fight that CAS, which this module is not allowed to do
+            # (``routes/verification.py`` owns the stop's target
+            # phase).
+            #
+            # What the operator gets from ``/start`` is the ordinary
+            # path: the round is picked up again, and the repair
+            # generation re-opens the session the stopped round was
+            # using (see ``repair_generator.repair_content_session``),
+            # so the interrupted work is not paid for twice.
+            _server.logger.warning(
+                "[Auto-Verification] Round %d cancelled by the operator "
+                "stop plan=%s — no terminal record, no repair tasks",
+                round_num, plan_id,
+            )
+            print(
+                f"[Auto-Verification] Round {round_num}: cancelled by the "
+                f"operator stop — {cancelled}"
             )
             return
         except Exception as e:

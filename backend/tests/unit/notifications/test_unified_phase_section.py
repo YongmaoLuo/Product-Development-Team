@@ -83,7 +83,10 @@ def _flatten_card_text(card: Dict[str, Any]) -> str:
         # Verification sub-stages — each maps to its own label.
         ("verification_running", "completed", "running", "🔍 初次验证"),
         ("verification_repairing", "completed", "running", "🔧 正在生成修复任务"),
-        ("verification_rerunning", "completed", "running", "🔁 重跑验证"),
+        # 2026-10-22: ``verification_rerunning`` was removed from the
+        # phase vocabulary (dead state); the "🔁 重跑验证" label belongs
+        # to ``verify_recheck``.
+        ("verify_recheck", "completed", "running", "🔁 重跑验证"),
         # Terminal verification states.
         ("verification_passed", "completed", "passed", "✅ 验证通过"),
         ("verification_failed", "completed", "failed", "❌ 验证失败"),

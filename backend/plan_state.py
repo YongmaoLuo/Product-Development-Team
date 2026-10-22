@@ -100,7 +100,12 @@ VALID_PHASES = [
     "verification_passed",
     "verification_failed",
     "verification_repairing",
-    "verification_rerunning",
+    # 2026-10-22: ``verification_rerunning`` was removed from the
+    # vocabulary. It was a DEAD state — its only writer,
+    # ``start_verification_rerun``, had no callers anywhere — so no
+    # plan can reach it any more. Rows written before the removal
+    # still carry the old value; they are read through
+    # :func:`normalize_phase` (historical value → ``verification_repairing``).
     "verification_loop_stopped",
     "completed",
     "failed",
@@ -108,6 +113,33 @@ VALID_PHASES = [
 ]
 
 TERMINAL_PHASES = {"completed", "failed", "stopped"}
+
+#: Historical phase values that are no longer written anywhere, mapped
+#: onto the phase that replaced them.
+#:
+#: 2026-10-22: ``verification_rerunning`` was a DEAD state — its only
+#: writer, :meth:`PlanState.start_verification_rerun`, had no callers
+#: anywhere in the repository — so it was removed from the phase
+#: vocabulary (``VALID_PHASES`` / ``VERIFICATION_PHASE_TRANSITIONS``).
+#: A ``plan_routing`` row written before the removal still carries the
+#: old value; the READ path maps it back onto the phase it stood for
+#: (``verification_repairing``) so such a plan neither crashes nor is
+#: stranded in a phase nothing can move it out of.
+LEGACY_PHASE_ALIASES: Dict[str, str] = {
+    "verification_rerunning": "verification_repairing",
+}
+
+
+def normalize_phase(phase: Optional[str]) -> Optional[str]:
+    """Map a historical phase value onto the phase that replaced it.
+
+    Unknown / non-string values are returned unchanged — this is a
+    compatibility shim for values that were written by an older
+    version, not a validator.
+    """
+    if not isinstance(phase, str):
+        return phase
+    return LEGACY_PHASE_ALIASES.get(phase, phase)
 
 # 2026-09-17 (schema v5): the ``_PLAN_PHASE_TO_ROUTING_STAGE``
 # translation table that used to live here is DELETED, along with the
@@ -174,9 +206,12 @@ VERIFICATION_PHASE_TRANSITIONS = {
     "verify_first_pass": ["verify_recheck", "verification_passed", "verification_failed", "verification_loop_stopped"],
     "verify_recheck": ["verification_passed", "verification_failed", "verification_loop_stopped"],
     "verification_passed": [],  # terminal: security boundary — no forward edge to ``completed``
-    "verification_failed": ["verification_repairing", "verification_rerunning", "verification_passed", "verification_loop_stopped"],
-    "verification_repairing": ["verification", "verification_rerunning", "verification_passed", "verification_loop_stopped", "verification_failed", "executing"],
-    "verification_rerunning": ["verification_running", "verification_passed", "verification_failed", "verification_loop_stopped"],
+    # 2026-10-22: ``verification_rerunning`` left this table with the
+    # phase it named (it was a dead state). A row that still holds the
+    # historical value is read as ``verification_repairing`` — see
+    # :data:`LEGACY_PHASE_ALIASES`.
+    "verification_failed": ["verification_repairing", "verification_passed", "verification_loop_stopped"],
+    "verification_repairing": ["verification", "verification_passed", "verification_loop_stopped", "verification_failed", "executing"],
     "verification_loop_stopped": ["failed", "verification_passed"],
 
     # ``completed`` is NOT a dead end for the verification sub-machine.
@@ -319,7 +354,14 @@ class PlanState:
                 return default
         return {
             "plan_id": row.get("plan_id"),
-            "current_phase": row.get("current_phase") or "interview",
+            # 2026-10-22: the read path maps the historical
+            # ``verification_rerunning`` value onto the phase it stood
+            # for, so a row written before that dead state was removed
+            # is read as ``verification_repairing`` instead of a phase
+            # that is no longer in the vocabulary.
+            "current_phase": normalize_phase(
+                row.get("current_phase") or "interview"
+            ),
             "completed_phases": _decode_json(row.get("completed_phases"), []),
             "review_rounds": _decode_json(row.get("review_rounds"), {"prd": 0, "arch": 0, "test": 0}),
             "flags": _decode_json(row.get("flags"), {}),
@@ -643,10 +685,11 @@ class PlanState:
             self._state["verification"]["status"] = "running"
             # Do NOT auto-increment the round here. ``verification_round``
             # is the number of completed rounds (0-based). It is bumped
-            # only by ``start_verification_rerun`` when the user confirms
-            # repair tasks and the orchestrator moves to the next round.
-            # Auto-incrementing on entry would break the 0-based contract
-            # expected by ``VerificationOrchestrator`` tests.
+            # by the repair path (``start_repair_execution``) when the
+            # user confirms repair tasks and the orchestrator moves to
+            # the next round. Auto-incrementing on entry would break the
+            # 0-based contract expected by ``VerificationOrchestrator``
+            # tests.
         elif phase == "verify_first_pass":
             self._state["verification"]["status"] = "running"
         elif phase == "verify_recheck":
@@ -828,17 +871,11 @@ class PlanState:
             )
         self.transition_to("verification_repairing")
 
-    def start_verification_rerun(self):
-        """Transition to rerun verification after repair."""
-        # Increment round before rerunning
-        self.increment_verification_round()
-
-        # Check if max rounds reached (stop if round >= max_rounds)
-        if self.get_verification_round() >= self.get_verification_max_rounds():
-            self.stop_verification_loop("max_rounds_reached")
-            return
-
-        self.transition_to("verification_rerunning")
+    # 2026-10-22: ``start_verification_rerun`` is GONE. It was the only
+    # writer of ``verification_rerunning``, and it had no callers
+    # anywhere in the repository — a dead state with a dead writer. The
+    # phase left the vocabulary with it (see :data:`LEGACY_PHASE_ALIASES`
+    # for the read-path compatibility).
 
     def start_repair_execution(self):
         """Transition from ``verification_repairing`` into ``executing``.
@@ -860,9 +897,9 @@ class PlanState:
         Side effects:
           * Increment ``verification.round`` so the post-repair
             verification cycle starts on round N+1, not the same N.
-            This mirrors ``start_verification_rerun``'s
-            ``increment_verification_round`` so the round counter
-            monotonically increases across all path types.
+            This mirrors the round bookkeeping the removed
+            ``start_verification_rerun`` used to do, so the round
+            counter monotonically increases across all path types.
         """
         current = self.get_current_phase()
         if current != "verification_repairing":
@@ -871,8 +908,8 @@ class PlanState:
                 f"Must be in 'verification_repairing' phase."
             )
         # Increment round counter first so post-repair verification
-        # cycle starts on the next round number (mirrors
-        # ``start_verification_rerun``'s increment_verification_round).
+        # cycle starts on the next round number (the round bookkeeping
+        # the removed ``start_verification_rerun`` used to do).
         self.increment_verification_round()
         self.transition_to("executing")
 
@@ -987,7 +1024,7 @@ class PlanState:
         verification_states = {
             "verification", "verification_running", "verify_first_pass",
             "verify_recheck", "verification_repairing",
-            "verification_rerunning", "verification_passed",
+            "verification_passed",
             "verification_failed", "verification_loop_stopped",
         }
         if current in verification_states:

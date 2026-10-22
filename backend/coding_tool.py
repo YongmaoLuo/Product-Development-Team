@@ -7,6 +7,7 @@ Abstract base class for AI coding tools and implementations.
 
 import copy
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -41,6 +42,7 @@ from quota_watchdog import get_shared_quota_watchdog as _shared_quota_watchdog
 # channel — record failures must never break a dispatch, so the registry
 # swallows its own errors and we never let them propagate either.
 from usage_registry import (
+    current_plan_id,
     current_task_allowed_files,
     current_task_id,
     current_task_is_readonly,
@@ -48,8 +50,177 @@ from usage_registry import (
 )
 from usage_registry import record_llm_call as _record_usage_entry
 from file_lock_protocol import socket_path
+# 2026-10-22: the type a cancelled dispatch raises. Dependency-free
+# (stdlib only), so a top-level import carries no cycle risk.
+from verification_cancel import VerificationCancelled
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch registration + cancellation (2026-10-22)
+# ---------------------------------------------------------------------------
+# A ``claude`` dispatch is a subprocess, and a subprocess is only
+# interruptible if somebody can find it. Until now the *verification
+# judgment / repair-task generation* call was the one LLM call with no
+# way in: the VP sub-agents register themselves in
+# ``sub_agent_registry`` (so ``/stop`` can SIGTERM them), and the repair
+# generation call — which happens in the server process, in the
+# auto-loop thread, after the round has already produced its report —
+# registered nothing. So an operator who pressed ``/stop`` during the
+# repair call watched the call keep running to completion.
+#
+# Two things make it interruptible:
+#
+#   1. the dispatch registers its handle, so ``/stop``'s existing kill
+#      path (``_cleanup_dead_verification_processes`` →
+#      ``_kill_sub_agent_process``) can reach ``tool._current_process``
+#      and take the subprocess down;
+#   2. the dispatch notices that it was cancelled and says so, with a
+#      type of its own (:class:`verification_cancel.VerificationCancelled`),
+#      so that "the operator stopped this" is never recorded as "this
+#      failed".
+#
+# Both are opt-in per plan: a dispatch with no plan attached behaves
+# exactly as it did before, byte for byte.
+
+#: Monotonic counter behind the registry's ``vp_id``. See
+#: :func:`_register_dispatch` for why the id has to be unique per
+#: dispatch rather than fixed.
+_DISPATCH_SEQ = itertools.count(1)
+
+
+def _dispatch_plan_id() -> Optional[str]:
+    """The plan this dispatch belongs to, or ``None``.
+
+    ``usage_registry.current_plan_id()`` reads the ``PDT_PLAN_ID``
+    environment variable as its fallback and a per-thread context
+    variable first. Both are the same question — "which plan is this
+    call for?" — and the environment variable alone is not enough:
+    ``PDT_PLAN_ID`` is set on the *executor* subprocess
+    (``routes/execution.py``), while the verification and repair calls
+    run inside the server process, where the plan arrives on the
+    context variable that ``plan_usage_context`` binds for the
+    verification worker and the auto-loop thread. Gating on the
+    environment variable alone would therefore have registered nothing
+    at all in the process that actually makes these calls — a change
+    that is green and does nothing. The context variable is what the
+    environment variable is a fallback for, so asking the registry
+    helper keeps the two from drifting.
+
+    ``None`` means "not a plan dispatch" — every non-plan scenario
+    keeps its current behaviour exactly.
+    """
+    try:
+        return current_plan_id()
+    except Exception:  # noqa: BLE001 — attribution must never break a call
+        return None
+
+
+def _dispatch_cancelled(plan_id: Optional[str]) -> bool:
+    """True when the operator has cancelled ``plan_id``'s round."""
+    if not plan_id:
+        return False
+    try:
+        import verification_cancel
+        return bool(verification_cancel.is_cancelled(plan_id))
+    except Exception:  # noqa: BLE001 — a missing flag is not a cancellation
+        return False
+
+
+def _raise_if_cancelled(plan_id: Optional[str], what: str) -> None:
+    """Raise :class:`VerificationCancelled` when the round was stopped.
+
+    The flag itself is read through :func:`_dispatch_cancelled`, which
+    imports ``verification_cancel`` lazily — the module is stdlib-only,
+    but a dispatch that has no plan never needs it.
+    """
+    if not plan_id or not _dispatch_cancelled(plan_id):
+        return
+    raise VerificationCancelled(
+        plan_id,
+        f"verification cancelled for plan {plan_id!r} while {what}",
+    )
+
+
+def _register_dispatch(scoped_tool, plan_id: Optional[str]):
+    """Register ``scoped_tool``'s in-flight subprocess under ``plan_id``.
+
+    Returns ``(registry, handle)`` — ``(None, None)`` when there is
+    nothing to register (no plan) or when the registration failed.
+    Registration is best-effort by construction: the registry is a
+    watchdog aid, and a dispatch that cannot be watched must still run.
+
+    **Why the ``vp_id`` is unique per dispatch.** ``register_sub_agent``
+    is idempotent on ``(plan_id, vp_id, attempt)``: re-registering the
+    same pair does *not* add a second handle, it REFRESHES the existing
+    one (rewriting its ``scoped_tool``, timestamps and stage) and
+    returns it. So a fixed ``vp_id`` would mean that two concurrent
+    dispatches under the same plan share one handle: the second
+    registration overwrites the first's ``scoped_tool``, and the first
+    subprocess becomes unreachable through the registry — the one thing
+    the handle exists for. A monotonic counter gives every dispatch its
+    own id, so N concurrent dispatches are N handles and each one still
+    points at the tool whose process it owns.
+
+    **Why ``attempt=0``.** The ``attempt`` field exists for the VP
+    sub-agent's own retry bookkeeping (one handle per attempt, so a
+    killed attempt is distinguishable from the one that replaced it).
+    Here the dispatch counter already distinguishes one dispatch from
+    the next, so the attempt is always the first — and a non-zero
+    attempt would only add a second key component that never varies.
+
+    **Why an existing handle for the same tool suppresses a second
+    registration.** The VP sub-agent, the binary-rebuild agent and the
+    service-restart agent all register their *own* handle with the
+    tool they are about to dispatch on, and then dispatch on it. A
+    second handle for the same tool would double the watchdog's view of
+    one subprocess and break the invariant that one live handle means
+    one live subprocess. When the tool already has a live handle under
+    this plan, the dispatch leaves the registry alone.
+    """
+    if not plan_id:
+        return None, None
+    try:
+        from sub_agent_registry import sub_agent_registry
+
+        for existing in sub_agent_registry.all_handles(plan_id):
+            if getattr(existing, "scoped_tool", None) is scoped_tool:
+                return None, None
+
+        handle = sub_agent_registry.register_sub_agent(
+            plan_id,
+            f"llm-dispatch-{next(_DISPATCH_SEQ)}",
+            0,
+            scoped_tool=scoped_tool,
+        )
+        return sub_agent_registry, handle
+    except Exception:  # noqa: BLE001 — a watchdog aid must never break a call
+        logger.warning(
+            "[dispatch-register] could not register the dispatch for plan "
+            "%s; continuing without a watchdog handle",
+            plan_id, exc_info=True,
+        )
+        return None, None
+
+
+def _unregister_dispatch(registry, plan_id: Optional[str], handle) -> None:
+    """Drop a handle registered by :func:`_register_dispatch`.
+
+    Best-effort and idempotent: ``unregister`` removes by identity and
+    tolerates a handle that is already gone, so calling it twice (once
+    on the read loop's exit and once on the exception arm) is safe.
+    """
+    if registry is None or handle is None or not plan_id:
+        return
+    try:
+        registry.unregister(plan_id, handle)
+    except Exception:  # noqa: BLE001 — cleanup must never break a call
+        logger.warning(
+            "[dispatch-unregister] could not unregister the dispatch "
+            "handle for plan %s; continuing",
+            plan_id, exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -83,15 +254,32 @@ class JsonSession:
 
     One per loop rather than one per call: the loop's second question is
     the first question again, and this is what makes it so.
+
+    ``pinned_session_id`` (2026-10-22) is the id the caller wants this
+    session to *have*, for a session that does not exist yet. The
+    distinction it draws is the one the CLI draws: ``--session-id <id>``
+    CREATES a session under that id, ``--resume <id>`` RE-OPENS one
+    that already exists. A handle that only carried the id it wants
+    could not say which of the two it meant, so a caller that wants a
+    deterministic id — one derived from the plan and the step, so that
+    a ``/start`` after a ``/stop`` can re-open the same conversation —
+    had no way to ask for the first dispatch. With a pinned id, the
+    first dispatch creates the session under it and every later
+    dispatch (in this process or the next) resumes it.
     """
 
-    __slots__ = ("session_id",)
+    __slots__ = ("session_id", "pinned_session_id")
 
-    def __init__(self, session_id: Optional[str] = None):
+    def __init__(self, session_id: Optional[str] = None,
+                 pinned_session_id: Optional[str] = None):
         self.session_id = session_id
+        self.pinned_session_id = pinned_session_id
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"JsonSession(session_id={self.session_id!r})"
+        return (
+            f"JsonSession(session_id={self.session_id!r}, "
+            f"pinned_session_id={self.pinned_session_id!r})"
+        )
 
 
 #: The session the call in flight should re-open, when its caller asked
@@ -2263,6 +2451,15 @@ class ClaudeCodingTool(CodingTool):
         subagent_uuid = uuid.uuid4().hex
         subagent_log_file = f"/tmp/subagent_{subagent_uuid}_activity.log"
 
+        # 2026-10-22 — the plan this dispatch belongs to, resolved once.
+        # ``None`` means "not a plan dispatch": nothing below changes for
+        # such a call, which is every non-plan scenario (the CLI without
+        # a plan, the unit tests, the vendor tools). The same value is
+        # used for the watchdog registration and for the cancellation
+        # check, so the two can never disagree about which plan they
+        # are talking about.
+        dispatch_plan_id = _dispatch_plan_id()
+
         # Sub-agent authorization: same iron rule as _run_claude_interactive.
         if self.hook_stdin:
             pdt_authorization = (
@@ -3562,6 +3759,13 @@ class ClaudeCodingTool(CodingTool):
         # as ``None`` because the ``Popen`` below may be exactly what
         # raised.
         process: Optional[subprocess.Popen] = None
+        # 2026-10-22 — the watchdog handle for this dispatch. Bound
+        # before the ``try`` so the ``except BaseException`` arm can
+        # always reach it: an exception raised BEFORE the registration
+        # (a failed settings write, a Popen that refuses) must not
+        # turn into an ``UnboundLocalError`` on the way out.
+        _dispatch_registry = None
+        _dispatch_handle = None
         try:
             if settings_data is not None:
                 # Copy every ANTHROPIC_* key the routing layer / ``self.*``
@@ -3672,6 +3876,25 @@ class ClaudeCodingTool(CodingTool):
 
             with self._process_lock:
                 self._current_process = process
+
+            # 2026-10-22 — register the dispatch so ``/stop`` can find
+            # and kill it. The handle is registered AFTER the spawn
+            # succeeded (there is nothing to kill before that) and
+            # BEFORE the output is read (the read is what blocks for
+            # minutes, and it is exactly the window the operator's
+            # stop has to be able to interrupt).
+            #
+            # ``scoped_tool=self`` is what makes the kill path work:
+            # ``_kill_sub_agent_process`` reaches the ``Popen`` through
+            # ``handle.scoped_tool._current_process``, under the tool's
+            # own ``_process_lock``.
+            #
+            # Every failure here is swallowed: the registry is a
+            # watchdog aid, and a dispatch that cannot be watched must
+            # still run. The same is true of the unregister below.
+            _dispatch_registry, _dispatch_handle = _register_dispatch(
+                self, dispatch_plan_id,
+            )
 
             # Feed the user prompt via stdin, then close.
             try:
@@ -3886,6 +4109,15 @@ class ClaudeCodingTool(CodingTool):
                     [effective_settings_path],
                     logger=logger,
                 )
+            # 2026-10-22 — the dispatch is over on this path (a raised
+            # watcher setup, a failed Popen, a KeyboardInterrupt), so
+            # the watchdog handle has to go with it. The read loop's own
+            # ``finally`` does the same for the paths that get that far;
+            # ``unregister`` removes by identity and tolerates a handle
+            # that is already gone, so the two never fight.
+            _unregister_dispatch(
+                _dispatch_registry, dispatch_plan_id, _dispatch_handle,
+            )
             raise
         result_text = ""
         # Usage metadata captured from the stream-json ``result`` event
@@ -4083,6 +4315,17 @@ class ClaudeCodingTool(CodingTool):
                     [effective_settings_path],
                     logger=logger,
                 )
+            # 2026-10-22 — the dispatch is over: the child is gone and
+            # the output has been read (or could not be read). The
+            # watchdog handle has to go with it, or the registry keeps
+            # offering the heartbeat a handle whose subprocess is
+            # already dead. This runs on the clean path, on the
+            # idle/total-timeout paths and on the ``ApiError`` path
+            # alike — all three leave the read loop through this
+            # ``finally``.
+            _unregister_dispatch(
+                _dispatch_registry, dispatch_plan_id, _dispatch_handle,
+            )
 
         # Layer 3: stderr capture — do this BEFORE the total-timeout check
         # so we can include stderr context in the timeout error message.
@@ -4093,6 +4336,27 @@ class ClaudeCodingTool(CodingTool):
         finally:
             with self._process_lock:
                 self._current_process = None
+
+        # 2026-10-22 — the operator stopped this plan while the dispatch
+        # was in flight. The subprocess is gone (that is exactly how the
+        # stop kills it) and there is no answer to read, so THIS is the
+        # moment to say "cancelled" rather than "failed": the caller
+        # must not retry it, must not record a failure for it, and must
+        # not turn it into a repair task.
+        #
+        # Only on the abnormal exit. A dispatch that DID produce an
+        # answer is a completed dispatch whatever the flag says, and
+        # raising here would throw away a result the operator is about
+        # to ask for again.
+        #
+        # The ``ApiError`` raised from inside the read loop never
+        # reaches this line — it leaves the function through the read
+        # loop's ``finally`` — so the cancellation is detected a second
+        # time, one layer up, in ``_run_interactive_resilient``.
+        if not (result_text or "").strip():
+            _raise_if_cancelled(
+                dispatch_plan_id, "the dispatch was in flight",
+            )
 
         # 2026-09-06 — If the read loop exited because the total-timeout
         # watcher SIGTERM'd the subprocess (rather than a clean ``result``
@@ -4482,7 +4746,25 @@ class ClaudeCodingTool(CodingTool):
                     meta=result_meta,
                 )
                 return result_text, resolved_session_id
+            except VerificationCancelled:
+                # 2026-10-22 — the operator stopped this plan. The
+                # dispatch is over and must not be retried: a retry
+                # would spend another provider's tokens on a round the
+                # operator asked to stop, and would keep the process
+                # alive that the stop just killed. Nothing is recorded
+                # either — a cancelled dispatch is not a failed one, and
+                # the usage registry is where "this round failed" is
+                # written down.
+                raise
             except EmptyResponseError as exc:
+                # 2026-10-22 — an empty reply on a cancelled plan is a
+                # cancellation, not an empty reply. The empty-response
+                # retry below would dispatch again, which is exactly
+                # what a stop forbids.
+                if _dispatch_cancelled(_dispatch_plan_id()):
+                    _raise_if_cancelled(
+                        _dispatch_plan_id(), "the dispatch was in flight",
+                    )
                 # Session never produced anything — CC Switch will have
                 # no rows for it either; record it so the cross-check
                 # can distinguish "dead session" from "scanner lag".
@@ -4534,6 +4816,18 @@ class ClaudeCodingTool(CodingTool):
                 # session would throw away the conversational context
                 # the follow-up hint depends on.
             except Exception as exc:
+                # 2026-10-22 — the dispatch was killed by the operator's
+                # stop and the failure surfaced as an ordinary error
+                # (the ``ApiError`` the read loop raises leaves the
+                # function before the cancellation check below the read
+                # loop can run). Say so here, where the retry policy
+                # lives: a cancelled dispatch is re-raised as a
+                # cancellation, is not recorded as a failure, and is not
+                # retried.
+                if _dispatch_cancelled(_dispatch_plan_id()):
+                    _raise_if_cancelled(
+                        _dispatch_plan_id(), "the dispatch was in flight",
+                    )
                 # Timeouts, ApiError, HardTimeoutError, … — record the
                 # failed attempt (the session may still exist and CC
                 # Switch may have partial rows for it) and re-raise so
@@ -4600,6 +4894,13 @@ class ClaudeCodingTool(CodingTool):
             # The resumed session is fine; the provider is slow. That is
             # the caller's existing timeout routing (auto-split, next
             # provider), not a resume failure — do not mask it as one.
+            raise
+        except VerificationCancelled:
+            # 2026-10-22 — the operator stopped the plan. The fallback
+            # below is a RETRY (the same work, in a fresh session), and
+            # a cancelled dispatch must not be retried: the stop killed
+            # the subprocess on purpose, and running the same work again
+            # on another provider is exactly what a stop request forbids.
             raise
         except Exception as exc:
             if self.logger:
@@ -5119,8 +5420,21 @@ class ClaudeCodingTool(CodingTool):
         session_handle = _JSON_SESSION.get()
         entry_resume = resume_session
         from_handle = entry_resume is None and session_handle is not None
+        # 2026-10-22 — a handle that carries a PINNED id but no live id
+        # yet is asking for its session to be CREATED under that id, not
+        # re-opened: the CLI's ``--session-id`` creates, its ``--resume``
+        # re-opens, and only the second one can fail on a session that
+        # does not exist yet. The pinned id is what makes a session
+        # deterministic — derived from the plan and the step, so a
+        # ``/start`` after a ``/stop`` re-opens the same conversation
+        # instead of starting a new one.
+        pinned_fresh: Optional[str] = None
         if entry_resume is None and session_handle is not None:
             entry_resume = session_handle.session_id
+            if not entry_resume:
+                pinned_fresh = getattr(
+                    session_handle, "pinned_session_id", None,
+                ) or None
 
         def _remember(sid: Optional[str]) -> None:
             """Hand the live session id back to the caller's loop.
@@ -5191,7 +5505,7 @@ class ClaudeCodingTool(CodingTool):
             # 32 hex chars WITHOUT dashes and is rejected with
             # ``Error: Invalid session ID``. str(uuid.uuid4()) is
             # the canonical dashed form.
-            session_id = resume_session or str(uuid.uuid4())
+            session_id = resume_session or pinned_fresh or str(uuid.uuid4())
             pinned[0] = session_id
             _remember(session_id)
             if resume_session:
@@ -5522,6 +5836,12 @@ class ClaudeCodingTool(CodingTool):
                 return _query_json_internal(excluded=new_excluded,
                                             resume_session=pinned[0],
                                             switch=True)
+            raise
+        except VerificationCancelled:
+            # 2026-10-22 — the operator stopped this plan. Not a
+            # failure, so it is not logged as one and not retried: the
+            # generic arm below would say "query_json failed" about a
+            # dispatch that a stop request targeted.
             raise
         except Exception as e:
             duration = int(time.monotonic() - start_time)

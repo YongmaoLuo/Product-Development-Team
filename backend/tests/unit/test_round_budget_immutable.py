@@ -108,13 +108,26 @@ def test_default_round_budget_is_the_decided_policy() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _reentry_source() -> str:
+    """重入逻辑的源码。
+
+    2026-10-22: ``_on_repair_complete`` 原本是
+    ``_run_auto_verification_loop_inner`` 里的闭包，现在提成了模块级工厂
+    ``_make_repair_on_complete``（``/start`` 的修复续跑路径共用同一份）。
+    重入逻辑整体搬进了工厂，所以下面这几条源码锁要看工厂。
+    """
+    return (
+        inspect.getsource(server._run_auto_verification_loop_inner)
+        + inspect.getsource(server._make_repair_on_complete)
+    )
+
+
 def test_the_reentry_no_longer_bumps_the_cap() -> None:
-    """``_on_repair_complete`` 是 ``_run_auto_verification_loop`` 内的闭包，
-    要起一整条验证循环才能执行；所以这条锁源码。
+    """``_on_repair_complete`` 要起一整条验证循环才能执行；所以这条锁源码。
 
     锁两件事：自增写法消失，且判定改走 ``_plan_next_round``。
     """
-    src = inspect.getsource(server._run_auto_verification_loop_inner)
+    src = _reentry_source()
 
     # 断言的是**赋值写法**，不是裸字符串：解释这段历史的注释里也会提到
     # 那个表达式，锁裸字符串会把自己的说明文字判成回归。
@@ -130,7 +143,7 @@ def test_the_reentry_no_longer_bumps_the_cap() -> None:
 
 
 def test_the_reentry_stops_with_max_rounds_reached() -> None:
-    src = inspect.getsource(server._run_auto_verification_loop_inner)
+    src = _reentry_source()
     idx = src.index("if _round_budget_exhausted:")
     # 从判定点搜到下一条 `return`，覆盖 warning 文案 + 终态调用。
     tail = src[idx:src.index("return", idx) + 1]
@@ -141,7 +154,7 @@ def test_the_reentry_stops_with_max_rounds_reached() -> None:
 
 def test_the_stale_self_extend_docstring_is_gone() -> None:
     """docstring 曾写"Bumps max_rounds by 1 (capped at 10)"。"""
-    src = inspect.getsource(server._run_auto_verification_loop_inner)
+    src = _reentry_source()
     assert "Bumps ``max_rounds``" not in src, (
         "docstring 还在描述已被删除的自增行为"
     )

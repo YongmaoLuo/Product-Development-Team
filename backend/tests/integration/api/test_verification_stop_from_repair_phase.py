@@ -1,11 +1,17 @@
-"""``stop`` works from ``verification_repairing`` / ``verification_rerunning``.
+"""``stop`` works from ``verification_repairing`` — and from a RESIDUAL
+``verification_rerunning`` row.
 
 A verification round is not parked at ``verification_running`` for its
 whole life. Once a round finishes, the auto-loop moves the routing row
-forward to ``verification_repairing`` (repair tasks to confirm) or
-``verification_rerunning`` — and a round's ``plan_verification`` row is
-still ``running`` through both. The operator's stop is exactly as
-legitimate there as it is at ``verification_running``.
+forward to ``verification_repairing`` (repair tasks to confirm) — and a
+round's ``plan_verification`` row is still ``running`` through it. The
+operator's stop is exactly as legitimate there as it is at
+``verification_running``.
+
+``verification_rerunning`` was a DEAD state and left the phase
+vocabulary on 2026-10-22, but a routing row written before that can
+still hold the historical value. The residual case is pinned here too:
+it must not crash and it must not be a stranded row.
 
 What is pinned here is that such a stop both **lands** and is
 **resumable**:
@@ -173,8 +179,8 @@ def _seed_plan(
 
     ``phase`` is the routing row's ``current_phase`` and is the whole
     point of this module: the round is in flight at
-    ``verification_repairing`` / ``verification_rerunning``, not at
-    ``verification_running``.
+    ``verification_repairing`` (or at a residual historical value), not
+    at ``verification_running``.
 
     ``status="running"`` is the row status of a round that is still in
     flight — the operator pressed stop while it was running.
@@ -233,9 +239,9 @@ def _read_phase(db_path: Path, plan_id: str):
 def _assert_stop_then_resume(env, client, stub_auto_loop, phase: str) -> None:
     """Stop a round parked at ``phase``, then start it again — same round.
 
-    Shared by the repairing and rerunning cases: the two phases differ
-    only in which one the auto-loop happened to park the row on, and the
-    contract under test is identical for both.
+    The shared contract of the live phase: the stop lands, it leaves a
+    resumable trace, and the next ``/start`` picks the same round back
+    up.
     """
     plans_dir, db_path = env
     plan_dir, _project_dir = _seed_plan(
@@ -323,18 +329,73 @@ def test_stop_from_repairing_phase_then_start_resumes(
     )
 
 
-def test_stop_from_rerunning_phase_then_start_resumes(
+def test_stop_from_residual_rerunning_phase_is_mapped_and_lands(
     env, client, stub_auto_loop,
 ):
-    """Same for ``verification_rerunning`` — the other in-flight phase.
+    """A RESIDUAL ``verification_rerunning`` row is a historical value.
 
-    It is pinned separately because it is a separate CAS source and a
-    separate row state: widening the source set to repair-only would
-    leave this one just as permanently stuck.
+    2026-10-22: that phase left the vocabulary — it was a dead state
+    (its only writer had no callers), so nothing enters it any more. A
+    routing row written before that still holds the value, and two things
+    must hold for it:
+
+    1. **It does not crash.** Reading the plan's phase maps the
+       historical value onto the phase that replaced it
+       (``verification_repairing``) instead of raising or reporting a
+       phase no code knows any more.
+    2. **It is not stranded.** The operator's stop still lands on such a
+       row — the historical value is accepted by the stop's CAS source
+       set — and the plan stays resumable through ``/start``.
     """
-    _assert_stop_then_resume(
-        env, client, stub_auto_loop, "verification_rerunning",
+    plans_dir, db_path = env
+    plan_dir, _project_dir = _seed_plan(
+        plans_dir, db_path, phase="verification_rerunning", round_n=2,
+        status="running", verdicts=ROUND_VERDICTS,
     )
+
+    # The raw row still holds the historical value ...
+    assert _read_phase(db_path, PLAN_ID) == "verification_rerunning"
+
+    # ... and reading it back maps it, without raising.
+    ps = server.PlanState(plan_dir)
+    ps.reload()
+    assert ps.get_current_phase() == "verification_repairing", (
+        "the residual 'verification_rerunning' value was not mapped onto "
+        f"the phase that replaced it: {ps.get_current_phase()!r}"
+    )
+
+    # --- the stop: the residual row is not a stranded row ------------------
+    stop = client.post(f"/api/verification/{PLAN_ID}/stop")
+    assert stop.status_code == 200, stop.text
+    stop_body = stop.json()
+    assert stop_body["status"] == "stopped", stop_body
+    assert stop_body["paused"] is True, stop_body
+    assert stop_body["round"] == 2, stop_body
+
+    parked = _read_phase(db_path, PLAN_ID)
+    assert parked == "verification", (
+        f"the stop left the routing row at {parked!r} instead of parking it "
+        "at 'verification' — a row that still holds the historical "
+        "'verification_rerunning' value must be stoppable, or the plan is "
+        "stuck at a phase no code knows any more"
+    )
+
+    # --- the start: the plan is still resumable ----------------------------
+    start = client.post(
+        f"/api/verification/{PLAN_ID}/start", json={"auto_fix": True},
+    )
+    assert start.status_code == 200, (
+        "the start was refused after a legitimate stop — the plan is now "
+        f"permanently unrecoverable through the API: {start.status_code} "
+        f"{start.text}"
+    )
+    start_body = start.json()
+    assert start_body["resumed"] is True, start_body
+    assert start_body["round"] == 2, start_body
+
+    assert stub_auto_loop.reached.wait(timeout=5), "the round never ran"
+    assert len(stub_auto_loop) == 1, stub_auto_loop
+    assert stub_auto_loop[0]["start_round"] == 2, stub_auto_loop
 
 
 # ---------------------------------------------------------------------------

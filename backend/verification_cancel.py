@@ -29,10 +29,54 @@ by ``/start`` and by the post-repair re-entry).
 from __future__ import annotations
 
 import threading
-from typing import List, Set
+from typing import List, Optional, Set
 
 _lock = threading.Lock()
 _cancelled: Set[str] = set()
+
+
+class VerificationCancelled(RuntimeError):
+    """The operator stopped this plan while an LLM call was in flight.
+
+    2026-10-22. A dispatch that the ``/stop`` endpoint killed used to
+    look exactly like a dispatch that failed: the subprocess died, the
+    read loop came back empty, and the caller walked the ordinary
+    failure path — retry it, record it as a failure, and (for the
+    repair-task generation) manufacture a repair task out of a round the
+    operator had just cancelled.
+
+    That is the wrong answer twice over. A stopped round is not a failed
+    round: it must not be retried (a stop was requested),
+    it must not leave a failure record behind (there is nothing to
+    triage), and it must not produce repair tasks (the plan is paused,
+    not broken).
+
+    So the cancellation is raised as its own type, from the place that
+    can see it — the dispatch that was killed — and every layer above
+    it either re-raises it untouched or treats it as "cancelled". The
+    type lives here, next to ``is_cancelled``, because the flag it is
+    derived from lives here: a caller that wants to ask "was this
+    cancelled?" needs the flag and the exception to come from the same
+    place, or the two can drift.
+
+    It is a :class:`RuntimeError` subclass so that a caller written
+    before this type existed still catches it in a generic
+    ``except Exception`` — it simply must not *convert* it, and every
+    layer on the path does exactly that.
+    """
+
+    def __init__(self, plan_id: str, message: Optional[str] = None):
+        self.plan_id = plan_id or ""
+        super().__init__(
+            message
+            or (
+                f"verification cancelled for plan {self.plan_id!r}: "
+                "the operator stopped this round"
+            )
+        )
+
+    def __str__(self) -> str:
+        return super().__str__()
 
 
 def request_cancel(plan_id: str) -> None:
