@@ -4756,8 +4756,97 @@ class ClaudeCodingTool(CodingTool):
 
         try:
             if timeout is None:
-                result = _call(excluded=excluded_providers,
-                               resume=entry_resume is not None)
+                # 2026-10-22 — the execution phase arrives here with no
+                # figure of its own: ``agent.py`` calls ``query`` without
+                # a ``timeout``, so the task dispatch took THIS branch and
+                # got neither layer of the cap. Layer 1 (the watcher
+                # inside ``_run_claude_interactive``) measures SILENCE, so
+                # a dispatch that keeps printing — thinking deltas, a live
+                # pytest, a chatty tool — is never killed by it; and layer
+                # 2 was installed only on the ``timeout is not None``
+                # branch below, so the call ran inline and unbounded. A
+                # wedged dispatch could hold its thread for ten hours.
+                # ``HARD_WALL_CLOCK_TIMEOUT_SECONDS`` was written for
+                # exactly this ceiling (2026-09-08) and nothing read it.
+                # It is read now.
+                #
+                # The cap is spent on the clock's *work* time, so a quota
+                # window this dispatch is parked on is not charged to it:
+                # ``_run_claude_interactive`` parks the clock that
+                # ``_dispatch_work_clock`` installs, and
+                # ``_result_under_work_clock`` asks that clock how much is
+                # left rather than counting wall time. A dispatch asleep
+                # on somebody else's meter is not working.
+                #
+                # Usage-registry attribution (2026-09-21): the caller's
+                # contextvars (plan/task binding) have to reach the worker
+                # thread. ``executor.submit`` does NOT copy context by
+                # default, and the copy is what keeps the attribution
+                # readable inside the dispatch.
+                _ctx = contextvars.copy_context()
+                with (
+                    _dispatch_work_clock(self, self.HARD_WALL_CLOCK_TIMEOUT_SECONDS) as _budget,
+                    ThreadPoolExecutor(max_workers=1) as executor,
+                ):
+                    future = executor.submit(
+                        _ctx.run, _call, excluded_providers, None,
+                        entry_resume is not None,
+                    )
+                    try:
+                        # 2026-10-22 — same clock as the arm below: the
+                        # wait spends work time, so a quota window this
+                        # dispatch is parked on cannot eat the cap.
+                        result = _result_under_work_clock(future, _budget)
+                    except HardTimeoutError:
+                        # Layer 1 fired (the subprocess went silent for
+                        # ``DEFAULT_TOTAL_TIMEOUT``). It is already the
+                        # error the auto-split routing wants, and it has
+                        # to reach the caller untouched.
+                        raise
+                    except FuturesTimeoutError:
+                        # Two different things arrive here and they do NOT
+                        # get the same answer.
+                        #
+                        # The budget expired: the cap did its job, and the
+                        # error is ``HardTimeoutError`` so the upper
+                        # layers route it to auto-split. A plain
+                        # ``TimeoutError`` here would be read as a
+                        # provider outage and retried against the next
+                        # provider instead.
+                        #
+                        # The dispatch raised a timeout of its OWN while
+                        # the budget still had time in it — the idle
+                        # watcher closing a silent pipe, say. That one is
+                        # NOT a hard timeout and must keep travelling as
+                        # the plain ``TimeoutError`` it was, because it
+                        # is the provider-fallback signal and the outer
+                        # arm below acts on it. The clock is what tells
+                        # the two apart: a budget that ran out has no
+                        # time left in it, and one that did not still
+                        # has plenty.
+                        if _budget.remaining() > 0.0:
+                            raise
+                        # The process group has to die, or this ``with``
+                        # block's ``shutdown(wait=True)`` would not
+                        # return until the dispatch finished on its own.
+                        with self._process_lock:
+                            proc = self._current_process
+                            self._current_process = None
+                        if proc is not None:
+                            kill_process_group(proc)
+                        duration = int(time.monotonic() - start_time)
+                        if self.logger:
+                            self.logger.warning(
+                                "coding_query_hard_timeout",
+                                f"Claude query exceeded the "
+                                f"{self.HARD_WALL_CLOCK_TIMEOUT_SECONDS}s "
+                                f"hard cap",
+                                data={"timeout": self.HARD_WALL_CLOCK_TIMEOUT_SECONDS,
+                                      "duration_sec": duration})
+                        raise HardTimeoutError.for_work_budget(
+                            self.HARD_WALL_CLOCK_TIMEOUT_SECONDS,
+                            float(duration),
+                        )
             else:
                 # 2026-09-06 — BOTH layers of timeout cap are active:
                 # 1. ``total_timeout=timeout`` → daemon watcher inside
@@ -5205,6 +5294,39 @@ class ClaudeCodingTool(CodingTool):
 
         try:
             if timeout is None:
+                # 2026-10-22 — NOT the execution path, and deliberately
+                # left without the hard cap the text twin above now
+                # spends. Two reasons, both about who lands here:
+                #
+                # 1. The execution phase does not come through this
+                #    branch. ``agent.py`` dispatches a task with
+                #    ``query`` (the text entry), so the task
+                #    execution's final caller is
+                #    ``_query_internal_m1`` — the branch that was
+                #    given the cap. This one is reached by the
+                #    *planning* phase (``agent.py``'s task breakdown),
+                #    the scope precheck (``interviewer.py``), the PRD
+                #    and alignment reviews (``prd_review.py``,
+                #    ``preflight_review.py``) and the verification
+                #    orchestrator's own plan/report calls
+                #    (``verification_agent.py``) — all of which pass
+                #    no ``timeout`` and therefore arrive here
+                #    unbounded, which is a real gap and a separate
+                #    change.
+                #
+                # 2. The one caller of THIS branch that does own a
+                #    hard cap is the verification sub-agent
+                #    (``verification_subagent.py``), and it owns it by
+                #    holding this very call inside
+                #    ``_await_under_work_clock`` on a ``WorkClock``
+                #    it installs on the tool first. A second expiry
+                #    here, on that same clock, would RACE the outer
+                #    one — and the two routings differ: the outer
+                #    ``asyncio.TimeoutError`` goes to the stuck-agent
+                #    summarizer, while a ``HardTimeoutError`` goes to
+                #    auto-split. Which of the two arrives would become
+                #    a race, and the verification phase's routing
+                #    depends on it.
                 result = _query_json_internal(excluded=excluded_providers,
                                               resume_session=entry_resume)
             else:
@@ -5448,6 +5570,22 @@ class VendorCCodingTool(CodingTool):
         # there is no internal silence/idle watcher in this plain
         # subprocess/HTTP implementation — an unbounded call would block
         # this thread forever — so fall back to DEFAULT_TOTAL_TIMEOUT.
+        #
+        # 2026-10-22 — the one-hour hard cap
+        # (``HARD_WALL_CLOCK_TIMEOUT_SECONDS``) is NOT added here, and
+        # the reason is not that this path was forgotten:
+        #   * ``timeout is None`` here means "no figure of my own", and
+        #     the fallback below IS a bound (900s) — tighter than the
+        #     one-hour cap, not looser. On the Claude path the same
+        #     ``None`` meant NOTHING bounded the call, which is why
+        #     that one was changed.
+        #   * ``HARD_WALL_CLOCK_TIMEOUT_SECONDS`` is declared on
+        #     ``ClaudeCodingTool``; this class descends from the
+        #     ``CodingTool`` base and has no such attribute.
+        #   * There is no quota window to be parked on this path — the
+        #     call is one plain ``subprocess.run`` — so the reason a
+        #     work clock exists (keep the wait out of the budget) has
+        #     nothing here to keep out.
         if timeout is None:
             timeout = self.DEFAULT_TOTAL_TIMEOUT
 
@@ -5499,6 +5637,22 @@ class VendorCCodingTool(CodingTool):
         # there is no internal silence/idle watcher in this plain
         # subprocess/HTTP implementation — an unbounded call would block
         # this thread forever — so fall back to DEFAULT_TOTAL_TIMEOUT.
+        #
+        # 2026-10-22 — the one-hour hard cap
+        # (``HARD_WALL_CLOCK_TIMEOUT_SECONDS``) is NOT added here, and
+        # the reason is not that this path was forgotten:
+        #   * ``timeout is None`` here means "no figure of my own", and
+        #     the fallback below IS a bound (900s) — tighter than the
+        #     one-hour cap, not looser. On the Claude path the same
+        #     ``None`` meant NOTHING bounded the call, which is why
+        #     that one was changed.
+        #   * ``HARD_WALL_CLOCK_TIMEOUT_SECONDS`` is declared on
+        #     ``ClaudeCodingTool``; this class descends from the
+        #     ``CodingTool`` base and has no such attribute.
+        #   * There is no quota window to be parked on this path — the
+        #     call is one plain ``subprocess.run`` — so the reason a
+        #     work clock exists (keep the wait out of the budget) has
+        #     nothing here to keep out.
         if timeout is None:
             timeout = self.DEFAULT_TOTAL_TIMEOUT
 
@@ -5549,6 +5703,22 @@ class OpenCodeCodingTool(CodingTool):
         # there is no internal silence/idle watcher in this plain
         # subprocess/HTTP implementation — an unbounded call would block
         # this thread forever — so fall back to DEFAULT_TOTAL_TIMEOUT.
+        #
+        # 2026-10-22 — the one-hour hard cap
+        # (``HARD_WALL_CLOCK_TIMEOUT_SECONDS``) is NOT added here, and
+        # the reason is not that this path was forgotten:
+        #   * ``timeout is None`` here means "no figure of my own", and
+        #     the fallback below IS a bound (900s) — tighter than the
+        #     one-hour cap, not looser. On the Claude path the same
+        #     ``None`` meant NOTHING bounded the call, which is why
+        #     that one was changed.
+        #   * ``HARD_WALL_CLOCK_TIMEOUT_SECONDS`` is declared on
+        #     ``ClaudeCodingTool``; this class descends from the
+        #     ``CodingTool`` base and has no such attribute.
+        #   * There is no quota window to be parked on this path — the
+        #     call is one plain ``subprocess.run`` — so the reason a
+        #     work clock exists (keep the wait out of the budget) has
+        #     nothing here to keep out.
         if timeout is None:
             timeout = self.DEFAULT_TOTAL_TIMEOUT
 
@@ -5585,6 +5755,22 @@ class OpenCodeCodingTool(CodingTool):
         # there is no internal silence/idle watcher in this plain
         # subprocess/HTTP implementation — an unbounded call would block
         # this thread forever — so fall back to DEFAULT_TOTAL_TIMEOUT.
+        #
+        # 2026-10-22 — the one-hour hard cap
+        # (``HARD_WALL_CLOCK_TIMEOUT_SECONDS``) is NOT added here, and
+        # the reason is not that this path was forgotten:
+        #   * ``timeout is None`` here means "no figure of my own", and
+        #     the fallback below IS a bound (900s) — tighter than the
+        #     one-hour cap, not looser. On the Claude path the same
+        #     ``None`` meant NOTHING bounded the call, which is why
+        #     that one was changed.
+        #   * ``HARD_WALL_CLOCK_TIMEOUT_SECONDS`` is declared on
+        #     ``ClaudeCodingTool``; this class descends from the
+        #     ``CodingTool`` base and has no such attribute.
+        #   * There is no quota window to be parked on this path — the
+        #     call is one plain ``subprocess.run`` — so the reason a
+        #     work clock exists (keep the wait out of the budget) has
+        #     nothing here to keep out.
         if timeout is None:
             timeout = self.DEFAULT_TOTAL_TIMEOUT
 
@@ -5672,4 +5858,27 @@ class HardTimeoutError(TimeoutError):
         # Exception.__init__ accepts a single message arg safely; this
         # avoids OSError's errno/strerror/filename constraint entirely.
         Exception.__init__(self, message)
+
+    @classmethod
+    def for_work_budget(cls, total_sec: int, elapsed: float) -> "HardTimeoutError":
+        """The hard cap expired on *work* time rather than on silence.
+
+        The plain constructor describes the case it was written for: the
+        inner watcher fired after ``total_sec`` seconds of stdout
+        silence. This one is the layer above it — a dispatch that keeps
+        printing and never trips the silence watcher, but spends more
+        than the budget in actual work.
+
+        The routing is the same (the auto-split path keys on the class,
+        not on the message) and the diagnostics are the same shape
+        (``total_sec`` / ``elapsed`` are read by the layers above), but
+        the description has to differ: "of stdout silence" would be a
+        lie about a call that was never silent.
+        """
+        exc = cls(total_sec, elapsed, "")
+        exc.args = (
+            f"Hard timeout after {total_sec}s of work time "
+            f"(elapsed={elapsed:.1f}s of wall clock)",
+        )
+        return exc
 

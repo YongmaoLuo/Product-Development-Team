@@ -719,3 +719,83 @@ def test_coding_tool_has_hard_wall_clock_constant():
     """
     assert hasattr(ClaudeCodingTool, "HARD_WALL_CLOCK_TIMEOUT_SECONDS")
     assert ClaudeCodingTool.HARD_WALL_CLOCK_TIMEOUT_SECONDS == 3600
+
+
+# ---------------------------------------------------------------------------
+# 14. The hard cap constant is READ, not merely defined
+# ---------------------------------------------------------------------------
+
+
+def _timeout_is_none_branch(func):
+    """The ``if timeout is None:`` arm of ``func``, as an AST node.
+
+    Parsed rather than grepped: the arm is found by the shape of its
+    test (``timeout is None``) instead of by a line number, so a
+    refactor that moves the code does not turn this into a false
+    alarm — and a refactor that *deletes* the arm does.
+    """
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(func))
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if (isinstance(test, ast.Compare)
+                and isinstance(test.left, ast.Name)
+                and test.left.id == "timeout"
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.Is)
+                and len(test.comparators) == 1
+                and isinstance(test.comparators[0], ast.Constant)
+                and test.comparators[0].value is None):
+            return node
+    return None
+
+
+def _arm_nodes(body):
+    """Every node under one arm of an ``if`` — the arm, not its ``else``."""
+    for node in body:
+        yield node
+        for child in ast.walk(node):
+            if child is not node:
+                yield child
+
+
+def test_the_unbounded_path_spends_the_hard_cap_constant():
+    """The constant must be READ, not merely defined.
+
+    ``HARD_WALL_CLOCK_TIMEOUT_SECONDS`` was introduced (2026-09-08) as
+    the absolute ceiling for the execution path, and nothing read it:
+    the ``timeout is None`` arm of ``_query_internal_m1`` installed
+    neither a work clock nor an executor, so a dispatch that kept
+    printing ran unbounded. ``test_coding_tool_has_hard_wall_clock_constant``
+    above only proves the constant EXISTS; this one proves the number in
+    it is the number the cap spends.
+
+    Checked on the source rather than by running an hour: the value is
+    read at exactly one place, and a static check can say so without
+    spending an hour to say it. The behavioural half — that the cap
+    follows the constant when the constant is changed — lives in
+    ``tests/unit/test_quota_wait_wall_clock_c.py``.
+    """
+    branch = _timeout_is_none_branch(ClaudeCodingTool._query_internal_m1)
+    assert branch is not None, (
+        "the `if timeout is None:` arm of _query_internal_m1 is gone"
+    )
+    budgets = []
+    for node in _arm_nodes(branch.body):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_dispatch_work_clock"
+                and len(node.args) >= 2):
+            budgets.append(ast.unparse(node.args[1]))
+    assert budgets, (
+        "the `timeout is None` arm must install a work clock — without "
+        "one there is no budget for the call to spend, and the call runs "
+        "inline and unbounded"
+    )
+    assert any("HARD_WALL_CLOCK_TIMEOUT_SECONDS" in b for b in budgets), (
+        f"the work clock is installed with {budgets} — the cap has to be "
+        f"the constant, not a number written down beside it"
+    )
