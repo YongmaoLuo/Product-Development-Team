@@ -45,6 +45,7 @@ control-flow defect of this shape can be observed.
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -87,6 +88,13 @@ def _make_agent(*, audit_passed: bool, prior_deliverable: bool):
     agent.retry_manager = MagicMock()
     agent.retry_manager.get_retry_prompt_modifier.return_value = ""
     agent.task_manager = MagicMock()
+    # The executor's per-task session is recovered from the plan
+    # directory and the plan id, so both have to name something real
+    # here — a mock-shaped tasks file would name no plan at all.
+    agent.task_manager.tasks_file = (
+        Path(tempfile.mkdtemp(prefix="pdt-audit-veto-")) / "tasks.json"
+    )
+    agent.plan_id = "pdt-audit-veto"
     agent.rollback_manager = MagicMock()
     agent._session_task_completed_counts = {}
 

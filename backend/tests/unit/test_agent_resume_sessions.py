@@ -39,8 +39,9 @@ TDD spec — 4 contract tests
    a mapped task id yields its session id; an unmapped id — and an id
    mapped to a non-string / empty value — yields ``None``.
 4. ``test_task_session_seeded``:
-   ``_make_task_session("3")`` carries the mapped id, and an unmapped
-   task id yields a handle with ``session_id is None`` (fresh session).
+   ``_make_task_session("3", plan_dir, plan_id)`` carries the mapped id,
+   and an unmapped task id yields a handle with ``session_id is None``
+   (no session to re-open yet — the id it will create is pinned).
 """
 
 import sys
@@ -60,6 +61,7 @@ from agent import (  # noqa: E402
     _make_task_session,
     _resume_session_id_for,
 )
+from plan_sessions import stable_session_id  # noqa: E402
 
 
 @pytest.fixture
@@ -101,12 +103,20 @@ def test_resume_session_id_for_hit_and_miss(clean_env):
     assert _resume_session_id_for("6") is None
 
 
-def test_task_session_seeded(clean_env):
-    """The handle handed to the subagent carries the recovered id."""
+def test_task_session_seeded(clean_env, tmp_path):
+    """The handle handed to the subagent carries the recovered id.
+
+    ``tmp_path`` stands in for the plan directory: the sidecar lives
+    there, so an empty one is what a plan that has never run looks
+    like.
+    """
     clean_env.setenv(RESUME_SESSIONS_ENV, '{"3": "sess-abc"}')
-    assert _make_task_session("3").session_id == "sess-abc"
-    # No entry → empty handle → the first dispatch opens a fresh session.
-    assert _make_task_session("4").session_id is None
+    assert _make_task_session("3", tmp_path, "plan-test").session_id == "sess-abc"
+    # No entry → nothing to re-open. The id the first dispatch will
+    # CREATE the session under is pinned instead of a random one.
+    unmapped = _make_task_session("4", tmp_path, "plan-test")
+    assert unmapped.session_id is None
+    assert unmapped.pinned_session_id == stable_session_id("plan-test", "task:4")
 
 
 if __name__ == "__main__":
