@@ -329,11 +329,34 @@ def test_agent_module_load_no_atexit_registration(monkeypatch: pytest.MonkeyPatc
     # Pop agent and any agent.* submodules from sys.modules so the
     # import below is a fresh one (not a cached already-imported
     # module). This guards against test-ordering flakiness.
-    for mod in list(sys.modules):
-        if mod == "agent" or mod.startswith("agent."):
-            sys.modules.pop(mod, None)
+    #
+    # The pop is UNDONE in the ``finally`` below. A fresh import leaves a
+    # different module object in ``sys.modules``, while the other test
+    # modules that did ``import agent`` at collection time still hold the
+    # old one. A ``monkeypatch.setattr(agent_module, ...)`` in one of
+    # those files then patches the object the code under test no longer
+    # uses, and the mock silently stops being called (2026-10-23 nightly:
+    # ``test_execution_persists_session_after_dispatch`` saw the id
+    # ``_make_task_session`` had pinned instead of the live one the fake
+    # dispatch reports). Restoring puts the collection-time module back,
+    # so every later ``from agent import ...`` gets that same object.
+    _saved_agent_modules = {
+        mod: sys.modules[mod]
+        for mod in list(sys.modules)
+        if mod == "agent" or mod.startswith("agent.")
+    }
+    for mod in _saved_agent_modules:
+        sys.modules.pop(mod, None)
 
-    import agent  # noqa: F401
+    try:
+        import agent  # noqa: F401
+    finally:
+        # Drop whatever the fresh import created, then put the originals
+        # back — the same object identity every other test file imported.
+        for mod in list(sys.modules):
+            if mod == "agent" or mod.startswith("agent."):
+                sys.modules.pop(mod, None)
+        sys.modules.update(_saved_agent_modules)
 
     if captured:
         formatted_calls = "\n".join(
