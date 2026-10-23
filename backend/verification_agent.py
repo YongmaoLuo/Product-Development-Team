@@ -39,6 +39,7 @@ from verification_persistence import VerificationPersistenceManager
 from verification_profile import ExecutionProfileGenerator
 from verification_split import SplitDecision
 from verification_subagent import VerificationSubAgent, Verdict
+from verification_buckets import blocked_reason
 from binary_freshness import (
     FreshnessReport,
     FreshnessCache,
@@ -82,6 +83,49 @@ from verification_ac_coverage import (  # noqa: E402
     find_uncovered_criteria,
     render_gap_feedback as render_acceptance_gap_feedback,
 )
+# 2026-10-23（工作树指纹）：依据核对读的是**活的**工作树。多个验证进程
+# 可以共用同一个 worktree，读取 citations/checkpoints 期间可能有并发写入
+# （"变异负控"）——那时核对读到的是一棵不属于这个 VP 的树。指纹让"树动过
+# 了"这件事可判定。
+#
+# 模块级导入是刻意的：护栏要在 ``_apply_evidence_check`` 里对照本轮基线，
+# 而测试要能 monkeypatch ``verification_agent.tree_mutated``。
+#
+# ``apply_to_verdict`` 同样在模块级绑定：轮次结束时要把挂起的核对重跑一遍，
+# 那一步要能被打桩 —— 而打桩的位置有两个合理的选择（源模块
+# ``verification_evidence`` 或本模块），见 ``_resolve_apply_to_verdict``。
+from verification_evidence import (  # noqa: E402
+    apply_to_verdict,
+    tree_fingerprint,
+    tree_mutated,
+)
+
+#: 导入那一刻的 ``apply_to_verdict``。留着它才能分辨"源模块被打桩了"和
+#: "本模块的全局被打桩了"——两者都是合法的打桩位置。
+_ORIGINAL_APPLY_TO_VERDICT = apply_to_verdict
+
+
+def _resolve_apply_to_verdict():
+    """The callable that re-runs an evidence check, resolved at call time.
+
+    Resolving at call time (instead of binding once at import) is what
+    lets a test stub the check through *either* module: the source
+    (``verification_evidence.apply_to_verdict``) or this one
+    (``verification_agent.apply_to_verdict``).  A stub on the source
+    wins — that is where the real implementation lives — and a stub on
+    this module is used when the source is untouched.
+
+    Returns ``None`` when the source module cannot be imported at all;
+    the caller then skips the check rather than guessing.
+    """
+    try:
+        import verification_evidence
+        live = getattr(verification_evidence, "apply_to_verdict", None)
+    except Exception:  # pragma: no cover - defensive
+        live = None
+    if live is not None and live is not _ORIGINAL_APPLY_TO_VERDICT:
+        return live
+    return apply_to_verdict
 
 
 class ApiTestSchemaViolation(RuntimeError):
@@ -758,6 +802,16 @@ class Orchestrator:
         # deriving something, so a report cannot describe a round with a
         # number the round never had.
         self._last_vp_capacity: Optional[int] = None
+        # 2026-10-23（工作树指纹基线）：本轮开始时工作树的内容指纹。依据
+        # 核对读的是活的树，基线用来判断"读到的还是不是这一轮的那棵树"。
+        # ``None`` = 没有基线（非 git 目录 / 探测失败）→ 沿用核对的前一种
+        # 行为，不挂起。
+        self._round_tree_fingerprint: Optional[str] = None
+        # 2026-10-23（挂起的依据核对）：树在核对期间被改过时，这次核对
+        # 不能据以降级 —— 它被挂到这里等人工复核，子 agent 的原结论保留。
+        # 每一项是 ``(vp_id, vp, verdict)``；不去重、不覆盖：同一个 VP
+        # 多次进入核对是多次独立观察，都要留住。
+        self._deferred_evidence_checks: list[tuple[str, dict, dict]] = []
         # Task-11 subagent callback chain: when set, the executor's
         # verdict recording path writes via VerificationRepository
         # instead of ``atomic_write_json`` to a per-plan JSON file.
@@ -2916,6 +2970,23 @@ class Orchestrator:
 
         Never raises: an evidence-check failure downgrades the verdict
         (when it was PASSED) and records why; it never aborts the VP.
+
+        **A mutated working tree defers the check** (2026-10-23).  The
+        check reads the *live* tree, and several verification processes
+        can share one worktree: a concurrent writer (a "变异负控"
+        running in parallel) can rewrite a file between the moment a
+        verdict was produced and the moment its citations are read — and
+        the check then reads a tree that belongs to nobody.  The 2026-10-23
+        production round hit exactly that: a ``code_review`` VP handed
+        back PASSED, and 7.5 ms later the framework downgraded it
+        because ``citations[8]`` pointed at a line the concurrent writer
+        had already removed.  That downgrade is a *false* FAILED — the
+        reviewer said nothing untrue, the tree simply moved under it.
+
+        So when the round's baseline fingerprint says the tree moved, the
+        check does not downgrade: the sub-agent's original verdict stands,
+        the check is held for review in ``_deferred_evidence_checks``, and
+        an auditable event records the deferral.
         """
         method = str(
             vp.get("verification_method") or vp.get("method") or ""
@@ -2924,6 +2995,15 @@ class Orchestrator:
             return verdict
 
         vp_id = str(vp.get("id", "unknown"))
+
+        # The tree moved under the check → do not downgrade on that basis.
+        # This is *before* ``apply_to_verdict``: the check must not run at
+        # all against a tree that is not the one the round produced its
+        # citations against.
+        if self._tree_mutated_since_baseline():
+            self._defer_evidence_check(vp_id, vp, verdict, method)
+            return verdict
+
         try:
             from verification_evidence import apply_to_verdict
         except Exception as exc:  # pragma: no cover - defensive
@@ -2958,6 +3038,244 @@ class Orchestrator:
                 },
             )
         return checked if checked is not None else verdict
+
+    def _tree_mutated_since_baseline(self) -> bool:
+        """Has the working tree moved away from the round's baseline?
+
+        ``False`` — "cannot tell, so do not defer" — when there is no
+        baseline (the project is not a git tree, or the round never
+        recorded one), when the project directory is unknown, or when the
+        probe itself fails.  A caller that cannot establish a baseline
+        keeps the behaviour it had before the fingerprint existed: it
+        does not start refusing to check work on the strength of a
+        missing measurement.
+
+        ``True`` means the tree moved: either HEAD changed or the status
+        changed.  That is the signal the caller needs to hold the check
+        until the concurrent writer is done.
+        """
+        baseline = getattr(self, "_round_tree_fingerprint", None)
+        if not baseline:
+            return False
+        project_dir = getattr(self, "project_dir", None)
+        if not project_dir:
+            return False
+        try:
+            return bool(tree_mutated(project_dir, baseline))
+        except Exception:  # pragma: no cover - the probe never raises
+            logger.exception(
+                "[verification_evidence] tree probe failed for %s",
+                project_dir,
+            )
+            return False
+
+    def _defer_evidence_check(
+        self, vp_id: str, vp: dict, verdict: dict, method: str,
+    ) -> None:
+        """Hold one evidence check for review; keep every entry.
+
+        The deferred check is *not* dropped and *not* de-duplicated: the
+        same VP may enter the check more than once in a round, and each
+        occurrence is a separate observation of the tree moving under a
+        verdict.  Every one of them is kept.
+
+        The append happens on the round's single event loop (the
+        executor dispatches VPs through one loop), so no lock is needed —
+        and a lock here would be a lie about where the concurrency is.
+        """
+        deferred = getattr(self, "_deferred_evidence_checks", None)
+        if deferred is None:
+            deferred = []
+            self._deferred_evidence_checks = deferred
+        deferred.append((vp_id, vp, verdict))
+        self._safe_log_freshness_event(
+            vp_id, "evidence_check_deferred_tree_mutated",
+            {
+                "method": method,
+                "status": (verdict or {}).get("status"),
+                "baseline": getattr(self, "_round_tree_fingerprint", None),
+                "current": self._current_tree_fingerprint(),
+            },
+        )
+
+    def _current_tree_fingerprint(self) -> Optional[str]:
+        """The tree's fingerprint right now, for the audit trail.
+
+        ``None`` when it cannot be read — an unreadable tree is not a
+        claim about the tree.
+        """
+        project_dir = getattr(self, "project_dir", None)
+        if not project_dir:
+            return None
+        try:
+            return tree_fingerprint(project_dir)
+        except Exception:  # pragma: no cover - the probe never raises
+            logger.exception(
+                "[verification_evidence] tree fingerprint failed for %s",
+                project_dir,
+            )
+            return None
+
+    def _flush_deferred_evidence_checks(
+        self, executor: Any,
+    ) -> List[str]:
+        """Re-run the evidence checks this round deferred, and write back.
+
+        A deferred check is this round's debt: the check was held back
+        because the working tree moved under it, and the round owes the
+        operator an answer.  By the end of the round the concurrent
+        writer is normally done, so the tree is back where the round
+        found it — and the check can be re-run against *that* tree.
+
+        Two outcomes, and they are not symmetric:
+
+          * **tree restored** → the check runs again.  If it now says
+            the basis does not hold, the verdict is downgraded and
+            written back into the executor's verdict table (through
+            the executor, so the index buckets follow the verdict).
+          * **tree still different** → the check stays *inconclusive*.
+            The sub-agent's original conclusion is kept: an unverified
+            PASSED is a smaller lie than a FAILED nobody can
+            reproduce.  The inconclusive state is recorded as an event
+            so the operator knows a verdict is unverified.
+
+        Never raises.  The flush runs in a ``finally`` next to
+        ``executor.run`` — an exception here would replace the round's
+        own exception and hide the real failure.
+
+        Args:
+            executor: The executor that ran the round — the holder of
+                the verdict table the corrections are written back to.
+
+        Returns:
+            The ids that were downgraded and written back.
+        """
+        deferred = list(getattr(self, "_deferred_evidence_checks", None) or [])
+        # The table is this round's debt and it is settled here: clear it
+        # first, so a flush that dies half-way cannot bill the same
+        # check twice (and a second flush is a no-op).
+        self._deferred_evidence_checks = []
+        if not deferred:
+            return []
+
+        # One reading for the whole flush: the tree either came back or
+        # it did not.  Re-probing per VP would race against a writer
+        # that is still running.
+        tree_still_moved = self._tree_mutated_since_baseline()
+
+        updates: Dict[str, Dict[str, Any]] = {}
+
+        for vp_id, vp, verdict in deferred:
+            method = str(
+                (vp or {}).get("verification_method")
+                or (vp or {}).get("method")
+                or ""
+            ).strip()
+            try:
+                if tree_still_moved:
+                    self._log_inconclusive_evidence_check(
+                        vp_id, method, verdict,
+                    )
+                    continue
+
+                checked = self._recheck_deferred_evidence(
+                    vp_id, method, verdict,
+                )
+                if checked is None:
+                    continue
+                if str(checked.get("status")) == str(
+                    (verdict or {}).get("status")
+                ):
+                    # The check ran and the basis holds: nothing changes,
+                    # so nothing is written and nothing is logged.
+                    continue
+                self._safe_log_freshness_event(
+                    vp_id, "evidence_check_downgraded",
+                    {
+                        "method": method,
+                        "from": (verdict or {}).get("status"),
+                        "to": checked.get("status"),
+                        "issues": (checked.get("evidence") or {}).get(
+                            "evidence_check", {},
+                        ),
+                        "phase": "round_end_flush",
+                    },
+                )
+                updates[vp_id] = checked
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "[verification_evidence] deferred check failed for %s",
+                    vp_id,
+                )
+                continue
+
+        if not updates:
+            return []
+        if executor is None:
+            return []
+        try:
+            applied = executor.apply_verdict_updates(updates)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "[verification_evidence] writing back the downgraded "
+                "verdicts failed",
+            )
+            return []
+        logger.info(
+            "[verification_evidence] round-end flush downgraded %s",
+            ", ".join(str(vp_id) for vp_id in applied) if applied else "(nothing)",
+        )
+        return [str(vp_id) for vp_id in applied]
+
+    def _recheck_deferred_evidence(
+        self, vp_id: str, method: str, verdict: dict,
+    ) -> Optional[dict]:
+        """Re-run one deferred evidence check; ``None`` when it cannot run.
+
+        A check that crashes is not a downgrade — it is a check that did
+        not happen.  The original conclusion stands and the crash is
+        logged; the round must not die over it.
+        """
+        apply_fn = _resolve_apply_to_verdict()
+        if apply_fn is None:  # pragma: no cover - defensive
+            return None
+        try:
+            checked = apply_fn(
+                verdict, method, self.plan_dir, self.project_dir, vp_id,
+            )
+        except Exception:
+            logger.exception(
+                "[verification_evidence] deferred check crashed for %s",
+                vp_id,
+            )
+            return None
+        if checked is None:
+            return None
+        return checked
+
+    def _log_inconclusive_evidence_check(
+        self, vp_id: str, method: str, verdict: dict,
+    ) -> None:
+        """Record a check that stays inconclusive (the tree never came back).
+
+        The verdict is **not** touched: the sub-agent's conclusion is
+        kept, and the operator gets an event saying the conclusion was
+        never checked.
+        """
+        self._safe_log_freshness_event(
+            vp_id, "evidence_check_inconclusive",
+            {
+                "method": method,
+                "status": (verdict or {}).get("status"),
+                "baseline": getattr(self, "_round_tree_fingerprint", None),
+                "current": self._current_tree_fingerprint(),
+                "reason": (
+                    "the working tree still differs from the round "
+                    "baseline at round end — the evidence check could "
+                    "not be re-run"
+                ),
+            },
+        )
 
     def _run_api_test_vp(self, vp: dict) -> dict:
         """Grade an ``api_test`` VP without an LLM (2026-09-18).
@@ -4327,6 +4645,15 @@ class Orchestrator:
         # 留下一份写死端口的旧计划。
         plan_data = self._resolve_service_placeholders(plan_data)
 
+        # 2026-10-23（工作树指纹基线）：本轮的树基线在这里取，而且必须取在
+        # preflight **之后** —— preflight 可能重建二进制（那会改动工作树），
+        # 把重建本身算成"并发变异"就等于一开始就误判。
+        #
+        # 挂起表在这里清空：它装的是"这一轮里因树动过而没跑成的核对"，
+        # 跨轮留着就是上一轮的旧账。
+        self._round_tree_fingerprint = self._current_tree_fingerprint()
+        self._deferred_evidence_checks = []
+
         # Step 2: delegate Phase 2 to VerificationExecutor. The
         # parent only sequences the call — per-VP work, layer
         # ordering, and short-circuit all live on the executor.
@@ -4347,14 +4674,32 @@ class Orchestrator:
             # verification point at a time and look perfectly healthy.
             # "0" is the docstring's unbounded sentinel.
             try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                asyncio.run(executor.run(max_parallel=0))
-            else:
-                # Loop is running (e.g. pytest-asyncio test).
-                import nest_asyncio  # type: ignore
-                nest_asyncio.apply()
-                asyncio.run(executor.run(max_parallel=0))
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    asyncio.run(executor.run(max_parallel=0))
+                else:
+                    # Loop is running (e.g. pytest-asyncio test).
+                    import nest_asyncio  # type: ignore
+                    nest_asyncio.apply()
+                    asyncio.run(executor.run(max_parallel=0))
+            finally:
+                # 2026-10-23（轮次结束重跑挂起的核对）：挂起的核对是"这一轮
+                # 欠下的账"——轮次崩了也不能赖掉，所以这一步放在 finally 里。
+                #
+                # 位置承重：必须在 ``executor.run`` **之后**（树该还原了）、
+                # 在 ``_build_execution_results_from_executor`` **之前**
+                # （报告要看到改判后的裁决）。
+                #
+                # 这里再兜一层：finally 里的异常会**替换**正在飞的那一个，
+                # 所以 flush 自己抛异常的话，轮次真正的失败原因就被它盖住了。
+                # flush 内部已经逐条吞掉异常，这里防的是它自己崩掉。
+                try:
+                    self._flush_deferred_evidence_checks(executor)
+                except Exception:
+                    logger.exception(
+                        "[verification_evidence] round-end flush failed",
+                    )
             # What the round actually reached, measured inside the
             # runner. This is the observable that replaces the width:
             # nothing here is a declared number, so it cannot disagree
@@ -4568,20 +4913,9 @@ class Orchestrator:
                     vp_id, "unsupported_method_blocked",
                     {"method": retired_method},
                 )
-                return {
-                    "status": "BLOCKED",
-                    "reasons": [
-                        f"verification_method {retired_method!r} is not one "
-                        f"of {list(SUPPORTED_METHODS)}"
-                    ],
-                    "actual_result": (
-                        f"该 VP 的 verification_method（{retired_method}）已退役"
-                        f"或不存在，无法执行；请把它重新表达为 api_test / "
-                        f"ui_validation / code_review。"
-                    ),
-                    "evidence": {"method": retired_method},
-                    "framework_checks": [],
-                }
+                return self._build_retired_method_blocked_verdict(
+                    vp_id, retired_method,
+                )
             # 2026-09-18（依据核对）：把本 VP 的证据产物目录告诉子 agent。
             # 它必须把结论的出处写到这里，框架随后逐条核对
             # （``verification_evidence``）。目录随 VP 走，不新增函数签名。
@@ -4609,6 +4943,43 @@ class Orchestrator:
             sub_agent_runner=_sub_agent_runner,
             verif_repo=getattr(self, "verif_repo", None),
         )
+
+    # ------------------------------------------------------------------
+    # BLOCKED verdicts — retired / unknown verification_method
+    # ------------------------------------------------------------------
+
+    def _build_retired_method_blocked_verdict(
+        self, vp_id: str, retired_method: str,
+    ) -> dict:
+        """Synthesize a BLOCKED verdict for a retired / unknown method.
+
+        2026-09-18（method 收敛）：``verification_method`` 已退役（例如
+        ``automated_test``）或根本不存在时，这条 VP **验不下去** —— 它不是
+        「验了没过」，而是「根本没验」。这两种语义都落在失败桶里（桶规则
+        见 :func:`verification_buckets.bucket_for_status`），所以 reason
+        必须带 ``BLOCKED — `` 前缀，读报告的人才分得清。
+
+        与 :meth:`_build_binary_freshness_blocked_verdict` /
+        :meth:`_build_service_freshness_blocked_verdict` 同形：``status`` /
+        ``reasons`` / ``actual_result`` / ``evidence`` / ``framework_checks``。
+        """
+        from verification_subagent import SUPPORTED_METHODS
+        return {
+            "status": "BLOCKED",
+            "reasons": [
+                blocked_reason(
+                    f"verification_method {retired_method!r} is not one "
+                    f"of {list(SUPPORTED_METHODS)}"
+                )
+            ],
+            "actual_result": (
+                f"该 VP 的 verification_method（{retired_method}）已退役"
+                f"或不存在，无法执行；请把它重新表达为 api_test / "
+                f"ui_validation / code_review。"
+            ),
+            "evidence": {"method": retired_method},
+            "framework_checks": [],
+        }
 
     # ------------------------------------------------------------------
     # Binary freshness — pre-flight check (per-VP) + report mutation
@@ -4671,7 +5042,7 @@ class Orchestrator:
             }
         return {
             "status": "BLOCKED",
-            "reasons": [f"binary stale: {freshness.detail}"],
+            "reasons": [blocked_reason(f"binary stale: {freshness.detail}")],
             "actual_result": (
                 f"binary stale ({freshness.kind}): {freshness.detail}\n"
                 f"rebuild: {rebuild}"
@@ -5002,7 +5373,7 @@ class Orchestrator:
             evidence["service_freshness"] = report.to_dict()
         return {
             "status": "BLOCKED",
-            "reasons": [f"service not ready on port(s) {ports}"],
+            "reasons": [blocked_reason(f"service not ready on port(s) {ports}")],
             "actual_result": (
                 f"service freshness preflight BLOCKED this VP: port(s) "
                 f"{ports} could not be restarted before the round. "

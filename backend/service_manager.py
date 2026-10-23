@@ -115,6 +115,23 @@ _VALUE_FLAGS = frozenset({
 
 _READY_POLL_INTERVAL = 1.0
 
+#: Markers that make a log line look like a real failure. Matching is
+#: case-sensitive on purpose: a summary line such as ``0 errors`` must
+#: not be mistaken for the error that killed the service.
+_ERROR_MARKERS = ("Traceback", "Error", "Exception")
+
+#: How many lines before the first error are kept as context.
+_ERROR_CONTEXT_LINES = 5
+
+#: Never read more than this many lines while looking for the first
+#: error. The scan runs *after* a readiness timeout, so a service that
+#: logged hundreds of thousands of lines must not turn a slow failure
+#: into a slower one.
+_MAX_ERROR_SCAN_LINES = 20_000
+
+#: Upper bound on the excerpt that goes into ``ServiceRuntime.detail``.
+_MAX_EXCERPT_CHARS = 1200
+
 
 # ---------------------------------------------------------------------------
 # Command normalisation + matching
@@ -785,12 +802,15 @@ def start_service(
         )
         return runtime
 
-    # Not ready: report what the log's tail says so the operator gets a
-    # diagnosable reason instead of a bare timeout.
-    tail = _tail(log_file, 15)
+    # Not ready: report what the log says so the operator gets a
+    # diagnosable reason instead of a bare timeout. The tail alone is
+    # not enough — a service that fails early drowns its own traceback
+    # in interpreter-shutdown noise — so the excerpt leads with the
+    # first error and keeps the tail after it.
     runtime.detail = (
         f"started (pid {proc.pid}) but not ready after "
-        f"{decl.ready_timeout_seconds}s; log tail: {tail or '(empty)'}"
+        f"{decl.ready_timeout_seconds}s; "
+        f"{_diagnosable_log(log_file, tail_lines=15)}"
     )
     return runtime
 
@@ -801,6 +821,101 @@ def _tail(path: Path, lines: int) -> str:
     except OSError:
         return ""
     return " | ".join(content[-lines:])
+
+
+def _head_lines(path: Path, limit: int) -> List[str]:
+    """The first *limit* lines of *path* (``[]`` when it cannot be read).
+
+    Stops at *limit* instead of reading the whole file: this runs on
+    the failure path, where the log may have grown enormous while the
+    service was failing.
+    """
+    lines: List[str] = []
+    try:
+        with open(path, "r", errors="replace") as fp:
+            for line in fp:
+                if len(lines) >= limit:
+                    break
+                lines.append(line.rstrip("\r\n"))
+    except OSError:
+        return []
+    return lines
+
+
+def _first_error_excerpt(
+    lines: list[str], context: int = 5,
+) -> Optional[tuple[int, str]]:
+    """The first error line in *lines*, together with the lines before it.
+
+    Returns ``(line_number, excerpt)``. ``line_number`` is 1-based —
+    the number an operator sees when they open the log — and
+    ``excerpt`` is the error line plus up to *context* lines that
+    precede it, joined the way the tail is joined.
+
+    ``None`` when no line carries an error marker.
+    """
+    for index, line in enumerate(lines):
+        if not any(marker in line for marker in _ERROR_MARKERS):
+            continue
+        start = max(0, index - context)
+        excerpt = " | ".join(lines[start:index + 1])
+        return index + 1, excerpt
+    return None
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    """Cap *text* at *max_chars*, saying how much was dropped."""
+    if len(text) <= max_chars:
+        return text
+    keep = max(0, max_chars - 40)
+    dropped = len(text) - keep
+    marker = f"…[truncated {dropped} chars]"
+    # The marker's own length depends on the number it reports, so
+    # shrink the kept part until the two fit together.
+    while keep > 0 and len(marker) > max_chars - keep:
+        keep -= 1
+        dropped = len(text) - keep
+        marker = f"…[truncated {dropped} chars]"
+    if len(marker) > max_chars:
+        return text[:max_chars]
+    return text[:keep] + marker
+
+
+def _diagnosable_log(
+    path: Path, tail_lines: int = 15, max_chars: int = _MAX_EXCERPT_CHARS,
+) -> str:
+    """Render a service log as something an operator can act on.
+
+    The tail alone is not enough. A service that dies during startup
+    often writes its traceback early and then floods the log with
+    interpreter-shutdown noise, so the last fifteen lines show the
+    noise and hide the cause — which is how the real failure (an
+    ``OSError`` nine lines in) went unreported.
+
+    So the excerpt leads with the first error line and the five lines
+    before it, and keeps the tail after it. When the first error is
+    already inside the tail window the tail carries it, and the error
+    is not said twice.
+
+    The result is capped at *max_chars*; whatever was dropped is
+    reported as ``…[truncated N chars]``. A missing or empty log
+    gives ``"(empty)"``.
+    """
+    head = _head_lines(path, _MAX_ERROR_SCAN_LINES)
+    tail = _tail(path, tail_lines)
+    if not tail and not any(line.strip() for line in head):
+        return "(empty)"
+
+    parts: List[str] = []
+    found = _first_error_excerpt(head, _ERROR_CONTEXT_LINES)
+    if found is not None:
+        line_number, excerpt = found
+        error_line = head[line_number - 1].strip()
+        # The tail already carries the error — don't say it twice.
+        if not error_line or error_line not in tail:
+            parts.append(f"first error at line {line_number}: {excerpt}")
+    parts.append(f"log tail: {tail or '(empty)'}")
+    return _truncate(" | ".join(parts), max_chars)
 
 
 # ---------------------------------------------------------------------------

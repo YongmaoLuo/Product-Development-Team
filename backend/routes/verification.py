@@ -2113,6 +2113,63 @@ def _verdicts_by_vp_id(
     return out
 
 
+#: ``actual_result`` / ``evidence_tail`` 的长度上限（飞书卡片的契约 ——
+#: 卡片把原因渲染成一行引文，太长会把卡片撑爆）。
+MAX_ACTUAL_RESULT_LEN = 500
+MAX_EVIDENCE_TAIL_LEN = 300
+
+
+def _stringify_evidence(evidence: Any) -> str:
+    """把 ``evidence`` 统一成一段文本（它的形状不固定）。
+
+    裁决侧写的是 ``dict``（``{"pytest": "..."}``），报告侧常见 ``str``，
+    偶尔是 ``list[str]``。直接切片（``s[:300]``）对 ``dict`` 会抛
+    ``TypeError`` —— 那会让整份报告的失败原因被 ``except`` 吞掉，
+    操作员看到的是「有失败数、没原因」。
+    """
+    if evidence is None:
+        return ""
+    if isinstance(evidence, str):
+        return evidence
+    if isinstance(evidence, dict):
+        try:
+            return json.dumps(evidence, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(evidence)
+    if isinstance(evidence, (list, tuple)):
+        return "；".join(str(item) for item in evidence)
+    return str(evidence)
+
+
+def _verdict_failure_reason(
+    verdict: Optional[Dict[str, Any]],
+) -> Tuple[str, str]:
+    """一条裁决 → ``(失败原因, 证据尾巴)``，都按契约截断。
+
+    原因优先取 ``actual_result``；没有就取 ``reasons`` 列表，用 ``；``
+    拼接（裁决表里通常只有 ``reasons``）。两个都没有 → 返回空串，由调用方
+    回退到 ``verification_report.json``。
+    """
+    if not isinstance(verdict, dict):
+        return "", ""
+
+    reason = ""
+    actual = verdict.get("actual_result")
+    if isinstance(actual, str):
+        reason = actual.strip()
+    if not reason:
+        reasons = verdict.get("reasons")
+        if isinstance(reasons, str):
+            reason = reasons.strip()
+        elif isinstance(reasons, (list, tuple)):
+            reason = "；".join(
+                str(item).strip() for item in reasons if str(item).strip()
+            )
+
+    evidence = _stringify_evidence(verdict.get("evidence")).strip()
+    return reason[:MAX_ACTUAL_RESULT_LEN], evidence[:MAX_EVIDENCE_TAIL_LEN]
+
+
 def _derive_vp_buckets(
     verification_row: Optional[Dict[str, Any]],
     plan_vps: List[dict],
@@ -2349,6 +2406,13 @@ def _verification_progress_body(
                 key=lambda v: (_latest_activity.get(v) or {}).get("start") or "",
             )[0]
 
+    # 2026-10-23: the verdict table is the **primary** source of the
+    # failure reason (same source as the failure bucket). The report
+    # below is only the fallback.
+    verdicts_by_id: Dict[str, Dict[str, Any]] = _verdicts_by_vp_id(
+        verification_row
+    )
+
     # 2026-08-26: surface failed-VP ``actual_result`` so the Feishu
     # card can render a red reason box per failing VP. The plan-index
     # only carries the static plan metadata (title / method / layer);
@@ -2359,6 +2423,14 @@ def _verification_progress_body(
     # tail to each failed VP entry below. The file may be missing
     # mid-round (orchestrator hasn't flushed yet) — that's expected
     # and ``failure_details_by_id`` simply stays empty.
+    #
+    # 2026-10-23: the report is now only a **fallback**. The failure
+    # reason must come from the same source as the failure bucket —
+    # the verdict table (``plan_verification.verdicts``). The two
+    # sources drift apart: the report is rewritten by later judging
+    # rounds (a plan whose report ended up "17 PASSED" still had 11
+    # failures in the bucket), so a report-derived reason matched
+    # nothing and the card showed a bare ``🔴 [VP-001] · 标题``.
     failure_details_by_id: Dict[str, Dict[str, str]] = {}
     try:
         report_files = sorted(
@@ -2402,13 +2474,15 @@ def _verification_progress_body(
                     # section only renders id+title.
                     if not _vid or _vr.get("status") not in ("FAILED", "SKIPPED", "BLOCKED"):
                         continue
-                    _ar = (_vr.get("actual_result") or "").strip()
+                    _ar = _stringify_evidence(
+                        _vr.get("actual_result")
+                    ).strip()
                     if _ar:
                         failure_details_by_id[_vid] = {
-                            "actual_result": _ar[:500],
-                            "evidence_tail": (
-                                (_vr.get("evidence") or "")[:300]
-                            ),
+                            "actual_result": _ar[:MAX_ACTUAL_RESULT_LEN],
+                            "evidence_tail": _stringify_evidence(
+                                _vr.get("evidence")
+                            )[:MAX_EVIDENCE_TAIL_LEN],
                         }
     except Exception:
         # Defensive: a corrupt report file must not break /progress.
@@ -2457,14 +2531,31 @@ def _verification_progress_body(
             "method": vp_meta.get("method", ""),
             "layer": vp_meta.get("layer", ""),
         }
-        # Attach failure details for failed VPs (matches the
-        # ``failure_details_by_id`` dict above).
+        # Attach the failure reason for failed VPs.
+        #
+        # 2026-10-23: the reason comes from the **same source as the
+        # bucket** — the verdict table (``plan_verification.verdicts``,
+        # read through ``_verdicts_by_vp_id``). ``verification_report.
+        # json`` is only a fallback for the rows that predate the
+        # verdict table (and for verdicts that carry no reason at
+        # all). The two used to be independent, and the report is
+        # rewritten by later judging rounds — a plan whose report had
+        # been rewritten to "17 PASSED" still had 11 failures in the
+        # bucket, so the card showed a bare ``🔴 [VP-001] · 标题``
+        # with no reason at all.
         if status == "failed":
+            reason, evidence_tail = _verdict_failure_reason(
+                verdicts_by_id.get(vp_id)
+            )
             details = failure_details_by_id.get(vp_id, {})
-            if details.get("actual_result"):
-                entry["actual_result"] = details["actual_result"]
-            if details.get("evidence_tail"):
-                entry["evidence_tail"] = details["evidence_tail"]
+            if not reason:
+                reason = details.get("actual_result", "")
+            if not evidence_tail:
+                evidence_tail = details.get("evidence_tail", "")
+            if reason:
+                entry["actual_result"] = reason
+            if evidence_tail:
+                entry["evidence_tail"] = evidence_tail
         vps.append(entry)
 
     in_progress_count = len(running_vp_ids)

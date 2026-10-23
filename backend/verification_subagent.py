@@ -57,6 +57,10 @@ from coding_tool import (
     WorkClock,
 )
 from utils.secret_files import private_dir, write_private_json
+# 2026-10-23（缺陷 4 要求 2）：BLOCKED 留在失败桶，但 reason 必须带
+# ``BLOCKED — `` 前缀 —— 读报告的人要一眼看出「验不下去」而不是「验了没过」。
+# 前缀由 :mod:`verification_buckets` 统一给出，四个 BLOCKED 产出点共用同一份。
+from verification_buckets import blocked_reason
 
 
 def _marshal_safe_on_worker_thread(func: Any) -> Any:
@@ -874,7 +878,7 @@ class VerificationSubAgent:
             last_blocked = e
             return Verdict(
                 verdict="BLOCKED",
-                reasons=[f"Security net blocked: {e.reason}"],
+                reasons=[blocked_reason(f"Security net blocked: {e.reason}")],
                 evidence=[e.evidence] if e.evidence else [],
                 provider="",
                 chosen_model="",
@@ -921,6 +925,14 @@ class VerificationSubAgent:
         from the last error.
         """
         last_error: Optional[str] = None
+        # Whether ``last_error`` describes a verdict-parse failure (the
+        # sub-agent answered something that is not a Verdict) as
+        # opposed to a transport-layer failure (the call itself blew
+        # up). The two are different malfunctions and the synthesized
+        # verdict at the bottom of the loop says which one happened —
+        # an operator must not be sent to the provider when the
+        # sub-agent is the one that answered nonsense.
+        last_error_is_parse_error = False
         # 2026-09-14: the watchdog-kill bonus slot is
         # REMOVED — total attempts is now a hard ``max_retries + 1``
         # (initial try + 2 retries = 3). The old ``+1`` reserved slot
@@ -971,6 +983,7 @@ class VerificationSubAgent:
                 # error into _self_heal (that path is for code
                 # defects, not for protocol garbles).
                 last_error = f"VerdictParseError: {e}"
+                last_error_is_parse_error = True
                 self._write_log(log_path, "verdict_parse_error", {
                     "attempt": attempt,
                     "error": last_error,
@@ -1047,6 +1060,7 @@ class VerificationSubAgent:
                 # failure and continue to the next attempt, unless
                 # we're out of budget.
                 last_error = str(e)
+                last_error_is_parse_error = False
                 self._write_log(log_path, "attempt_exception", {
                     "attempt": attempt,
                     "error": last_error,
@@ -1090,9 +1104,27 @@ class VerificationSubAgent:
         # verdict never reaches this point — it returns above). Per PRD
         # decision point 3 (zero-tolerance for skipping), we never
         # coerce this to SKIPPED; it's a hard FAILED.
+        #
+        # 2026-10-23: the wording names WHICH malfunction ate the
+        # budget. An unparseable verdict (the sub-agent's answer did
+        # not satisfy the Verdict JSON contract) is a different
+        # failure from a transport error, and the operator reading the
+        # report has to be able to tell them apart — "max retries
+        # exhausted" on a parse failure would send them to the
+        # provider when the sub-agent is the one that answered
+        # nonsense.
+        if last_error_is_parse_error:
+            exhausted_reason = (
+                f"verdict unparseable after {total_attempts} attempts: "
+                f"{last_error or 'unknown error'}"
+            )
+        else:
+            exhausted_reason = (
+                f"max retries exhausted: {last_error or 'unknown error'}"
+            )
         return Verdict(
             verdict="FAILED",
-            reasons=[f"max retries exhausted: {last_error or 'unknown error'}"],
+            reasons=[exhausted_reason],
             evidence=[],
             model_complexity=self.model_complexity,
         )
@@ -1418,13 +1450,27 @@ class VerificationSubAgent:
                 # ui_validation, ``verification_api_runner`` for api_test)
                 # is what decides whether a PASSED is honoured.
                 return parse_verdict_to_dataclass(raw)
-            except VerdictParseError as e:
-                return Verdict(
-                    verdict="FAILED",
-                    reasons=[f"verdict parse error: {e}"],
-                    evidence=[raw[:500]],
-                    model_complexity=self.model_complexity,
-                )
+            except VerdictParseError:
+                # 2026-10-23: an unparseable verdict is a MALFUNCTION
+                # of the protocol, not a finding about the code under
+                # test. It used to be turned into a clean FAILED
+                # verdict right here, and that made
+                # ``_self_heal_loop``'s ``except VerdictParseError``
+                # branch dead code: the loop returns a clean FAILED
+                # immediately (2026-09-15 — the verifier is an
+                # observer, a finding is not a malfunction to retry
+                # away), so a sub-agent that answered ``{}`` was
+                # reported as a verification failure and the retry
+                # budget never spent a single attempt on it
+                # (measured: attempt log held ``attempt_started`` +
+                # ``attempt_completed FAILED`` and nothing else).
+                #
+                # Re-raise so the caller can retry it (bounded
+                # exponential backoff) and, once the budget is gone,
+                # synthesize a FAILED verdict that says the verdict
+                # was UNPARSEABLE rather than dressing it up as an
+                # exhausted transport budget.
+                raise
         finally:
             if watchdog_handle is not None and self.registry is not None:
                 try:

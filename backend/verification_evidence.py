@@ -46,9 +46,21 @@ The artifact is also the audit trail: ``plans/<id>/vp_artifacts/<vp_id>/``
 holds the citations/checkpoints (and the raw API response for
 ``api_test``), so an operator can re-check any verdict after the fact
 without replaying the round.
+
+The framework also has to know whether the tree it is checking is
+still the tree the round produced its citations against.  Several
+verification processes can share one worktree, and a concurrent
+mutation (a "变异负控" running in parallel) can rewrite a file between
+the moment a verdict was written and the moment its citations are read
+— and the check then reads a tree that belongs to nobody.
+:func:`tree_fingerprint` gives the round a content-based fingerprint of
+the working tree (HEAD plus a hash of ``git status --porcelain``) so
+the two states can be told apart; :func:`tree_mutated` compares a
+later reading against it.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -518,3 +530,110 @@ def attach_evidence_command(
     evidence["evidence_command"] = outcome.to_dict()
     verdict["evidence"] = evidence
     return verdict
+
+
+# ---------------------------------------------------------------------------
+# Working-tree fingerprint — is the tree I am about to read still mine?
+# ---------------------------------------------------------------------------
+
+#: Seconds either git probe may take before it is given up on.  The
+#: fingerprint is a safety net, not a gate: a slow repository must not
+#: be able to hold up a verification round, and a tree that cannot be
+#: interrogated in time is handled exactly like a tree that is not a
+#: repository at all — no fingerprint, no claim of a change.
+TREE_FINGERPRINT_TIMEOUT_SECONDS = 10
+
+
+def _git_output(args: List[str], project_dir: Path) -> Optional[str]:
+    """Run ``git <args>`` in ``project_dir`` and return its stdout.
+
+    ``None`` when git is not installed, the directory is not a
+    repository, the command takes longer than
+    :data:`TREE_FINGERPRINT_TIMEOUT_SECONDS`, or git exits non-zero.
+
+    Never raises: the caller degrades to "no fingerprint" and the
+    evidence check carries on as it did before.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            timeout=TREE_FINGERPRINT_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def tree_fingerprint(project_dir: Path) -> Optional[str]:
+    """A content-based fingerprint of the working tree at ``project_dir``.
+
+    The fingerprint is ``"<HEAD sha>:<sha256 of git status --porcelain>"``:
+
+      * **HEAD** — which commit the tree sits on.  A commit moves it even
+        when the tree is clean again afterwards.
+      * **porcelain** — the status of the tree relative to that commit,
+        hashed.  This is what catches the mutation that matters for an
+        evidence check: a file edited in the worktree, or a file that
+        appeared, *after* the round recorded its citations.
+
+    It is deliberately content-based and not mtime-based: touching a
+    file without changing it does not move the fingerprint, so a
+    checkout that merely refreshed timestamps is not mistaken for a
+    concurrent edit.
+
+    A **clean** tree still has a fingerprint — an empty porcelain output
+    is a fact about the tree, not the absence of one.  Only a tree that
+    cannot be interrogated at all (no git, not a repository, no HEAD
+    yet, git too slow, git failed) yields ``None``.
+    """
+    project_dir = Path(project_dir)
+
+    head = _git_output(["rev-parse", "HEAD"], project_dir)
+    if head is None:
+        return None
+    head_sha = head.strip()
+    if not head_sha:
+        return None
+
+    # ``--no-optional-locks`` keeps ``git status`` from taking the
+    # optional index lock to refresh the stat cache.  This probe runs
+    # against a worktree other processes may be writing to, and taking
+    # a lock on their behalf is exactly the interference it is meant to
+    # detect.  It changes what git *writes*, not what it *reports*.
+    status = _git_output(
+        ["--no-optional-locks", "status", "--porcelain"], project_dir
+    )
+    if status is None:
+        return None
+
+    status_digest = hashlib.sha256(status.encode("utf-8")).hexdigest()
+    return f"{head_sha}:{status_digest}"
+
+
+def tree_mutated(project_dir: Path, baseline: Optional[str]) -> bool:
+    """Has the working tree at ``project_dir`` moved away from ``baseline``?
+
+    ``baseline`` is a fingerprint taken earlier (:func:`tree_fingerprint`).
+
+    Returns ``False`` — "cannot tell, so assume it did not move" — when
+    there is no baseline to compare against, or when the current
+    fingerprint cannot be computed (no git, not a repository, git timed
+    out).  A caller that cannot establish a baseline keeps the
+    behaviour it had before the fingerprint existed; it does not start
+    refusing work on the strength of a missing measurement.
+
+    ``True`` means the tree moved: either HEAD changed or the status
+    changed.  That is the signal the caller needs to hold an evidence
+    check until the concurrent writer is done.
+    """
+    if not baseline:
+        return False
+    current = tree_fingerprint(project_dir)
+    if current is None:
+        return False
+    return current != baseline

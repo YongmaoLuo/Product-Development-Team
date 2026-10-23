@@ -721,6 +721,72 @@ class VerificationExecutor(BaseExecutor):
             return
         self._save_state()
 
+    def apply_verdict_updates(
+        self, updates: Dict[str, Dict[str, Any]],
+    ) -> List[str]:
+        """Re-record verdicts that changed after the round finished.
+
+        A verdict is corrected **through** :meth:`record_verdict` — never
+        by writing ``self._verdicts`` directly.  ``record_verdict`` takes
+        a defensive copy (``dict(verdict)``), stamps the command
+        provenance and maintains the mutually exclusive index buckets;
+        poking ``self._verdicts`` would leave the buckets and the
+        persisted state describing the *old* verdict — a VP reported as
+        completed while its own table says FAILED.
+
+        Args:
+            updates: ``{vp_id: verdict}`` — the verdicts to re-record.
+
+        Returns:
+            The ids that were actually re-recorded, in the order they
+            were applied.
+
+        Notes:
+            An update is a **correction** of the verdict that is already
+            stored, so it is applied as a patch over that verdict: the
+            keys the correction carries win, the keys it does not
+            mention are kept.  That is what lets a partial correction
+            (``{"status": "FAILED", "reasons": [...]}``) land — the
+            stored verdict supplies the schema's other required fields
+            — while a full correction (what the round-end flush
+            produces) simply replaces the verdict.
+
+            A VP the executor never saw is **skipped**, not an error:
+            there is no conclusion of its own to correct, and inventing
+            one would put a VP into the buckets that the round never
+            ran.  A verdict the schema still rejects after the patch is
+            skipped for the same reason — the previous conclusion
+            stays.
+        """
+        applied: List[str] = []
+        if not updates:
+            return applied
+        for vp_id, verdict in updates.items():
+            base = self._verdicts.get(vp_id)
+            if base is None:
+                logger.warning(
+                    "[verification_executor] verdict update for %s skipped "
+                    "— no such verdict in this run", vp_id,
+                )
+                continue
+            try:
+                patched = dict(base)
+                patched.update(dict(verdict or {}))
+                # The stored verdict is schema-valid, so these are
+                # already present; the defaults only cover a verdict
+                # that was recorded before the schema existed.
+                patched.setdefault("reasons", [])
+                patched.setdefault("evidence", {})
+                self.record_verdict(vp_id, patched)
+            except Exception:
+                logger.exception(
+                    "[verification_executor] verdict update for %s rejected "
+                    "— keeping the previous verdict", vp_id,
+                )
+                continue
+            applied.append(vp_id)
+        return applied
+
     # ------------------------------------------------------------------
     # Index buckets (mutually exclusive)
     # ------------------------------------------------------------------
