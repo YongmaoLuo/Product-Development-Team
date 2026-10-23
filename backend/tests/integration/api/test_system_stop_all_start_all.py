@@ -16,18 +16,22 @@ What is pinned here:
    stopped (a conflict, say) is reported as ``ok: false`` and the other
    plans are still stopped — a global stop that gives up half way
    through is worse than one that reports what it could not do.
-3. **start_all resumes every pause checkpoint**, dispatching each plan
-   to the start that matches its kind.
+3. **start_all resumes the batch the stop recorded**, dispatching each
+   plan to the start that matches its kind — and nothing else. A
+   checkpoint left on disk by an earlier, unrelated stop is not
+   resumed; the restart belongs to the batch.
 4. **start_all also picks up the orphans a hard kill leaves behind** — a
    verification whose state was recovered from disk and whose thread is
    gone. Such a plan has no checkpoint (it was killed, not stopped), and
    without this source it could never be started again: its recovered
    state still says "running", so the start endpoint answers 409 forever.
-5. **No targets is an empty answer**, not an error.
+   It is resumed only when the batch names it.
+5. **No batch is an empty answer**, not an error.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -47,6 +51,9 @@ from state_machine.db.schema import migrate
 EXEC_PLAN_ID = "20261020-sysall-exec"
 VERIF_PLAN_ID = "20261020-sysall-verif"
 ORPHAN_PLAN_ID = "20261020-sysall-orphan"
+
+#: The batch record the global stop writes and the global start reads.
+BATCH_FILENAME = "stop_all_batch.json"
 
 
 class Recorder:
@@ -164,6 +171,20 @@ def _write_checkpoint(
         unfinished_tasks=[{"task_id": "2", "status": "pending"}],
     )
     return plan_dir
+
+
+def _write_batch(db_path: Path, plan_ids: List[str]) -> Path:
+    """The batch record a global stop would have written."""
+    path = db_path.parent / BATCH_FILENAME
+    path.write_text(
+        json.dumps({
+            "version": 1,
+            "written_at": "2026-10-20T12:00:00+00:00",
+            "plan_ids": list(plan_ids),
+        }),
+        encoding="utf-8",
+    )
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -295,10 +316,11 @@ def test_stop_all_handles_one_plan_once(env, client, monkeypatch):
 
 
 def test_start_all_resumes_checkpoints(env, client, monkeypatch):
-    """Each checkpoint is resumed by the start that matches its kind."""
-    plans_dir, _db_path = env
+    """Each checkpoint of the batch is resumed by the start that matches its kind."""
+    plans_dir, db_path = env
     _write_checkpoint(plans_dir, EXEC_PLAN_ID, kind="execution")
     _write_checkpoint(plans_dir, VERIF_PLAN_ID, kind="verification")
+    _write_batch(db_path, [EXEC_PLAN_ID, VERIF_PLAN_ID])
 
     exec_start = Recorder()
     verif_start = Recorder()
@@ -329,6 +351,34 @@ def test_start_all_resumes_checkpoints(env, client, monkeypatch):
     assert request.project_dir is None, request
 
 
+def test_start_all_ignores_a_checkpoint_outside_the_batch(env, client, monkeypatch):
+    """A checkpoint the batch does not name is not resumed.
+
+    A checkpoint is durable: it outlives the stop that wrote it. The
+    global start belongs to the batch, not to every pause that ever
+    happened — otherwise a restart wakes up plans an unrelated stop
+    left days ago.
+    """
+    plans_dir, db_path = env
+    _write_checkpoint(plans_dir, EXEC_PLAN_ID, kind="execution")
+    _write_checkpoint(plans_dir, VERIF_PLAN_ID, kind="verification")
+    _write_batch(db_path, [EXEC_PLAN_ID])
+
+    exec_start = Recorder()
+    verif_start = Recorder()
+    monkeypatch.setattr(routes_execution, "start_execution", exec_start)
+    monkeypatch.setattr(routes_verification, "start_verification", verif_start)
+
+    resp = client.post("/api/system/start_all")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    results = {row["plan_id"]: row for row in body["results"]}
+    assert set(results) == {EXEC_PLAN_ID}, body
+    assert exec_start.plan_ids == [EXEC_PLAN_ID], exec_start.calls
+    assert verif_start.calls == [], verif_start.calls
+
+
 # ---------------------------------------------------------------------------
 # 4) start_all picks up the orphans a hard kill leaves behind
 # ---------------------------------------------------------------------------
@@ -341,8 +391,11 @@ def test_start_all_includes_recovered_verification(env, client, monkeypatch):
     disk, so it still says "running" while nothing is running it. The
     start endpoint would answer 409 for that plan forever, so the
     global start has to name it explicitly.
+
+    The batch filters it too: a recovered verification the batch does
+    not name is not started.
     """
-    plans_dir, _db_path = env
+    plans_dir, db_path = env
     plan_dir = plans_dir / ORPHAN_PLAN_ID
     plan_dir.mkdir(parents=True, exist_ok=True)
     server._verification_state[ORPHAN_PLAN_ID] = {
@@ -351,6 +404,7 @@ def test_start_all_includes_recovered_verification(env, client, monkeypatch):
         "recovered": True,
         "thread": None,
     }
+    _write_batch(db_path, [ORPHAN_PLAN_ID])
 
     exec_start = Recorder()
     verif_start = Recorder()
@@ -377,7 +431,7 @@ def test_start_all_skips_a_live_verification(env, client, monkeypatch):
     round that is genuinely running has a live thread and must be left
     alone, or the global start would run two rounds over one plan.
     """
-    plans_dir, _db_path = env
+    plans_dir, db_path = env
     plan_dir = plans_dir / ORPHAN_PLAN_ID
     plan_dir.mkdir(parents=True, exist_ok=True)
     server._verification_state[ORPHAN_PLAN_ID] = {
@@ -386,13 +440,19 @@ def test_start_all_skips_a_live_verification(env, client, monkeypatch):
         "recovered": True,
         "thread": object(),
     }
+    _write_batch(db_path, [ORPHAN_PLAN_ID])
 
     verif_start = Recorder()
     monkeypatch.setattr(routes_verification, "start_verification", verif_start)
 
     resp = client.post("/api/system/start_all")
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"results": []}, resp.text
+    body = resp.json()
+
+    # The plan of the batch was not resumed — it owns a live thread —
+    # and it is reported rather than dropped.
+    assert [row["plan_id"] for row in body["results"]] == [ORPHAN_PLAN_ID], body
+    assert body["results"][0]["ok"] is False, body
     assert verif_start.calls == [], verif_start.calls
 
 
@@ -436,8 +496,9 @@ def test_start_all_reaches_the_real_execution_start(env, client):
     than swallowed. A global start that hid the refusal would tell the
     operator a plan was resumed when it was not.
     """
-    plans_dir, _db_path = env
+    plans_dir, db_path = env
     _write_checkpoint(plans_dir, EXEC_PLAN_ID, kind="execution")
+    _write_batch(db_path, [EXEC_PLAN_ID])
 
     resp = client.post("/api/system/start_all")
     assert resp.status_code == 200, resp.text
@@ -449,15 +510,19 @@ def test_start_all_reaches_the_real_execution_start(env, client):
 
 
 # ---------------------------------------------------------------------------
-# 6) no targets is an empty answer
+# 6) no batch is an empty answer
 # ---------------------------------------------------------------------------
 
 
 def test_start_all_empty(env, client):
-    """Nothing paused, nothing running: an empty list, not an error."""
+    """No batch on record: an empty list, not an error."""
     resp = client.post("/api/system/start_all")
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"results": []}, resp.text
+    assert resp.json() == {
+        "results": [],
+        "batch": None,
+        "detail": "no stop_all batch on record",
+    }, resp.text
 
 
 def test_stop_all_empty(env, client):
@@ -465,3 +530,20 @@ def test_stop_all_empty(env, client):
     resp = client.post("/api/system/stop_all")
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"results": []}, resp.text
+
+
+def test_stop_all_records_the_batch_it_stopped(env, client, monkeypatch):
+    """The stop writes down the plans it stopped, for the start to use."""
+    plans_dir, db_path = env
+    _mark_execution_running(plans_dir, EXEC_PLAN_ID)
+    _mark_verification_running(plans_dir, VERIF_PLAN_ID)
+
+    monkeypatch.setattr(routes_execution, "stop_execution", Recorder())
+    monkeypatch.setattr(routes_verification, "stop_verification", Recorder())
+
+    resp = client.post("/api/system/stop_all")
+    assert resp.status_code == 200, resp.text
+
+    batch = json.loads((db_path.parent / BATCH_FILENAME).read_text())
+    assert batch["version"] == 1, batch
+    assert set(batch["plan_ids"]) == {EXEC_PLAN_ID, VERIF_PLAN_ID}, batch

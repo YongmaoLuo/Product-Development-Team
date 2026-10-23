@@ -11,7 +11,7 @@ from fastapi import APIRouter
 from typing import Dict, List, Optional, Tuple, Any
 from fastapi import HTTPException, Request
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import sqlite3
 import time
@@ -550,6 +550,19 @@ def get_active_tasks():
 _EXECUTION_TYPE = "execution"
 _VERIFICATION_TYPE = "verification"
 
+#: The file the global stop writes and the global start consumes. It
+#: lives next to the state database — the one directory the backend
+#: already owns — and its name says what it is.
+_BATCH_FILENAME = "stop_all_batch.json"
+
+#: Bumped only on an incompatible change to the batch document's shape.
+#: A record written by a newer PDT is ignored rather than half-read.
+_BATCH_VERSION = 1
+
+#: The kind reported for a batch member that has nothing to resume. It
+#: is a marker, not a real kind: no start route owns it.
+_NO_CHECKPOINT_KIND = "no_checkpoint"
+
 
 def _failure_text(exc: BaseException) -> str:
     """A short reason for a plan that could not be stopped or started.
@@ -636,6 +649,137 @@ def _run_for_plan(plan_id: str, kind: str, action: Any) -> Dict[str, Any]:
     return {"plan_id": plan_id, "type": kind, "ok": True}
 
 
+def _batch_path() -> Optional[Path]:
+    """Where the stop_all batch record lives.
+
+    Next to the state database — the directory the backend already
+    owns — resolved through ``_server._state_db_path`` so a test (or a
+    deployment that moves the database) gets the right answer instead
+    of a hard-coded ``.pdt``.
+
+    ``None`` when the path cannot be resolved at all: the record is a
+    convenience, and a stop that cannot place it must still stop.
+    """
+    try:
+        return Path(_server._state_db_path()).parent / _BATCH_FILENAME
+    except Exception:  # noqa: BLE001 — the path is not worth a 500
+        return None
+
+
+def _write_stop_all_batch(plan_ids: List[str]) -> bool:
+    """Record the plans this stop stopped, for the next start to resume.
+
+    The record is the *batch*: the set of plans one global stop
+    touched. It is written atomically, so a stop killed mid-write
+    leaves the previous record intact rather than a torn one.
+
+    A stop that stopped nothing still writes a record — an empty one.
+    "Nothing was running" and "nothing was ever stopped" are different
+    answers, and only the first one may resume a plan.
+    """
+    from utils.atomic_io import atomic_write_json
+
+    path = _batch_path()
+    if path is None:
+        _server.logger.warning(
+            "[system_stop_start] cannot resolve the state db path; "
+            "no stop_all batch was recorded"
+        )
+        return False
+    payload = {
+        "version": _BATCH_VERSION,
+        "written_at": datetime.now(timezone.utc).isoformat(),
+        "plan_ids": list(plan_ids),
+    }
+    try:
+        atomic_write_json(path, payload, logger=_server.logger, reraise=True)
+    except OSError as exc:
+        _server.logger.warning(
+            "[system_stop_start] could not write the stop_all batch %s (%s); "
+            "the next start_all will have nothing to resume",
+            path, type(exc).__name__,
+        )
+        return False
+    return True
+
+
+def _read_stop_all_batch() -> Optional[Dict[str, Any]]:
+    """The recorded stop_all batch, or ``None`` when there is not one.
+
+    Every unusable record answers ``None``: absent, unreadable, not
+    JSON, JSON but not an object, a version this code does not know, or
+    a ``plan_ids`` that is not a list. A damaged record costs a
+    resume — never an exception, and never a wrong resume.
+    """
+    path = _batch_path()
+    if path is None:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        # ``ValueError`` covers ``json.JSONDecodeError``.
+        _server.logger.warning(
+            "[system_stop_start] ignoring an unreadable stop_all batch %s (%s)",
+            path, type(exc).__name__,
+        )
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("version") != _BATCH_VERSION:
+        _server.logger.warning(
+            "[system_stop_start] ignoring a stop_all batch %s with version %r",
+            path, data.get("version"),
+        )
+        return None
+    if not isinstance(data.get("plan_ids"), list):
+        return None
+    return data
+
+
+def _batch_plan_ids(batch: Optional[Dict[str, Any]]) -> List[str]:
+    """The plan ids of a batch record, in the order they were stopped."""
+    if not batch:
+        return []
+    plan_ids: List[str] = []
+    seen: set = set()
+    for raw in batch.get("plan_ids") or []:
+        plan_id = str(raw or "").strip()
+        if not plan_id or plan_id in seen:
+            continue
+        # A plan id is a directory name, never a path: refuse anything
+        # that could point outside PLANS_DIR.
+        if plan_id in (".", "..") or "/" in plan_id or "\\" in plan_id:
+            continue
+        seen.add(plan_id)
+        plan_ids.append(plan_id)
+    return plan_ids
+
+
+def _consume_stop_all_batch() -> None:
+    """Delete the batch record: the global start consumes it.
+
+    A failure here is a warning, not an error: the resume already
+    happened, and a record that could not be deleted only means a
+    second start_all would try the same batch again.
+    """
+    path = _batch_path()
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        _server.logger.warning(
+            "[system_stop_start] could not delete the stop_all batch %s (%s); "
+            "a second start_all would try the same batch again",
+            path, type(exc).__name__,
+        )
+
+
 @router.post("/api/system/stop_all")
 def stop_all_tasks():
     """Stop every plan that is running, in one call.
@@ -656,6 +800,12 @@ def stop_all_tasks():
     module-level import here would be circular.
 
     One plan's failure is one row. The others are still stopped.
+
+    The plans this call actually stopped are recorded as a *batch* (see
+    :func:`_write_stop_all_batch`), and the batch is the only thing
+    the global start will resume. Without it, a restart would pick up
+    every checkpoint left on disk — including the ones a previous,
+    unrelated stop left days ago.
     """
     from routes.execution import stop_execution
     from routes.verification import stop_verification
@@ -679,13 +829,45 @@ def stop_all_tasks():
             continue
         handled.add(plan_id)
         results.append(_run_for_plan(plan_id, kind, action))
+
+    # Only the plans that were really stopped belong to the batch: a
+    # plan that refused to stop has nothing to resume, and listing it
+    # would make the next start report a phantom failure.
+    _write_stop_all_batch([
+        row["plan_id"] for row in results if row.get("ok") is True
+    ])
     return {"results": results}
 
 
-def _start_targets() -> List[Tuple[str, str]]:
-    """Every plan that has something to resume, and how to resume it.
+def _checkpoint_kind(plan_id: str) -> Tuple[bool, str]:
+    """``(a checkpoint was there, the kind it names)`` for one plan.
 
-    Two sources, unioned:
+    A checkpoint that cannot be read counts as absent — the same
+    degradation every other reader of it makes, so a torn file can
+    never turn this listing into an error.
+    """
+    from pause_state import checkpoint_path, read_pause_checkpoint
+
+    try:
+        plan_dir = _server.PLANS_DIR / plan_id
+        if not checkpoint_path(plan_dir).exists():
+            return False, ""
+        checkpoint = read_pause_checkpoint(plan_dir)
+    except OSError:
+        return False, ""
+    if not isinstance(checkpoint, dict):
+        return False, ""
+    return True, str(checkpoint.get("kind") or "")
+
+
+def _start_targets(batch_plan_ids: List[str]) -> List[Tuple[str, str]]:
+    """Every plan in the batch that has something to resume, and how.
+
+    The batch is the *only* source of candidates. A plan this stop did
+    not stop is not resumed, however old its checkpoint is: a restart
+    must not wake up the leftovers of an unrelated stop from days ago.
+
+    Within the batch, two things can make a plan resumable:
 
     * a **pause checkpoint on disk** — the durable half of a stop, and
       the one that survives the restart this endpoint exists for. The
@@ -697,63 +879,51 @@ def _start_targets() -> List[Tuple[str, str]]:
       again: its recovered state still says "running", so the start
       endpoint would answer 409 forever.
 
-    A checkpoint that cannot be read is treated as absent — the same
-    degradation every other reader of it makes, so a torn file can
-    never turn this listing into an error.
+    A batch member with neither is reported as ``_NO_CHECKPOINT_KIND``
+    rather than dropped: silence would leave the operator believing the
+    whole batch was resumed.
     """
-    from pause_state import checkpoint_path, read_pause_checkpoint
-
     targets: List[Tuple[str, str]] = []
-    seen: set = set()
-    try:
-        plan_dirs = sorted(_server.PLANS_DIR.iterdir())
-    except OSError:
-        # No plans directory yet (fresh install), or one that vanished
-        # under us. Either way there is nothing paused in it.
-        plan_dirs = []
-    for plan_dir in plan_dirs:
-        if not plan_dir.is_dir():
+    for plan_id in batch_plan_ids:
+        has_checkpoint, kind = _checkpoint_kind(plan_id)
+        if has_checkpoint:
+            # A checkpoint with an unknown (or empty) kind is still a
+            # checkpoint: the caller reports it as unsupported rather
+            # than as "nothing to resume".
+            targets.append((plan_id, kind))
             continue
-        try:
-            if not checkpoint_path(plan_dir).exists():
-                continue
-            checkpoint = read_pause_checkpoint(plan_dir)
-        except OSError:
+        state = (_server._verification_state or {}).get(plan_id)
+        if (
+            isinstance(state, dict)
+            and state.get("recovered") is True
+            and state.get("thread") is None
+        ):
+            # The recovered marker is what makes a hard-killed plan
+            # resumable; a round that is genuinely running owns a live
+            # thread and must be left alone, or two rounds would run
+            # over one plan.
+            targets.append((plan_id, _VERIFICATION_TYPE))
             continue
-        if not isinstance(checkpoint, dict):
-            continue
-        plan_id = plan_dir.name
-        if plan_id in seen:
-            continue
-        seen.add(plan_id)
-        targets.append((plan_id, str(checkpoint.get("kind") or "")))
-
-    for plan_id, state in (_server._verification_state or {}).items():
-        if not isinstance(state, dict):
-            continue
-        # The recovered marker is what makes a hard-killed plan
-        # resumable; a round that is genuinely running owns a live
-        # thread and must be left alone, or two rounds would run over
-        # one plan.
-        if state.get("recovered") is not True or state.get("thread") is not None:
-            continue
-        if plan_id in seen:
-            continue
-        seen.add(plan_id)
-        targets.append((str(plan_id), _VERIFICATION_TYPE))
+        targets.append((plan_id, _NO_CHECKPOINT_KIND))
     return targets
 
 
 @router.post("/api/system/start_all")
 def start_all_tasks():
-    """Resume every paused plan, in one call.
+    """Resume the batch this stop stopped, in one call.
 
     The second half of a backend restart, and the counterpart of
     :func:`stop_all_tasks`.
 
-    The targets are the plans that have something to resume: a pause
-    checkpoint on disk, and the verification a hard kill left without a
-    thread. Each is started by the route that owns its kind.
+    The targets are the plans named by the batch the global stop
+    recorded — and only those. A checkpoint left on disk by an earlier,
+    unrelated stop is not resumed: the restart belongs to the batch,
+    not to every pause that ever happened.
+
+    Within the batch, a plan is resumed from its pause checkpoint on
+    disk, or — for a verification whose thread a hard kill took away —
+    from its recovered state. Each is started by the route that owns
+    its kind.
 
     The execution start is handed an explicitly empty request: the
     checkpoint carries the project directory the work was happening in,
@@ -761,6 +931,13 @@ def start_all_tasks():
     directory it was never written for.
 
     One plan's failure is one row. The others are still started.
+
+    The batch is consumed: the record is deleted once the resume has
+    been attempted, whatever the per-plan outcome, so a second
+    ``start_all`` is a no-op instead of a second resume.
+
+    The answer carries the batch it acted on (``"batch"``), and
+    ``"detail"`` when there was none to act on.
     """
     from routes.execution import start_execution
     from routes.verification import start_verification
@@ -776,8 +953,22 @@ def start_all_tasks():
         _VERIFICATION_TYPE: _start_verification,
     }
 
+    batch = _read_stop_all_batch()
+    batch_plan_ids = _batch_plan_ids(batch)
+
     results: List[Dict[str, Any]] = []
-    for plan_id, kind in _start_targets():
+    for plan_id, kind in _start_targets(batch_plan_ids):
+        if kind == _NO_CHECKPOINT_KIND:
+            # A plan of the batch that has nothing to resume. Reported
+            # as one row: the other plans of the batch are still
+            # started.
+            results.append({
+                "plan_id": plan_id,
+                "type": "unknown",
+                "ok": False,
+                "error": "no_checkpoint",
+            })
+            continue
         action = actions.get(kind)
         if action is None:
             # A checkpoint nobody can resume. Reported rather than
@@ -791,7 +982,18 @@ def start_all_tasks():
             })
             continue
         results.append(_run_for_plan(plan_id, kind, action))
-    return {"results": results}
+
+    # The batch is consumed whatever the rows say: a batch that
+    # survived its own start would be resumed a second time.
+    _consume_stop_all_batch()
+
+    if batch is None:
+        return {
+            "results": results,
+            "batch": None,
+            "detail": "no stop_all batch on record",
+        }
+    return {"results": results, "batch": batch}
 
 
 @router.get("/api/plans")
