@@ -86,6 +86,39 @@ VERIFIER_TIMEOUT = "verifier_timeout"
 #: middle of a message stays ``infra``.
 VERIFIER_TIMEOUT_PREFIX = VERIFIER_TIMEOUT + ":"
 
+#: The sub-agent burned its whole work budget (2026-10-23).
+#:
+#: This is the executor's own hard-timeout message — "Hard timeout after
+#: 3600s of work time" / "… of stdout silence" — raised by
+#: ``coding_tool.HardTimeoutError`` when the dispatch ran past its cap.
+#: It says the CODER ran out of time.
+#:
+#: How it differs from the two timeout kinds above, because the three
+#: are genuinely different facts:
+#:
+#: * ``INFRA`` is a provider/environment problem. Nobody's fault, and
+#:   decomposing the task changes nothing.
+#: * ``VERIFIER_TIMEOUT`` is the VERIFIER running out of budget. The
+#:   work may well have succeeded — there is simply no verdict, so the
+#:   thing that is missing is a measurement.
+#: * ``CODER_TIMEOUT`` is the CODER running out of budget. The work did
+#:   NOT finish: no test assertion ever ran, so this is not a test
+#:   failure either. Filed as ``test_failure`` (which it WAS, before
+#:   this kind existed — the generic timeout rule matches "HARD
+#:   TIMEOUT" / "timed out" / "Timeout", and the executor's message
+#:   says "Hard timeout after ", none of which it matches) it told the
+#:   refiner "this task is too big, split it" when the truth is "this
+#:   run needed more time". The honest response to a first occurrence is
+#:   to give the task one more go with the same budget; only a repeat
+#:   is evidence that the task needs to be smaller.
+CODER_TIMEOUT = "coder_timeout"
+
+#: The executor's own spelling of the hard timeout. Only this exact
+#: prefix buys the kind: a generic timeout in the middle of a message
+#: stays ``infra``, and the verifier's own prefix (checked first) keeps
+#: its kind.
+CODER_TIMEOUT_PREFIX = "Hard timeout after "
+
 # ---------------------------------------------------------------------------
 # The remedy: what to DO about a failure (2026-10-22)
 # ---------------------------------------------------------------------------
@@ -153,6 +186,14 @@ REMEDY_BY_KIND = {
     # No verdict was reached at all — the verification needs a bigger
     # budget, not a smaller task.
     VERIFIER_TIMEOUT: REVERIFY_WITH_MORE_BUDGET,
+    # 2026-10-23: the sub-agent used up its work budget. The FIRST
+    # occurrence buys ONE restart (the executor's extra attempt) with
+    # the SAME budget — a restart is the cheapest possible answer to
+    # "the run ran out of time", and it costs no extra budget because
+    # the attempt slot was already reserved. Only a REPEAT is evidence
+    # that the task needs to be smaller, and only then may the refiner
+    # split it.
+    CODER_TIMEOUT: RETRY_THEN_SPLIT,
 }
 
 
@@ -427,7 +468,10 @@ def _classify_kind(error):
     The verifier timeout (2026-10-22) sits ahead of all of them, prefix
     and all, for the same reason: a message that says the run "timed
     out" is not a verdict, and filing it as ``infra`` would have the
-    refiner retry what needs a bigger budget.
+    refiner retry what needs a bigger budget. The coder's own
+    hard-timeout message (2026-10-23) sits right behind it, for the
+    same reason: no test assertion ran, so "the code does not pass" is
+    not what the message says either.
     """
     if not error:
         return UNKNOWN
@@ -439,6 +483,19 @@ def _classify_kind(error):
     # keep retrying, when in truth there is no verdict to act on at all.
     if error.startswith(VERIFIER_TIMEOUT_PREFIX):
         return VERIFIER_TIMEOUT
+    # 2026-10-23: the executor's own hard-timeout message. Placed right
+    # after the verifier prefix (which is checked first, because the
+    # verifier's spelling is the more specific one) and before every
+    # other rule, because this message is about the CODER running out
+    # of work budget and nothing else. It used to fall through to the
+    # generic timeout rule, which does NOT match it — the executor says
+    # "Hard timeout after ", and the rule looks for "HARD TIMEOUT" /
+    # "timed out" / "Timeout" — and therefore all the way through to
+    # ``test_failure``. That is the wrong answer twice over: no test
+    # assertion ran, and "the task is too big" is not what a run that
+    # ran out of time is telling us.
+    if error.startswith(CODER_TIMEOUT_PREFIX):
+        return CODER_TIMEOUT
     # A refusal by the second-pass audit: the evidence was rejected.
     if error.startswith("audit_second_pass_failed"):
         return REPORT_FORMAT

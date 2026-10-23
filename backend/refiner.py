@@ -49,6 +49,65 @@ _JSON_ONLY_REMINDER = (
 )
 
 
+class _UnusableRefinerReply(Exception):
+    """The refiner's reply was JSON, but not a task list we can use.
+
+    Raised for a reply that is neither the ``{"tasks": [...]}`` object
+    the prompt asks for nor a bare array of task objects: a bare
+    string, a number, ``None``, or an array whose entries are not task
+    objects.
+
+    Handled exactly like an unparseable reply — the round is re-asked
+    for JSON only — because that is what it IS from the caller's point
+    of view: the model did not answer in the shape the answer has to
+    have. Before this existed, such a reply reached
+    ``response.get("tasks", tasks)`` and raised ``AttributeError``,
+    which killed the whole refinement: the task list came back
+    unchanged, the caller logged ``refine_exception``, and the plan
+    stalled with the failing task still marked failed.
+    """
+
+
+def _refiner_tasks_from_response(response, fallback: List[Dict]) -> List[Dict]:
+    """The task list carried by the refiner's reply.
+
+    Two shapes are accepted:
+
+    * ``{"tasks": [...]}`` — the object the prompt asks for. The
+      ``tasks`` key wins; when it is absent the caller's current task
+      list is used, exactly as before.
+    * ``[...]`` — a bare array of task objects. The model sometimes
+      answers with the array alone; the reply is perfectly usable and
+      dropping it (or crashing on ``.get``) loses the whole answer.
+
+    Anything else raises :class:`_UnusableRefinerReply`, which the
+    caller handles exactly like a JSON parse failure: a re-ask for JSON
+    only, then the pre-existing failure path if that does not help.
+
+    Args:
+        response: Whatever the coding tool returned for the round.
+        fallback: The task list to use when the reply is an object
+            without a ``tasks`` key.
+    """
+    if isinstance(response, dict):
+        return response.get("tasks", fallback)
+    if isinstance(response, list):
+        if all(isinstance(item, dict) for item in response):
+            return response
+        raise _UnusableRefinerReply(
+            "refiner reply is an array whose entries are not task objects"
+        )
+    raise _UnusableRefinerReply(
+        f"refiner reply is a {type(response).__name__}, not a task list"
+    )
+
+
+#: "The round produced no task list at all". Distinct from a task list
+#: that happens to be empty — and from a reply whose ``tasks`` key
+#: holds ``None``, which is a malformed reply rather than no reply.
+_NO_TASKS = object()
+
+
 class RefinerExhausted(Exception):
     """Raised when the refiner cannot produce a valid task list."""
 
@@ -150,9 +209,9 @@ class TaskRefiner:
                     )
                 # 2026-09-17 (C3): tolerate an unparseable reply by
                 # re-asking before treating the round as a no-op.
-                response = None
-                json_error: Optional[json.JSONDecodeError] = None
+                json_error: Optional[Exception] = None
                 round_context = current_context
+                new_tasks = _NO_TASKS
                 for json_retry in range(MAX_REFINER_JSON_RETRIES + 1):
                     try:
                         response = query_json_in_session(
@@ -160,9 +219,25 @@ class TaskRefiner:
                             system_instruction=refiner_prompt,
                             scene="refiner",
                         )
+                        # 2026-10-23: a reply that is not a task list is
+                        # handled exactly like a reply that is not
+                        # JSON — both are "the model did not answer in
+                        # the shape the answer has to have", and both
+                        # cost one re-ask for JSON only. The shape check
+                        # lives INSIDE this loop for that reason: a
+                        # wrong-shaped answer must consume a retry, not
+                        # fall through to ``response.get(...)`` and
+                        # raise ``AttributeError``.
+                        new_tasks = _refiner_tasks_from_response(response, tasks)
                         break
-                    except json.JSONDecodeError as exc:
+                    except (json.JSONDecodeError, _UnusableRefinerReply) as exc:
                         json_error = exc
+                        # A rejected reply leaves no task list behind:
+                        # without this, the loop would exit with the
+                        # unusable reply still bound to ``response`` and
+                        # the exhaustion check below would let it
+                        # through.
+                        new_tasks = _NO_TASKS
                         # Only announce a re-ask that will actually happen;
                         # the final failure is reported by the caller's
                         # ``refine_exception`` path.
@@ -173,7 +248,7 @@ class TaskRefiner:
                             self.logger.warning(
                                 "refiner_json_retry",
                                 f"Refiner reply for task [{last_task_id}] was not "
-                                f"parseable JSON "
+                                f"a usable task list "
                                 f"(retry {json_retry + 1}/{MAX_REFINER_JSON_RETRIES}); "
                                 f"re-asking for JSON only",
                                 task_id=last_task_id,
@@ -185,14 +260,12 @@ class TaskRefiner:
                                 },
                             )
                         round_context = current_context + _JSON_ONLY_REMINDER
-                if response is None:
-                    # Budget exhausted — surface the parse error so the
-                    # caller's existing failure path handles it.
+                if new_tasks is _NO_TASKS:
+                    # Budget exhausted — surface the parse/shape error so
+                    # the caller's existing failure path handles it.
                     raise json_error or json.JSONDecodeError(
                         "no JSON object / array boundaries found", "", 0
                     )
-
-                new_tasks = response.get("tasks", tasks)
                 if self.logger:
                     self.logger.debug(
                         "refiner_query_completed",

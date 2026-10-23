@@ -35,11 +35,14 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from failure_classification import (  # noqa: E402
+    CODER_TIMEOUT,
     EMPTY_DIFF,
     INFRA,
     REPORT_FORMAT,
+    RETRY_THEN_SPLIT,
     TEST_FAILURE,
     UNKNOWN,
+    VERIFIER_TIMEOUT,
     classify_failure,
 )
 
@@ -65,6 +68,28 @@ EMPTY_DIFF_ERROR = (
 )
 HARD_TIMEOUT = "HARD TIMEOUT after 1800s while running task 7's test_command"
 REAL_TEST_FAILURE = "AssertionError: expected 3, got 2 (tests/test_calc.py::test_sum)"
+
+# 2026-10-23: the executor's own hard-timeout message, in both the
+# shapes ``coding_tool.HardTimeoutError`` produces — the work-budget
+# variant and the stdout-silence variant.
+#
+# Before the ``coder_timeout`` kind existed these fell through EVERY
+# timeout rule and were filed as ``test_failure``: the rule matches
+# "HARD TIMEOUT" / "timed out" / "Timeout", and the executor writes
+# "Hard timeout after " — none of which it matches. So the run told the
+# refiner "the code does not pass, this task is too big, split it",
+# for a task whose test suite never ran at all.
+CODER_HARD_TIMEOUT = (
+    "Hard timeout after 3600s of work time (elapsed=3600.0s of wall clock)"
+)
+CODER_SILENCE_TIMEOUT = (
+    "Hard timeout after 600s of stdout silence "
+    "(elapsed=605.5s, last_line='pytest FAILED 3')"
+)
+# The verifier's own spelling, and a generic timeout that is neither
+# the coder's nor the verifier's.
+VERIFIER_TIMEOUT_ERROR = "verifier_timeout: pytest exceeded its budget"
+GENERIC_TIMEOUT = "operation timed out"
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +122,48 @@ def test_empty_error_is_unknown_not_a_failure():
     an absence of information.
     """
     assert classify_failure("").kind == UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# 1b. The three timeout kinds are three different facts (2026-10-23)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [CODER_HARD_TIMEOUT, CODER_SILENCE_TIMEOUT],
+)
+def test_coder_hard_timeout_is_its_own_kind(error):
+    """The sub-agent used up its work budget. That is NOT a test
+    failure: no assertion ever ran, so "the code does not pass" is not
+    what the message says — and "this task is too big" is not what a run
+    that ran out of time is telling us.
+    """
+    failure = classify_failure(error)
+    assert failure.kind == CODER_TIMEOUT
+    assert failure.kind != TEST_FAILURE
+
+
+def test_verifier_timeout_keeps_its_kind():
+    """The verifier running out of budget is a different fact from the
+    coder running out of budget, and neither may swallow the other.
+    """
+    assert classify_failure(VERIFIER_TIMEOUT_ERROR).kind == VERIFIER_TIMEOUT
+
+
+def test_generic_timeout_stays_infra():
+    """A timeout that is neither the executor's nor the verifier's is
+    still an environment problem, and stays ``infra``.
+    """
+    assert classify_failure(GENERIC_TIMEOUT).kind == INFRA
+
+
+def test_coder_timeout_remedy_is_retry_then_split():
+    """The remedy is what the executor consumes: the FIRST occurrence
+    buys one restart (the executor's extra attempt) with the same
+    budget, and only a repeat is allowed to reach the refiner's split.
+    """
+    assert classify_failure(CODER_HARD_TIMEOUT).remedy == RETRY_THEN_SPLIT
 
 
 def test_signature_is_scoped_by_kind():
