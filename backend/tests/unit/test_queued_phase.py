@@ -54,8 +54,16 @@ def test_manual_path_is_preserved():
 
 
 def test_queued_cannot_jump_into_unrelated_phases():
+    """``queued`` stays a narrow gate.
+
+    2026-10-23: ``stopped`` joined the row. It is the one addition,
+    and it is not an "unrelated phase": it is where the operator's
+    stop parks a queued plan. The narrowness the test protects is
+    that a queued plan cannot jump into the workflow (prd_review,
+    verification, …) — that is unchanged.
+    """
     allowed = set(PHASE_TRANSITIONS["queued"])
-    assert allowed == {"ready", "executing"}, (
+    assert allowed == {"ready", "executing", "stopped"}, (
         f"queued must be a narrow gate; got {sorted(allowed)}"
     )
 

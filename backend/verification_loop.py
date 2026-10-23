@@ -3448,6 +3448,53 @@ def _revive_failed_repair_task(
     return True
 
 
+def _is_repair_task_id(tid: str, task_group: Optional[str]) -> bool:
+    """Is this task id one of the repair round's tasks?
+
+    2026-09-12 plan v2: accept BOTH the legacy ``RP-<n>`` id format
+    (pre-v9) AND the post-v9 ``R<round>-<i>`` id format. The two
+    share the ``task_group`` prefix ``repair`` (and its
+    ``repair-round-<N>`` variants) so we match on ``task_group``
+    rather than the literal ``RP-`` prefix — which would otherwise
+    silently drop R6-1 / R6-2 from the executor queue.
+    See also [[ac-repair-task-persistence-2026-09-12]] for the
+    parallel ``_TERMINAL_REPAIR_TASK_GROUP_PREFIX`` guard in the
+    refiner at agent.py:5940.
+
+    2026-10-23: the id shape that ``RepairTaskAssembler`` actually
+    produces is LOWERCASE ``repair-r<round>-<seq>`` (``repair-r1-01``)
+    and its breakdown children (``repair-r1-06-1``) — and those rows
+    carry NO ``task_group``. The old predicate matched neither branch:
+    ``"repair-r3-01-1"`` does not start with ``"RP-"`` nor with
+    ``"R"`` (it starts with a lowercase ``r``), and its ``task_group``
+    is NULL. So the "has the repair batch drained?" guard
+    (:func:`_get_pending_repair_tasks`) always saw an empty list and
+    never noticed a queued repair task.
+
+    The comparison is case-insensitive so the real shape and the
+    legacy ``RP-`` shape are both recognised. The predicate stays
+    NARROW on purpose: a task id is a repair task when it carries a
+    known repair prefix — never merely because it contains the word
+    "repair" somewhere.
+    """
+    if not isinstance(tid, str) or not tid:
+        return False
+    tid_l = tid.lower()
+    if tid_l.startswith("repair-") or tid_l.startswith("rp-"):
+        # The real assembler shape (``repair-r3-01-1``) and the legacy
+        # ``RP-<n>`` shape, case-insensitively.
+        return True
+    # The legacy post-v9 ``R<round>-<i>`` shape. The parentheses spell
+    # out the precedence: ``and`` binds tighter than ``or``, so this
+    # reads ``RP-*`` OR (``R*`` AND ``contains a dash``).
+    if tid.startswith("RP-") or (tid.startswith("R") and "-" in tid):
+        return True
+    # Defensive fallback: even if id has an unusual prefix, the
+    # orchestrator-stamped ``task_group`` is the authoritative
+    # marker — ``repair*`` indicates a repair task.
+    return bool(task_group) and task_group.startswith("repair")
+
+
 def _get_pending_repair_tasks(
     plan_id: str,
     failed_vp_ids: Optional[Iterable[str]] = None,
@@ -3464,7 +3511,7 @@ def _get_pending_repair_tasks(
     chain.
 
     This helper reads ``state.db.plan_tasks`` directly and filters for
-    repair-shaped ids (see :func:`_is_repair_task_id` below). Empty list
+    repair-shaped ids (see :func:`_is_repair_task_id` above). Empty list
     on DB error so the caller can fall back to the orchestrator's
     ``repair_tasks`` payload.
 
@@ -3547,25 +3594,6 @@ def _get_pending_repair_tasks(
     round_failures: set = set(failed_vp_ids) if failed_vp_ids else set()
     split_parents = _split_parent_ids(all_tasks)
     pending: List[Dict[str, Any]] = []
-    # 2026-09-12 plan v2: accept BOTH the legacy ``RP-<n>`` id format
-    # (pre-v9) AND the post-v9 ``R<round>-<i>`` id format. The two
-    # share the ``task_group`` prefix ``repair`` (and its
-    # ``repair-round-<N>`` variants) so we match on ``task_group``
-    # rather than the literal ``RP-`` prefix — which would otherwise
-    # silently drop R6-1 / R6-2 from the executor queue.
-    # See also [[ac-repair-task-persistence-2026-09-12]] for the
-    # parallel ``_TERMINAL_REPAIR_TASK_GROUP_PREFIX`` guard in the
-    # refiner at agent.py:5940.
-    def _is_repair_task_id(tid: str, task_group: Optional[str]) -> bool:
-        if not isinstance(tid, str) or not tid:
-            return False
-        if tid.startswith("RP-") or tid.startswith("R") and "-" in tid:
-            # Cover both legacy ``RP-*`` and ``R<n>-<i>`` shapes.
-            return True
-        # Defensive fallback: even if id has an unusual prefix, the
-        # orchestrator-stamped ``task_group`` is the authoritative
-        # marker — ``repair*`` indicates a repair task.
-        return bool(task_group) and task_group.startswith("repair")
     for tid, entry in all_tasks.items():
         if not isinstance(entry, dict):
             continue
