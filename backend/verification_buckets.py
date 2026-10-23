@@ -12,6 +12,10 @@
     bucket_for_status(status, vp_id=None, retired=None) -> str | None
     derive_index_buckets(verdicts, *, retired=None) -> dict[str, list[str]]
 
+外加一个**文本**层面的纯函数 ``blocked_reason(detail)``：BLOCKED 留在失败桶
+里（桶规则不变），但它的 reason 一律带 ``BLOCKED — `` 前缀，好让读报告的人
+分得出「验不下去」和「验了没过」。
+
 纯函数的含义（与「读侧能不能复用」直接相关）：
 
   * 不碰 I/O、不碰全局状态、不改入参；
@@ -55,6 +59,35 @@ BUCKET_DEFERRED = "deferred_vps"
 #: 计划作废的两种标记（与 ``VerificationExecutor._vp_retired_marker`` 同名）。
 RETIRED_OBSOLETE = "obsolete"
 RETIRED_SUPERSEDED_BY = "superseded_by"
+
+#: BLOCKED 裁决的 reason 前缀。BLOCKED **留在失败桶**里（见
+#: :func:`bucket_for_status`），但「验不下去」和「验了没过」是两种语义 ——
+#: 混在同一个桶里没人分得出来。这个前缀让读报告的人一眼看出是哪一种。
+BLOCKED_REASON_PREFIX = "BLOCKED — "
+
+
+def blocked_reason(detail: str) -> str:
+    """给 BLOCKED 的 reason 加上统一的前缀（``BLOCKED — ``）。
+
+    四个 BLOCKED 产出点（二进制过期 / method 退役 / 服务起不来 / 安全网拦截）
+    都走这一个函数 —— 各写各的前缀迟早漂移（前缀改一次要改四处）。
+
+    三条规则：
+
+      * 普通 detail → ``"BLOCKED — " + detail``（前缀**恰好一次**）；
+      * 已经带前缀的 detail → **不再叠加**（幂等，重复调用安全）；
+      * 空 detail → ``"BLOCKED — (no detail)"`` —— 不得只剩一个前缀，
+        那等于没说发生了什么。
+
+    :param detail: 具体的阻塞原因（可为空）。
+    :return: 带前缀的 reason 文本。
+    """
+    text = (detail or "").strip()
+    if not text:
+        return f"{BLOCKED_REASON_PREFIX}(no detail)"
+    if text.startswith(BLOCKED_REASON_PREFIX):
+        return text
+    return f"{BLOCKED_REASON_PREFIX}{text}"
 
 
 def _retired_marker(vp_id: Any, retired: Optional[Mapping[str, str]]) -> Optional[str]:
@@ -173,6 +206,8 @@ __all__ = [
     "BUCKET_DEFERRED",
     "RETIRED_OBSOLETE",
     "RETIRED_SUPERSEDED_BY",
+    "BLOCKED_REASON_PREFIX",
+    "blocked_reason",
     "bucket_for_status",
     "derive_index_buckets",
 ]
