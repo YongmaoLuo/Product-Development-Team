@@ -29,6 +29,20 @@ import threading
 # this module (see the wiring at the bottom of server.py).
 import server as _server
 
+# 2026-10-23: 读侧与写侧共用同一条「verdicts → 索引桶」规则。
+# ``verification_buckets`` 是那条规则的**唯一**实现：写侧
+# ``VerificationExecutor._backfill_index_lists_from_verdicts`` 与读侧
+# ``_derive_vp_buckets`` 都从它取，两边不可能再漂移。它是叶子模块
+# （只依赖 typing），所以这里可以安全地模块级导入。
+from verification_buckets import (
+    BUCKET_COMPLETED,
+    BUCKET_FAILED,
+    BUCKET_SKIPPED,
+    RETIRED_OBSOLETE,
+    RETIRED_SUPERSEDED_BY,
+    derive_index_buckets,
+)
+
 router = APIRouter()
 
 
@@ -2041,6 +2055,119 @@ def _build_verification_progress(plan_id: str) -> dict:
         _server._close_state_machine(sm)
 
 
+def _retired_vps_from_plan(plan_vps: List[dict]) -> Dict[str, str]:
+    """The plan's retired VPs → the marker that retired each one.
+
+    Mirrors ``VerificationExecutor._vp_retired_marker``: ``obsolete``
+    wins over ``superseded_by`` — both mean "this VP is not run any
+    more", and only the FAILED handling differs between them (obsolete
+    → no bucket at all, superseded_by → skipped).
+    """
+    retired: Dict[str, str] = {}
+    for vp in plan_vps or []:
+        if not isinstance(vp, dict):
+            continue
+        if vp.get("obsolete"):
+            marker = RETIRED_OBSOLETE
+        elif vp.get("superseded_by"):
+            marker = RETIRED_SUPERSEDED_BY
+        else:
+            continue
+        vp_id = vp.get("id")
+        if vp_id:
+            retired[str(vp_id)] = marker
+    return retired
+
+
+def _verdicts_by_vp_id(
+    verification_row: Optional[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """The row's verdict table → ``{vp_id: verdict}`` (last write wins).
+
+    ``plan_verification.verdicts`` is a **list** of ``{"vp_id", "status",
+    ...}`` dicts — the executor appends one per judged VP. The legacy
+    on-disk shape (``{vp_id: verdict}``) is accepted too.
+
+    Duplicate verdicts for one VP are normalised here: the **last** one
+    wins, mirroring the write side (the verdict map is a dict, so a
+    later write overwrites the earlier one). Entries that cannot be
+    attributed to a VP (no ``vp_id``) are dropped — a verdict without a
+    subject says nothing about any bucket.
+    """
+    raw = (verification_row or {}).get("verdicts")
+    entries: List[Tuple[Any, Any]] = []
+    if isinstance(raw, dict):
+        entries = list(raw.items())
+    elif isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, dict):
+                entries.append((entry.get("vp_id"), entry))
+    out: Dict[str, Dict[str, Any]] = {}
+    for vp_id, verdict in entries:
+        if not isinstance(verdict, dict):
+            continue
+        key = str(vp_id) if vp_id is not None else ""
+        if not key:
+            continue
+        out[key] = verdict
+    return out
+
+
+def _derive_vp_buckets(
+    verification_row: Optional[Dict[str, Any]],
+    plan_vps: List[dict],
+    progress: Dict[str, Any],
+) -> Dict[str, List[str]]:
+    """The three terminal buckets — derived from the verdict table.
+
+    ``progress_state``'s ``completed_vps`` / ``failed_vps`` /
+    ``skipped_vps`` are a **cache**, not the truth. A historical bad row
+    (one VP listed as both failed *and* completed) is served to the card
+    verbatim, and the repair loop then re-runs a VP that is actually
+    SKIPPED. The truth is the verdict table
+    (``plan_verification.verdicts``) — the write side has derived its
+    index lists from it since 2026-08-25
+    (``VerificationExecutor._backfill_index_lists_from_verdicts``), and
+    the rule itself lives in :mod:`verification_buckets`.
+
+    The rules:
+
+      * **verdicts 非空** → the three lists are derived from the
+        verdicts and ``progress_state``'s lists are ignored
+        **entirely** (a row that has any verdict never falls back to
+        the cached lists);
+      * **verdicts 为空**（真正的旧行）→ fall back to the stored lists.
+        That fallback exists for the migration window only;
+      * DEFERRED lands in no terminal bucket — it stays *pending*
+        (Phase 2 will re-run it);
+      * the plan's retired VPs follow the write side's rules (see
+        :mod:`verification_buckets`).
+
+    Deliberately **not** done here: judging whether a verdict is stale.
+    ``_record_result`` writes the DB row without the command
+    fingerprint, so ``verdict_provenance.is_stale`` would call every
+    verdict stale and empty every bucket.
+    """
+    raw_verdicts = (verification_row or {}).get("verdicts")
+    if not raw_verdicts:
+        # 真正的旧行：只有缓存的三个列表。迁移窗口内保持旧行为。
+        return {
+            "completed_vps": list(progress.get("completed_vps") or []),
+            "failed_vps": list(progress.get("failed_vps") or []),
+            "skipped_vps": list(progress.get("skipped_vps") or []),
+        }
+
+    buckets = derive_index_buckets(
+        _verdicts_by_vp_id(verification_row),
+        retired=_retired_vps_from_plan(plan_vps),
+    )
+    return {
+        "completed_vps": list(buckets[BUCKET_COMPLETED]),
+        "failed_vps": list(buckets[BUCKET_FAILED]),
+        "skipped_vps": list(buckets[BUCKET_SKIPPED]),
+    }
+
+
 def _verification_progress_body(
     plan_id: str, sm: Optional[Tuple[Any, ...]],
 ) -> dict:
@@ -2158,9 +2285,15 @@ def _verification_progress_body(
             if isinstance(vp_id, str):
                 plan_index[vp_id] = vp
 
-    completed_vps: List[str] = list(progress.get("completed_vps") or [])
-    failed_vps: List[str] = list(progress.get("failed_vps") or [])
-    skipped_vps: List[str] = list(progress.get("skipped_vps") or [])
+    # 2026-10-23: the three terminal lists are **derived** from the
+    # verdict table, not read from ``progress_state``'s cache — a
+    # historical bad row (one VP listed as both failed and completed)
+    # used to be served to the card verbatim. See
+    # :func:`_derive_vp_buckets`.
+    _buckets = _derive_vp_buckets(verification_row, plan_vps, progress)
+    completed_vps: List[str] = list(_buckets["completed_vps"])
+    failed_vps: List[str] = list(_buckets["failed_vps"])
+    skipped_vps: List[str] = list(_buckets["skipped_vps"])
 
     current_vp_id = progress.get("current_vp")
     in_flight: Optional[str] = (

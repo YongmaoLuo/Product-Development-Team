@@ -66,6 +66,18 @@ from utils.atomic_io import atomic_write_json
 # 2026-09-15: verdict 的出处 —— 结论只对产生它的那条
 # 命令有效。见 ``verification_verdict_provenance`` 的模块 docstring。
 import verification_verdict_provenance as verdict_provenance
+# 2026-10-23: 索引桶的**唯一**派生规则（纯函数）。写侧（``record_verdict``）
+# 与读侧（报告 / 卡片 / API）共用它，两份规则必然漂移 —— 漂移的产物是
+# 「同一个 VP 既在失败桶又在完成桶」。见 ``verification_buckets`` 的模块
+# docstring。
+from verification_buckets import (
+    BUCKET_COMPLETED,
+    BUCKET_DEFERRED,
+    BUCKET_FAILED,
+    BUCKET_SKIPPED,
+    bucket_for_status,
+    derive_index_buckets,
+)
 # 2026-09-16 两阶段验证：Phase 1 子任务级 / Phase 2 全量关卡。
 from verification_phases import (
     PHASE_CORE,
@@ -112,6 +124,27 @@ ALLOWED_STATUSES = ("PASSED", "FAILED", "SKIPPED", "BLOCKED", "DEFERRED")
 #: Required keys for a valid verdict payload. The contract is
 #: position-free: any extra keys are ignored.
 REQUIRED_VERDICT_KEYS = ("status", "reasons", "evidence")
+
+
+# Index-bucket plumbing -------------------------------------------------------
+
+#: 索引桶名 → 执行器里存这个桶成员的字段名。``BUCKET_*`` 常量的值就是
+#: :mod:`verification_buckets` 返回 dict 的键名，字段名与之一一对应。
+_BUCKET_MEMBER_ATTR: Dict[str, str] = {
+    BUCKET_COMPLETED: "_completed_vps",
+    BUCKET_FAILED: "_failed_vps",
+    BUCKET_SKIPPED: "_skipped_vps",
+    BUCKET_DEFERRED: "_deferred_vps",
+}
+
+#: 三个**终态**桶 → BaseExecutor 里的同义字段。``DEFERRED`` 没有对应项 ——
+#: 它不是终态成功：进 ``completed_set`` 会让下一轮跳过它，而被延后的
+#: 全量关卡必须在下轮真跑。
+_TERMINAL_BUCKET_MIRROR_ATTR: Dict[str, str] = {
+    BUCKET_COMPLETED: "_completed_items",
+    BUCKET_FAILED: "_failed_items",
+    BUCKET_SKIPPED: "_skipped_items",
+}
 
 #: Default filename for the on-disk state file. The state file lives
 #: next to the other verification artifacts under ``plan_dir`` so the
@@ -604,14 +637,21 @@ class VerificationExecutor(BaseExecutor):
           3. Remove ``vp_id`` from ``self._pending_vps`` (idempotent
             — recording the same VP twice is a no-op for the
              pending set).
-          4. If ``self.verif_repo`` is bound, route the verdict
+          4. Place ``vp_id`` into **exactly one** index bucket (see
+            :meth:`_place_in_bucket`).  The bucket comes from
+            :func:`verification_buckets.bucket_for_status` — the one
+            rule the read side shares.  A VP that changes status
+            leaves its previous bucket: the buckets are mutually
+            exclusive, so "failed then passed" ends up in *completed
+            only*, never in both.
+          5. If ``self.verif_repo`` is bound, route the verdict
              through
              :meth:`state_machine.repositories.verification_repository.VerificationRepository.append_verdict`
              (a single ``BEGIN IMMEDIATE`` + ``COMMIT`` transaction)
              and SKIP the legacy on-disk JSON state write.  This
              is the task-11 contract: the subagent callback path
              produces zero ``verification_*_state.json`` files.
-          5. Otherwise, fall back to ``_save_state()`` (the
+          6. Otherwise, fall back to ``_save_state()`` (the
              historical atomic-write path).
 
         The future ``run()`` main loop will call this once per VP
@@ -643,20 +683,21 @@ class VerificationExecutor(BaseExecutor):
         # is not in the pending list, which would mask a benign
         # double-record. Use a filter to keep behaviour predictable.
         self._pending_vps = [v for v in self._pending_vps if v != vp_id]
-        # Maintain the failed / skipped index lists. Re-recording a
-        # verdict for the same VP (a benign double-record, e.g. the
-        # short-circuit path that has already pre-populated the
-        # list) is a no-op for the index so we dedupe on vp_id.
+        # Maintain the four index buckets. 2026-10-23: 分桶规则来自
+        # ``verification_buckets.bucket_for_status`` —— 与读侧（报告 / 卡片 /
+        # API）共用的**唯一**一份规则；写侧不再自带一份判断。
+        #
+        # ``_place_in_bucket`` 保证四个桶**互斥**：同一个 VP 换状态时旧桶里
+        # 那份必须消失。以前这里只往目标桶追加，于是「先 FAILED 后 PASSED」
+        # 的 VP 同时留在 failed 与 completed —— 仪表盘报「1 失败 1 通过」，
+        # 而裁决表里只有一条结论。
         status = verdict.get("status")
-        if status == "FAILED" and vp_id not in self._failed_vps:
-            self._failed_vps.append(vp_id)
-        elif status == "SKIPPED" and vp_id not in self._skipped_vps:
-            self._skipped_vps.append(vp_id)
-        elif status == "DEFERRED" and vp_id not in self._deferred_vps:
-            # 2026-09-16 两阶段：Phase 2 关卡被门禁延后。刻意不进
-            # ``_skipped_vps``（那是"终态成功"，会让下一轮跳过它），
-            # 也不进 ``_failed_vps``（没验过，不是失败）。
-            self._deferred_vps.append(vp_id)
+        bucket = bucket_for_status(
+            status,
+            vp_id=vp_id,
+            retired=self._plan_retired_vps(),
+        )
+        self._place_in_bucket(vp_id, bucket)
         if self.verif_repo is not None:
             # Task-11 contract: route through the state-machine
             # repository, skip the legacy JSON write.
@@ -679,6 +720,62 @@ class VerificationExecutor(BaseExecutor):
             )
             return
         self._save_state()
+
+    # ------------------------------------------------------------------
+    # Index buckets (mutually exclusive)
+    # ------------------------------------------------------------------
+
+    def _place_in_bucket(self, vp_id: str, bucket: Optional[str]) -> None:
+        """Put ``vp_id`` into **exactly one** index bucket.
+
+        The four buckets are mutually exclusive by contract: a VP that
+        changes status leaves its previous bucket.  "Failed then passed"
+        must end up in *completed only* — the dashboard reporting "1
+        failed / 1 passed" for a verdict table that holds a single row
+        is one of the hardest drifts to spot.
+
+        Args:
+            vp_id: The VP id.
+            bucket: The target bucket (one of the ``BUCKET_*`` names).
+                ``None`` means "no bucket at all" — the case for a VP
+                the plan itself retired (``obsolete``): producing a
+                failure for a criterion nobody asks for pollutes both
+                the failure counters and the repair task's input.
+
+        Notes:
+            Re-recording the same status is a no-op for the bucket
+            (no duplicate entry, and the existing position is kept —
+            bucket order follows the verdict-recording order so the
+            counters line up with the per-VP verdict table).
+
+            The three *terminal* buckets are mirrored into
+            BaseExecutor's ``completed_items`` / ``failed_items`` /
+            ``skipped_items``: ``_save_progress`` copies those fields
+            **back** into this class, so without the mirror the bucket
+            this method just wrote would be wiped by the next
+            ``_save_state()``.
+        """
+        if bucket is not None and bucket not in _BUCKET_MEMBER_ATTR:
+            # 一个拼错的桶名如果被默默接受，VP 会「哪个桶都不是」——
+            # 静默的错分桶比响亮的报错难查得多。
+            raise ValueError(
+                f"unknown index bucket {bucket!r}; expected one of "
+                f"{sorted(_BUCKET_MEMBER_ATTR)}"
+            )
+        for name, attr in _BUCKET_MEMBER_ATTR.items():
+            members: List[str] = getattr(self, attr)
+            if name == bucket:
+                if vp_id not in members:
+                    members.append(vp_id)
+            else:
+                # Remove it from every other bucket (``while`` rather
+                # than ``if``: a bucket that already carried the VP
+                # twice must not keep a copy behind).
+                while vp_id in members:
+                    members.remove(vp_id)
+        # Keep BaseExecutor's view of the same three buckets in sync.
+        for name, attr in _TERMINAL_BUCKET_MIRROR_ATTR.items():
+            setattr(self, attr, list(getattr(self, _BUCKET_MEMBER_ATTR[name])))
 
     # ------------------------------------------------------------------
     # Validation
@@ -912,6 +1009,16 @@ class VerificationExecutor(BaseExecutor):
         VPs were recorded), so the dashboard's failure / skip
         counters match the per-VP verdict table row-for-row.
 
+        2026-10-23: 分桶本身**委托**给
+        :func:`verification_buckets.derive_index_buckets` —— 与读侧（报告 /
+        卡片 / API）、``record_verdict``、``_record_result`` 共用的**唯一**一份
+        规则。这个方法以前自带一份 status → 桶的判断，于是同一个裁决两处说法
+        不同（``BLOCKED`` 在 ``_record_result`` 里进失败桶，在这里却哪儿都不是）。
+        两份规则必然漂移 —— 漂移的产物是「同一个 VP 既在失败桶又在完成桶」。
+        委托之后，桶的语义只看 :mod:`verification_buckets` 的 docstring；
+        这里仍然保留的两步预处理是 **stale 摘除**（结论的出处过期）与
+        **retired 标记**（计划自己不再要求这个判据），两者都不是分桶规则。
+
         # 2026-08-25: ``_completed_vps`` was the universal set of
         # VPs that produced a terminal verdict (PASSED, FAILED, or
         # SKIPPED). That contract was incompatible with the resume
@@ -939,11 +1046,6 @@ class VerificationExecutor(BaseExecutor):
         # the round skipped it as green. See
         # ``verification_verdict_provenance``.
         """
-        completed: List[str] = []
-        failed: List[str] = []
-        skipped: List[str] = []
-        deferred: List[str] = []
-
         # 2026-09-15: 出处对不上的结论先摘掉。
         #
         # 判据是**命令有没有变过**，不是"操作者重置了轮次计数"——重置常常
@@ -972,49 +1074,20 @@ class VerificationExecutor(BaseExecutor):
         # 刻意**不 pop** ``_verdicts``（与上面 stale 的处理不同）：那份裁决
         # 是审计痕迹，报告侧在 :meth:`collect_verdicts` 里过滤即可。
         # ``superseded_by`` 的父 VP 尤其不能摘 —— 它的 SPLIT 裁决是"父不重跑"
-        # 这条契约的承重件（见下面 SPLIT 分支），摘掉等于让拆分过的大 VP
-        # 每轮重跑一次。
+        # 这条契约的承重件，摘掉等于让拆分过的大 VP 每轮重跑一次。
         retired = self._plan_retired_vps()
 
-        for vp_id, verdict in self._verdicts.items():
-            status = verdict.get("status") if isinstance(verdict, dict) else None
-            if status == "FAILED" and str(vp_id) in retired:
-                if retired[str(vp_id)] == "superseded_by":
-                    # 父 VP 已被子 VP 取代，结论由子 VP 承担。仍进 skipped
-                    # （= ``completed_set``），否则下一轮会把拆分过的那条
-                    # 大 VP 重新跑一遍 —— 那正是拆分要避免的代价。
-                    skipped.append(vp_id)
-                # ``obsolete`` 的 VP 进哪个桶都不影响重跑判定：
-                # ``_build_items_from_plan`` 已经把它们排除在 items 之外，
-                # 它们永远进不了 pending。刻意不进 completed —— 把一个
-                # 从没验证过的东西记成"验证通过"同样是说谎。
-                continue
-            if status == "FAILED":
-                failed.append(vp_id)
-            elif status == "SKIPPED":
-                skipped.append(vp_id)
-            elif status == "PASSED":
-                completed.append(vp_id)
-            elif status == "SPLIT":
-                # 2026-09-14: a VP the repair-phase judge split into
-                # sub-VPs. The parent must NOT re-run — its children are
-                # in ``verification_plan.json`` (written by
-                # ``vp_split.VpSplitter``) and carry the real verdicts.
-                # Bucketing it with SKIPPED puts it in BaseExecutor's
-                # ``completed_set`` so a resumed round runs only the
-                # children.
-                skipped.append(vp_id)
-            elif status == "DEFERRED":
-                # 2026-09-16 两阶段：Phase 2 关卡被门禁延后。**刻意不进任何
-                # "终态成功"桶**——BaseExecutor 的 ``completed_set`` 是
-                # completed ∪ skipped，不在里面才会在下一轮重跑，这正是
-                # "Phase 1 修好之后要把全量关卡真正跑一遍"的语义。
-                deferred.append(vp_id)
-            # Unknown / None status: skip (don't add to any bucket).
-        self._completed_vps = completed
-        self._failed_vps = failed
-        self._skipped_vps = skipped
-        self._deferred_vps = deferred
+        # 2026-10-23: 分桶规则来自 :func:`verification_buckets.
+        # derive_index_buckets` —— 与读侧（报告 / 卡片 / API）、``record_verdict``、
+        # ``_record_result`` 共用的**唯一**一份规则。这里以前自带一份 status →
+        # 桶的判断，于是同一个裁决两处说法不同（``BLOCKED`` 在 ``_record_result``
+        # 里进失败桶，在这里却因为「不认识这个 status」而哪儿都不是）。两份规则
+        # 必然漂移 —— 漂移的产物是「同一个 VP 既在失败桶又在完成桶」。
+        buckets = derive_index_buckets(self._verdicts, retired=retired)
+        self._completed_vps = buckets[BUCKET_COMPLETED]
+        self._failed_vps = buckets[BUCKET_FAILED]
+        self._skipped_vps = buckets[BUCKET_SKIPPED]
+        self._deferred_vps = buckets[BUCKET_DEFERRED]
 
     # ------------------------------------------------------------------
     # Crash-recovery pass
@@ -1401,19 +1474,28 @@ class VerificationExecutor(BaseExecutor):
         layer: List[Dict[str, Any]],
         reason: str,
     ) -> None:
-        """Mark every VP in ``layer`` as SKIPPED with ``reason``."""
+        """Mark every VP in ``layer`` as SKIPPED with ``reason``.
+
+        2026-10-23: 四个索引桶必须**互斥** —— 整层跳过时，这个 VP 之前落在
+        failed / completed 里的那份必须消失。以前这里只往 ``skipped_vps``
+        追加（而且遇到已有裁决的 VP 直接 ``continue``），于是「上一轮失败、
+        这一轮整层被门禁跳过」的 VP 同时是失败和跳过。
+
+        裁决表也一并改写成 SKIPPED（方法契约本来就是「mark **every** VP in
+        layer」）：读侧（报告 / 卡片 / API）是从裁决表派生的，桶说「跳过」而
+        裁决表还写着「失败」是最难查的一种漂移 —— 两边必须说同一件事。
+        """
         for item in layer:
             item_id = self._derive_item_id(item)
-            if item_id in self._verdicts:
-                continue
             verdict = {
                 "status": "SKIPPED",
                 "reasons": [reason],
                 "evidence": {},
             }
             self._verdicts[item_id] = verdict
-            if item_id not in self._skipped_vps:
-                self._skipped_vps.append(item_id)
+            # ``_place_in_bucket`` 负责互斥：先进 skipped，再把它从
+            # failed / completed / deferred 里摘掉。
+            self._place_in_bucket(item_id, BUCKET_SKIPPED)
         self._save_state()
 
     def _record_result(
@@ -1427,11 +1509,18 @@ class VerificationExecutor(BaseExecutor):
         keyed by VP id) and mirrors the resulting status into
         BaseExecutor's index lists so future callers that go
         through the base-class ``run()`` see consistent state.
-        ``completed_vps`` contains every VP that produced a
-        terminal verdict (PASSED / FAILED / SKIPPED) — the failed
-        and skipped subsets are kept in their own index lists so
-        the dashboard can render a "X passed / Y failed / Z
-        skipped" summary without re-scanning the verdict map.
+        ``completed_vps`` is PASSED-only — the failed and skipped
+        subsets are kept in their own index lists so the dashboard
+        can render a "X passed / Y failed / Z skipped" summary
+        without re-scanning the verdict map.
+
+        2026-10-23: 分桶改走 :meth:`_place_in_bucket` —— 四个索引桶
+        **互斥**。以前这里只往目标桶追加，于是同一个 VP 换状态时旧桶里那份
+        永远留着（「先 FAILED 后 PASSED」→ 同时在 failed 与 completed，仪表盘
+        报「1 失败 1 通过」而裁决表里只有一条结论）。桶的归属规则来自
+        :func:`verification_buckets.bucket_for_status` —— 与读侧（报告 / 卡片 /
+        API）和另一个写入点 ``record_verdict`` 共用同一份，写侧不再自带一份
+        判断。
 
         When ``self.verif_repo`` is bound, the verdict is also
         routed through
@@ -1456,20 +1545,33 @@ class VerificationExecutor(BaseExecutor):
         # FAILED). Mirror the contract change applied to
         # ``_backfill_index_lists_from_verdicts`` (this class's
         # load-time index list derivation).
-        if status == "PASSED":
-            if item_id not in self._completed_vps:
-                self._completed_vps.append(item_id)
-        elif status == "SKIPPED":
-            if item_id not in self._skipped_vps:
-                self._skipped_vps.append(item_id)
-        else:  # FAILED or any other non-PASSED / non-SKIPPED
-            if item_id not in self._failed_vps:
-                self._failed_vps.append(item_id)
-        # Mirror into BaseExecutor's in-memory fields.
+        #
+        # 2026-10-23: 分桶规则来自 ``verification_buckets.bucket_for_status``
+        # —— 与读侧（报告 / 卡片 / API）以及另一个写入点 ``record_verdict``
+        # 共用的**唯一**一份规则；写侧不再自带一份判断。
+        #
+        # ``_place_in_bucket`` 保证四个桶**互斥**：同一个 VP 换状态时旧桶里
+        # 那份必须消失。以前这里只往目标桶追加，于是「先 FAILED 后 PASSED」
+        # 的 VP 同时留在 failed 与 completed —— 仪表盘报「1 失败 1 通过」，
+        # 而裁决表里只有一条结论。
+        bucket = bucket_for_status(
+            status,
+            vp_id=item_id,
+            retired=self._plan_retired_vps(),
+        )
+        if bucket is None and status not in ALLOWED_STATUSES:
+            # 未知 status：沿用历史 else 分支的合约 —— 归入失败桶。写侧刚刚
+            # 亲手写下这条裁决，落进「哪儿都不是」等于这个 VP 永远没人修。
+            #
+            # （合法的 status 走到这里只可能是「计划已作废的 VP 的 FAILED」：
+            #  那种失败刻意不进任何桶，见 ``verification_buckets`` 的 retired
+            #  规则 —— 为一个没人要的判据生产失败会污染失败统计与修复任务的
+            #  输入。）
+            bucket = BUCKET_FAILED
+        self._place_in_bucket(item_id, bucket)
+        # Mirror into BaseExecutor's in-memory fields.（``_place_in_bucket``
+        # 已经把 completed / failed / skipped 三个镜像同步过去了。）
         self._current_item = self._current_vp
-        self._completed_items = list(self._completed_vps)
-        self._failed_items = list(self._failed_vps)
-        self._skipped_items = list(self._skipped_vps)
         if self.verif_repo is not None:
             # Task-11 contract: route through the state-machine
             # repository, skip the legacy JSON write.
