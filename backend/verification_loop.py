@@ -3823,6 +3823,87 @@ def _settle_phase_after_verification_loop(
         ps.transition_to("completed")
 
 
+# ---------------------------------------------------------------------------
+# What a round snapshot has to carry (2026-10-23)
+# ---------------------------------------------------------------------------
+#
+# The intent gate (R4) reports the repair rows it dropped on the round's
+# *result* — ``intent_conflicts`` / ``needs_operator_decision``. That
+# result lives in memory for the length of one round: neither
+# ``verification_repair_tasks.json`` nor the in-memory
+# ``_verification_state`` entry ever learned about it, so a conflict was
+# gone the moment the round ended, and a server restart erased the only
+# trace an operator could have read.
+#
+# Two helpers, used by BOTH write sites — the repair-resume callback
+# (:func:`_make_repair_on_complete`) and the auto-loop
+# (:func:`_run_auto_verification_loop_inner`) — so the snapshot cannot
+# drift between the two paths that write it.
+
+
+def _repair_intent_round_fields(result: Any) -> Dict[str, Any]:
+    """Extract the intent-gate facts a round snapshot has to carry.
+
+    Returns ``{"intent_conflicts": [...], "summary":
+    {"needs_operator_decision": bool}}``.
+
+    Nothing here raises. A result that is not a dict, or one from a round
+    that predates the gate, carries no conflicts: the snapshot says so
+    explicitly (``[]`` / ``False``) rather than guessing. The flag is
+    True when the round reported a conflict — and the result's own
+    ``needs_operator_decision`` is honoured as well, so a decision the
+    round asked for is never dropped on the way to the file.
+    """
+    conflicts: List[Dict[str, Any]] = []
+    flagged = False
+    if isinstance(result, dict):
+        raw = result.get("intent_conflicts")
+        if isinstance(raw, (list, tuple)):
+            # A conflict the gate could not describe is not a conflict
+            # an operator can act on — but the ones it could describe
+            # are copied, not aliased, so the snapshot cannot change
+            # under the writer's feet.
+            conflicts = [dict(c) for c in raw if isinstance(c, dict)]
+        raw_flag = result.get("needs_operator_decision")
+        if raw_flag is None:
+            # A snapshot read back as a "result" carries the flag inside
+            # ``summary`` — accept that shape too.
+            summary = result.get("summary")
+            if isinstance(summary, dict):
+                raw_flag = summary.get("needs_operator_decision")
+        flagged = bool(raw_flag)
+    return {
+        "intent_conflicts": conflicts,
+        "summary": {"needs_operator_decision": bool(conflicts) or flagged},
+    }
+
+
+def _build_repair_round_entry(
+    round_number: Any,
+    tasks: Any,
+    result: Any,
+    generated_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build one round entry for ``verification_repair_tasks.json``.
+
+    The entry is what the round accumulation and the card readers see:
+    ``round`` / ``generated_at`` / ``tasks``, plus the intent facts
+    (``intent_conflicts`` and the ``summary`` flag). A ``tasks`` value
+    that is not a list is dropped — the aggregation walks
+    ``entry["tasks"]`` as a list, and a snapshot it cannot read is worse
+    than one that admits it has no tasks.
+    """
+    if not isinstance(tasks, list):
+        tasks = []
+    entry: Dict[str, Any] = {
+        "round": round_number,
+        "generated_at": generated_at or datetime.now().isoformat(),
+        "tasks": list(tasks),
+    }
+    entry.update(_repair_intent_round_fields(result))
+    return entry
+
+
 def _make_repair_on_complete(
     plan_id: str,
     project_dir: Path,
@@ -4135,6 +4216,20 @@ def _make_repair_on_complete(
                     _v_state["vp_splits"] = (
                         _result.get("vp_splits") or []
                     )
+                    # 2026-10-23: the intent gate's verdict belongs on
+                    # the state as well — a conflict that only lives in
+                    # the round's result is gone once the round ends.
+                    _intent_fields = _repair_intent_round_fields(
+                        _result,
+                    )
+                    _v_state["intent_conflicts"] = (
+                        _intent_fields["intent_conflicts"]
+                    )
+                    _v_state["needs_operator_decision"] = (
+                        _intent_fields["summary"][
+                            "needs_operator_decision"
+                        ]
+                    )
                     _v_state["updated_at"] = (
                         datetime.now().isoformat()
                     )
@@ -4150,6 +4245,13 @@ def _make_repair_on_complete(
                     ) or []
                     if not isinstance(_rt_payload, list):
                         _rt_payload = []
+                    # 2026-10-23: the round entry is built by the same
+                    # helper the auto-loop uses, so the intent facts
+                    # (conflicts + the operator-decision flag) land on
+                    # the snapshot no matter which path wrote it.
+                    _rt_entry = _build_repair_round_entry(
+                        _next_round, _rt_payload, _result,
+                    )
                     _rt_path = (
                         _server._plan_dir(plan_id)
                         / "verification_repair_tasks.json"
@@ -4163,11 +4265,7 @@ def _make_repair_on_complete(
                         json.dump(
                             {
                                 "plan_id": plan_id,
-                                "round": _next_round,
-                                "generated_at": (
-                                    datetime.now().isoformat()
-                                ),
-                                "tasks": _rt_payload,
+                                **_rt_entry,
                             },
                             _rtf,
                             ensure_ascii=False,
@@ -4729,6 +4827,16 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                     "performance_metrics": {},
                 }
                 v_state["execution_profile"] = report.get("execution_profile", {})
+                # 2026-10-23: the intent gate's verdict belongs on the
+                # state as well — a conflict that only lives in the
+                # round's result is gone once the round ends.
+                _intent_fields = _repair_intent_round_fields(result)
+                v_state["intent_conflicts"] = (
+                    _intent_fields["intent_conflicts"]
+                )
+                v_state["needs_operator_decision"] = (
+                    _intent_fields["summary"]["needs_operator_decision"]
+                )
 
             # 2026-09-11 plan v12 (cards.py repair_tasks 持久化):
             # The orchestrator's ``result["repair_tasks"]`` only lives
@@ -4790,22 +4898,32 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                                     and isinstance(_legacy_tasks, list)
                                     and _legacy_round != round_num
                                 ):
-                                    _existing_rounds.append({
-                                        "round": _legacy_round,
-                                        "generated_at": _rt_existing.get(
-                                            "generated_at"
-                                        ),
-                                        "tasks": _legacy_tasks,
-                                    })
+                                    # 2026-10-23: the legacy file is
+                                    # itself a round snapshot — it may
+                                    # already carry the intent facts, so
+                                    # it is read through the same helper
+                                    # instead of being rebuilt by hand.
+                                    # Otherwise a conflict recorded by
+                                    # the repair-resume path would be
+                                    # dropped by the very migration that
+                                    # is supposed to preserve it.
+                                    _existing_rounds.append(
+                                        _build_repair_round_entry(
+                                            _legacy_round,
+                                            _legacy_tasks,
+                                            _rt_existing,
+                                            generated_at=_rt_existing.get(
+                                                "generated_at"
+                                            ),
+                                        )
+                                    )
                     except Exception:
                         # Corrupt or unreadable existing file — start
                         # fresh rather than crashing the round write.
                         _existing_rounds = []
-                _new_round_entry = {
-                    "round": round_num,
-                    "generated_at": datetime.now().isoformat(),
-                    "tasks": _rt_payload,
-                }
+                _new_round_entry = _build_repair_round_entry(
+                    round_num, _rt_payload, result,
+                )
                 _existing_rounds.append(_new_round_entry)
                 with _rt_path.open("w", encoding="utf-8") as _rtf:
                     json.dump(
