@@ -50,10 +50,13 @@ from config import AgentConfig
 from config_registry import ConfigRegistry
 from failure_classification import (
     REPORT_FORMAT,
+    REVERIFY_WITH_MORE_BUDGET,
     Failure,
+    VERIFIER_TIMEOUT,
     classify_failure,
     is_split_allowed,
 )
+from verify_budget import budget_ladder, timeout_seconds
 from retry_manager import RetryManager
 from background_manager import BackgroundManager
 from rollback_manager import RollbackManager
@@ -6270,19 +6273,52 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     result_context = f"Task '{task.title}' failed"
                     result_context += f"\nAI test report:\n{test_reason}"
 
-                    if self.logger:
+                    # 2026-10-23 — the failure's REMEDY decides whether
+                    # the task is run again at all, so the classification
+                    # has to happen BEFORE the retry decision rather than
+                    # after it.
+                    #
+                    # A verifier timeout is evidence of NOTHING: the
+                    # verification did not finish inside its budget, so
+                    # the task's code has neither been proven right nor
+                    # proven wrong. Running the task again answers a
+                    # question nobody asked — and it spends the second
+                    # occurrence, which is the very thing the split gate
+                    # reads as "this task is too big for one subagent".
+                    # So a timeout is not retried here; it falls through
+                    # to the dispatch below, which fails the task
+                    # without an extra attempt and without a split.
+                    #
+                    # The classification is taken again by
+                    # ``_note_failure`` below, because the marker drain
+                    # there may rewrite ``error_msg``; this one only
+                    # answers "may this task be run again?".
+                    failure_class = classify_failure(
+                        error_msg, project_dir=self.project_dir,
+                    )
+                    fail_only = (
+                        failure_class.remedy == REVERIFY_WITH_MORE_BUDGET
+                    )
+
+                    # A failure that is not retried must not be logged
+                    # as a retry: the event name is what the attempt
+                    # counters and the operator's greps are built on.
+                    if self.logger and not fail_only:
                         self.logger.warning("task_retry",
                                             f"Task [{task.id}] test failed: {error_msg[:200]}",
                                             task_id=task.id,
                                             data={"attempt": attempt + 1, "test_reason": (test_reason or "")[:500]})
 
-                    if attempt < max_retries - 1:
+                    if not fail_only and attempt < max_retries - 1:
                         print("Retrying with refined approach...")
                         continue
 
                     # All in-run retries exhausted — refine the task list
                     # (split into children) ONCE, then mark as failed for
-                    # cross-run detection. Refining on every failure caused
+                    # cross-run detection. (A ``fail_only`` failure never
+                    # gets this far: it returns in the dispatch below, and
+                    # it never had in-run retries to exhaust.)
+                    # Refining on every failure caused
                     # the task list to balloon during the wide
                     # provider-config rewrite (15 -> 35 subtasks); the
                     # cross-verify layer already feeds the
@@ -6317,15 +6353,57 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     # because it tried to write a file it never declared
                     # reproduces the same declaration mistake one level
                     # deeper.
+                    #
+                    # 2026-10-23: the drain does NOT overwrite a
+                    # verifier timeout. A timeout means there is no
+                    # verdict at all, and the refused path is a fact
+                    # about the code that no verdict has confirmed; the
+                    # timeout is the reason the task cannot be judged.
                     refused = self._take_undeclared_writes(task.id)
-                    if refused:
+                    if refused and not fail_only:
                         error_msg = "undeclared_write: " + ", ".join(
                             refused[:5]
                         )
                     failure, occurrence = self._note_failure(
                         task, error_msg,
                     )
-                    if occurrence == 1 and not extra_attempt_granted:
+                    # 2026-10-23 — one disposition, one place. The
+                    # remedy picks it: a failure that calls for a bigger
+                    # verification budget is failed on the spot, and the
+                    # occurrence count — which is what the split gate
+                    # reads as "too big" — never gets to override it.
+                    disposition = self._failure_disposition(
+                        failure, occurrence, extra_attempt_granted,
+                    )
+                    if disposition == "fail_only":
+                        # 验证未能完成，任务代码未被证伪 — the verification
+                        # did not complete, so the task's code was not
+                        # disproven. The task fails; it is not run again
+                        # and it is not split.
+                        if self.logger:
+                            self.logger.error(
+                                "task_verifier_timeout_unproven",
+                                (
+                                    f"Task [{task.id}] 验证未能完成，任务代码未被证伪"
+                                    f" (the verification did not complete "
+                                    f"inside its budget, so the task's code "
+                                    f"was neither proven right nor proven "
+                                    f"wrong): {error_msg[:200]}. Not running "
+                                    f"the task again and not splitting it."
+                                ),
+                                task_id=task.id,
+                                data={
+                                    "kind": failure.kind,
+                                    "signature": failure.signature,
+                                    "occurrence": occurrence,
+                                    "reason": error_msg[:500],
+                                },
+                            )
+                        self.task_manager.record_task_failure(
+                            task.id, error_msg,
+                        )
+                        return False
+                    if disposition == "extra_attempt":
                         extra_attempt_granted = True
                         # The extra attempt buys nothing if the feedback
                         # names the wrong failure class. Only a genuine
@@ -6911,6 +6989,20 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         | non-zero    | PASSED     | FAILED  | "Subagent lied: claimed PASSED but pytest exit <code>" |
         | non-zero    | FAILED     | FAILED  | (AI reason + actual tail)     |
         | non-zero    | (no claim) | FAILED  | "pytest exit <code> (AI did not report test result)" |
+        | (timed out) | any        | INCONCLUSIVE | "verifier_timeout: …" — the verifier ran out of budget, so there is no evidence either way |
+
+        The timeout row is not one of the exit-code rows: a command that
+        did not finish produced no exit code, and the verdict must not
+        be derived from the AI's claim (which is what the non-zero rows
+        do when the claim is PASSED).  A timeout is evidence of nothing —
+        not that the task is done, and not that the subagent lied.
+
+        A timeout is also the one symptom that more budget can fix, so
+        it is not the end of the verification: the commands are re-run on
+        a ladder of budgets (base → heavy → 2×heavy) and only the
+        verification is re-run — never the task.  A real exit code is an
+        answer rather than a symptom, so a run that produced one (exit 0
+        or a failure) is never re-verified.
 
         Args:
             task: SubTask carrying ``project_dir`` and ``get_test_commands()``.
@@ -6974,6 +7066,16 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
             return ai_claimed_passed, reason
 
         # Run every test command. All must pass for the verdict to be PASSED.
+        #
+        # A timeout is not a verdict — it is the verifier running out of
+        # budget — so it gets the one remedy that more budget can
+        # actually fix: a bigger budget.  The ladder below is tried in
+        # order (base → heavy → 2×heavy) and ONLY the verification is
+        # re-run.  The task itself is never re-executed: a task that
+        # ran out of budget would hit the same wall at the same budget,
+        # and re-running it would burn the second occurrence that turns
+        # "the budget was too small" into "the task is too big".
+        ladder = budget_ladder(' '.join(test_cmds))
         aggregate_exit = 0
         failure_tail = ""
         # Output of the legs that *did* pass. The vacuity gate below has
@@ -6983,32 +7085,162 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         # ``running N tests`` first and ``test result: …`` last, and a
         # full `cargo test` transcript is far larger than either.
         passing_output = ""
-        for cmd in test_cmds:
-            try:
-                proc = run_bounded(
-                    cmd,
-                    cwd=str(project_dir),
-                    text=True,
-                    timeout=600,  # 10 min per command — pytest can be slow
+        # A timeout is not an exit code.  These record that the
+        # verifier ran out of budget instead of producing a verdict, and
+        # they are what keeps the timeout OUT of the cheat-detection
+        # branch below: that branch accuses the subagent of lying, and a
+        # timeout is no evidence of anything the subagent wrote.
+        # ``timed_out`` is per-round (it says whether THIS round timed
+        # out); ``timed_out_cmd`` / ``timeout_used`` describe the last
+        # timeout the ladder saw, so the inconclusive verdict can name
+        # the command and the budget that ran out.
+        timed_out = False
+        timed_out_cmd = ""
+        timeout_used = 0
+        # How many budgets were spent before the verdict was reached.
+        attempts_used = 0
+        # The exit code of the round that produced one, if any.  A round
+        # produces an exit code only when the runner actually ran the
+        # command to completion: a timeout and a runner that could not
+        # start the command at all both produce none, and neither is
+        # evidence about the code the task wrote.
+        verdict_exit: Optional[int] = None
+        # Whether any rung of the ladder timed out.  When no rung
+        # produced an exit code, this is what decides the verdict: the
+        # only thing known is that the command ran out of budget, so
+        # the verdict is the inconclusive one.
+        ever_timed_out = False
+        for attempt, budget in enumerate(ladder):
+            # Every round starts from a clean slate: the state below
+            # describes THIS attempt.  A stale exit code or a stale
+            # output tail left over from an earlier round would decide
+            # the verdict for a later one — and the timeout check has to
+            # be able to see that a later round produced a real answer.
+            aggregate_exit = 0
+            failure_tail = ""
+            passing_output = ""
+            timed_out = False
+            attempts_used = attempt + 1
+            runner_failed = False
+            for cmd in test_cmds:
+                # The budget is configuration, not a constant: a single
+                # test file and a whole test directory do not have the
+                # same runtime magnitude, and both numbers are read from
+                # the environment (see ``verify_budget``).  The rung is
+                # a FLOOR, not a replacement: a heavy-lane command must
+                # never get less than the heavy budget just because the
+                # ladder starts at the light one.
+                cmd_budget = max(timeout_seconds(cmd), budget)
+                try:
+                    proc = run_bounded(
+                        cmd,
+                        cwd=str(project_dir),
+                        text=True,
+                        timeout=cmd_budget,
+                    )
+                except subprocess.TimeoutExpired:
+                    # Keep 124 as the exit code — an earlier leg may have
+                    # exited 0, and dropping it would let the timeout read as
+                    # a PASSED run.  The ``timed_out`` flag below is what
+                    # actually decides the verdict.
+                    aggregate_exit = 124  # convention: timeout
+                    timed_out = True
+                    ever_timed_out = True
+                    timed_out_cmd = cmd
+                    timeout_used = cmd_budget
+                    failure_tail = f"[timeout after {cmd_budget}s] {cmd}"
+                    break
+                except Exception as e:
+                    aggregate_exit = 1
+                    runner_failed = True
+                    failure_tail = f"[runner error: {e}] {cmd}"
+                    break
+                if proc.returncode != 0:
+                    aggregate_exit = proc.returncode
+                    # Keep last 1000 chars of output for diagnostics
+                    tail = (proc.stdout or "")[-1000:] + (proc.stderr or "")[-500:]
+                    failure_tail = f"[exit {proc.returncode}] {cmd}\n{tail}"
+                    break
+                _leg = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                passing_output += _leg[:4000] + "\n…\n" + _leg[-2000:] + "\n"
+
+            if not timed_out and not runner_failed:
+                # The command produced an answer — exit 0 or a real
+                # failure.  Escalating here would re-run a verdict we
+                # already have, and a failure is an answer, not a
+                # symptom of an insufficient budget.
+                verdict_exit = aggregate_exit
+                break
+            if runner_failed and not ever_timed_out:
+                # The runner could not run the command at all and no
+                # earlier rung timed out, so there is nothing to
+                # escalate towards: the verification never started.
+                # This is the ordinary failure it has always been.
+                verdict_exit = aggregate_exit
+                break
+            if attempt + 1 >= len(ladder):
+                # The ladder is exhausted without a verdict: the last
+                # rung produced neither an exit code nor a timeout that
+                # could be cured.  The verdict below is the inconclusive
+                # one.
+                break
+            next_timeout = ladder[attempt + 1]
+            if self.logger:
+                self.logger.warning(
+                    "test_cross_verify_reverify",
+                    "验证未产生结论（超时或执行器异常），按预算阶梯重跑验证（不重跑任务）",
+                    task_id=task.id,
+                    data={
+                        "attempt": attempt + 1,
+                        "timeout_used": timeout_used,
+                        "next_timeout": next_timeout,
+                        "timed_out_cmd": timed_out_cmd[:300],
+                        "test_commands": [c[:300] for c in test_cmds],
+                    },
                 )
-            except subprocess.TimeoutExpired:
-                aggregate_exit = 124  # convention: timeout
-                failure_tail = f"[timeout after 600s] {cmd}"
-                break
-            except Exception as e:
-                aggregate_exit = 1
-                failure_tail = f"[runner error: {e}] {cmd}"
-                break
-            if proc.returncode != 0:
-                aggregate_exit = proc.returncode
-                # Keep last 1000 chars of output for diagnostics
-                tail = (proc.stdout or "")[-1000:] + (proc.stderr or "")[-500:]
-                failure_tail = f"[exit {proc.returncode}] {cmd}\n{tail}"
-                break
-            _leg = (proc.stdout or "") + "\n" + (proc.stderr or "")
-            passing_output += _leg[:4000] + "\n…\n" + _leg[-2000:] + "\n"
+            continue
 
         # Decision table
+        #
+        # The timeout case comes FIRST, before the exit-code table.  It
+        # has to: the table below asks "what did the exit code say?", and
+        # a timed-out run has no exit code to ask about.  Folding it into
+        # the ordinary non-zero branch made the branch's only question —
+        # "did the AI claim PASSED?" — decide the verdict, and the
+        # result was a slow-but-correct suite being recorded as
+        # "the subagent lied".  A timeout says the verifier ran out of
+        # budget; it is INCONCLUSIVE, and inconclusive is its own
+        # verdict with its own event.
+        #
+        # "No rung produced an exit code" is the condition, not "the
+        # last rung timed out": a rung that crashed the runner produced
+        # no exit code either, and the evidence such a rung adds to the
+        # earlier timeout is none.  A rung that DID produce an exit code
+        # decides the verdict on its own, whatever the earlier rungs
+        # timed out on — that is the whole point of escalating.
+        if verdict_exit is None and ever_timed_out:
+            reason = (
+                f"{VERIFIER_TIMEOUT}: 验证命令在 {timeout_used}s 内未完成，"
+                f"不能据此判定 subagent 说谎；任务代码未被证伪。"
+                f"命令：{timed_out_cmd}"
+            )
+            if self.logger:
+                self.logger.warning(
+                    "test_cross_verify_inconclusive",
+                    "验证命令超时，不能据此判定 subagent 说谎；任务代码未被证伪",
+                    task_id=task.id,
+                    data={
+                        "timeout_used": timeout_used,
+                        "timed_out_cmd": timed_out_cmd[:300],
+                        "pytest_exit": aggregate_exit,
+                        "ai_claimed_passed": ai_claimed_passed,
+                        "attempts": attempts_used,
+                        "budget_ladder": list(ladder),
+                        "test_commands": [c[:300] for c in test_cmds],
+                    },
+                )
+            return False, reason
+
         if aggregate_exit == 0:
             # 2026-10-11: exit 0 is only a PASSED verdict if the run
             # actually executed a test.
@@ -8220,6 +8452,53 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
             )
         return failure, occurrence
 
+    def _failure_disposition(
+        self,
+        failure: Failure,
+        occurrence: int,
+        extra_attempt_granted: bool,
+    ) -> str:
+        """What the executor does with a classified failure.
+
+        Three dispositions, and the failure's REMEDY picks between them
+        — the executor CONSUMES the remedy the failure carries, it does
+        not re-derive it from the kind:
+
+          * ``"fail_only"`` — the failure produced no verdict at all
+            (a verifier timeout). The task fails, and nothing else
+            happens: no further run of the task, no extra attempt, no
+            split. The task's code was not disproven, so neither of
+            those would say anything true about it.
+          * ``"extra_attempt"`` — the first time this failure was seen
+            in this lineage. One more attempt at the ANSWER, because a
+            first occurrence is evidence that one answer was wrong, not
+            that the task is too big.
+          * ``"refine"`` — everything else: a repeat, or the extra
+            attempt was already spent. The refiner may look at it.
+
+        The remedy is consulted FIRST, and deliberately so. The
+        occurrence count is what the split gate reads as "this task is
+        too big for one subagent" — but a failure whose remedy says
+        "re-verify with a bigger budget" must not be laundered into
+        that by counting, because the count would then be reporting
+        "the same thing happened twice" when what actually happened is
+        "the measurement was missing twice". That inference is exactly
+        the false one that turns a budget problem into a task-size
+        problem.
+
+        Args:
+            failure: The classified failure. Its ``remedy`` decides.
+            occurrence: How many times this failure has been seen in
+                the task's lineage (1 = first).
+            extra_attempt_granted: Whether the one-off extra attempt
+                has already been spent on this task.
+        """
+        if failure.remedy == REVERIFY_WITH_MORE_BUDGET:
+            return "fail_only"
+        if occurrence == 1 and not extra_attempt_granted:
+            return "extra_attempt"
+        return "refine"
+
     def _refine_after_failure(self, task: SubTask, coder_response: str, result_context: str,
                               file_context: str, exit_code: int,
                               *, failure: Failure | None = None,
@@ -8261,6 +8540,42 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                         "refinements": self._refinement_count,
                         "cap": EXECUTOR_MAX_REFINEMENTS,
                         "task_count": len(self.task_manager.tasks),
+                    },
+                )
+            return
+        # 2026-10-23 — defence in depth. The executor's dispatch (see
+        # ``_failure_disposition``) already keeps a verifier timeout
+        # away from the refiner, but this method is also called from
+        # three other tails, and a caller that hands it a timeout
+        # failure must not get a split out of it: the verification
+        # produced no verdict, so there is nothing to decompose — the
+        # children could not be verified either. Refining here would be
+        # the "the budget was too small, so the task must be too big"
+        # mistake the remedy table exists to prevent.
+        #
+        # Placed AFTER the run-level cap check on purpose, for the same
+        # reason the split gate is: a run that is out of refinement
+        # budget must report *that*, not something else.
+        if (
+            failure is not None
+            and failure.remedy == REVERIFY_WITH_MORE_BUDGET
+        ):
+            if self.logger:
+                self.logger.info(
+                    "refine_skipped_verifier_timeout",
+                    (
+                        f"Task [{task.id}] failed with a {failure.kind} "
+                        f"failure; not refining it. The verification did "
+                        f"not complete, so the task's code was neither "
+                        f"proven right nor proven wrong — there is no "
+                        f"verdict to decompose."
+                    ),
+                    task_id=task.id,
+                    data={
+                        "kind": failure.kind,
+                        "signature": failure.signature,
+                        "occurrence": occurrence,
+                        "lineage": self._lineage_id(task.id),
                     },
                 )
             return
