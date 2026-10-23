@@ -221,27 +221,36 @@ def test_other_phase_transitions_unchanged():
             "stopped",
             "ready",
         ],
+        # 2026-10-23: every verification phase gained a ``stopped``
+        # edge. A stop has to be able to park the plan it stopped —
+        # without the edge the stop endpoint's ``transition_to`` raised
+        # ``ValueError`` and the plan kept a phase that still reads as
+        # "verification is live".
         "verification": [
             "verification_running",
             "verification_passed",
             "verification_failed",
             "verification_loop_stopped",
+            "stopped",
         ],
         "verification_running": [
             "verify_first_pass",
             "verification_passed",
             "verification_failed",
+            "stopped",
         ],
         "verify_first_pass": [
             "verify_recheck",
             "verification_passed",
             "verification_failed",
             "verification_loop_stopped",
+            "stopped",
         ],
         "verify_recheck": [
             "verification_passed",
             "verification_failed",
             "verification_loop_stopped",
+            "stopped",
         ],
         # ``verification_passed`` is the security-boundary terminal:
         # the migration lands plans here and the whitelist does NOT
@@ -261,6 +270,7 @@ def test_other_phase_transitions_unchanged():
             "verification_repairing",
             "verification_passed",
             "verification_loop_stopped",
+            "stopped",
         ],
         "verification_repairing": [
             "verification",
@@ -268,6 +278,7 @@ def test_other_phase_transitions_unchanged():
             "verification_loop_stopped",
             "verification_failed",
             "executing",
+            "stopped",
         ],
         # 2026-09-13: production added the ``verification_passed``
         # recovery edge (operator force-pass after the loop stopped;

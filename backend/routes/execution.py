@@ -725,6 +725,32 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
             else:
                 raise
 
+    # --- Step 2b: clear the cooperative cancel flag --------------------
+    # 2026-10-23: a stop flips ``verification_cancel`` for this plan
+    # (see ``_stop_running_execution``) so that the verification chain
+    # does not re-enter behind the operator's back. A start is the
+    # operator saying "go again" — so the flag has to go with it.
+    #
+    # Without this, P1 would be a one-way door: every later start of
+    # this plan would be born cancelled, and the verification chain
+    # would exit at its first check (verification_loop.py) and never
+    # run a round again. The two halves are one contract: the stop
+    # sets the flag, the start clears it.
+    #
+    # It is cleared AFTER the routing CAS (so a rejected start — 409 —
+    # does not silently un-cancel a plan that was never restarted) and
+    # BEFORE the spawn (so the executor that is about to run is not
+    # born cancelled). Mirrors ``routes/verification.py``'s
+    # repair-resume path.
+    try:
+        import verification_cancel
+        verification_cancel.clear(plan_id)
+    except Exception:  # noqa: BLE001 — a stale flag must not abort the start
+        _server.logger.exception(
+            "execution_start: could not clear the verification cancel "
+            "flag plan=%s", plan_id,
+        )
+
     # Spawn the subprocess synchronously so the pid is known at return time
     # 2026-09-06:
     # Route this through the shared :func:`_spawn_executor_subprocess`
@@ -1582,15 +1608,66 @@ def _stop_interruption(
 
 
 def _stop_response(
-    *, paused: bool, paused_at: Optional[str], interrupted: int
+    *,
+    paused: bool,
+    paused_at: Optional[str],
+    interrupted: int,
+    phase_transition_error: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """The answer ``POST /stop`` gives, whichever path it took."""
-    return {
+    """The answer ``POST /stop`` gives, whichever path it took.
+
+    ``phase_transition_error`` is present ONLY when the plan could not
+    be parked in the ``stopped`` phase (2026-10-23). Its presence is
+    the signal that the stop did not fully hold: the work was killed,
+    but the plan is still sitting in the phase it had before — so the
+    chain that reads the phase may still consider it live. The key is
+    absent on a clean stop, so the normal four-key contract is
+    unchanged.
+    """
+    body: Dict[str, Any] = {
         "status": "stopped",
         "paused": paused,
         "paused_at": paused_at,
         "interrupted_task_count": interrupted,
     }
+    if phase_transition_error is not None:
+        body["phase_transition_error"] = phase_transition_error
+    return body
+
+
+def _park_plan_in_stopped_phase(
+    plan_id: str, plan_dir: Path, *, skip_terminal: bool = True
+) -> Optional[str]:
+    """Move the plan into the ``stopped`` phase; return the failure text.
+
+    Returns ``None`` when the plan is parked (or already was), and the
+    ``ValueError`` text when it could not be — the caller puts that
+    text in the response body under ``phase_transition_error`` so the
+    operator can see that the stop did not hold, instead of the stop
+    silently pretending it did.
+
+    ``skip_terminal`` is what the idle path uses: a plan that is
+    already in a terminal phase has nothing to park, and forcing
+    ``completed → stopped`` would raise a ``ValueError`` that says
+    nothing about the stop. The running path does NOT skip — there the
+    transition is the stop's own contract, and a refusal is exactly
+    the "the stop did not hold" case the response has to report.
+    """
+    from plan_state import TERMINAL_PHASES
+
+    try:
+        ps = _server.PlanState(plan_dir)
+        ps.reload()
+        if skip_terminal and ps.get_current_phase() in TERMINAL_PHASES:
+            return None
+        ps.transition_to("stopped")
+        return None
+    except ValueError as exc:
+        _server.logger.error(
+            "stop_execution: could not park the plan in the 'stopped' "
+            "phase plan=%s: %s", plan_id, exc,
+        )
+        return str(exc)
 
 
 def _stop_running_execution(
@@ -1654,6 +1731,37 @@ def _stop_running_execution(
             "plan=%s", plan_id,
         )
 
+    # --- 1b. cancel the verification chain ----------------------------
+    # 2026-10-23: killing the executor is NOT enough to stop a plan.
+    #
+    # The repair executor is killed by step 2 below, and its
+    # ``process.wait()`` callback comes back with ``rc=-15`` — which is
+    # indistinguishable from a repair run that finished normally.
+    # ``_on_repair_complete`` (verification_loop.py) reads that return
+    # code as "the repair is done" and re-enters verification:
+    # ``begin_verification`` → ``start_verification_cycle`` →
+    # ``_run_repair_execution_async`` → a NEW executor subprocess.
+    #
+    # So without this flag the operator's stop is a no-op for the
+    # chain: stop → kill the repair executor → the callback re-enters
+    # verification → a new repair round → a new executor. The gate in
+    # ``_on_repair_complete`` that was written for exactly this case
+    # ("if the operator stopped the plan while this repair was running,
+    # do NOT re-enter verification") consults
+    # ``verification_cancel.is_cancelled(plan_id)`` — and this endpoint
+    # never set it. The gate was right; nothing ever flipped the flag.
+    #
+    # The flag is set BEFORE the kill, so it is already in place when
+    # the killed process's callback fires.
+    try:
+        import verification_cancel
+        verification_cancel.request_cancel(plan_id)
+    except Exception:  # noqa: BLE001 — a missing flag must not abort the stop
+        _server.logger.exception(
+            "stop_execution: could not request the verification cancel "
+            "plan=%s", plan_id,
+        )
+
     # --- 2. terminate -------------------------------------------------
     # Only THIS plan's process group. Another plan's executor is none
     # of this stop's business.
@@ -1694,21 +1802,29 @@ def _stop_running_execution(
         )
 
     # --- 4. transition ------------------------------------------------
-    try:
-        _server.PlanState(plan_dir).transition_to("stopped")
-    except ValueError:
-        pass
+    # A refusal here is reported, not swallowed (2026-10-23). The plan
+    # is killed but not parked, so the phase still says whatever it
+    # said before — and a phase that says "verification_*" is read by
+    # the chain as "still live". Swallowing the ``ValueError`` made the
+    # endpoint answer a clean 200 for a stop that did not hold.
+    phase_transition_error = _park_plan_in_stopped_phase(
+        plan_id, plan_dir, skip_terminal=False,
+    )
 
     # The pause is over: the reason for it is no longer "a pause is in
     # progress" but the stop that was asked for.
     state["stop_reason"] = "user_requested"
 
     if checkpoint is None:
-        return _stop_response(paused=False, paused_at=None, interrupted=0)
+        return _stop_response(
+            paused=False, paused_at=None, interrupted=0,
+            phase_transition_error=phase_transition_error,
+        )
     return _stop_response(
         paused=True,
         paused_at=checkpoint.get("paused_at"),
         interrupted=len(interrupted),
+        phase_transition_error=phase_transition_error,
     )
 
 
@@ -1726,20 +1842,41 @@ def _stop_idle_execution(
       actually happened.
     * there is no checkpoint — nothing was interrupted, so there is
       nothing to pause and nothing to record.
+
+    2026-10-23: the idle path used to leave the phase completely
+    alone. A plan sitting in ``verification_repairing`` (or ``ready``,
+    or ``queued``) that the operator stopped therefore kept a phase
+    that says "live" — the stop did not hold for anything that reads
+    the phase. The plan is now parked in ``stopped`` whenever it is
+    not already in a terminal phase, on BOTH branches (the one with a
+    checkpoint and the one without).
     """
     from pause_state import clear_pause_checkpoint, read_pause_checkpoint
+
+    # Park the phase first: a refusal is reported in the body, and it
+    # must not stop the checkpoint bookkeeping from happening.
+    phase_transition_error = _park_plan_in_stopped_phase(
+        plan_id, plan_dir, skip_terminal=True,
+    )
 
     existing = read_pause_checkpoint(plan_dir)
     if discard:
         clear_pause_checkpoint(plan_dir)
-        return _stop_response(paused=False, paused_at=None, interrupted=0)
+        return _stop_response(
+            paused=False, paused_at=None, interrupted=0,
+            phase_transition_error=phase_transition_error,
+        )
     if existing is not None:
         return _stop_response(
             paused=True,
             paused_at=existing.get("paused_at"),
             interrupted=len(existing.get("interrupted_tasks") or []),
+            phase_transition_error=phase_transition_error,
         )
-    return _stop_response(paused=False, paused_at=None, interrupted=0)
+    return _stop_response(
+        paused=False, paused_at=None, interrupted=0,
+        phase_transition_error=phase_transition_error,
+    )
 
 
 @router.post("/api/execution/{plan_id}/stop")

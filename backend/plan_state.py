@@ -187,31 +187,46 @@ PHASE_TRANSITIONS = {
     "test_approved": ["test_refining", "preflight_review", "tasks_generation", "executing"],
     "preflight_review": ["tasks_generation", "prd_review", "arch_review", "test_review"],
     "tasks_generation": ["ready", "queued", "executing"],
-    "ready": ["executing", "queued"],
+    # 2026-10-23: ``stopped`` is reachable from every phase the
+    # operator can stop a plan in. A stop that cannot park the phase
+    # leaves a plan that still reads as live — the stop does not hold.
+    "ready": ["executing", "queued", "stopped"],
     # 2026-09-15: ``queued`` is the auto-scheduler's inbox. The operator
     # can pull a plan back to ``ready`` (and take it off the queue), or
     # the scheduler/operator can start it directly.
-    "queued": ["ready", "executing"],
+    "queued": ["ready", "executing", "stopped"],
     "executing": ["completed", "failed", "stopped", "ready"],
     "completed": ["verification"],
-    "failed": ["executing", "ready"],
+    # 2026-10-23: ``failed`` → ``stopped`` — a plan whose executor
+    # stamped ``failed`` can still be stopped by the operator, and the
+    # stop has to be able to park it.
+    "failed": ["executing", "ready", "stopped"],
     "stopped": ["executing", "ready"],
 }
 
 VERIFICATION_PHASE_TRANSITIONS = {
     "ready": ["verification", "verification_running"],
     "executing": ["verification", "completed", "failed", "stopped", "ready"],
-    "verification": ["verification_running", "verification_passed", "verification_failed", "verification_loop_stopped"],
-    "verification_running": ["verify_first_pass", "verification_passed", "verification_failed"],
-    "verify_first_pass": ["verify_recheck", "verification_passed", "verification_failed", "verification_loop_stopped"],
-    "verify_recheck": ["verification_passed", "verification_failed", "verification_loop_stopped"],
+    # 2026-10-23: ``stopped`` is reachable from every verification
+    # phase. A plan stopped in the middle of a round (or in the middle
+    # of a repair) has to be able to park — otherwise the stop leaves
+    # the phase saying "verification is live" and the chain keeps
+    # running behind the operator's back.
+    #
+    # ``verification_passed`` stays empty (it is the security boundary:
+    # a passing verdict may not be laundered into a terminal phase),
+    # and ``verification_loop_stopped`` is untouched.
+    "verification": ["verification_running", "verification_passed", "verification_failed", "verification_loop_stopped", "stopped"],
+    "verification_running": ["verify_first_pass", "verification_passed", "verification_failed", "stopped"],
+    "verify_first_pass": ["verify_recheck", "verification_passed", "verification_failed", "verification_loop_stopped", "stopped"],
+    "verify_recheck": ["verification_passed", "verification_failed", "verification_loop_stopped", "stopped"],
     "verification_passed": [],  # terminal: security boundary — no forward edge to ``completed``
     # 2026-10-22: ``verification_rerunning`` left this table with the
     # phase it named (it was a dead state). A row that still holds the
     # historical value is read as ``verification_repairing`` — see
     # :data:`LEGACY_PHASE_ALIASES`.
-    "verification_failed": ["verification_repairing", "verification_passed", "verification_loop_stopped"],
-    "verification_repairing": ["verification", "verification_passed", "verification_loop_stopped", "verification_failed", "executing"],
+    "verification_failed": ["verification_repairing", "verification_passed", "verification_loop_stopped", "stopped"],
+    "verification_repairing": ["verification", "verification_passed", "verification_loop_stopped", "verification_failed", "executing", "stopped"],
     "verification_loop_stopped": ["failed", "verification_passed"],
 
     # ``completed`` is NOT a dead end for the verification sub-machine.
