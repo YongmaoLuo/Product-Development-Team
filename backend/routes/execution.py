@@ -761,6 +761,43 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
     # (above) is the only declaration in the system — write it onto the
     # tasks before the executor reads them. See ``_adopt_run_project_dir``.
     _adopt_run_project_dir(plan_dir, project_dir, tasks_file)
+
+    # --- 3a. audit ----------------------------------------------------
+    # The resume decision lives in the HTTP response, and a response is
+    # gone when the request ends — while the checkpoint it was made from
+    # is consumed below. So once the resume has happened, nothing left
+    # anywhere says "this plan was interrupted here, and this is what
+    # was in flight when it was". The plan's own execution log is where
+    # that answer belongs: it is append-only, it rotates rather than
+    # being consumed, and it travels with the plan.
+    #
+    # The event is a *copy* of the decision this endpoint already
+    # published, not a second derivation of it: the strategy, the plan
+    # and the sessions are the very variables the response carries. Two
+    # answers that disagree make the audit record worse than none.
+    #
+    # It is written BEFORE the executor is spawned: a start that cannot
+    # spawn continued nothing, but it did decide what to continue, and
+    # that decision is worth keeping.
+    #
+    # A failing writer is isolated: the audit record is evidence, not
+    # control flow — the start itself must still succeed.
+    if resumed:
+        try:
+            import resume_audit_log
+            resume_audit_log.log_resume_decision(
+                plan_id, plan_dir,
+                resume_strategy=resume_strategy,
+                resume_plan=resume_plan,
+                sessions=resume_sessions,
+                checkpoint=checkpoint,
+            )
+        except Exception:  # noqa: BLE001 — 日志是证据，不是控制流
+            _server.logger.warning(
+                "execution_start: could not record the resume decision plan=%s",
+                plan_id,
+            )
+
     try:
         process, log_path = _server._spawn_executor_subprocess(
             plan_id=plan_id,
@@ -1686,7 +1723,9 @@ def _stop_running_execution(
         ExecutionRepository,
         PlanNotFoundError as ExecPlanNotFoundError,
     )
-    from pause_state import clear_pause_checkpoint, write_pause_checkpoint
+    from pause_state import (
+        clear_pause_checkpoint, read_pause_checkpoint, write_pause_checkpoint,
+    )
 
     # --- 1. mark ------------------------------------------------------
     # The plan is marked BEFORE anything is killed. The executor's
@@ -1800,6 +1839,34 @@ def _stop_running_execution(
             interrupted_tasks=interrupted,
             unfinished_tasks=unfinished,
         )
+
+    # --- 3b. audit ----------------------------------------------------
+    # The resume point is on disk now, and the plan's own execution log
+    # is where a reader will look for it later: the checkpoint itself is
+    # consumed by the next resume, so once the resume has happened
+    # nothing is left that says "this plan was stopped here, and this is
+    # what was in flight when it was".
+    #
+    # The event is written from what was READ BACK, not from the value
+    # the write returned: ``write_pause_checkpoint`` swallows a failed
+    # write (a checkpoint is a resume optimisation, not worth failing a
+    # stop over), so the in-memory document can describe a resume point
+    # that never reached the disk. ``paused_at`` is that document's
+    # identity — a file on disk carrying a different stamp is a stale
+    # checkpoint from an earlier stop, not this stop's record, and
+    # nothing is written for it.
+    if checkpoint is not None:
+        try:
+            import resume_audit_log
+            stored = read_pause_checkpoint(plan_dir)
+            if stored is not None and stored.get("paused_at") == checkpoint.get("paused_at"):
+                resume_audit_log.log_stop_checkpoint(
+                    plan_id, plan_dir, stored, hard_killed=hard_killed,
+                )
+        except Exception:  # noqa: BLE001 — 日志是证据，不是控制流
+            _server.logger.warning(
+                "stop_execution: could not record the resume point plan=%s", plan_id,
+            )
 
     # --- 4. transition ------------------------------------------------
     # A refusal here is reported, not swallowed (2026-10-23). The plan
