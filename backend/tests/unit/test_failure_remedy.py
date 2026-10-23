@@ -45,6 +45,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from failure_classification import (  # noqa: E402
+    CODER_TIMEOUT,
     EMPTY_DIFF,
     INFRA,
     LOCK_CONFLICT,
@@ -190,6 +191,7 @@ def test_every_kind_the_module_owns_has_a_registered_remedy():
     without adding its row turns THIS red.
     """
     all_kinds = [
+        CODER_TIMEOUT,
         REPORT_FORMAT,
         EMPTY_DIFF,
         TEST_FAILURE,

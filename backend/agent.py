@@ -5474,6 +5474,78 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                         continue
 
                     print("Max retries exhausted on hard timeout; delegating split to refiner...")
+                    # 2026-10-23 — the hard-timeout tail now goes through
+                    # the SAME classification + disposition path as every
+                    # other failure (see the tail at ~6367). It used to
+                    # call the refiner with no ``failure=`` and never
+                    # called ``_note_failure``, so the run logged no
+                    # ``failure_classified`` event at all and the
+                    # refiner split the task on the FIRST hard timeout.
+                    #
+                    # The executor's message ("Hard timeout after ...")
+                    # classifies as ``coder_timeout``: the sub-agent used
+                    # up its work budget. That is not a test failure, so
+                    # the honest answer to the FIRST one is to give the
+                    # task another go — a restart with the SAME budget,
+                    # which the loop's attempt range already has room
+                    # for. Only a REPEAT reaches the refiner. No budget
+                    # is raised here and ``HARD_WALL_CLOCK_TIMEOUT_SECONDS``
+                    # is untouched: the extra attempt is a restart, not
+                    # a longer run.
+                    failure, occurrence = self._note_failure(task, error_msg)
+                    disposition = self._failure_disposition(
+                        failure, occurrence, extra_attempt_granted,
+                    )
+                    if disposition == "fail_only":
+                        # Symmetry with the generic tail. ``coder_timeout``
+                        # never lands here (its remedy is
+                        # ``retry_then_split``), but the branch stays so
+                        # the two tails cannot drift apart.
+                        if self.logger:
+                            self.logger.error(
+                                "task_hard_timeout_unproven",
+                                (
+                                    f"Task [{task.id}] hit the hard timeout "
+                                    f"and the failure calls for no further "
+                                    f"attempt: {error_msg[:200]}"
+                                ),
+                                task_id=task.id,
+                                data={
+                                    "kind": failure.kind,
+                                    "signature": failure.signature,
+                                    "occurrence": occurrence,
+                                    "reason": error_msg[:500],
+                                },
+                            )
+                        self.task_manager.record_task_failure(
+                            task.id, error_msg,
+                        )
+                        return False
+                    if disposition == "extra_attempt":
+                        # A restart, not a longer budget: the attempt slot
+                        # was already reserved by the loop's range, so
+                        # granting it costs no extra budget.
+                        extra_attempt_granted = True
+                        self.retry_manager.record_attempt(
+                            task.id, error_msg, False,
+                        )
+                        if self.logger:
+                            self.logger.info(
+                                "failure_first_occurrence_retry",
+                                (
+                                    f"Task [{task.id}] hit a "
+                                    f"{failure.kind} failure for the first "
+                                    f"time; granting one more attempt "
+                                    f"instead of splitting it."
+                                ),
+                                task_id=task.id,
+                                data={
+                                    "kind": failure.kind,
+                                    "signature": failure.signature,
+                                    "occurrence": occurrence,
+                                },
+                            )
+                        continue
                     try:
                         self._refine_after_failure(
                             task=task,
@@ -5481,6 +5553,8 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                             result_context=error_msg,
                             file_context="",
                             exit_code=1,
+                            failure=failure,
+                            occurrence=occurrence,
                         )
                         # 2026-09-08: auto-split succeeded — transition
                         # plan state so the orchestrator re-runs the new
