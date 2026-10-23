@@ -9,6 +9,7 @@ Core responsibilities:
 - Persist all state transitions through PlanState
 """
 
+import inspect
 import json
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -17,7 +18,15 @@ from coding_tool import CodingTool, ClaudeCodingTool
 from config_paths import resolve_state_db_path
 from plan_state import PlanState
 from verification_agent import VerificationAgent
-from repair_generator import RepairTaskGenerator
+from repair_generator import (
+    RepairTaskGenerator,
+    # 2026-10-23: the plan's own constraints. ``_plan_intent`` reads the
+    # constraint sentences the plan states about itself, and
+    # ``apply_intent_gate`` keeps a repair row that crosses one of them
+    # from becoming a repair task.
+    _plan_intent,
+    apply_intent_gate,
+)
 # 2026-10-22: the type a cancelled round raises. Dependency-free, so a
 # top-level import carries no cycle risk.
 from verification_cancel import VerificationCancelled
@@ -45,6 +54,39 @@ def _state_db_path_for_orchestrator() -> Path:
     having.
     """
     return resolve_state_db_path()
+
+
+def _accepts_plan_intent(generator: Any) -> bool:
+    """Whether ``generator.generate_repair_contents`` takes ``plan_intent``.
+
+    The orchestrator hands the plan's own constraints to the repair
+    generator so the model can *avoid* the conflict instead of being
+    caught by it (2026-10-23). That is a courtesy to the model, not a
+    precondition for the round: a collaborator whose signature predates
+    the parameter still has to be callable, because a round that dies on
+    a keyword argument produces no repair tasks at all — which the
+    auto-loop reads as "nothing to repair", the exact failure this
+    codebase has fought hardest against.
+
+    A callable whose signature cannot be read is assumed to accept the
+    parameter: the modern generator is the common case, and silently
+    withholding the constraints would weaken the prompt for everybody.
+    The deterministic intent gate downstream (``apply_intent_gate``) is
+    what actually holds the line, so a generator that never saw the
+    constraints loses the courtesy, not the protection.
+    """
+    try:
+        parameters = inspect.signature(
+            generator.generate_repair_contents
+        ).parameters
+    except (AttributeError, TypeError, ValueError):
+        return True
+    if "plan_intent" in parameters:
+        return True
+    return any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in parameters.values()
+    )
 
 
 class VerificationOrchestrator:
@@ -416,6 +458,11 @@ class VerificationOrchestrator:
         - repair_tasks: List[Dict]
         - waiting_for_user: bool
         - status: str   # passed | loop_stopped | verification_failed
+        - intent_conflicts: List[Dict]   # 2026-10-23: the repair rows
+          that crossed the plan's own constraints and were dropped
+        - needs_operator_decision: bool   # 2026-10-23: True when
+          ``intent_conflicts`` is non-empty — only an operator can say
+          whether the constraint or the requirement gives way
         """
         overall_status = report.get("overall_status", "FAILED")
 
@@ -458,6 +505,12 @@ class VerificationOrchestrator:
                 "should_stop": False,
                 "stop_reason": None,
                 "repair_tasks": [],
+                # 2026-10-23 — the gate never ran on a passing round, so
+                # there is nothing to report. The fields are present on
+                # every return path so a consumer can read them without
+                # guarding for their absence.
+                "intent_conflicts": [],
+                "needs_operator_decision": False,
                 "waiting_for_user": False,
                 "status": "passed",
             }
@@ -503,6 +556,9 @@ class VerificationOrchestrator:
                     "should_stop": True,
                     "stop_reason": "same_failure_repeated_after_max_attempts",
                     "repair_tasks": [],
+                    # 2026-10-23 — the gate never ran on this path.
+                    "intent_conflicts": [],
+                    "needs_operator_decision": False,
                     "waiting_for_user": False,
                     "status": "loop_stopped",
                 }
@@ -676,12 +732,30 @@ class VerificationOrchestrator:
                 f"skipped ({outcomes_exc})"
             )
             repair_outcomes = {}
+        # 2026-10-23 — the plan's own constraints, read once and used
+        # twice: they go into the prompt (so the model can avoid the
+        # conflict rather than be caught by it) and they gate the rows
+        # the model produced (so a conflict the model missed still
+        # cannot become a repair task). ``_plan_intent`` is
+        # best-effort by contract — a plan directory it cannot read
+        # contributes no constraints, it is never an error.
+        plan_intent = _plan_intent(self.plan_dir)
         if repair_candidates:
+            # 2026-10-23 — the plan's constraints go into the prompt so
+            # the model can steer clear of the conflict. A generator
+            # that predates the parameter is called without it: the
+            # round continues, and the intent gate below still refuses
+            # the rows that cross a constraint.
+            generator_kwargs = {
+                "previous_failure_feedback": previous_failure_feedback,
+                "repair_outcomes": repair_outcomes,
+            }
+            if _accepts_plan_intent(self.repair_generator):
+                generator_kwargs["plan_intent"] = plan_intent
             try:
                 repair_contents = self.repair_generator.generate_repair_contents(
                     repair_candidates, round_number,
-                    previous_failure_feedback=previous_failure_feedback,
-                    repair_outcomes=repair_outcomes,
+                    **generator_kwargs,
                 )
             except VerificationCancelled:
                 # 2026-10-22 — the operator stopped this plan while the
@@ -708,6 +782,76 @@ class VerificationOrchestrator:
                 f"[Repair] round {round_number}: all {len(failed_vps)} "
                 f"failed VP(s) routed to split — no repair tasks generated"
             )
+        # 2026-10-23 — the intent gate (R4). The model was *asked* whether
+        # its fix crosses the plan's own constraint, and the answer is
+        # only as good as the model's reading of it; the gate re-checks
+        # the rows deterministically and drops the ones that must not be
+        # executed.
+        #
+        # A dropped row is a fact about the plan, not an error in the
+        # repair path: the round continues with the rows that survived
+        # (one conflict does not abort the round), and the conflicts are
+        # reported on the result so an operator can decide whether the
+        # constraint or the requirement gives way.
+        intent_conflicts: List[Dict[str, Any]] = []
+        if repair_contents:
+            try:
+                kept_contents, intent_conflicts = apply_intent_gate(
+                    repair_contents, plan_intent,
+                )
+            except Exception as gate_exc:  # noqa: BLE001
+                # The gate is best-effort by contract and is not allowed
+                # to strand the round. A broken gate keeps every row (the
+                # executor still has the constraint in its prompt) rather
+                # than dropping the round's whole repair work — the
+                # failure the auto-loop would read as "no repair tasks
+                # needed" is the one this codebase has fought hardest
+                # against.
+                print(
+                    f"[Repair] round {round_number}: intent gate failed, "
+                    f"keeping every generated row ({gate_exc})"
+                )
+                kept_contents = list(repair_contents)
+                intent_conflicts = []
+            repair_contents = kept_contents
+        # 2026-10-23 — every conflict is a WARNING: the plan states a
+        # constraint, the repair crossed it, and an operator has to look
+        # at it. The log is where they look. A missing logger is not a
+        # reason to lose the event, so the print is the fallback — and it
+        # never raises.
+        for conflict in intent_conflicts:
+            vp_id = str(conflict.get("vp_id") or "")
+            constraint = str(conflict.get("constraint") or "")
+            reason = str(conflict.get("reason") or "")
+            logged = False
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                try:
+                    logger.warning(
+                        "repair_intent_conflict",
+                        f"repair content for {vp_id or '(unknown VP)'} "
+                        f"crosses the plan's own constraint "
+                        f"({constraint}) — dropped (round {round_number})",
+                        data={
+                            "plan_id": self.plan_dir.name,
+                            "round": round_number,
+                            "vp_id": vp_id,
+                            "constraint": constraint,
+                            "reason": reason,
+                        },
+                    )
+                    logged = True
+                except Exception as log_exc:  # noqa: BLE001
+                    print(
+                        f"[Repair] WARNING: repair_intent_conflict could "
+                        f"not be logged ({log_exc})"
+                    )
+            if not logged:
+                print(
+                    f"[Repair] WARNING: repair_intent_conflict — "
+                    f"{vp_id or '(unknown VP)'} 被意图门禁拦下 — "
+                    f"{reason or constraint}"
+                )
         # 2026-09-14: the repair task's ``test_command`` must be the failed
         # VP's *raw* command from ``verification_plan.json``. The path-based
         # reader above deliberately returns only a bounded summary + a
@@ -961,6 +1105,14 @@ class VerificationOrchestrator:
             # 且本轮可能因此没有修复任务可执行 —— auto-loop 依据它
             # 跳过执行器、直接进入下一轮验证。
             "vp_splits": vp_splits,
+            # 2026-10-23 — the repair rows that crossed the plan's own
+            # constraints and were dropped by the intent gate. Each one
+            # is ``{vp_id, constraint, reason}``. Non-empty means the
+            # plan has a failure this round deliberately did not repair,
+            # and only an operator can say whether the constraint or the
+            # requirement gives way.
+            "intent_conflicts": intent_conflicts,
+            "needs_operator_decision": bool(intent_conflicts),
             "waiting_for_user": False,
             "status": "verification_failed",
         }

@@ -38,7 +38,7 @@ import re
 import os
 import sys
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Iterator, Optional, List, Dict, Any, Sequence, Tuple
 
 from coding_tool import CodingTool, JsonSession, query_json_in_session
 # ``stable_session_id`` is re-exported from ``plan_sessions`` rather than
@@ -776,7 +776,8 @@ REPAIR_CONTENT_SYSTEM_PROMPT = """你是一位资深技术架构师，专注于�
       "acceptance_criteria": "TDD 规格：test_xxx 条件 → 预期",
       "files_to_modify": ["相对项目根的路径", "..."],
       "priority_hint": "high|medium|low",
-      "execution_group_hint": 0
+      "execution_group_hint": 0,
+      "intent_check": {"violates": false, "constraint": "", "reason": "一句话"}
     }
   ]
 }
@@ -788,6 +789,15 @@ REPAIR_CONTENT_SYSTEM_PROMPT = """你是一位资深技术架构师，专注于�
 4. **不要去改验收判据。** VP 的 `request` / `assertions` / `target_url` 等声明字段是不可变的 —— 它们是"被测对象"，不是"可调参数"。修复任务的职责永远是改**源码**去满足判据。判据确实写错时，正确做法是作废该 VP 并新增一条表达正确的（见 `verification_plan_delta` 的"绝不修改已有验证点"）。
 5. `files_to_modify` 必须是**相对项目根目录**的路径（不要绝对路径、不要 `..`）。修复任务的验收命令由系统自动带上，你不需要产出 test_command。路径拿不准时给出你最可能改动的那个文件，不要编造不存在的深层目录。
 6. 只输出 JSON，不要 markdown 代码块标记。
+7. 用户消息里的「原计划的初衷与硬约束」段是**硬约束**，不是建议：每一条都来自这个计划自己
+   对改动范围的声明，越过它就等于把计划要做的事换成了另一件事。给修复之前先判断它是否与
+   其中任何一条**冲突**。冲突时**不要**生成那条修复任务 —— 在 `description` 里写明与第几条
+   冲突、冲突点是什么，**上报**给上层决定；不要自己换一个同样越界的方案。如果同一条失败
+   还有不冲突的修法，就用那种修法。
+8. 每条 task 必须带 `intent_check`，它是你对上面那条硬约束的**结构化判断**：
+   不冲突时 `violates` 为 `false`、`constraint` 与 `reason` 留空字符串；冲突时
+   `violates` 为 `true`，`constraint` 写明冲突的是第几条 / 哪句话，`reason` 写明冲突点。
+   它只是把第 7 条的结论写清楚，不要为了填这个字段而改写你的判断。
 """
 
 
@@ -1663,27 +1673,17 @@ class RepairTaskAssembler:
 
         Preferred source is the LLM's ``files_to_modify`` hint (the same
         shape the main task generator emits). Entries are normalised and
-        filtered: relative, no ``..`` traversal, no absolute paths, no
-        empty strings. An empty list means "scope unknown" — the executor
-        then gives the subagent no file hint and lets it discover the
-        paths, which is strictly better than a scope pointing at the
-        wrong file.
+        filtered by :func:`normalise_declared_files`: relative, no
+        ``..`` traversal, no absolute paths, no empty strings. An empty
+        list means "scope unknown" — the executor then gives the
+        subagent no file hint and lets it discover the paths, which is
+        strictly better than a scope pointing at the wrong file.
+
+        The filter itself lives at module level because the banned-region
+        fallback needs the same normalisation for the paths it checks
+        against the plan's constraints.
         """
-        raw = content.get("files_to_modify")
-        if isinstance(raw, str):
-            raw = [raw]
-        if not isinstance(raw, list):
-            return []
-        cleaned: List[str] = []
-        for entry in raw:
-            if not isinstance(entry, str):
-                continue
-            path = entry.strip().replace("\\", "/")
-            if not path or path.startswith("/") or ".." in path.split("/"):
-                continue
-            if path not in cleaned:
-                cleaned.append(path)
-        return cleaned
+        return normalise_declared_files(content.get("files_to_modify"))
 
     def _fallback_description(
         self, failed_vp_id: str, vp_plan: Dict[str, Any]
@@ -1926,6 +1926,43 @@ def _build_test_command_fill_prompt(
     return "\n".join(parts)
 
 
+#: Heading of the plan-intent section inside the repair-content prompt.
+#: Named here (rather than written inline) because the system prompt
+#: refers to this section by name — the two have to stay in sync.
+PLAN_INTENT_HEADING = "## 原计划的初衷与硬约束"
+
+#: What the prompt tells the model to do when a proposed fix would
+#: cross one of the plan's own constraints.
+PLAN_INTENT_CONFLICT_RULES = (
+    "在做决定之前，先判断这条修复是否与上面任何一条冲突。",
+    "冲突时不要生成修复任务；如果同一条失败还有不冲突的修法，就用那种修法。",
+)
+
+
+def _normalise_plan_intent(plan_intent: Any) -> List[str]:
+    """Turn a raw intent sequence into the list of sentences to render.
+
+    Every entry is stringified and stripped; an entry that is blank
+    afterwards carries no constraint and is dropped. The order of the
+    surviving entries is the order they were handed over in — the
+    numbering in the prompt follows it.
+    """
+    if not plan_intent:
+        return []
+    if isinstance(plan_intent, (str, bytes)):
+        # A bare string is one sentence, not a sequence of characters.
+        plan_intent = [plan_intent]
+    normalised: List[str] = []
+    for entry in plan_intent:
+        try:
+            text = str(entry).strip()
+        except Exception:  # noqa: BLE001 — a broken entry is not a failure
+            continue
+        if text:
+            normalised.append(text)
+    return normalised
+
+
 def _build_repair_contents_prompt(
     failed_vps: List[Dict[str, Any]],
     round_number: int,
@@ -1933,6 +1970,7 @@ def _build_repair_contents_prompt(
     project_dir: Path,
     previous_failure_feedback: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     repair_outcomes: Optional[Dict[str, Dict[str, Any]]] = None,
+    plan_intent: Sequence[str] = (),
 ) -> str:
     """Build the single LLM prompt for repair-content generation.
 
@@ -1950,6 +1988,13 @@ def _build_repair_contents_prompt(
     VP. This replaced an earlier "cap at 3 rounds" design: feeding the
     failure back gives the generating agent information to learn from,
     whereas a hard cap simply ends the chain without a hint.
+
+    2026-10-23: ``plan_intent`` carries the constraint sentences the
+    plan states about itself (see :func:`_plan_intent`). They are
+    rendered as their own section *before* the VP list, so the model
+    reads the plan's terms of reference before it reads the failures
+    it is about to repair. An empty intent renders no section at all —
+    a plan that states no constraint gets no constraint section.
     """
     parts = [
         f"Round {round_number}: generate one repair task per FAILED verification point.",
@@ -1958,6 +2003,15 @@ def _build_repair_contents_prompt(
         f"Project directory: {project_dir}",
         "",
     ]
+    intent_items = _normalise_plan_intent(plan_intent)
+    if intent_items:
+        parts.append(PLAN_INTENT_HEADING)
+        parts.append("")
+        for index, item in enumerate(intent_items, start=1):
+            parts.append(f"{index}. {item}")
+        parts.append("")
+        parts.extend(PLAN_INTENT_CONFLICT_RULES)
+        parts.append("")
     if previous_failure_feedback:
         # Filter to VPs that still appear in this round's failures —
         # otherwise we'd show feedback for already-fixed VPs which
@@ -2108,6 +2162,7 @@ class _RepairContentGeneratorMixin:
         round_number: int,
         previous_failure_feedback: Optional[Dict[str, List[Dict[str, Any]]]] = None,
         repair_outcomes: Optional[Dict[str, Dict[str, Any]]] = None,
+        plan_intent: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Single LLM call producing repair content for each failed VP.
 
@@ -2138,6 +2193,16 @@ class _RepairContentGeneratorMixin:
                 state.db ``plan_tasks``; repair tasks are not in
                 ``tasks.json``). Rendered under the VP so the LLM stops
                 re-proposing a remedy that is already proven ineffective.
+            plan_intent: 2026-10-23: the constraint sentences the plan
+                states about itself (see :func:`_plan_intent`). ``None``
+                means "read them from this plan's directory" — which is
+                what every caller that does not care wants. An explicit
+                list is used as-is, so a caller that already holds the
+                intent does not pay for a second read. The sentences
+                reach the prompt as their own section, before the VP
+                list, and the system prompt (:data:`REPAIR_CONTENT_SYSTEM_PROMPT`)
+                declares them hard constraints: a fix that would cross
+                one has to be reported rather than generated.
 
         Returns:
             A list of content dicts, one per failed VP, each carrying:
@@ -2182,6 +2247,12 @@ class _RepairContentGeneratorMixin:
             str(vp.get("id")) for vp in failed_vps if vp.get("id")
         ]
 
+        # 2026-10-23 — the plan's own constraints. ``None`` means the
+        # caller has none of its own and wants the plan directory read;
+        # an explicit list (possibly empty) is taken as given.
+        if plan_intent is None:
+            plan_intent = _plan_intent(self.plan_dir)
+
         prompt = _build_repair_contents_prompt(
             failed_vps,
             round_number,
@@ -2189,6 +2260,7 @@ class _RepairContentGeneratorMixin:
             self.project_dir,
             previous_failure_feedback=previous_failure_feedback,
             repair_outcomes=repair_outcomes,
+            plan_intent=plan_intent,
         )
         # 2026-10-22 — the session handle is bound before the dispatch so
         # the id can be recorded afterwards, whether the call answered or
@@ -2252,6 +2324,61 @@ class _RepairContentGeneratorMixin:
             contents, failed_vps, round_number,
         )
         return contents
+
+
+def _intent_check_text(value: Any) -> str:
+    """Render one ``intent_check`` text field as stripped text.
+
+    A model that has nothing to say sends ``null`` (or omits the key),
+    so ``None`` becomes the empty string rather than the text "None".
+    """
+    if value is None:
+        return ""
+    try:
+        return str(value).strip()
+    except Exception:  # noqa: BLE001 — a broken field is not a failure
+        return ""
+
+
+def _normalise_intent_check(value: Any) -> Dict[str, Any]:
+    """Normalise the model's ``intent_check`` block into a fixed shape.
+
+    The block is the machine-readable form of the model's judgement
+    about the plan's own hard constraints (see
+    :data:`REPAIR_CONTENT_SYSTEM_PROMPT` rule 7). It has to survive
+    the parse unchanged enough that a downstream reader can tell
+    "the model judged this out of scope" apart from "the model never
+    looked" — the two are indistinguishable when the answer only
+    exists as prose in ``description``.
+
+    Rules:
+
+    * a missing block, or one that is not a dict, degrades to
+      ``{"violates": False, "constraint": "", "reason": ""}`` — "no
+      conflict reported" is the safe reading, and a malformed block
+      must never raise;
+    * ``violates`` is true only for a real boolean ``True`` or the
+      strings ``"true"`` / ``"yes"`` (case-insensitive). Models emit
+      booleans as strings often enough that accepting only ``True``
+      would lose the signal; other truthy values (``1``, ``"maybe"``)
+      are *not* violations;
+    * ``constraint`` / ``reason`` become stripped strings;
+    * keys the model invented are dropped — the shape is fixed so a
+      consumer can read it without guarding every field.
+    """
+    if not isinstance(value, dict):
+        return {"violates": False, "constraint": "", "reason": ""}
+    raw_violates = value.get("violates", False)
+    violates = False
+    if isinstance(raw_violates, bool):
+        violates = raw_violates
+    elif isinstance(raw_violates, str):
+        violates = raw_violates.strip().lower() in ("true", "yes")
+    return {
+        "violates": violates,
+        "constraint": _intent_check_text(value.get("constraint")),
+        "reason": _intent_check_text(value.get("reason")),
+    }
 
 
 def _parse_repair_contents_response(
@@ -2320,8 +2447,575 @@ def _parse_repair_contents_response(
             "test_command_source": str(item.get("test_command_source", "") or ""),
             "priority_hint": str(item.get("priority_hint", "") or ""),
             "execution_group_hint": item.get("execution_group_hint", 0),
+            # The model's structured judgement about the plan's own hard
+            # constraints. Carried through the parser so a downstream
+            # reader can tell "the model judged this out of scope" from
+            # "the model never looked" — a distinction that is lost the
+            # moment the answer only lives in the description prose.
+            # A missing / malformed block means "no conflict reported".
+            "intent_check": _normalise_intent_check(item.get("intent_check")),
         })
     return parsed
+
+
+# ---------------------------------------------------------------------------
+# Plan intent — the constraints the plan states about itself.
+# ---------------------------------------------------------------------------
+#
+# The repair path decides what to change from the verification evidence
+# alone. A plan whose own material says "不碰 Rust" therefore still had
+# Rust files rewritten by the auto-repair: the restriction lived in the
+# plan directory and nowhere the repair path reads. The three helpers
+# below read those restriction sentences back out of the plan directory
+# so a caller can carry them into the repair prompt.
+
+#: Plan-directory members that can carry the plan's own wording. The
+#: imported material is the fast lane's own document; the PRD is the
+#: document the regular lane writes. Both are read; neither is
+#: required — a plan directory that has neither contributes nothing.
+_PLAN_INTENT_FILES: Tuple[str, ...] = ("import.json", "prd.json", "prd.md")
+
+#: Sentences are separated by these full-width terminators and by any
+#: line break. Half-width punctuation is deliberately not a separator:
+#: a path or a version number inside a sentence must not cut it in
+#: half, and the terminators above are the ones Chinese plan material
+#: actually uses.
+_INTENT_SENTENCE_SPLIT = re.compile(r"[。！？；\r\n]+")
+
+#: A sentence is a constraint only when it carries one of these markers.
+#: They are the ways a plan says "not this, only that" — the shape the
+#: restriction takes in plan material.
+_INTENT_MARKERS: Tuple[str, ...] = (
+    "不碰",
+    "不要改",
+    "不得",
+    "禁止",
+    "不要动",
+    "不在本期范围",
+    "只改",
+    "仅限",
+)
+
+#: The one ASCII marker, matched case-insensitively because English
+#: plan material capitalises it freely.
+_INTENT_MARKER_ASCII = "out of scope"
+
+#: Cap on a single collected sentence, so one runaway paragraph cannot
+#: fill a prompt.
+_MAX_INTENT_SENTENCE_CHARS = 300
+
+#: Cap on how many sentences one plan contributes.
+_MAX_INTENT_SENTENCES = 20
+
+
+def _flatten_json_strings(value: Any) -> List[str]:
+    """Collect every string inside a JSON-ish value, in document order.
+
+    The imported material is a JSON *value*, not a string: it can be a
+    bare string, an object holding nested objects, or a list. A
+    restriction can sit at any depth, so the whole value is walked and
+    the strings are kept in the order they appear.
+
+    A string is first tried as JSON. The fast lane's payload is
+    regularly a JSON document *encoded inside* a string, and decoding it
+    is what makes the nested wording reachable at all. A string that is
+    not JSON is kept verbatim — that is the plain-text case, and the
+    common one.
+
+    Non-string scalars (numbers, booleans, ``None``) carry no wording
+    and are dropped.
+    """
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            # Not JSON: plain text, kept as it is.
+            return [value]
+        if isinstance(parsed, str):
+            return [parsed]
+        return _flatten_json_strings(parsed)
+    if isinstance(value, dict):
+        collected: List[str] = []
+        for item in value.values():
+            collected.extend(_flatten_json_strings(item))
+        return collected
+    if isinstance(value, list):
+        collected = []
+        for item in value:
+            collected.extend(_flatten_json_strings(item))
+        return collected
+    return []
+
+
+def _iter_intent_sentences(text: Any) -> Iterator[str]:
+    """Yield the constraint sentences inside ``text``.
+
+    A sentence is a stretch of text between two terminators — a
+    full-width stop, bang, question mark or semicolon, or a line
+    break. Only sentences carrying a constraint marker are yielded:
+    what this extractor is for is handing the repair path the plan's
+    *restrictions*, and a sentence that states no restriction is noise
+    in that prompt.
+
+    The marker is looked for in the whole sentence and the sentence is
+    capped afterwards, so a long sentence is still recognised as a
+    constraint instead of being judged on its first 300 characters
+    alone.
+    """
+    if not isinstance(text, str):
+        return
+    for raw in _INTENT_SENTENCE_SPLIT.split(text):
+        sentence = raw.strip()
+        if not sentence:
+            continue
+        carries_marker = any(marker in sentence for marker in _INTENT_MARKERS)
+        if not carries_marker and _INTENT_MARKER_ASCII not in sentence.lower():
+            continue
+        yield sentence[:_MAX_INTENT_SENTENCE_CHARS]
+
+
+def _plan_intent(plan_dir: Path) -> List[str]:
+    """Collect the constraint sentences the plan states about itself.
+
+    Reads the plan's own material (see :data:`_PLAN_INTENT_FILES`) and
+    returns the restriction sentences found in it, in the order they
+    appear, each one at most once.
+
+    Everything here is best-effort by contract: a member that is
+    missing or unreadable is skipped, a member whose content is not
+    parseable is read as plain text, and no failure of any kind is
+    allowed to escape — a plan directory the extractor cannot read is a
+    plan directory that contributes no constraints, not an error in the
+    repair path.
+    """
+    collected: List[str] = []
+    seen = set()
+    try:
+        directory = Path(plan_dir)
+    except TypeError:
+        return collected
+    for name in _PLAN_INTENT_FILES:
+        try:
+            path = directory / name
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # Missing or unreadable: this member simply says nothing.
+            continue
+        try:
+            chunks = _flatten_json_strings(text)
+        except (TypeError, ValueError):
+            continue
+        for chunk in chunks:
+            for sentence in _iter_intent_sentences(chunk):
+                if sentence in seen:
+                    continue
+                seen.add(sentence)
+                collected.append(sentence)
+                if len(collected) >= _MAX_INTENT_SENTENCES:
+                    return collected
+    return collected
+
+
+# ---------------------------------------------------------------------------
+# Deterministic banned-region fallback (R5)
+#
+# The model is asked to judge whether a proposed fix crosses one of the
+# plan's own constraints (see :data:`REPAIR_CONTENT_SYSTEM_PROMPT` rule
+# 7). A judgement is only as good as the model's reading of the
+# constraint, and a model that answers ``violates=false`` for a fix
+# that rewrites a whole Rust crate is indistinguishable, downstream, from
+# a model that read the constraint correctly and found no conflict.
+#
+# So the constraint is re-read deterministically as well: the plan's own
+# constraint sentences are mined for the regions they put off limits,
+# and a file the repair wants to touch is checked against those regions
+# by path segment. The judgement stays the primary signal; this is the
+# floor under it.
+# ---------------------------------------------------------------------------
+
+#: Language names that put code off limits without naming a directory.
+#: "不碰 Rust" is about the code, not one project's crate folder, so the
+#: name is matched against what Rust code looks like on disk: a ``.rs``
+#: file, a ``Cargo.toml`` / ``Cargo.lock`` manifest, or a crate directory
+#: (a segment ending in ``_rs``). Hard-coding one project's crate name
+#: would work for exactly one repository.
+_LANGUAGE_REGIONS = frozenset({"rust"})
+
+#: The tokens that can name a region: a backticked span, or a run of
+#: path-ish characters. The class stops at CJK punctuation, so
+#: "只改 Python（`src/`" yields the tokens "Python" and "src" — never
+#: "Python（".
+_BANNED_REGION_TOKEN_RE = re.compile(
+    r"`(?P<ticked>[^`]+)`"
+    r"|(?P<bare>[A-Za-z0-9][A-Za-z0-9._/-]*)"
+)
+
+#: Punctuation that closes a token in running text rather than belonging
+#: to the name itself.
+_REGION_TRAILING_PUNCT = ".,;:!?、，。；：！？)]}）】」』"
+
+#: The characters that separate an identifier from the sentence around
+#: it. A bare identifier (one carrying a "-" or a "_") names a
+#: region; a plain word like "Python" names a language, not a path, and
+#: is not a region.
+_REGION_NAME_SEPARATORS = ("-", "_", "/")
+
+
+def normalise_declared_files(raw: Any) -> List[str]:
+    """Normalise a declared file scope into a list of relative paths.
+
+    The same filter the repair task assembler has always applied to the
+    LLM's ``files_to_modify`` hint, now a named function so the
+    banned-region fallback can put candidate paths through exactly the
+    same normalisation before matching them against the plan's
+    constraints.
+
+    Entries are stripped, backslashes are folded to forward slashes,
+    and an entry is dropped when it is blank, absolute, or walks out of
+    the project with ``..``. Duplicates collapse, and the first
+    occurrence decides the order.
+
+    A bare string is one entry, not a sequence of characters; anything
+    that is not a list carries no scope at all.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    cleaned: List[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        path = entry.strip().replace("\\", "/")
+        if not path or path.startswith("/") or ".." in path.split("/"):
+            continue
+        if path not in cleaned:
+            cleaned.append(path)
+    return cleaned
+
+
+def _constraint_sentences(texts: Any) -> List[str]:
+    """The constraint sentences to read, whatever shape they arrive in.
+
+    A bare string is one sentence, not a sequence of characters; a
+    shape that is not a sequence of sentences carries none.
+    """
+    if texts is None:
+        return []
+    if isinstance(texts, (str, bytes)):
+        texts = [texts]
+    if not isinstance(texts, (list, tuple)):
+        return []
+    sentences: List[str] = []
+    for entry in texts:
+        try:
+            text = str(entry).strip()
+        except Exception:  # noqa: BLE001 — a broken entry is not a failure
+            continue
+        if text:
+            sentences.append(text)
+    return sentences
+
+
+def _trim_region_token(token: str) -> str:
+    """Strip the punctuation a token carries from the sentence around it.
+
+    "不要改 `api/` 目录" names "api", not "api/" and not "api/ 目录";
+    "不碰 Rust." names "Rust", not "Rust.". The trailing slash goes
+    too — it is part of how a directory is written, not part of its
+    name.
+    """
+    cleaned = token.strip().strip("`\"'“”‘’")
+    while cleaned:
+        last = cleaned[-1]
+        if last == "/" or last in _REGION_TRAILING_PUNCT:
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        break
+    return cleaned
+
+
+def _extract_banned_regions(texts: Any) -> List[str]:
+    """The regions the plan's own constraints put off limits.
+
+    Read off the constraint sentences themselves, so the check does not
+    depend on the model having read the constraint correctly. A region
+    is named in one of three ways, and all three are taken:
+
+    * a backticked identifier — `` `src/` ``, `` `web-frontend` ``;
+    * a token carrying a ``/`` — "不要改 src/ 下的任何文件";
+    * a bare identifier carrying a ``-`` or a ``_`` —
+      "web-frontend", "engine_rs".
+
+    A plain word names no region: "只改 Python" restricts a language,
+    not a path, and the path of a language is not a directory in the
+    project. A language the matcher *does* recognise is the exception:
+    it is kept as the language it names (see :data:`_LANGUAGE_REGIONS`)
+    and matched against the shape of that language's code.
+
+    A language name is kept as the language it names ("Rust" →
+    ``rust``) so that a file path can actually hit it — a Rust file is
+    Rust whatever the project calls the directory it lives in.
+
+    The regions come back in the order they appear in the text, and a
+    region named twice is kept once, at its first place.
+    """
+    regions: List[str] = []
+    seen = set()
+    for sentence in _constraint_sentences(texts):
+        for match in _BANNED_REGION_TOKEN_RE.finditer(sentence):
+            ticked = match.group("ticked")
+            if ticked is not None:
+                # A backticked span names a region whatever it looks
+                # like — but only up to its first blank, so that
+                # "`api/ 目录`" names "api" and not "api/ 目录".
+                head = ticked.split()
+                if not head:
+                    continue
+                candidate = _trim_region_token(head[0])
+            else:
+                bare = match.group("bare")
+                candidate = _trim_region_token(bare)
+                if candidate.lower() in _LANGUAGE_REGIONS:
+                    # A language the matcher recognises: keep the
+                    # language itself, not a directory that stands in
+                    # for it.
+                    candidate = candidate.lower()
+                elif not any(
+                    sep in bare for sep in _REGION_NAME_SEPARATORS
+                ):
+                    # A plain word — a language, a noun, a word. Not a
+                    # region.
+                    continue
+            if not candidate:
+                continue
+            if candidate not in seen:
+                seen.add(candidate)
+                regions.append(candidate)
+    return regions
+
+
+def _path_hits_language_region(path: str, language: str) -> bool:
+    """Whether ``path`` is code in ``language``.
+
+    Only ``rust`` is recognised today: a ``.rs`` file, a Cargo manifest,
+    or a crate directory (a path segment ending in ``_rs``). The check
+    is on the path alone — the plan's constraint is about the code, and
+    the code is identified by its own shape.
+    """
+    segments = [
+        segment for segment in str(path or "").replace("\\", "/").split("/")
+        if segment
+    ]
+    if not segments:
+        return False
+    if language == "rust":
+        name = segments[-1]
+        return (
+            name.endswith(".rs")
+            or name in ("Cargo.toml", "Cargo.lock")
+            or any(segment.endswith("_rs") for segment in segments)
+        )
+    return False
+
+
+def _path_hits_region(path: str, region: str) -> bool:
+    """Whether ``path`` falls inside ``region``.
+
+    A region that names a *language* ("rust") is matched by the shape
+    of that language's code rather than by path segment — the plan says
+    "不碰 Rust", and Rust code is Rust wherever it lives. Every other
+    region is matched by path segment: both are read as
+    ``/``-separated segments, and the region hits when its segments
+    appear *consecutively* in the path — so a file below a region hits
+    it ("engine_rs/src/signals.rs" hits "engine_rs"), while a region
+    that only shares a word with the path does not.
+    """
+    if str(region or "").strip().lower() in _LANGUAGE_REGIONS:
+        return _path_hits_language_region(path, str(region).strip().lower())
+    path_segments = [
+        segment for segment in str(path or "").replace("\\", "/").split("/")
+        if segment
+    ]
+    region_segments = [
+        segment for segment in str(region or "").replace("\\", "/").split("/")
+        if segment
+    ]
+    if not path_segments or not region_segments:
+        return False
+    span = len(region_segments)
+    for start in range(len(path_segments) - span + 1):
+        if path_segments[start:start + span] == region_segments:
+            return True
+    return False
+
+
+def _constraint_for_region(region: str, texts: Any) -> str:
+    """The constraint sentence that puts ``region`` off limits.
+
+    A sentence names a region either by writing the name out ("不要改
+    src 目录") or by naming it the way the plan does ("不碰 Rust" names
+    the language ``rust``). Both are recognised, and the
+    sentence is reported verbatim so the caller can quote the plan
+    itself rather than a paraphrase.
+    """
+    name = str(region or "").strip()
+    if not name:
+        return ""
+    for sentence in _constraint_sentences(texts):
+        if name in sentence:
+            return sentence
+        if name in _extract_banned_regions([sentence]):
+            return sentence
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# The intent gate (R4 + R5)
+#
+# Two signals now say whether a proposed repair crosses one of the
+# plan's own hard constraints: the model's structured judgement
+# (``intent_check.violates``) and the deterministic path check above.
+# This is where they become one gate — a row either signal rejects does
+# not become a repair task (R4), and the rejection is recorded as a
+# conflict rather than raised as an error (R5): a plan that names a
+# constraint the repair cannot respect has to be *reported* to the
+# operator, not crashed on.
+# ---------------------------------------------------------------------------
+
+#: The reason recorded when the model itself reported the conflict and
+#: did not say why.
+_MODEL_VIOLATION_REASON = "模型判断违背计划约束"
+
+#: The reason recorded when the model said the fix was fine and the
+#: path check said it was not. The wording names the disagreement,
+#: because that disagreement is the thing an operator has to look at.
+_DETERMINISTIC_MISMATCH_REASON = "模型判断与确定性检查不一致"
+
+
+def _first_banned_region_hit(raw_files: Any, regions: Sequence[str]) -> str:
+    """The first banned region one of the declared files falls into.
+
+    The regions are read in the order the plan's constraints name them,
+    so the region reported is the plan's own first word about what is
+    off limits — not merely the first path that happens to hit
+    something.
+
+    The declared paths are *normalised* before matching (the same
+    filter the repair task assembler applies), but they are never
+    rewritten: this function only reads them (R6).
+    """
+    if not regions:
+        return ""
+    paths = normalise_declared_files(raw_files)
+    if not paths:
+        return ""
+    for region in regions:
+        for path in paths:
+            if _path_hits_region(path, region):
+                return region
+    return ""
+
+
+def apply_intent_gate(
+    contents: List[Dict[str, Any]],
+    plan_intent: Sequence[str],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Filter the repair rows that cross the plan's own constraints.
+
+    Returns ``(kept, conflicts)``:
+
+    * ``kept`` — the rows that may become repair tasks, in their
+      original order and *unmodified*;
+    * ``conflicts`` — one record per rejected row, each a dict with
+      ``vp_id`` / ``constraint`` / ``reason``.
+
+    A row is rejected when either signal says so:
+
+    * the model judged it a violation (``intent_check.violates``) —
+      the model is the primary signal, and its own answer is taken at
+      face value;
+    * a file it declared falls into a region the plan's constraints
+      put off limits — the deterministic floor under the model's
+      judgement (R5). A model that answers ``violates=false`` for a
+      fix that rewrites a whole Rust crate is indistinguishable from a
+      model that read the constraint correctly, so the constraint is
+      re-read deterministically as well.
+
+    Nothing here raises. A conflict is a fact about the plan, not an
+    error in the repair path: the row is dropped, the conflict is
+    recorded, and the caller decides what to do about it. A plan with
+    no constraints at all keeps every row the model did not reject —
+    an empty ``plan_intent`` means there is no region to hit, not that
+    every path is forbidden.
+
+    The gate never rewrites or deletes the paths the model declared
+    (R6): a rejected row is dropped whole, and a kept row carries
+    exactly the scope the model gave it. The paths are normalised only
+    for the matching, so a declared path that is absolute or walks out
+    of the project cannot be used to slip past the check.
+
+    Every deterministic conflict is printed as a WARNING as well as
+    recorded: the model said this fix was fine and the check said it
+    was not, and that disagreement has to be visible in the log, not
+    only in the returned record.
+    """
+    if not isinstance(contents, (list, tuple)):
+        return [], []
+
+    regions = _extract_banned_regions(plan_intent)
+    sentences = _constraint_sentences(plan_intent)
+    fallback_constraint = sentences[0] if sentences else ""
+
+    kept: List[Dict[str, Any]] = []
+    conflicts: List[Dict[str, Any]] = []
+
+    for content in contents:
+        if not isinstance(content, dict):
+            # A row the gate cannot read is not a row it can judge —
+            # and it is not a repair task either. The parser upstream
+            # is what guarantees the shape; here it is simply not
+            # something the gate has an opinion about.
+            continue
+
+        vp_id = str(content.get("failed_vp_id") or "")
+        check = _normalise_intent_check(content.get("intent_check"))
+
+        if check["violates"]:
+            conflicts.append({
+                "vp_id": vp_id,
+                "constraint": check["constraint"] or fallback_constraint,
+                "reason": check["reason"] or _MODEL_VIOLATION_REASON,
+            })
+            continue
+
+        region = _first_banned_region_hit(
+            content.get("files_to_modify"), regions,
+        )
+        if region:
+            reason = (
+                f"{_DETERMINISTIC_MISMATCH_REASON}："
+                f"files_to_modify 命中禁改区域 {region}"
+            )
+            conflicts.append({
+                "vp_id": vp_id,
+                "constraint": _constraint_for_region(region, plan_intent)
+                or region,
+                "reason": reason,
+            })
+            print(
+                f"[Repair] WARNING: {vp_id or '(未知 VP)'} 被意图门禁拦下 — "
+                f"{reason}"
+            )
+            continue
+
+        kept.append(content)
+
+    return kept, conflicts
 
 
 # Attach the mixin method to RepairTaskGenerator without breaking
