@@ -24,6 +24,14 @@ Three answers, one per defect:
   all. That is a fact about the *reading*, not about the budget, so it
   goes into the log lines and changes no verdict.
 
+* **The two levels, and the label that tells them apart.** A provider's
+  own moment (when *it* can serve again) and the queue's moment (when
+  the fleet should try again) are two questions with opposite answers:
+  the provider's is the **latest** empty window, the queue's is the
+  **earliest** blocked provider. Both are pinned here so that one
+  cannot be read as the other, and the wait says which case it is in —
+  ``weekly_only`` when no burst-window reopen can save the queue.
+
 Every wait below is observed from the production dispatch, not from a
 helper: the number a wake asks for and the reason it gives for it are
 only worth anything if the dispatch that owns them uses them, and a
@@ -53,10 +61,12 @@ if str(_BACKEND_DIR) not in sys.path:
 import coding_tool  # noqa: E402
 import provider_order  # noqa: E402
 import provider_routing  # noqa: E402
+import quota_watchdog  # noqa: E402
 from coding_tool import (  # noqa: E402
     ClaudeCodingTool,
     _quota_wake_delay,
     _quota_wake_probe_sec,
+    _quota_wake_soonest_reset,
 )
 from dynamic_provider_concurrency import (  # noqa: E402
     ActiveConcurrencyTracker,
@@ -590,3 +600,241 @@ class TestTheQuotaLogLines:
         exhausted = log.of("provider_scene_all_pools_exhausted")
         assert exhausted, sorted(log.names())
         assert exhausted[0]["tiers_missing"] == expected, exhausted[0]
+
+
+# ---------------------------------------------------------------------------
+# The two levels - a provider's own moment, and the queue's
+# ---------------------------------------------------------------------------
+
+
+class TestTheTwoLevels:
+    """Two questions, two levels, and they take opposite extrema.
+
+    The first level is per provider: *when can this provider serve
+    again?* The answer is the **latest** reopen among that provider's
+    empty windows, because a provider whose burst window and whose week
+    are both empty is empty until the later of the two comes back.
+
+    The second level is per queue: *when should the whole queue try
+    again?* The answer is the **earliest** reopen among the blocked
+    providers, because the queue can serve again as soon as the first
+    of them is back.
+
+    The two take opposite extrema on purpose, and reading one as the
+    other is the bug this class pins shut. Reading the provider-level
+    answer as a queue-level one puts a provider back in front of a
+    dispatcher ten minutes too early, to be refused again for three
+    days; reading the queue-level answer as a provider-level one keeps
+    a provider out of the chain long after it could have served.
+
+    The wait's *reason* is observed from the production dispatch, so
+    the label the operator reads is the label the dispatch actually
+    emits — a helper-level assertion would not notice the call site
+    being unwired.
+    """
+
+    @pytest.mark.parametrize(
+        "five_hour_used, weekly_used, expected_binding, expected_in_sec",
+        [
+            pytest.param(
+                100.0, 70.0, "five_hour", 600.0,
+                id="burst-window-empty-the-week-still-has-room",
+            ),
+            pytest.param(
+                100.0, 100.0, "weekly_limit", 3 * 24 * 3600.0,
+                id="both-windows-empty",
+            ),
+            pytest.param(
+                40.0, 100.0, "weekly_limit", 3 * 24 * 3600.0,
+                id="the-week-empty-even-though-the-burst-window-has-room",
+            ),
+        ],
+    )
+    def test_a_provider_serves_again_when_its_own_latest_empty_window_returns(
+        self, five_hour_used, weekly_used, expected_binding, expected_in_sec,
+    ):
+        """The provider's own moment: the **latest** empty window.
+
+        The burst window reopens in ten minutes and the week in three
+        days. Whichever of the two is empty decides when this provider
+        can serve again — and when *both* are empty, the later one
+        decides, because the burst window reopening does not make a
+        week-empty provider dispatchable.
+        """
+        burst = _now() + timedelta(minutes=10)
+        week = _now() + timedelta(days=3)
+
+        quota = _quota(
+            "Vendor A",
+            five_hour_used=five_hour_used, five_hour_resets_at=burst,
+            weekly_used=weekly_used, weekly_resets_at=week,
+        )
+
+        expected = burst if expected_binding == "five_hour" else week
+        assert quota.exhausted_resets_at == expected, (
+            "the provider's own moment is the latest reopen among the "
+            "windows that are empty; the ten-minute burst window does "
+            "not shorten it when the week is empty as well"
+        )
+        assert quota.binding_tier == expected_binding
+        assert quota.exhausted is True, (
+            "an empty window disqualifies the provider whatever the "
+            "other window says - a burst window with room left in it "
+            "does not make a week-empty provider dispatchable"
+        )
+
+        in_sec = (quota.exhausted_resets_at - _now()).total_seconds()
+        assert in_sec == pytest.approx(expected_in_sec, abs=5.0), (
+            f"expected this provider to be able to serve again in about "
+            f"{expected_in_sec:.0f}s, got {in_sec:.0f}s"
+        )
+
+        if expected_binding == "weekly_limit":
+            assert quota.exhausted_resets_at != burst, (
+                "taking the earliest reopen here would put the provider "
+                "back in front of a dispatcher in ten minutes, to be "
+                "refused again for three days"
+            )
+
+            delay, reason = _quota_wake_delay(
+                ["Vendor A"], {"Vendor A": quota},
+            )
+            assert reason == "weekly_only", (
+                f"{reason} - the burst window reopening cannot save a "
+                f"provider whose week is empty, so the wait says so "
+                f"instead of looking like a ten-minute wait"
+            )
+            assert delay == WAKE_CAP_SEC, (
+                f"{delay} - the delay itself is unchanged: the week is "
+                f"three days out, so the cap still applies to it"
+            )
+        else:
+            delay, reason = _quota_wake_delay(
+                ["Vendor A"], {"Vendor A": quota},
+            )
+            assert reason == "soonest_reset", (
+                f"{reason} - a provider bound on its burst window is "
+                f"waiting for that window, and saying otherwise would "
+                f"hide a ten-minute wait behind a three-day one"
+            )
+            assert delay == pytest.approx(602.0, abs=1.0), (
+                f"{delay} - the burst window reopens in ten minutes, so "
+                f"the wait is ten minutes and not the three days the week "
+                f"would have asked for"
+            )
+
+    def test_the_queue_retries_on_the_earliest_of_its_blocked_providers(self):
+        """The queue's moment: the **earliest** of the blocked providers.
+
+        Both providers are out of their burst window, and both burst
+        windows reopen in ten minutes — but one of them is out of its
+        week as well, so that provider stays shut for three days and
+        only the other one can put the queue back in play. The queue's
+        moment is therefore ten minutes, and both places that answer
+        this question name the same provider's moment.
+        """
+        burst = _now() + timedelta(minutes=10)
+        week = _now() + timedelta(days=3)
+
+        quota_map = {
+            "Vendor A": _quota(
+                "Vendor A",
+                five_hour_used=100.0, five_hour_resets_at=burst,
+                weekly_used=70.0, weekly_resets_at=week,
+            ),
+            "Vendor B": _quota(
+                "Vendor B",
+                five_hour_used=100.0, five_hour_resets_at=burst,
+                weekly_used=100.0, weekly_resets_at=week,
+            ),
+        }
+        blocked = ["Vendor A", "Vendor B"]
+
+        assert quota_map["Vendor A"].exhausted_resets_at == burst
+        assert quota_map["Vendor B"].exhausted_resets_at == week, (
+            "each provider answers for itself: Vendor B is bound by its "
+            "week, not by the burst window that reopens in ten minutes"
+        )
+
+        resets_at, seconds = _quota_wake_soonest_reset(blocked, quota_map)
+
+        assert resets_at == burst, (
+            "the queue can serve again as soon as the first blocked "
+            "provider is back, so the wait is sized on the earliest - "
+            "not on the latest, which would keep the whole queue asleep "
+            "for three days after a provider could already serve"
+        )
+        assert seconds == pytest.approx(600.0, abs=5.0)
+
+        assert quota_watchdog.earliest_reset(quota_map, blocked) == (
+            burst.isoformat()
+        ), (
+            "the watchdog answers the same question as the dispatch and "
+            "has to name the same moment"
+        )
+
+    def test_a_fleet_that_can_only_wait_for_the_week_says_so(
+        self, tmp_path, monkeypatch, scene,
+    ):
+        """The wait says it is *not* waiting for the burst window.
+
+        Every provider in the fleet still has room in its burst window
+        — that window reopens in ten minutes and reopening it saves
+        nothing, because the week is empty and the week is what binds
+        them. The wait line says that in one word, because "waiting ten
+        minutes" and "waiting three days" look the same to a reader who
+        only has the seconds.
+        """
+        burst = _now() + timedelta(minutes=10)
+        week = _now() + timedelta(days=3)
+        rows = [
+            _row(
+                name, five_hour_used=40.0, five_hour_resets_at=burst,
+                weekly_used=100.0, weekly_resets_at=week,
+            )
+            for name in CHAIN
+        ]
+
+        log, waits = _dispatch(tmp_path, monkeypatch, _payload(rows))
+
+        assert len(waits) == 1, waits
+        assert waits[0] == WAKE_CAP_SEC, (
+            f"{waits} - the delay itself is unchanged: the week is three "
+            f"days out, so the cap still applies to it"
+        )
+        data = log.of("provider_quota_window_wait")[0]
+        assert data["wait_reason"] == "weekly_only", data
+
+    def test_one_provider_a_burst_reopen_can_save_keeps_the_old_reason(
+        self, tmp_path, monkeypatch, scene,
+    ):
+        """The label only appears when it is true of the whole fleet.
+
+        One provider is out of its burst window alone, so its burst
+        window reopening does put the queue back in play — the wait is a
+        ten-minute wait, not a three-day one, and calling that
+        "weekly only" would be a lie about it.
+        """
+        burst = _now() + timedelta(minutes=10)
+        week = _now() + timedelta(days=3)
+        rows = [
+            _row(
+                CHAIN[0], five_hour_used=100.0, five_hour_resets_at=burst,
+                weekly_used=70.0, weekly_resets_at=week,
+            ),
+            _row(
+                CHAIN[1], five_hour_used=100.0, five_hour_resets_at=burst,
+                weekly_used=100.0, weekly_resets_at=week,
+            ),
+            _row(
+                CHAIN[2], five_hour_used=100.0, five_hour_resets_at=burst,
+                weekly_used=100.0, weekly_resets_at=week,
+            ),
+        ]
+
+        log, waits = _dispatch(tmp_path, monkeypatch, _payload(rows))
+
+        assert len(waits) == 1, waits
+        assert waits[0] == pytest.approx(602.0, abs=1.0), waits
+        data = log.of("provider_quota_window_wait")[0]
+        assert data["wait_reason"] == "soonest_reset", data

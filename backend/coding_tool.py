@@ -1592,10 +1592,48 @@ def _tiers_missing_for(names: Any, quota_map: Any) -> Dict[str, List[str]]:
     return out
 
 
+def _quota_wake_weekly_only(blocked: Any, quota_map: Any) -> bool:
+    """True when every blocked provider is bound shut by its week alone.
+
+    The burst window and the week are two independent budgets. A
+    provider whose week is empty cannot be dispatched to no matter what
+    its burst window does, so when *every* blocked provider is bound
+    that way, no burst-window reopen is going to save the queue: the
+    next moment anything can serve again is the week, and a wait that
+    looked like it was waiting on the burst window was waiting on the
+    wrong thing.
+
+    The reading's own name for this is ``binding_tier`` — the exhausted
+    tier that reopens last and therefore owns that provider's
+    ``exhausted_resets_at``. A provider bound on ``five_hour`` is not
+    in this case: its burst window *is* the thing that has to come
+    back, and a reopen of it does put the queue back in play.
+
+    One blocked provider with no reading at all is enough to say "not
+    this case": a provider whose binding tier is unknown is not
+    evidence that only the week can save the queue.
+    """
+    if not quota_map:
+        return False
+    names = list(blocked or ())
+    if not names:
+        return False
+    for name in names:
+        try:
+            quota = quota_map.get(name)
+        except AttributeError:
+            return False
+        if quota is None:
+            return False
+        if getattr(quota, "binding_tier", None) != "weekly_limit":
+            return False
+    return True
+
+
 def _quota_wake_delay(blocked: Any, quota_map: Any) -> Tuple[float, str]:
     """(seconds, reason) —— 下一次探测之前睡多久，以及为什么。
 
-    Two answers, and the second one says which it is.
+    Three answers, and the second one says which it is.
 
     ``soonest_reset``
         The reading named a moment at which one of the blocked
@@ -1605,6 +1643,16 @@ def _quota_wake_delay(blocked: Any, quota_map: Any) -> Tuple[float, str]:
         is actually open costs one wake instead of two, and a probe
         that lands before the meter has caught up costs the wait
         anyway.
+
+    ``weekly_only``
+        Every blocked provider is bound shut by its week alone, so no
+        burst-window reopen can save the queue and the next moment
+        anything can serve again is the week. The delay is the number
+        the ``soonest_reset`` answer would give — only the reason is
+        different — so this is a label, not a policy: it tells an
+        operator that the wait is not waiting on the burst window,
+        which is the whole difference between "ten minutes" and "three
+        days" when both windows are empty.
 
     ``probe``
         No named moment: the reading said nothing about when this
@@ -1624,7 +1672,10 @@ def _quota_wake_delay(blocked: Any, quota_map: Any) -> Tuple[float, str]:
         return _quota_wake_probe_sec(), "probe"
     _resets_at, seconds = soonest
     cap = _quota_wake_cap_sec()
-    return max(5.0, min(seconds + 2.0, cap)), "soonest_reset"
+    delay = max(5.0, min(seconds + 2.0, cap))
+    if _quota_wake_weekly_only(blocked, quota_map):
+        return delay, "weekly_only"
+    return delay, "soonest_reset"
 
 
 class WorkClock:

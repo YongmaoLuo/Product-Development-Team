@@ -929,16 +929,24 @@ class ProviderQuota:
         exhausted_tier: Name of the tier that tripped the gate
             (``five_hour`` / ``weekly_limit``), or ``None``. Drives
             which ``resets_at`` becomes the cooldown length.
-        exhausted_resets_at: The **latest** ``resets_at`` among the tiers
-            that are exhausted, or ``None`` when absent, unparseable, or
-            already in the past. It is the latest because it is the one
-            that decides when the provider can serve again: a provider
-            whose burst window and whose week are both empty is empty
-            until the *later* of the two comes back, so a cooldown
-            sized on the earlier one would wake up to the same refusal.
-            A tier that is exhausted but names no moment does not
-            contribute, and a reading with no moment at all leaves this
-            ``None`` so the caller falls back to its own default.
+        exhausted_resets_at: When **this provider** can serve again,
+            and nothing else. It has exactly one meaning: the moment
+            this provider itself becomes dispatchable. "When the queue
+            as a whole should try again" is a different question, asked
+            a level up — :func:`coding_tool._quota_wake_soonest_reset`
+            answers it by taking the **earliest** of this value across
+            the blocked providers, and the two levels take opposite
+            extrema on purpose. The **latest** ``resets_at`` among the
+            tiers that are exhausted, or ``None`` when absent,
+            unparseable, or already in the past. It is the latest
+            because it is the one that decides when the provider can
+            serve again: a provider whose burst window and whose week
+            are both empty is empty until the *later* of the two comes
+            back, so a cooldown sized on the earlier one would wake up
+            to the same refusal. A tier that is exhausted but names no
+            moment does not contribute, and a reading with no moment at
+            all leaves this ``None`` so the caller falls back to its own
+            default.
         binding_tier: Name of the tier that owns :attr:`exhausted_resets_at`
             — the exhausted tier that reopens last. ``None`` when no
             exhausted tier named a moment. Unlike :attr:`exhausted_tier`,
