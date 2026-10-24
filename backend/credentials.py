@@ -137,6 +137,9 @@ The handoff is therefore an **anonymous pipe**, with three parts:
 ``read_secret_fd``
     reads the pipe to EOF, closes the descriptor, and returns the
     decoded object. One consumer per pipe: the descriptor is spent.
+    A descriptor that is not the pipe this module published is left
+    alone — see :func:`read_secret_fd` for why a number that arrived
+    without its pipe is not this module's to close.
 
 Why JSON, and why keyed by logical name. A ``KEY=value`` line would be
 shorter, and it is wrong in three ways at once — a value containing a
@@ -172,6 +175,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import select
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -430,8 +435,8 @@ def _secret_reader_bin() -> Optional[str]:
     Read on every call rather than bound at import, for the same reason
     :func:`_keychain_file` and :func:`keychain_disabled` are: the value
     belongs to the deployment, and one captured at import is a copy taken
-    before the environment could say otherwise. An absent variable and an
-    empty one are the same thing here, for the reason
+    before the environment could say otherwise. An absent variable and
+    an empty one are the same thing here, for the reason
     :func:`_env_value` gives — an empty path names no binary.
 
     The value is handed on **as written**. It is not resolved against the
@@ -687,6 +692,127 @@ def _resolve_from_env(spec: SecretSpec) -> Tuple[Optional[str], str]:
     return (value, SOURCE_ENVIRONMENT)
 
 
+def _is_pipe(fd: int) -> bool:
+    """Whether ``fd`` names a pipe.
+
+    ``os.fstat`` is the only portable way to ask: ``/proc`` does not
+    exist on macOS, and ``fcntl`` does not answer the question. A
+    descriptor that is not open at all answers ``False`` rather than
+    raising, because the question is "can this be the pipe we
+    published", and "no" is an answer.
+
+    What this does **not** settle. On macOS the event loop's own kqueue
+    descriptor is a pipe as far as ``fstat`` is concerned — the kernel
+    gives the two the same kind of object — so being a pipe is a
+    necessary condition for "this is the pipe we published" and not a
+    sufficient one. :func:`_drain_published_pipe` is what settles it.
+    """
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError:
+        return False
+    return stat.S_ISFIFO(mode)
+
+
+def _drain_published_pipe(fd: int) -> Optional[bytes]:
+    """Read the payload out of ``fd``, if ``fd`` is the pipe we published.
+
+    Returns the raw bytes, or ``None`` when ``fd`` does not name a
+    published pipe. In that case the descriptor is left exactly as it
+    was found: not closed, its flags as they were, and whatever it
+    names still owned by whoever owns it.
+
+    Two things have to line up for a descriptor to be the pipe this
+    module published:
+
+    * it is a pipe at all (:func:`_is_pipe`), and
+    * its writer is gone. The published pipe has its write end closed
+      before the number is handed out, so a read of it ends at EOF. A
+      pipe with a live writer belongs to somebody else, and reading it
+      would wait for that somebody to write — in a server's startup,
+      a hang rather than a failure.
+
+    **The non-blocking guarantee is still here; it comes from a
+    different place.** It used to come from the descriptor's own flags:
+    the pipe was put into non-blocking mode, read, and put back. It
+    comes now from a readiness question asked before every read.
+    ``select.select([fd], [], [], 0)`` says whether a read would find
+    data — or the end of the pipe — waiting for it, and it answers
+    without touching the descriptor. A read that follows a "yes" cannot
+    block, because there is something to take; a read that follows a
+    "no" is not made at all. So every read is preceded by a zero
+    timeout readiness query, and no read of this function can wedge a
+    server's startup.
+
+    **The flags are not touched at all — not even read.** That is not a
+    preference; it is the only shape that can keep its promise on
+    macOS. The event loop's own kqueue descriptor is a pipe as far as
+    ``fstat`` is concerned — the kernel gives the two the same kind of
+    object — so being a pipe is a necessary condition for "this is the
+    pipe we published" and not a sufficient one. ``fcntl`` on such a
+    descriptor fails with ENOTTY, and **A failed F_SETFL still takes
+    effect**: the kernel applies F_SETFL and only then reports the
+    error, so a failed ``os.set_blocking(fd, False)`` leaves somebody
+    else's descriptor in non-blocking mode anyway. Measured on macOS:
+
+        fresh kqueue fd          F_GETFL=2   O_NONBLOCK=False
+        os.set_blocking(fd, False) → OSError: [Errno 25] Inappropriate ioctl for device
+        after                     F_GETFL=6   O_NONBLOCK=True    ← somebody else's fd, changed
+        os.set_blocking(fd, True)  → OSError: [Errno 25] Inappropriate ioctl for device
+        after                     F_GETFL=2   O_NONBLOCK=False   ← the restore still works
+
+    A shape that switches the flags off and back on therefore cannot
+    promise that it changed nothing: it changes the flags of a
+    descriptor whose ``fcntl`` fails, and only *maybe* puts them back.
+    This shape never issues the call, so there is nothing to restore
+    and nothing to get wrong. ``select`` asks the question without
+    touching the descriptor: on macOS it judges a kqueue descriptor
+    "not readable" and returns at once.
+
+    Why any of this matters. A descriptor *number* is only meaningful
+    in the process that published it. The number travels through the
+    environment; the pipe does not always travel with it. Where the
+    pipe did not arrive, the number names whatever else the receiving
+    process opened at that number — and in a child process that is
+    usually the event loop's own selector, because the selector takes
+    the lowest free descriptor. Closing that is what killed the service
+    before it was ready, with ``OSError: [Errno 9] Bad file descriptor``
+    out of ``asyncio/base_events.py``. The full account is in
+    ``docs/development/service-spawn-root-cause.md``.
+    """
+    if not _is_pipe(fd):
+        return None
+
+    chunks: List[bytes] = []
+    while True:
+        try:
+            ready, _, _ = select.select([fd], [], [], 0)
+        except (OSError, ValueError):
+            # Not a descriptor this module can ask about: a closed one
+            # answers EBADF, and one above the platform's FD_SETSIZE
+            # answers ValueError. Neither is the pipe this module
+            # published, and neither is a reason to read from it.
+            return None
+        if not ready:
+            # Nothing to take and no end of the pipe: the writer is
+            # still attached. This is somebody else's pipe, and it is
+            # refused without a single byte being read out of it.
+            return None
+        try:
+            chunk = os.read(fd, _FD_READ_CHUNK)
+        except OSError:
+            # Not readable at all. Nothing was drained, so nothing is
+            # spent and nothing is closed.
+            return None
+        if not chunk:
+            # EOF: the writer is gone, which is the shape of a
+            # published pipe.
+            break
+        chunks.append(chunk)
+
+    return b"".join(chunks)
+
+
 def _resolve_from_inherited_fd(name: str) -> Tuple[Optional[str], str]:
     """Return ``(value, source)`` from the pipe a parent handed down.
 
@@ -702,9 +828,17 @@ def _resolve_from_inherited_fd(name: str) -> Tuple[Optional[str], str]:
     and then died before the child read, a number that is not an
     integer, a payload that is not the object the writer promised —
     also reports ``(None, SOURCE_MISSING)`` and lets the caller try the
-    next source. The descriptor is spent either way, because
-    :func:`read_secret_fd` closes it on every path; leaving a half-read
-    pipe open would hand it to whatever reads a descriptor next.
+    next source.
+
+    A descriptor that is named but is **not** the pipe this module
+    published is the same case, and it is the one that bites. The
+    number in the environment was issued in another process, and where
+    the pipe did not arrive with it, the number names something this
+    process owns — very often the event loop's own selector. Closing
+    that is what took the server down before it was ready, so a
+    descriptor this module did not publish is left exactly as it was
+    found: not read, not closed. There was no handoff, so there is no
+    value, and the process carries on.
 
     The variable naming the descriptor is left in place. It holds a
     number naming a closed pipe, so it carries nothing, and removing it
@@ -722,13 +856,20 @@ def _resolve_from_inherited_fd(name: str) -> Tuple[Optional[str], str]:
         log.debug("inherited fd for %s is not an integer: %r", name, raw_fd)
         return (None, SOURCE_MISSING)
 
+    if not _is_pipe(fd):
+        # The number arrived without the pipe behind it. Whatever it
+        # names here belongs to this process, and is not ours to close.
+        log.debug("inherited fd for %s does not name a pipe: %r", name, raw_fd)
+        return (None, SOURCE_MISSING)
+
     try:
         payload = read_secret_fd(fd)
     except (OSError, ValueError) as exc:
-        # A pipe whose writer never arrived, and a payload the writer
-        # should not have produced, are the same problem here: this
-        # source has no value. Both are worth a log line, because both
-        # mean the handoff did not arrive intact.
+        # A pipe whose writer never arrived, a payload the writer
+        # should not have produced, and a descriptor that is not the
+        # published pipe at all are the same problem here: this source
+        # has no value. All three are worth a log line, because all
+        # three mean the handoff did not arrive intact.
         log.debug("inherited fd for %s did not yield a value: %s", name, exc)
         return (None, SOURCE_MISSING)
 
@@ -1120,38 +1261,50 @@ def publish_secret_fd(name: str) -> int | None:
 def read_secret_fd(fd: int) -> dict[str, str]:
     """Read a published secret from ``fd``; return it, and close ``fd``.
 
-    The descriptor is spent by this call. A pipe has exactly one reader,
+    The descriptor is spent by this call — but only if it was the
+    published pipe in the first place. A pipe has exactly one reader,
     and leaving the descriptor open would hand it to the next reader in
     the process — whose read would then block forever, waiting on a
     writer that went away the moment the payload was written. Closing on
     the way out turns that into a fast failure.
+
+    A descriptor this module did **not** publish is a different matter,
+    and it is not this module's to close. A descriptor number is only
+    meaningful in the process that issued it; the number travels
+    through the environment, and the pipe does not always travel with
+    it. Where the pipe did not arrive, the number names something else
+    this process owns, and closing it would be a bug in a place that
+    has nothing to do with secrets. So such a descriptor is read from
+    neither side of this call: not read, and not closed. See
+    :func:`_drain_published_pipe` for how "the pipe we published" is
+    established, and ``docs/development/service-spawn-root-cause.md``
+    for what happens when it is not.
 
     The return is a flat object of strings, keyed by logical name. Flat
     because the only thing that goes through this pipe is a secret
     resolved by one name; a nested structure would be a shape nothing in
     this module produces and nothing here knows how to validate.
 
-    Raises ``ValueError`` for a payload that is not such an object.
-    That is a contract violation between the two halves of this module
-    rather than a deployment state, so it is reported rather than
-    smoothed over: returning ``{}`` for a payload the reader could not
-    understand would turn a bug at the handoff into an authentication
-    error at the far end of a notification send.
+    Raises ``ValueError`` for a payload that is not such an object, and
+    for a descriptor that does not name the published pipe. Both are
+    contract violations between the two halves of this module rather
+    than a deployment state, so they are reported rather than smoothed
+    over: returning ``{}`` for a payload the reader could not understand
+    would turn a bug at the handoff into an authentication error at the
+    far end of a notification send.
     """
-    try:
-        chunks: List[bytes] = []
-        while True:
-            chunk = os.read(fd, _FD_READ_CHUNK)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        raw = b"".join(chunks)
-    finally:
-        # Closed on every path, including a decode failure below. The
-        # caller handed over a descriptor and expects it spent; a
-        # descriptor this function leaves behind is a descriptor the
-        # caller has no way to find again.
-        os.close(fd)
+    raw = _drain_published_pipe(fd)
+    if raw is None:
+        raise ValueError(
+            f"descriptor {fd} does not name a published secret pipe"
+        )
+
+    # Closed once the payload is in hand, and before it is parsed, so a
+    # payload the reader could not understand still leaves the
+    # descriptor spent: the caller handed over a descriptor and expects
+    # it spent, and a descriptor this function leaves behind is a
+    # descriptor the caller has no way to find again.
+    os.close(fd)
 
     payload = json.loads(raw.decode("utf-8", "surrogateescape"))
     if not isinstance(payload, dict) or not all(

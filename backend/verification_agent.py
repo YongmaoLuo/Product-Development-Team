@@ -560,6 +560,120 @@ def _render_evidence_for_prompt(
     return _truncate_annotated(rendered, limit)
 
 
+# ---------------------------------------------------------------------------
+# Which ``service_manager`` does the spawn come from? (2026-10-24)
+# ---------------------------------------------------------------------------
+
+
+#: The two entry points the declared-services preflight needs from a
+#: ``service_manager`` module.  A project module that does not offer both
+#: is not usable here, and the loader falls back to the harness' copy.
+_SERVICE_MANAGER_ENTRY_POINTS = ("ensure_services", "record_runtimes")
+
+
+def _project_service_manager_path(project_dir: Any) -> Optional[Path]:
+    """The project's own ``service_manager``, if it ships one.
+
+    ``<project_dir>/backend/service_manager.py`` — the layout every
+    ``backend/*.py`` module of this project family uses.
+    """
+    if not project_dir:
+        return None
+    try:
+        candidate = Path(project_dir) / "backend" / "service_manager.py"
+    except TypeError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _load_service_manager(project_dir: Any = None) -> Any:
+    """The ``service_manager`` module that belongs to *project_dir*.
+
+    Why this exists
+    ---------------
+    A declared service's ``start_cmd`` runs the *project's* own code
+    (``python -m backend.server``, with ``cwd`` inside the project), so
+    the project is what a verification round is about.  The machinery
+    that launches that code has to come from the same place: while the
+    preflight called the **harness' own** ``service_manager``, a project
+    that had fixed its spawn shape was still verified through the
+    backend's *old* one — and the round failed for reasons that had
+    nothing to do with the project.
+
+    Resolution order:
+
+      1. ``<project_dir>/backend/service_manager.py`` — the project's
+         own module, loaded **from its path** (never from ``sys.path``,
+         so the harness' copy cannot shadow it).
+      2. The harness' own ``service_manager`` — the fallback, used when
+         the project ships no such module or when loading it fails.
+
+    The boundary this leaves behind
+    -------------------------------
+    The project's module does *flat* imports (``from credentials import
+    ...``, ``from service_declaration import ...``, ``from
+    service_freshness import ...``) — the convention every ``backend/*.py``
+    module follows, and the reason ``backend/`` sits on ``sys.path``.
+    Those names therefore resolve to the **harness'** copies, not to the
+    project's.  That is acceptable as long as the shared constants stay
+    in step (``credentials._FD_ENV_PREFIX``, ``service_freshness.
+    PROTECTED_PORTS`` and the rest carry the same values in both trees),
+    and it is spelled out here so it does not quietly become an implicit
+    contract: if a project ever needs its *own* ``credentials``, the
+    flat-import convention has to change first.
+
+    Never raises — a project that cannot be loaded falls back to the
+    harness' module rather than taking the round down.
+    """
+    path = _project_service_manager_path(project_dir)
+    if path is None:
+        import service_manager
+
+        return service_manager
+
+    try:
+        import hashlib
+        import importlib.util
+
+        # A name that is not ``service_manager``: ``sys.modules`` already
+        # holds the harness' module under that name, and shadowing it
+        # would swap the harness' spawn machinery for the project's —
+        # the exact confusion this loader exists to prevent.  The digest
+        # keeps two projects apart when both are loaded in one process.
+        digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:12]
+        module_name = f"pdt_project_service_manager_{digest}"
+        spec = importlib.util.spec_from_file_location(module_name, str(path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"no loader for {path}")
+        module = importlib.util.module_from_spec(spec)
+        # Registered while it executes, so a module that looks itself up
+        # by ``__name__`` finds itself; removed again afterwards, so the
+        # registry keeps describing the harness' own modules.
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop(module_name, None)
+        missing = [
+            name for name in _SERVICE_MANAGER_ENTRY_POINTS
+            if not hasattr(module, name)
+        ]
+        if missing:
+            raise AttributeError(
+                f"{path} does not offer {', '.join(missing)}"
+            )
+        return module
+    except Exception as exc:  # noqa: BLE001 — a fallback, never a failure
+        logger.warning(
+            "[service_freshness] could not load the project's own "
+            "service_manager (%s); falling back to the harness' copy: %s",
+            path, exc,
+        )
+        import service_manager
+
+        return service_manager
+
+
 #
 # Refactor note (Phase C7 → Orchestrator): the historical class name
 # ``VerificationAgent`` is kept as a backward-compatibility alias of the
@@ -5158,11 +5272,20 @@ class Orchestrator:
         rather than killed (see :mod:`service_manager` for the three-way
         ownership rule).
 
+        The spawn itself comes from the **project's** ``service_manager``
+        (see :func:`_load_service_manager`): the service that the
+        declaration starts is the project's own code, so the code that
+        starts it has to be the project's too.  Otherwise a project that
+        fixed its spawn shape would still be verified through the
+        backend's old one.
+
         A stale build artefact is rebuilt first — relaunching a service
         against yesterday's binary would just serve old code again,
         which is the ordering the legacy path already had.
         """
-        from service_manager import ensure_services, record_runtimes
+        service_manager = _load_service_manager(self.project_dir)
+        ensure_services = service_manager.ensure_services
+        record_runtimes = service_manager.record_runtimes
 
         self._maybe_rebuild_before_service_start()
         runtime_map = ensure_services(

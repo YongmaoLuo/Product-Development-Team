@@ -47,7 +47,7 @@ _NOISE_LINES = [f"GeneratorExit {n}" for n in range(15)]
 _PID = 424242
 
 #: The fixed prefix every "not ready" detail starts with.
-_PREFIX = f"started (pid {_PID}) but not ready after 180s; "
+_PREFIX = f"started (pid {_PID}, pgid {_PID}) but not ready after 180s; rc=None; "
 
 
 def _fixture_log() -> str:

@@ -81,6 +81,14 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path.startswith("/headers"):
+            # Echo back the headers the runner actually put on the wire.
+            body = json.dumps(dict(self.headers)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(500)
             self.send_header("Content-Length", "0")
@@ -657,3 +665,47 @@ def test_replay_of_a_missing_vp_still_exits_two(
         f"an unknown VP id must exit 2, got {exit_code}"
     )
     assert "not found" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# The runner sends exactly the declared headers — and nothing else
+# ---------------------------------------------------------------------------
+
+def test_the_runner_never_injects_the_guard_header(server_url: str) -> None:
+    """api runner 只发声明过的头；它**绝不能**自动补 ``X-PDT-Request``。
+
+    仓库对 ``/api/*`` 强制要求 ``X-PDT-Request: 1``（``backend/request_guard.py``），
+    而仓库里至少 12 条计划的验证点把「不带该头 → 403」当成正式判据（跨源
+    浏览器页不得直接调本地 API）。api runner 一旦对 ``/api/*`` 自动补这个头，
+    那些守卫验证点会全部变成假通过 —— 守卫本身的语义正是「本地脚本须显式
+    带上这个头」。
+
+    所以这里钉的是「不多发」：声明了什么就发什么，没声明的绝不替它加。
+    """
+    from verification_api_runner import run_api_verification
+
+    url = f"{server_url}/headers"
+    vp = {
+        "id": "VP-001",
+        "verification_method": "api_test",
+        "request": {
+            "method": "GET",
+            "url": url,
+            "headers": {"Accept": "application/json"},
+        },
+        "assertions": [{"name": "200", "status": 200}],
+    }
+
+    result = run_api_verification(vp, artifact_dir=None)
+
+    assert result.status == STATUS_PASSED, result.reasons
+    seen = json.loads(result.evidence["response_body"])
+    assert not any(
+        name.lower() == "x-pdt-request" for name in seen
+    ), (
+        "the runner injected the guard header — every verification point that "
+        f"asserts 'no header → 403' would become a false pass: {sorted(seen)}"
+    )
+    assert any(name.lower() == "accept" for name in seen), (
+        f"the declared headers must still go out: {sorted(seen)}"
+    )

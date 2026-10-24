@@ -450,9 +450,97 @@ def test_start_service_launches_detached_and_waits(project, monkeypatch):
     assert runtime.ready is True
     assert runtime.origin == "spawned"
     assert runtime.pid == 999999
-    assert spawned["argv"][:2] == ["/bin/bash", "-lc"]
-    assert spawned["kwargs"]["start_new_session"] is True
+    # The command is started through the wrapper: the wrapper's own
+    # program comes first, and the declared command follows it verbatim
+    # -- never re-parsed, never re-quoted.
+    argv = spawned["argv"]
+    assert argv[0] == (sys.executable or "/usr/bin/python3")
+    assert argv[1] == "-c"
+    assert argv[3:] == ["/bin/bash", "-lc", "npx next dev -p 3000"]
+    # The wrapper makes the session itself, so Popen must not ask for one
+    # as well: the child would already be a group leader and the
+    # wrapper's own ``setsid`` would fail with EPERM.
+    assert "start_new_session" not in spawned["kwargs"]
     assert spawned["kwargs"]["cwd"] == str(project)
+
+
+def test_detached_argv_hands_the_command_over_verbatim():
+    """The wrapper starts the declared command, not a re-quoted copy."""
+    start_cmd = "npx next dev -p 3000 --label 'a b'"
+
+    argv = sm._detached_argv(start_cmd)
+
+    assert argv[0] == (sys.executable or "/usr/bin/python3")
+    assert argv[1] == "-c"
+    assert argv[3:] == ["/bin/bash", "-lc", start_cmd]
+    # The wrapper is what separates the session and what keeps the
+    # descriptor variables out of the child.
+    assert "os.setsid()" in argv[2]
+    assert sm._SECRET_FD_ENV_PREFIX in argv[2]
+
+
+@pytest.mark.timeout(120)
+def test_the_wrapper_drops_descriptor_variables_and_leaves_the_session(
+    tmp_path, monkeypatch,
+):
+    """The child must not see the descriptor variables, and must run in a
+    session of its own.
+
+    The descriptor variables name a descriptor number, and that number
+    only means something in the process that published it. A child that
+    inherits the variable reads a number that is its own -- and closes
+    it -- which is how the event loop's selector used to die before the
+    service was ready.
+    """
+    import subprocess
+    import time as _time
+
+    monkeypatch.setenv("PDT_SECRET_FD_FEISHU_APP_SECRET", "3")
+    report = tmp_path / "report.json"
+    script = tmp_path / "report.py"
+    script.write_text(
+        "import json, os, sys\n"
+        "out = {\n"
+        "    'fd_vars': sorted(\n"
+        "        k for k in os.environ\n"
+        f"        if k.startswith({sm._SECRET_FD_ENV_PREFIX!r})\n"
+        "    ),\n"
+        "    'sid': os.getsid(0),\n"
+        "    'pgid': os.getpgid(0),\n"
+        "}\n"
+        "open(sys.argv[1], 'w').write(json.dumps(out))\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.Popen(
+        sm._detached_argv(f"{sys.executable} {script} {report}"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+    try:
+        deadline = _time.monotonic() + 30.0
+        while _time.monotonic() < deadline and not report.exists():
+            _time.sleep(0.05)
+        assert report.exists(), (
+            "the wrapper never started the command it was given"
+        )
+        payload = json.loads(report.read_text())
+        assert payload["fd_vars"] == [], (
+            f"the child still sees the descriptor variables: "
+            f"{payload['fd_vars']}"
+        )
+        assert payload["sid"] != os.getsid(0), (
+            "the child shares this process' session, so it would not "
+            "outlive the process that started it"
+        )
+        assert payload["pgid"] == payload["sid"], (
+            f"the child's group ({payload['pgid']}) is not the one it "
+            f"leads ({payload['sid']}), so stopping it by group would "
+            f"miss the service"
+        )
+    finally:
+        _force_cleanup(proc.pid)
 
 
 def test_start_service_failure_carries_the_log_tail(project, monkeypatch):
