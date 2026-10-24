@@ -1504,6 +1504,129 @@ def _quota_wake_probe_sec() -> float:
     return float(DEFAULT_COOLDOWN_SEC)
 
 
+#: The longest a wake will sleep on a *named* reopen, in seconds. Half
+#: an hour: the escape hatch that keeps the argument in
+#: :func:`_quota_wake_probe_sec` alive without paying for it on every
+#: round. A plan upgrade brings the budget back at a moment no
+#: ``resets_at`` was ever going to name, so a wake that slept for a week
+#: would keep waiting through a window that had already opened — but
+#: half an hour of lateness on the discovery of a plan upgrade is
+#: acceptable, and half an hour of it is the whole price.
+_QUOTA_WAKE_MAX_SEC_DEFAULT = 1800.0
+
+
+def _quota_wake_cap_sec() -> float:
+    """The ceiling on a wake that sleeps on a named reopen."""
+    raw = os.environ.get("PDT_QUOTA_WAKE_MAX_SEC", _QUOTA_WAKE_MAX_SEC_DEFAULT)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return _QUOTA_WAKE_MAX_SEC_DEFAULT
+
+
+def _quota_wake_soonest_reset(
+    blocked: Any, quota_map: Any
+) -> Optional[Tuple[datetime, float]]:
+    """``(resets_at, seconds)`` of the soonest reopen among ``blocked``.
+
+    The soonest is the one the wait is actually about: if the whole
+    fleet is shut, what matters is the first moment any of it can serve
+    again, because that is when the wait could plausibly end.
+
+    Only a *future* moment counts. A stamp already in the past is a
+    reading that has not caught up with the refresh, and counting it
+    would size a wait of zero — which is how a wake turns into a hot
+    loop against the provider's usage endpoint. So a past stamp is not
+    a candidate, and a provider that names no moment at all is not one
+    either.
+    """
+    if not quota_map:
+        return None
+    soonest: Optional[Tuple[datetime, float]] = None
+    for name in blocked or ():
+        try:
+            quota = quota_map.get(name)
+        except AttributeError:
+            return None
+        if quota is None:
+            continue
+        resets_at = getattr(quota, "exhausted_resets_at", None)
+        if not isinstance(resets_at, datetime):
+            continue
+        now = (
+            datetime.now(resets_at.tzinfo)
+            if resets_at.tzinfo
+            else datetime.now()
+        )
+        seconds = (resets_at - now).total_seconds()
+        if seconds <= 0:
+            continue
+        if soonest is None or seconds < soonest[1]:
+            soonest = (resets_at, seconds)
+    return soonest
+
+
+def _tiers_missing_for(names: Any, quota_map: Any) -> Dict[str, List[str]]:
+    """Which gated windows each named provider's reading did not carry.
+
+    Recorded, never decided on. A provider whose reading carries only
+    the burst window has no week reading at all — which is a fact about
+    the *reading*, not about the budget — so the point of putting it in
+    a log line is to let an operator tell "no budget" from "no
+    reading". Providers whose reading carried every gated window are
+    left out: the line is about the exception.
+    """
+    out: Dict[str, List[str]] = {}
+    if not quota_map:
+        return out
+    for name in names or ():
+        try:
+            quota = quota_map.get(name)
+        except AttributeError:
+            return out
+        if quota is None:
+            continue
+        missing = list(getattr(quota, "tiers_missing", ()) or ())
+        if missing:
+            out[name] = missing
+    return out
+
+
+def _quota_wake_delay(blocked: Any, quota_map: Any) -> Tuple[float, str]:
+    """(seconds, reason) —— 下一次探测之前睡多久，以及为什么。
+
+    Two answers, and the second one says which it is.
+
+    ``soonest_reset``
+        The reading named a moment at which one of the blocked
+        providers comes back, so the wait is sized on it: the soonest
+        reopen plus a small margin, clamped to
+        :data:`_QUOTA_WAKE_MAX_SEC_DEFAULT`. Sleeping until the window
+        is actually open costs one wake instead of two, and a probe
+        that lands before the meter has caught up costs the wait
+        anyway.
+
+    ``probe``
+        No named moment: the reading said nothing about when this
+        window reopens, or said a moment already in the past. That is
+        the case :func:`_quota_wake_probe_sec` exists for — a plan
+        upgrade comes back at a moment no ``resets_at`` was going to
+        name — so the wait falls back to the fixed beat.
+
+    The cap is what keeps the first answer honest: a window a week out
+    is not slept through, because the window might be bought back long
+    before it rolls. Thirty minutes is the most a wake will ever spend
+    on a single named reopen, and the argument that made the fixed
+    beat necessary still holds at that scale.
+    """
+    soonest = _quota_wake_soonest_reset(blocked, quota_map)
+    if soonest is None:
+        return _quota_wake_probe_sec(), "probe"
+    _resets_at, seconds = soonest
+    cap = _quota_wake_cap_sec()
+    return max(5.0, min(seconds + 2.0, cap)), "soonest_reset"
+
+
 class WorkClock:
     """A budget that stops spending while its holder is parked.
 
@@ -3226,6 +3349,9 @@ class ClaudeCodingTool(CodingTool):
                                     "candidates": scene_candidates,
                                     "quota_exhausted": _quota_blocked,
                                     "wait_sec": wait_sec,
+                                    "tiers_missing": _tiers_missing_for(
+                                        scene_candidates, quota_map
+                                    ),
                                     "slot_wait_rounds": _slot_rounds,
                                     "slot_waited_sec": round(_slot_waited, 1),
                                     "tracker": self._concurrency_tracker.snapshot(),
@@ -3501,7 +3627,12 @@ class ClaudeCodingTool(CodingTool):
                                 logger=self.logger,
                             )
 
-                        delay = _quota_wake_probe_sec()
+                        delay, _wait_reason = _quota_wake_delay(
+                            _window_blocked, quota_map
+                        )
+                        _soonest = _quota_wake_soonest_reset(
+                            _window_blocked, quota_map
+                        )
                         _wake_rounds = _quota_watchdog.wait_round()
                         if self.logger:
                             self.logger.info(
@@ -3512,6 +3643,15 @@ class ClaudeCodingTool(CodingTool):
                                     "scene": effective_scene,
                                     "quota_exhausted": _window_blocked,
                                     "wait_sec": delay,
+                                    "wait_reason": _wait_reason,
+                                    "soonest_reset_at": (
+                                        _soonest[0].isoformat()
+                                        if _soonest is not None
+                                        else None
+                                    ),
+                                    "tiers_missing": _tiers_missing_for(
+                                        _window_blocked, quota_map
+                                    ),
                                     "wake_rounds": _wake_rounds,
                                     "waiting_dispatches": (
                                         _quota_watchdog.waiting_dispatches
