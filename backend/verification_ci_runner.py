@@ -66,6 +66,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -110,6 +111,20 @@ NODE_ID_MARKER = "::"
 #: pytest 的用例收窄选择器 —— 用了它就不是"跑整套"。
 _PYTEST_NARROWING_FLAGS = ("-k", "--keyword", "-m", "--markexpr")
 
+#: python 解释器的可执行文件名 —— ``python`` / ``python3`` / ``python3.11``
+#: / ``python3.exe``（含 Windows 的 ``.exe`` 后缀）。
+#:
+#: 存在的理由：``-m`` 是唯一一个**拼写会撞车**的收窄选择器。
+#: ``python3 -m pytest backend/tests`` 里的 ``-m`` 是**解释器**的"以模块
+#: 方式运行"标志（``-m pytest``），后面的 ``pytest backend/tests`` 跑的是
+#: 整个目录 —— 但旧判据只看 token 本身，把解释器的 ``-m`` 当成了 pytest 的
+#: ``--markexpr`` 简写，于是把一条**整仓**入口判成"收窄了验证范围"，
+#: 门禁一行都没跑（2026-10-24 的 VP-019）。
+#:
+#: 判据：``-m`` 紧跟在 python 解释器后面 → 它属于解释器，不算收窄；
+#: 否则 → 它是 pytest 自己的选择器，照旧判为收窄。
+_PYTHON_INTERPRETER_RE = re.compile(r"^python(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
+
 #: cargo test 的收窄选择器。
 _CARGO_NARROWING_FLAGS = ("--test", "--lib", "--bins", "--examples", "--doc")
 
@@ -152,6 +167,28 @@ class CiRunResult:
 # ---------------------------------------------------------------------------
 
 
+def _belongs_to_python_interpreter(tokens: List[str], index: int) -> bool:
+    """Is ``tokens[index]`` a ``-m`` that belongs to a python interpreter?
+
+    True means the ``-m`` is the interpreter's "run this module" flag
+    (``python3 -m pytest``), not pytest's ``--markexpr`` shorthand.
+
+    The discriminator is the token in front of the ``-m``: when its
+    basename is a python interpreter (``python`` / ``python3`` /
+    ``python3.11`` / ``python3.exe``) the ``-m`` is the interpreter's.
+    A ``-m`` with nothing in front of it — or with anything else in
+    front of it — stays pytest's, and stays a narrowing signal.
+    """
+    if index == 0:
+        return False
+    previous = tokens[index - 1]
+    if previous.startswith("-"):
+        # A flag cannot be an interpreter path; ``-m`` after another
+        # flag is pytest's own selector.
+        return False
+    return bool(_PYTHON_INTERPRETER_RE.match(os.path.basename(previous)))
+
+
 def looks_narrowed(entry: str) -> Optional[str]:
     """Return why ``entry`` is a *scoped* command rather than a full gate.
 
@@ -161,6 +198,12 @@ def looks_narrowed(entry: str) -> Optional[str]:
     point?); this function carries the negative one, which is the part
     that stops ``ci_entry`` from decaying back into a general-purpose
     ``test_command``.
+
+    One marker has an exception: ``-m``. ``python3 -m pytest <dir>``
+    puts a ``-m`` on the command line that belongs to the *interpreter*
+    ("run this module"), not to pytest — the entry still runs the whole
+    directory. See :func:`_belongs_to_python_interpreter` for how the
+    two are told apart. Every other marker keeps its plain reading.
     """
     text = str(entry or "").strip()
     if not text:
@@ -181,9 +224,14 @@ def looks_narrowed(entry: str) -> Optional[str]:
         # narrowing signal, so don't claim it is one.
         tokens = text.split()
 
-    for token in tokens:
+    for index, token in enumerate(tokens):
         if any(flag == token or token.startswith(flag + "=")
                for flag in _PYTEST_NARROWING_FLAGS):
+            if token == "-m" and _belongs_to_python_interpreter(tokens, index):
+                # ``python3 -m pytest …`` —— 这个 ``-m`` 是解释器的
+                # "以模块方式运行"标志，不是 pytest 的 markexpr。入口
+                # 跑的是 ``pytest`` 后面的整个目标，不是收窄过的用例集。
+                continue
             return f"入口用了用例收窄选择器 `{token}`"
         if any(flag == token for flag in _CARGO_NARROWING_FLAGS):
             return f"入口用了收窄选择器 `{token}`"

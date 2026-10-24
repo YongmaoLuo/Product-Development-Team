@@ -30,6 +30,7 @@ task retry, etc.) while reusing the battle-tested scheduler.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -37,7 +38,7 @@ import tempfile
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from utils.atomic_io import atomic_write_json
 
@@ -45,6 +46,29 @@ from utils.atomic_io import atomic_write_json
 def _now_iso() -> str:
     """Return current UTC time as ISO-8601 with ``Z`` suffix."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def stable_fingerprint(payload: Any) -> str:
+    """Return a stable, order-insensitive hash of ``payload``.
+
+    The payload is serialised as canonical JSON (sorted keys, no
+    whitespace) before hashing, so two structurally equal payloads
+    always produce the same fingerprint no matter how their keys were
+    ordered.  A value JSON cannot represent falls back to ``str`` so a
+    stray object inside a definition cannot crash the fingerprint.
+
+    Args:
+        payload: Any JSON-ish value (dict / list / scalar).
+
+    Returns:
+        The first 16 hex characters of the SHA-256 of the canonical
+        form — short enough to store next to an id, long enough that
+        two different definitions do not collide by accident.
+    """
+    canonical = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def _atomic_write(path: Path, payload: dict) -> None:
@@ -172,6 +196,19 @@ class BaseExecutor(ABC):
     # Construction
     # ------------------------------------------------------------------
 
+    #: Whether a cached id may only be resumed when the **definition**
+    #: it was earned under still matches the item's current definition.
+    #:
+    #: ``False`` in the base class — the task executor keeps the historic
+    #: "skip by id" behaviour.  ``VerificationExecutor`` turns it on:
+    #: there an id is only a *name*, and the plan may put a different
+    #: criterion behind the same name (2026-10-24: the plan delta
+    #: re-issued an already-PASSED id with a different definition, and
+    #: the resume path inherited the previous round's verdict — the
+    #: report then showed a conclusion about a target the plan no
+    #: longer asked for).
+    _REQUIRE_MATCHING_DEFINITION = False
+
     def __init__(
         self,
         plan: Dict[str, Any],
@@ -292,6 +329,93 @@ class BaseExecutor(ABC):
         (e.g. layer summary counters, budget tracking).
         """
 
+    # ------------------------------------------------------------------
+    # Definition fingerprint (resume safety)
+    # ------------------------------------------------------------------
+    #
+    # A cached result is only worth inheriting if it was earned under
+    # the definition the item carries **now**.  The base class knows
+    # nothing about what an item's definition is, so it asks two
+    # questions and lets the subclass answer them:
+    #
+    #   * :meth:`_item_definition_fingerprint` — what does the item
+    #     look like right now?
+    #   * :meth:`_cached_definition_fingerprint` — what did the item
+    #     look like when the cached result was earned?
+    #
+    # The default answers are "unknown" and "no fingerprint scheme",
+    # which keeps the historic "skip by id" behaviour for every
+    # executor that does not opt in.
+
+    def _item_definition_fingerprint(self, item: Dict[str, Any]) -> str:
+        """Stable hash of ``item``'s current definition.
+
+        Returns ``""`` when the executor has no notion of a definition
+        (the base-class default).
+        """
+        return ""
+
+    def _cached_definition_fingerprint(self, item_id: str) -> Optional[str]:
+        """The fingerprint stored with ``item_id``'s cached result.
+
+        ``None`` means "this id carries no fingerprint" — either the
+        cache predates the fingerprint format, or the item was never
+        recorded.  The resume filter reads that as "definition
+        unknown" and re-runs the item.
+        """
+        return None
+
+    def _resumable_completed_ids(self, items: List[Dict[str, Any]]) -> Set[str]:
+        """Which cached ids this resume may skip.
+
+        The historic rule was "skip every cached id".  That rule is
+        only sound while an id *is* its definition — and it is not: a
+        plan may put a different criterion behind the same id (a plan
+        delta that re-issues an id, a rewritten ``expected_result``).
+        Inheriting the old verdict then reports a conclusion about a
+        target the plan no longer asks for.
+
+        So when the executor opts in (``_REQUIRE_MATCHING_DEFINITION``),
+        a cached id is resumable only when the definition fingerprint
+        stored with it still matches the item's current definition.
+        A cached id with **no** fingerprint (the old cache format) is
+        treated as "definition unknown" and re-run: an unknown
+        definition cannot be assumed to still hold, and re-running is
+        the direction that cannot report a stale conclusion.
+
+        Args:
+            items: The items this run would execute.
+
+        Returns:
+            The subset of the cached ids that may be skipped.
+        """
+        cached = set(self._completed_items) | set(self._skipped_items)
+        if not self._REQUIRE_MATCHING_DEFINITION:
+            return cached
+
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for item in items:
+            item_id = str(self._derive_item_id(item))
+            if item_id:
+                by_id[item_id] = item
+
+        resumable: Set[str] = set()
+        for item_id in cached:
+            item = by_id.get(item_id)
+            if item is None:
+                # Not part of this plan — the pending filter never
+                # looks at it, so it neither blocks nor enables
+                # anything.
+                continue
+            recorded = self._cached_definition_fingerprint(item_id)
+            if not recorded:
+                # Old-format cache entry (an id and nothing else): the
+                # definition it was earned under is unknown.
+                continue
+            if recorded == self._item_definition_fingerprint(item):
+                resumable.add(item_id)
+        return resumable
+
     def _build_execution_layers(
         self,
         items: List[Dict[str, Any]],
@@ -411,9 +535,13 @@ class BaseExecutor(ABC):
         # green ones, re-run the red ones". Folding the FAILED set into
         # ``completed_set`` satisfies the letter of that rule while
         # running none of the VPs the round exists for.
-        completed_set = (
-            set(self._completed_items) | set(self._skipped_items)
-        )
+        #
+        # ``_resumable_completed_ids`` is the one place that decides
+        # what "already done" means. For the verification round it is
+        # not just the id: a cached verdict is only inherited when the
+        # definition it was earned under still matches the plan's
+        # current definition (see ``_REQUIRE_MATCHING_DEFINITION``).
+        completed_set = self._resumable_completed_ids(items)
         pending = [it for it in items if self._derive_item_id(it) not in completed_set]
 
         if not pending:

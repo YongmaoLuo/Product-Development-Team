@@ -59,9 +59,9 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from base_executor import BaseExecutor, _build_layers, _now_iso
+from base_executor import BaseExecutor, _build_layers, _now_iso, stable_fingerprint
 from utils.atomic_io import atomic_write_json
 # 2026-09-15: verdict 的出处 —— 结论只对产生它的那条
 # 命令有效。见 ``verification_verdict_provenance`` 的模块 docstring。
@@ -124,6 +124,112 @@ ALLOWED_STATUSES = ("PASSED", "FAILED", "SKIPPED", "BLOCKED", "DEFERRED")
 #: Required keys for a valid verdict payload. The contract is
 #: position-free: any extra keys are ignored.
 REQUIRED_VERDICT_KEYS = ("status", "reasons", "evidence")
+
+
+# Definition fingerprint -----------------------------------------------------
+#
+# 2026-10-24: 一条结论只对它**产生它的那份定义**有效。
+#
+# 起因：增量评估把上一轮已经 PASSED 的 VP id 又发了一遍，计划的
+# ``expected_result`` / ``verification_method`` / 判据载荷被换成了别的内容，
+# 而 resume 路径**只按 id 字符串**跳过 VP（``BaseExecutor.run`` 的
+# ``completed_set``）。上一轮的结论于是被当成本轮的结论 —— 报告里出现
+# 「验证对象错位」，而这一轮那个 VP **一次都没跑过**（``logs/vp_attempts/``
+# 里没有它的尝试记录）。
+#
+# 修法与 :mod:`verification_verdict_provenance` 同源，只是被指纹的对象从
+# 「命令」换成「定义」：写入时随 id 存一份稳定哈希，resume 读回后只把
+# **指纹一致**的 id 放进 ``completed_set``。
+
+#: The field a verdict carries the fingerprint of the definition that
+#: earned it.  Same shape as
+#: :data:`verification_verdict_provenance.FINGERPRINT_FIELD`, but what
+#: is fingerprinted is the **definition** (what the VP proves), not
+#: the command that ran it.
+DEFINITION_FINGERPRINT_FIELD = "definition_fingerprint"
+
+#: Each verification method's **criterion payload**: the fields that
+#: decide *what* the VP proves and *how* it is run.  A change to any of
+#: them changes the criterion, so a verdict earned under the old
+#: payload must not be inherited by a round whose plan says something
+#: else.
+#:
+#: Deliberately **narrow**: ``title`` / ``priority`` / ``timeout_seconds``
+#: / ``execution_group`` only *describe* a VP or schedule it.  Letting
+#: them move the fingerprint would re-run the world over a cosmetic
+#: edit — and ``execution_group`` in particular shifts whenever the
+#: plan gains a new method, which says nothing about any single VP.
+_METHOD_CRITERION_FIELDS: Dict[str, Tuple[str, ...]] = {
+    "api_test": ("request", "assertions", "target_url", "uses_services"),
+    "ui_validation": ("target_url", "uses_services"),
+    "e2e": ("target_url", "uses_services"),
+    "full_ci": ("ci_entry",),
+    "code_review": ("related_prd_criteria",),
+}
+
+#: Criterion fields used for a method this module does not know about.
+#: A superset of every method's payload — over-invalidating a verdict
+#: only costs one extra run, under-invalidating it costs a wrong
+#: conclusion.
+_GENERIC_CRITERION_FIELDS: Tuple[str, ...] = (
+    "request",
+    "assertions",
+    "target_url",
+    "ci_entry",
+    "uses_services",
+    "related_prd_criteria",
+    "test_command",
+)
+
+
+def _fold_whitespace(value: Any) -> Any:
+    """Collapse whitespace runs in a text value; other values pass through.
+
+    Prose gets re-wrapped by tooling all the time; the criterion it
+    describes did not move, so the fingerprint must not either.
+    """
+    if isinstance(value, str):
+        return " ".join(value.split())
+    return value
+
+
+def definition_fingerprint_for_vp(vp: Any) -> str:
+    """Return the stable fingerprint of a VP's **definition**.
+
+    The payload is the id, the expected result, the verification method
+    and that method's criterion payload.  Fields that merely *describe*
+    the VP (title, priority, scheduling bookkeeping) are left out on
+    purpose: they do not change what the VP proves.
+
+    The hash is canonical (sorted keys), so re-ordering the fields of
+    one and the same definition yields the same fingerprint.
+
+    Args:
+        vp: One verification point — a dict from the plan.
+
+    Returns:
+        The fingerprint, or ``""`` for anything that is not a VP.  An
+        empty fingerprint means "definition unknown", which the resume
+        path treats as "must re-run".
+    """
+    if not isinstance(vp, dict):
+        return ""
+    # The executor schema renames ``verification_method`` to ``method``
+    # (see ``verification_agent._convert_plan_to_executor_schema``), the
+    # LLM schema keeps the long name.  Both are read here so the
+    # fingerprint says the same thing whichever schema the plan uses.
+    method = str(
+        vp.get("verification_method") or vp.get("method") or ""
+    ).strip()
+    payload: Dict[str, Any] = {
+        "id": str(vp.get("id") or ""),
+        "expected_result": _fold_whitespace(vp.get("expected_result")),
+        "verification_method": method,
+    }
+    for field in _METHOD_CRITERION_FIELDS.get(method, _GENERIC_CRITERION_FIELDS):
+        if field in vp:
+            payload[field] = vp[field]
+    return stable_fingerprint(payload)
 
 
 # Index-bucket plumbing -------------------------------------------------------
@@ -228,6 +334,16 @@ class VerificationExecutor(BaseExecutor):
     derived in-memory from the verdict map; no separate progress
     state-file is written.
     """
+
+    #: A cached verdict is only inherited when the definition it was
+    #: earned under still matches the plan's current definition.  An
+    #: id is only a *name*: the plan may put a different criterion
+    #: behind the same name (2026-10-24: the plan delta re-issued an
+    #: already-PASSED id with a different definition, and the resume
+    #: path inherited the previous round's verdict — the report showed
+    #: a conclusion about a target the plan no longer asked for, and
+    #: the VP itself never ran that round).
+    _REQUIRE_MATCHING_DEFINITION = True
 
     # ------------------------------------------------------------------
     # Construction
@@ -678,6 +794,10 @@ class VerificationExecutor(BaseExecutor):
         verdict = verdict_provenance.stamp(
             verdict, self._current_command_for(vp_id),
         )
+        # 2026-10-24: 盖上"产生这份结论的那份定义"的指纹。同一个 id 在
+        # 下一轮可能换成别的判据（增量重发 id / 改写 expected_result）——
+        # 没有这份指纹，resume 路径会按 id 把上一轮的结论继承过来。
+        verdict = self._stamp_definition_fingerprint(vp_id, verdict)
         self._verdicts[vp_id] = dict(verdict)  # defensive copy
         # Idempotent removal: ``list.remove`` would raise if the vp
         # is not in the pending list, which would mask a benign
@@ -715,6 +835,11 @@ class VerificationExecutor(BaseExecutor):
                     # 又变成"没有指纹"，下一轮全被作废，C 就白做了。
                     verdict_provenance.FINGERPRINT_FIELD: verdict.get(
                         verdict_provenance.FINGERPRINT_FIELD, "",
+                    ),
+                    # 2026-10-24: 定义指纹同理 —— 不落库的话，resume 读回来
+                    # 的结论就是"没有指纹"的旧格式条目，只能全部重跑。
+                    DEFINITION_FINGERPRINT_FIELD: verdict.get(
+                        DEFINITION_FINGERPRINT_FIELD, "",
                     ),
                 },
             )
@@ -1597,6 +1722,11 @@ class VerificationExecutor(BaseExecutor):
         loop, which calls ``_record_result`` after every VP, must
         produce zero ``verification_*_state.json`` files.
         """
+        # 2026-10-24: 盖上"产生这份结论的那份定义"的指纹。这是**生产路径**
+        # （``BaseExecutor.run`` → ``_record_result``），所以指纹必须在这里
+        # 也盖上 —— 只有 ``record_verdict`` 盖的话，resume 从磁盘/DB 读回
+        # 的结论永远没有指纹，每一轮都会全量重跑。
+        result = self._stamp_definition_fingerprint(item_id, result)
         self._verdicts[item_id] = result
         status = result.get("status", "FAILED")
         # 2026-08-25: contract change — ``completed_vps`` is now
@@ -1651,6 +1781,12 @@ class VerificationExecutor(BaseExecutor):
                     "seq": self._verdict_seq,
                     "reasons": list(result.get("reasons", []) or []),
                     "evidence": dict(result.get("evidence", {}) or {}),
+                    # 2026-10-24: 定义指纹必须一起落库（理由同
+                    # ``record_verdict``）：不落库的话，resume 从 DB 水合
+                    # 回来的结论是"没有指纹"的旧格式条目，只能全部重跑。
+                    DEFINITION_FINGERPRINT_FIELD: result.get(
+                        DEFINITION_FINGERPRINT_FIELD, "",
+                    ),
                 },
             )
             return
@@ -1756,6 +1892,63 @@ class VerificationExecutor(BaseExecutor):
             or self.plan.get("verification_points")
             or []
         )
+
+    # ------------------------------------------------------------------
+    # Definition fingerprint
+    # ------------------------------------------------------------------
+    #
+    # The verdict map is the completion cache: it is keyed by VP id and
+    # survives across rounds (that is what makes ``resume`` cheaper
+    # than a clean slate).  An id alone cannot say *which* definition
+    # a cached verdict was earned under, so the verdict carries that
+    # fingerprint alongside its status.
+
+    def _item_definition_fingerprint(self, item: Dict[str, Any]) -> str:
+        """The current definition fingerprint of one plan VP."""
+        return definition_fingerprint_for_vp(item)
+
+    def _cached_definition_fingerprint(self, item_id: str) -> Optional[str]:
+        """The fingerprint stored with ``item_id``'s cached verdict.
+
+        ``None`` when the cached verdict carries no fingerprint — the
+        old cache format, where an entry was just an id and a verdict.
+        Such an entry cannot prove which definition it was earned
+        under, so the resume path re-runs it (the safe direction: an
+        extra run costs tokens, a stale conclusion costs the truth).
+        """
+        verdict = self._verdicts.get(item_id)
+        if not isinstance(verdict, dict):
+            return None
+        value = verdict.get(DEFINITION_FINGERPRINT_FIELD)
+        if not isinstance(value, str) or not value:
+            return None
+        return value
+
+    def _definition_fingerprint_for_vp_id(self, vp_id: str) -> str:
+        """The current definition fingerprint of the plan's VP ``vp_id``.
+
+        ``""`` when the plan does not carry that id — the fingerprint
+        is then unknown, which the resume path reads as "must re-run".
+        """
+        for vp in self._plan_vps():
+            if isinstance(vp, dict) and str(vp.get("id") or "") == str(vp_id):
+                return definition_fingerprint_for_vp(vp)
+        return ""
+
+    def _stamp_definition_fingerprint(
+        self,
+        vp_id: str,
+        verdict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Stamp ``verdict`` with the definition it was earned under.
+
+        Returns a copy — the caller's dict is left alone.
+        """
+        stamped = dict(verdict)
+        stamped[DEFINITION_FINGERPRINT_FIELD] = (
+            self._definition_fingerprint_for_vp_id(vp_id)
+        )
+        return stamped
 
     def _build_execution_layers(
         self,

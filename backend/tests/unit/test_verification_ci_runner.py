@@ -103,6 +103,69 @@ class TestLooksNarrowed:
 
 
 # ---------------------------------------------------------------------------
+# looks_narrowed — the ``-m`` ambiguity (2026-10-24)
+# ---------------------------------------------------------------------------
+#
+# ``-m`` is the one pytest selector whose spelling collides with another
+# program: ``python3 -m pytest`` is the *interpreter's* "run this module"
+# flag, and the entry still runs the whole test directory. The old check
+# looked at the token alone, so it read the interpreter's ``-m`` as
+# pytest's ``--markexpr`` shorthand and rejected a perfectly whole-repo
+# entry — VP-019 never ran a single line of the gate because of it.
+#
+# The discriminator is the token *before* the ``-m``: a python
+# interpreter basename (``python`` / ``python3`` / ``python3.11`` /
+# ``python3.exe``) means the ``-m`` belongs to the interpreter.
+# Everything else — ``-k``, ``--markexpr``, ``::`` node ids, single test
+# files — keeps its previous verdict.
+
+
+class TestLooksNarrowedDashMAmbiguity:
+    def test_interpreter_dash_m_module_flag_is_not_narrowed(self):
+        assert looks_narrowed("python3 -m pytest backend/tests -q") is None
+
+    def test_interpreter_dash_m_with_venv_path_is_not_narrowed(self):
+        assert looks_narrowed(
+            "/opt/venv/bin/python3 -m pytest backend/tests -q"
+        ) is None
+
+    def test_versioned_interpreter_dash_m_is_not_narrowed(self):
+        assert looks_narrowed("python3.11 -m pytest backend/tests") is None
+
+    def test_windows_interpreter_dash_m_is_not_narrowed(self):
+        assert looks_narrowed("python3.exe -m pytest backend/tests") is None
+
+    def test_declared_ci_entry_shape_is_not_narrowed(self):
+        # The exact shape VP-019 declares: an env prefix, an absolute
+        # interpreter path, then ``-m pytest <whole dir>``.
+        assert looks_narrowed(
+            "CI=true /abs/path/backend/.venv/bin/python3 -m pytest "
+            "backend/tests -q"
+        ) is None
+
+    def test_pytest_markexpr_after_interpreter_is_still_narrowed(self):
+        # The interpreter's ``-m`` is exempt; pytest's own ``-m slow``
+        # further down the line is not.
+        reason = looks_narrowed("python3 -m pytest -m slow")
+        assert reason and "-m" in reason
+
+    def test_pytest_keyword_after_interpreter_is_still_narrowed(self):
+        reason = looks_narrowed("python3 -m pytest -k divergence")
+        assert reason and "-k" in reason
+
+    def test_pytest_markexpr_equals_form_after_interpreter_is_narrowed(self):
+        assert looks_narrowed("python3 -m pytest --markexpr=slow") is not None
+
+    def test_bare_dash_m_without_interpreter_is_still_narrowed(self):
+        # No interpreter in front of it → the ``-m`` is pytest's own.
+        reason = looks_narrowed("-m slow backend/tests")
+        assert reason and "-m" in reason
+
+    def test_dash_m_equals_form_is_still_narrowed(self):
+        assert looks_narrowed("pytest backend/tests -m=slow") is not None
+
+
+# ---------------------------------------------------------------------------
 # validate_vp
 # ---------------------------------------------------------------------------
 
@@ -151,6 +214,15 @@ class TestValidateVp:
     def test_non_dict_vp_is_reported(self):
         issues = validate_vp("not-a-vp")
         assert len(issues) == 1
+
+    def test_interpreter_module_entry_is_not_a_schema_issue(self, tmp_path):
+        # ``python3 -m pytest <dir>`` runs the whole directory — the gate
+        # must accept it (2026-10-24: the ``-m`` of the interpreter used
+        # to be read as pytest's markexpr and rejected the entry).
+        (tmp_path / "backend" / "tests").mkdir(parents=True)
+        assert validate_vp(
+            _vp("python3 -m pytest backend/tests -q"), project_dir=tmp_path,
+        ) == []
 
 
 # ---------------------------------------------------------------------------

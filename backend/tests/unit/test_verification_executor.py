@@ -63,6 +63,7 @@ from verification_executor import (  # noqa: E402
     PROGRESS_STATE_FILENAME,
     VerdictSchemaError,
     VerificationExecutor,
+    definition_fingerprint_for_vp,
 )
 
 
@@ -954,6 +955,13 @@ async def test_run_dag_resume_skips_completed_dependency(
     # Pre-populate the on-disk state with VP-A already having a
     # verdict (simulates a prior run that crashed after A but
     # before B).
+    #
+    # 2026-10-24: the cached verdict carries the fingerprint of the
+    # definition it was earned under.  The resume path only inherits
+    # a cached verdict whose fingerprint still matches the plan's
+    # current definition; an entry without one is the old cache format
+    # and is re-run (see
+    # ``test_cache_entry_without_fingerprint_is_rerun_on_resume``).
     prior_state = {
         "plan_id": "dag-resume",
         "pending_vps": ["VP-A", "VP-B"],
@@ -962,6 +970,9 @@ async def test_run_dag_resume_skips_completed_dependency(
                 "status": "PASSED",
                 "reasons": ["prior run"],
                 "evidence": {},
+                "definition_fingerprint": definition_fingerprint_for_vp(
+                    plan["vps"][0]
+                ),
             },
         },
     }
@@ -1014,3 +1025,254 @@ async def test_run_dag_no_deps_preserves_plan_order(
     await executor.run()
 
     assert dispatched == ["VP-X1", "VP-X2", "VP-X3"]
+
+
+# ---------------------------------------------------------------------------
+# Definition fingerprint — resume must not inherit a verdict that was
+# earned under a different definition.
+# ---------------------------------------------------------------------------
+#
+# 2026-10-24: 增量评估把上一轮已经 PASSED 的 VP id 又发了一遍，计划的
+# ``expected_result`` / ``verification_method`` / 判据载荷被换成了别的内容，
+# 而 resume 路径**只按 id 字符串**跳过 VP（``BaseExecutor.run`` 的
+# ``completed_set``）—— 上一轮的结论于是被当成本轮的结论，报告里出现
+# 「验证对象错位」。
+#
+# 修法：完成缓存随 id 存一份「定义指纹」（id + expected_result +
+# verification_method + 该方法的判据载荷）。resume 读回后只把**指纹一致**的
+# id 放进 ``completed_set``；只有 id、没有指纹的旧格式条目按「定义未知」
+# 处理为必须重跑（保守方向，一次性升级缓存格式）。
+#
+# 这几条用例里的 VP **刻意没有** ``test_command``：``verification_verdict_provenance``
+# 会把「命令变过」的旧结论直接摘掉，走那条路也能让 VP 重跑 —— 那样这些用例
+# 就会因为**另一个**原因变绿，验的就不是定义指纹了。
+
+
+def _definition_plan(
+    expected_result: str = "退出码 0 且响应体含 id 字段",
+    method: str = "api_test",
+) -> Dict[str, Any]:
+    """A one-VP plan whose VP carries a criterion payload."""
+    return {
+        "vps": [
+            {
+                "id": "VP-001",
+                "title": "登录接口契约",
+                "verification_method": method,
+                "expected_result": expected_result,
+                "request": {
+                    "method": "GET",
+                    "url": "http://127.0.0.1:8000/api/login",
+                },
+                "assertions": [{"name": "状态码", "status": 200}],
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_resume_replays_vp_whose_definition_changed(
+    tmp_plan_dir: Path,
+) -> None:
+    """Same id, different definition → the VP must run again.
+
+    The plan keeps the id but changes what the VP has to prove.  The
+    cached verdict was earned under the *old* definition, so inheriting
+    it would report a conclusion about something the plan no longer
+    asks for.
+    """
+    dispatched: List[str] = []
+
+    def runner(vp: Dict[str, Any]) -> Dict[str, Any]:
+        dispatched.append(str(vp["id"]))
+        return _passing_verdict(reason=str(vp["id"]))
+
+    first = _make_executor(
+        _definition_plan(),
+        tmp_plan_dir,
+        runner,
+        plan_id="fingerprint-changed",
+    )
+    await first.run()
+    assert dispatched == ["VP-001"], "the first round has nothing cached"
+
+    # The plan now asks for something else under the same id.
+    dispatched.clear()
+    second = _make_executor(
+        _definition_plan(expected_result="退出码 0 且响应体含 token 字段"),
+        tmp_plan_dir,
+        runner,
+        plan_id="fingerprint-changed",
+    )
+    await second.run()
+
+    assert dispatched == ["VP-001"], (
+        "a VP whose definition changed must earn its verdict again — "
+        "skipping it by id alone reports the previous round's "
+        "conclusion as this round's (verification-target mismatch)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_still_skips_unchanged_passed_vp(
+    tmp_plan_dir: Path,
+) -> None:
+    """An unchanged PASSED VP is still skipped.
+
+    This is the whole point of resume: a definition that did not move
+    keeps its verdict, so the round does not re-run the world.
+    """
+    dispatched: List[str] = []
+
+    def runner(vp: Dict[str, Any]) -> Dict[str, Any]:
+        dispatched.append(str(vp["id"]))
+        return _passing_verdict(reason=str(vp["id"]))
+
+    first = _make_executor(
+        _definition_plan(),
+        tmp_plan_dir,
+        runner,
+        plan_id="fingerprint-same",
+    )
+    await first.run()
+    assert dispatched == ["VP-001"]
+
+    dispatched.clear()
+    second = _make_executor(
+        _definition_plan(),
+        tmp_plan_dir,
+        runner,
+        plan_id="fingerprint-same",
+    )
+    await second.run()
+
+    assert dispatched == [], (
+        "an unchanged definition keeps its PASSED verdict — resume "
+        "exists to avoid re-running it"
+    )
+    assert "VP-001" in second.completed_vps
+
+
+@pytest.mark.asyncio
+async def test_cache_entry_without_fingerprint_is_rerun_on_resume(
+    tmp_plan_dir: Path,
+) -> None:
+    """A legacy cache entry (an id and a verdict, no fingerprint) re-runs.
+
+    The old cache format cannot say which definition it was earned
+    under, and an unknown definition cannot be assumed to still hold.
+    The safe direction is to earn the verdict again.
+    """
+    prior_state = {
+        "plan_id": "fingerprint-legacy",
+        "pending_vps": ["VP-001"],
+        "verdicts": {
+            "VP-001": {
+                "status": "PASSED",
+                "reasons": ["上一轮跑过"],
+                "evidence": {},
+            }
+        },
+    }
+    (tmp_plan_dir / DEFAULT_STATE_FILENAME).write_text(
+        json.dumps(prior_state, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    dispatched: List[str] = []
+
+    def runner(vp: Dict[str, Any]) -> Dict[str, Any]:
+        dispatched.append(str(vp["id"]))
+        return _passing_verdict(reason=str(vp["id"]))
+
+    executor = _make_executor(
+        _definition_plan(),
+        tmp_plan_dir,
+        runner,
+        plan_id="fingerprint-legacy",
+    )
+    await executor.run()
+
+    assert dispatched == ["VP-001"], (
+        "a cache entry without a fingerprint cannot prove which "
+        "definition it was earned under — it must be re-run"
+    )
+
+
+def test_fingerprint_ignores_irrelevant_field_reordering() -> None:
+    """The fingerprint tracks the criterion, nothing else.
+
+    Re-ordering the fields of one and the same definition, or adding
+    fields that only *describe* the VP (title / priority / scheduling
+    bookkeeping), must not move the fingerprint — otherwise a cosmetic
+    edit re-runs every verdict.  Changing the criterion must move it.
+    """
+    base = _definition_plan()["vps"][0]
+
+    # Same definition, fields in a different order.
+    reordered = {
+        "assertions": base["assertions"],
+        "expected_result": base["expected_result"],
+        "verification_method": base["verification_method"],
+        "request": base["request"],
+        "id": base["id"],
+        "title": base["title"],
+    }
+    assert definition_fingerprint_for_vp(base) == definition_fingerprint_for_vp(
+        reordered
+    ), "field order must not change the fingerprint"
+
+    # Irrelevant fields added — the criterion did not move.
+    noisy = dict(
+        base,
+        title="换了个标题",
+        priority="high",
+        timeout_seconds=30,
+        execution_group=2,
+    )
+    assert definition_fingerprint_for_vp(noisy) == definition_fingerprint_for_vp(
+        base
+    ), "descriptive / scheduling fields must not change the fingerprint"
+
+    # The criterion moved — the fingerprint must follow.
+    changed = dict(base, expected_result="换了个判据")
+    assert definition_fingerprint_for_vp(changed) != definition_fingerprint_for_vp(
+        base
+    ), "a changed criterion must change the fingerprint"
+
+
+def test_fingerprint_reads_the_executor_schema_method_key() -> None:
+    """The executor schema renames ``verification_method`` to ``method``.
+
+    ``verification_agent._convert_plan_to_executor_schema`` is what the
+    production executor actually receives, so the fingerprint has to
+    read the method from either key — otherwise the method silently
+    drops out of the fingerprint and a VP whose *method* changed keeps
+    the verdict it earned under the old one.
+    """
+    executor_schema_vp = {
+        "id": "VP-001",
+        "method": "api_test",
+        "title": "登录接口契约",
+        "expected_result": "退出码 0",
+        "request": {"method": "GET", "url": "http://127.0.0.1:8000/api/login"},
+        "assertions": [{"name": "状态码", "status": 200}],
+        "target_url": "",
+        "ci_entry": "",
+        "uses_services": [],
+        "priority": "medium",
+        "timeout_seconds": 3600,
+    }
+    llm_schema_vp = dict(executor_schema_vp)
+    llm_schema_vp.pop("method")
+    llm_schema_vp["verification_method"] = "api_test"
+
+    assert definition_fingerprint_for_vp(executor_schema_vp) == (
+        definition_fingerprint_for_vp(llm_schema_vp)
+    ), "both schemas must fingerprint the same definition"
+
+    # The method itself is part of the criterion: switching it moves
+    # the fingerprint.
+    switched = dict(executor_schema_vp, method="code_review")
+    assert definition_fingerprint_for_vp(switched) != definition_fingerprint_for_vp(
+        executor_schema_vp
+    ), "a changed verification method must change the fingerprint"

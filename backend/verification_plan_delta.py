@@ -31,7 +31,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from verification_phases import PHASE_CORE, PHASE_FINAL_GATE
 
@@ -42,6 +42,19 @@ OBSOLETE_ROUND_FIELD = "obsoleted_round"
 #: 新增 VP 的来源标记，便于日志回溯"这条是谁加的、依据是什么"。
 ADDED_REASON_FIELD = "added_reason"
 ADDED_ROUND_FIELD = "added_round"
+
+#: delta state 里记录"历轮分配出去的 VP id"的键。
+#:
+#: 2026-10-24：基础计划（磁盘上的 ``verification_plan.json``）每轮被**整份
+#: 复用**，增量条目只活在内存里 —— 于是按基础计划求最大值的 id 分配器每轮
+#: 都从同一个数重新开始，**同一个 id 被分了两轮**（第 3 轮的 VP-021/VP-022
+#: 在第 4 轮被又分了一次，标题与判据完全不同）。而这两个 id 上一轮已经是
+#: PASSED，resume 路径按 id 跳过执行，报告里留下的就是上一轮的
+#: actual_result，被拿去和新 expected_result 比对后判成「验证对象错位」。
+#:
+#: 占位必须落在 delta state 里：**基础计划不能被改写** —— 它是「这一轮判据
+#: 是什么」的唯一权威，注入占位条目会让判据与实际执行的东西对不上。
+ALLOCATED_IDS_KEY = "allocated_vp_ids"
 
 _ID_RE = re.compile(r"^VP-(\d+)$")
 
@@ -145,8 +158,20 @@ def collect_acceptance(plan_dir: Path) -> List[str]:
     return out
 
 
-def next_vp_id(plan_data: Dict[str, Any]) -> str:
-    """分配一个不与现有 VP 冲突的新 id（``VP-0NN`` 递增）。"""
+def next_vp_id(
+    plan_data: Dict[str, Any],
+    reserved_ids: Optional[Iterable[str]] = None,
+) -> str:
+    """分配一个不与现有 VP、也不与历轮已分配 id 冲突的新 id（``VP-0NN`` 递增）。
+
+    ``reserved_ids`` 是**历轮已经分配出去、但不在 ``plan_data`` 里**的 id：
+    增量条目只活在内存里，基础计划看不到它们（见
+    :data:`ALLOCATED_IDS_KEY` 的说明）。不跳过它们就会出现「同一个 id 分了
+    两轮」—— 上一轮已 PASSED 的 VP 被新一轮的同名条目顶掉，而 resume 路径
+    按 id 跳过执行，报告里留下的是上一轮的结果。
+
+    跳过是**向前**跳的：id 单调递增，宁可留空号也不复用。
+    """
     highest = 0
     for vp in plan_data.get("verification_points") or []:
         if not isinstance(vp, dict):
@@ -154,7 +179,11 @@ def next_vp_id(plan_data: Dict[str, Any]) -> str:
         match = _ID_RE.match(str(vp.get("id", "")))
         if match:
             highest = max(highest, int(match.group(1)))
-    return f"VP-{highest + 1:03d}"
+    reserved = {str(rid) for rid in (reserved_ids or ())}
+    candidate = highest + 1
+    while f"VP-{candidate:03d}" in reserved:
+        candidate += 1
+    return f"VP-{candidate:03d}"
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +391,7 @@ def build_delta_prompt(
 
 def parse_delta_payload(
     raw: Any, plan_data: Dict[str, Any],
+    reserved_ids: Optional[Iterable[str]] = None,
 ) -> PlanDelta:
     """把 LLM 返回的 JSON 规整成 :class:`PlanDelta`，并在此处执行硬约束。
 
@@ -373,6 +403,10 @@ def parse_delta_payload(
     * ``obsolete`` 指向不存在的 id／已废弃的 id → 记入 ``rejected_additions``
       之外的拒绝清单（复用 ``rejected_modifications`` 会混淆语义，这里同样
       归入 ``rejected_additions`` 之外的记录，但保留原始项）。
+
+    ``reserved_ids`` 是历轮分配出去、但不在 ``plan_data`` 里的 id（增量条目
+    只活在内存里）。复用它们同样等于「顶掉一条已经跑过/判过的验证点」，所以
+    与复用基础计划里的 id 一样按"试图修改已有 VP"拒绝。
     """
     delta = PlanDelta(raw=raw if isinstance(raw, dict) else {})
     if not isinstance(raw, dict):
@@ -383,6 +417,8 @@ def parse_delta_payload(
         for vp in plan_data.get("verification_points") or []
         if isinstance(vp, dict)
     }
+    reserved = {str(rid) for rid in (reserved_ids or ())}
+    taken_ids = existing_ids | reserved
     already_obsolete = {
         str(vp.get("id"))
         for vp in plan_data.get("verification_points") or []
@@ -398,11 +434,15 @@ def parse_delta_payload(
             )
             continue
         item_id = item.get("id")
-        if item_id and str(item_id) in existing_ids:
+        if item_id and str(item_id) in taken_ids:
             # 用户硬约束：不允许修改已有 VP。
             delta.rejected_modifications.append(
                 {"id": str(item_id), "item": item,
-                 "why": "试图复用已有 VP id（等价于修改已有验证点）"}
+                 "why": (
+                     "试图复用已有 VP id（等价于修改已有验证点）"
+                     if str(item_id) in existing_ids
+                     else "试图复用历轮已分配的 VP id（增量 id 必须跨轮单调）"
+                 )}
             )
             continue
         if not str(item.get("reason", "")).strip():
@@ -450,6 +490,7 @@ def apply_delta(
     plan_data: Dict[str, Any],
     delta: PlanDelta,
     round_number: int,
+    reserved_ids: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """就地应用增量，返回可写日志的摘要。
 
@@ -459,6 +500,11 @@ def apply_delta(
     还没验完时就开跑，白白阻塞整轮 —— that round就出现过一条
     「Nightly CI 全过」被按 Phase 1 排进去、整轮只能 SKIPPED 的情况
     （2026-09-19）。阶段判定权仍在规划 LLM 手里，这里只负责把它的声明带过去。
+
+    ``reserved_ids`` 是历轮已经分配出去的 id（见 :data:`ALLOCATED_IDS_KEY`）：
+    新条目必须跳过它们，id 才跨轮单调。摘要里的 ``allocated_vp_ids`` 记下
+    本轮**实际分配出去**的 id（含随后被护栏丢弃的那些）—— 丢掉的 id 同样
+    不能被下一轮复用。
     """
     points = plan_data.setdefault("verification_points", [])
     summary: Dict[str, Any] = {
@@ -467,10 +513,14 @@ def apply_delta(
         "rejected_additions": len(delta.rejected_additions),
         "rejected_obsoletes": len(delta.rejected_obsoletes),
         "rejected_modifications": len(delta.rejected_modifications),
+        "allocated_vp_ids": [],
     }
+    reserved = {str(rid) for rid in (reserved_ids or ())}
 
     for item in delta.added:
-        new_id = next_vp_id(plan_data)
+        new_id = next_vp_id(plan_data, reserved_ids=reserved)
+        reserved.add(new_id)
+        summary["allocated_vp_ids"].append(new_id)
         vp = {
             "id": new_id,
             "title": str(item.get("title", "")).strip(),
@@ -542,3 +592,49 @@ def save_delta_state(plan_dir: Path, state: Dict[str, Any]) -> None:
         )
     except OSError:
         pass  # 记忆文件写不进去不影响本轮评估
+
+
+# ---------------------------------------------------------------------------
+# 历轮分配过的 VP id（跨轮占位）
+# ---------------------------------------------------------------------------
+
+
+def _vp_id_sort_key(vp_id: str) -> Tuple[int, str]:
+    """按数字段排序（``VP-999`` 必须排在 ``VP-1000`` 前面）。"""
+    match = _ID_RE.match(str(vp_id))
+    number = int(match.group(1)) if match else 0
+    return (number, str(vp_id))
+
+
+def allocated_vp_ids(state: Dict[str, Any]) -> Set[str]:
+    """读出 state 里记着的"历轮分配过的 VP id"。
+
+    认不出的 id（格式不对、不是 VP-0NN）直接丢掉 —— 占位集合宁可少一个，
+    也不能把乱七八糟的字符串当成 id。
+    """
+    raw = (state or {}).get(ALLOCATED_IDS_KEY) or []
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    out: Set[str] = set()
+    for item in raw:
+        text = str(item)
+        if _ID_RE.match(text):
+            out.add(text)
+    return out
+
+
+def merge_allocated_ids(
+    state: Dict[str, Any],
+    summary: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """把本轮分配出去的 id 累加进 state 的 ``allocated_vp_ids``。
+
+    返回累加后的完整列表（按数字段升序）。**不就地修改** ``state`` ——
+    落盘由调用方决定（:func:`save_delta_state`）。
+    """
+    ids = allocated_vp_ids(state)
+    for extra in ((summary or {}).get("allocated_vp_ids") or []):
+        text = str(extra)
+        if _ID_RE.match(text):
+            ids.add(text)
+    return sorted(ids, key=_vp_id_sort_key)
