@@ -18,14 +18,15 @@ pins the parts of it that are answers rather than mechanics:
   agent holding it finishes, and the existing poller already waits for
   that. Unifying the two spends the wait of one on the timescale of the
   other.
-* **The wait is a fixed probe, not a countdown to the window.** How long
-  a window stays shut is the provider's fact and not the dispatcher's,
-  and a caller that gives up on its own schedule does not get the window
-  back — it only reports a failure for a wait it declared over on a
-  figure it invented. So the wake probes on a fixed beat until the
-  reading changes, and the beat never consults ``resets_at``: a plan
-  upgrade brings the budget back at a moment no stamp was going to
-  name, and that is the case a countdown cannot see.
+* **The wait is sized on the reopen the reading names, and capped.** A
+  window that says when it reopens is waited for until then — one wake
+  instead of two probes — but never for more than half an hour, which
+  is what keeps the case a countdown cannot see visible: a plan upgrade
+  brings the budget back at a moment no stamp was going to name, and a
+  wait sized on a week-long window would sleep straight through it. A
+  window that names no moment (or names one already in the past) falls
+  back to the fixed probe beat, because there is nothing to count down
+  to.
 * **Waiting is not working.** The budget that bounds a call's wall time
   is parked while the dispatch waits and starts running again when it
   does not, so a wait cannot spend the very budget that exists to catch
@@ -148,6 +149,28 @@ def _full_fleet(*, resets_in_minutes=12):
     return _reading(*[
         _full(name, resets_in_minutes=resets_in_minutes) for name in CHAIN
     ])
+
+
+#: The ceiling on a wake that sleeps on a named reopen — half an hour.
+#: It is the escape hatch that keeps a plan upgrade visible to a wake
+#: that is counting down to a window: the budget comes back at a moment
+#: no ``resets_at`` was going to name, so a wait sized on a week-long
+#: window would sleep straight through it.
+WAKE_CAP_SEC = 1800.0
+
+
+def _expected_wake(resets_in_minutes):
+    """The wait the dispatch should ask for on a window named N minutes out.
+
+    The reopen plus a small margin, clamped to the cap. A window that
+    names no moment at all falls back to the fixed probe beat. The
+    margin covers the few milliseconds between the reading being built
+    and the wait being asked for, so the figures are compared with a
+    tolerance rather than for equality.
+    """
+    if resets_in_minutes is None:
+        return float(DEFAULT_COOLDOWN_SEC)
+    return max(5.0, min(resets_in_minutes * 60.0 + 2.0, WAKE_CAP_SEC))
 
 
 def _open(provider):
@@ -433,19 +456,19 @@ class TestWakesAndDispatches:
         assert result == "ok"
         assert tool.current_call_provider in CHAIN
         assert len(wake.sleeps) == 1, wake.sleeps
-        assert wake.sleeps[0] == pytest.approx(DEFAULT_COOLDOWN_SEC, abs=0.001), (
-            "the wait must be the probe interval, not zero and not a "
-            "figure invented from the reading"
+        assert wake.sleeps[0] == pytest.approx(_expected_wake(12), abs=1.0), (
+            "the wait must be the reopen the reading names plus a "
+            "margin — not zero, and not a figure invented from it"
         )
         assert tracker.current("Vendor A Pro") == 0, "the slot came back"
 
-    def test_a_window_three_days_out_probes_the_same_and_reads_again(
+    def test_a_window_three_days_out_caps_the_wait_and_reads_again(
         self, tmp_path, monkeypatch, scene,
     ):
-        """How far off the window is has no effect on the cadence.
+        """How far off the window is has an effect — up to the cap.
 
-        The two halves are one contract. A cadence that grew with the
-        distance to ``resets_at`` would be blind to the reopen no stamp
+        The two halves are one contract. A wait that grew without a
+        ceiling would sleep straight through the reopen no stamp
         describes — the plan upgrade — and would spend the wait parked
         on a moment that has stopped meaning anything. And a probe that
         did not re-read would be asking the cache, which was answered
@@ -460,7 +483,7 @@ class TestWakesAndDispatches:
         tool = _tool(ActiveConcurrencyTracker())
         _run(tool)
 
-        assert wake.sleeps == [DEFAULT_COOLDOWN_SEC], wake.sleeps
+        assert wake.sleeps == [WAKE_CAP_SEC], wake.sleeps
         assert wake.reads >= 2, (
             "a probe is a re-read: the payload behind it has to be asked "
             "for again, or the wake is handed the verdict it slept through"
@@ -572,9 +595,9 @@ class TestStillFullAfterWaking:
         assert result == "ok", "twenty full readings must not end the wait"
         assert tool.current_call_provider in CHAIN
         assert len(wake.sleeps) == 20, wake.sleeps
-        assert set(wake.sleeps) == {DEFAULT_COOLDOWN_SEC}, (
-            "every probe is the same beat; a cadence that grew with the "
-            "wait would be spending more to be told less"
+        assert set(wake.sleeps) == {WAKE_CAP_SEC}, (
+            "every probe is the capped wait; a window thirty days out "
+            "must not buy a longer sleep than the cap allows"
         )
         assert wake.forced == [False] + [True] * 20, (
             "every probe asks again; only the dispatch's own read is cached"
@@ -957,11 +980,11 @@ class TestTheDispatchParksTheCallersBudget:
     ):
         """The case this file exists for.
 
-        One probe of five minutes against a budget of two: the wait is
-        longer than everything the budget has to give, which is the
-        shape of a provider closed for a week against an hour-long cap.
-        It dispatches when the window opens, because the wait was never
-        charged to the cap.
+        One capped wait of half an hour against a budget of two: the
+        wait is longer than everything the budget has to give, which is
+        the shape of a provider closed for a week against an hour-long
+        cap. It dispatches when the window opens, because the wait was
+        never charged to the cap.
 
         Note what this is *not* asserting: that the test did not time
         out. It asserts the number on the budget, read after the fact,
@@ -991,9 +1014,9 @@ class TestTheDispatchParksTheCallersBudget:
 
         assert result == "ok"
         assert tool.current_call_provider in CHAIN
-        assert wake.sleeps == [DEFAULT_COOLDOWN_SEC]
+        assert wake.sleeps == [WAKE_CAP_SEC]
         waited = mono.now - 1000.0
-        assert waited == DEFAULT_COOLDOWN_SEC > budget, (
+        assert waited == WAKE_CAP_SEC > budget, (
             "the wait served must actually be longer than the whole "
             f"budget ({waited}s against {budget}s), or this proves nothing"
         )
@@ -1036,7 +1059,7 @@ class TestTheDispatchParksTheCallersBudget:
             "the budget must read full before every single probe, not "
             "decaying across the wait"
         )
-        assert mono.now - 1000.0 == 20 * DEFAULT_COOLDOWN_SEC
+        assert mono.now - 1000.0 == 20 * WAKE_CAP_SEC
         assert clock.remaining() == 3600.0
 
     def test_the_budget_starts_running_again_when_the_window_opens(
@@ -1129,7 +1152,8 @@ class TestTheDispatchParksTheCallersBudget:
         result, _session, _meta = _run(tool)
 
         assert result == "ok"
-        assert wake.sleeps == [DEFAULT_COOLDOWN_SEC]
+        assert len(wake.sleeps) == 1, wake.sleeps
+        assert wake.sleeps[0] == pytest.approx(_expected_wake(12), abs=1.0)
 
     def test_a_full_local_pool_is_not_charged_either(
         self, tmp_path, monkeypatch, scene,

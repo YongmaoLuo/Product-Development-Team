@@ -929,8 +929,35 @@ class ProviderQuota:
         exhausted_tier: Name of the tier that tripped the gate
             (``five_hour`` / ``weekly_limit``), or ``None``. Drives
             which ``resets_at`` becomes the cooldown length.
-        exhausted_resets_at: That tier's ``resets_at``, or ``None`` when
-            absent, unparseable, or already in the past.
+        exhausted_resets_at: When **this provider** can serve again,
+            and nothing else. It has exactly one meaning: the moment
+            this provider itself becomes dispatchable. "When the queue
+            as a whole should try again" is a different question, asked
+            a level up — :func:`coding_tool._quota_wake_soonest_reset`
+            answers it by taking the **earliest** of this value across
+            the blocked providers, and the two levels take opposite
+            extrema on purpose. The **latest** ``resets_at`` among the
+            tiers that are exhausted, or ``None`` when absent,
+            unparseable, or already in the past. It is the latest
+            because it is the one that decides when the provider can
+            serve again: a provider whose burst window and whose week
+            are both empty is empty until the *later* of the two comes
+            back, so a cooldown sized on the earlier one would wake up
+            to the same refusal. A tier that is exhausted but names no
+            moment does not contribute, and a reading with no moment at
+            all leaves this ``None`` so the caller falls back to its own
+            default.
+        binding_tier: Name of the tier that owns :attr:`exhausted_resets_at`
+            — the exhausted tier that reopens last. ``None`` when no
+            exhausted tier named a moment. Unlike :attr:`exhausted_tier`,
+            which stays the *first* tier to trip the gate, this one is
+            about the moment that binds the provider shut.
+        tiers_missing: The gated tiers this provider's reading did not
+            carry at all, in :data:`GATED_TIERS` order. Recorded only:
+            a missing tier is not a verdict, it is the absence of a
+            reading, and a provider that has no week window (a metered
+            API product, say) is not disqualified by one. It is here so
+            a log line can tell "no budget" from "no reading".
         unreadable: True when CC Switch reported no usable meter for
             this provider. The verdict still admits it; what changes is
             how long this reading is trusted (see :func:`probe_floor_sec`).
@@ -942,6 +969,8 @@ class ProviderQuota:
     exhausted: bool = False
     exhausted_tier: Optional[str] = None
     exhausted_resets_at: Optional[datetime] = None
+    binding_tier: Optional[str] = None
+    tiers_missing: Tuple[str, ...] = ()
     unreadable: bool = False
 
 
@@ -1016,7 +1045,9 @@ def _tier_map(record: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
     return out
 
 
-def _no_reading(provider: str) -> ProviderQuota:
+def _no_reading(
+    provider: str, tiers_missing: Tuple[str, ...] = ()
+) -> ProviderQuota:
     """The verdict for a provider CC Switch could not meter.
 
     ``unreadable=True`` is what earns this reading the long probe floor
@@ -1025,9 +1056,15 @@ def _no_reading(provider: str) -> ProviderQuota:
     reading reached by a malformed row and one reached by a healthy
     fetch of a meter-less provider are the same fact, and only one of
     them being treated as cheap to re-ask would be a bug.
+
+    ``tiers_missing`` is carried through for the one of those call
+    sites that *did* receive tiers and could not make a number out of
+    them: there the reading says which windows it has, and a window it
+    left out is worth recording even though the verdict is "no reading".
     """
     return ProviderQuota(
         provider=provider, shape=SHAPE_UNREADABLE, unreadable=True,
+        tiers_missing=tiers_missing,
     )
 
 
@@ -1059,6 +1096,15 @@ def _quota_from_record(
     if not tiers:
         return _no_reading(provider)
 
+    # Which gated windows this reading did not carry at all. Recorded
+    # only — a missing window is the absence of a reading, not a
+    # verdict, and a provider that simply has no week window is not
+    # disqualified by one. It is here so that a log line can tell "no
+    # budget" from "no reading", which are otherwise the same silence.
+    tiers_missing: Tuple[str, ...] = tuple(
+        name for name in GATED_TIERS if name not in tiers
+    )
+
     # Every tier is classified by its own ``unit`` rather than by a
     # single shape for the whole row, because a row that carries both a
     # currency and a window has two independent budgets and one answer.
@@ -1085,7 +1131,14 @@ def _quota_from_record(
     worst: Optional[float] = None
     burst_used: Optional[float] = None
     window_exhausted_tier: Optional[str] = None
-    window_resets_at: Optional[datetime] = None
+    # Every exhausted window that named a moment, as ``(tier, stamp)``.
+    # The *latest* of them is the one that binds the provider shut: a
+    # provider whose burst window and whose week are both empty is
+    # empty until the later of the two comes back, so a cooldown sized
+    # on the earlier one would only wake up to the same refusal. The
+    # first tier to trip the gate still names the *window* (see
+    # ``window_exhausted_tier``); this list is about the *moment*.
+    window_exhausted_resets: List[Tuple[str, datetime]] = []
     for name in GATED_TIERS:
         tier = window_tiers.get(name)
         if tier is None:
@@ -1096,9 +1149,12 @@ def _quota_from_record(
         if name == _HEADROOM_TIER:
             burst_used = used
         worst = used if worst is None else max(worst, used)
-        if used >= 100.0 and window_exhausted_tier is None:
-            window_exhausted_tier = name
-            window_resets_at = parse_resets_at(tier.get("resets_at"))
+        if used >= 100.0:
+            resets_at = parse_resets_at(tier.get("resets_at"))
+            if window_exhausted_tier is None:
+                window_exhausted_tier = name
+            if resets_at is not None:
+                window_exhausted_resets.append((name, resets_at))
 
     # (2) The balance. ``used_percent`` is 0.0 for every funded account
     #     this shape produces (the payload divides by a ``total`` of 0),
@@ -1124,7 +1180,7 @@ def _quota_from_record(
 
     if worst is None and balance_funded is None:
         # Tiers exist but none of them carried a usable number.
-        return _no_reading(provider)
+        return _no_reading(provider, tiers_missing)
 
     exhausted = (worst is not None and worst >= 100.0) or (
         balance_funded is False
@@ -1155,6 +1211,31 @@ def _quota_from_record(
     else:
         headroom = 100.0 - burst_used
 
+    # (4) The moment the provider comes back. Among the exhausted
+    #     windows the binding one is the *latest* to reopen — that is
+    #     the one the provider is really waiting on, and it is what a
+    #     cooldown has to be sized on. A window and a balance that are
+    #     both exhausted are compared the same way: the later moment
+    #     wins, because the earlier one alone would let the provider be
+    #     picked again while the other budget was still empty.
+    #
+    #     An exhausted window that names no moment contributes nothing:
+    #     there is no moment to wait for, so the caller falls back to
+    #     its own default rather than to a number this reading did not
+    #     give.
+    binding_tier: Optional[str] = None
+    exhausted_resets_at: Optional[datetime] = None
+    for name, stamp in window_exhausted_resets:
+        if exhausted_resets_at is None or stamp > exhausted_resets_at:
+            exhausted_resets_at = stamp
+            binding_tier = name
+    if (
+        balance_resets_at is not None
+        and (exhausted_resets_at is None or balance_resets_at > exhausted_resets_at)
+    ):
+        exhausted_resets_at = balance_resets_at
+        binding_tier = balance_exhausted_tier
+
     return ProviderQuota(
         provider=provider,
         shape=shape,
@@ -1167,7 +1248,9 @@ def _quota_from_record(
         # because a window is the one with a moment attached: a balance
         # is topped up by a person, so its length is a guess either way.
         exhausted_tier=window_exhausted_tier or balance_exhausted_tier,
-        exhausted_resets_at=window_resets_at or balance_resets_at,
+        exhausted_resets_at=exhausted_resets_at,
+        binding_tier=binding_tier,
+        tiers_missing=tiers_missing,
     )
 
 
