@@ -250,6 +250,20 @@ def _measure_startup(
     returns 200.
     """
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    # 2026-10-24: the child must not inherit the operator's secret-pipe
+    # environment.  ``credentials.secret_fd_env_var`` publishes a secret by
+    # naming a DESCRIPTOR in the environment (e.g.
+    # ``PDT_SECRET_FD_FEISHU_APP_SECRET=3``).  A child that inherits the
+    # NAME but not the descriptor spends a descriptor number it does not
+    # own: ``read_secret_fd`` closes the number it was given, and by then
+    # that number belongs to one of the child's own sockets — the asyncio
+    # event loop's self-pipe — so the server died with
+    # ``OSError: [Errno 9] Bad file descriptor`` before it ever answered
+    # /health, and this test failed with "connection refused" instead of
+    # measuring anything.  A startup-latency fixture needs no secrets, so
+    # the names are dropped.
+    for _key in [k for k in env if k.startswith("PDT_SECRET_FD_")]:
+        env.pop(_key)
     # The chain is asked of CC Switch's HTTP provider list. Point at
     # whatever that is, so the measurement does not depend on whether
     # the developer happens to have CC Switch running on the machine
@@ -399,48 +413,74 @@ def test_backend_startup_latency_within_10ms(tmp_path: Path) -> None:
     # One stand-in CC Switch serves both processes: the current tree and
     # the git-archive baseline have to be asking the same question, or
     # the comparison measures which copy could reach an answer.
+    # The baseline copy has to exist before the first measurement, so it
+    # is extracted up front.
+    baseline_dir = tmp_path / "baseline"
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+
+    archive = subprocess.run(
+        ["git", "archive", "HEAD"],
+        cwd=_PROJECT_ROOT,
+        capture_output=True,
+        check=True,
+    )
+    with tarfile.open(fileobj=BytesIO(archive.stdout), mode="r:*") as tar:
+        tar.extractall(path=baseline_dir)
+
+    # No order file has to be planted inside the baseline copy: both
+    # processes ask the same stand-in CC Switch, so the comparison is
+    # not measuring which copy found a file.
+
+    # Baseline is extracted from ``git archive HEAD``. It is measured
+    # on the same endpoint as the current tree — a comparison between
+    # two different endpoints is not a comparison — and a baseline
+    # that cannot boot is a *failure* of this test, not a skip: the
+    # skip that used to be here is what let the endpoint mismatch
+    # (and a broken baseline) pass unnoticed. ``_measure_startup``
+    # reports the server's exit code and the tail of its stdout, so
+    # a failure says what went wrong.
+    #
+    # 2026-10-24: the two sides are measured in INTERLEAVED rounds and
+    # compared as PAIRED per-round differences.  Measuring the three
+    # current-tree boots first and the three baseline boots afterwards
+    # compares two halves of the run that can be a minute apart, so any
+    # change in machine load between the halves lands entirely on one
+    # side of the comparison: the gate then reports a startup regression
+    # that is really just a quieter machine.  Measured on this tree, the
+    # sequential layout reported the current tree ~900 ms SLOWER than
+    # HEAD's copy, while the interleaved layout measured the same two
+    # trees ~150 ms FASTER (median paired difference -152.7 ms) — the
+    # two trees are not distinguishable on startup time.  A paired round
+    # measures both sides under the same load, and the median of the
+    # per-round differences is the estimator that also survives one bad
+    # round.  The order inside a round alternates, so a monotone load
+    # drift does not systematically favour one side.
     with _cc_switch_serving(chain) as cc_switch_base:
-        current_times = [
-            _measure_startup(
-                _PROJECT_ROOT, _STARTUP_ENDPOINT, order_file,
-                home_dir=tmp_path, cc_switch_base=cc_switch_base,
-            )
-            for _ in range(3)
-        ]
-        current_median = _median(current_times)
+        pairs: list[tuple[float, float]] = []
+        for index in range(3):
+            if index % 2 == 0:
+                current = _measure_startup(
+                    _PROJECT_ROOT, _STARTUP_ENDPOINT, order_file,
+                    home_dir=tmp_path, cc_switch_base=cc_switch_base,
+                )
+                baseline = _measure_startup(
+                    baseline_dir, _STARTUP_ENDPOINT, order_file,
+                    home_dir=tmp_path, cc_switch_base=cc_switch_base,
+                )
+            else:
+                baseline = _measure_startup(
+                    baseline_dir, _STARTUP_ENDPOINT, order_file,
+                    home_dir=tmp_path, cc_switch_base=cc_switch_base,
+                )
+                current = _measure_startup(
+                    _PROJECT_ROOT, _STARTUP_ENDPOINT, order_file,
+                    home_dir=tmp_path, cc_switch_base=cc_switch_base,
+                )
+            pairs.append((current, baseline))
 
-        baseline_dir = tmp_path / "baseline"
-        baseline_dir.mkdir(parents=True, exist_ok=True)
-
-        archive = subprocess.run(
-            ["git", "archive", "HEAD"],
-            cwd=_PROJECT_ROOT,
-            capture_output=True,
-            check=True,
-        )
-        with tarfile.open(fileobj=BytesIO(archive.stdout), mode="r:*") as tar:
-            tar.extractall(path=baseline_dir)
-
-        # No order file has to be planted inside the baseline copy: both
-        # processes ask the same stand-in CC Switch, so the comparison is
-        # not measuring which copy found a file.
-
-        # Baseline is extracted from ``git archive HEAD``. It is measured
-        # on the same endpoint as the current tree — a comparison between
-        # two different endpoints is not a comparison — and a baseline
-        # that cannot boot is a *failure* of this test, not a skip: the
-        # skip that used to be here is what let the endpoint mismatch
-        # (and a broken baseline) pass unnoticed. ``_measure_startup``
-        # reports the server's exit code and the tail of its stdout, so
-        # a failure says what went wrong.
-        baseline_times = [
-            _measure_startup(
-                baseline_dir, _STARTUP_ENDPOINT, order_file,
-                home_dir=tmp_path, cc_switch_base=cc_switch_base,
-            )
-            for _ in range(3)
-        ]
-        baseline_median = _median(baseline_times)
+    current_median = _median([current for current, _ in pairs])
+    baseline_median = _median([baseline for _, baseline in pairs])
+    paired_median = _median([current - baseline for current, baseline in pairs])
 
     # The contract is that the upgrade does not *slow* startup by more
     # than 10 ms. Being faster is acceptable (and expected here because
@@ -450,9 +490,10 @@ def test_backend_startup_latency_within_10ms(tmp_path: Path) -> None:
     # jitter, port-binding variance and filesystem cache effects. A
     # 10 ms threshold is too tight in this environment, so we allow a
     # small tolerance while still catching material regressions.
-    assert current_median <= baseline_median + 0.200, (
-        f"median startup latency regressed by {(current_median - baseline_median) * 1000:.2f} ms "
-        f"(current={current_median * 1000:.2f} ms, baseline={baseline_median * 1000:.2f} ms)"
+    assert paired_median <= 0.200, (
+        f"median startup latency regressed by {paired_median * 1000:.2f} ms "
+        f"(current={current_median * 1000:.2f} ms, baseline={baseline_median * 1000:.2f} ms, "
+        f"rounds={[(round(c * 1000, 1), round(b * 1000, 1)) for c, b in pairs]})"
     )
 
 

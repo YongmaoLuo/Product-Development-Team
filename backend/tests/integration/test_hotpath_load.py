@@ -15,11 +15,31 @@ Each test seeds an isolated plans directory with N=20 plans, fires a
 fixed number of concurrent requests across a thread pool, and asserts:
 
   (a) wall-clock latency stays under a budget,
-  (b) the response cache short-circuits the second call (cache-hit
-      latency is materially smaller than the first call's cold latency),
+  (b) the response cache short-circuits the second call — asserted
+      **structurally**, not by wall clock: the second request must not
+      re-enter the cache-miss path at all (call count), and must return
+      the very same body,
   (c) ``snapshot_for_list`` and ``_open_state_machine`` are NOT called
       once-per-request — we count them via a ``Counter``-wrapped
       ``ExecutionRepository`` / state-machine open handle.
+
+2026-10-24 — why (b) is structural now
+-------------------------------------
+(b) used to read "the warm call's wall time is smaller than the cold
+call's". That is not a cache assertion, it is a *scheduling* assertion:
+under the ``-n 8`` parallel lane the jitter between two consecutive
+in-process requests is the same order of magnitude as the difference
+being measured, so the comparison flipped at random (observed: warm
+4.6ms vs cold 2.6ms — the cache was working, the measurement was
+noise) and the case failed the whole-repo gate for a reason that had
+nothing to do with the code under test.
+
+The cache-hit semantics of this endpoint are structural: a hit means
+the request **does not re-enter the cache-miss path**
+(``routes.plans._list_plans_impl``). That is now asserted with a call
+count plus a response-body equality check, and the accompanying
+negative control disables the cache read to prove the assertion still
+has discriminating power.
 
 The ``snapshot`` fixture exposes the raw measurements as a dict; the
 companion runner ``scripts/runners/run_hotpath_load_baseline.py``
@@ -80,6 +100,12 @@ from server import (  # noqa: E402
     invalidate_files_cache,
     invalidate_plans_cache,
 )
+
+# The cache-miss path of ``GET /api/plans``. The route resolves
+# ``_list_plans_impl`` from this module's globals at call time, so
+# patching the attribute here is what the call counter hooks — the
+# ``server`` module only holds a by-value re-export of it.
+from routes import plans as routes_plans  # noqa: E402
 
 
 client = TestClient(app)
@@ -356,32 +382,91 @@ def test_api_execution_files_load_under_budget(hotpath_env):
     )
 
 
-def test_api_plans_cache_hit_is_faster_than_cold(hotpath_env):
-    """Second call within TTL must be materially faster than the first.
+def _probe_plans_cache(monkeypatch) -> Dict[str, Any]:
+    """Fire two ``GET /api/plans`` requests and observe the cache.
 
-    With a TTL of 2s (see ``_PLANS_CACHE_TTL_SECONDS``) and the second
-    call fired ~10ms after the first, the cached call should be
-    < 50% of the cold call's wall time. If the cache is bypassed the
-    two calls would have effectively identical cost (both walk the
-    plans dir + open SQLite).
+    Returns how many times the **cache-miss path**
+    (``routes.plans._list_plans_impl``) was entered, plus both response
+    bodies.
+
+    The count is the deterministic signal: "cache hit" for this
+    endpoint means *the request did not re-enter the cache-miss path* —
+    a property of what was called, not of how long it took.
     """
-    t0 = time.monotonic()
-    resp1 = client.get("/api/plans")
-    cold = time.monotonic() - t0
-    assert resp1.status_code == 200
+    entries = {"count": 0}
+    original = routes_plans._list_plans_impl
 
-    t0 = time.monotonic()
-    resp2 = client.get("/api/plans")
-    warm = time.monotonic() - t0
-    assert resp2.status_code == 200
+    def counting(request, include_terminal):
+        entries["count"] += 1
+        return original(request, include_terminal)
 
-    # Warm is bounded above by 50% of cold. Generous on purpose: a
-    # noisy CI runner can easily add 5-10ms of scheduling jitter to
-    # either call. The signal we care about is "warm < cold", not
-    # "warm is microseconds".
-    assert warm < cold, (
-        f"cache hit ({warm*1000:.1f}ms) should be faster than "
-        f"cold call ({cold*1000:.1f}ms); cache may be broken"
+    monkeypatch.setattr(routes_plans, "_list_plans_impl", counting)
+
+    first = client.get("/api/plans")
+    second = client.get("/api/plans")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    return {
+        "cache_miss_entries": entries["count"],
+        "first_body": first.json(),
+        "second_body": second.json(),
+    }
+
+
+def test_api_plans_cache_hit_skips_the_cache_miss_path(hotpath_env, monkeypatch):
+    """The second ``GET /api/plans`` must be served from the cache.
+
+    Structural assertion (2026-10-24): the cache-miss path — the
+    ``_list_plans_impl`` call that walks the plans dir and opens the
+    state DB — must run **exactly once** across the two requests. The
+    first request fills the TTL cache (2s, see
+    ``_PLANS_CACHE_TTL_SECONDS``); the second must be served from it
+    and return the identical body.
+
+    This used to be asserted as "the second call is faster than the
+    first". A wall-clock comparison between two consecutive in-process
+    requests measures the scheduler, not the cache — under the ``-n 8``
+    parallel lane it flipped at random and failed the whole-repo gate
+    while the cache was working perfectly.
+    """
+    probe = _probe_plans_cache(monkeypatch)
+
+    assert probe["cache_miss_entries"] == 1, (
+        f"the cache-miss path ran {probe['cache_miss_entries']} times "
+        "across two requests; the second one must be served from the "
+        "response cache"
+    )
+    assert probe["first_body"] == probe["second_body"], (
+        "the cached response body differs from the cold one"
+    )
+
+
+def test_api_plans_cache_hit_assertion_has_discriminating_power(
+    hotpath_env, monkeypatch,
+):
+    """Negative control: with the cache read disabled, the cache-hit
+    assertion must stop holding.
+
+    This is what keeps the assertion above from being vacuous: if the
+    counter could not tell a hit from a miss, disabling the cache would
+    still leave it passing. With ``_read_plans_cache`` forced to
+    ``None`` every request is a miss, so the cache-miss path runs
+    twice — and the ``== 1`` assertion of the previous test would fail.
+    """
+    monkeypatch.setattr(
+        server, "_read_plans_cache", lambda include_terminal: None,
+    )
+
+    probe = _probe_plans_cache(monkeypatch)
+
+    assert probe["cache_miss_entries"] == 2, (
+        "negative control did not actually disable the cache "
+        f"(cache-miss entries: {probe['cache_miss_entries']}); the "
+        "cache-hit assertion would be vacuous"
+    )
+    assert probe["cache_miss_entries"] != 1, (
+        "the cache-hit assertion would still hold with the cache "
+        "disabled — it does not discriminate"
     )
 
 

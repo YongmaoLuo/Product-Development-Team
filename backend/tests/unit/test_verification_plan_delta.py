@@ -713,3 +713,205 @@ def test_obsolete_plus_add_replaces_a_broken_api_test_verification_point() -> No
         "the added api_test VP must survive schema validation, otherwise the "
         "guardrail drops it and 'obsolete + add' stays a dead end"
     )
+# ---------------------------------------------------------------------------
+#
+# 事故：验证框架把上一轮的 VP id 又发了一遍。
+#
+# 基础计划（磁盘上的 ``verification_plan.json``）每轮都被整份复用，增量条目
+# 只活在内存里 —— 于是 ``next_vp_id`` 每轮都从**基础计划**的最大值重新算，
+# 同一个 id 被分了两轮：第 3 轮分出去的 VP-021/VP-022 在第 4 轮被又分了一次
+# （标题、判据完全不同）。而这两个 id 上一轮已经是 PASSED，resume 路径按
+# id 跳过执行，报告里留下的就是上一轮的 actual_result，被拿去和新
+# expected_result 比对后判成「验证对象错位」。
+#
+# 修法：历轮分配出去的 id 记在 delta state 里（``allocated_vp_ids``），
+# 下一轮分配时跳过它们。占位**只落在 delta state** —— 基础计划不能被改写
+# （它是「这一轮判据是什么」的唯一权威）。
+
+
+def test_next_vp_id_skips_reserved_ids() -> None:
+    """历轮分配出去的 id 必须被跳过。"""
+    from verification_plan_delta import next_vp_id
+
+    plan = _plan(_vp("VP-001"), _vp("VP-020"))
+    assert next_vp_id(plan) == "VP-021"
+    assert next_vp_id(plan, reserved_ids={"VP-021"}) == "VP-022"
+    assert next_vp_id(plan, reserved_ids={"VP-021", "VP-022"}) == "VP-023"
+    # 基础计划里没有、但上一轮分出去的 id 同样要跳过
+    assert next_vp_id(_plan(_vp("VP-001")), reserved_ids={"VP-002"}) == "VP-003"
+
+
+def test_round_two_delta_allocates_fresh_ids() -> None:
+    """第二轮增量不能复用上一轮已经分出去的 id。
+
+    复现事故的两轮：每轮都从**同一份基础计划**出发（基础计划没被改写，
+    增量条目只活在内存里），第二轮必须拿到 VP-023 而不是 VP-021。
+    """
+    from verification_plan_delta import apply_delta, parse_delta_payload
+
+    base = _plan(*[_vp(f"VP-{i:03d}") for i in range(1, 21)])
+
+    # 第 3 轮：增量新增两条
+    round3 = json.loads(json.dumps(base))
+    summary3 = apply_delta(
+        round3,
+        parse_delta_payload({"add": [
+            {"title": "第一轮新增 A", "reason": "依据"},
+            {"title": "第一轮新增 B", "reason": "依据"},
+        ]}, round3),
+        round_number=3,
+    )
+    assert [a["id"] for a in summary3["added"]] == ["VP-021", "VP-022"]
+
+    # 第 4 轮：又从同一份基础计划出发，历轮的 id 作为占位传进去
+    round4 = json.loads(json.dumps(base))
+    reserved = {a["id"] for a in summary3["added"]}
+    summary4 = apply_delta(
+        round4,
+        parse_delta_payload({"add": [
+            {"title": "第二轮新增 C", "reason": "依据"},
+        ]}, round4, reserved_ids=reserved),
+        round_number=4,
+        reserved_ids=reserved,
+    )
+    new_ids = [a["id"] for a in summary4["added"]]
+    assert new_ids == ["VP-023"], (
+        f"round 4 reused an id allocated in round 3: {new_ids} vs {reserved}"
+    )
+    assert not reserved & set(new_ids)
+
+
+def test_delta_state_persists_allocated_vp_ids(tmp_path: Path) -> None:
+    """历轮分配过的 id 必须落在 delta state 里，下一轮才拿得到。"""
+    from verification_plan_delta import (
+        allocated_vp_ids,
+        apply_delta,
+        load_delta_state,
+        merge_allocated_ids,
+        parse_delta_payload,
+        save_delta_state,
+    )
+
+    state: dict = {"seen_task_ids": ["1"], "round": 3}
+    plan = _plan(_vp("VP-001"))
+    summary = apply_delta(
+        plan,
+        parse_delta_payload({"add": [{"title": "x", "reason": "依据"}]}, plan),
+        round_number=3,
+    )
+    state["allocated_vp_ids"] = merge_allocated_ids(state, summary)
+    save_delta_state(tmp_path, state)
+
+    reloaded = load_delta_state(tmp_path)
+    assert reloaded["allocated_vp_ids"] == ["VP-002"]
+    assert allocated_vp_ids(reloaded) == {"VP-002"}
+
+    # 下一轮：占位从 state 里读出来，分配必须跳过它
+    reserved = allocated_vp_ids(reloaded)
+    plan2 = _plan(_vp("VP-001"))
+    summary2 = apply_delta(
+        plan2,
+        parse_delta_payload(
+            {"add": [{"title": "y", "reason": "依据"}]}, plan2,
+            reserved_ids=reserved,
+        ),
+        round_number=4,
+        reserved_ids=reserved,
+    )
+    assert [a["id"] for a in summary2["added"]] == ["VP-003"]
+    state2 = dict(reloaded)
+    state2["allocated_vp_ids"] = merge_allocated_ids(reloaded, summary2)
+    assert state2["allocated_vp_ids"] == ["VP-002", "VP-003"]
+
+
+def test_add_naming_a_previously_allocated_id_is_rejected() -> None:
+    """LLM 复用上一轮的 VP id → 按「修改已有 VP」拒绝。"""
+    from verification_plan_delta import parse_delta_payload
+
+    plan = _plan(_vp("VP-001"))
+    delta = parse_delta_payload({
+        "add": [{
+            "id": "VP-021",                       # ← 上一轮已经分出去过
+            "title": "换个说法",
+            "reason": "依据",
+        }],
+    }, plan, reserved_ids={"VP-021"})
+
+    assert delta.added == []
+    assert delta.rejected_modifications
+    assert delta.rejected_modifications[0]["id"] == "VP-021"
+
+
+def test_agent_delta_allocates_fresh_ids_across_rounds(tmp_path: Path) -> None:
+    """端到端：增量 id 跨轮单调，且基础计划文件不被改写。
+
+    单元测试只钉住纯函数；这里钉住**接线** —— 占位必须真的落进 delta
+    state 并被下一轮读回来，否则同一个 id 照样会被分两轮。
+    """
+    from verification_agent import Orchestrator
+    from verification_plan_delta import load_delta_state
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    base = _plan(*[_vp(f"VP-{i:03d}") for i in range(1, 21)])
+    plan_file = plan_dir / "verification_plan.json"
+    plan_file.write_text(
+        json.dumps(base, ensure_ascii=False), encoding="utf-8",
+    )
+
+    class _FakeCodingTool:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def query_json(self, prompt, system_instruction=None, scene=None,
+                       **kwargs):
+            self.calls += 1
+            return {
+                "add": [{
+                    "title": "新增行为的验收",
+                    "reason": "本轮新增了任务，当前没有 VP 覆盖它",
+                    "verification_method": "code_review",
+                }],
+                "obsolete": [],
+            }
+
+    def _write_tasks(*ids: str) -> None:
+        (plan_dir / "tasks.json").write_text(
+            json.dumps(
+                {"tasks": [{"id": i, "title": "任务"} for i in ids]},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    orch = Orchestrator(
+        plan_dir=plan_dir, project_dir=tmp_path,
+        coding_tool=_FakeCodingTool(),
+    )
+
+    # 第 1 轮：只记基线，不评估
+    _write_tasks("1")
+    orch._current_round = 1
+    orch._maybe_evaluate_plan_delta(json.loads(json.dumps(base)))
+    assert load_delta_state(plan_dir)["seen_task_ids"] == ["1"]
+
+    # 第 2 轮：出现新任务 → 分配 VP-021
+    _write_tasks("1", "repair-r1-01")
+    orch._current_round = 2
+    summary = orch._maybe_evaluate_plan_delta(json.loads(json.dumps(base)))
+    assert [a["id"] for a in summary["added"]] == ["VP-021"]
+    assert load_delta_state(plan_dir)["allocated_vp_ids"] == ["VP-021"]
+
+    # 第 3 轮：又从**同一份基础计划**出发 → 必须拿到 VP-022
+    _write_tasks("1", "repair-r1-01", "repair-r1-02")
+    orch._current_round = 3
+    summary = orch._maybe_evaluate_plan_delta(json.loads(json.dumps(base)))
+    assert [a["id"] for a in summary["added"]] == ["VP-022"], (
+        "the second delta round reused an id allocated by the first one"
+    )
+
+    # 占位只落在 delta state —— 基础计划文件一个字节都不能变
+    on_disk = json.loads(plan_file.read_text(encoding="utf-8"))
+    assert [vp["id"] for vp in on_disk["verification_points"]] == [
+        f"VP-{i:03d}" for i in range(1, 21)
+    ]

@@ -1437,17 +1437,27 @@ class Orchestrator:
         try:
             from verification_plan_delta import (
                 DELTA_SYSTEM_PROMPT,
+                allocated_vp_ids,
                 apply_delta,
                 build_delta_prompt,
                 collect_acceptance,
                 collect_new_tasks,
                 load_delta_state,
+                merge_allocated_ids,
                 parse_delta_payload,
                 save_delta_state,
             )
 
             state = load_delta_state(self.plan_dir)
             seen = state.get("seen_task_ids")
+            # 2026-10-24: 历轮分配出去的 VP id。基础计划（磁盘上的
+            # ``verification_plan.json``）每轮被整份复用，增量条目只活在内存
+            # 里 —— 不把它们当占位，同一个 id 就会被分两轮（第 3 轮的
+            # VP-021/VP-022 在第 4 轮被又分了一次）。而这两个 id 上一轮已经
+            # PASSED，resume 路径按 id 跳过执行，报告里留下的就是上一轮的
+            # actual_result，被拿去和新 expected_result 比对后判成「验证对象
+            # 错位」。占位只落在 delta state，**不改写基础计划**。
+            reserved = allocated_vp_ids(state)
             new_tasks, all_ids = collect_new_tasks(
                 self.plan_dir, seen or [],
             )
@@ -1459,6 +1469,7 @@ class Orchestrator:
                 save_delta_state(self.plan_dir, {
                     "seen_task_ids": all_ids,
                     "round": round_number,
+                    "allocated_vp_ids": merge_allocated_ids(state),
                 })
                 return {}
 
@@ -1466,6 +1477,7 @@ class Orchestrator:
                 save_delta_state(self.plan_dir, {
                     "seen_task_ids": all_ids,
                     "round": round_number,
+                    "allocated_vp_ids": merge_allocated_ids(state),
                 })
                 return {}
 
@@ -1477,8 +1489,10 @@ class Orchestrator:
                 system_instruction=DELTA_SYSTEM_PROMPT,
                 scene="verification_plan_delta",
             )
-            delta = parse_delta_payload(raw, plan_data)
-            summary = apply_delta(plan_data, delta, round_number)
+            delta = parse_delta_payload(raw, plan_data, reserved_ids=reserved)
+            summary = apply_delta(
+                plan_data, delta, round_number, reserved_ids=reserved,
+            )
 
             # 新增的 VP 必须和初次生成时一样过护栏（2026-09-18 定下）：
             # 每轮跑之前都要先过护栏，因为这一轮会生成新的 VP。
@@ -1537,6 +1551,9 @@ class Orchestrator:
             save_delta_state(self.plan_dir, {
                 "seen_task_ids": all_ids,
                 "round": round_number,
+                # 本轮分配出去的 id 累加进去 —— 下一轮据此跳过它们，id 才
+                # 跨轮单调（2026-10-24）。
+                "allocated_vp_ids": merge_allocated_ids(state, summary),
                 "last_delta": summary,
             })
             self._safe_log_freshness_event(
