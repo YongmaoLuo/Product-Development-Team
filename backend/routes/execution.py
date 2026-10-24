@@ -30,6 +30,12 @@ import threading
 # this module (see the wiring at the bottom of server.py).
 import server as _server
 
+# The single place that decides whether a ``project_dir`` is usable.
+# Imported by value (it has no state and no late binding to preserve):
+# the route below must not have a second opinion about what a working
+# directory is.
+from project_dir_guard import ProjectDirInvalidError, validate_project_dir
+
 router = APIRouter()
 
 
@@ -457,6 +463,78 @@ def _consume_execution_checkpoint(plan_dir: Path) -> None:
         )
 
 
+def _record_project_dir_rejection(
+    plan_id: str, plan_dir: Path, exc: ProjectDirInvalidError
+) -> None:
+    """Leave a diagnosable trace of a refused ``project_dir``.
+
+    A refusal that says nothing is indistinguishable from a start that
+    never happened: the operator sees a plan that is not running and no
+    reason why. Two traces are written, and **both are best-effort** —
+    a refusal must never turn into a 500 because the log directory or
+    the database happened to be unreachable.
+
+    1. ``<plan_dir>/logs/execution_start.log`` — one appended line
+       naming the offending path verbatim, so the reason can be read
+       off the plan's own directory without the server's stdout.
+    2. The ``plan_execution`` row — ``exec_status='failed'``,
+       ``exec_pid=NULL``, ``stop_reason='project_dir_invalid'`` — so
+       every consumer that reads the row sees a failed run instead of a
+       plan that silently never started. ``create_if_missing=True``
+       because a plan whose row was never bootstrapped has no other
+       home for this state.
+
+    Args:
+        plan_id: The plan whose start was refused.
+        plan_dir: ``plans/<id>/`` — where the log line goes.
+        exc: The refusal, carrying ``project_dir`` and ``reason``.
+    """
+    try:
+        log_dir = plan_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / "execution_start.log").open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"{datetime.now().isoformat()} "
+                f"project_dir_invalid plan={plan_id} "
+                f"project_dir={exc.project_dir} reason={exc.reason}\n"
+            )
+    except Exception:  # noqa: BLE001 — a refusal must not become a 500
+        _server.logger.exception(
+            "execution_start: could not write the project_dir rejection log "
+            "plan=%s project_dir=%s",
+            plan_id,
+            exc.project_dir,
+        )
+
+    try:
+        from state_machine.db.connection import open as open_db
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.execution_repository import (
+            ExecutionRepository,
+        )
+
+        conn = open_db(_server._state_db_path())
+        try:
+            migrate(conn)
+            ExecutionRepository(conn).update_fields(
+                plan_id,
+                create_if_missing=True,
+                project_dir=exc.project_dir,
+                exec_status="failed",
+                stop_reason="project_dir_invalid",
+                exec_pid=None,
+            )
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — a refusal must not become a 500
+        _server.logger.exception(
+            "execution_start: could not persist the project_dir rejection "
+            "plan=%s project_dir=%s",
+            plan_id,
+            exc.project_dir,
+        )
+
+
 @router.post("/api/execution/{plan_id}/start")
 def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.StartExecutionRequest()):
     """Start autonomous task execution as a background subprocess.
@@ -609,7 +687,23 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
     # allowed, since a plan may legitimately create new subdirectories
     # there.
 
-    project_dir.mkdir(parents=True, exist_ok=True)
+    # The directory the executor works in must already exist, and must
+    # really be a directory. This used to be
+    # ``mkdir(parents=True, exist_ok=True)``, which turned a typo — or a
+    # worktree that had been removed — into a silently created empty
+    # directory, and the real error only surfaced much later as a
+    # confusing "no such file" from inside the subprocess.
+    #
+    # The check runs BEFORE the routing CAS, so a refused start leaves
+    # the plan in the phase it was in (never ``executing``) and never
+    # reaches the spawn. ``validate_project_dir`` is the single
+    # definition of "usable working directory" (see
+    # ``backend/project_dir_guard.py``) — it never creates anything.
+    try:
+        project_dir = validate_project_dir(project_dir)
+    except ProjectDirInvalidError as exc:
+        _record_project_dir_rejection(plan_id, plan_dir, exc)
+        raise HTTPException(400, str(exc))
 
     # Kill any existing execution for this plan
     existing = _server._execution_state.get(plan_id, {})
@@ -801,6 +895,13 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
                     create_if_missing=True,
                     exec_status="failed",
                     stop_reason="process_died_unexpectedly",
+                    # The executor never came up, so there is no pid to
+                    # keep.  A stale pid left on a row that says
+                    # ``failed`` reads as a live execution to every
+                    # "is this execution alive?" reader — the same ghost
+                    # the terminal-status rule forbids (accident B,
+                    # 2026-10-23).
+                    exec_pid=None,
                 )
             finally:
                 persist_conn.close()
@@ -1715,7 +1816,14 @@ def _stop_running_execution(
         persist_conn = open_db(_server._state_db_path())
         try:
             migrate(persist_conn)
-            fields: Dict[str, Any] = {"exec_status": "stopped"}
+            fields: Dict[str, Any] = {
+                "exec_status": "stopped",
+                # The executor is about to be killed — the pid belongs
+                # to a process that will not exist any more.  Leaving
+                # it behind makes the row read as a live execution
+                # (accident B, 2026-10-23).
+                "exec_pid": None,
+            }
             if project_dir:
                 fields["project_dir"] = str(project_dir)
             ExecutionRepository(persist_conn).update_fields(

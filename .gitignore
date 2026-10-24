@@ -89,6 +89,27 @@ backend/verification_report.json
 # clone, which is the worst possible shape for a fixture.
 /plans/
 
+# Scratch directories a test or a browser session writes at the repository
+# root. Both are per-machine runtime data, not source.
+#
+# Anchored to the repo root on purpose, for the same reason ``/plans/`` is:
+# an unanchored ``tmp/`` would also match any nested directory with that
+# name, and an unanchored ``.playwright-mcp/`` would match the same-named
+# directory inside a checkout of some other project.
+#
+# 2026-10-23: a ``git add -A`` committed a fixture tree under ``tmp/`` and
+# a Playwright page snapshot under ``.playwright-mcp/``. Both are top-level
+# directories, so ``test_every_tracked_directory_is_scanned.py`` — which
+# derives the tracked top-level directories from ``HEAD`` and requires each
+# one to be a privacy scan root — went red: the two directories were
+# tracked and no gate read them. The fix is to keep them out of the
+# repository, not to start scanning them.
+#
+# Ignoring them is also what stops them coming back: a tracked local
+# artifact is one ``git add -A`` away from being published.
+/tmp/
+/.playwright-mcp/
+
 # Nightly CI writes its result envelope here. It is produced by the
 # operator's local nightly runner, so it belongs to that machine, not to
 # the repo. Since 2026-09-28 it lives at ``.pdt/nightly-results.json``

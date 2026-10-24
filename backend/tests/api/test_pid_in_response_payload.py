@@ -151,6 +151,7 @@ class TestStartExecutionPayloadContainsPid:
         plan_id = "vp001-pid-in-payload"
         _setup_plan(plan_id)
         project_dir = tmp_path / "target-vp001"
+        project_dir.mkdir(parents=True, exist_ok=True)
         resp = client.post(
             f"/api/execution/{plan_id}/start",
             json={"project_dir": str(project_dir)},
@@ -166,6 +167,7 @@ class TestStartExecutionPayloadContainsPid:
         plan_id = "vp001-pid-int-type"
         _setup_plan(plan_id)
         project_dir = tmp_path / "target-vp001-int"
+        project_dir.mkdir(parents=True, exist_ok=True)
         resp = client.post(
             f"/api/execution/{plan_id}/start",
             json={"project_dir": str(project_dir)},
@@ -185,6 +187,7 @@ class TestStartExecutionPayloadContainsPid:
         plan_id = "vp001-pid-matches-subproc"
         _setup_plan(plan_id)
         project_dir = tmp_path / "target-vp001-match"
+        project_dir.mkdir(parents=True, exist_ok=True)
         resp = client.post(
             f"/api/execution/{plan_id}/start",
             json={"project_dir": str(project_dir)},
@@ -233,6 +236,7 @@ class TestStartExecutionPayloadContainsPid:
         plan_id = "vp001-pid-not-none"
         _setup_plan(plan_id)
         project_dir = tmp_path / "target-vp001-non-none"
+        project_dir.mkdir(parents=True, exist_ok=True)
         resp = client.post(
             f"/api/execution/{plan_id}/start",
             json={"project_dir": str(project_dir)},

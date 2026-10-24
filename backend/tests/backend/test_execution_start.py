@@ -133,6 +133,7 @@ def clean_state(monkeypatch, tmp_path):
 def _setup_plan_dir(plan_id: str, plans_dir: Path) -> Path:
     plan_dir = plans_dir / plan_id
     plan_dir.mkdir(parents=True, exist_ok=True)
+    (plan_dir / "project").mkdir(parents=True, exist_ok=True)
     (plan_dir / "tasks.json").write_text(
         json.dumps({"tasks": []}), encoding="utf-8"
     )

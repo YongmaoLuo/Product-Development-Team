@@ -38,6 +38,12 @@ import server as _server
 # has to be able to name it in an ``except`` clause, which a lazy
 # import inside a hot path could not do cheaply.
 from verification_cancel import VerificationCancelled
+# 2026-10-23: the single ``project_dir`` validator, shared with the
+# start-execution route (see ``backend/project_dir_guard.py``). A
+# ``project_dir`` that is not an existing directory is a configuration
+# error, and this dispatch must say so *before* it stamps the plan
+# ``executing`` and spawns a subprocess that can only fail.
+from project_dir_guard import ProjectDirInvalidError, validate_project_dir
 
 
 def _verification_event_logger(plan_dir: Path):
@@ -2275,6 +2281,38 @@ def _release_verification_state_conn(plan_id: str) -> None:
         pass
 
 
+def _write_project_dir_rejection(plan_dir: Path, exc: "ProjectDirInvalidError") -> None:
+    """Append the refused ``project_dir`` to the plan's execution log.
+
+    The dispatch is rejected before anything observable happens, which
+    makes the log the only place the operator can learn *which*
+    directory was refused — the plan id alone does not say, and the
+    refusal itself never reaches the executor's own (never-written)
+    log file.
+
+    The line carries the path verbatim, because the path is the whole
+    content of the error: a resolved path would hide the difference
+    between "the operator typed a typo" and "the worktree was deleted
+    under us".
+
+    Failures to write are swallowed: a log line is a diagnostic, and
+    losing it must not turn a clean rejection into a crash.
+    """
+    try:
+        logs_dir = plan_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        with (logs_dir / "execution_start.log").open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"{datetime.now().isoformat()} project_dir rejected: "
+                f"{exc.project_dir} ({exc.reason})\n"
+            )
+    except Exception:
+        _server.logger.exception(
+            "[repair_async] could not write project_dir rejection log plan=%s",
+            plan_dir.name,
+        )
+
+
 def _run_repair_execution_async(
     plan_id: str,
     project_dir: Path,
@@ -2289,6 +2327,13 @@ def _run_repair_execution_async(
     subprocess exit (success or failure). On spawn failure,
     ``on_complete(-1)`` fires before this function returns.
 
+    2026-10-23: a ``project_dir`` that is not an existing directory is
+    refused BEFORE the phase is stamped and the subprocess is spawned,
+    and the refusal returns
+    ``{"status": "failed", "reason": "project_dir_invalid"}``. Nothing
+    runs in that case, so the plan must not be left looking like it did
+    — see the comment at the validation site below.
+
     2026-09-23: ``outcome`` is how the caller's
     :class:`_VerificationLoopOutcome` learns that the auto-verification
     loop is ending in a **hand-off** rather than a terminal verdict. The
@@ -2302,6 +2347,38 @@ def _run_repair_execution_async(
     plan_dir = _server._plan_dir(plan_id)
     tasks_file = plan_dir / "tasks.json"
     log_path = plan_dir / "logs" / f"repair_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    # 2026-10-23: refuse an unusable working directory BEFORE anything
+    # observable happens. The order matters: ``force_set_phase("executing")``
+    # writes the phase the operator and the watchdog read, and the spawn
+    # starts a subprocess whose own failure is invisible from here. So a
+    # ``project_dir`` that is gone (a deleted worktree, a typo) used to
+    # leave the plan stamped ``executing`` with nothing running — the
+    # ghost state this check exists to prevent.
+    #
+    # The validation is the shared one (``project_dir_guard``), so the
+    # repair path and the start-execution route cannot drift apart.
+    try:
+        project_dir = validate_project_dir(project_dir)
+    except ProjectDirInvalidError as exc:
+        _server.logger.error(
+            "[repair_async] project_dir rejected plan=%s: %s", plan_id, exc)
+        with _server._execution_state_lock:
+            _state = _server._execution_state.setdefault(plan_id, {})
+            _state.update({
+                'status': 'failed',
+                'stop_reason': 'project_dir_invalid',
+                'project_dir': exc.project_dir,
+                'ended_at': datetime.now().isoformat(),
+            })
+        _write_project_dir_rejection(plan_dir, exc)
+        if on_complete is not None:
+            try:
+                on_complete(-1)
+            except Exception:
+                _server.logger.exception(
+                    "[repair_async] on_complete(-1) crashed plan=%s", plan_id)
+        return {'status': 'failed', 'reason': 'project_dir_invalid'}
 
     # Seed ``_execution_state`` BEFORE spawning so the watchdog sees the
     # new pid from the very first heartbeat tick. Without this, a 30s
@@ -2436,13 +2513,23 @@ def _run_repair_execution_async(
             # ``_mark_failed_dead`` if the subprocess crashes.
             process.wait()
             with _server._execution_state_lock:
-                # 2026-09-11 plan v11: set the watchdog-friendly
-                # "finished cleanly" flag BEFORE any subsequent state
-                # mutation, mirroring the main execution path's fix
-                # for the same race window.
-                state["executor_finished_cleanly"] = True
+                # 2026-10-23: the "finished cleanly" flag is the executor
+                # watchdog's yield signal — ``_lazy_check_execution``
+                # early-returns instead of firing ``_mark_failed_dead``
+                # when it is set. It therefore has to mean "the
+                # subprocess exited 0", nothing else. Writing it
+                # unconditionally (as this path used to) told the
+                # watchdog to stand down over a crashed executor, so a
+                # non-zero exit was never accounted for by anything.
+                #
+                # The return code itself is recorded unconditionally.
                 state["executor_returncode"] = process.returncode
                 if process.returncode == 0:
+                    # 2026-09-11 plan v11: set the watchdog-friendly
+                    # "finished cleanly" flag BEFORE any subsequent state
+                    # mutation, mirroring the main execution path's fix
+                    # for the same race window.
+                    state["executor_finished_cleanly"] = True
                     # ------------------------------------------------------------
                     # 2026-10-11: a 0 return code means "the subprocess did
                     # not crash", nothing more. The repair path used to read
@@ -2494,6 +2581,12 @@ def _run_repair_execution_async(
                         state["status"] = "completed"
                         state["stop_reason"] = None
                 else:
+                    # Explicit False, not "leave it alone": the state
+                    # dict is keyed by plan_id and survives across
+                    # rounds, so a previous round's ``True`` would
+                    # otherwise linger here and keep the watchdog
+                    # yielding over this crash.
+                    state["executor_finished_cleanly"] = False
                     state["status"] = "failed"
                     state["stop_reason"] = "repair_non_zero_exit"
                 state["ended_at"] = datetime.now().isoformat()
@@ -2574,6 +2667,24 @@ def _run_repair_execution_async(
     return {"status": "started", "pid": process.pid}
 
 
+#: 2026-10-23 (accident B — the repair path's ghost state): the
+#: verification STATUSES that mean "this verdict ends the chain".
+#:
+#: 2026-09-20 (post-mortem) reached the conclusion for the convergence
+#: reasons — what ends the chain is the VERDICT (the status); the stop
+#: reason only DESCRIBES it.  It was never applied to the repair path,
+#: so ``repair_non_zero_exit`` and the segmented
+#: ``repair_batch_not_drained:<reason>:<n>_pending`` — neither of which
+#: can be enumerated in a fixed reason set — left the plan parked at
+#: ``current_phase='executing'`` forever: the repair round was over
+#: while the plan still looked like it was running.
+#:
+#: A caller that is mid-loop (the executor subprocess is still
+#: in-flight) says so explicitly with ``chain_ending=False``; the
+#: status alone must not end the chain behind the executor's back.
+_TERMINAL_VERIFICATION_STATUSES = frozenset({"passed", "failed", "loop_stopped"})
+
+
 def _persist_verification_terminal(
     plan_id: str,
     status: str,
@@ -2591,8 +2702,12 @@ def _persist_verification_terminal(
     is over (the watchdog: it only fires once the verification thread is
     dead or has stopped writing progress) pass ``True`` so a future
     addition to the stop-reason vocabulary cannot silently regress into
-    a split-brain state. Leave it ``None`` to keep the reason-based
-    default (see ``VERIFICATION_TERMINAL_STOP_REASONS``).
+    a split-brain state. Callers that know the opposite — the executor
+    subprocess is still mid-flight — pass ``False``; that explicit flag
+    is the mid-loop guard. Leave it ``None`` to keep the default: the
+    STATUS decides (see ``_TERMINAL_VERIFICATION_STATUSES``), with the
+    stop-reason set kept for compatibility only (see
+    ``VERIFICATION_TERMINAL_STOP_REASONS``).
 
     Status mapping (consistent with the inline
     ``_record_terminal`` closure in
@@ -2730,8 +2845,8 @@ def _persist_verification_terminal(
     # "verification")`` raises Illegal transition on the next round.
     #
     # "Actually ending" = one of:
-    #   - status == "passed" (all VPs passed)
-    #   - stop_reason is in ``VERIFICATION_TERMINAL_STOP_REASONS``
+    #   - the STATUS is terminal (``passed`` / ``failed`` /
+    #     ``loop_stopped``) — see the 2026-09-20 conclusion below
     #   - the caller passed ``chain_ending=True`` explicitly
     #
     # 2026-09-13: the reason set now unions
@@ -2744,13 +2859,35 @@ def _persist_verification_terminal(
     # ``plan_verification.verification_status='failed'``. That is exactly
     # the "飞书卡片说验证失败，本地状态还在跑" split-brain.
     #
+    # 2026-10-23 (accident B — the repair path's ghost state): the
+    # 2026-09-20 post-mortem reached the conclusion for the convergence
+    # reasons — the verdict that ends the chain is the STATUS; the stop
+    # reason only DESCRIBES it.  It had not been applied here, so the
+    # repair path's ``repair_non_zero_exit`` and the segmented
+    # ``repair_batch_not_drained:<reason>:<n>_pending`` (a reason string
+    # no fixed set can ever enumerate) left the plan parked at
+    # ``current_phase='executing'`` forever: the repair round was over
+    # while the plan still looked like it was running.
+    #
+    # A reason whitelist is a losing game — every new stop reason has to
+    # be added to it, and the one that gets forgotten strands the plan.
+    # ``VERIFICATION_TERMINAL_STOP_REASONS`` therefore survives for
+    # COMPATIBILITY only: it still ends the chain for a caller that
+    # reports a non-terminal status carrying a terminal reason.  It is
+    # no longer the classifier.
+    #
+    # The mid-loop guard is now the EXPLICIT ``chain_ending=False``
+    # flag: a caller that knows the executor subprocess is still
+    # in-flight says so, instead of relying on the absence of a reason
+    # from a set that cannot enumerate segmented reasons.
+    #
     # Hoisted above step 2 (it used to be computed inside step 2's ``try``,
     # so an import failure there left it unbound for step 3).
     _chain_ending = (
         chain_ending
         if chain_ending is not None
         else (
-            status == "passed"
+            status in _TERMINAL_VERIFICATION_STATUSES
             or stop_reason in _server.VERIFICATION_TERMINAL_STOP_REASONS
         )
     )
@@ -3100,7 +3237,14 @@ def _dead_end_terminal(
     must keep its routing row inside the verification family.
     """
     final_status = "failed" if reason == "no_repair_tasks" else "loop_stopped"
-    _server._record_verification_terminal(plan_id, final_status, reason)
+    # 2026-10-23 (accident B): this call RECORDS the verdict; whether it
+    # also ENDS the chain is decided further down (the rollback branch
+    # below, or the explicit ``chain_ending=True`` write at the end).
+    # The status-based rule would end the chain right here, so the
+    # mid-loop guard has to be said out loud.
+    _server._record_verification_terminal(
+        plan_id, final_status, reason, chain_ending=False,
+    )
     unfinished = _count_unfinished_execution_tasks(plan_id)
     if unfinished > 0:
         if rollback_to_ready:
@@ -3199,9 +3343,15 @@ def _repair_generation_failed(plan_id: str, error: str) -> None:
     same as "there is nothing to fix".
 
     The chain must not be closed in that case. We record the failure on
-    ``plan_verification`` for visibility — the reason is deliberately
-    absent from ``VERIFICATION_TERMINAL_STOP_REASONS``, so the routing
-    stage is not advanced by it.
+    ``plan_verification`` for visibility and pass
+    ``chain_ending=False``, so the routing stage is not advanced by it.
+
+    2026-10-23 (accident B): "the reason is absent from the stop-reason
+    set" used to be what kept the stage put — the chain-ending decision
+    was made from the reason.  It is now made from the STATUS, so a
+    terminal status ends the chain unless the caller says otherwise.
+    This call site is such a caller: the auto-loop retries the round,
+    so the chain is demonstrably NOT over.
 
     Why this exists: ``generate_repair_contents`` used to swallow its
     own LLM exception and return ``[]``. The auto-loop then read the
@@ -3235,7 +3385,9 @@ def _repair_generation_failed(plan_id: str, error: str) -> None:
         "(%s) — recorded; the auto-loop retries in the next round",
         plan_id, error,
     )
-    _server._record_verification_terminal(plan_id, "failed", reason)
+    _server._record_verification_terminal(
+        plan_id, "failed", reason, chain_ending=False,
+    )
 
 
 def _round_failed_vp_ids(orch: Any, report: Any) -> set:
@@ -3684,6 +3836,7 @@ def _handle_passed_round(
 
 def _record_verification_terminal(
     plan_id: str, status: str, stop_reason: Optional[str],
+    *, chain_ending: Optional[bool] = None,
 ) -> None:
     """2026-09-11 plan v14: module-level wrapper that updates the
     in-memory ``_verification_state[plan_id]`` AND delegates to
@@ -3700,6 +3853,13 @@ def _record_verification_terminal(
       * ``_verification_state[plan_id].ended_at`` set to now
       * SQLite ``plan_verification`` + ``plan_routing`` advanced
         (via ``_persist_verification_terminal``)
+
+    2026-10-23 (accident B): ``chain_ending`` is forwarded verbatim to
+    ``_persist_verification_terminal``.  A mid-loop caller (the loop is
+    still working and the executor subprocess is still in-flight) passes
+    ``False`` — the verdict is recorded, the chain is NOT closed.
+    ``None`` (the default) leaves the decision to the status-based rule
+    in ``_persist_verification_terminal``.
     """
     v_state = _server._verification_state.get(plan_id)
     if v_state:
@@ -3708,7 +3868,9 @@ def _record_verification_terminal(
         v_state["updated_at"] = datetime.now().isoformat()
         v_state["ended_at"] = v_state["updated_at"]
 
-    _server._persist_verification_terminal(plan_id, status, stop_reason or "")
+    _server._persist_verification_terminal(
+        plan_id, status, stop_reason or "", chain_ending=chain_ending,
+    )
 
 
 class _VerificationLoopOutcome:
