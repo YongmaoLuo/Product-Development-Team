@@ -58,12 +58,14 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from credentials import _FD_ENV_PREFIX as _SECRET_FD_ENV_PREFIX
 from service_declaration import SERVICE_HOST, ServiceDeclaration
 from service_freshness import (
     PROTECTED_PORTS,
@@ -131,6 +133,12 @@ _MAX_ERROR_SCAN_LINES = 20_000
 
 #: Upper bound on the excerpt that goes into ``ServiceRuntime.detail``.
 _MAX_EXCERPT_CHARS = 1200
+
+#: The program used to count a process' open descriptors.
+_LSOF_BIN = "lsof"
+
+#: How long the descriptor count may take before it is given up on.
+_FD_COUNT_TIMEOUT_SECONDS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +357,81 @@ def _process_group_of(pid: int) -> Optional[int]:
     return pgid
 
 
+#: The program a declared service is started through.
+#:
+#: It does three things, in this order:
+#:
+#: 1. Drops the environment variables that name a descriptor. A
+#:    descriptor number only means something in the process that
+#:    published it, and a child inherits the *variable* without
+#:    inheriting the pipe behind it -- so the number names something
+#:    else in the child. ``credentials.read_secret_fd`` closes whatever
+#:    number it is given, and in the child that number is the event
+#:    loop's own selector: the service was dying of ``Bad file
+#:    descriptor`` before it was ready. The launcher's own handoff is
+#:    untouched by this -- it execs the backend directly, where the
+#:    numbers are valid, and that path does not go through here.
+#: 2. Calls ``setsid()``, so the service runs in a session of its own
+#:    and outlives the backend that started it.
+#: 3. Execs the real command, unchanged.
+_DETACHED_WRAPPER_SOURCE = (
+    "import os,sys\n"
+    "for _name in [k for k in os.environ if k.startswith("
+    f"{_SECRET_FD_ENV_PREFIX!r})]:\n"
+    "    del os.environ[_name]\n"
+    "os.setsid()\n"
+    "os.execvp(sys.argv[1], sys.argv[1:])\n"
+)
+
+
+#: How long the spawn path waits for the child to report that it has
+#: made itself a process-group leader.
+_DETACHED_PGID_TIMEOUT_SECONDS = 5.0
+
+
+def _detached_argv(start_cmd: str) -> List[str]:
+    """The argv a declared service is started with.
+
+    The command is handed to the wrapper as it stands -- one argv
+    element, never re-parsed and never re-quoted -- and the wrapper
+    execs it through the same shell the service has always been started
+    with, so the command sees the shell it expects.
+    """
+    return [
+        sys.executable or "/usr/bin/python3",
+        "-c",
+        _DETACHED_WRAPPER_SOURCE,
+        "/bin/bash",
+        "-lc",
+        start_cmd,
+    ]
+
+
+def _detached_pgid_of(pid: int) -> Optional[int]:
+    """*pid*'s process group, once the child has made itself a leader.
+
+    The child calls ``setsid()`` itself -- see :func:`_detached_argv` --
+    so for a moment after ``Popen`` returns it is still a member of
+    *our* group. Recording that group would hand :func:`stop_service` a
+    pgid that names the caller's own processes, and signalling it would
+    take down the backend that asked for the service. So wait for the
+    separation, and record nothing rather than record the caller's
+    group.
+    """
+    deadline = time.monotonic() + _DETACHED_PGID_TIMEOUT_SECONDS
+    while True:
+        pgid = _process_group_of(pid)
+        if pgid is None:
+            # The child is gone; there is no group left to record.
+            return None
+        if pgid == pid:
+            # It leads its own group now, so the separation has happened.
+            return pgid
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.01)
+
+
 def _process_start_epoch(pid: int) -> Optional[float]:
     raw = _run(["ps", "-p", str(pid), "-o", "lstart="])
     if not raw:
@@ -418,6 +501,13 @@ def stop_service(
         return result
 
     pgid = runtime.pgid or _process_group_of(targets[0])
+    # Never our own group: that is the caller, and everything it owns.
+    # Signalling it would take down the backend — or, under pytest, the
+    # whole session, which is a failure with no trace of its cause. A
+    # child that has not made itself a group leader yet sits in it.
+    own_pgid = os.getpgrp()
+    if pgid is not None and pgid == own_pgid:
+        pgid = None
     signalled_pg = False
     if pgid and pgid > 1:
         try:
@@ -705,9 +795,9 @@ def start_service(
 ) -> ServiceRuntime:
     """Launch one declared service detached and wait for readiness.
 
-    Detached (``start_new_session=True``) so it outlives this process —
-    which is also why C3 exists: a detached process nobody reaps is an
-    orphan.
+    Detached so it outlives this process: the wrapper the service is
+    started through calls ``setsid()`` for that — which is also why C3
+    exists: a detached process nobody reaps is an orphan.
     """
     runtime = ServiceRuntime(
         name=decl.name, port=decl.port, start_cmd=decl.start_cmd,
@@ -737,20 +827,19 @@ def start_service(
         env.update(service_env(decl))
         with open(log_file, "ab") as log_fp:
             proc = subprocess.Popen(
-                ["/bin/bash", "-lc", decl.start_cmd],
+                _detached_argv(decl.start_cmd),
                 cwd=str(workdir),
                 env=env,
                 stdout=log_fp,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                start_new_session=True,
             )
     except Exception as exc:  # noqa: BLE001 - never abort the round
         runtime.detail = f"spawn failed: {type(exc).__name__}: {exc}"
         return runtime
 
     runtime.pid = proc.pid
-    runtime.pgid = _process_group_of(proc.pid)
+    runtime.pgid = _detached_pgid_of(proc.pid)
     # Our own clock, not the system's. `proc` was created by the line
     # above, so we know when it started without asking anyone, and that
     # matters twice over: the `ps -o lstart=` probe is unavailable or
@@ -784,15 +873,16 @@ def start_service(
         # Sampling once straight after the readiness probe, which returns
         # in milliseconds, reliably caught the shell before it had exited
         # and reported the dead service as ready.
-        exited, _ = _await_exit(proc, timeout=2.0)
+        exited, rc = _await_exit(proc, timeout=2.0)
         if exited:
-            tail = _tail(log_file, 15)
             runtime.ready = False
-            runtime.detail = (
-                f"exited immediately (rc={proc.returncode}); port "
-                f"{decl.port} is answering but this process never served "
-                f"on it — something else holds the port. Log tail: "
-                f"{tail or '(empty)'}"
+            runtime.detail = _failure_detail(
+                pid=proc.pid,
+                pgid=runtime.pgid,
+                fds=_fd_count(proc.pid),
+                timeout_seconds=decl.ready_timeout_seconds,
+                rc=rc,
+                log_file=log_file,
             )
             return runtime
         runtime.ready = True
@@ -805,12 +895,15 @@ def start_service(
     # Not ready: report what the log says so the operator gets a
     # diagnosable reason instead of a bare timeout. The tail alone is
     # not enough — a service that fails early drowns its own traceback
-    # in interpreter-shutdown noise — so the excerpt leads with the
-    # first error and keeps the tail after it.
-    runtime.detail = (
-        f"started (pid {proc.pid}) but not ready after "
-        f"{decl.ready_timeout_seconds}s; "
-        f"{_diagnosable_log(log_file, tail_lines=15)}"
+    # in interpreter-shutdown noise — so the excerpt of the first
+    # error comes first, and the tail after it.
+    runtime.detail = _failure_detail(
+        pid=proc.pid,
+        pgid=runtime.pgid,
+        fds=_fd_count(proc.pid),
+        timeout_seconds=decl.ready_timeout_seconds,
+        rc=proc.poll(),
+        log_file=log_file,
     )
     return runtime
 
@@ -916,6 +1009,79 @@ def _diagnosable_log(
             parts.append(f"first error at line {line_number}: {excerpt}")
     parts.append(f"log tail: {tail or '(empty)'}")
     return _truncate(" | ".join(parts), max_chars)
+
+def _fd_count(pid: int) -> Optional[int]:
+    """How many descriptors *pid* holds open, or ``None``.
+
+    ``None`` means "not measurable here", not "zero": ``lsof`` may not
+    be installed, may not be permitted to look at that process, or may
+    have failed. A caller that turned that into ``0`` would report a
+    descriptor exhaustion that was never observed.
+
+    The count is the number of **numbered** descriptors. ``lsof`` also
+    reports the current working directory, the executable and the root
+    as ``fcwd`` / ``ftxt`` / ``frtd``, which are not descriptors and
+    would inflate the count by three.
+    """
+    try:
+        completed = subprocess.run(
+            [_LSOF_BIN, "-p", str(pid), "-Fn"],
+            capture_output=True, text=True, check=False,
+            timeout=_FD_COUNT_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 - a probe is best-effort
+        # ``lsof`` may be missing, the process may be gone, the call
+        # may have been refused.  None of that may break the failure
+        # path this probe is there to explain.
+        logger.debug(
+            "[service_manager] fd count for %s failed: %s", pid, exc,
+        )
+        return None
+    if completed.returncode != 0:
+        return None
+    count = 0
+    for line in completed.stdout.splitlines():
+        field = line.strip()
+        if field.startswith("f") and field[1:].isdigit():
+            count += 1
+    return count or None
+
+def _failure_detail(
+    *,
+    pid: int,
+    pgid: Optional[int],
+    fds: Optional[int],
+    timeout_seconds: int,
+    rc: Optional[int],
+    log_file: Path,
+) -> str:
+    """The one-line diagnosis of a service that did not come up.
+
+    The shape is fixed, because the reader of this line is a human
+    with the log open in another window::
+
+        started (pid 24057, pgid 24057, fds 37) but not ready after 8s;
+        rc=None; first error at line 9: ...; log tail: ...
+
+    *pid* / *pgid* say which process to look at; *fds* says how many
+    descriptors it held when it failed, and is **omitted** when the
+    count could not be taken; *rc* is the exit code when the child has
+    already exited and ``None`` while it is still running.
+
+    The log half is :func:`_diagnosable_log` and not a second copy of
+    it: the first error line, the five lines before it, then the tail,
+    capped at ``_MAX_EXCERPT_CHARS``. Two implementations of "where did
+    it first go wrong" would drift apart, and the one that drifted
+    would be whichever the reader did not have open.
+    """
+    fd_part = f", fds {fds}" if fds is not None else ""
+    return (
+        f"started (pid {pid}, pgid {pgid}{fd_part}) but not ready after "
+        f"{timeout_seconds}s; rc={rc}; "
+        f"{_diagnosable_log(log_file, tail_lines=15)}"
+    )
+
+
 
 
 # ---------------------------------------------------------------------------

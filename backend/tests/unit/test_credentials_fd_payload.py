@@ -45,10 +45,13 @@ that the module closes its own.
 from __future__ import annotations
 
 import ast
+import asyncio
 import errno
 import json
 import os
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -105,6 +108,17 @@ def _isolated_credentials_state(monkeypatch):
     for spec in credentials.SECRET_SPECS.values():
         keys.add(spec.fallback_env_key)
         keys.add(spec.account_env_key)
+    # The variables that *name* a descriptor are cleared as well. They
+    # carry no secret, so the list above is not the place to look for
+    # them, but a number in one of them is only meaningful where it was
+    # issued -- and the resolver used to close whatever it named. A
+    # suite that inherits them from the surrounding shell is a suite
+    # whose result depends on the machine it runs on, and on a machine
+    # where the shell has them, the resolver would close a descriptor
+    # this very process owns.
+    for key in list(os.environ):
+        if key.startswith(credentials._FD_ENV_PREFIX):
+            keys.add(key)
     for key in keys:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(credentials, "_is_macos", lambda: True)
@@ -528,3 +542,361 @@ def test_module_uses_json_and_os_and_nothing_else_new():
     assert "json" in roots, "the payload codec is not json"
     assert "os" in roots
     assert "notifications" not in roots
+
+
+# ---------------------------------------------------------------------------
+# A descriptor number only means something where it was published
+# ---------------------------------------------------------------------------
+#
+# The pipe is published in one process and read in another, and the
+# environment carries the *number* of the descriptor between them. A
+# number is only meaningful where it was issued: the child inherits the
+# variable, but not necessarily the pipe behind it.
+#
+# Where the pipe did not arrive, the number names something else -- and
+# in a child process that is usually the event loop's own selector,
+# because the selector takes the lowest free descriptor and the pipe's
+# number was among the lowest. The reader used to close whatever number
+# it was handed, which closed the selector out from under the running
+# server: "OSError: [Errno 9] Bad file descriptor" out of
+# ``asyncio/base_events.py``, before the service was ever ready.
+#
+# The root cause is written up in
+# ``docs/development/service-spawn-root-cause.md``. The fix on the
+# spawning side is a wrapper that drops the descriptor-naming variables
+# before the service is exec'd. What is pinned here is the other half:
+# a reader that is handed a descriptor it did not publish must leave it
+# alone, so that a process which loses the handoff degrades to "no
+# secret" instead of taking its own event loop down with it.
+
+
+def test_reader_leaves_a_descriptor_it_did_not_publish_open(tmp_path):
+    """A descriptor this module did not open is not this module's to close.
+
+    A regular file is the simplest thing that is definitely not the
+    pipe this module published. The reader must leave it open: it
+    belongs to whoever opened it, and closing it is the whole bug.
+    """
+    path = tmp_path / "not-a-pipe"
+    path.write_text("not a published secret", encoding="utf-8")
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        with pytest.raises(ValueError):
+            credentials.read_secret_fd(fd)
+        assert _is_open(fd) is True, "the reader closed a descriptor it did not publish"
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def test_reader_leaves_a_pipe_with_a_live_writer_alone():
+    """A pipe whose writer is still attached is not the published pipe.
+
+    The published pipe has its write end closed before the number is
+    handed out, so a read of it ends at EOF. A pipe with a live writer
+    belongs to somebody else -- and a reader that waits for EOF on it
+    waits for a writer that may never write, which in a server's
+    startup is a hang rather than a failure.
+
+    The writer gives up on its own after a moment, so a reader that
+    waits anyway fails this test instead of hanging the suite.
+    """
+    read_fd, write_fd = os.pipe()
+    give_up = threading.Event()
+    closed = threading.Event()
+
+    def _writer():
+        give_up.wait(3.0)
+        try:
+            os.close(write_fd)
+        finally:
+            closed.set()
+
+    writer = threading.Thread(target=_writer, daemon=True)
+    writer.start()
+    try:
+        with pytest.raises(ValueError):
+            credentials.read_secret_fd(read_fd)
+        assert _is_open(read_fd) is True, "the reader closed a pipe it does not own"
+    finally:
+        give_up.set()
+        closed.wait(10.0)
+        writer.join(10.0)
+        try:
+            os.close(read_fd)
+        except OSError:
+            pass
+
+
+def test_reader_restores_the_flags_of_a_pipe_it_did_not_publish():
+    """A pipe with a live writer comes back with the flags it had.
+
+    The reader has to tell an empty pipe from one whose writer is
+    gone, and it does that by asking whether a read would find
+    anything -- a question about the pipe rather than a change to it.
+    So the flags come back exactly as they were: not because they were
+    changed and put back, but because nothing ever changed them. A
+    foreign descriptor left in non-blocking mode would change how
+    whoever owns it behaves, because a read on it comes back empty
+    instead of waiting.
+    """
+    fcntl = pytest.importorskip("fcntl")
+
+    read_fd, write_fd = os.pipe()
+    give_up = threading.Event()
+    closed = threading.Event()
+
+    def _writer():
+        give_up.wait(3.0)
+        try:
+            os.close(write_fd)
+        finally:
+            closed.set()
+
+    writer = threading.Thread(target=_writer, daemon=True)
+    writer.start()
+    before = fcntl.fcntl(read_fd, fcntl.F_GETFL)
+    was_blocking = os.get_blocking(read_fd)
+    try:
+        with pytest.raises(ValueError):
+            credentials.read_secret_fd(read_fd)
+
+        assert fcntl.fcntl(read_fd, fcntl.F_GETFL) == before, (
+            "the reader left a pipe it does not own in a different mode: "
+            f"{before} -> {fcntl.fcntl(read_fd, fcntl.F_GETFL)}"
+        )
+        assert os.get_blocking(read_fd) == was_blocking, (
+            "the reader changed the blocking mode of a pipe it does not own"
+        )
+    finally:
+        give_up.set()
+        closed.wait(10.0)
+        writer.join(10.0)
+        try:
+            os.close(read_fd)
+        except OSError:
+            pass
+
+
+def _foreign_kqueue_descriptor():
+    """A descriptor that is a pipe to ``fstat`` and refuses ``fcntl``.
+
+    On macOS the event loop's own selector is a kqueue descriptor: the
+    kernel gives it the same kind of object as a pipe, so ``fstat``
+    reports a FIFO, while ``fcntl`` on it fails with ENOTTY. It is the
+    descriptor the production failure landed on, and it is the one
+    descriptor guaranteed not to belong to this module.
+
+    Returns ``(module, fd)``, and the caller must keep the module
+    alive: it owns the descriptor.
+    """
+    fcntl = pytest.importorskip("fcntl")
+    select = pytest.importorskip("select")
+    if not hasattr(select, "kqueue"):
+        pytest.skip("this platform has no kqueue descriptor")
+    kqueue = select.kqueue()
+    return fcntl, kqueue, kqueue.fileno()
+
+
+def test_drain_leaves_a_foreign_descriptor_flags_untouched():
+    """A descriptor this module cannot even ask must come back as it was.
+
+    The kqueue descriptor of the event loop is a pipe as far as
+    ``fstat`` is concerned, so the reader cannot rule it out by its
+    kind. It does not have to try to change it either: the reader asks
+    whether a read would find anything, and a kqueue descriptor
+    answers "no" -- without the reader issuing a single call that
+    touches the flags. That matters because a failed call is not proof
+    that nothing changed: the kernel applies F_SETFL and only then
+    reports the error, so a reader that tried would leave somebody
+    else's descriptor in non-blocking mode.
+
+    The flags must be exactly as they were found.
+    """
+    fcntl, _kqueue, fd = _foreign_kqueue_descriptor()
+
+    before = fcntl.fcntl(fd, fcntl.F_GETFL)
+    was_blocking = os.get_blocking(fd)
+
+    assert credentials._drain_published_pipe(fd) is None
+
+    after = fcntl.fcntl(fd, fcntl.F_GETFL)
+    assert after == before, (
+        f"the reader changed the flags of a descriptor it does not own: "
+        f"{before} -> {after}"
+    )
+    assert os.get_blocking(fd) == was_blocking, (
+        "the reader changed the blocking mode of a descriptor it does not own"
+    )
+
+
+def test_reader_leaves_a_foreign_descriptor_flags_untouched():
+    """The same contract one layer up, through the public reader.
+
+    ``read_secret_fd`` is what the resolver calls, and it is what
+    raises ``ValueError`` for a descriptor that is not the published
+    pipe. The contract it owes a descriptor it does not own is the
+    same one: not closed, not read, and its flags as they were --
+    which is not the achievement of a restore but the absence of any
+    call that could have changed them.
+    """
+    fcntl, _kqueue, fd = _foreign_kqueue_descriptor()
+
+    before = fcntl.fcntl(fd, fcntl.F_GETFL)
+    was_blocking = os.get_blocking(fd)
+
+    with pytest.raises(ValueError):
+        credentials.read_secret_fd(fd)
+
+    after = fcntl.fcntl(fd, fcntl.F_GETFL)
+    assert after == before, (
+        f"the reader changed the flags of a descriptor it does not own: "
+        f"{before} -> {after}"
+    )
+    assert os.get_blocking(fd) == was_blocking, (
+        "the reader changed the blocking mode of a descriptor it does not own"
+    )
+    assert _is_open(fd) is True, "the reader closed a descriptor it does not own"
+
+
+def test_resolver_does_not_close_the_event_loop_selector(monkeypatch):
+    """The number in the environment must not be able to close the loop's own fd.
+
+    This is the production failure, in miniature. A server resolves a
+    secret while it starts up; the variable names a descriptor this
+    process did not open; the reader closes it. If that descriptor is
+    the event loop's selector, the next ``selector.select()`` fails and
+    the server exits before it is ready to answer anything.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        selector_fd = loop._selector.fileno()
+        monkeypatch.setenv(credentials.secret_fd_env_var(LOGICAL_NAME), str(selector_fd))
+
+        value, source = credentials._resolve_from_inherited_fd(LOGICAL_NAME)
+
+        assert value is None
+        assert source == credentials.SOURCE_MISSING
+        assert _is_open(selector_fd) is True, "the resolver closed the event loop's selector"
+
+        # And the loop still works -- this is where the production
+        # failure surfaced: OSError: [Errno 9] Bad file descriptor.
+        loop.run_until_complete(asyncio.sleep(0))
+    finally:
+        try:
+            loop.close()
+        except OSError:
+            # A selector that was closed underneath us makes close()
+            # fail too. That is a symptom, not the finding.
+            pass
+
+
+def test_resolver_treats_a_number_nothing_holds_as_no_handoff(monkeypatch):
+    """A number nothing holds any more means there was no handoff.
+
+    The launcher publishes a pipe and the environment carries its
+    number. A process that did not receive the pipe has no handoff to
+    consume, and "missing" is the only correct answer. The number is
+    left alone: it may name a descriptor this process opened for
+    something else entirely.
+    """
+    fd = os.open(os.devnull, os.O_RDONLY)
+    os.close(fd)
+    monkeypatch.setenv(credentials.secret_fd_env_var(LOGICAL_NAME), str(fd))
+
+    value, source = credentials._resolve_from_inherited_fd(LOGICAL_NAME)
+
+    assert value is None
+    assert source == credentials.SOURCE_MISSING
+
+
+#: The child of :func:`test_child_process_survives_a_stale_descriptor_number`.
+#:
+#: It is a real interpreter, and it is handed a real descriptor number
+#: through the environment -- the number the parent published. What it
+#: is not handed is the pipe, which is the whole point: the number
+#: arrives, the pipe does not, and the number lands on the child's own
+#: event loop selector.
+_STALE_FD_CHILD_SRC = """
+import asyncio
+import os
+import sys
+
+sys.path.insert(0, os.environ["PDT_TEST_BACKEND_DIR"])
+
+import credentials
+
+fd_var = os.environ["PDT_TEST_FD_VAR"]
+logical = os.environ["PDT_TEST_SECRET_NAME"]
+stale = int(os.environ[fd_var])
+
+# The pipe the parent published did not survive into this process:
+# Popen closes every descriptor above stderr unless it is passed on.
+# Closing it here is what that looks like from the inside.
+os.close(stale)
+
+# Make `stale` the lowest free descriptor, so the event loop's own
+# selector takes exactly the number the inherited variable names.
+if stale > 3:
+    held = os.open(os.devnull, os.O_RDONLY)
+    while held < stale - 1:
+        held = os.dup(held)
+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+selector_fd = loop._selector.fileno()
+if selector_fd != stale:
+    sys.stderr.write("selector %d is not the stale number %d\\n" % (selector_fd, stale))
+    sys.exit(4)
+
+value, source = credentials._resolve_from_inherited_fd(logical)
+if value is not None or source != credentials.SOURCE_MISSING:
+    sys.stderr.write("resolved %r from %r\\n" % (value, source))
+    sys.exit(5)
+
+# The service died here, with "OSError: [Errno 9] Bad file
+# descriptor", before it was ever ready to answer a request.
+loop.run_until_complete(asyncio.sleep(0.01))
+sys.stdout.write("CHILD SURVIVED")
+"""
+
+
+def test_child_process_survives_a_stale_descriptor_number():
+    """A child that lost the handoff must serve, not die before it is ready.
+
+    The whole chain, in a real process: the parent publishes a pipe and
+    puts its number in the environment; the child does not get the pipe;
+    the number lands on the child's own event loop selector; the child
+    resolves a secret during startup.
+
+    Before the fix the child died right here, with "OSError: [Errno 9]
+    Bad file descriptor" out of ``asyncio/base_events.py`` -- the exact
+    failure the service had under the harness.
+    """
+    read_fd, write_fd = os.pipe()
+    try:
+        env = dict(os.environ)
+        env["PDT_TEST_BACKEND_DIR"] = str(MODULE_PATH.parent)
+        env["PDT_TEST_FD_VAR"] = credentials.secret_fd_env_var(LOGICAL_NAME)
+        env["PDT_TEST_SECRET_NAME"] = LOGICAL_NAME
+        env[credentials.secret_fd_env_var(LOGICAL_NAME)] = str(read_fd)
+
+        completed = subprocess.run(
+            [sys.executable, "-c", _STALE_FD_CHILD_SRC],
+            env=env,
+            pass_fds=(read_fd,),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    finally:
+        for fd in (read_fd, write_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    assert completed.returncode == 0, completed.stderr
+    assert "CHILD SURVIVED" in completed.stdout

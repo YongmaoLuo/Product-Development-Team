@@ -65,6 +65,32 @@ ADD_THROUGH_FIELDS: Tuple[str, ...] = (
     "execution_group",
 )
 
+# ---------------------------------------------------------------------------
+# 仓库强制的请求头（提示词要教给增量 LLM 的那一条）
+# ---------------------------------------------------------------------------
+#
+# 2026-10-24：本仓库对 ``/api/*`` 强制要求一个自定义请求头
+# （``backend/request_guard.py``）。不带它的 ``/api/*`` 请求一律 403，响应体
+# 是错误信封而不是业务数据 —— 于是「漏了这个头」写出来的 ``api_test``，
+# 它的断言**永远无法满足**。
+#
+# 提示词不教这件事，增量 LLM 就会再造一条同样漏头的验证点（本轮 VP-004 就是
+# 这么来的）。所以这里从 ``request_guard`` 直接取名字与取值，而不是把字面量
+# 抄进提示词 —— 抄一份就会漂。
+try:  # pragma: no cover - 兜底分支只在 request_guard 不可导入时走到
+    from request_guard import (
+        GUARDED_PREFIX as _GUARDED_PREFIX,
+        REQUEST_HEADER as _REQUEST_HEADER,
+        REQUEST_HEADER_VALUE as _REQUEST_HEADER_VALUE,
+    )
+except Exception:  # noqa: BLE001 - 文案不该因为一次导入失败就整个模块不可用
+    _GUARDED_PREFIX = "/api/"
+    _REQUEST_HEADER = "X-PDT-Request"
+    _REQUEST_HEADER_VALUE = "1"
+
+#: 提示词里说「带上这个头」时用的写法：``X-PDT-Request: 1``。
+GUARD_HEADER_SPEC = f"{_REQUEST_HEADER}: {_REQUEST_HEADER_VALUE}"
+
 
 # ---------------------------------------------------------------------------
 # 输入采集
@@ -166,7 +192,7 @@ class PlanDelta:
 # 提示词
 # ---------------------------------------------------------------------------
 
-DELTA_SYSTEM_PROMPT = """你是资深测试架构师，负责维护一份**已经存在**的验证计划（VP 清单）。
+DELTA_SYSTEM_PROMPT = f"""你是资深测试架构师，负责维护一份**已经存在**的验证计划（VP 清单）。
 
 本轮你的唯一职责是判断：这份计划需不需要**新增**或**废弃**验证点。
 **只允许这两个动作。**
@@ -198,27 +224,65 @@ DELTA_SYSTEM_PROMPT = """你是资深测试架构师，负责维护一份**已�
    Phase 2。**「Nightly CI 全过」这类整仓门禁属于 Phase 2**，不要写成
    Phase 1 —— 写在 Phase 1 会让它在每条子功能都没验完时就开跑，把整轮堵死。
    新增的验证点默认落 Phase 1，只有这类全量关卡才写
-   `"verification_phase": 2`。
+   `"verification_phase": 2。
+
+7. **`api_test` 必须自带判据载荷**。只给标题和预期结果的 `api_test` 等于
+   没给：`request` / `assertions` 缺失时它跑不出任何结论，会被框架整条丢弃。
+   每条新增的 `api_test` 必须写全：
+   - `request`：`{{"method": "GET", "url": "{{{{svc.<name>.url}}}}/<path>",
+     "headers": {{...}}, "body": null, "timeout_seconds": 30}}`。服务地址用
+     占位符 `{{{{svc.<name>.url}}}}`，不要写死端口。
+   - `assertions`：非空数组。每条断言**恰好一个**主体，主体只能是
+     `status` / `header` / `json_path` / `body_contains` /
+     `body_not_contains`；`header` 与 `json_path` 还必须再给一个比较符
+     （`equals` / `contains` / `not_contains` / `exists` / `length_gte` / …），
+     而 `status` / `body_contains` / `body_not_contains` 自带期望值，不要再
+     加比较符。
+
+8. **打 `{_GUARDED_PREFIX}` 的请求必须带上仓库强制的守卫头**：
+   `{GUARD_HEADER_SPEC}`（见 `backend/request_guard.py`）。不带这个头的
+   `{_GUARDED_PREFIX}` 请求一律 403，响应体是错误信封而不是业务数据 ——
+   那样写出来的断言永远不可能满足。
+   反过来，「缺该头 → 403」本身可以是**另一条**验证点的判据；两条互不影响，
+   不要因为要给新验证点补这个头就去改那条守卫验证点。
+
+9. **已有验证点的请求规格写错了怎么办**：**作废它 + 新增一条正确的**，
+   不要改它（硬规则 1）。最常见的场景就是硬规则 8：已有 `api_test` 漏了那个
+   请求头，它的断言因此永远无法满足。这时在 `obsolete` 里写明原因把它标记
+   掉，同时在 `add` 里给出表达正确的那一条（`request` 与 `assertions` 写全）。
+   作废是标记不是删除，审计痕迹要留着。
 
 输出必须是**纯 JSON**（不要 markdown 代码块）：
 
-{
+{{
   "add": [
-    {
+    {{
       "title": "验证点标题",
       "related_prd_criteria": "对应的验收标准 / 任务 id / 新行为说明",
       "verification_method": "api_test|code_review|ui_validation|e2e|full_ci",
       "verification_phase": 1,
+      "priority": "medium",
       "expected_result": "预期结果",
-      "reason": "为什么现在需要新增它（依据）"
-    }
+      "reason": "为什么现在需要新增它（依据）",
+      "request": {{                      // api_test 必填
+        "method": "GET",
+        "url": "{{{{svc.api.url}}}}/api/items",
+        "headers": {{"Accept": "application/json", "{_REQUEST_HEADER}": "{_REQUEST_HEADER_VALUE}"}},
+        "body": null,
+        "timeout_seconds": 30
+      }},
+      "assertions": [                    // api_test 必填
+        {{"name": "状态码", "status": 200}},
+        {{"name": "响应类型是 JSON", "header": "content-type", "contains": "json"}}
+      ]
+    }}
   ],
   "obsolete": [
-    {"id": "VP-0NN", "reason": "为什么不再需要它"}
+    {{"id": "VP-0NN", "reason": "为什么不再需要它"}}
   ]
-}
+}}
 
-没有需要增减的，就输出 {"add": [], "obsolete": []} —— 这是最常见的答案。
+没有需要增减的，就输出 {{"add": [], "obsolete": []}} —— 这是最常见的答案。
 """
 
 
@@ -241,14 +305,30 @@ def build_delta_prompt(
             f"｜{str(vp.get('title', ''))[:80]}"
             f"｜依据：{str(vp.get('related_prd_criteria', ''))[:120]}"
         )
+        # 请求规格也要进提示词。增量 LLM 只有看得见那条请求长什么样，才发现
+        # 得了「它的请求规格漏了仓库强制的请求头」——而漏头会让断言永远无法
+        # 满足。没有这一段，漏头这件事**不可见**，也就无从作废它。
+        request = vp.get("request")
+        if isinstance(request, dict):
+            headers = request.get("headers") or {}
+            header_text = "、".join(
+                f"{name}: {value}" for name, value in headers.items()
+            ) or "（无）"
+            lines.append(
+                f"  └ 请求：{request.get('method', '')} "
+                f"{request.get('url', '')}｜请求头：{header_text}"
+            )
     lines.append("")
 
     lines.append("## 本轮新增的任务（执行阶段新加的工作，可能缺少覆盖）")
     if new_tasks:
         for task in new_tasks:
+            # 2026-10-24：描述**不再截断**。描述是「新增必须有依据」的依据
+            # 来源：截断到 200 字，增量 LLM 只能猜一个请求规格出来，而不是照
+            # 着任务真正要求的接口写 —— 于是新增的 api_test 拿不到判据载荷。
             lines.append(
                 f"- {task.get('id')}｜{str(task.get('title', ''))[:80]}"
-                f"｜{str(task.get('description', ''))[:200]}"
+                f"｜{str(task.get('description', ''))}"
             )
     else:
         lines.append("（无）")
@@ -265,6 +345,12 @@ def build_delta_prompt(
     lines.append(
         "请判断是否需要新增或废弃验证点。记住：修改已有验证点是被禁止的；"
         "新增必须给出依据；没有需要增减时返回空的 add / obsolete。"
+    )
+    lines.append(
+        "如果某条已有验证点的**请求规格写错了**（最常见的是打 "
+        f"{_GUARDED_PREFIX} 却漏了 {GUARD_HEADER_SPEC} 这个必需请求头，"
+        "断言因此永远无法满足），**不要改它**：在 obsolete 里写明原因把它作废掉，"
+        "同时在 add 里新增一条表达正确的（request 与 assertions 都要写全）。"
     )
     return "\n".join(lines)
 
