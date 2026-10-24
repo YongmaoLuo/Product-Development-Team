@@ -43,10 +43,15 @@ Contract pinned here:
      ``verification_repairing → verification_rerunning``).
   4. ``begin_verification(round_n=N)`` preserves ``round = N``;
      ``begin_verification()`` (no arg) defaults to ``round = 0``.
-  5. ``_persist_verification_terminal`` mid-loop stop_reasons
-     (``"no_repair_tasks"``, etc.) do NOT CAS routing.stage to
-     ``failed``; chain-ending stop_reasons
-     (``"same_failure_repeated"``, etc.) DO.
+  5. ``_persist_verification_terminal`` does NOT CAS routing.stage to
+     ``failed`` for a mid-loop write — one the caller marks with the
+     explicit ``chain_ending=False`` — and DOES for a chain-ending one.
+     2026-10-23: "mid-loop" is no longer inferred from the stop reason's
+     absence from a whitelist.  A reason set cannot enumerate the repair
+     path's segmented reasons, so the reason that got forgotten stranded
+     the plan; what ends the chain is the verdict (the status), and the
+     reason only describes it.  See
+     ``backend/tests/unit/test_chain_ending_by_status.py``.
 """
 
 from __future__ import annotations
@@ -536,16 +541,34 @@ def _read_routing_stage(state_db_path, plan_id):
 def test_persist_verification_terminal_mid_loop_skips_cas(
     patched_server_state, tmp_path,
 ):
-    """``_persist_verification_terminal`` with a mid-loop stop_reason
+    """``_persist_verification_terminal`` with an explicit mid-loop flag
     MUST NOT CAS routing.stage to ``failed``.
-
-    Mid-loop = stop_reason NOT in the chain-ending whitelist
-    (``same_failure_repeated``, ``max_rounds_reached``, etc.) AND
-    ``status != "passed"``.
 
     Without this guard the executor subprocess running RP-* tasks
     finds ``routing.stage = "failed"`` and can't restart
     the verification loop, breaking the closed-loop state machine.
+
+    2026-10-23 (contract change, commit 7e52d4b "R3：_chain_ending 改按
+    status 判定"): "mid-loop" is no longer INFERRED from the stop reason
+    being absent from a whitelist.  The whitelist could
+    not enumerate the repair path's segmented reasons, so the reason that
+    got forgotten stranded the plan; what ends the chain is the verdict
+    (the status), and the reason only DESCRIBES it.  ``_chain_ending``
+    now reads the status (``_TERMINAL_VERIFICATION_STATUSES``), and a
+    caller that is mid-loop says so out loud with ``chain_ending=False``.
+
+    That is the PRD's R3 rule ("decide by ``status``; do not add words
+    to the reason set") applied to this call site, so the legacy case
+    is migrated to the explicit flag instead of being kept alive by a
+    reason string.
+
+    This test therefore passes the flag explicitly.  It is the same
+    contract the production code already uses: ``_dead_end_terminal``
+    (``backend/verification_loop.py``) records the verdict with
+    ``chain_ending=False`` precisely because the executor subprocess may
+    still be in flight at that point.  The status-based rule and the
+    explicit flag are pinned together in
+    ``backend/tests/unit/test_chain_ending_by_status.py``.
     """
     import server
 
@@ -579,9 +602,11 @@ def test_persist_verification_terminal_mid_loop_skips_cas(
         current_stage="verification_repairing",
     )
 
-    # Mid-loop stop_reason (not in whitelist).
+    # Mid-loop write: the verdict is recorded, the chain is NOT ended.
+    # 2026-10-23: said out loud with the explicit flag rather than
+    # inferred from a reason's absence from a whitelist.
     server._persist_verification_terminal(
-        plan_id, "failed", "no_repair_tasks",
+        plan_id, "failed", "no_repair_tasks", chain_ending=False,
     )
 
     # routing.stage MUST NOT have flipped to failed.

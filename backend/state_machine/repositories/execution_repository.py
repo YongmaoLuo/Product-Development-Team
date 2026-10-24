@@ -88,6 +88,15 @@ _PASSTHROUGH_COLUMNS: frozenset[str] = frozenset(
     _WRITEABLE_COLUMNS - _JSON_COLUMNS
 )
 
+#: The execution statuses that mean "there is no executor process
+#: any more".  Reaching one of these ends the run, so ``exec_pid``
+#: must go back to NULL — a pid left behind belongs to a process that
+#: is already gone, and every "is this execution alive?" reader
+#: believes a pid means alive (accident B, 2026-10-23).
+_TERMINAL_EXEC_STATUSES: frozenset[str] = frozenset(
+    {"completed", "failed", "stopped"}
+)
+
 
 def _now_iso() -> str:
     """Return the current UTC time as an ISO-8601 string with ``Z`` suffix.
@@ -414,6 +423,27 @@ class ExecutionRepository:
                     f"unknown field {key!r}; must be one of "
                     f"{sorted(_WRITEABLE_COLUMNS)}"
                 )
+        # A terminal status means there is no executor process any more,
+        # so ``exec_pid`` goes back to NULL — here, in the single write
+        # point every column change goes through.
+        #
+        # The rule lives HERE and not only in :meth:`update_status`
+        # because several callers persist a terminal ``exec_status``
+        # through ``update_fields`` directly: the stop path, the
+        # ``project_dir`` rejection, and the start route's spawn-failure
+        # branch.  Each of those had to remember to clear the pid on its
+        # own, and one of them (the spawn failure) did not — leaving a
+        # dead pid on a row that said ``failed`` while the API answered
+        # ``pid: null`` (accident B, 2026-10-23).  Normalising here
+        # makes it impossible for a future caller to re-open the hole:
+        # a terminal status lands with the pid cleared, whether the
+        # caller passed a pid or not.
+        #
+        # A non-terminal status (``running`` / ``not_started``) is left
+        # alone: the pid is the whole point of a live execution, and the
+        # "running" write path must keep it.
+        if fields.get("exec_status") in _TERMINAL_EXEC_STATUSES:
+            fields["exec_pid"] = None
         encoded = self._encode_fields(fields)
         if not encoded:
             raise ValueError(
@@ -480,6 +510,13 @@ class ExecutionRepository:
         value changed or not, and the helper does not raise on
         that).
 
+        A **terminal** status (``completed`` / ``failed`` /
+        ``stopped``) also clears ``exec_pid``: the executor process is
+        gone by then, and a pid left behind belongs to a dead process
+        (accident B, 2026-10-23 — the row kept pid 58353 after the plan
+        was terminated, and every "is this execution alive?" reader
+        believed it).  A non-terminal status leaves the pid alone.
+
         2026-09-19: this used to call
         ``update_phase(plan_id, current_phase="executing", ...)``, which
         made every status write stamp ``current_phase='executing'`` on
@@ -503,7 +540,12 @@ class ExecutionRepository:
                 f"unknown execution status {status!r}; must be one of "
                 f"{sorted(recognised)}"
             )
-        self.update_fields(plan_id, exec_status=status)
+        if status in _TERMINAL_EXEC_STATUSES:
+            # The run is over — there is no executor process left, so
+            # the pid column goes back to NULL (accident B, 2026-10-23).
+            self.update_fields(plan_id, exec_status=status, exec_pid=None)
+        else:
+            self.update_fields(plan_id, exec_status=status)
 
     def update_task_progress(
         self, plan_id: str, progress: dict[str, Any]

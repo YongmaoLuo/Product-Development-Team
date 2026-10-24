@@ -32,6 +32,12 @@ Contract pinned here
 * A terminal write with a watchdog reason moves ``plan_routing.current_phase``
   out of ``verification_running``.
 * A genuine mid-loop terminal write still leaves the phase alone.
+  2026-10-23: a mid-loop write says so with the explicit
+  ``chain_ending=False`` flag, rather than being inferred from the stop
+  reason's absence from a whitelist — the reason set could not enumerate
+  the repair path's segmented reasons, so the reason that got forgotten
+  stranded the plan.  What ends the chain is now the verdict (the
+  status).  See ``backend/tests/unit/test_chain_ending_by_status.py``.
 * The staleness check counts ``logs/vp_attempts/*.log`` as progress.
 """
 
@@ -321,12 +327,37 @@ def test_mid_loop_terminal_write_leaves_routing_stage_alone(hermetic_server):
     """Guard the original intent: an interim ``_record_terminal`` call made
     while the executor subprocess is still mid-flight must NOT CAS the
     routing row (the executor owns ``current_phase`` until the chain
-    really ends)."""
+    really ends).
+
+    2026-10-23 (contract change, commit 7e52d4b "R3：_chain_ending 改按
+    status 判定"): "mid-loop" is no longer INFERRED from
+    the stop reason being absent from ``VERIFICATION_TERMINAL_STOP_REASONS``.
+    A reason set cannot enumerate the repair path's segmented reasons, so
+    the one that got forgotten stranded the plan — what ends the chain is
+    the verdict (the status), and the reason only DESCRIBES it.  The
+    mid-loop protection is now the explicit ``chain_ending=False`` flag,
+    which is what the production call sites already pass: the repair
+    path's ``_dead_end_terminal`` in ``backend/verification_loop.py``
+    records the verdict with ``chain_ending=False`` precisely because the
+    executor subprocess may still be in flight.
+
+    That is the PRD's R3 rule ("decide by ``status``; do not add words
+    to the reason set") applied to this call site, so the legacy case
+    is migrated to the explicit flag instead of being kept alive by a
+    reason string.  The same contract seen from the routing-row side is
+    pinned by ``test_state_machine_closed_loop.py``
+    ``::test_persist_verification_terminal_mid_loop_skips_cas``.
+
+    The status-based rule and the explicit flag are pinned together in
+    ``backend/tests/unit/test_chain_ending_by_status.py``.
+    """
     server, plans_root, db_path = hermetic_server
     plan_id = "mid-loop-terminal"
     _seed_running_verification(db_path, plan_id, plans_root)
 
-    server._persist_verification_terminal(plan_id, "failed", "no_repair_tasks")
+    server._persist_verification_terminal(
+        plan_id, "failed", "no_repair_tasks", chain_ending=False
+    )
 
     assert _phase(db_path, plan_id) == "verification_running"
 

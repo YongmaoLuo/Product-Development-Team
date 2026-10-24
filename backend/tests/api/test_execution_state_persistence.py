@@ -193,6 +193,7 @@ class TestExecutionStatePersistedToDisk:
         plan_id = "vp005-persist-file-written"
         _setup_plan(plan_id)
         project_dir = tmp_path / "target-vp005-file"
+        project_dir.mkdir(parents=True, exist_ok=True)
         resp = client.post(
             f"/api/execution/{plan_id}/start",
             json={"project_dir": str(project_dir)},
@@ -212,6 +213,7 @@ class TestExecutionStatePersistedToDisk:
         plan_id = "vp005-persist-pid-int"
         _setup_plan(plan_id)
         project_dir = tmp_path / "target-vp005-pid-int"
+        project_dir.mkdir(parents=True, exist_ok=True)
         resp = client.post(
             f"/api/execution/{plan_id}/start",
             json={"project_dir": str(project_dir)},
@@ -241,6 +243,7 @@ class TestExecutionStatePersistedToDisk:
         plan_id = "vp005-persist-pid-not-none"
         _setup_plan(plan_id)
         project_dir = tmp_path / "target-vp005-pid-not-none"
+        project_dir.mkdir(parents=True, exist_ok=True)
         resp = client.post(
             f"/api/execution/{plan_id}/start",
             json={"project_dir": str(project_dir)},
@@ -262,6 +265,7 @@ class TestExecutionStatePersistedToDisk:
         plan_id = "vp005-persist-pid-matches"
         _setup_plan(plan_id)
         project_dir = tmp_path / "target-vp005-pid-match"
+        project_dir.mkdir(parents=True, exist_ok=True)
         resp = client.post(
             f"/api/execution/{plan_id}/start",
             json={"project_dir": str(project_dir)},
@@ -283,6 +287,7 @@ class TestExecutionStatePersistedToDisk:
         plan_id = "vp005-persist-status-running"
         _setup_plan(plan_id)
         project_dir = tmp_path / "target-vp005-status"
+        project_dir.mkdir(parents=True, exist_ok=True)
         resp = client.post(
             f"/api/execution/{plan_id}/start",
             json={"project_dir": str(project_dir)},
@@ -304,6 +309,7 @@ class TestExecutionStatePersistedToDisk:
         plan_id = "vp005-persist-started-at-iso"
         _setup_plan(plan_id)
         project_dir = tmp_path / "target-vp005-started-at"
+        project_dir.mkdir(parents=True, exist_ok=True)
         resp = client.post(
             f"/api/execution/{plan_id}/start",
             json={"project_dir": str(project_dir)},

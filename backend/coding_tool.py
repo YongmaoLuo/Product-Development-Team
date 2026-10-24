@@ -1388,6 +1388,35 @@ def is_capacity_error(exc: BaseException) -> bool:
     return looks_like_quota_exhaustion(str(exc))
 
 
+#: The local system errors that mean "this machine cannot run the call
+#: at all": the working directory the dispatch was going to run in is
+#: gone, is not a directory, or cannot be entered. They are answers
+#: about the LOCAL environment, not about the provider.
+_DETERMINISTIC_LOCAL_ERRORS = (
+    FileNotFoundError,
+    NotADirectoryError,
+    PermissionError,
+)
+
+
+def is_deterministic_local_error(exc: BaseException) -> bool:
+    """True when ``exc`` says the LOCAL environment cannot run the call.
+
+    The three system errors named here are answers about the machine:
+    the working directory does not exist, is not a directory, or cannot
+    be entered. Nothing about a retry changes any of those, so a caller
+    that sees this must raise rather than re-dispatch — a second
+    attempt into the same missing directory costs a whole dispatch plus
+    a second copy of the prompt, and buries the real cause under a
+    "retrying" log line.
+
+    Every other error stays somebody else's to handle: a provider
+    refusal, a timeout and a programming mistake all mean something
+    different, and none of them is settled by the filesystem's answer.
+    """
+    return isinstance(exc, _DETERMINISTIC_LOCAL_ERRORS)
+
+
 def _quota_reset_seconds_for(provider: str, fallback: float) -> float:
     """Seconds until the window that emptied ``provider`` comes back.
 
@@ -5074,6 +5103,41 @@ class ClaudeCodingTool(CodingTool):
             # on another provider is exactly what a stop request forbids.
             raise
         except Exception as exc:
+            if is_deterministic_local_error(exc):
+                # 2026-10-23 — the LOCAL environment answered, not the
+                # provider: the working directory is gone, is not a
+                # directory, or cannot be entered. The fallback below is
+                # a RETRY of the same prompt, and it would run in the
+                # same broken directory and fail the same way — so the
+                # dispatch is doubled and the real cause is buried under
+                # a "retrying in a fresh session" log line. Raise it and
+                # let the caller decide what to do about the machine.
+                _log = getattr(self, "logger", None)
+                if _log:
+                    _log.warning(
+                        "coding_deterministic_local_error",
+                        f"deterministic local error while resuming session "
+                        f"{prev_session_id} ({type(exc).__name__}); not "
+                        f"retrying in a fresh session",
+                        data={
+                            "session_id": prev_session_id,
+                            "resume": True,
+                            "error": type(exc).__name__,
+                            "error_detail": str(exc)[:500],
+                            "provider": getattr(
+                                self, "current_call_provider", None
+                            ),
+                            "excluded_providers": list(excluded_providers or []),
+                            "scene": scene,
+                            "fallback": "none",
+                        },
+                    )
+                logger.warning(
+                    "[DETERMINISTIC LOCAL ERROR] session=%s error=%s: %s — "
+                    "not retrying in a fresh session",
+                    prev_session_id, type(exc).__name__, str(exc)[:200],
+                )
+                raise
             if not fallback_on_capacity_error and is_capacity_error(exc):
                 # The provider is the one saying no, and the caller is
                 # counting the refusals. A fresh-session fallback would

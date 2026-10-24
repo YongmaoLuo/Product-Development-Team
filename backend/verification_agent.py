@@ -30,6 +30,7 @@ from coding_tool import (
     ApiError,
     HardTimeoutError,
     ProviderSlotWaitExpired,
+    is_deterministic_local_error,
 )
 from config_paths import resolve_plans_dir
 import provider_capacity
@@ -4441,6 +4442,29 @@ class Orchestrator:
                     raise
             except Exception as e:
                 print(f"[Verification] Error generating report (attempt {attempt + 1}/{retry_llm}): {e}")
+                # 2026-10-23 (incident A, second retry chain): a
+                # DETERMINISTIC local error — the dispatch's working
+                # directory is gone, is not a directory, or cannot be
+                # entered — cannot be healed by another attempt. The
+                # generic handler used to spend the whole retry budget
+                # on it (three dispatches, no backoff) and then produce
+                # the same fallback report, so the only thing the extra
+                # attempts bought was cost and a "retrying" log line
+                # that buried the real cause. Short-circuit to the
+                # fallback report instead.
+                #
+                # Only THIS class of failure is short-circuited.
+                # ``ApiError`` keeps its own branch above (provider-side,
+                # with its own retry semantics), and everything else
+                # — timeouts, provider outages, programming mistakes —
+                # still runs the full ``retry_llm`` budget below.
+                if is_deterministic_local_error(e):
+                    print(
+                        "[Verification] Deterministic local error "
+                        "(not retrying): "
+                        f"{e}"
+                    )
+                    return self._persist_fallback_report(execution_results)
                 if attempt == retry_llm - 1:
                     # Generate minimal report on total failure
                     return self._persist_fallback_report(execution_results)
