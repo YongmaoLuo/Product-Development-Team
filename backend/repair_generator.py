@@ -411,6 +411,102 @@ def _failure_record(failed_vp: Dict[str, Any]) -> Dict[str, Any]:
     return record
 
 
+def resolve_repair_project_dir(
+    plan_dir: Path, fallback: Optional[Path] = None,
+) -> Optional[str]:
+    """The directory this plan's repairs happen in.
+
+    The execution chain reads exactly one place for "where does this
+    plan's work happen": the ``project_dir`` column of
+    ``plan_execution``.  A verification run registers its worktree
+    there (``verification_workspace.register_project_dir``), so the
+    repair round that follows reads the worktree's path out of the same
+    row the executor and the verification loop read — which is what
+    makes a fix land in the tree the verification branch owns rather
+    than in the pull request head or in the main checkout.
+
+    The row wins over ``fallback``.  The row is the field the whole
+    chain reads, so a caller that hands the generator a *different*
+    directory has not changed where the plan's work happens — it has
+    only changed what it believes about it.  ``fallback`` is what a plan
+    with no execution row yet gets, and it is what the generator's own
+    ``project_dir`` argument is.
+
+    Best-effort by design: a missing row, an unreadable database or a
+    locked one must not stop a repair round.  The fallback covers those
+    cases, and an absent answer leaves the repair tasks without a
+    directory — the same state they were in before this field existed.
+    """
+    plan_id = Path(plan_dir).name
+    if plan_id:
+        try:
+            from config_paths import resolve_state_db_path
+            from state_machine.db.connection import open as open_db
+            from state_machine.repositories.execution_repository import (
+                ExecutionRepository,
+            )
+
+            conn = open_db(resolve_state_db_path())
+            try:
+                row = ExecutionRepository(conn).summary(plan_id)
+            finally:
+                conn.close()
+            registered = str((row or {}).get("project_dir") or "").strip()
+            if registered:
+                return registered
+        except Exception:  # noqa: BLE001 — the fallback covers this
+            pass
+    if fallback is not None:
+        text = str(fallback).strip()
+        if text:
+            return text
+    return None
+
+
+def one_row_per_defect(
+    contents: List[Dict[str, Any]], round_number: int = 0,
+) -> List[Dict[str, Any]]:
+    """Keep the first row for each confirmed defect, drop the rest.
+
+    One defect, one task, one commit, one regression test — that is the
+    rule the repair round is built on (test decision 7/8).  The model is
+    asked for one row per failed verification point and usually answers
+    that way, but it does answer with a second row for a defect it
+    already covered often enough to matter: two tasks for one defect are
+    two commits for one fix, and the round's own bookkeeping then counts
+    one fix as two.
+
+    The drop happens *here*, where the model's answer is read, rather
+    than in the assembler: the assembler is handed the content and turns
+    it into tasks, and a caller may legitimately hand it several rows
+    for one defect on purpose.  Refusing it there would refuse the
+    caller's rows, not the model's.
+
+    The first row for a defect wins: it is the answer the model gave
+    before it started repeating itself.
+    """
+    kept: List[Dict[str, Any]] = []
+    seen: set = set()
+    for content in contents or []:
+        if not isinstance(content, dict):
+            continue
+        failed_vp_id = str(content.get("failed_vp_id", "") or "")
+        if failed_vp_id and failed_vp_id in seen:
+            print(
+                f"[Repair] repair_task_dropped_duplicate_defect "
+                f"round={round_number} failed_vp_id={failed_vp_id} "
+                f"title={str(content.get('title', '') or '')!r} "
+                f"reason=the defect already has a repair task in this "
+                f"batch — one defect gets one task, one commit and one "
+                f"regression test"
+            )
+            continue
+        if failed_vp_id:
+            seen.add(failed_vp_id)
+        kept.append(content)
+    return kept
+
+
 class RepairTaskGenerator:
     """Generates requirement-driven repair tasks from verification failures."""
 
@@ -1299,6 +1395,12 @@ class RepairTaskAssembler:
             ``1`` (a plan's first repair batch). Callers that may be
             emitting a *second* batch for the same round must pass
             :func:`next_repair_seq_base`'s result so ids never repeat.
+        project_dir: Where the repairs of this batch run. Defaults to
+            ``None``, which means "ask the plan's execution row" — the
+            field the execution chain reads, and where a verification
+            run registers its worktree.  It is the *fallback* for a plan
+            with no row, never an override of one.  See
+            :func:`resolve_repair_project_dir`.
 
     Note:
         Task IDs use the ``repair-r{N}-{seq}`` prefix (not the legacy
@@ -1344,6 +1446,16 @@ class RepairTaskAssembler:
         "llm", "llm_retry", "vp", "api_replay", "audit_style", "missing",
     )
 
+    #: Where the repairs of this batch run, when the caller named one.
+    #: Empty means "ask the plan's execution row" — see
+    #: :func:`resolve_repair_project_dir`.  A fallback, never an
+    #: override: the row is the authority.
+    #:
+    #: A class-level default because an assembler may be built without
+    #: running ``__init__`` (the stub helpers in the test suite do), and
+    #: the attribute has to be readable either way.
+    project_dir: str = ""
+
     def __init__(
         self,
         round_number: int,
@@ -1351,6 +1463,7 @@ class RepairTaskAssembler:
         vp_test_commands: Optional[Dict[str, str]] = None,
         plan_path: Optional[str] = None,
         seq_base: int = 1,
+        project_dir: Optional[str] = None,
     ):
         if round_number < 1:
             raise ValueError(f"round_number must be >= 1, got {round_number}")
@@ -1383,7 +1496,7 @@ class RepairTaskAssembler:
         # inference.
         #
         #   ``dropped_empty_files_to_modify`` → ``repair_task_dropped_empty_files_to_modify``
-        #   ``unverifiable_no_test_command``   → ``repair_task_unverifiable_no_test_command``
+        #   ``unverifiable_no_test_command``  → ``repair_task_unverifiable_no_test_command``
         #
         # The second is a *count of degraded tasks*, not of refusals: a
         # row with no command is still emitted. See :meth:`assemble`.
@@ -1404,6 +1517,13 @@ class RepairTaskAssembler:
         # Used only to build the "was the plan entry actually changed?"
         # guard command for repairs whose target is the plan file itself.
         self.plan_path: str = str(plan_path or "")
+        #: Where the repairs of this batch run.  Empty means "ask the
+        #: plan's execution row" — see :func:`resolve_repair_project_dir`.
+        #: A verification run registers its worktree there, so this is
+        #: the tree the fix belongs in; the pull request head and the
+        #: main checkout are not.  A fallback for a plan with no row,
+        #: not an override of one.
+        self.project_dir: str = str(project_dir).strip() if project_dir else ""
         #: Lazy cache for :meth:`_plan_points`. ``_UNSET`` until first read.
         self._plan_points_cache: Any = _UNSET
 
@@ -1478,6 +1598,20 @@ class RepairTaskAssembler:
             ``dropped_empty_files_to_modify``). A row with no
             ``test_command`` is *not* on that path — it is emitted and
             counted in ``unverifiable_no_test_command``.
+
+        Two further rules apply to what comes out:
+
+        * **One defect, one task.**  The content this assembler is
+          handed already carries at most one row per confirmed defect —
+          :meth:`RepairTaskGenerator.generate_repair_contents` drops a
+          second row for a defect the round already covers.  One defect
+          gets one task, one commit and one regression test; a second
+          task for it is a second commit for one fix.
+        * **Every task names the directory it runs in.**  The
+          ``project_dir`` is the plan's registered workspace — the
+          verification worktree — so a repair lands in the tree the
+          verification branch owns.  See
+          :meth:`_resolve_task_project_dir`.
         """
         if not contents:
             return []
@@ -1609,7 +1743,7 @@ class RepairTaskAssembler:
             # ``test_command_source`` column. Same reason the generator
             # keeps its sources out of the task dict.
             self.test_command_sources[task_id] = test_command_source
-            tasks.append({
+            task = {
                 "id": task_id,
                 "task_group": f"repair-round-{self.round}",
                 "execution_group": exec_group,
@@ -1633,8 +1767,54 @@ class RepairTaskAssembler:
                 "failed_vp_id": failed_vp_id,
                 "round": self.round,
                 "status": "pending",
-            })
+            }
+            # Where the repair runs.  The plan's registered workspace —
+            # the verification worktree — so the fix lands in the tree
+            # the verification branch owns and not in the pull request
+            # head or the main checkout.  Resolved from the content the
+            # generator stamped, from an explicit caller override, or
+            # from the plan's execution row; the first two are the same
+            # value in production, and the row is the field the whole
+            # execution chain reads.
+            workspace = self._resolve_task_project_dir(content)
+            if workspace:
+                task["project_dir"] = workspace
+            tasks.append(task)
         return tasks
+
+    def _resolve_task_project_dir(self, content: Dict[str, Any]) -> str:
+        """The directory this task's repair runs in.
+
+        The plan's execution row is the authority — it is the one field
+        the whole execution chain reads, and where a verification run
+        registers its worktree.  Two things carry it here:
+
+        1. the ``project_dir`` the generator stamped on the content it
+           produced (:meth:`RepairTaskGenerator.generate_repair_contents`
+           resolves the row once per round, so every task of a round
+           agrees);
+        2. the row itself, read now, for content this assembler was
+           handed from somewhere else.
+
+        The caller's own ``project_dir`` is the *fallback* for a plan
+        with neither — the same precedence
+        :func:`resolve_repair_project_dir` uses, so the two layers of
+        the round never disagree about where the repair happens.
+
+        Returns ``""`` when none of them knows — a plan with no
+        execution row and no caller-supplied directory.  The task is then
+        emitted without the field, which is the state every repair task
+        was in before the workspace existed.
+        """
+        stamped = str(content.get("project_dir") or "").strip()
+        if stamped:
+            return stamped
+        plan_dir = Path(self.plan_path).parent if self.plan_path else None
+        if plan_dir is None or not plan_dir.name:
+            return self.project_dir
+        return resolve_repair_project_dir(
+            plan_dir, Path(self.project_dir) if self.project_dir else None,
+        ) or ""
 
     def _plan_points(self) -> Dict[str, Dict[str, Any]]:
         """``{vp_id: verification point}`` from the plan, or ``{}``.
@@ -2608,6 +2788,15 @@ class _RepairContentGeneratorMixin:
         # instead of paying for the whole context again.
         persist_repair_content_session(self.plan_dir, session)
         contents = _parse_repair_contents_response(response, failed_vps)
+        # One defect, one task.  The model is asked for one row per
+        # failed verification point, and it usually answers that way —
+        # but a second row for a defect the round already covers is two
+        # commits for one fix, and the round's bookkeeping then counts
+        # one fix as two.  The drop belongs here, where the model's
+        # answer is read: the assembler is handed the content and
+        # turns it into tasks, and a caller may hand it several rows
+        # for one defect on purpose.
+        contents = one_row_per_defect(contents, round_number)
         if not contents:
             # The model answered, but with nothing we can turn into a
             # task. With >=1 failed VP in hand that is a generation
@@ -2638,6 +2827,20 @@ class _RepairContentGeneratorMixin:
         self._fill_missing_test_commands(
             contents, failed_vps, round_number,
         )
+        # Where the repair happens.  Stamped here, on the content the
+        # assembler is about to turn into tasks, because the assembler
+        # is handed the *content* and nothing else: the directory a
+        # repair runs in is a property of the round, not of the model's
+        # answer, so the generator — which knows the round — puts it
+        # there.  The value is the plan's registered workspace (the
+        # verification worktree), so the fix lands in the tree the
+        # verification branch owns.
+        workspace = resolve_repair_project_dir(
+            self.plan_dir, self.project_dir,
+        )
+        if workspace:
+            for content in contents:
+                content["project_dir"] = workspace
         return contents
 
 

@@ -67,6 +67,43 @@ _XDIST_WORKER = xdist_worker_id()
 
 
 # ---------------------------------------------------------------------------
+# The verification-mode fixtures, and the rule that hands them back.
+# ---------------------------------------------------------------------------
+#
+# The fixtures an end-to-end verification run needs — a reproducible upstream
+# repository, a minimal PRD, a scripted LLM, an isolated workspace and a
+# server on an ephemeral port — live in their own module
+# (``backend/tests/fixtures/verification_mode.py``) rather than here: they
+# are a coherent set with a contract between them, and a contract spread
+# over two files is a contract half of which nobody reads.
+#
+# They are imported here because this file is where the suite's teardown
+# lives, and the teardown has to reach the *same* registry the fixtures
+# write to.  A worktree or a server that outlives its test is the same
+# defect as a monitor thread that outlives its test, and the teardown
+# already says so about threads: "a test hands back every resource it
+# starts".
+#
+# The import sits below ``install_hermetic_env()`` on purpose: the backend
+# modules it pulls in read the environment, and the environment has to be
+# the hermetic one before they are read the first time.
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
+from tests.fixtures.verification_mode import (  # noqa: E402
+    clear_verification_registries,
+    detect_leftover_resources,
+    minimal_prd,
+    reclaim_verification_resources,
+    running_server,
+    scripted_llm,
+    upstream_repo,
+    verification_plan,
+    workspace_root,
+)
+
+
+# ---------------------------------------------------------------------------
 # Tripwire: no test may aim a broadcast at the machine it runs on.
 # ---------------------------------------------------------------------------
 #
@@ -1151,12 +1188,22 @@ def clean_execution_state(monkeypatch):
     # test's registrations into the next one.
     _OPEN_FDS.clear()
     _CHILD_PROCESSES.clear()
+    # The same rule for the verification-mode resources: the worktrees and
+    # the servers a test registered belong to that test, and a session
+    # interrupted mid-teardown must not carry them into the next one.
+    clear_verification_registries()
 
     if not hasattr(server, "_execution_state"):
         try:
             yield
         finally:
             _reclaim_registered_resources()
+            verification_problems = _reclaim_verification_resources()
+            assert not verification_problems, (
+                f"{len(verification_problems)} verification resource(s) outlived "
+                f"their test:\n  "
+                + "\n  ".join(verification_problems)
+            )
         return
 
     #: ``(thread, process)`` for every application worker started during
@@ -1228,6 +1275,13 @@ def clean_execution_state(monkeypatch):
     # the one that inherits it.
     _reclaim_registered_resources()
 
+    # The same rule for the verification-mode resources: a worktree that
+    # outlives its test keeps a checkout registered in the upstream
+    # repository, and a server that outlives its test answers the next
+    # run's health probe. Both are reclaimed here, before any assertion
+    # below can end this fixture.
+    verification_problems = _reclaim_verification_resources()
+
     stuck = [thread for thread, _ in workers if thread.is_alive()]
 
     if hasattr(server, "_execution_state"):
@@ -1244,6 +1298,14 @@ def clean_execution_state(monkeypatch):
         f"``terminate``) hook so this fixture can unblock it — see "
         f"tests/api/test_execution_state_persistence.py for a fake that "
         f"parks its worker on purpose and is still reclaimable."
+    )
+    assert not verification_problems, (
+        f"{len(verification_problems)} verification resource(s) outlived their "
+        f"test:\n  "
+        + "\n  ".join(verification_problems)
+        + "\nEvery test hands back what it starts: a verification worktree or "
+        "a server that outlives its test keeps writing into a later run's "
+        "tree, and a leftover directory is litter nobody remembers to clean."
     )
 
 
@@ -1417,6 +1479,20 @@ def _reclaim_registered_resources() -> None:
     for proc in children:
         _join_child(proc)
         _RECLAIMED_CHILDREN.append(proc)
+
+
+def _reclaim_verification_resources() -> list:
+    """Reclaim the worktrees and the servers a verification-mode test started.
+
+    Returns the problems rather than raising: the reclamation has to run
+    to the end before any verdict is delivered, and a raise from the middle
+    of it would leave the rest of the resources behind.  A leftover is a
+    leftover whether or not the removal failed — the point of the second
+    list is the directory that is still there after the removal.
+    """
+    problems = reclaim_verification_resources()
+    problems.extend(detect_leftover_resources())
+    return problems
 
 
 @pytest.fixture(autouse=True)

@@ -1022,13 +1022,23 @@ def _without_volatile_ids(value: Any) -> Any:
     allowed to disagree about it — and about nothing else. What the
     question *is* is compared instead, by the point it is about and the
     class it was raised for (``_decision_rows``).
+
+    A repair task also carries the directory it really ran in, and
+    that directory is a fresh temporary one per replay: it is
+    environment-derived, not part of what the artifact *is*. So it is
+    masked the same way — what is compared is that the field is there
+    and that every other field agrees.
     """
     if isinstance(value, dict):
         return {
             key: (
                 "<a-question-id>"
                 if key == "decision_id" and isinstance(item, str)
-                else _without_volatile_ids(item)
+                else (
+                    "<project-dir>"
+                    if key == "project_dir" and isinstance(item, str)
+                    else _without_volatile_ids(item)
+                )
             )
             for key, item in value.items()
         }

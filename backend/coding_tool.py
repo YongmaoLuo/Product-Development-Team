@@ -5957,6 +5957,14 @@ class ClaudeCodingTool(CodingTool):
             scene: Optional per-call workflow scene override for provider
                    routing (e.g. ``"refiner"`` → high-tier chain).
         """
+        # 2026-10-24 — the scripted double answers from a fixture file.
+        # Checked FIRST, before any part of the dispatch can spend a real
+        # provider call: in scripted mode the CLI is never spawned.  An
+        # unregistered prompt raises here rather than falling through to
+        # the network.
+        if scripted_mode_enabled():
+            return _scripted_registry().response(prompt)
+
         start_time = time.monotonic()
         prompt_len = len(prompt) if prompt else 0
         self._log_query_context(prompt, system_instruction, phase="query")
@@ -5990,6 +5998,15 @@ class ClaudeCodingTool(CodingTool):
 
         scene: per-call workflow scene override for provider routing.
         """
+        # 2026-10-24 — the scripted double answers from a fixture file.
+        # Checked FIRST, before any part of the dispatch can spend a real
+        # provider call: in scripted mode the CLI is never spawned.  The
+        # fixture is parsed by the same helper the live path uses, so a
+        # malformed one raises the same ``json.JSONDecodeError``.
+        if scripted_mode_enabled():
+            from utils.json_repair import parse_llm_json
+            return parse_llm_json(_scripted_registry().response(prompt))
+
         # 2026-09-13: per-call model_type no longer swaps the model —
         # model management is delegated to CC Switch. The scene kwarg
         # (forwarded below) is the per-call routing lever.
@@ -6825,6 +6842,279 @@ class OpenCodeCodingTool(CodingTool):
                 raise TimeoutError(f"Query timed out after {timeout} seconds")
 
 
+# ---------------------------------------------------------------------------
+# Scripted LLM mode — the strict double at the process boundary
+# ---------------------------------------------------------------------------
+#
+# 2026-10-24 — an end-to-end run wants everything real: real git, the real
+# filesystem, real SQLite, real FastAPI.  The one thing it cannot have is a
+# real LLM, because the model is the only non-deterministic part of the
+# pipeline, and a run that answers differently every time is a run nobody
+# can verify.  So the LLM gets replaced — and only the LLM.
+#
+# The switch is OFF by default, and when it is off not one line of the
+# existing path changes: the mode is read from the environment at the call
+# site, so an unset variable leaves the old code running verbatim.
+#
+# Two rules make the double worth trusting:
+#
+#   1. It never falls back.  A prompt nobody registered raises.  It does
+#      not answer with an empty string (which downstream code would read as
+#      a legitimate empty answer), and it does not quietly spend a real
+#      provider call to fill the hole.
+#   2. It fails at startup.  A script directory that is not there is a
+#      misconfiguration, and a misconfiguration that only shows up as a
+#      wrong answer three phases later is worth nothing.
+#
+# The on-disk contract — what the E2E harness writes:
+#
+#   <script_dir>/registry.json   {"prompts": {"<key>": "<matcher>"}}
+#   <script_dir>/<key>.txt       the canned answer for that key
+#
+# ``<matcher>`` is the text that identifies the prompt: the whole prompt, or
+# any stable fragment of it.  Real prompts carry timestamps, plan ids and
+# file contents, so an exact match is rarely available; the most specific
+# fragment wins, so a narrow matcher beats the catch-all it is contained in.
+
+#: The environment variable that switches the strict double on.
+LLM_MODE_ENV = "PDT_LLM_MODE"
+
+#: The environment variable naming the directory that holds the fixtures.
+LLM_SCRIPT_DIR_ENV = "PDT_LLM_SCRIPT_DIR"
+
+#: The mode value that activates the double.
+LLM_MODE_SCRIPTED = "scripted"
+
+#: The registry file inside the script directory.
+SCRIPT_REGISTRY_FILENAME = "registry.json"
+
+
+class ScriptedLLMError(RuntimeError):
+    """The scripted double could not answer.
+
+    A ``RuntimeError`` so that "the double refused" is one
+    ``except RuntimeError`` away from every caller, and so it can never be
+    mistaken for a successful — if empty — answer.
+    """
+
+
+def llm_mode() -> str:
+    """The active LLM mode, lowercased; empty when the double is off."""
+    return (os.environ.get(LLM_MODE_ENV) or "").strip().lower()
+
+
+def scripted_mode_enabled() -> bool:
+    """True when the strict double is switched on."""
+    return llm_mode() == LLM_MODE_SCRIPTED
+
+
+def _scripted_script_dir(script_dir: Optional[str] = None) -> str:
+    """The directory holding the fixtures.
+
+    The environment variable is the contract.  An explicit argument wins,
+    so one tool can be pointed at another set of fixtures.
+    """
+    value = (script_dir or os.environ.get(LLM_SCRIPT_DIR_ENV) or "").strip()
+    if not value:
+        raise ScriptedLLMError(
+            f"scripted LLM mode is on but {LLM_SCRIPT_DIR_ENV} is not set"
+        )
+    return value
+
+
+class ScriptedLLMRegistry:
+    """The scripted answers registered for one script directory.
+
+    See the module comment above for the on-disk contract.
+    """
+
+    def __init__(self, script_dir: str):
+        self.script_dir = Path(script_dir).expanduser()
+        if not self.script_dir.exists():
+            raise ScriptedLLMError(
+                f"scripted LLM mode: script directory does not exist: {self.script_dir}"
+            )
+        if not self.script_dir.is_dir():
+            raise ScriptedLLMError(
+                f"scripted LLM mode: script path is not a directory: {self.script_dir}"
+            )
+        # Read the registry once here, so a broken fixture set is a
+        # startup failure rather than a surprise mid-run.  Every lookup
+        # reads it again, so a fixture edited between two calls counts.
+        self._load_entries()
+
+    @property
+    def registry_path(self) -> Path:
+        return self.script_dir / SCRIPT_REGISTRY_FILENAME
+
+    def keys(self) -> List[str]:
+        """The registered prompt keys, in registry order."""
+        return [key for key, _, _ in self._load_entries()]
+
+    def _load_entries(self) -> List[Tuple[str, str, str]]:
+        """The ``(key, matcher, response file)`` rows, in registry order."""
+        path = self.registry_path
+        if not path.is_file():
+            raise ScriptedLLMError(
+                f"scripted LLM mode: registry file not found: {path}"
+            )
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ScriptedLLMError(
+                f"scripted LLM mode: cannot read registry {path}: {exc}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise ScriptedLLMError(
+                f"scripted LLM mode: registry {path} must be a JSON object"
+            )
+        # The canonical shape is ``{"prompts": {...}}``; the flat
+        # ``{"<key>": "<matcher>"}`` is accepted as a shorthand.
+        table = raw.get("prompts", raw)
+        if not isinstance(table, dict):
+            raise ScriptedLLMError(
+                f"scripted LLM mode: registry {path} has no 'prompts' object"
+            )
+        entries: List[Tuple[str, str, str]] = []
+        for key, spec in table.items():
+            matcher, filename = self._parse_entry(key, spec)
+            entries.append((str(key), matcher, filename))
+        return entries
+
+    @staticmethod
+    def _parse_entry(key: str, spec) -> Tuple[str, str]:
+        """The matcher and the response file name of one registry entry."""
+        if isinstance(spec, str):
+            matcher, filename = spec, f"{key}.txt"
+        elif isinstance(spec, dict):
+            matcher = spec.get("match", "")
+            filename = spec.get("file") or f"{key}.txt"
+        else:
+            raise ScriptedLLMError(
+                f"scripted LLM mode: prompt '{key}' must map to a matcher "
+                f"string or an object, got {type(spec).__name__}"
+            )
+        if not isinstance(matcher, str) or not matcher.strip():
+            raise ScriptedLLMError(
+                f"scripted LLM mode: prompt '{key}' has no matcher to identify it by"
+            )
+        if not isinstance(filename, str) or not filename.strip():
+            raise ScriptedLLMError(
+                f"scripted LLM mode: prompt '{key}' has no response file name"
+            )
+        return matcher, filename
+
+    def resolve(self, prompt: str) -> Tuple[str, str]:
+        """The ``(key, response file)`` registered for ``prompt``.
+
+        Raises ``ScriptedLLMError`` when no entry matches — that is the
+        "no fallback" rule, and it is the whole point of the double.
+        """
+        text = prompt or ""
+        entries = self._load_entries()
+        # An exact match wins outright.
+        for key, matcher, filename in entries:
+            if text == matcher:
+                return key, filename
+        # Otherwise the most specific fragment wins: a narrow matcher
+        # beats the catch-all it is contained in.
+        best = None
+        for key, matcher, filename in entries:
+            if matcher in text:
+                if best is None or len(matcher) > len(best[1]):
+                    best = (key, matcher, filename)
+        if best is not None:
+            return best[0], best[2]
+        registered = ", ".join(key for key, _, _ in entries) or "none"
+        raise ScriptedLLMError(
+            f"scripted LLM mode: no scripted response is registered for this "
+            f"prompt: {text[:200]!r} (registered keys: {registered})"
+        )
+
+    def response(self, prompt: str) -> str:
+        """The scripted answer for ``prompt``, verbatim."""
+        key, filename = self.resolve(prompt)
+        path = self.script_dir / filename
+        if not path.is_file():
+            raise ScriptedLLMError(
+                f"scripted LLM mode: no response file for prompt '{key}': {path}"
+            )
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ScriptedLLMError(
+                f"scripted LLM mode: cannot read response file {path}: {exc}"
+            ) from exc
+
+
+class ScriptedCodingTool(CodingTool):
+    """The strict double: every answer comes from a fixture file.
+
+    It is a ``CodingTool`` like any other, so every caller keeps
+    working; what changes is where the answer comes from.  Nothing here
+    spawns a process, opens a socket or reads a credential.
+    """
+
+    def __init__(self, script_dir: Optional[str] = None, cwd: Optional[str] = None,
+                 logger=None, scene: Optional[str] = None):
+        self.script_dir = _scripted_script_dir(script_dir)
+        self.registry = ScriptedLLMRegistry(self.script_dir)
+        self.cwd = cwd
+        self.logger = logger
+        self.scene = scene
+        # Duck-type the attributes callers reach for on a real tool, so a
+        # scripted run fails on the ANSWER and never on an AttributeError
+        # three layers up.
+        self.model = None
+        self.model_type = "medium"
+        self.model_map = {}
+        self.provider_priority = []
+        self.base_url = None
+        self.auth_token = None
+        self.mcp_config = None
+        self.settings = None
+        self.hook_stdin = {}
+        self.current_call_model = None
+
+    def query(self, prompt: str, system_instruction: Optional[str] = None,
+              retries: int = 3, timeout: Optional[int] = None,
+              model_type: Optional[str] = None,
+              scene: Optional[str] = None) -> str:
+        """The scripted answer for ``prompt``.
+
+        The keyword surface matches ``ClaudeCodingTool.query``, so a
+        caller cannot tell the two apart by the call it makes.
+        """
+        return self.registry.response(prompt)
+
+    def query_json(self, prompt: str, system_instruction: Optional[str] = None,
+                   retries: int = 3, timeout: Optional[int] = None,
+                   model_type: Optional[str] = None,
+                   allowed_tools: Optional[list] = None,
+                   scene: Optional[str] = None) -> dict:
+        """The scripted answer for ``prompt``, parsed as JSON.
+
+        Parsed with the same helper the live path uses, so a fixture
+        written as a fenced JSON block behaves the way it would live.  A
+        fixture that is not JSON raises ``json.JSONDecodeError`` — the
+        same exception the live path raises, so the caller's recovery
+        code is the same code.
+        """
+        from utils.json_repair import parse_llm_json
+        return parse_llm_json(self.registry.response(prompt))
+
+
+def _scripted_registry() -> ScriptedLLMRegistry:
+    """The registry for the configured script directory.
+
+    Built per call: the fixtures are files, and a file that changed
+    between two calls must be honoured.  A directory that is not there
+    raises — the double never falls back to the network, not even on the
+    first call.
+    """
+    return ScriptedLLMRegistry(_scripted_script_dir())
+
+
 def create_coding_tool(tool_type: Optional[str] = None, cwd: Optional[str] = None, logger=None,
                        scene: Optional[str] = None) -> CodingTool:
     """Factory function to create the appropriate coding tool.
@@ -6836,9 +7126,18 @@ def create_coding_tool(tool_type: Optional[str] = None, cwd: Optional[str] = Non
         scene: Workflow scene for provider routing (2026-09-13). Forwarded
             to ``ClaudeCodingTool``; ignored by the vendor-c/opencode branches.
 
+        In scripted mode (``PDT_LLM_MODE=scripted``) the strict double
+        replaces the tool entirely: the scripted mode answers every LLM
+        call from a fixture file, so which CLI would have run is
+        irrelevant — and letting it run would put a real provider call
+        back on the table.
+
     Returns:
         CodingTool instance.
     """
+    if scripted_mode_enabled():
+        return ScriptedCodingTool(cwd=cwd, logger=logger, scene=scene)
+
     if tool_type is None:
         tool_type = os.environ.get("PDT_DEFAULT_CODING_TOOL", "claude").lower()
 

@@ -2687,6 +2687,236 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
+  # STAGE 4d — VERIFICATION MODE LANES (repair round + perf, both serial)
+  #
+  # The verification branch is a different pipeline from the development
+  # branch: it verifies somebody else's repository, it repairs what it
+  # finds on a `fix/<plan_id>-verification` worktree branch, and it must
+  # leave that repository byte-for-byte alone. Both lanes below are about
+  # that pipeline, and both are **serial** — one pytest process at a time
+  # (`needs: unit-tests`, no `-n`) — because a lane that measures or
+  # reproduces a run while seven other workers share the machine is
+  # measuring the workers.
+  #
+  # `needs: unit-tests` is what "serial" costs and buys: the shards of
+  # `unit-tests` run in parallel with anything not chained after them, so
+  # without the chain these lanes would start while the shards are still
+  # running, and the runner they land on is not the machine they think it
+  # is. The chain buys a lane that starts on a quiet machine.
+  #
+  # `backend/tests/static_gates/test_ci_verification_mode_jobs.py` pins
+  # the four properties that make these lanes what they claim to be: the
+  # two jobs exist, each runs its pytest serially, the unit lane still
+  # runs `tests/unit` with `-n 8`, and the repair round still uploads the
+  # plan directory and the git state when it fails. A lane that quietly
+  # stopped being serial, or that stopped uploading its evidence, is
+  # invisible in the job list — and the evidence is the whole point of
+  # the repair round.
+  # ---------------------------------------------------------------------------
+
+  verification-e2e:
+    name: Verification mode E2E (repair round, serial)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    # Chained after the unit shards: the lane starts on a quiet machine.
+    needs: unit-tests
+    # Ten minutes is the ceiling for the WHOLE job, and the repair round
+    # fits in it with room to spare (five scenarios, a 180-second budget
+    # each, a few seconds in practice). The ceiling exists so a wedged
+    # lane cannot hold a runner for the hour GitHub would otherwise
+    # allow — and because the lane retries once, the ceiling has to
+    # cover both attempts.
+    timeout-minutes: 10
+    env:
+      # The plan directory and the state database are redirected into the
+      # workspace, so the failure upload below can find them. The hermetic
+      # test environment otherwise puts them in a per-session scratch
+      # directory whose path only the pytest process knows — and an
+      # artifact that cannot name its own evidence is no evidence.
+      PDT_PLANS_DIR: ${{ github.workspace }}/backend/verification-e2e-state/plans
+      PDT_STATE_DB_PATH: ${{ github.workspace }}/backend/verification-e2e-state/state.db
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The repair round creates git worktrees and inspects the
+          # repository's own state, so the checkout carries the history
+          # rather than one commit of it.
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          uv sync --project backend --locked
+
+      - name: Configure git for the verification worktrees
+        run: |
+          # The repair round commits on a worktree branch, and a hosted
+          # runner has no committer identity by default: without this the
+          # commit fails and the round cannot reach its second turn.
+          git config --global user.name "PDT CI"
+          git config --global user.email "pdt-ci@example.invalid"
+          git config --global init.defaultBranch main
+
+      # Selection is by PATH, not by marker, and deliberately so: the
+      # repair round is this lane's subject, and a marker would have to be
+      # excluded by the default lanes, collected by some other lane, and
+      # registered in a baseline list — three files to keep in sync, in
+      # order to name one file that can simply be named here.
+      #
+      # The retry is bounded at ONE. A repair round that fails twice has
+      # told us what it has to tell; a third attempt would only make the
+      # lane slower without making the answer better. The first failure
+      # is still reported: the loop echoes it before it tries again.
+      - name: Run the verification repair-round E2E (at most one retry)
+        working-directory: backend
+        timeout-minutes: 8
+        run: |
+          set -o pipefail
+          for attempt in 1 2; do
+            if ./.venv/bin/python3 -m pytest \
+                 tests/e2e/test_verification_mode_repair_round.py \
+                 --tb=short --timeout=180 -v; then
+              echo "verification E2E green on attempt ${attempt}"
+              exit 0
+            fi
+            echo "::warning::verification E2E red on attempt ${attempt}"
+            if [ "${attempt}" -ge 2 ]; then
+              echo "::error::verification E2E red on both attempts; giving up"
+              exit 1
+            fi
+            echo "retrying once (attempt 2 of 2)"
+          done
+
+      - name: Capture the git state
+        if: failure()
+        run: |
+          # The repair round's claim is that it left the repository alone.
+          # The state that proves it is the repository's own: what HEAD
+          # was, what the worktrees are, and what the working tree looks
+          # like afterwards.
+          {
+            echo "----- git status --porcelain -----"
+            git status --porcelain || true
+            echo "----- git log -----"
+            git log --oneline -10 || true
+            echo "----- git worktree list -----"
+            git worktree list || true
+            echo "----- git rev-parse HEAD -----"
+            git rev-parse HEAD || true
+          } > verification-git-state.txt
+
+      - name: Upload the plan directory and the git state
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-e2e-state-${{ github.sha }}
+          path: |
+            backend/verification-e2e-state/
+            backend/logs/
+            verification-git-state.txt
+          # upload-artifact v4.4+ skips dot-prefixed path components
+          # unless told otherwise, and reports 'No files were found' —
+          # which reads as "the run produced nothing".
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
+
+  verification-perf:
+    name: Verification mode perf (4-core fidelity, serial)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    # Chained after the unit shards, for the reason the sibling lane
+    # above gives: the machine has to be quiet before a number is read
+    # off it.
+    needs: unit-tests
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          uv sync --project backend --locked
+
+      # 4-core fidelity. The verification mode's perf budgets are stated
+      # for a four-CPU machine, so the measurement is pinned to four CPUs
+      # whenever the runner can provide them: a machine with more would
+      # make every run look faster than the reference, and a number taken
+      # there is not comparable with the last one. A runner with fewer
+      # cannot reproduce the reference at all, and that is said out loud
+      # rather than measured quietly — a budget tripped on a smaller
+      # machine is not a regression, and saying so is the difference
+      # between a warning and a false alarm.
+      - name: Pin the measurement to 4 CPUs
+        run: |
+          CORES="$(nproc)"
+          echo "runner cores: ${CORES}"
+          if [ "${CORES}" -ge 4 ]; then
+            echo "affinity: 4 CPUs (0-3)"
+            echo "TASKSET_PREFIX=taskset -c 0-3" >> "$GITHUB_ENV"
+          else
+            echo "::warning::this runner has ${CORES} CPUs; the verification perf budgets are stated for 4. The measurement will be slower than the reference, so a budget tripped here is not necessarily a regression."
+            echo "TASKSET_PREFIX=" >> "$GITHUB_ENV"
+          fi
+
+      # No ``-n``: these are wall-clock budgets, and a wall-clock
+      # assertion measured beside other workers is a measurement of the
+      # workers. The perf file takes the fastest of several runs, which
+      # is what makes a single process enough.
+      - name: Run the verification-mode perf tests (serial)
+        working-directory: backend
+        timeout-minutes: 8
+        run: ${TASKSET_PREFIX} ./.venv/bin/python3 -m pytest tests/perf/test_verification_mode_scaling.py --tb=short --timeout=1800 -v
+
+      - name: Upload the perf logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-perf-logs-${{ github.sha }}
+          path: |
+            backend/logs/
+            backend/.pytest_cache/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
   # STAGE 5 — MERGE GATE
   #
   # The single job branch protection requires. Everything above it can be
@@ -2760,6 +2990,8 @@ jobs:
       - e2e-keychain
       - existing-test
       - negctl
+      - verification-e2e
+      - verification-perf
     runs-on: ubuntu-latest
     steps:
       - name: Fail unless every upstream job succeeded

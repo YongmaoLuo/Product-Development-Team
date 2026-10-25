@@ -90,12 +90,24 @@ def test_start_verification_succeeds_from_executing(verification_env):
 
     assert response.status_code == 200
     # 2026-10-20: /start 新增 round/resumed，暂停/续跑需要
-    assert response.json() == {
-        "plan_id": plan_id,
-        "status": "started",
-        "round": 1,
-        "resumed": False,
-    }
+    # 2026-10-25: 响应里还多了 project_dir —— 这一轮真正跑在哪个目录里。
+    #
+    # 这里**不**再用「整个响应逐键相等」来钉：生产加一个键就让这条断言
+    # 变红，而它测的东西一个都没变。钉住的是契约里的那几个键**在**且
+    # 值对得上，外加新键 project_dir 指向种下去的那个目录。
+    body = response.json()
+    for key, expected in (
+        ("plan_id", plan_id),
+        ("status", "started"),
+        ("round", 1),
+        ("resumed", False),
+    ):
+        assert body.get(key) == expected, (
+            f"{key} 不对：{body.get(key)!r} != {expected!r}"
+        )
+    assert body.get("project_dir") == str(plans_dir / plan_id / "project"), (
+        "project_dir 是这一轮真正跑在的那个目录"
+    )
     assert RoutingRepository(conn).current(plan_id)["current_phase"] == "verification_running"
     row = VerificationRepository(conn).current(plan_id)
     assert row["verification_status"] == "running"
