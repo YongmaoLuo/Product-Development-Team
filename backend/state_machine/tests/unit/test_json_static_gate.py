@@ -116,12 +116,20 @@ LEGACY_TABLE_NAMES: tuple[str, ...] = (
 )
 
 #: The exact schema produced by :func:`state_machine.db.schema.migrate`.
-#: ``schema_version`` is the migration logbook; the five ``plan_*``
-#: tables are the canonical state-machine surface.
+#: ``schema_version`` is the migration logbook; the ``plan_*`` tables
+#: are the canonical state-machine surface.  The count in the test's
+#: name is where that number came from, not what the set holds today:
+#: the surface has grown since, and the name is kept so that the
+#: anchor keeps pointing at the same gate.
 #:
 #: Schema v4 normalisation (2026-09-09) added ``plan_tasks`` so
 #: per-task state lives in its own table rather than inside
-#: ``plan_execution.task_progress`` JSON.
+#: ``plan_execution.task_progress`` JSON.  Schema v7 (2026-10-21) added
+#: ``plan_decisions``, the human-in-the-loop decision store (see
+#: ``state_machine/db/schema.py``'s ``_ensure_plan_decisions``).  This
+#: list is where the state-machine side says so; the backend's own
+#: copy of the same gate lives in
+#: ``backend/tests/static_gates/test_sqlite_schema_tables_exactly_four_plus_version.py``.
 EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
     {
         "plan_routing",
@@ -129,6 +137,7 @@ EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
         "plan_verification",
         "plan_artifacts",
         "plan_tasks",
+        "plan_decisions",
         "schema_version",
     }
 )

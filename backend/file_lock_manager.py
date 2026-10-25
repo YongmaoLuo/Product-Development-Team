@@ -14,12 +14,62 @@ inside a project.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import List
 
 from filelock import FileLock, Timeout
 
 from file_lock_protocol import fallback_locks_dir, lock_file_path
+
+
+def domains_overlap(a: str, b: str) -> bool:
+    """Return whether two write domains claim any of the same files.
+
+    A domain is a plan-declared path: a task may claim a whole directory
+    (``src/a``) where another claims one file inside it (``src/a/b.py``).
+    Those are the same bytes, so the plan gate must read them as a
+    conflict. Equality alone does not — the strings differ, so a pair that
+    edits one file through two spellings sails through.
+
+    The comparison is **lexical**, deliberately: no ``Path.resolve()``, no
+    ``os.stat``. The domains come from a plan, not from a checkout, and a
+    task routinely claims a directory that does not exist yet — asking the
+    filesystem would both cost a syscall per pair and answer the wrong
+    question (``..`` in a plan is a claim about paths, not about links on
+    this particular disk). ``os.path.normpath`` collapses ``.``/``..``/
+    duplicate separators purely textually.
+
+    The prefix test anchors on a separator rather than on a bare
+    ``str.startswith``: ``src/ab/c.py`` starts with the characters
+    ``src/a``, but it is a different directory, and refusing that pair
+    would serialise two genuinely independent tasks behind each other.
+
+    Args:
+        a: First domain, relative to the project or absolute.
+        b: Second domain, same conventions.
+
+    Returns:
+        ``True`` if the two domains are equal or one is an ancestor
+        directory of the other. ``False`` if either is empty — an empty
+        domain constrains nothing, so it conflicts with nothing.
+    """
+    if not a or not b:
+        return False
+
+    norm_a = os.path.normpath(a)
+    norm_b = os.path.normpath(b)
+    if norm_a == norm_b:
+        return True
+
+    sep = os.sep
+    # A filesystem-root domain (POSIX "/" or a Windows drive root) is the
+    # ancestor of everything, and it carries no trailing separator for the
+    # prefix test above to append.
+    if norm_a == sep or norm_b == sep:
+        return True
+
+    return norm_b.startswith(norm_a + sep) or norm_a.startswith(norm_b + sep)
 
 
 class FileLockManager:

@@ -9,10 +9,14 @@ Core responsibilities:
 - Persist all state transitions through PlanState
 """
 
+import hashlib
 import inspect
 import json
+import logging
+import os
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Set, Tuple
 
 from coding_tool import CodingTool, ClaudeCodingTool
 from config_paths import resolve_state_db_path
@@ -30,6 +34,418 @@ from repair_generator import (
 # 2026-10-22: the type a cancelled round raises. Dependency-free, so a
 # top-level import carries no cycle risk.
 from verification_cancel import VerificationCancelled
+from verification.failure_triage import (
+    CRITERION_DEFECT,
+    DELIVERABLE_DEFECT,
+    Disposition,
+    disposition_for,
+    is_not_looser,
+)
+from verification.triage_agent import VPTriageJudge
+from verification_plan_delta import (
+    OBSOLETE_FIELD,
+    OBSOLETE_REASON_FIELD,
+    OBSOLETE_ROUND_FIELD,
+    PlanDelta,
+    PlanDeltaPersistError,
+    REPLACEMENT_FOR_FIELD,
+    apply_delta_persisted,
+)
+
+
+#: The version of ``verification_loop_tracking.json`` this module writes.
+#:
+#: v1 stored the failed verification-point ids and one counter for the
+#: whole set, so a point that kept failing for a *different* reason
+#: still read as "the same failure" as the round before. v2 stores the
+#: failed ``(point, failure class)`` pairs and counts each pair on its
+#: own.
+_LOOP_TRACKING_VERSION = 2
+
+#: The separator between a point id and its failure class in a decision
+#: key — the same spelling :func:`verification.failure_triage.decision_key`
+#: uses, so a key reads the same in a log line as it does on disk.
+_DECISION_KEY_SEPARATOR = "|"
+
+
+def _decision_key_str(key: Tuple[str, str]) -> str:
+    """The on-disk spelling of one ``(point, failure class)`` pair."""
+    vp_id, failure_class = key
+    return f"{vp_id}{_DECISION_KEY_SEPARATOR}{failure_class}"
+
+
+def _parse_decision_key(text: Any) -> Optional[Tuple[str, str]]:
+    """Read one decision key back, or ``None`` when it is malformed.
+
+    A key without the separator names a point but not a class, and a
+    class is not something this module may guess — so the entry is
+    dropped rather than completed.
+    """
+    if not isinstance(text, str):
+        return None
+    vp_id, separator, failure_class = text.partition(_DECISION_KEY_SEPARATOR)
+    if not separator or not vp_id:
+        return None
+    return (vp_id, failure_class)
+
+
+def _is_counted_failure(key: Tuple[str, str]) -> bool:
+    """Whether this failure may move the same-cause counter.
+
+    Only the failures a human should see move it: an infrastructure
+    blip is not evidence that the work is wrong, and an out-of-scope
+    check is not evidence of anything. Counting either would escalate a
+    healthy run to a human and would make the counter report "same
+    cause, twice" about two failures that have nothing in common.
+
+    The rule is :func:`verification.failure_triage.is_counted` — the
+    same one the failure-disposition chain uses — so the counter and
+    the disposition never disagree about what counts.
+    """
+    from verification import failure_triage
+
+    return failure_triage.is_counted(key[1])
+
+
+#: The reason the loop stops when the triage could not name the failure.
+#:
+#: The loop knows it is stuck on a failure and knows the failure is not
+#: one it can fix by itself — but it does not know *what* the failure
+#: is, because the judge could not check its own answer. A human has
+#: to look, and the reason says so in a shape a card can render.
+STOP_REASON_NO_TRIAGE_CONCLUSION = "same_failure_no_triage_conclusion"
+
+#: The reason a round carries when the triage itself could not deliver
+#: an answer.
+#:
+#: The provider blew up, the payload was not a JSON object, or the
+#: quote the answer carried could not be verified against the recorded
+#: failure. None of those is a statement about the failure — they are
+#: statements about the triage — so the round is *not* stopped on it:
+#: the repair path gets its chance and the same-cause counter is left
+#: alone. Stopping here would void a criterion over a triage that
+#: never classified anything.
+#:
+#: 2026-10-23 (VP-019): before this reason existed the two failures
+#: were indistinguishable — the shipped judge answers with a
+#: conclusion instead of raising, so every technical failure landed in
+#: the "no conclusion" branch and stopped the chain with an empty
+#: ``repair_tasks``.
+REASON_TRIAGE_UNAVAILABLE = "triage_unavailable"
+
+#: The reason the loop stops when the triage named a broken criterion.
+#:
+#: A criterion defect cannot be repaired by reworking the deliverable:
+#: the check itself is wrong, so the loop stops and a human fixes the
+#: check.
+#:
+#: 2026-10-22: the loop stops here only when the triage named the broken
+#: criterion **without saying what should replace it**. When the triage
+#: does propose a replacement, the loop replaces the criterion itself
+#: (see :meth:`VerificationOrchestrator._apply_criterion_replacement`)
+#: and keeps going — see :data:`REASON_CRITERION_REPLACED`.
+STOP_REASON_CRITERION_DEFECT = "same_failure_criterion_defect"
+
+#: The reason a round carries when the triage's proposed replacement was
+#: used: the broken criterion was obsoleted and a new one took its place
+#: on disk, so the loop continues with the *new* criterion.
+REASON_CRITERION_REPLACED = "criterion_replaced"
+
+#: The source a question asked from the verification side carries.
+#:
+#: The verification loop waits for the questions it recognises by this
+#: name (``verification_loop.VERIFICATION_DECISION_SOURCE``), so a
+#: question asked from here is one the round will wait for.
+VERIFICATION_DECISION_SOURCE = "verification"
+
+#: The answers an out-of-scope question offers.
+#:
+#: The check asked for something nobody scoped. The two answers are the
+#: two things a human can do about it: drop the check, or agree to
+#: build what it asked for. There is no third — the plan's scope is
+#: the plan's scope.
+OUT_OF_SCOPE_OPTIONS = ("skip_the_check", "bring_it_into_scope")
+
+#: The answer an out-of-scope question falls back to when nobody replies.
+#:
+#: ``auto`` mode needs one, and this is the conservative reading: the
+#: check asked for something the plan never agreed to build, so the
+#: default is to leave the plan alone.
+OUT_OF_SCOPE_DEFAULT_OPTION = "skip_the_check"
+
+
+#: The module logger.
+#:
+#: The orchestrator's ``self.logger`` is injected by the callers that
+#: have one — and nothing in the backend injects it, so every line
+#: written through it alone was dropped on the floor. This logger is
+#: always there, so an audit line that matters (a refused replacement,
+#: a write that failed) is never silently lost.
+logger = logging.getLogger(__name__)
+
+
+#: The synthetic point id the plan-delta audit events are filed under.
+#:
+#: The event is about the **plan**, not about one verification point: a
+#: refused replacement touches the plan file, so it cannot be filed
+#: under the point whose criterion was to be replaced — that point's own
+#: events say what happened to the check, not to the plan.
+PLAN_DELTA_AUDIT_VP_ID = "__plan_delta__"
+
+#: The event written when the plan delta could not be written to disk.
+EVENT_PLAN_DELTA_PERSIST_FAILED = "plan_delta_persist_failed"
+
+#: The event written when the proposed replacement was refused on its
+#: merits — it checks less than the criterion it replaces, or it is
+#: unusable as it stands.
+EVENT_PLAN_DELTA_REPLACEMENT_REJECTED = "plan_delta_replacement_rejected"
+
+#: Why a proposed replacement was not used: the write did not land.
+#:
+#: The plan on disk still says what it said before, so the failure is
+#: downgraded to a deliverable defect and the loop keeps repairing.
+REPLACEMENT_REJECTED_PERSIST_FAILED = "persist_failed"
+
+#: Why a proposed replacement was not used: it checks less than the
+#: criterion it replaces (a rubber stamp is not a replacement).
+REPLACEMENT_REJECTED_WEAKER_METHOD = "weaker_method"
+
+#: Why a proposed replacement was not used: the proposal itself was
+#: unusable (it carried no title, or the plan's own guard dropped it).
+REPLACEMENT_REJECTED_INVALID_PROPOSAL = "invalid_proposal"
+
+#: The audit event each rejection reason is filed under.
+_REJECTION_EVENTS: Dict[str, str] = {
+    REPLACEMENT_REJECTED_PERSIST_FAILED: EVENT_PLAN_DELTA_PERSIST_FAILED,
+    REPLACEMENT_REJECTED_WEAKER_METHOD: EVENT_PLAN_DELTA_REPLACEMENT_REJECTED,
+    REPLACEMENT_REJECTED_INVALID_PROPOSAL: (
+        EVENT_PLAN_DELTA_REPLACEMENT_REJECTED
+    ),
+}
+
+
+class TriageStopReason(str):
+    """A stop reason that is a code to the machine and a verdict to a human.
+
+    Two contracts meet at the stop reason, and neither fits into the
+    other's value:
+
+    * The **state machine's vocabulary** is a closed set of strings, and
+      the whole verification stack compares a stop reason against it:
+      the auto-loop's convergence guard, the terminal write's
+      chain-ending decision, the ``plan_verification`` column, the API
+      response model. A *mapping* that reached that stack would raise
+      on the first membership test — ``dict`` is unhashable, so
+      ``reason in frozenset`` is a ``TypeError`` — and the plan it
+      belonged to would be stranded inside the verification family: a
+      silent failure that looks like a plan that simply never finishes.
+    * The **triage's verdict** is a mapping: which point failed, which
+      failure class it was, and what the triage said about it. A bare
+      string says only *that* the loop stopped, which is the very thing
+      the triage was introduced to fix.
+
+    So the reason *is* the code — a string, and therefore hashable,
+    bindable, serialisable and comparable everywhere the vocabulary
+    expects one — and the verdict travels with it. The verdict is read
+    three ways, so every way a caller might reach for it works:
+    through :attr:`verdict`, by subscript (``reason["vp_id"]``), and by
+    comparison (``result["stop_reason"] == {...}``).
+    """
+
+    __slots__ = ("verdict",)
+
+    def __new__(cls, code: str, verdict: Optional[Mapping] = None):
+        obj = super().__new__(cls, code or "")
+        obj.verdict = dict(verdict) if verdict else {}
+        return obj
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, TriageStopReason):
+            # Two reasons are the same reason when they say the same
+            # thing: the same code *and* the same verdict. Comparing
+            # the verdicts alone would let two different codes with
+            # one verdict pass for each other.
+            return (
+                str.__eq__(self, other) is True
+                and self.verdict == other.verdict
+            )
+        if isinstance(other, Mapping):
+            return self.verdict == dict(other)
+        return str.__eq__(self, other)
+
+    def __ne__(self, other: Any) -> bool:
+        verdict = self.__eq__(other)
+        if verdict is NotImplemented:
+            return verdict
+        return not verdict
+
+    def __getitem__(self, key: str) -> Any:
+        """Read the verdict by key, the way a mapping would.
+
+        The reason is a code with a verdict attached; when a caller
+        writes ``reason["vp_id"]`` it means the verdict.
+        """
+        return self.verdict[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """The verdict's ``get`` — a key the verdict does not carry is
+        not an error, it is the default."""
+        return self.verdict.get(key, default)
+
+    # Defining ``__eq__`` sets ``__hash__`` to None; the reason must
+    # stay hashable — the vocabulary is a set.
+    __hash__ = str.__hash__
+
+
+def stop_reason_code(result: Mapping) -> str:
+    """The machine-facing spelling of a round's stop reason.
+
+    The orchestrator's stop reason carries the triage's verdict (see
+    :class:`TriageStopReason`), and the state machine's vocabulary is a
+    closed set of strings. This helper is the seam between the two: it
+    always yields a string, so a verdict that reaches the vocabulary
+    can never raise on it.
+
+    A *string* reason wins over the code: the auto-loop rewrites the
+    reason in a few branches (``pending_repair_tasks``), and that
+    rewrite is the more specific statement of what happened.
+
+    Args:
+        result: A round's result payload.
+
+    Returns:
+        The code, or ``""`` when the payload carries no reason.
+    """
+    reason = result.get("stop_reason")
+    if isinstance(reason, str) and reason:
+        return str(reason)
+    code = result.get("stop_reason_code")
+    if isinstance(code, str) and code:
+        return str(code)
+    if isinstance(reason, Mapping):
+        return str(reason.get("reason") or "")
+    return ""
+
+
+def _read_triage_conclusion(
+    conclusion: Any,
+) -> Optional[Tuple[bool, str, str, bool]]:
+    """The ``(conclusive, failure_class, rationale, available)`` of a verdict.
+
+    The judge answers with a
+    :class:`verification.triage_agent.TriageConclusion`; a double that
+    answers with a mapping carrying the same fields is read the same
+    way. Anything else — ``None``, a string, an object without a
+    ``conclusive`` field — is not a verdict at all, and ``None`` says
+    so: the caller must not act on it.
+
+    ``available`` is the difference between a triage that malfunctioned
+    and a triage that ran without being able to characterise the
+    failure — see :func:`_read_triage_availability`.
+
+    Args:
+        conclusion: Whatever the judge returned.
+
+    Returns:
+        The four fields, or ``None`` when the answer is not a verdict.
+    """
+    if isinstance(conclusion, Mapping):
+        if "conclusive" not in conclusion:
+            return None
+        return (
+            bool(conclusion.get("conclusive")),
+            str(conclusion.get("failure_class") or ""),
+            str(conclusion.get("rationale") or ""),
+            _read_triage_availability(conclusion),
+        )
+    if not hasattr(conclusion, "conclusive"):
+        return None
+    return (
+        bool(getattr(conclusion, "conclusive")),
+        str(getattr(conclusion, "failure_class", "") or ""),
+        str(getattr(conclusion, "rationale", "") or ""),
+        _read_triage_availability(conclusion),
+    )
+
+
+def _read_triage_availability(conclusion: Any) -> bool:
+    """Whether the triage itself delivered an answer at all.
+
+    A verdict that does not say is taken at its word — *available* —
+    because that is the shape every conclusion had before the
+    distinction existed, and a conclusion nobody could act on is not
+    evidence about the failure. Only an explicit ``False`` says the
+    triage malfunctioned, and only then does the caller keep the loop
+    running instead of stopping on it.
+
+    Args:
+        conclusion: Whatever the judge returned.
+
+    Returns:
+        ``True`` when the triage delivered an answer, ``False`` when it
+        malfunctioned.
+    """
+    if isinstance(conclusion, Mapping):
+        value = conclusion.get("available", True)
+    else:
+        value = getattr(conclusion, "available", True)
+    if value is None:
+        return True
+    return bool(value)
+
+
+def _read_triage_replacement(conclusion: Any) -> Optional[Dict[str, Any]]:
+    """The proposed replacement criterion of a triage verdict, if any.
+
+    A :class:`verification.triage_agent.TriageConclusion` carries the
+    replacement the judge proposed for a broken criterion; a double that
+    answers with a mapping carrying the same field is read the same way.
+    A verdict without a replacement — or with one that is not a mapping
+    — proposes nothing, and ``None`` says so: the caller must not act on
+    it.
+
+    Args:
+        conclusion: Whatever the judge returned.
+
+    Returns:
+        The replacement as a plain dict, or ``None`` when the verdict
+        proposes no replacement.
+    """
+    if isinstance(conclusion, Mapping):
+        replacement = conclusion.get("replacement")
+    else:
+        replacement = getattr(conclusion, "replacement", None)
+    if not isinstance(replacement, Mapping):
+        return None
+    return dict(replacement)
+
+
+def _undefined_vp_operator_action(vp_ids: Any) -> Optional[str]:
+    """What the operator has to do about the points the plan never defined.
+
+    A point the plan never wrote down has no criterion: there is nothing
+    to check it against, and no rework of the deliverable can satisfy it.
+    The executor must not invent one — so the plan's **owner** has to void
+    the point or express its criterion. That is the action this string
+    names, and it is what the round hands to whoever reads the verdict.
+
+    The wording is deliberately an action and not a verdict: the judge
+    layer did not judge this point, so it must not dress the record up as
+    a pass either — it says what it is and who has to act on it.
+
+    Args:
+        vp_ids: The points that are in the report but not in the plan.
+
+    Returns:
+        The action to take, or ``None`` when there is nothing to void.
+    """
+    ids = sorted({str(vp_id).strip() for vp_id in vp_ids or () if str(vp_id).strip()})
+    if not ids:
+        return None
+    return (
+        f"{', '.join(ids)} 在验证计划里没有定义，"
+        "须由计划属主作废或重新表达它的判据"
+    )
 
 
 def _state_db_path_for_orchestrator() -> Path:
@@ -98,6 +514,7 @@ class VerificationOrchestrator:
         project_dir: Path,
         coding_tool: Optional[CodingTool] = None,
         verif_repo: Optional[Any] = None,
+        triage_judge: Optional[Any] = None,
     ):
         self.plan_dir = Path(plan_dir)
         self.project_dir = Path(project_dir)
@@ -121,8 +538,19 @@ class VerificationOrchestrator:
         # resumed round reads to skip the superseded parent).
         self.verif_repo = verif_repo
         self._current_vp_splits: List[Dict[str, Any]] = []
-        self._previous_failed_ids: Optional[set] = None
-        self._consecutive_same_failure_rounds: int = 0
+        # 2026-10-22 (v2): the same-cause state is per
+        # ``(verification point, failure class)`` pair, not per failed
+        # point. ``_previous_failed_keys`` holds the pairs that failed in
+        # the last recorded round; ``_same_failure_counts`` holds how
+        # many rounds each failure has repeated (one on the round it
+        # first failed) — failures that do not count (``infra``,
+        # ``out_of_scope``) are absent from it. The two legacy
+        # attributes (``_previous_failed_ids`` /
+        # ``_consecutive_same_failure_rounds``) are views over these two
+        # — see the properties below.
+        self._previous_failed_keys: set = set()
+        self._same_failure_counts: Dict[str, int] = {}
+        self._last_round: int = 0
         # 2026-09-12: terminating the chain after 1
         # same-failure repeat (old behaviour) is too violent — but
         # giving the agent unlimited retries without feedback lets it
@@ -140,13 +568,9 @@ class VerificationOrchestrator:
         # 3. Hard cap ``_MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS`` as
         #    a safety net — enough chances for feedback to land, but
         #    not so many that a truly broken VP burns tokens forever.
-        self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS = 1
+        #
         # 2026-09-19（**推翻** 2026-09-12 的"第一次重复不终止"）：两轮失败
         # 集合相同就停。
-        #
-        # 计数语义：`_consecutive_same_failure_rounds` 数的是**重复次数**，
-        # 即"第 2 轮和第 1 轮相同"记 1、"第 3 轮又相同"记 2。所以阈值 1 =
-        # **两轮失败集合相同就停**。
         #
         # 2026-09-12 当时的理由是"第一次重复就终止太暴力，真 bug 一轮修不
         # 完"；2026-09-19 实测推翻了它：某一轮的 round 2 与 round 3 的失败
@@ -155,7 +579,28 @@ class VerificationOrchestrator:
         # 所以阈值 3 在 `max_rounds=3` 下**数学上不可达**——这条停止条件从来
         # 没生效过，每次都以 `max_rounds_reached` 收场。
         #
-        # 想再放宽的话，阈值必须同时满足 `<= max_rounds - 1`，否则又是死代码。
+        # 2026-10-22 (v2): 比较粒度从"失败点集合"变成
+        # `(vp_id, failure_class)`，计数也从"整集合"变成"逐 key"。文件里的
+        # `same_failure_counts[key]` 是**该失败已经连续重复了几轮**（首次
+        # 失败那轮记 1）。
+        #
+        # 2026-10-22 (triage): 阈值从 1 改成 2，而且**达到阈值不再直接终止**
+        # ——先做一次语义分诊（`VPTriageJudge.judge()`，一次无工具的 LLM
+        # 调用），由分诊结论决定"终止"还是"分流"：
+        #
+        # * `criterion_defect`（判据本身坏了）→ 终止：再怎么返工也满足不
+        #   了这条判据，只能由人改判据；
+        # * `deliverable_defect`（产物真的错了）→ 分流：继续修，并且给这个
+        #   失败重新发一轮预算；
+        # * 分诊给不出可核验的结论 → 终止，但终止原因是**结构化**的（点名
+        #   哪个点、哪一类失败、分诊自己说了什么）；
+        # * 分诊本身炸了 → 既不终止也不作废计数：坏的分诊不是关于失败的证据。
+        #
+        # 计数的单位：阈值 2 = **同一个 `(点, 失败类别)` 连续失败两轮**就
+        # 触发分诊（首次失败那轮记 1，第二轮记 2）。这是"轮数"，不是
+        # "重复次数"——后者见 `_consecutive_same_failure_rounds` 的
+        # docstring，两者相差一轮。
+        self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS = 2
         # ``vp_id -> list of {round, actual_result, evidence}`` —
         # one entry per round where the VP failed. The list grows
         # monotonically and is cleared only when the VP passes.
@@ -174,24 +619,32 @@ class VerificationOrchestrator:
             self._load_failure_history()
         )
         self._failure_history_seeded = False
-        # 2026-09-19: ``_previous_failed_ids`` /
-        # ``_consecutive_same_failure_rounds`` used to live ONLY in this
+        # 2026-09-19: the same-failure tracking used to live ONLY in this
         # instance's memory — precisely the hole the paragraph above
         # describes for the failure history, and it was never closed for
-        # these two. Because ``_on_repair_complete`` builds a FRESH
-        # orchestrator for every post-repair round, both reset to
-        # ``None`` / ``0`` at the start of each round, which puts
-        # ``_previous_failed_ids`` at ``None`` on the comparison below —
-        # the same-failure branch could never fire at all: consecutive
-        # rounds fail the identical VP set and the loop still ends with
-        # ``max_rounds_reached``.
+        # it. Because ``_on_repair_complete`` builds a FRESH orchestrator
+        # for every post-repair round, the tracking reset to ``None`` /
+        # ``0`` at the start of each round — the same-failure branch
+        # could never fire at all: consecutive rounds fail the identical
+        # VP set and the loop still ends with ``max_rounds_reached``.
         # Persisted next to the failure history so the stop decision
         # survives the rebuild.
-        self._previous_failed_ids, self._consecutive_same_failure_rounds = (
-            self._load_loop_tracking()
-        )
+        # 2026-10-22 (v2): the persisted state is per
+        # ``(verification point, failure class)`` pair, so a point that
+        # changed its failure class is not counted as the same cause.
+        (
+            self._previous_failed_keys,
+            self._same_failure_counts,
+            self._last_round,
+        ) = self._load_loop_tracking()
         self._current_repair_tasks: List[Dict] = []
         self._waiting_for_user = False
+        # 2026-10-22 (triage): the semantic judge that names the nature of
+        # a failure the loop is stuck on. Injected in tests; built on first
+        # use in production (the judge is only needed once the same-cause
+        # threshold is reached, so building it lazily keeps the common
+        # path free of it).
+        self._triage_judge = triage_judge
 
     #: Loop-progress tracking that must outlive a single orchestrator (see
     #: the 2026-09-19 note in ``__init__``).
@@ -200,14 +653,103 @@ class VerificationOrchestrator:
     def _loop_tracking_path(self) -> Path:
         return Path(self.plan_dir) / self._LOOP_TRACKING_FILENAME
 
-    def _load_loop_tracking(self) -> Tuple[Optional[set], int]:
-        """Return ``(previous_failed_ids, consecutive_same_failure_rounds)``.
+    # ------------------------------------------------------------------
+    # The legacy views of the v2 state
+    # ------------------------------------------------------------------
+    @property
+    def _previous_failed_ids(self) -> Optional[set]:
+        """The points that failed in the last recorded round, ids only.
 
-        Missing / unreadable / malformed file → ``(None, 0)``, i.e. the
-        old in-memory behaviour. A file left over from a previous plan
-        generation is not a correctness problem: the first comparison
-        would simply be against a set of VP ids that no longer matches,
-        which resets the counter instead of stopping the loop.
+        A view over the v2 keys, for the callers that only care about
+        *which* points failed (the failure-history prune, the audit
+        surface). ``None`` means "no round with failures has been
+        recorded" — the shape the pre-v2 code used.
+        """
+        if not self._previous_failed_keys:
+            return None
+        return {vp_id for vp_id, _ in self._previous_failed_keys}
+
+    @_previous_failed_ids.setter
+    def _previous_failed_ids(self, value) -> None:
+        if value is None:
+            self._previous_failed_keys = set()
+            return
+        # The ids carry no class. An empty class records exactly that —
+        # "the class was not recorded" — and never matches a real class,
+        # so a legacy assignment cannot be mistaken for a classified
+        # failure.
+        self._previous_failed_keys = {(str(vp_id), "") for vp_id in value}
+
+    @property
+    def _consecutive_same_failure_rounds(self) -> int:
+        """How many consecutive rounds the most-repeated failure repeated.
+
+        The v2 count is the number of rounds a failure has repeated (one
+        on the round it first failed); this view reports the *repeats* —
+        the rounds after the first — because that is what the pre-v2
+        counter counted and what the loop-control threshold is still
+        expressed in. The two differ by one round, so the stop point
+        of the loop is unchanged by the v2 upgrade.
+
+        Only the failures of the last recorded round are considered:
+        a count left over from an earlier round describes a failure
+        that is not being made again.
+        """
+        repeats = 0
+        for key in self._previous_failed_keys:
+            count = self._same_failure_counts.get(_decision_key_str(key), 0)
+            repeats = max(repeats, count - 1)
+        return max(0, repeats)
+
+    @_consecutive_same_failure_rounds.setter
+    def _consecutive_same_failure_rounds(self, value) -> None:
+        count = (
+            value
+            if isinstance(value, int) and not isinstance(value, bool)
+            else 0
+        )
+        count = max(0, count)
+        if count == 0:
+            self._same_failure_counts = {}
+            return
+        # The aggregate is spread over the keys of the last recorded
+        # round — the only failures it can be about. The count is the
+        # number of rounds the failure repeated, which is one more than
+        # the repeats this attribute reports.
+        self._same_failure_counts = {
+            _decision_key_str(key): count + 1
+            for key in self._previous_failed_keys
+        }
+
+    def _load_loop_tracking(self) -> Tuple[set, Dict[str, int], int]:
+        """Return ``(failed_keys, same_failure_counts, last_round)``.
+
+        v2 (2026-10-22): the tracking file counts failures per
+        ``(verification point, failure class)`` pair, so a point that
+        keeps failing for a *different* reason is a different failure
+        and no longer counts as the same cause. The file shapes:
+
+        * v2 — ``{"version": 2, "previous_failed_keys": [...],
+          "same_failure_counts": {...}, "last_round": N}``
+        * v1 — ``{"previous_failed_ids": [...],
+          "consecutive_same_failure_rounds": N}``
+
+        ``same_failure_counts`` holds, per decision key, the number of
+        rounds that failure has repeated — one on the round it first
+        failed. Failures that do not count (``infra``,
+        ``out_of_scope``) have no entry at all.
+
+        A v1 file is read as an empty state. It names the points that
+        failed but not *why*, and inventing a class for them would
+        fabricate the very distinction v2 exists to make — a v1 file
+        therefore contributes no keys and no counts, and the next write
+        upgrades the file to v2.
+
+        Missing / unreadable / malformed file → ``(set(), {}, 0)``, i.e.
+        the old in-memory behaviour. A file left over from a previous
+        plan generation is not a correctness problem: the first
+        comparison would simply be against a set of keys that no longer
+        matches, which resets the counter instead of stopping the loop.
 
         ``verification/reset`` deletes this file, so an operator restart
         starts the counting from scratch rather than inheriting a
@@ -217,46 +759,1195 @@ class VerificationOrchestrator:
             with self._loop_tracking_path().open("r", encoding="utf-8") as fh:
                 payload = json.load(fh)
         except (OSError, ValueError):
-            return None, 0
+            return set(), {}, 0
         if not isinstance(payload, dict):
-            return None, 0
-        raw_ids = payload.get("previous_failed_ids")
-        previous = (
-            {str(i) for i in raw_ids} if isinstance(raw_ids, list) else None
-        )
-        raw_count = payload.get("consecutive_same_failure_rounds")
-        count = (
-            raw_count
-            if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+            return set(), {}, 0
+
+        failed_keys: set = set()
+        raw_keys = payload.get("previous_failed_keys")
+        if isinstance(raw_keys, list):
+            for item in raw_keys:
+                parsed = _parse_decision_key(item)
+                if parsed is not None:
+                    failed_keys.add(parsed)
+
+        counts: Dict[str, int] = {}
+        raw_counts = payload.get("same_failure_counts")
+        if isinstance(raw_counts, dict):
+            for name, value in raw_counts.items():
+                if not isinstance(name, str):
+                    continue
+                if isinstance(value, bool) or not isinstance(value, int):
+                    continue
+                counts[name] = max(0, value)
+
+        raw_round = payload.get("last_round")
+        last_round = (
+            raw_round
+            if isinstance(raw_round, int) and not isinstance(raw_round, bool)
             else 0
         )
-        return previous, max(0, count)
+        return failed_keys, counts, max(0, last_round)
 
     def _save_loop_tracking(self) -> None:
-        """Persist the loop-progress tracking.
+        """Persist the loop-progress tracking (v2).
+
+        The payload names the decision keys of the last recorded round
+        and, per key, how many rounds that failure has repeated — the
+        tally the next round's fresh orchestrator continues from.
+
+        The write is atomic: the payload goes to a temporary file next
+        to the target and is then moved into place with ``os.replace``.
+        A failure therefore leaves the previous file whole — a
+        half-written JSON would be read as a corrupt file, which resets
+        the counter and lets the loop run on forever.
 
         Best-effort: a write failure must never abort a verification
         round — the worst case is that the next (fresh) orchestrator
         behaves as it did before 2026-09-19.
         """
         payload = {
-            "previous_failed_ids": (
-                sorted(self._previous_failed_ids)
-                if self._previous_failed_ids is not None
-                else None
+            "version": _LOOP_TRACKING_VERSION,
+            "previous_failed_keys": sorted(
+                _decision_key_str(key) for key in self._previous_failed_keys
             ),
-            "consecutive_same_failure_rounds": (
-                self._consecutive_same_failure_rounds
-            ),
+            "same_failure_counts": {
+                name: count
+                for name, count in sorted(self._same_failure_counts.items())
+                if count > 0
+            },
+            "last_round": int(self._last_round),
         }
         path = self._loop_tracking_path()
+        tmp = path.with_name(path.name + ".tmp")
         try:
-            tmp = path.with_name(path.name + ".tmp")
             with tmp.open("w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False)
-            tmp.replace(path)
+            os.replace(tmp, path)
         except OSError:
+            # The target is untouched; drop the half-written temporary
+            # file so it cannot be mistaken for the tracking file.
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    # ------------------------------------------------------------------
+    # The same-failure triage
+    # ------------------------------------------------------------------
+    #
+    # The loop control used to end the chain the moment the same failure
+    # repeated, with a bare string as the reason and no repair tasks. The
+    # triage replaced that: reaching the threshold buys ONE semantic
+    # triage call, and the triage's verdict decides whether the loop
+    # stops (a human has to look) or diverts into the repair path.
+
+    #: The file the triage's verdict is written to.
+    #:
+    #: The verdict answers *why* the chain stopped, and the chain stops
+    #: in a process that ends right there — the in-memory verdict dies
+    #: with the round. The plan's own directory is where the other
+    #: round-scoped records live (``verification_loop_tracking.json``,
+    #: ``verification_failure_history.json``), so the verdict goes
+    #: there too: the human who opens the plan can read what the
+    #: triage said, instead of a bare code that says only that the
+    #: chain gave up.
+    _TRIAGE_VERDICT_FILENAME = "verification_triage_verdict.json"
+
+    def _triage_verdict_path(self) -> Path:
+        return Path(self.plan_dir) / self._TRIAGE_VERDICT_FILENAME
+
+    def _save_triage_verdict(
+        self, verdict: Mapping, round_number: int,
+    ) -> None:
+        """Write the triage's verdict to the plan's directory.
+
+        Best-effort, like every other record the orchestrator keeps: a
+        write failure must never abort a round that has already reached
+        its verdict. The write is atomic (a temporary file next to the
+        target, moved into place) so a reader never sees half a file.
+        """
+        payload = {
+            "round": int(round_number),
+            "verdict": dict(verdict),
+        }
+        path = self._triage_verdict_path()
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    def _stuck_failure_keys(self) -> List[Tuple[str, str]]:
+        """The decision keys whose same-cause count has reached the cap.
+
+        A key is a ``(verification point, failure class)`` pair, and its
+        count is the number of rounds that failure has repeated — one on
+        the round it first failed. The cap is
+        ``_MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS`` **rounds**, so a cap of
+        2 fires on the round the same failure repeats for the second
+        time.
+
+        Only the current round's keys are considered: a count left over
+        from an earlier round describes a failure that is not being made
+        again. And a failure that does not count (``infra``,
+        ``out_of_scope``) has no count at all, so it can never be here —
+        two rounds of an environment blip buy no triage call.
+        """
+        cap = self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS
+        return sorted(
+            key
+            for key in self._previous_failed_keys
+            if self._same_failure_counts.get(_decision_key_str(key), 0) >= cap
+        )
+
+    def _triage_judge_for(self) -> Any:
+        """The judge to ask — the injected one, or one built on first use.
+
+        The judge makes one tool-less LLM call, so it is built only when
+        a failure is actually stuck; the common path never pays for it.
+        """
+        if self._triage_judge is None:
+            self._triage_judge = VPTriageJudge(coding_tool=self.coding_tool)
+        return self._triage_judge
+
+    def _report_failure_entries(self, report: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Every result entry of the report, the freshest first.
+
+        The same two lists :meth:`_extract_failed_ids` walks: the
+        top-level results and the last round's snapshot.
+        """
+        entries: List[Dict[str, Any]] = []
+        top_level = report.get("verification_results") or []
+        if isinstance(top_level, list):
+            entries.extend(e for e in top_level if isinstance(e, dict))
+        rounds_field = report.get("rounds") or []
+        if isinstance(rounds_field, list) and rounds_field:
+            last_round = (
+                rounds_field[-1] if isinstance(rounds_field[-1], dict) else {}
+            )
+            last_results = last_round.get("results") or []
+            if isinstance(last_results, list):
+                entries.extend(e for e in last_results if isinstance(e, dict))
+        return entries
+
+    def _route_failed_vps(
+        self, failed_vps: List[Dict[str, Any]], round_number: int,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Split the failed VPs by the remedy their failure class buys.
+
+        The four classes are not four flavours of "the deliverable is
+        wrong" — each one wants a different remedy, and the table that
+        says which is :func:`verification.failure_triage.disposition_for`
+        (the same table the same-cause counter reads, so the two can
+        never disagree about what a failure is):
+
+        * ``deliverable_defect`` → the deliverable is wrong: a repair
+          task. This is the only class that reaches the repair model.
+        * ``infra`` → the attempt malfunctioned: **no** repair task.
+          Reworking a deliverable does not fix a rate limit, and the
+          attempt is worth another try — the next round runs it again.
+        * ``criterion_defect`` → the check itself is broken: **no**
+          repair task. The criterion is retired by the triage
+          (:meth:`_apply_criterion_replacement`), not by a rework.
+        * ``out_of_scope`` → the check asks for something nobody scoped:
+          **no** repair task and **no** criterion delta — the question
+          goes to a human (:meth:`_ask_a_human_about`).
+
+        The split happens *before* the repair model is asked anything,
+        so a failure that must not be repaired never reaches the model
+        at all — not even as a row the parser has to drop.
+
+        A record that names no class reads as ``deliverable_defect``:
+        the classification is newer than most verdicts, and "nobody said
+        otherwise" has always meant "repair it".
+
+        Returns:
+            ``(repairable, deferred)``. ``repairable`` holds the
+            records that may become repair tasks; ``deferred`` holds
+            one entry per failure that got none, naming the point, its
+            class, the disposition and — for an out-of-scope check — the
+            question that was put to a human.
+        """
+        from verification.failure_history import failure_class_of
+
+        repairable: List[Dict[str, Any]] = []
+        deferred: List[Dict[str, Any]] = []
+        for vp in failed_vps or []:
+            if not isinstance(vp, dict):
+                continue
+            failure_class = failure_class_of(vp)
+            disposition = disposition_for(failure_class)
+            if disposition == Disposition.RETRY_COUNTED:
+                repairable.append(vp)
+                continue
+            record: Dict[str, Any] = {
+                "id": str(vp.get("id") or ""),
+                "failure_class": failure_class,
+                "disposition": disposition,
+            }
+            if disposition == Disposition.SKIP_NOT_COUNTED:
+                # The check asks for something nobody scoped: the only
+                # remedy is a human's answer, so the question is asked
+                # here and now — not after the repair path has run.
+                record["decision_id"] = self._ask_a_human_about(
+                    vp, failure_class, round_number,
+                )
+            deferred.append(record)
+        return repairable, deferred
+
+    def _ask_a_human_about(
+        self, vp: Dict[str, Any], failure_class: str, round_number: int,
+    ) -> str:
+        """Put an out-of-scope check to a human, and report the question.
+
+        The question is asked through :func:`hitl.service.create_decision`
+        — the only writer of ``plan_decisions`` — so it lands in the
+        table the verification loop waits on
+        (``verification_loop._open_verification_decisions``) and in the
+        audit mirror every other question lands in.
+
+        One question per point: a failure that repeats while the first
+        question is still open does not pile up questions nobody can
+        answer.
+
+        Returns:
+            The decision id, or ``""`` when no question was asked (one
+            was already open, or the question could not be created).
+        """
+        from hitl.models import DecisionRequest
+        from hitl.service import create_decision
+
+        plan_id = self.plan_dir.name
+        vp_id = str(vp.get("id") or "")
+        if self._open_decision_for(plan_id, vp_id):
+            return ""
+
+        summary = str(
+            vp.get("actual_result_summary") or vp.get("evidence_summary") or ""
+        )
+        request = DecisionRequest(
+            plan_id=plan_id,
+            source=VERIFICATION_DECISION_SOURCE,
+            vp_id=vp_id,
+            failure_class=failure_class,
+            round=round_number,
+            question=(
+                f"the verification check {vp_id} asks for something this "
+                f"plan never scoped: {summary}"
+            ),
+            options=list(OUT_OF_SCOPE_OPTIONS),
+            default_option=OUT_OF_SCOPE_DEFAULT_OPTION,
+        )
+        try:
+            decision = create_decision(request, self.plan_dir)
+        except Exception as exc:  # noqa: BLE001 — a question is not a verdict
+            # A decision that could not be created must not take the
+            # round down with it: the failure is still recorded, still
+            # not repaired, and the operator sees why in the audit.
+            self._log_audit(
+                "verification_out_of_scope_decision_failed",
+                f"the out-of-scope question for {vp_id} could not be asked: "
+                f"{type(exc).__name__}: {exc}",
+                data={
+                    "plan_id": plan_id,
+                    "vp_id": vp_id,
+                    "failure_class": failure_class,
+                    "round": round_number,
+                },
+            )
+            return ""
+        return str(getattr(decision, "decision_id", "") or "")
+
+    def _open_decision_for(self, plan_id: str, vp_id: str) -> bool:
+        """Whether an open question about this point is already waiting.
+
+        "Open" is the pair of states the verification loop waits on
+        (``pending`` / ``paused``): a question nobody answered yet.
+        A settled question — answered, defaulted, expired, unroutable —
+        is not open, so the next round may ask again.
+        """
+        from hitl.models import DecisionStatus
+        from hitl.service import list_decisions
+
+        open_statuses = (
+            DecisionStatus.PENDING.value,
+            DecisionStatus.PAUSED.value,
+        )
+        try:
+            decisions = list_decisions(plan_id)
+        except Exception as exc:  # noqa: BLE001 — the store may be gone
+            self._log_audit(
+                "verification_out_of_scope_decision_lookup_failed",
+                f"the open questions about {vp_id} could not be read: "
+                f"{type(exc).__name__}: {exc}",
+                data={"plan_id": plan_id, "vp_id": vp_id},
+            )
+            return False
+        return any(
+            decision.status in open_statuses
+            and str(getattr(decision, "vp_id", "") or "") == vp_id
+            for decision in decisions
+        )
+
+    def _read_verification_plan(self) -> Optional[Dict[str, Any]]:
+        """The verification plan file's payload — ``None`` when it cannot be read.
+
+        Two facts a caller must not confuse:
+
+        * ``None`` — the file is missing, unreadable, malformed, or does
+          not hold a plan object. The plan's wishes are **unknown**.
+        * a payload that declares no verification point — the plan is
+          readable but asks for nothing.
+
+        The distinction matters wherever the *report* is compared against
+        the *plan* (2026-10-25, VP-031): an unreadable plan must never be
+        read as "the plan asks for nothing", and a plan that declares no
+        point must never be read as "every point in the report is
+        undefined" — that reading would void a whole round's failures and
+        pass a plan whose criteria were never written down (the boundary
+        ``e394a52`` established).
+        """
+        path = Path(self.plan_dir) / "verification_plan.json"
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def _verification_point_definitions(self) -> Dict[str, Dict[str, Any]]:
+        """The verification plan's points, by id.
+
+        The plan is the only place that knows what a point *asked for*
+        (its title, expected result, verification method and test
+        command) — the report only knows how it went.
+        """
+        payload = self._read_verification_plan()
+        if payload is None:
+            return {}
+        return self._verification_points_of(payload)
+
+    def _verification_points_of(
+        self, payload: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        """The plan payload's points, by id."""
+        points = payload.get("verification_points") or []
+        definitions: Dict[str, Dict[str, Any]] = {}
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            vp_id = str(point.get("id") or "").strip()
+            if vp_id:
+                definitions[vp_id] = point
+        return definitions
+
+    def _obsolete_vp_ids(self) -> Set[str]:
+        """The points the plan itself retired.
+
+        A point the plan marked ``obsolete`` — or gave an
+        ``obsolete_reason`` — is a criterion the plan no longer
+        requires: the executor skips such a point
+        (:meth:`verification_executor.VerificationExecutor._build_items_from_plan`),
+        because running a check the plan dropped would manufacture a
+        failure for something nobody asked for.
+
+        The only trace left of such a point in a round is the
+        **report** entry that still lists it as FAILED — the round that
+        retired it is the round that saw it fail. Left alone, that
+        entry produces a repair task for a judgement nobody can
+        satisfy, and it feeds the same-cause counter, so a criterion
+        that is already gone ends the chain with "the same failure,
+        again".
+
+        The predicate reads the **plan file's** points
+        (``verification_points`` — the agent schema), not the
+        executor's converted list: the conversion
+        (:meth:`verification_agent.VerificationAgent._convert_plan_to_executor_schema`)
+        forwards ``obsolete`` but drops ``obsolete_reason``, and a
+        reason alone is enough to retire a point.
+        """
+        retired: Set[str] = set()
+        for vp_id, point in self._verification_point_definitions().items():
+            reason = str(point.get(OBSOLETE_REASON_FIELD) or "").strip()
+            if point.get(OBSOLETE_FIELD) or reason:
+                retired.add(vp_id)
+        return retired
+
+    def _undefined_vp_ids(self, report: Dict[str, Any]) -> Set[str]:
+        """The points the report failed but the plan never defined.
+
+        The twin of :meth:`_obsolete_vp_ids`, for the other way a
+        criterion can be gone: the plan **retired** a point (it says so
+        with ``obsolete`` / ``obsolete_reason``), or the plan **never
+        wrote the point down at all**. The retired-point rule can only
+        reach the first — a point the plan never defined cannot be marked
+        retired, so the report's FAILED entry for it survives every round,
+        is counted as a failure every round, and produces a repair task
+        for a judgement nobody can satisfy (``VP-031``, 2026-10-25).
+
+        A point with an id but no criterion is a broken *criterion*, not a
+        broken deliverable: nothing in the plan says what "passing" would
+        mean, so no rework of the deliverable can satisfy it. The
+        executor must not invent one, and the plan's owner has to void it
+        or write its criterion down.
+
+        **The two ways of not knowing are kept apart** — and both void
+        nothing:
+
+        * the plan file is missing / unreadable / malformed → the plan's
+          wishes are unknown, and an unknown plan cannot say that a point
+          is undefined. "The plan does not ask for it" and "we could not
+          read what the plan asks for" are different facts.
+        * the plan is readable but declares no verification point → a
+          plan that never wrote a criterion down cannot have one voided
+          by the judge, and the round must not pass on the strength of an
+          empty plan (the boundary ``e394a52`` established).
+
+        The classification is not invented here: an undefined point is
+        ``criterion_defect`` by the explicit mapping in
+        :data:`verification.failure_triage.SIGNAL_CLASSES`
+        (``vp_definition_missing``) — the same criterion the dispatch
+        guard (:func:`verification_agent.vp_dispatch_gaps`) and the repair
+        gate use.
+        """
+        payload = self._read_verification_plan()
+        if payload is None:
+            # The plan could not be read: nothing is voided.
+            return set()
+        definitions = self._verification_points_of(payload)
+        if not definitions:
+            # The plan declares no point at all: nothing is voided.
+            return set()
+        failed_ids = self._extract_failed_ids(report)
+        # The ids are compared as the plan spells them (``str`` + stripped)
+        # — the same spelling :meth:`_obsolete_vp_ids` uses for the plan's
+        # own ids, so the void sets and the failure count talk about the
+        # same points.
+        return {
+            str(vp_id).strip() for vp_id in failed_ids
+            if str(vp_id).strip() and str(vp_id).strip() not in definitions
+        }
+
+    def _triage_vp_payload(self, vp_id: str, report: Dict[str, Any]) -> Dict[str, Any]:
+        """The verification point as the judge should see it.
+
+        The judge's prompt reads the point's *definition* (title,
+        expected result, verification method, test command) and may only
+        quote from its *recorded failure* (actual result, evidence). The
+        definition comes from ``verification_plan.json`` and the
+        recorded failure from the report — the two halves of what the
+        judge is allowed to know.
+        """
+        payload: Dict[str, Any] = {"id": vp_id}
+        definition = self._verification_point_definitions().get(vp_id)
+        if definition:
+            payload.update(definition)
+        for entry in self._report_failure_entries(report):
+            if str(entry.get("id") or "").strip() != vp_id:
+                continue
+            payload.update(entry)
+            break
+        return payload
+
+    def _triage_failure_history(
+        self, vp_id: str, report: Dict[str, Any], round_number: int,
+    ) -> List[Dict[str, Any]]:
+        """The recorded failures of one point — this round included.
+
+        The stored history holds the *previous* rounds (this round's
+        entries are merged further down, after the loop-control
+        decision), so the current round's record is appended here: the
+        judge has to see the failure it is asked to classify.
+        """
+        history: List[Dict[str, Any]] = [
+            dict(entry)
+            for entry in (self._failure_history.get(vp_id) or [])
+            if isinstance(entry, dict)
+        ]
+        for entry in self._report_failure_entries(report):
+            if str(entry.get("id") or "").strip() != vp_id:
+                continue
+            history.append({
+                "round": round_number,
+                "actual_result": str(entry.get("actual_result", "") or ""),
+                "evidence": str(entry.get("evidence", "") or ""),
+                "failure_class": str(entry.get("failure_class", "") or ""),
+            })
+            break
+        return history
+
+    def _log_audit(
+        self, event: str, message: str,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """One structured line about the audit — never a reason to fail a round.
+
+        Two loggers may be reachable: the injected ``self.logger`` (a
+        structured logger that takes the event name and the payload as
+        separate arguments) and the module logger (always present, but
+        a plain :mod:`logging` logger that takes one format string).
+        They are called in their own dialect, because the structured
+        one cannot be called the stdlib way without losing the payload.
+
+        Before this existed the orchestrator wrote its audit lines
+        through ``self.logger`` only — an attribute nothing ever
+        assigns — so every one of those lines was dropped on the floor.
+        The module logger is the floor that is never missing.
+        """
+        payload = dict(data or {})
+        for target in (getattr(self, "logger", None), logger):
+            if target is None:
+                continue
+            try:
+                if isinstance(target, logging.Logger):
+                    target.warning(
+                        "%s: %s", event, message,
+                        extra={"event": event, "data": payload},
+                    )
+                else:
+                    target.warning(event, message, data=payload)
+                return
+            except Exception:
+                continue
+
+    def _log_triage(self, vp_id: str, failure_class: str, message: str) -> None:
+        """One log line about the triage — never a reason to fail a round."""
+        self._log_audit(
+            "verification_same_failure_triage",
+            f"same-failure triage for {vp_id}: {message}",
+            data={
+                "plan_id": getattr(self.plan_dir, "name", "?"),
+                "vp_id": vp_id,
+                "failure_class": failure_class,
+            },
+        )
+
+    def classify_cycle(
+        self,
+        key: Tuple[str, str],
+        report: Dict[str, Any],
+        round_number: int,
+    ) -> Dict[str, Any]:
+        """Ask the judge what the stuck failure *is*, and decide.
+
+        One call, one answer, and the answer decides:
+
+        * **A criterion defect with a usable replacement** → the
+          criterion is replaced on disk (the broken one is obsoleted, a
+          new one is added) and the loop continues with the new
+          criterion. The replacement is only used when it checks at
+          least as much as the criterion it replaces.
+        * **A criterion defect without a replacement** → the loop
+          stops: no amount of rework can satisfy a broken check, and
+          nobody said what the check should be, so a human has to fix
+          the criterion.
+        * **Anything else** → the loop diverts into the repair path
+          with a fresh budget for this failure (the triage HAS decided,
+          so the same-cause counter starts over).
+        * **A triage that malfunctioned** → the loop does *not* stop:
+          the provider blew up, the answer was unreadable, or the quote
+          it carried could not be verified. None of that is a
+          statement about the failure, so the repair path gets its
+          chance and the counter is left alone.
+        * **A triage that ran and could not characterise the failure**
+          → the loop stops with a structured reason: the loop cannot
+          tell what to do with the failure, so a human has to look.
+
+        The verdict it returns is *structured* — it names the point, the
+        failure class and the triage's own words — because a human is
+        the one who has to act on it. The machine-facing code travels
+        with it (see :class:`TriageStopReason`): the state machine's
+        vocabulary is a closed set of strings, and the chain-ending
+        decision turns on the code, not on the verdict.
+
+        Returns:
+            ``{"should_stop": bool, "stop_reason": dict | None,
+            "reason": str, "void_counter": bool}``. ``reason`` is the
+            precise code of this verdict (the triage's own conclusion);
+            the *coarse* one — "the chain converged" — is the code the
+            reason carries to the state machine.
+        """
+        vp_id, failure_class = key
+        try:
+            judge = self._triage_judge_for()
+            conclusion = judge.judge(
+                vp=self._triage_vp_payload(vp_id, report),
+                failure_history=self._triage_failure_history(
+                    vp_id, report, round_number,
+                ),
+                round_number=round_number,
+            )
+        except Exception as exc:  # noqa: BLE001 — a broken judge is not a verdict
+            self._log_triage(
+                vp_id, failure_class, f"judge failed: {type(exc).__name__}: {exc}",
+            )
+            return {
+                "should_stop": False,
+                "stop_reason": None,
+                "reason": REASON_TRIAGE_UNAVAILABLE,
+                "void_counter": False,
+            }
+
+        parsed = _read_triage_conclusion(conclusion)
+        if parsed is None:
+            self._log_triage(
+                vp_id, failure_class, "judge returned no usable conclusion",
+            )
+            return {
+                "should_stop": False,
+                "stop_reason": None,
+                "reason": REASON_TRIAGE_UNAVAILABLE,
+                "void_counter": False,
+            }
+
+        conclusive, concluded_class, rationale, available = parsed
+        if not available:
+            # 2026-10-23 (VP-019): the triage itself malfunctioned — the
+            # provider blew up, the answer was unreadable, or the quote
+            # it carried could not be verified against the recorded
+            # failure. That is a statement about the triage, not about
+            # the failure, so the loop must not stop on it: the repair
+            # path gets its chance and the same-cause counter is left
+            # alone. Stopping here would void a criterion over a triage
+            # that never classified anything.
+            self._log_triage(
+                vp_id, failure_class, f"triage unavailable — {rationale}",
+            )
+            return {
+                "should_stop": False,
+                "stop_reason": None,
+                "reason": REASON_TRIAGE_UNAVAILABLE,
+                "void_counter": False,
+            }
+
+        if not conclusive:
+            self._log_triage(vp_id, failure_class, "no conclusion — stopping")
+            return {
+                "should_stop": True,
+                "stop_reason": {
+                    "reason": STOP_REASON_NO_TRIAGE_CONCLUSION,
+                    "vp_id": vp_id,
+                    "failure_class": failure_class,
+                    "triage_rationale": rationale,
+                },
+                "reason": STOP_REASON_NO_TRIAGE_CONCLUSION,
+                "void_counter": False,
+            }
+
+        if concluded_class == CRITERION_DEFECT:
+            # 2026-10-22 (criterion replacement): a broken criterion is
+            # only a dead end when nobody knows what should replace it.
+            # The judge is asked for exactly that, so the branch has
+            # three outcomes, in this order:
+            #
+            # * the proposal was usable → the criterion is replaced on
+            #   disk (the old one obsoleted, a new one added) and the
+            #   loop continues with the new criterion;
+            # * the proposal existed but could not be used (a weaker
+            #   method, a write that failed) → the criterion stays and
+            #   the failure is downgraded to a deliverable defect, so
+            #   the loop keeps working instead of stopping on something
+            #   it cannot repair;
+            # * no proposal at all → a human has to decide what the
+            #   criterion should be, so the loop stops.
+            outcome = self._apply_criterion_replacement(
+                vp_id, conclusion, round_number=round_number,
+            )
+            if outcome.get("applied"):
+                record = dict(outcome.get("record") or {})
+                self._log_triage(
+                    vp_id, failure_class,
+                    f"criterion defect — replaced by {record['replaced_by']}",
+                )
+                return {
+                    "should_stop": False,
+                    "stop_reason": None,
+                    "reason": REASON_CRITERION_REPLACED,
+                    "void_counter": True,
+                    "obsoleted_vp_ids": [str(vp_id)],
+                    "criterion_replacement": record,
+                }
+            if _read_triage_replacement(conclusion) is None:
+                self._log_triage(
+                    vp_id, failure_class,
+                    "criterion defect — no replacement proposed, stopping "
+                    "for a human",
+                )
+                return {
+                    "should_stop": True,
+                    "stop_reason": {
+                        "reason": STOP_REASON_CRITERION_DEFECT,
+                        "vp_id": vp_id,
+                        "failure_class": failure_class,
+                        "triage_rationale": rationale,
+                    },
+                    "reason": STOP_REASON_CRITERION_DEFECT,
+                    "void_counter": False,
+                }
+            # A proposal that could not be used: the criterion stays as
+            # it is, and the failure is treated as a deliverable defect
+            # so the loop keeps repairing instead of stopping.
+            #
+            # 2026-10-23 (VP-020): the refusal is recorded, not just
+            # survived. The reason travels with the round's decision, so
+            # the operator can tell "the write failed" from "the
+            # proposal checked less than the criterion it replaces" —
+            # and the criterion is *not* treated as obsoleted, because
+            # the plan on disk still says it is there.
+            rejected_reason = str(
+                outcome.get("replacement_rejected_reason") or ""
+            )
+            self._log_triage(
+                vp_id, failure_class,
+                "criterion defect — replacement refused, diverting into "
+                "repair",
+            )
+            return {
+                "should_stop": False,
+                "stop_reason": None,
+                "reason": DELIVERABLE_DEFECT,
+                "void_counter": True,
+                "replacement_rejected_reason": rejected_reason,
+                "replacement_rejected_error": str(outcome.get("error") or ""),
+            }
+
+        # A deliverable defect (or a class the loop may retry / skip):
+        # the loop keeps working on it — with a fresh budget, because
+        # the triage HAS decided what the failure is.
+        self._log_triage(
+            vp_id, failure_class, f"{concluded_class} — diverting into repair",
+        )
+        return {
+            "should_stop": False,
+            "stop_reason": None,
+            "reason": concluded_class,
+            "void_counter": True,
+        }
+
+    def _criterion_replacement_guard(
+        self, candidate: Dict[str, Any], summary: Dict[str, Any],
+    ) -> None:
+        """The guard that runs on the candidate plan **before** it lands.
+
+        Two rules, and both of them are about the plan not losing a
+        criterion:
+
+        1. **The replacement must be runnable.** A method the runner
+           does not know produces a point that can never produce a
+           verdict — a criterion that is checked by nobody. Such a
+           replacement is dropped.
+        2. **A dropped replacement revives the original.** The obsolete
+           mark is withdrawn, because "the old criterion died" and "the
+           new criterion was refused" cannot both be true: the plan has
+           to keep the criterion it had rather than lose it.
+
+        The summary is left describing what will actually be on disk —
+        :func:`verification_plan_delta._prune_summary` prunes it further
+        against the candidate, so an emptied summary means "nothing to
+        write" and the plan file is not touched at all.
+        """
+        added = [
+            entry for entry in summary.get("added") or []
+            if isinstance(entry, dict)
+        ]
+        obsoleted = [
+            entry for entry in summary.get("obsoleted") or []
+            if isinstance(entry, dict)
+        ]
+        by_id = {
+            str(vp.get("id")): vp
+            for vp in candidate.get("verification_points") or []
+            if isinstance(vp, dict)
+        }
+
+        if not added:
+            # Nothing to add: the criterion must not die either.
+            self._withdraw_obsolete_marks(candidate, obsoleted)
+            summary["obsoleted"] = []
+            return
+
+        from verification_subagent import SUPPORTED_METHODS
+
+        rejected = set()
+        for entry in added:
+            vp = by_id.get(str(entry.get("id")))
+            if vp is None:
+                continue
+            method = str(vp.get("verification_method") or "")
+            if method not in SUPPORTED_METHODS:
+                rejected.add(str(entry.get("id")))
+        if rejected:
+            candidate["verification_points"] = [
+                vp for vp in candidate.get("verification_points") or []
+                if str(vp.get("id")) not in rejected
+            ]
+            summary["added"] = [
+                entry for entry in summary.get("added") or []
+                if str(entry.get("id")) not in rejected
+            ]
+            summary["rejected_by_guard"] = sorted(rejected)
+            # The replacement is gone → the original criterion stays.
+            self._withdraw_obsolete_marks(candidate, obsoleted)
+            summary["obsoleted"] = []
+            return
+
+        # The replacement landed: name it in the obsolete reason, so the
+        # plan alone answers "this criterion is gone — that one took its
+        # place" (the audit chain the delta module asks for).
+        replacement_id = str(added[0].get("id"))
+        for entry in obsoleted:
+            old = by_id.get(str(entry.get("id")))
+            if old is None:
+                continue
+            reason = str(old.get(OBSOLETE_REASON_FIELD) or "").strip()
+            old[OBSOLETE_REASON_FIELD] = (
+                f"{reason} (replaced by {replacement_id})".strip()
+            )
+
+    @staticmethod
+    def _withdraw_obsolete_marks(
+        candidate: Dict[str, Any], obsoleted: List[Dict[str, Any]],
+    ) -> None:
+        """Take the obsolete mark back off the points a delta wanted to retire.
+
+        The mark is what makes the executor skip a point, so a mark that
+        survives without a replacement does not retire anything — it
+        just hides a criterion that is still there and still failing.
+        """
+        ids = {str(entry.get("id")) for entry in obsoleted or []}
+        if not ids:
+            return
+        for vp in candidate.get("verification_points") or []:
+            if not isinstance(vp, dict):
+                continue
+            if str(vp.get("id")) not in ids:
+                continue
+            vp.pop(OBSOLETE_FIELD, None)
+            vp.pop(OBSOLETE_REASON_FIELD, None)
+            vp.pop(OBSOLETE_ROUND_FIELD, None)
+
+    def _audit_plan_delta(
+        self, event: str, vp_id: str, error: str,
+        replacement_rejected_reason: str,
+    ) -> None:
+        """Write one plan-delta audit event where it cannot be lost.
+
+        The decision this event records is one the operator has to be
+        able to read afterwards: the criterion was **not** replaced, and
+        why. It therefore goes to disk — the round's own audit trail
+        (the verification agent's persistence, the same
+        ``write_verification_point_log`` shape every other per-point
+        event uses) and the plan's durable audit file, which does not
+        depend on a round log being open.
+
+        The event is filed under :data:`PLAN_DELTA_AUDIT_VP_ID`: it is
+        about the plan, not about one check. The point whose criterion
+        was to be replaced travels in the payload.
+
+        Args:
+            event: The event name (e.g. ``plan_delta_persist_failed``).
+            vp_id: The point whose criterion was to be replaced.
+            error: What went wrong, in words.
+            replacement_rejected_reason: The machine-readable reason
+                (e.g. ``persist_failed``).
+        """
+        payload = {
+            "plan_id": getattr(self.plan_dir, "name", "?"),
+            "replaced_vp_id": str(vp_id),
+            "event": event,
+            "error": error,
+            "replacement_rejected_reason": replacement_rejected_reason,
+        }
+        # (1) The round's own audit trail — the same per-point event
+        #     shape every other verification event uses.
+        agent = getattr(self, "verification_agent", None)
+        writer = getattr(agent, "_safe_log_freshness_event", None)
+        if callable(writer):
+            try:
+                writer(PLAN_DELTA_AUDIT_VP_ID, event, dict(payload))
+            except Exception:
+                pass
+        # (2) The plan's durable audit file — independent of an open
+        #     round log, so the event cannot be lost because the round
+        #     was not running.
+        try:
+            from verification_persistence import write_audit_event
+
+            write_audit_event(
+                self.plan_dir, PLAN_DELTA_AUDIT_VP_ID, event, dict(payload),
+            )
+        except Exception:
             pass
+        # (3) The structured log line.
+        self._log_audit(event, error, data=payload)
+
+    def _refuse_replacement(
+        self, vp_id: str, reason: str, error: str,
+    ) -> Dict[str, Any]:
+        """Record a refused replacement and say what it cost.
+
+        A refusal is not a no-op: the criterion was supposed to be
+        replaced and was not, so the refusal leaves an audit event on
+        disk and a reason in the round's record. The plan itself is
+        untouched — the refusal never claims a change that did not
+        happen.
+
+        Args:
+            vp_id: The point whose criterion was to be replaced.
+            reason: The machine-readable reason (see
+                :data:`_REJECTION_EVENTS`).
+            error: What went wrong, in words.
+
+        Returns:
+            The outcome the caller reads: nothing was written, and
+            this is why.
+        """
+        event = _REJECTION_EVENTS.get(
+            reason, EVENT_PLAN_DELTA_REPLACEMENT_REJECTED,
+        )
+        self._audit_plan_delta(event, vp_id, error, reason)
+        self._log_triage(vp_id, CRITERION_DEFECT, f"replacement refused — {error}")
+        return {
+            "applied": False,
+            "record": None,
+            "replacement_rejected_reason": reason,
+            "error": error,
+        }
+
+    def _apply_criterion_replacement(
+        self,
+        vp_id: str,
+        conclusion: Any,
+        expected_digest: Optional[str] = None,
+        round_number: int = 0,
+    ) -> Dict[str, Any]:
+        """Replace a broken criterion with the one the triage proposed.
+
+        The whole branch is one promise: **the disk and the verdict
+        store must agree**. The plan file says the old criterion is
+        obsolete and the new one replaced it; the verdict store records
+        the same fact. Neither may claim something the other does not.
+
+        The order is what makes that promise hold:
+
+        1. the proposal is read and checked — a replacement that checks
+           less than the criterion it replaces
+           (:func:`verification.failure_triage.is_not_looser`) is
+           refused, and a refused replacement touches **nothing**;
+        2. the delta is applied to a copy and persisted atomically
+           (:func:`verification_plan_delta.apply_delta_persisted`), so a
+           failed write leaves the plan exactly as it was;
+        3. only **after** the write succeeded is the OBSOLETE verdict
+           appended — a verdict that outlives the change it describes
+           would be worse than no verdict at all.
+
+        A refusal at any step writes **nothing** and says why: the
+        outcome carries ``replacement_rejected_reason`` and an audit
+        event has landed on disk (see :meth:`_refuse_replacement`). The
+        caller must then treat the failure as something else (see
+        :meth:`classify_cycle`).
+
+        Args:
+            vp_id: The point whose criterion is broken.
+            conclusion: The triage verdict (a
+                :class:`verification.triage_agent.TriageConclusion` or a
+                mapping carrying the same fields). Its ``replacement``
+                is the proposal.
+            expected_digest: The sha256 of the plan file the caller
+                based its decision on. When it does not match the file
+                on disk, the plan changed underneath and the
+                replacement is refused rather than overwriting whoever
+                wrote it.
+            round_number: The round the replacement belongs to (written
+                into the plan as ``obsoleted_round`` / ``added_round``).
+
+        Returns:
+            The outcome of the attempt: ``{"applied": bool, "record":
+            dict | None, "replacement_rejected_reason": str, "error":
+            str}``. On success ``record`` is the replacement's record
+            — ``{"vp_id", "failure_class", "replaced_by"}`` — and the
+            reason is empty; on a refusal ``record`` is ``None`` and
+            the reason says why nothing was written.
+        """
+        replacement = _read_triage_replacement(conclusion)
+        if not replacement:
+            # Nothing was proposed, so nothing was refused: a human
+            # has to say what the criterion should be.
+            return {
+                "applied": False,
+                "record": None,
+                "replacement_rejected_reason": "",
+                "error": "the triage proposed no replacement",
+            }
+
+        plan_file = Path(self.plan_dir) / "verification_plan.json"
+        try:
+            raw = plan_file.read_bytes()
+        except OSError as exc:
+            return self._refuse_replacement(
+                vp_id, REPLACEMENT_REJECTED_PERSIST_FAILED,
+                f"the plan file could not be read: {exc}",
+            )
+        digest = hashlib.sha256(raw).hexdigest()
+        if expected_digest is not None and expected_digest != digest:
+            return self._refuse_replacement(
+                vp_id, REPLACEMENT_REJECTED_PERSIST_FAILED,
+                "the plan changed underneath the replacement",
+            )
+        try:
+            plan_data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            return self._refuse_replacement(
+                vp_id, REPLACEMENT_REJECTED_PERSIST_FAILED,
+                f"the plan file is not readable JSON: {exc}",
+            )
+        if not isinstance(plan_data, dict):
+            return self._refuse_replacement(
+                vp_id, REPLACEMENT_REJECTED_PERSIST_FAILED,
+                "the plan file does not hold a plan object",
+            )
+
+        original = None
+        for vp in plan_data.get("verification_points") or []:
+            if isinstance(vp, dict) and str(vp.get("id")) == str(vp_id):
+                original = vp
+                break
+        if original is None:
+            return self._refuse_replacement(
+                vp_id, REPLACEMENT_REJECTED_PERSIST_FAILED,
+                "the point is not in the plan",
+            )
+
+        original_method = str(original.get("verification_method") or "")
+        replacement_method = str(replacement.get("verification_method") or "")
+        if not is_not_looser(original_method, replacement_method):
+            # A weaker check is a rubber stamp. Refuse it and touch
+            # nothing — the plan stays byte-for-byte what it was.
+            return self._refuse_replacement(
+                vp_id, REPLACEMENT_REJECTED_WEAKER_METHOD,
+                f"{replacement_method!r} is not at least as strong as "
+                f"{original_method!r}",
+            )
+
+        title = str(replacement.get("title") or "").strip()
+        if not title:
+            return self._refuse_replacement(
+                vp_id, REPLACEMENT_REJECTED_INVALID_PROPOSAL,
+                "the proposal carries no title",
+            )
+
+        rationale = ""
+        if isinstance(conclusion, Mapping):
+            rationale = str(conclusion.get("rationale") or "")
+        else:
+            rationale = str(getattr(conclusion, "rationale", "") or "")
+
+        added_item: Dict[str, Any] = {
+            "title": title,
+            "verification_method": replacement_method,
+            "reason": (
+                f"replaces {vp_id} — the triage named the criterion broken"
+                + (f": {rationale}" if rationale else "")
+            ),
+            REPLACEMENT_FOR_FIELD: str(vp_id),
+        }
+        # The replacement stands in for the same criterion, so it keeps
+        # the criterion's place in the plan: the PRD criterion it
+        # answers for, the phase it runs in, and the payload the runner
+        # needs. Anything the proposal states wins; anything it leaves
+        # out is inherited rather than invented.
+        for key in ("related_prd_criteria", "verification_phase"):
+            if key in replacement:
+                added_item[key] = replacement[key]
+            elif original.get(key) is not None:
+                added_item[key] = original[key]
+        for key in (
+            "request", "assertions", "target_url", "timeout_seconds",
+            "execution_group",
+        ):
+            if key in replacement:
+                added_item[key] = replacement[key]
+
+        delta = PlanDelta(
+            added=[added_item],
+            obsoleted=[{
+                "id": str(vp_id),
+                "reason": (
+                    "criterion defect — the triage named this criterion "
+                    "broken and proposed a replacement"
+                ),
+            }],
+        )
+        try:
+            summary = apply_delta_persisted(
+                plan_file, plan_data, delta, round_number,
+                post_apply=self._criterion_replacement_guard,
+                expected_digest=digest,
+            )
+        except PlanDeltaPersistError as exc:
+            # The plan on disk is untouched; nothing may be claimed.
+            # The failure is audited, because "the plan is unchanged"
+            # is not the same as "nothing happened".
+            return self._refuse_replacement(
+                vp_id, REPLACEMENT_REJECTED_PERSIST_FAILED,
+                f"the delta did not land: {exc}",
+            )
+        except Exception as exc:  # noqa: BLE001 — a failed delta is a refusal
+            return self._refuse_replacement(
+                vp_id, REPLACEMENT_REJECTED_PERSIST_FAILED,
+                f"{type(exc).__name__}: {exc}",
+            )
+
+        if not summary.get("added") or not summary.get("obsoleted"):
+            # The guard refused the replacement: the plan was not
+            # written, so nothing may be claimed about it.
+            return self._refuse_replacement(
+                vp_id, REPLACEMENT_REJECTED_INVALID_PROPOSAL,
+                "the guard rejected the new criterion",
+            )
+        obsoleted_id = str(summary["obsoleted"][0].get("id"))
+        if obsoleted_id != str(vp_id):
+            return self._refuse_replacement(
+                vp_id, REPLACEMENT_REJECTED_PERSIST_FAILED,
+                f"the delta obsoleted {obsoleted_id!r} instead of {vp_id!r}",
+            )
+        replaced_by = str(summary["added"][0].get("id"))
+
+        # The plan file says it. Only now may the verdict store say it
+        # too.
+        verdict = {
+            "vp_id": str(vp_id),
+            "failure_class": CRITERION_DEFECT,
+            "replaced_by": replaced_by,
+        }
+        if self.verif_repo is not None:
+            try:
+                self.verif_repo.append_verdict(self.plan_dir.name, verdict)
+            except Exception as exc:  # noqa: BLE001 — best-effort record
+                self._log_triage(
+                    vp_id, CRITERION_DEFECT,
+                    f"replacement landed but the verdict was not recorded: {exc}",
+                )
+        else:
+            self._log_triage(
+                vp_id, CRITERION_DEFECT,
+                "replacement landed but there is no verdict store to "
+                "record it in",
+            )
+        return {
+            "applied": True,
+            "record": dict(verdict),
+            "replacement_rejected_reason": "",
+            "error": "",
+        }
 
     def _load_failure_history(self) -> Dict[str, List[Dict[str, Any]]]:
         """Per-VP failure history for this plan.
@@ -476,10 +2167,37 @@ class VerificationOrchestrator:
         # even though the verdict was ``PASSED``.
         self.plan_state.reload()
 
+        # 2026-10-25 (VP-031): a criterion that is **gone** must not pin
+        # the plan at FAILED. There are two ways a criterion can be gone:
+        # the plan retired the point (``obsolete`` / ``obsolete_reason``),
+        # or the plan never wrote the point down at all. The retired-point
+        # rule could only reach the first — a point the plan never defined
+        # cannot be marked retired, so its FAILED entry survived every
+        # round, was counted as a failure every round, and produced a
+        # repair task for a judgement nobody can satisfy.
+        #
+        # Both sets are taken out **before** the failure count is read, so
+        # the round's verdict is decided by the criteria the plan actually
+        # asks for. The report keeps its entries — they are the evidence,
+        # and the operator needs to see them.
+        obsolete_vp_ids = self._obsolete_vp_ids()
+        undefined_vp_ids = self._undefined_vp_ids(report)
+        void_vp_ids = obsolete_vp_ids | undefined_vp_ids
+        # What the operator has to do about the points the plan never
+        # defined — void them, or express their criterion. The judge layer
+        # did not judge those points, so it says so rather than dressing
+        # the record up as a pass.
+        operator_action = _undefined_vp_operator_action(undefined_vp_ids)
+        if operator_action:
+            print(f"[Verification] round {round_number}: {operator_action}")
+
         # Count actual failures (excluding SKIPPED/manual_check)
+        # The voided points are compared with the ids as the plan spells
+        # them (stripped) — the same spelling the void sets hold.
         failed_count = sum(
             1 for r in report.get("verification_results", [])
             if r.get("status") == "FAILED"
+            and str(r.get("id") or "").strip() not in void_vp_ids
         )
         deviation_count = len(report.get("requirement_deviations", []))
 
@@ -487,6 +2205,7 @@ class VerificationOrchestrator:
         if overall_status == "PASSED" or (overall_status == "PARTIAL" and failed_count == 0 and deviation_count == 0):
             self._previous_failed_ids = None
             self._consecutive_same_failure_rounds = 0
+            self._last_round = round_number
             self._save_loop_tracking()
             # All failures resolved — drop the per-VP feedback history
             # so the next plan (if this orchestrator is reused) starts
@@ -513,10 +2232,44 @@ class VerificationOrchestrator:
                 "needs_operator_decision": False,
                 "waiting_for_user": False,
                 "status": "passed",
+                # 2026-10-25 (VP-031): the points this round voided. A
+                # round that passes while a point the plan never defined
+                # is still in the report must say so — the pass is not a
+                # judgement about that point, and the operator has to void
+                # it or express its criterion.
+                "void_vp_ids": sorted(void_vp_ids),
+                "undefined_vp_ids": sorted(undefined_vp_ids),
+                "operator_action": operator_action,
             }
 
         # --- Failure path ---
-        current_failed_ids = self._extract_failed_ids(report)
+        # 2026-10-22 (retired criteria): a point the plan retired is
+        # not a failure any more. The report still lists it — the round
+        # that retired it is the round that saw it fail — so the
+        # retired points are taken out of the failure set *here*, before
+        # the same-cause counter reads it and before the repair path
+        # builds tasks from it. Otherwise a criterion that no longer
+        # exists keeps the counter moving (and ends the chain on "the
+        # same failure, again") and keeps producing repair tasks for a
+        # judgement nobody can satisfy.
+        #
+        # 2026-10-25 (VP-031): the same holds for a point the plan never
+        # defined (``_undefined_vp_ids``) — it is taken out of the
+        # failure set here too, so the same-cause counter is not moved by
+        # a criterion that does not exist and the repair path never sees
+        # it.
+        current_failed_ids = (
+            self._extract_failed_ids(report) - void_vp_ids
+        )
+        # 2026-10-22 (v2): the same-cause comparison is per
+        # ``(verification point, failure class)`` pair. The pre-v2 code
+        # compared the whole failed-point set, so a point that kept
+        # failing for a *different* reason counted as the same cause —
+        # the very distinction this file exists to make.
+        current_failed_keys = {
+            key for key in self._extract_failed_keys(report)
+            if key[0] not in void_vp_ids
+        }
 
         # (2) Same-failure detection — 2026-09-12 fix: don't terminate
         # the chain on the first repeat. Real bugs (e.g. VP-006
@@ -536,24 +2289,92 @@ class VerificationOrchestrator:
         # rounds with the same failure set AND no executor pass
         # intervened. Otherwise still generate repair_tasks so the
         # executor gets another shot.
-        if (
-            self._previous_failed_ids is not None
-            and current_failed_ids == self._previous_failed_ids
-            and len(current_failed_ids) > 0
-        ):
-            self._consecutive_same_failure_rounds += 1
-            if (
-                self._consecutive_same_failure_rounds
-                >= self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS
-            ):
-                # Genuinely stuck — fall through to terminate.
-                self._safe_phase_call("verification_failed", "verification_failed")
-                self.plan_state.stop_verification_loop(
-                    "same_failure_repeated_after_max_attempts"
+        #
+        # 2026-10-22 (v2): the count is per decision key, so a key that
+        # failed in the previous round *and* in this one repeated, while
+        # a key that failed for the first time (or that changed its
+        # failure class) starts over.
+        #
+        # The count is the number of rounds the failure has repeated —
+        # one on the round it first failed. The counts of the failures
+        # that stopped are kept: the file is a tally of what each
+        # failure has cost, not just of what failed last.
+        previous_failed_keys = self._previous_failed_keys
+        counts = dict(self._same_failure_counts)
+        for key in current_failed_keys:
+            name = _decision_key_str(key)
+            if not _is_counted_failure(key):
+                # An infrastructure blip (or an out-of-scope check) is
+                # not evidence that the work is wrong — it must not
+                # move the same-cause counter.
+                continue
+            counts[name] = (
+                self._same_failure_counts.get(name, 0) + 1
+                if key in previous_failed_keys
+                else 1
+            )
+        self._same_failure_counts = counts
+        # The keys of *this* round — the counts above are now the
+        # current round's view of what repeated.
+        self._previous_failed_keys = current_failed_keys
+
+        # 2026-10-22 (triage): reaching the cap no longer terminates the
+        # chain on its own. It buys ONE semantic triage call, and the
+        # triage's verdict decides between stopping (a human has to
+        # look) and diverting into the repair path.
+        #
+        # 2026-10-22 (criterion replacement): a third outcome — the
+        # triage's proposal was used, and the criterion was replaced on
+        # disk. The points that were obsoleted this round are recorded
+        # here, because the report still lists them as failed: their
+        # criterion no longer exists, so reworking the deliverable for
+        # them is work nobody asked for.
+        obsoleted_vp_ids: List[str] = []
+        criterion_replacements: List[Dict[str, Any]] = []
+        # 2026-10-23 (VP-020): why a proposed replacement was not used
+        # (a write that failed, a proposal that checked less). The
+        # round's record carries it, so the operator can read *why* the
+        # criterion was not replaced instead of finding no replacement
+        # and no explanation.
+        replacement_rejected_reason: Optional[str] = None
+        stuck_keys = self._stuck_failure_keys()
+        if stuck_keys:
+            decision = self.classify_cycle(
+                stuck_keys[0], report, round_number,
+            )
+            obsoleted_vp_ids = [
+                str(vp_id) for vp_id in decision.get("obsoleted_vp_ids") or []
+            ]
+            if decision.get("criterion_replacement"):
+                criterion_replacements.append(
+                    dict(decision["criterion_replacement"]),
                 )
-                return {
+            if decision.get("replacement_rejected_reason"):
+                replacement_rejected_reason = str(
+                    decision["replacement_rejected_reason"]
+                )
+            if decision.get("should_stop"):
+                # Genuinely stuck, and the triage said why. The
+                # machine-facing code (the state machine's vocabulary is
+                # closed) is the convergence verdict; the structured
+                # triage verdict below is what the caller — and the
+                # human reading the card — needs.
+                self._safe_phase_call(
+                    "verification_failed", "verification_failed",
+                )
+                stop_payload = {
                     "should_continue": False,
                     "should_stop": True,
+                    # The machine-facing code, spelled out as a literal
+                    # on purpose: the vocabulary guard in
+                    # ``tests/unit/test_verification_terminal_state_machine.py``
+                    # reads this function's return literals to prove that
+                    # every reason it can return is classified as
+                    # chain-ending. It is the one spelling of this code
+                    # in the function — the reason below is built from
+                    # it. The *precise* reason — a broken criterion, or a
+                    # triage that could not conclude — is the verdict
+                    # the reason carries.
                     "stop_reason": "same_failure_repeated_after_max_attempts",
                     "repair_tasks": [],
                     # 2026-10-23 — the gate never ran on this path.
@@ -561,30 +2382,62 @@ class VerificationOrchestrator:
                     "needs_operator_decision": False,
                     "waiting_for_user": False,
                     "status": "loop_stopped",
+                    # 2026-10-25 (VP-031): the points this round voided —
+                    # the operator still has to act on them, and the
+                    # terminal verdict has to say which ones.
+                    "void_vp_ids": sorted(void_vp_ids),
+                    "undefined_vp_ids": sorted(undefined_vp_ids),
+                    "operator_action": operator_action,
                 }
-            # Not yet at the cap — log and continue, generating
-            # repair tasks again so the executor can try once more.
-            _logger = getattr(self, "logger", None)
-            if _logger is not None:
-                try:
-                    _logger.warning(
-                        "verification_same_failures_persisting",
-                        f"Same failures persisted for "
-                        f"{self._consecutive_same_failure_rounds}/"
-                        f"{self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS} rounds — "
-                        f"regenerating repair tasks",
-                        data={
-                            "plan_id": getattr(self.plan_dir, "name", "?"),
-                            "failed_vps": sorted(current_failed_ids),
-                            "consecutive_rounds": self._consecutive_same_failure_rounds,
-                            "max_consecutive_rounds": self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS,
-                        },
-                    )
-                except Exception:
-                    pass
-        else:
-            # Different (or first) failure set — reset counter.
-            self._consecutive_same_failure_rounds = 0
+                # The reason is the code *and* the verdict: a string to
+                # every consumer that compares a stop reason against the
+                # state machine's vocabulary, and the triage's own
+                # words to the human who has to act on it.
+                stop_payload["stop_reason"] = TriageStopReason(
+                    stop_payload["stop_reason"],
+                    decision.get("stop_reason") or {},
+                )
+                self.plan_state.stop_verification_loop(
+                    stop_reason_code(stop_payload)
+                )
+                self._save_triage_verdict(
+                    decision.get("stop_reason") or {}, round_number,
+                )
+                return stop_payload
+            if decision.get("void_counter"):
+                # The triage decided what this failure is, so the
+                # same-cause counter starts over for it: the loop has
+                # earned a fresh budget instead of a stop.
+                self._same_failure_counts[
+                    _decision_key_str(stuck_keys[0])
+                ] = 0
+        # Not yet at the cap — log and continue, generating
+        # repair tasks again so the executor can try once more.
+        _logger = getattr(self, "logger", None)
+        if _logger is not None and self._consecutive_same_failure_rounds > 0:
+            try:
+                _logger.warning(
+                    "verification_same_failures_persisting",
+                    f"Same failures persisted for "
+                    f"{self._consecutive_same_failure_rounds}/"
+                    f"{self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS} rounds — "
+                    f"regenerating repair tasks",
+                    data={
+                        "plan_id": getattr(self.plan_dir, "name", "?"),
+                        "failed_vps": sorted(current_failed_ids),
+                        "repeated_keys": sorted(
+                            _decision_key_str(key)
+                            for key in current_failed_keys
+                            if self._same_failure_counts.get(
+                                _decision_key_str(key), 0
+                            ) > 1
+                        ),
+                        "consecutive_rounds": self._consecutive_same_failure_rounds,
+                        "max_consecutive_rounds": self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS,
+                    },
+                )
+            except Exception:
+                pass
 
         # (1) Round limit — soft only. Verification must keep
         # iterating until all failures are fixed (or same-failure-repeated
@@ -614,7 +2467,10 @@ class VerificationOrchestrator:
         # must never be able to destroy the round's actual work, so it is
         # now best-effort with a force-set fallback.
         self._safe_phase_call("verification_failed", "verification_failed")
-        self._previous_failed_ids = current_failed_ids
+        # 2026-10-22 (v2): the recorded state is the round's decision
+        # keys (point + failure class), not the bare point ids — those
+        # were already set above, where the counts were computed.
+        self._last_round = round_number
         # 2026-09-19: record the round's failure set (and the repeat
         # counter that was bumped / reset just above) on disk. This is
         # the only write the comparison at the top of the next round
@@ -641,7 +2497,17 @@ class VerificationOrchestrator:
         # next round's prompt isn't polluted with stale failures), then
         # persist so a freshly-constructed orchestrator (the auto-loop
         # builds one per post-repair round) reads the same history back.
-        _failure_history_mod.prune(self._failure_history, current_failed_ids)
+        # 2026-10-25 (VP-031): a point the plan never defined is **not**
+        # a failure of the deliverable, but it is still an open item — the
+        # plan's owner has to void it or express its criterion. Pruning it
+        # away would erase the audit trail of a record nobody may repair,
+        # so it stays in the history: ``save`` settles it to
+        # ``criterion_defect`` and marks it reconciled, and the file keeps
+        # it for the operator to look at.
+        _failure_history_mod.prune(
+            self._failure_history, current_failed_ids | undefined_vp_ids,
+        )
+
         _failure_history_mod.save(self.plan_dir, self._failure_history)
 
         # Build feedback dict: vp_id -> previous attempts (excluding
@@ -686,6 +2552,30 @@ class VerificationOrchestrator:
             self.plan_dir / "verification_report.json",
             self.plan_dir / "verification_plan.json",
         )
+        # 2026-10-22 (retired criteria): the same filter the failure
+        # set got above — a point the plan retired produces no repair
+        # task. Its criterion is gone, so reworking the deliverable for
+        # it is work nobody asked for.
+        retired_failed_vps = [
+            vp for vp in failed_vps
+            if str(vp.get("id") or "") in obsolete_vp_ids
+        ]
+        if retired_failed_vps:
+            failed_vps = [
+                vp for vp in failed_vps
+                if str(vp.get("id") or "") not in obsolete_vp_ids
+            ]
+        # 2026-10-22 (criterion replacement): a point whose criterion was
+        # replaced this round is gone — the criterion it failed against
+        # does not exist any more, so a repair task for it would be work
+        # nobody asked for. The report still lists it (the round that
+        # replaced it is the round that saw it fail), so it has to be
+        # dropped here, before the split and repair paths see it.
+        if obsoleted_vp_ids:
+            failed_vps = [
+                vp for vp in failed_vps
+                if str(vp.get("id") or "") not in obsoleted_vp_ids
+            ]
         # 2026-09-14 — repair vs split 判断.
         #
         # 修复任务生成器同时充当判断者：对一个失败的 VP，决定是生成
@@ -697,13 +2587,39 @@ class VerificationOrchestrator:
         # 入 state.db，下一轮验证跑子 VP。判 repair 的走原有流程。
         # 任何异常都回退"全部走 repair" —— 拆分是优化路径，绝不能成为
         # 新的搁浅原因。
-        repair_candidates = failed_vps
+        # 2026-10-23 (VP-026): the four failure classes each buy a
+        # different remedy, and the table that says which is
+        # ``verification.failure_triage.disposition_for`` — the same
+        # table the same-cause counter reads, so the two can never
+        # disagree about what a failure is.
+        #
+        # The split happens here, before the repair model is asked
+        # anything: only a broken deliverable is reworked. An infra
+        # failure is retried (another attempt, not another rework), a
+        # broken criterion is retired by the triage, and an out-of-scope
+        # check is put to a human — the question is asked on the spot,
+        # by the product, not by whoever reads the log afterwards.
+        repair_candidates, deferred_vps = self._route_failed_vps(
+            failed_vps, round_number,
+        )
+        if deferred_vps:
+            print(
+                f"[Repair] round {round_number}: "
+                f"{len(deferred_vps)} failed VP(s) are not broken "
+                f"deliverables — no repair task generated for "
+                f"{', '.join(item['id'] for item in deferred_vps)}"
+            )
+            for item in deferred_vps:
+                print(
+                    f"[Repair]   {item['id'] or '<unnamed VP>'}: "
+                    f"{item['failure_class']} — {item['disposition']}"
+                )
         vp_splits: List[Dict[str, Any]] = []
         # ``_apply_vp_split_decisions`` never raises — any failure inside
         # the judge/splitter degrades to "repair everything", so the
         # split path can't become a new stranding cause.
         repair_candidates, vp_splits = self._apply_vp_split_decisions(
-            failed_vps, round_number,
+            repair_candidates, round_number,
         )
 
         # 2026-09-14 — a FAILED generation must not masquerade as "no
@@ -774,14 +2690,40 @@ class VerificationOrchestrator:
                     f"{gen_exc}"
                 )
         else:
-            # Every failure was routed to a split — there is nothing for
+            # Every failure was either routed to a split, retired by the
+            # plan, or bought a different remedy — there is nothing for
             # the repair LLM to do. Skipping the call (instead of asking
             # for an empty list) keeps the "no repair tasks" outcome
             # unambiguous for the auto-loop's split branch.
-            print(
-                f"[Repair] round {round_number}: all {len(failed_vps)} "
-                f"failed VP(s) routed to split — no repair tasks generated"
-            )
+            #
+            # 2026-10-22 (retired criteria): the two are told apart in
+            # the log. "all N routed to split" is a lie about a round
+            # whose failures were retired — nothing was split there,
+            # and an operator reading the log would go looking for a
+            # split that never happened.
+            #
+            # 2026-10-23 (VP-026): the same is true of a failure that
+            # bought another remedy — an out-of-scope check is a
+            # question for a human, not a split and not a repair.
+            if retired_failed_vps:
+                print(
+                    f"[Repair] round {round_number}: "
+                    f"{len(retired_failed_vps)} failed VP(s) retired by "
+                    f"the plan, {len(failed_vps)} routed to split — no "
+                    f"repair tasks generated"
+                )
+            elif deferred_vps:
+                print(
+                    f"[Repair] round {round_number}: no broken deliverable "
+                    f"among the {len(failed_vps)} failed VP(s) — no repair "
+                    f"tasks generated"
+                )
+            else:
+                print(
+                    f"[Repair] round {round_number}: all "
+                    f"{len(failed_vps)} failed VP(s) routed to split — no "
+                    f"repair tasks generated"
+                )
         # 2026-10-23 — the intent gate (R4). The model was *asked* whether
         # its fix crosses the plan's own constraint, and the answer is
         # only as good as the model's reading of it; the gate re-checks
@@ -1113,8 +3055,37 @@ class VerificationOrchestrator:
             # requirement gives way.
             "intent_conflicts": intent_conflicts,
             "needs_operator_decision": bool(intent_conflicts),
+            # 2026-10-23 (VP-026): the failures that got no repair task
+            # because their class buys a different remedy. Each entry is
+            # ``{"id", "failure_class", "disposition"}`` — plus the
+            # ``decision_id`` of the question an out-of-scope check was
+            # put to. A failure that got no task is exactly what an
+            # operator asks about, so the round says which one it was
+            # and why.
+            "deferred_vps": deferred_vps,
+            # 2026-10-22 (criterion replacement): the criteria this
+            # round replaced. Each entry is
+            # ``{"vp_id", "failure_class", "replaced_by"}`` — the same
+            # shape as the OBSOLETE verdict written to the state
+            # machine, so a caller can read the round's decision from
+            # either side.
+            "criterion_replacements": criterion_replacements,
+            # 2026-10-23 (VP-020): why the proposed replacement was not
+            # used — ``persist_failed`` (the write did not land),
+            # ``weaker_method`` (the proposal checked less than the
+            # criterion it replaces) or ``invalid_proposal``. ``None``
+            # when no replacement was proposed or the replacement landed.
+            "replacement_rejected_reason": replacement_rejected_reason,
             "waiting_for_user": False,
             "status": "verification_failed",
+            # 2026-10-25 (VP-031): the points this round voided — the
+            # ones the plan never defined. They are not failures of the
+            # deliverable, so they got no repair task; the operator still
+            # has to void them or express their criterion, and the exit
+            # says which ones and what to do about them.
+            "void_vp_ids": sorted(void_vp_ids),
+            "undefined_vp_ids": sorted(undefined_vp_ids),
+            "operator_action": operator_action,
         }
 
     def _load_disk_task_titles(self) -> Dict[str, str]:
@@ -1423,6 +3394,74 @@ class VerificationOrchestrator:
             failed_ids.add(d.get("verification_point_id", ""))
         return {fid for fid in failed_ids if fid}
 
+    def _extract_failed_keys(self, report: dict) -> set:
+        """The ``(verification point, failure class)`` pairs that failed.
+
+        2026-10-22 (v2): the same-cause counter is per pair, so the
+        class is part of the identity of a failure. A point that fails
+        again for a *different* reason is a different failure and must
+        not be counted as the same cause.
+
+        The class is the one the verdict carries. A report that names
+        none reads as ``deliverable_defect`` — the only class whose
+        verdict is safe to act on when nobody has said otherwise (the
+        other three either do not count or demand a human). That
+        defaulting is :func:`verification.failure_triage.decision_key`'s,
+        and this method goes through it rather than re-deriving the
+        rule.
+
+        The points walked are the ones :meth:`_extract_failed_ids`
+        walks — the top-level results plus the last round's snapshot —
+        and the first occurrence of a point wins, because the top-level
+        list is the freshest.
+        """
+        from verification import failure_triage
+
+        classes: Dict[str, str] = {}
+
+        def _class_of(vp_id: str, entry: Dict[str, Any]) -> str:
+            key = failure_triage.decision_key(vp_id, entry.get("failure_class"))
+            if not key:
+                return ""
+            _, _, failure_class = key.partition(_DECISION_KEY_SEPARATOR)
+            return failure_class
+
+        results_lists: List[List[Dict[str, Any]]] = []
+        top_level = report.get("verification_results") or []
+        if top_level:
+            results_lists.append(top_level)
+        rounds_field = report.get("rounds") or []
+        if isinstance(rounds_field, list) and rounds_field:
+            last_round = rounds_field[-1] if isinstance(rounds_field[-1], dict) else {}
+            last_results = last_round.get("results") or []
+            if isinstance(last_results, list) and last_results:
+                results_lists.append(last_results)
+
+        for results_list in results_lists:
+            for r in results_list:
+                if not isinstance(r, dict):
+                    continue
+                if r.get("status") not in ("FAILED", "timeout", "SPLIT", "hard_timeout"):
+                    continue
+                vp_id = str(r.get("id") or "").strip()
+                if not vp_id or vp_id in classes:
+                    continue
+                failure_class = _class_of(vp_id, r)
+                if failure_class:
+                    classes[vp_id] = failure_class
+
+        for d in report.get("requirement_deviations", []) or []:
+            if not isinstance(d, dict):
+                continue
+            vp_id = str(d.get("verification_point_id") or "").strip()
+            if not vp_id or vp_id in classes:
+                continue
+            failure_class = _class_of(vp_id, d)
+            if failure_class:
+                classes[vp_id] = failure_class
+
+        return {(vp_id, failure_class) for vp_id, failure_class in classes.items()}
+
     def _extract_failed_vps_with_evidence(self, report: dict) -> Dict[str, Dict[str, Any]]:
         """Like :meth:`_extract_failed_ids` but returns the full
         ``actual_result`` / ``evidence`` text per VP.
@@ -1465,5 +3504,14 @@ class VerificationOrchestrator:
                 out[vp_id] = {
                     "actual_result": str(r.get("actual_result", "") or ""),
                     "evidence": str(r.get("evidence", "") or ""),
+                    # 2026-10-23 (VP-026): the class the verdict recorded.
+                    # Without it the history records every failure as
+                    # ``deliverable_defect`` — the class that counts —
+                    # and the triage reads a history that says every
+                    # failure was a broken deliverable.
+                    "failure_class": str(r.get("failure_class", "") or ""),
+                    "failure_class_source": str(
+                        r.get("failure_class_source", "") or ""
+                    ),
                 }
         return out

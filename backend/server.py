@@ -18,7 +18,7 @@ import time
 import atexit
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple, Any, Union
 
@@ -114,6 +114,16 @@ from config_paths import (
     resolve_server_host,
     resolve_state_db_path,
 )
+
+# ---------------------------------------------------------------------------
+# hitl.service — the human-in-the-loop decision service
+# ---------------------------------------------------------------------------
+# Imported flat, like every other ``backend/*.py`` module: it resolves
+# only while ``backend/`` is on ``sys.path``.  Only the expiry sweep is
+# needed here — the HTTP surface asks, lists and answers through
+# ``routes/hitl.py`` — and it is imported by name so that the sweep the
+# heartbeat runs is a name the suite can replace.
+from hitl.service import expire_due
 
 # ---------------------------------------------------------------------------
 # service_manager (orphan-process reaping) — resolved once, at import time
@@ -816,6 +826,14 @@ class HeartbeatMonitor:
     Both checks are idempotent: if status is not 'running' the check is a
     no-op, and only the in-memory state is touched (plan_state transition
     is best-effort and skipped if already terminal).
+
+    On each tick the monitor also runs the **human-in-the-loop expiry
+    sweep**: an ``auto`` decision nobody answered ends by itself when its
+    deadline passes — the stored ``default_option`` becomes the answer and
+    the decision ends ``defaulted`` (``hitl.service.expire_due``).  The
+    sweep runs on every tick, including on an idle server: a plan waiting
+    for a human is not running, so "nothing is in flight" is exactly when
+    a missed deadline still has to be noticed.
     """
 
     def __init__(self, interval: float = HEARTBEAT_INTERVAL):
@@ -840,13 +858,72 @@ class HeartbeatMonitor:
         self._thread = None
 
     def _loop(self) -> None:
+        """The monitor's daemon loop: one tick per ``interval``.
+
+        The tick is a method of its own so that a single iteration can
+        be driven without a thread — the sweeps it runs have to be
+        testable one at a time.
+
+        The guard around the tick is the last line of defence: a
+        daemon thread that died would stop every sweep for the rest of
+        the process' life, and nothing would report it.
+        """
         while not self._stop_event.is_set():
             try:
-                self._check_once()
-            except Exception:
-                pass
+                self._tick()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("heartbeat tick failed: %s", exc)
             if self._stop_event.wait(self.interval):
                 break
+
+    def _tick(self) -> None:
+        """One tick of the monitor.
+
+        Two sweeps, in this order: the liveness sweep (``_check_once``)
+        and the human-in-the-loop expiry sweep.
+
+        The expiry sweep runs **after** the liveness sweep, not inside
+        it.  ``_check_once`` returns immediately when no plan is in
+        flight — and a plan waiting for a human is not running, so an
+        idle server is exactly the case where a missed deadline has to
+        be noticed.  A sweep inside ``_check_once`` would resolve the
+        overdue decisions only while some other plan happened to be
+        running.
+
+        Neither sweep can take the monitor down: a failure is logged
+        and the next tick runs.
+        """
+        try:
+            self._check_once()
+        except Exception:
+            pass
+        self._expire_hitl_decisions()
+
+    def _expire_hitl_decisions(self) -> None:
+        """Resolve the human-in-the-loop decisions whose deadline passed.
+
+        An ``auto`` decision nobody answered ends by itself when its
+        deadline passes: the stored ``default_option`` becomes the
+        answer and the decision ends ``defaulted``.  ``expire_due``
+        knows *how*; the tick knows *when* — and this monitor is the
+        thing that runs every 30 seconds, whether or not a plan is in
+        flight.
+
+        A failure here is logged and swallowed.  The sweep writes to a
+        database another thread may be writing to, and a monitor that
+        died on its first expiry would leave every later decision
+        waiting forever — silently, because the loop swallows what
+        the tick raises.
+        """
+        try:
+            migrated = expire_due(now=datetime.now(timezone.utc))
+        except Exception as exc:
+            logger.warning("hitl expiry sweep failed: %s", exc)
+            return
+        if migrated:
+            logger.info(
+                "hitl expiry sweep resolved %d overdue decision(s)", migrated
+            )
 
     def _check_once(self) -> None:
         # 2026-09-06: stamp the watchdog sweep before any early-exit so
@@ -2804,6 +2881,29 @@ from routes.verification import (  # noqa: E402,F401
 )
 
 app.include_router(_routes_verification.router)
+
+
+# --- routes/hitl.py -----------------------------------------------
+# The human-in-the-loop decision endpoints: ask a human, list what a
+# plan is waiting for, answer.
+#
+# Mounted here for the same reason the routers above are: this block
+# runs before the frontend catch-all at the bottom of the file.  For
+# the other routers that ordering is belt-and-braces — they are POSTs
+# and the catch-all is a GET — but the list endpoint is a GET, so the
+# ordering is load-bearing: a route registered after the catch-all
+# would never be reached, and the request would be answered with
+# ``index.html`` instead of the decision list.
+from routes import hitl as _routes_hitl  # noqa: E402
+from routes.hitl import (  # noqa: E402,F401
+    AnswerDecisionRequest,
+    CreateDecisionRequest,
+    answer_hitl_decision,
+    create_hitl_decision,
+    list_hitl_decisions,
+)
+
+app.include_router(_routes_hitl.router)
 
 
 # --- verification_loop.py ----------------------------------------

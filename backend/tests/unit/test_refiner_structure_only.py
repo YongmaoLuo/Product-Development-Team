@@ -62,8 +62,24 @@ def test_refine_routes_structural_changes_through_mutate_structure():
     result = refiner.refine(
         requirement="test requirement",
         tasks=[
-            {"id": "2", "title": "parent", "status": "pending"},
-            {"id": "3", "title": "downstream", "depends_on": ["2"], "status": "pending"},
+            {
+                "id": "2",
+                "title": "parent",
+                "status": "pending",
+                # The row states what "done" looks like, so the
+                # necessity audit judges its acceptance; a row that
+                # states no acceptance is refused the split before the
+                # model is asked (see
+                # tests/integration/test_refiner_necessity_step0.py).
+                "acceptance_criteria": "the parent task is split into children",
+            },
+            {
+                "id": "3",
+                "title": "downstream",
+                "depends_on": ["2"],
+                "status": "pending",
+                "acceptance_criteria": "the downstream task waits for the children",
+            },
         ],
         last_coder_response="response",
         last_result="result",
@@ -215,12 +231,23 @@ def test_refine_routes_description_rewrite_through_mutate_structure():
     refiner.refine(
         requirement="test",
         tasks=[
-            {"id": "1", "title": "parent", "status": "pending"},
+            {
+                "id": "1",
+                "title": "parent",
+                "status": "pending",
+                # The row states what "done" looks like, so the
+                # necessity audit judges its acceptance; a row that
+                # states no acceptance is refused the split before the
+                # model is asked (see
+                # tests/integration/test_refiner_necessity_step0.py).
+                "acceptance_criteria": "the parent task is split into children",
+            },
             {
                 "id": "2-1",
                 "title": "downstream",
                 "depends_on": ["1"],
                 "status": "pending",
+                "acceptance_criteria": "the downstream task waits for the children",
             },
         ],
         last_coder_response="r",

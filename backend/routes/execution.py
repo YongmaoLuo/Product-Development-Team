@@ -2415,6 +2415,14 @@ def get_execution_progress(plan_id: str):
         else:
             execution_status = "not_started"
 
+    # The plan's outstanding human decisions.  The same block the plan
+    # summary carries, so a consumer that polls the progress endpoints
+    # reads the same shape it reads from the summary.  Imported here
+    # rather than at module scope: ``routes.plans`` reaches back into
+    # this module, and a module-level import between the two would be a
+    # cycle.
+    from routes.plans import _pending_decisions_block
+
     return {
         "plan_id": plan_id,
         "pid": s.get("pid"),
@@ -2424,6 +2432,9 @@ def get_execution_progress(plan_id: str):
         "current": current,
         "next": next_task,
         "counts": counts,
+        # Always present — an empty block means "nothing is
+        # outstanding", which is an answer, not a missing key.
+        "pending_decisions": _pending_decisions_block(plan_id),
         # What the executor is doing when no task row says. ``current``
         # is derived from ``plan_tasks`` and is None across every window
         # the executor spends on work that is not a task — the refiner

@@ -58,8 +58,22 @@ router = APIRouter()
 import server as _server  # noqa: E402  (late binding — see the module docstring)
 
 
+class StartInterviewRequest(_server.StartInterviewRequest):
+    """``POST /api/interview/start``'s body, plus the plan's hook binding.
+
+    The two extra fields say which session created the plan and where a
+    human-in-the-loop question about it should be delivered.  Both are
+    optional and mean exactly what they mean on ``POST /api/plan/import``:
+    a plan started without them asks nobody, which is the right answer
+    for a plan started by a bare ``curl`` rather than a failure.
+    """
+
+    hook_destination: Optional[str] = None
+    hook_session_id: Optional[str] = None
+
+
 @router.post("/api/interview/start")
-def start_interview(req: _server.StartInterviewRequest):
+def start_interview(req: StartInterviewRequest):
     """Start a new interview."""
     from datetime import datetime
 
@@ -113,6 +127,24 @@ def start_interview(req: _server.StartInterviewRequest):
     plan_id = req.plan_id or derive_plan_id(requirement, max_len=20)
     plan_dir = _server._plan_dir(plan_id)
     plan_dir.mkdir(parents=True, exist_ok=True)
+
+    # The plan's hook binding: the session it was created in, and where a
+    # human-in-the-loop question about it goes.  The helper is the fast
+    # lane's, so both plan-creation doors record the origin the same way
+    # — one rule, one implementation.  It is imported here rather than at
+    # the top of the module because ``routes.fast_lane`` late-binds into
+    # ``server``, which imports this module: a module-level import would
+    # be a cycle.
+    from routes.fast_lane import bind_hook_for_plan
+
+    # Read with ``getattr`` so a caller that hands this handler the older
+    # request model (which has no hook fields) still creates a plan — one
+    # that asks nobody.
+    bind_hook_for_plan(
+        plan_dir,
+        getattr(req, "hook_destination", None),
+        getattr(req, "hook_session_id", None),
+    )
 
     # Task #3.9: seed a ``plan_routing`` row with ``stage='interview'``
     # at plan creation so the interview phase is tracked in SQLite

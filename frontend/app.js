@@ -1287,6 +1287,10 @@ function updateVerificationVisibility(status) {
 function renderVerificationPanel(data) {
     if (!data) return;
 
+    // The verification progress carries the plan's outstanding human
+    // decisions; the plan page shows them as a read-only count.
+    if (data.pending_decisions) renderPendingDecisions(data.pending_decisions);
+
     const status = data.verification_status || data.status || "pending";
     const round = data.current_round ?? data.verification_round ?? 0;
     const maxRounds = data.max_rounds ?? data.verification_max_rounds ?? 4;
@@ -1372,6 +1376,10 @@ async function fetchVerificationStatus() {
             data.failed_vps = progressResp.failed_vps || [];
             data.skipped_vps = progressResp.skipped_vps || [];
             data.current_vp = progressResp.current_vp;
+            // The progress projection carries the plan's outstanding
+            // human decisions. Carried over here so the panel that
+            // renders this payload can show them.
+            data.pending_decisions = progressResp.pending_decisions;
         }
         window.verificationState = data;
         renderVerificationPanel(data);
@@ -1518,6 +1526,73 @@ async function resumeVerificationPanel(planId) {
 
 // --- Tasks View ---
 
+// --- Pending decisions (read-only) ---
+//
+// The plan's outstanding human decisions.
+//
+// The backend answers "how is this plan doing" with three
+// projections — the plan summary, the execution progress and the
+// verification progress — and all three carry the same
+// `pending_decisions` block: a count plus the items. This page reads
+// that block and shows it, because a plan that waits for a person
+// looks exactly like a plan that is simply not moving.
+//
+// Read-only on purpose. Answering a decision is an HTTP exchange the
+// operator performs outside this page — the PRD keeps the interactive
+// card and the buttons out of it — so there is no button here and this
+// file never asks the decision service for anything.
+//
+// Every string reaches the DOM through `textContent`. `question` and
+// `decision_id` are free text written by whoever raised the decision:
+// a decision that says `<img src=x onerror=...>` has to render as
+// those characters, not as markup.
+
+//: What the block reads when nothing has told it otherwise. The
+//: projection degrades to an empty block every time the decision table
+//: cannot be read, so "0 条" is the honest answer for a plan whose
+//: decisions nobody could read.
+const PENDING_DECISIONS_EMPTY = "待决策 0 条";
+
+// The block's host on the plan page. Created on demand so the page
+// carries no empty placeholder for it, and placed under the plan
+// page's heading — the count of the decisions that are waiting is the
+// first thing the page has to say.
+function pendingDecisionsHost() {
+    const view = $("#tasks-view");
+    if (!view) return null;
+    let host = view.querySelector(".pending-decisions");
+    if (!host) {
+        host = document.createElement("div");
+        host.className = "pending-decisions";
+        host.textContent = PENDING_DECISIONS_EMPTY;
+        const heading = view.querySelector("h2");
+        view.insertBefore(host, heading ? heading.nextSibling : view.firstChild);
+    }
+    return host;
+}
+
+// Render one `pending_decisions` block.
+//
+// `block` is the projection's own shape — `{count, items}` — and it
+// may be missing entirely: a plan page that throws on a missing block
+// is a plan page that cannot be opened. A missing block and an empty
+// item list both render "待决策 0 条".
+function renderPendingDecisions(block) {
+    const host = pendingDecisionsHost();
+    if (!host) return;
+    const items = block && Array.isArray(block.items) ? block.items : [];
+    const declared = block && Number.isFinite(block.count) ? block.count : 0;
+    const count = items.length || declared;
+    const detail = items
+        .map((item) => {
+            const fields = item || {};
+            return [fields.decision_id, fields.question].filter(Boolean).join(" ");
+        })
+        .filter(Boolean)
+        .join("；");
+    host.textContent = detail ? `待决策 ${count} 条：${detail}` : `待决策 ${count} 条`;
+}
+
 // --- Usage panel (per-plan LLM accounting, 2026-09-21) ---
 //
 // Numbers come from GET /api/plan/{id}/usage, which aggregates CC
@@ -1653,8 +1728,18 @@ async function showTasksView(planId) {
 async function loadTasks(planId) {
     showLoading("加载任务...");
     try {
-        const data = await api("/tasks/" + planId);
-        renderTasks(data);
+        // The plan summary is read next to the task list because it
+        // carries the outstanding human decisions, which the plan page
+        // shows as a read-only count. The summary is fetched with its
+        // own catch: a summary that cannot be read must not take the
+        // task list down with it.
+        const [taskData, summary] = await Promise.all([
+            api("/tasks/" + planId),
+            api("/plan/" + planId + "/summary").catch(() => null),
+        ]);
+        renderTasks(Object.assign({}, taskData, {
+            pending_decisions: summary ? summary.pending_decisions : undefined,
+        }));
     } catch {
         $("#tasks-list").innerHTML = `
             <div class="empty-state">
@@ -1689,6 +1774,14 @@ async function generateTasks() {
 function renderTasks(data) {
     const container = $("#tasks-list");
     const tasks = data.tasks || [];
+
+    // The plan summary carries the outstanding human decisions; the
+    // plan page shows them as a read-only count above the task list.
+    // The guard keeps a payload that does not carry the block — the
+    // task list on its own — from overwriting a count that a fuller
+    // payload has already put there.
+    if (data.pending_decisions) renderPendingDecisions(data.pending_decisions);
+
     const counts = data.counts || {
         total: tasks.length,
         completed: 0,

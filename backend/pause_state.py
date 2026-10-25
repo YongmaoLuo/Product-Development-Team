@@ -34,7 +34,10 @@ The document
       "unfinished_tasks": [             # tasks never reached
         {"task_id": "3", "status": "in_progress"}
       ],
-      "verification_round": null        # set when the stop happened mid-review
+      "verification_round": null,       # set when the stop happened mid-review
+      "decision_id": "d1"               # optional: the HITL decision that
+                                        # caused the pause (absent when the
+                                        # pause had no decision behind it)
     }
 
 Both task lists are normalised to a **fixed key set** on the way in. That
@@ -44,6 +47,12 @@ is not tidiness for its own sake: a resume path that trusts
 ``KeyError`` at the worst possible moment. A caller that smuggles an
 extra key into an entry cannot smuggle it past here, so the on-disk
 contract stays the one this module documents.
+
+``decision_id`` is the one **optional** top-level key: it is written
+only when the caller supplies it, and is left out entirely otherwise.
+A key that is present-and-null says "there was a decision and we lost
+it", which is a different claim from the absent key's "no decision was
+involved" — and only the second one is true of most pauses.
 
 Degradation is the default, never an exception
 ----------------------------------------------
@@ -116,6 +125,12 @@ _INTERRUPTED_TASK_FIELDS = (
 #: Exact key set of an ``unfinished_tasks`` entry, in write order.
 _UNFINISHED_TASK_FIELDS = ("task_id", "status")
 
+#: Optional top-level key naming the HITL decision that caused the pause.
+#: Written only when the caller supplies one, and left out entirely
+#: otherwise — see the module docstring for why "absent" and "null" are
+#: not the same statement.
+_DECISION_ID_FIELD = "decision_id"
+
 #: The log event that carries a task→session binding. The executor
 #: writes one per attempt, with the session id under ``data``.
 _SESSION_BOUND_EVENT = "task_session_bound"
@@ -179,11 +194,12 @@ def write_pause_checkpoint(
     plan_dir: PathLike,
     *,
     kind: str,
-    project_dir: Optional[str],
-    reason: Optional[str],
-    interrupted_tasks: Optional[Iterable[Any]],
-    unfinished_tasks: Optional[Iterable[Any]],
+    project_dir: Optional[str] = None,
+    reason: Optional[str] = None,
+    interrupted_tasks: Optional[Iterable[Any]] = None,
+    unfinished_tasks: Optional[Iterable[Any]] = None,
     verification_round: Optional[Any] = None,
+    decision_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Record what ``stop`` interrupted, and return what was written.
 
@@ -196,6 +212,13 @@ def write_pause_checkpoint(
     there" is not a reason to lose the interruption record, and the
     failure would otherwise land as a confusing error much later, during
     the resume this file exists to enable.
+
+    ``decision_id`` names the HITL decision the pause was waiting on —
+    a strict-mode verification that hit its deadline passes the id of
+    the decision that timed out, so the resume path can find that
+    decision again instead of guessing which one it was. It is
+    **optional**: a pause with no decision behind it (a user-requested
+    stop, a crash) writes no such key at all, rather than a null one.
 
     The write is atomic (tempfile + ``os.replace``), so a stop killed
     mid-write leaves the previous checkpoint intact rather than a torn
@@ -216,6 +239,11 @@ def write_pause_checkpoint(
         "unfinished_tasks": _normalise_unfinished(unfinished_tasks),
         "verification_round": verification_round,
     }
+    # Written only when the caller names a decision. An absent key and a
+    # null one are different statements, and only the absent one is true
+    # of a pause that had no decision behind it.
+    if decision_id is not None:
+        checkpoint[_DECISION_ID_FIELD] = _text(decision_id)
 
     path = checkpoint_path(plan_dir)
     try:
@@ -324,20 +352,28 @@ def checkpoint_summary(plan_dir: PathLike) -> Optional[Dict[str, Any]]:
     """The projection a listing needs: what stopped, when, how much.
 
     Returns ``None`` when there is no checkpoint, and otherwise only the
-    five scalar fields — never the task bodies. A summary that carries
-    the task list is a second way to leak a plan's internals into a view
+    scalar fields — never the task bodies. A summary that carries the
+    task list is a second way to leak a plan's internals into a view
     that has no use for them.
+
+    ``decision_id`` is projected only when the checkpoint carries one,
+    for the same reason the writer omits it: a summary that always had
+    the key would claim a decision was behind every pause.
     """
     checkpoint = read_pause_checkpoint(plan_dir)
     if checkpoint is None:
         return None
-    return {
+    summary = {
         "paused_at": checkpoint.get("paused_at"),
         "kind": checkpoint.get("kind"),
         "project_dir": checkpoint.get("project_dir"),
         "interrupted_task_count": len(checkpoint.get("interrupted_tasks") or []),
         "verification_round": checkpoint.get("verification_round"),
     }
+    decision_id = checkpoint.get(_DECISION_ID_FIELD)
+    if decision_id is not None:
+        summary[_DECISION_ID_FIELD] = decision_id
+    return summary
 
 
 # ---------------------------------------------------------------------------

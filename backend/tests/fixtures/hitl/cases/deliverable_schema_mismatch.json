@@ -1,0 +1,42 @@
+{
+  "case": "deliverable_schema_mismatch",
+  "description": "The check is fine and the deliverable is not: the report the task produced is missing the field the check reads, so the work is wrong and has to be redone. The remedy is a repair task, which is what the plan moves on with, and the attempt counts against the same-cause counter. The repair needs to know which files to touch, so the sample carries both seeds the shared scope rule reads: the stack of the raw output and the diff of the failed attempt. The previous round was an infra failure, so it joins no same-cause group and leaves the counter for this class at zero.",
+  "source": "verification",
+  "verdict": {
+    "verdict": "FAILED",
+    "failure_class": "deliverable_defect",
+    "failure_class_source": "llm",
+    "actual_result": "FAILED tests/integration/test_report_schema.py::test_report_carries_checksum - AssertionError: report is missing the 'checksum' field\n  File \"backend/report/schema.py\", line 118, in build_report\n    return {\"status\": status, \"items\": items}\nE   AssertionError: report is missing the 'checksum' field",
+    "evidence_quote": "report is missing the 'checksum' field"
+  },
+  "failure_history": [
+    {
+      "round": 1,
+      "verdict": "FAILED",
+      "actual_result": "VerdictParseError: Invalid JSON: Expecting value: line 1 column 1",
+      "failure_class": "infra",
+      "failure_class_source": "deterministic",
+      "evidence_quote": "Expecting value"
+    }
+  ],
+  "verification_plan": {
+    "plan_id": "fixture-plan-006",
+    "verification_points": [
+      {
+        "id": "VP-003",
+        "verification_method": "full_ci",
+        "criterion": "the generated report carries the checksum the exporter writes",
+        "request": null,
+        "replacement": null,
+        "diff": [
+          "backend/report/schema.py"
+        ]
+      }
+    ]
+  },
+  "expected_disposition": {
+    "disposition": "repair_task_generated",
+    "defaulted": false,
+    "target_vp_id": "VP-003"
+  }
+}

@@ -16,7 +16,7 @@ import logging
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Set, Union
 
 # Module-level logger — surfaces provider-fallback resolution to
 # backend.log (or any Python logging handler). Distinct from
@@ -42,6 +42,7 @@ from executor import Executor
 from config_paths import resolve_state_db_path
 from git_manager import GitManager
 from refiner import TaskRefiner
+from refiner_necessity import command_source_paths
 from task import SubTask, UNKNOWN_MODIFICATIONS_SENTINEL, NO_FILE_CHANGES_SENTINEL
 from test_command_quality import inspect_command as inspect_test_command
 from test_command_quality import find_vacuous_pass as _find_vacuous_pass
@@ -87,6 +88,7 @@ from plan_sessions import (
     save_session_id,
     stable_session_id,
 )
+from hitl import service as hitl_service
 from utils.atomic_io import atomic_write_json
 from framework.task_graph import DanglingTaskDependency, find_dangling_references
 from framework.prompts import INLINE_SPEC_CODE_REVIEW_PROMPT
@@ -2147,6 +2149,261 @@ def _persist_task_session(
                 pass
 
 
+#: The largest file the necessity index will read.  The index exists
+#: to answer "is this test an empty shell", and a test source is not a
+#: megabyte; a file past this size is not one.
+_INDEX_FILE_LIMIT_BYTES = 512 * 1024
+
+
+def _necessity_project_index(
+    project_dir: Optional[Path],
+    tasks: List[Dict[str, Any]],
+    focus_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """What the project provides, for the split-time necessity audit.
+
+    The audit (:mod:`refiner_necessity`) is a pure function: it reads
+    what the project has and compares.  Reading the project is the
+    caller's job — this is that job.  Without an index the audit has
+    nothing to say, so the checks that need the project (the
+    ``pytest --collect-only`` probe, the empty-shell static check, the
+    environment check) would never fire outside the tests.
+
+    Three things are collected:
+
+    * ``files`` — the source of the test files the batch's acceptance
+      commands name, so the empty-shell check has something to read.
+    * ``probe_runner`` — the caller that runs ``pytest --collect-only``
+      and reports how many tests it collected.  The audit starts no
+      process: it hands the rewritten command to this callable.  Only
+      the round's own task is probed: one round refines one task, and
+      a probe is a process — probing the whole batch would make every
+      refinement pay for the size of the plan.
+    * ``env_vars`` / ``ports`` / ``services`` — what the project
+      declares, so the environment check can say whether a task's
+      requirement is there at all.
+
+    A section the project does not declare is left out entirely.  An
+    absent section means "the audit knows nothing about this"; an
+    empty one means "the project was asked and has nothing", and only
+    the second may make a task look environmentally impossible.
+    """
+    index: Dict[str, Any] = {}
+
+    if project_dir is None:
+        return index
+
+    root = Path(project_dir)
+    commands = _acceptance_commands(tasks)
+
+    sources: Dict[str, str] = {}
+    for command in commands:
+        for relative in command_source_paths(command):
+            if relative in sources:
+                continue
+            source = _read_project_file(root, relative)
+            if source is not None:
+                sources[relative] = source
+    if sources:
+        index["files"] = sources
+
+    focus_commands = _acceptance_commands(
+        [task for task in tasks if str(task.get("id")) == str(focus_id)]
+    )
+    if focus_commands:
+        index["probe_runner"] = _collect_only_runner(root, focus_commands)
+
+    for kind, names in _declared_environment(root).items():
+        if names:
+            index[kind] = sorted(names)
+
+    return index
+
+
+def _acceptance_commands(tasks: List[Dict[str, Any]]) -> List[str]:
+    """The acceptance commands of a batch of task rows, in order."""
+    commands: List[str] = []
+    for task in tasks or ():
+        if not isinstance(task, dict):
+            continue
+        command = task.get("test_command")
+        if not isinstance(command, str) or not command.strip():
+            values = task.get("test_commands")
+            command = values[0] if isinstance(values, list) and values else ""
+        if isinstance(command, str) and command.strip() and command not in commands:
+            commands.append(command.strip())
+    return commands
+
+
+def _read_project_file(root: Path, relative: str) -> Optional[str]:
+    """The source of a project file, or ``None`` when it is not there.
+
+    A path that escapes the project root is not read: the acceptance
+    command is task-authored, and the index must not hand the audit a
+    file from outside the project it is judging.  A file too large to
+    be a test source is not read either — the index is there to answer
+    "is this test an empty shell", not to copy the repository.
+    """
+    try:
+        candidate = (root / relative).resolve()
+        candidate.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    try:
+        if not candidate.is_file():
+            return None
+        if candidate.stat().st_size > _INDEX_FILE_LIMIT_BYTES:
+            return None
+        return candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _collect_only_runner(root: Path, commands: List[str]):
+    """A probe runner that answers "how many tests would this collect?".
+
+    The command arrives already rewritten into its collection-only
+    form.  It is run the way the executor runs a task's command — a
+    shell pipeline in the project directory — and the count is read
+    back out of pytest's own summary line.
+
+    Only the commands this runner was built for are answered.  A probe
+    is a process, and one round refines one task: probing every task of
+    the batch would make each refinement pay for the size of the plan.
+
+    An outcome that cannot be read is raised, not reported as a zero.
+    A zero is an answer ("this command collects nothing"); a timeout, a
+    crash or an unreadable summary is not, and the audit treats a
+    failed probe as no claim at all.
+    """
+    wanted = set(commands)
+    cache: Dict[str, int] = {}
+
+    def run(probe_command: str) -> int:
+        if probe_command in cache:
+            return cache[probe_command]
+        if not _probes_one_of(probe_command, wanted):
+            raise RuntimeError(
+                "collect-only probe is not available for this command"
+            )
+        try:
+            completed = run_bounded(
+                probe_command,
+                cwd=str(root),
+                timeout=120,
+                # The command is a task-authored shell pipeline, so the
+                # shell is required, and it is the thing being bounded:
+                # ``bounded_subprocess.run_bounded`` spawns it under its
+                # own process group so the timeout can kill the whole
+                # tree.  Bandit reports the flag on this call site as
+                # well as at the spawn; the reason it is accepted is the
+                # one recorded at the spawn itself.
+                shell=True,  # nosec B604 - task-authored pipeline, see above
+            )
+        except Exception as exc:
+            raise RuntimeError(f"collect-only probe failed: {exc}") from exc
+        count = _parse_collected_count(
+            (completed.stdout or "") + (completed.stderr or "")
+        )
+        if count is None:
+            raise RuntimeError(
+                "collect-only probe produced no readable count"
+            )
+        cache[probe_command] = count
+        return count
+
+    return run
+
+
+def _probes_one_of(probe_command: str, wanted: Set[str]) -> bool:
+    """Whether a rewritten probe belongs to one of the given commands.
+
+    The audit rewrites the command into its collection-only form
+    before handing it over: the probe is the original command with
+    ``--collect-only`` added.  Removing the flag again and comparing
+    the whole command is what tells the two apart — comparing tokens
+    would not, because every pytest command shares the words "pytest"
+    and "-q".
+    """
+    text = " ".join((probe_command or "").split())
+    without_flag = " ".join(text.replace("--collect-only", " ").split())
+    for command in wanted:
+        candidate = " ".join((command or "").split())
+        if text == candidate or without_flag == candidate:
+            return True
+    return False
+
+
+def _parse_collected_count(output: str) -> Optional[int]:
+    """How many tests pytest said it collected, or ``None``.
+
+    pytest prints ``collected 12 items`` for a normal collection and
+    ``no tests ran`` when it found none; with ``-q`` the summary reads
+    ``12 tests collected``.  A summary that says neither is not a
+    count, and reporting a zero for it would be a claim the run never
+    made.
+    """
+    text = output or ""
+    for pattern in (
+        r"collected\s+(\d+)\s+items?",
+        r"(\d+)\s+tests?\s+collected",
+    ):
+        found = re.search(pattern, text)
+        if found:
+            return int(found.group(1))
+    if re.search(r"no tests ran", text):
+        return 0
+    return None
+
+
+def _declared_environment(root: Path) -> Dict[str, Set[Any]]:
+    """The environment the project declares: variables, ports, services.
+
+    Only what the project states on disk counts.  A variable that
+    appears in ``.env.example`` is one the project knows about; a
+    service listed in a compose file is one it can run.
+    """
+    env_vars: Set[str] = set()
+    ports: Set[Any] = set()
+    services: Set[str] = set()
+
+    for name in (".env", ".env.example"):
+        path = root / name
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            if not key:
+                continue
+            env_vars.add(key)
+            value = value.strip().strip("'\"")
+            if key.upper().endswith("PORT") and value.isdigit():
+                ports.add(int(value))
+
+    for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yml"):
+        path = root / name
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for found in re.finditer(
+            r"^  ([A-Za-z0-9_.-]+):\s*$", text, flags=re.MULTILINE
+        ):
+            services.add(found.group(1))
+
+    return {"env_vars": env_vars, "ports": ports, "services": services}
+
+
 class AutonomousAgent:
     """Configurable autonomous agent for various task types."""
 
@@ -3989,9 +4246,41 @@ class AutonomousAgent:
             # (which append child tasks to ``self._active_tasks`` /
             # ``task_manager.tasks``) and just-completed tasks (which
             # become terminal) are reflected before the next layer build.
-            active_tasks = self._get_active_tasks_for_scheduling()
+            #
+            # The HITL gate is read once per round, for the same reason:
+            # a human may answer the question between two rounds, and
+            # the answer has to be able to release what it was holding.
+            decision_blocked = self._decision_blocked_tasks(self.plan_id)
+            active_tasks = self._get_active_tasks_for_scheduling(decision_blocked)
 
             if not active_tasks:
+                # The gate can empty this list without the plan being
+                # finished: what it holds is waiting for a human, not
+                # done.  Reporting "all tasks completed" here would be
+                # a lie, so the run stops with the reason that says
+                # what it is waiting for.
+                held = [
+                    t for t in (self._active_tasks or self.task_manager.tasks)
+                    if t.id in decision_blocked
+                    and t.status not in _TERMINAL_TASK_STATUSES
+                ]
+                if held:
+                    held_ids = [t.id for t in held]
+                    self.task_manager.set_stop_reason(
+                        "hitl_decision_pending",
+                        f"waiting for a human decision on: {', '.join(held_ids)}",
+                    )
+                    print(
+                        "\nPaused: waiting for a human decision on "
+                        f"{', '.join(held_ids)}"
+                    )
+                    if self.logger:
+                        self.logger.info(
+                            "execution_paused",
+                            "Execution paused: waiting for a HITL decision",
+                            data={"held_task_ids": held_ids},
+                        )
+                    break
                 if total_tasks > 0:
                     self.task_manager.set_stop_reason("success")
                     final_completed = sum(1 for t in self.task_manager.tasks if t.status == "completed")
@@ -4040,6 +4329,15 @@ class AutonomousAgent:
                         # so the blocker check must be repeated here or
                         # the loop detector fires every iteration.
                         if t.id in self._dispatcher_blocked:
+                            continue
+                        # HITL gate: a task an open decision holds — and
+                        # everything downstream of it — must not be
+                        # scheduled while the question is unanswered.
+                        # The check is repeated here for the same
+                        # reason the blocker check above is: this
+                        # micro-layer is rebuilt from ``self._all_tasks``,
+                        # not from the gated active view.
+                        if t.id in decision_blocked:
                             continue
                         # Principle 3 (2026-08-19 audit): hard-gate on
                         # depends_on. ``is_dependency_ready`` returns
@@ -4444,7 +4742,59 @@ class AutonomousAgent:
                 return True
             return False
 
-    def _get_active_tasks_for_scheduling(self) -> List[SubTask]:
+    def _decision_blocked_tasks(self, plan_id: str) -> Set[str]:
+        """The task ids an open HITL decision holds out of the schedule.
+
+        A plan can ask a human a question while it runs
+        (:mod:`hitl.service`).  While that question is unanswered, the
+        task it is about — and everything downstream of it — must not
+        be scheduled: the work would run on a premise the human has
+        not confirmed yet.  Every other task keeps running.
+
+        The set is **computed, never stored**.  The service owns that
+        computation; this method only asks for it.  No task status is
+        touched, so answering the question opens the gate again by
+        itself, and a plan without an open question schedules exactly
+        what it scheduled before.
+
+        The gate is **fail-open**.  If the service cannot answer — the
+        database is gone, the schema is not what it was, anything at
+        all — the plan keeps scheduling and the failure is logged.  A
+        gate that stopped the plan whenever it could not tell whether
+        a question was open would turn a broken lookup into a stuck
+        plan, and a stuck plan is worse than a question asked one
+        moment too late.
+
+        Parameters
+        ----------
+        plan_id:
+            The plan whose decisions and task graph are read.  An empty
+            id means "no plan", and a plan that does not exist has no
+            open decision.
+
+        Returns
+        -------
+        Set[str]
+            The task ids to keep out of the schedule.  Empty when
+            nothing is open — and empty when the lookup failed.
+        """
+        if not plan_id:
+            return set()
+        try:
+            return set(hitl_service.blocked_task_ids(plan_id))
+        except Exception as exc:  # noqa: BLE001 - the gate fails open, by design
+            log.warning(
+                "hitl_gate_unavailable: plan %s: %s: %s; scheduling "
+                "without the decision gate",
+                plan_id,
+                type(exc).__name__,
+                exc,
+            )
+            return set()
+
+    def _get_active_tasks_for_scheduling(
+        self, decision_blocked: Optional[Set[str]] = None
+    ) -> List[SubTask]:
         """Return the list of tasks eligible for scheduling, filtered.
 
         Prefers ``self._active_tasks`` when populated (the canonical
@@ -4466,17 +4816,33 @@ class AutonomousAgent:
         would re-emit them on the next iteration and trip the
         ``same_id_loop_detected`` guard every cycle until the user
         manually stops the run.
+        The tasks an open HITL decision holds back are excluded for
+        the same reason and with the same consequence: the work they
+        describe is waiting for a human, and the status the operator
+        sees stays untouched, so answering the question releases it.
+
+        ``decision_blocked`` is the gate's answer for this round.  A
+        caller that already has it (the dispatcher reads it once per
+        round, because the same set also filters the micro-layer it
+        picks) passes it in; a caller that does not has it read here.
         """
+        blocked = (
+            self._decision_blocked_tasks(self.plan_id)
+            if decision_blocked is None
+            else set(decision_blocked)
+        )
         if self._active_tasks:
             return [
                 t for t in self._active_tasks
                 if t.status not in _TERMINAL_TASK_STATUSES
                 and t.id not in self._dispatcher_blocked
+                and t.id not in blocked
             ]
         return [
             t for t in self.task_manager.tasks
             if t.status not in _TERMINAL_TASK_STATUSES
             and t.id not in self._dispatcher_blocked
+            and t.id not in blocked
         ]
 
     def _extract_target_files(self, task: SubTask) -> list[str]:
@@ -8780,7 +9146,14 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 last_result=result_context,
                 file_context="",  # no-bulk-context: drop the snapshot
                 exit_code=exit_code,
-                last_task_id=task.id
+                last_task_id=task.id,
+                # The necessity audit reads what the project provides.
+                # Without this the collect-only probe, the empty-shell
+                # check and the environment check never fire outside
+                # the tests.
+                project_index=_necessity_project_index(
+                    self.project_dir, current_tasks_dict, task.id
+                ),
             )
             # 2026-09-17 (C1): the refiner's parsed conclusion is an
             # auditable artifact, not just an in-memory return value.

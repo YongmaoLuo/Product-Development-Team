@@ -275,11 +275,22 @@ def iter_commit_sources(repo: Path, sha: str) -> Iterator[tuple[str, str]]:
     is parsed rather than asked for names only, so that non-blob entries --
     submodule commits, nested trees -- are dropped by *type* instead of
     being fed to ``cat-file`` and failing.
+
+    The listing is read with ``-z``. Without it git *quotes* a path that
+    holds a character it considers unusual -- an em dash, a quote, a
+    backslash -- and the quoted spelling is not the path: the blob spec
+    built from it names nothing, ``cat-file`` answers "missing", and the
+    scan refuses to report a clean result over a partial read. The NUL
+    form is the raw path, with the entries separated by a byte that cannot
+    occur in a name, so nothing has to be unescaped and nothing can be
+    truncated at a space.
     """
-    tree = _git(repo, ["ls-tree", "-r", sha])
+    tree = _git(repo, ["ls-tree", "-r", "-z", sha])
     paths: list[Path] = []
-    for line in tree.splitlines():
-        meta, _, path = line.partition("\t")
+    for entry in tree.split("\0"):
+        if not entry:
+            continue
+        meta, _, path = entry.partition("\t")
         fields = meta.split()
         if len(fields) < 3 or fields[1] != "blob":
             continue

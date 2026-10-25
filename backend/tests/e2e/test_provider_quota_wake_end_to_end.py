@@ -85,6 +85,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 import coding_tool  # noqa: E402
+import dynamic_provider_concurrency  # noqa: E402
 import provider_order  # noqa: E402
 import provider_routing  # noqa: E402
 from coding_tool import ClaudeCodingTool  # noqa: E402
@@ -370,6 +371,18 @@ def test_a_closed_window_is_slept_through_and_then_dispatched(
 
     _install_fake_claude(tmp_path, monkeypatch)
 
+    # The wake probes the quota window on a fixed beat, and the beat is
+    # the shared cooldown constant — five minutes in production.  This
+    # file's own subject is a wake SHORTER than the quota TTL (60 s): a
+    # wake that outlasts the TTL is handed the cached reading when it
+    # wakes, and the disagreement between the four moving parts (the
+    # read, the TTL cache, the stamp, the sleep) never gets a chance to
+    # appear.  The production cadence is not changed anywhere — the
+    # figure the wake reads is shortened for the length of this test, so
+    # the wake crosses the one-second window inside a single
+    # three-second beat rather than in three ten-second ones, and the
+    # case finishes inside the suite's own timeout.
+    #
     # The production beat is five minutes, which is longer than the
     # suite's own per-test timeout, so the figure is replaced for the
     # length of this test rather than in the code. The probe reads
@@ -378,7 +391,7 @@ def test_a_closed_window_is_slept_through_and_then_dispatched(
     # the figure below — the same sleep, the same forced re-read, a
     # beat the suite can afford.
     monkeypatch.setattr(
-        "dynamic_provider_concurrency.DEFAULT_COOLDOWN_SEC", PROBE_SEC
+        dynamic_provider_concurrency, "DEFAULT_COOLDOWN_SEC", PROBE_SEC,
     )
 
     usage = _Usage(WINDOW_SEC).start()

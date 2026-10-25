@@ -18,6 +18,14 @@ A second, bounded LLM call fills a missing acceptance command
 for rows the derived sources cannot answer for, and the assembler never
 calls a model at all.
 
+Which failures become a repair task at all is decided here, not by the
+model: :func:`select_repairable_failed_vps` keeps only the
+``deliverable_defect`` failures (the one class whose remedy is "redo the
+deliverable") and records why each of the others was refused. The edit
+scope of a row that declared none is derived by the shared rule
+(:func:`test_command_rules.derive_files_to_modify`) rather than by a
+second copy of the path-reading logic kept in this module.
+
 What does not live here, and why
 --------------------------------
 This module grew a requirement-driven chain first: understand the
@@ -48,6 +56,7 @@ from coding_tool import CodingTool, JsonSession, query_json_in_session
 from plan_sessions import stable_session_id
 from test_command_quality import check_falsifiable, inspect_command
 from verification_cancel import VerificationCancelled
+from test_command_rules import derive_files_to_modify
 from verification_persistence import VerificationPersistenceManager
 
 
@@ -198,6 +207,210 @@ class RepairGenerationError(RuntimeError):
         self.failed_vp_ids = list(failed_vp_ids or [])
 
 
+# ---------------------------------------------------------------------------
+# Which failed VPs may become a repair task
+# ---------------------------------------------------------------------------
+#
+# A repair task reworks the DELIVERABLE. That is the right remedy for one
+# failure class and the wrong remedy for the other three:
+#
+#   * ``deliverable_defect`` — the thing under verification is wrong.
+#     Redo it. This is the class a repair task exists for.
+#   * ``infra`` — the attempt malfunctioned (rate limit, timeout, an
+#     answer that could not be parsed). Another attempt is the remedy; a
+#     rework would touch a file that was never the problem.
+#   * ``criterion_defect`` — the verification point itself is wrong. No
+#     amount of reworking the deliverable satisfies it; a human has to
+#     fix the criterion.
+#   * ``out_of_scope`` — nobody agreed to build this. The remedy is
+#     nothing at all.
+#
+# The vocabulary is task 1's (``verification.failure_triage``) and the
+# "no class stated → the class that counts" rule is
+# ``verification.failure_history``'s. Both are imported INSIDE
+# :func:`select_repairable_failed_vps`, not at module scope: they live in
+# the ``verification`` package, whose ``__init__`` imports the
+# orchestrator, and the orchestrator imports this module — a module-level
+# import is an import cycle, measured rather than assumed
+# (``ImportError: cannot import name 'RepairTaskGenerator' from partially
+# initialised module 'repair_generator'``).
+
+
+def select_repairable_failed_vps(
+    failed_vps: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split failed VPs into the ones a repair task may be built from and
+    the ones that may not.
+
+    Only ``deliverable_defect`` may become a repair task. The other three
+    classes each want a different remedy (see the block above), and a
+    repair task built for one of them is work nobody asked for, pointed
+    at a file that may not be the problem at all.
+
+    A record that carries no class reads as ``deliverable_defect``: the
+    classification is newer than most verdicts, and "nobody said
+    otherwise" has always meant "repair it" — that is the historical
+    behaviour, kept so a plan whose verdicts predate the classification
+    keeps repairing exactly what it used to.
+
+    2026-10-25 (VP-031): a record that says the point has **no
+    definition** is refused on that ground alone, even when it carries
+    no class. The class is newer than most verdicts, so a record that
+    predates it would otherwise fall back to "repair it" — and a point
+    that was never written down has nothing a rework could satisfy. The
+    refusal says what a **human** has to do (void the point, or have
+    the plan's owner re-express the criterion), because the exit of a
+    ``verification_failed`` round is read by a person, not by a model.
+
+    Args:
+        failed_vps: The failed-VP records, in the shape
+            :func:`verification.verification_report_reader.extract_failed_vps_with_paths`
+            returns them.
+
+    Returns:
+        ``(repairable, filtered)``. ``repairable`` keeps the input order
+        and holds the records themselves. ``filtered`` holds one entry per
+        refused VP, each carrying its ``id``, the ``failure_class`` it was
+        refused for, and a ``reason`` naming what that class wants
+        instead.
+    """
+    from verification.failure_history import failure_class_of
+    from verification.failure_triage import (
+        CRITERION_DEFECT,
+        DELIVERABLE_DEFECT,
+        INFRA,
+        OUT_OF_SCOPE,
+    )
+
+    #: What each non-repairable class wants instead of a rework. The
+    #: wording is the operator's: the reason is read in a log line, and a
+    #: log line that says only "filtered" sends the reader looking for
+    #: the reason somewhere else. It says what a **human** has to do, not
+    #: "try again".
+    reasons = {
+        INFRA: (
+            "环境失败（infra）：该重试的是验证本身，不是重做产物；"
+            "不生成修复任务"
+        ),
+        CRITERION_DEFECT: (
+            "判据本身有缺陷（criterion_defect）：应由人修判据，重做产物不解决"
+        ),
+        OUT_OF_SCOPE: (
+            "越界检查（out_of_scope）：没有人要求建这个，不生成修复任务"
+        ),
+    }
+
+    #: The reason for a point that has no definition at all. It is
+    #: spelled out rather than reusing the generic ``criterion_defect``
+    #: wording, because the action here is concrete: there is no
+    #: criterion to fix — the point was never written down.
+    def _definition_missing_reason(vp_id: str) -> str:
+        return (
+            f"{vp_id} 在验证计划里没有定义（definition_missing）："
+            f"请作废该验证点，或由计划属主重新表达它的判据；"
+            f"执行器不得自行发明判据，重做产物也解决不了没有判据的问题，"
+            f"因此不生成修复任务"
+        )
+
+    repairable: List[Dict[str, Any]] = []
+    filtered: List[Dict[str, Any]] = []
+    for vp in failed_vps or []:
+        if not isinstance(vp, dict):
+            continue
+        vp_id = str(vp.get("id", "") or "")
+        # 2026-10-25 (VP-031): the fact that the point has no
+        # definition stands on its own. A record that predates the
+        # classification carries no class at all, and the "no class
+        # stated → repair it" rule would let it through.
+        definition_missing = bool(vp.get("definition_missing"))
+        failure_class = (
+            CRITERION_DEFECT if definition_missing else failure_class_of(vp)
+        )
+        if failure_class == DELIVERABLE_DEFECT:
+            repairable.append(vp)
+            continue
+        reason = (
+            _definition_missing_reason(vp_id)
+            if definition_missing
+            else reasons.get(
+                failure_class,
+                f"失败分类 {failure_class} 不是 deliverable_defect，不生成修复任务",
+            )
+        )
+        filtered.append({
+            "id": vp_id,
+            "failure_class": failure_class,
+            "reason": reason,
+            # What a human has to do about it, said as an action rather
+            # than as a class name.
+            "operator_action": (
+                "void_or_re_express"
+                if definition_missing
+                else {
+                    INFRA: "retry_verification",
+                    CRITERION_DEFECT: "re_express_criterion",
+                    OUT_OF_SCOPE: "decide_scope",
+                }.get(failure_class, "review")
+            ),
+        })
+    return repairable, filtered
+
+
+def _has_declared_scope(raw: Any) -> bool:
+    """Whether a content row declared a non-empty edit scope.
+
+    The declared scope is the model's own answer and it wins: the shared
+    rule is a fallback for the rows that declared nothing, not an
+    override for the rows that did.
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return False
+    return any(isinstance(entry, str) and entry.strip() for entry in raw)
+
+
+def _failure_record(failed_vp: Dict[str, Any]) -> Dict[str, Any]:
+    """The failed VP in the shape the shared scope rule reads.
+
+    :func:`test_command_rules.derive_files_to_modify` reads a path out of
+    a failure's text (``stack`` / ``traceback`` / ``output`` …) or out of
+    a field that names the failing file outright. A failed-VP record is
+    therefore handed over **as it stands** — a record that already
+    carries a ``stack`` or a ``file`` has that read, and dropping it on
+    the way to the rule would throw away the one piece of evidence the
+    rule was written for.
+
+    What is added is the *report-side* spelling of the same text: the
+    report reader puts the failure output under ``actual_result`` /
+    ``evidence`` (or their ``_summary`` variants), and the rule reads
+    ``stack`` / ``output``. The two are filled in only when the record
+    does not already carry them, so a record that says both says the
+    same thing twice and the rule sees the record's own wording first.
+
+    Nothing is invented: a record with no failure text at all simply
+    yields no path.
+    """
+    record = dict(failed_vp)
+    record.setdefault(
+        "stack",
+        str(
+            failed_vp.get("actual_result")
+            or failed_vp.get("actual_result_summary")
+            or ""
+        ),
+    )
+    record.setdefault(
+        "output",
+        str(
+            failed_vp.get("evidence")
+            or failed_vp.get("evidence_summary")
+            or ""
+        ),
+    )
+    return record
+
+
 class RepairTaskGenerator:
     """Generates requirement-driven repair tasks from verification failures."""
 
@@ -225,6 +438,16 @@ class RepairTaskGenerator:
         # routinely produce several tasks sharing one command shape; the
         # probe runs a subprocess, so it must not be repeated per task.
         self._falsifiability_cache: Dict[str, bool] = {}
+
+        # The failed VPs this generator refused to turn into repair
+        # tasks, each with the reason why. Rewritten on every round this
+        # generator runs — a generator does not outlive a round (see the
+        # note on ``_REPAIR_CONTENT_SESSIONS``), so the attribute always
+        # describes the round that produced the tasks in hand. It is the
+        # record of *why a failure got no repair*, which is the question
+        # an operator asks when a plan's verification failed and no
+        # repair task appeared for one of the failures.
+        self.filtered_vps: List[Dict[str, Any]] = []
 
         # File paths
         self.prd_file = self.plan_dir / "prd.json"
@@ -627,6 +850,62 @@ class RepairTaskGenerator:
                 f"by category"
             )
         return filled
+
+    # ------------------------------------------------------------------
+    # Path B — the edit scope, derived by the shared rule
+    # ------------------------------------------------------------------
+
+    def _fill_missing_files_to_modify(
+        self,
+        contents: List[Dict[str, Any]],
+        failed_vps: List[Dict[str, Any]],
+    ) -> None:
+        """Give a content row that declared no edit scope a derived one.
+
+        The scope is a hard gate downstream: ``RepairTaskAssembler.assemble``
+        refuses a task whose ``files_to_modify`` resolves to ``[]``, because
+        an empty scope is read as "touch nothing" and the task then has no
+        declared blast radius at all. So a row that declares no scope is a
+        task that never gets dispatched — and the failure usually DID name
+        the file it came from.
+
+        Reading that file out of the failure is a rule, and the rule
+        already exists: :func:`test_command_rules.derive_files_to_modify`,
+        shared with the refiner. This calls it rather than keeping a
+        second copy of the path-reading logic here, so the two sides
+        cannot drift apart on what counts as a file.
+
+        A row that DID declare a scope keeps it, unchanged. The model's
+        own answer is the better one, and the shared rule is a fallback
+        for the rows that said nothing — not an override of the rows
+        that said something.
+
+        Mutates ``contents`` in place. A row nothing can be derived for
+        keeps its empty scope, and the assembler drops it as before: the
+        rule invents no path (see the "no stack and no diff → no files"
+        boundary in ``test_command_rules``).
+        """
+        by_id = {
+            str(vp.get("id")): vp
+            for vp in failed_vps
+            if isinstance(vp, dict) and vp.get("id")
+        }
+        for content in contents:
+            if _has_declared_scope(content.get("files_to_modify")):
+                continue
+            vp = by_id.get(str(content.get("failed_vp_id", "") or ""))
+            if vp is None:
+                continue
+            derived = derive_files_to_modify(
+                _failure_record(vp), vp.get("diff"),
+            )
+            if derived:
+                content["files_to_modify"] = derived
+                print(
+                    f"[Repair] no edit scope declared for "
+                    f"{content.get('failed_vp_id')}; derived from the "
+                    f"failure: {', '.join(derived)}"
+                )
 
     def _verification_plan_points(self) -> Dict[str, Dict[str, Any]]:
         """``{vp_id: verification point}`` from the plan, or ``{}``.
@@ -2171,7 +2450,8 @@ class _RepairContentGeneratorMixin:
                 :func:`verification.verification_report_reader.extract_failed_vps_from_report`.
                 Each item carries ``id``, ``title``, ``priority``,
                 ``actual_result``, ``evidence``, and optionally
-                ``test_command`` / ``expected_result``.
+                ``test_command`` / ``expected_result`` and
+                ``failure_class``.
             round_number: Current verification round number (1-based).
             previous_failure_feedback: 2026-09-12:
                 ``{vp_id: [{round, actual_result, evidence}, ...]}``
@@ -2227,8 +2507,9 @@ class _RepairContentGeneratorMixin:
             * ``execution_group_hint`` — optional integer, the
               assembler passes it through
 
-            Returns an empty list only when ``failed_vps`` is empty —
-            i.e. there is genuinely nothing to repair.
+            Returns an empty list only when there is genuinely nothing to
+            repair: either ``failed_vps`` was empty, or every failed VP
+            it carried was refused by the failure-class filter below.
 
             Raises:
                 RepairGenerationError: the LLM call failed, or it
@@ -2243,6 +2524,35 @@ class _RepairContentGeneratorMixin:
         """
         if not failed_vps:
             return []
+        # 2026-10-22 (P0-2): only a deliverable defect may become a
+        # repair task. The other three classes want a different remedy
+        # (see the block above :func:`select_repairable_failed_vps`),
+        # and a repair task built for one of them is work nobody asked
+        # for. The filter runs BEFORE the prompt is built, so the model
+        # is never even asked about a VP that will not get a task, and
+        # the parser is handed the filtered list, so a row that names a
+        # refused VP is dropped as the hallucination it now is.
+        #
+        # The refusals are recorded rather than swallowed: a failure that
+        # got no repair task is exactly the thing an operator asks about
+        # ("why is there no task for VP-1?"), and "no task" is not an
+        # answer.
+        repairable, filtered = select_repairable_failed_vps(failed_vps)
+        self.filtered_vps = filtered
+        if filtered:
+            print(
+                f"[Repair] round {round_number}: {len(filtered)} failed VP(s) "
+                f"are not deliverable defects — no repair task generated for "
+                f"{', '.join(item['id'] for item in filtered)}"
+            )
+            for item in filtered:
+                print(
+                    f"[Repair]   {item['id'] or '<unnamed VP>'}: "
+                    f"{item['reason']}"
+                )
+        if not repairable:
+            return []
+        failed_vps = repairable
         failed_vp_ids = [
             str(vp.get("id")) for vp in failed_vps if vp.get("id")
         ]
@@ -2316,6 +2626,11 @@ class _RepairContentGeneratorMixin:
                 round_number=round_number,
                 failed_vp_ids=failed_vp_ids,
             )
+        # Path B: a row that declared no edit scope gets one derived from
+        # the failure by the shared rule, so the assembler's
+        # "empty scope → refuse the task" gate does not throw the repair
+        # away over a scope the model simply did not spell out.
+        self._fill_missing_files_to_modify(contents, failed_vps)
         # Path A: a verification point that is not a shell command has no
         # command to copy, so the content prompt — which never asks for
         # one — cannot produce one either. Re-ask for it explicitly

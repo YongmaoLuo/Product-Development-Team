@@ -987,7 +987,13 @@ class VerificationSubAgent:
                 self._write_log(log_path, "verdict_parse_error", {
                     "attempt": attempt,
                     "error": last_error,
-                    "raw_output_head": (str(e) or "")[:400],
+                    # The raw payload the sub-agent produced rides along
+                    # on the exception (see ``_execute_attempt``'s
+                    # parse-error arm); the message itself is the
+                    # fallback for an error raised elsewhere.
+                    "raw_output_head": str(
+                        getattr(e, "raw_output_head", "") or (str(e) or "")
+                    )[:400],
                 })
                 if attempt < self.max_retries:
                     # Bounded exponential backoff: 1s, 2s, 4s, ...
@@ -1122,11 +1128,24 @@ class VerificationSubAgent:
             exhausted_reason = (
                 f"max retries exhausted: {last_error or 'unknown error'}"
             )
+        # 2026-10-22 (P0-1): the class is ``infra`` and the source is
+        # ``deterministic``. The attempts malfunctioned (a verdict-parse
+        # garble, a watchdog kill, a transport error) and nothing was
+        # ever established about the deliverable, so the verdict must
+        # not be filed as a broken deliverable — that is the class that
+        # counts, and counting it would charge the deliverable for the
+        # environment's malfunctions. The source says ``deterministic``
+        # because the class was derived by rule here, not read off a
+        # claim; a ``defaulted`` class would be degraded downstream to
+        # ``deliverable_defect`` and land exactly where the confusion
+        # starts.
         return Verdict(
             verdict="FAILED",
             reasons=[exhausted_reason],
             evidence=[],
             model_complexity=self.model_complexity,
+            failure_class=INFRA_FAILURE_CLASS,
+            failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
         )
 
     async def _execute_attempt(
@@ -1162,6 +1181,8 @@ class VerificationSubAgent:
                     reasons=[f"no coding tool available: {e}"],
                     evidence=[],
                     model_complexity=self.model_complexity,
+                    failure_class=INFRA_FAILURE_CLASS,
+                    failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
                 )
 
         prompt = self._build_prompt(vp_node, attempt=attempt)
@@ -1417,6 +1438,8 @@ class VerificationSubAgent:
                         ],
                         evidence=[],
                         model_complexity=self.model_complexity,
+                        failure_class=INFRA_FAILURE_CLASS,
+                        failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
                     )
                 if kc >= 1 and not retry_already_used:
                     # First kill on the initial attempt — raise so
@@ -1429,12 +1452,17 @@ class VerificationSubAgent:
                         kill_count=kc, original_exc=e,
                     )
                 # No watchdog kill involved — genuine coding-tool
-                # failure, same as the pre-fix behavior.
+                # failure, same as the pre-fix behavior. The verdict
+                # value and the reasons are unchanged; what the
+                # classification adds is the answer to "whose failure
+                # is this?" — the attempt's, not the deliverable's.
                 return Verdict(
                     verdict="FAILED",
                     reasons=[f"coding tool call failed: {e}"],
                     evidence=[],
                     model_complexity=self.model_complexity,
+                    failure_class=INFRA_FAILURE_CLASS,
+                    failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
                 )
 
             raw = json.dumps(response_dict) if not isinstance(
@@ -1450,7 +1478,20 @@ class VerificationSubAgent:
                 # ui_validation, ``verification_api_runner`` for api_test)
                 # is what decides whether a PASSED is honoured.
                 return parse_verdict_to_dataclass(raw)
-            except VerdictParseError:
+            # NEGCTL-P0-1-BEGIN
+            except VerdictParseError as e:
+                # 2026-10-22 (P0-1): a payload that cannot be parsed is
+                # a MALFUNCTION of this attempt, not a statement about
+                # the deliverable under verification. Answering with a
+                # FAILED verdict here used to swallow the failure: the
+                # caller saw a well-formed verdict, so the L2 retry
+                # branch in ``_self_heal_loop`` — the one that exists
+                # exactly for a transient protocol garble (truncated
+                # stream, stray prose around the JSON object) — was
+                # unreachable, and one garbled response failed the
+                # verification point for good while claiming the
+                # deliverable was broken.
+                #
                 # 2026-10-23: an unparseable verdict is a MALFUNCTION
                 # of the protocol, not a finding about the code under
                 # test. It used to be turned into a clean FAILED
@@ -1470,7 +1511,13 @@ class VerificationSubAgent:
                 # synthesize a FAILED verdict that says the verdict
                 # was UNPARSEABLE rather than dressing it up as an
                 # exhausted transport budget.
+                #
+                # The raw payload rides along on the exception so the
+                # attempt log keeps the forensic trail the inline
+                # verdict used to carry in ``evidence``.
+                e.raw_output_head = raw[:400]
                 raise
+            # NEGCTL-P0-1-END
         finally:
             if watchdog_handle is not None and self.registry is not None:
                 try:
@@ -2336,6 +2383,13 @@ class SettingsJsonBuilder:
 # PRD Decision Point 3 (zero-tolerance for skipping): ``verdict="SKIPPED"``
 # is coerced to ``"FAILED"`` at parse time. The downstream judgment
 # pipeline never sees a SKIPPED value.
+#
+# 2026-10-22 (P2-2): the verdict text is normalised (stripped, folded
+# to upper case) before the vocabulary check, and the canonical value
+# is what the caller gets. A value that normalises to nothing known is
+# rejected with ``VerdictParseError`` rather than passed through — the
+# vocabulary is closed, and a status string the pipeline was never
+# told to expect is a defect, not a verdict.
 
 
 class VerdictParseError(ValueError):
@@ -2348,6 +2402,58 @@ class VerdictParseError(ValueError):
     parse time; downstream judgment therefore never has to handle
     a SKIPPED value.
     """
+
+
+#: The failure class a verdict carries when nothing earned a different
+#: one — the class that *counts*. Mirrors
+#: ``verification.failure_triage.FailureClass.DELIVERABLE_DEFECT``.
+#:
+#: Spelled as a literal rather than imported, on purpose:
+#: ``verification_subagent`` is imported by ``verification_agent``,
+#: which the ``verification`` package imports in turn, so a
+#: module-level import of that package here would be a circular
+#: import. ``tests/unit/test_verdict_fields.py`` pins this literal
+#: against the constant, so a drift is a test failure rather than a
+#: silent inconsistency.
+DEFAULT_FAILURE_CLASS = "deliverable_defect"
+
+#: The source tag of a failure class that was assumed rather than
+#: earned. Mirrors ``verification.failure_triage.SOURCE_DEFAULTED``
+#: (same drift guard as :data:`DEFAULT_FAILURE_CLASS`).
+DEFAULT_FAILURE_CLASS_SOURCE = "defaulted"
+
+#: The failure class of a verdict whose ATTEMPT malfunctioned — a
+#: verdict-parse garble, a watchdog kill, a transport error. The
+#: deliverable is not implicated by any of those, so the verdict must
+#: not be filed as a broken deliverable.
+#:
+#: Spelled as a literal for the same reason as
+#: :data:`DEFAULT_FAILURE_CLASS` (the import would be circular), and
+#: pinned against the constant by
+#: ``tests/unit/test_verdict_parse_retry.py``.
+INFRA_FAILURE_CLASS = "infra"
+
+#: The source tag of a class this module derived by RULE rather than by
+#: reading a claim off a payload. Mirrors
+#: ``verification.failure_triage.SOURCE_DETERMINISTIC`` (same drift
+#: guard as :data:`DEFAULT_FAILURE_CLASS`).
+#:
+#: It matters that this is not ``defaulted``: a defaulted claim is
+#: degraded downstream to ``deliverable_defect``, so an attempt
+#: malfunction would be filed as a broken deliverable — exactly the
+#: confusion the four failure classes exist to prevent.
+DETERMINISTIC_FAILURE_CLASS_SOURCE = "deterministic"
+
+
+def _canonical_verdict_text(text: str) -> str:
+    """The canonical spelling of a verdict: stripped, upper case.
+
+    One definition, so the parse layer and the dataclass cannot drift
+    apart on what "the same verdict" is. This is spelling only — what
+    to *do* with a spelling (the ``SKIPPED`` coercion) is a policy
+    decision and stays in :func:`parse_verdict`.
+    """
+    return text.strip().upper()
 
 
 @dataclass
@@ -2368,6 +2474,14 @@ class Verdict:
             (e.g. ``"Vendor A-M3"``, ``"B-PRO-5.1"``).
         model_complexity: Tier hint that produced the routing decision
             (e.g. ``"simple"`` / ``"medium"`` / ``"complex"``).
+        failure_class: The class of the failure this verdict carries
+            (e.g. ``"deliverable_defect"``). Empty for a passed
+            verdict — a pass has no failure to classify.
+        failure_class_source: Where the class came from
+            (e.g. ``"defaulted"``). ``"defaulted"`` says the class was
+            assumed, not earned.
+        evidence_quote: The fragment of raw output the class is
+            anchored in, quoted verbatim. Empty when there is none.
     """
 
     verdict: str
@@ -2376,6 +2490,24 @@ class Verdict:
     provider: str = ""
     chosen_model: str = ""
     model_complexity: str = ""
+    failure_class: str = DEFAULT_FAILURE_CLASS
+    failure_class_source: str = DEFAULT_FAILURE_CLASS_SOURCE
+    evidence_quote: str = ""
+
+    def __post_init__(self) -> None:
+        """Give a passed verdict the empty class it has no use for.
+
+        A verdict that passed has no failure to classify, and the
+        empty class is the convention the verdict record uses for that
+        case — the same one
+        :func:`verification.failure_triage.classify_verdict` returns
+        for a passed verdict. The construction point may pass the
+        empty class explicitly; this is the backstop for the ones
+        that do not, so no construction point can end up claiming
+        that a passing deliverable is broken.
+        """
+        if _canonical_verdict_text(str(self.verdict)) == "PASSED":
+            self.failure_class = ""
 
 
 def parse_verdict(subagent_output: Dict[str, Any]) -> str:
@@ -2410,10 +2542,27 @@ def parse_verdict(subagent_output: Dict[str, Any]) -> str:
     ``SKIPPED`` is coerced to ``FAILED`` per PRD decision point 3
     (zero-tolerance for skipping).
 
+    2026-10-22 (P2-2): the verdict text is put into the vocabulary
+    before it is used. An LLM asked for ``"verdict": "PASSED"`` answers
+    ``"passed"`` about as often as it answers ``"PASSED"``, and the
+    whitespace around a value that was quoted out of a sentence is not
+    information. The text is therefore stripped and folded to upper
+    case, and the *canonical* value is what the caller gets back — no
+    downstream consumer ever has to compare against a second spelling
+    of the same verdict, and no verdict record ends up holding
+    ``"passed"``.
+
+    A value that does not normalise to a known verdict is rejected the
+    same way a malformed payload is: with ``VerdictParseError``. That
+    includes the empty string and a non-string value — from the
+    caller's point of view they are the same situation, there is no
+    verdict here to act on, so the only correct move is to retry.
+
     Raises:
         VerdictParseError: If ``subagent_output`` is not a dict, is
-            missing the ``verdict`` field, or has a ``verdict`` value
-            outside ``{"PASSED", "FAILED", "SKIPPED"}``.
+            missing the ``verdict`` field, is not a string, or holds a
+            ``verdict`` value that does not normalise to one of
+            ``{"PASSED", "FAILED", "SKIPPED"}``.
     """
     if not isinstance(subagent_output, dict):
         raise VerdictParseError(
@@ -2430,14 +2579,20 @@ def parse_verdict(subagent_output: Dict[str, Any]) -> str:
             f"'verdict' must be a str, got {type(verdict).__name__}"
         )
 
-    if verdict == "SKIPPED":
+    # Normalise before the vocabulary check, and normalise *only* the
+    # case and the surrounding whitespace: " 通过" is a different
+    # language, not a different spelling, and the vocabulary is
+    # English and closed.
+    normalized = _canonical_verdict_text(verdict)
+
+    if normalized == "SKIPPED":
         return "FAILED"
-    if verdict not in ("PASSED", "FAILED"):
+    if normalized not in ("PASSED", "FAILED"):
         raise VerdictParseError(
             "verdict must be 'PASSED' or 'FAILED' (or 'SKIPPED' to be "
             f"coerced to FAILED), got {verdict!r}"
         )
-    return verdict
+    return normalized
 
 
 def parse_verdict_to_dataclass(raw_output: str) -> "Verdict":
@@ -2450,8 +2605,17 @@ def parse_verdict_to_dataclass(raw_output: str) -> "Verdict":
     PRD decision point 4).
 
     Internally: JSON-decode ``raw_output``, validate the status via
-    :func:`parse_verdict`, then carry ``reasons`` / ``evidence`` /
-    ``provider`` / ``chosen_model`` / ``model_complexity`` through.
+    :func:`parse_verdict` (which normalises the status text and
+    refuses anything outside the closed vocabulary), then carry
+    ``reasons`` / ``evidence`` / ``provider`` / ``chosen_model`` /
+    ``model_complexity`` / ``failure_class`` / ``failure_class_source``
+    / ``evidence_quote`` through.
+
+    The three classification fields are optional: a payload that
+    carries none of them is not malformed, it simply gets the
+    conservative defaults (the class that counts, marked as
+    defaulted, with no quote). What the payload *does* claim about
+    them reaches the dataclass unchanged.
 
     Raises:
         VerdictParseError: For malformed JSON, missing required
@@ -2484,6 +2648,23 @@ def parse_verdict_to_dataclass(raw_output: str) -> "Verdict":
             f"'evidence' must be a list, got {type(evidence).__name__}"
         )
 
+    # The failure classification the payload claims, and the quote it
+    # anchors the claim in. A payload that claims nothing gets the
+    # class that counts, marked as defaulted — an unearned claim must
+    # not be able to file a broken deliverable as an environment
+    # failure. A passed verdict has no failure to classify, so its
+    # class is empty by convention.
+    if verdict_str == "PASSED":
+        failure_class = ""
+    else:
+        failure_class = str(
+            data.get("failure_class") or DEFAULT_FAILURE_CLASS
+        )
+    failure_class_source = str(
+        data.get("failure_class_source") or DEFAULT_FAILURE_CLASS_SOURCE
+    )
+    evidence_quote = str(data.get("evidence_quote") or "")
+
     return Verdict(
         verdict=verdict_str,
         reasons=list(raw_reasons),
@@ -2491,4 +2672,7 @@ def parse_verdict_to_dataclass(raw_output: str) -> "Verdict":
         provider=str(data.get("provider", "")),
         chosen_model=str(data.get("chosen_model", "")),
         model_complexity=str(data.get("model_complexity", "")),
+        failure_class=failure_class,
+        failure_class_source=failure_class_source,
+        evidence_quote=evidence_quote,
     )

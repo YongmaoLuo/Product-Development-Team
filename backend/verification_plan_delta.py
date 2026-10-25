@@ -24,15 +24,39 @@ VP 清单在验证第一轮生成后就固定了：``generate_verification_plan`
 **修改已有 VP 一律拒绝**，并在结果里记录 ``rejected_modifications`` 以便
 操作者从日志回溯 LLM 是否试图越界。不做人工审批、不做数量
 上限，只要有日志可回溯。
+
+落盘：copy-then-swap
+--------------------
+:func:`apply_delta` 只改内存。增量评估在复用路径上跑完就返回，磁盘上的
+``verification_plan.json`` 一个字节都没动 —— 于是"作废"下一轮就复活，替换
+VP 也跟着消失，修复任务照旧围绕一条已经不成立的判据生成。
+
+:func:`apply_delta_persisted` 是"应用增量 + 让增量留下来"合成的一步：
+先在深拷贝上应用，校验通过后原子替换磁盘上的计划文件，**只有写成功了**
+才让调用方手里的 ``plan_data`` 换内容。任何一步失败，磁盘与内存都保持
+调用前的原样 —— **内存永远不领先磁盘**。
+
+配套的两个异常把两种失败分开：
+
+* :class:`PlanDeltaPersistError` —— 这次增量**没有**落盘（写失败、护栏
+  抛错、往返校验不过）；
+* :class:`PlanChangedDuringDelta` —— 这次增量**不该**落盘（写前摘要复核
+  发现计划文件已被外部改写，写回去会覆盖掉别人的改动）。
+
+写前摘要用 :func:`plan_file_digest` 算：读入计划时记下它，写回前再算
+一次，不一致就放弃这一轮增量。
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
+from utils import atomic_io
 from verification_phases import PHASE_CORE, PHASE_FINAL_GATE
 
 #: 已废弃 VP 的标记字段（执行器据此跳过，不进任何统计桶）。
@@ -42,6 +66,13 @@ OBSOLETE_ROUND_FIELD = "obsoleted_round"
 #: 新增 VP 的来源标记，便于日志回溯"这条是谁加的、依据是什么"。
 ADDED_REASON_FIELD = "added_reason"
 ADDED_ROUND_FIELD = "added_round"
+#: 替换 VP 指向"被它替换掉的那条 VP"的字段名。
+#:
+#: 2026-10-21：作废与替换必须**互指**才查得清"这条判据为什么不见了、换成了
+#: 哪条"。方向固定为「新的指向旧的」：替换 VP 带
+#: ``replacement_for = <原 VP id>``；原 VP 那一侧记的是作废痕迹
+#: （``obsolete`` / ``obsolete_reason`` / ``obsoleted_round``）。
+REPLACEMENT_FOR_FIELD = "replacement_for"
 
 #: delta state 里记录"历轮分配出去的 VP id"的键。
 #:
@@ -70,12 +101,17 @@ _ID_RE = re.compile(r"^VP-(\d+)$")
 #: 根本不存在 —— 只能眼看着旧判据继续失败。
 #:
 #: 只在 delta 条目**确实写了**该键时才搬，不给每条新增 VP 凭空塞五个键。
+#:
+#: 2026-10-21：``replacement_for`` 也在这里 —— 替换 VP 与被它替换掉的那条
+#: VP 之间的指向关系必须落到计划文件里，否则"作废"在审计时是断的链：磁盘上
+#: 只看得到一条被作废的判据，看不到接替它的是哪条。
 ADD_THROUGH_FIELDS: Tuple[str, ...] = (
     "request",
     "assertions",
     "target_url",
     "timeout_seconds",
     "execution_group",
+    REPLACEMENT_FOR_FIELD,
 )
 
 # ---------------------------------------------------------------------------
@@ -161,6 +197,8 @@ def collect_acceptance(plan_dir: Path) -> List[str]:
 def next_vp_id(
     plan_data: Dict[str, Any],
     reserved_ids: Optional[Iterable[str]] = None,
+    *,
+    avoid_ids: Iterable[str] = (),
 ) -> str:
     """分配一个不与现有 VP、也不与历轮已分配 id 冲突的新 id（``VP-0NN`` 递增）。
 
@@ -170,7 +208,20 @@ def next_vp_id(
     两轮」—— 上一轮已 PASSED 的 VP 被新一轮的同名条目顶掉，而 resume 路径
     按 id 跳过执行，报告里留下的是上一轮的结果。
 
-    跳过是**向前**跳的：id 单调递增，宁可留空号也不复用。
+    ``avoid_ids`` 是同一个东西的另一个名字：**发号账本**
+    （``allocated_vp_ids``）里已经发出去的号。跳过它们的理由不只是"撞号"，
+    而是**继承**：那个号在 SQLite 里可能还留着上一轮的裁决（VP-031 的
+    FAILED、VP-033 的 PASSED）。重新发出去同一个号，新验证点就会继承旧结论
+    —— 一次都没跑就记成失败，或者一次都没跑就被当成"验证通过"而跳过
+    （2026-10-25）。
+
+    两个参数等价，取并集；跳过是**向前**跳的：id 单调递增，宁可留空号也
+    不复用。
+
+    **只有能产出完整定义的条目才配调用它**（见 :func:`vp_definition_gaps`
+    与 :func:`apply_delta`）：发出去的号必须有定义跟在后面，否则分配账本上
+    会留下一个"有 id、无定义"的占位 —— 而执行器对这种条目没有分派前校验，
+    会按缺省方法把它派出去（2026-10-24 的 VP-031）。
     """
     highest = 0
     for vp in plan_data.get("verification_points") or []:
@@ -179,11 +230,45 @@ def next_vp_id(
         match = _ID_RE.match(str(vp.get("id", "")))
         if match:
             highest = max(highest, int(match.group(1)))
-    reserved = {str(rid) for rid in (reserved_ids or ())}
+    avoided = {
+        str(vp_id).strip().upper()
+        for vp_id in list(reserved_ids or ()) + list(avoid_ids or ())
+        if str(vp_id or "").strip()
+    }
     candidate = highest + 1
-    while f"VP-{candidate:03d}" in reserved:
+    while f"VP-{candidate:03d}".upper() in avoided:
         candidate += 1
     return f"VP-{candidate:03d}"
+
+
+def vp_definition_gaps(vp: Dict[str, Any]) -> List[str]:
+    """这条 VP 还差什么才能算一条**完整**的定义（空列表 = 完整）。
+
+    "完整"是执行器能判它的最低要求：**有标题**（说清要断言什么），
+    **方法在 ``SUPPORTED_METHODS`` 里**（框架会照它跑）。缺任何一样，
+    这条 VP 就跑不出结论 —— 重做交付物也救不了它，只能由操作者重新表达。
+
+    2026-10-24（VP-031）：这个判据以前只存在于护栏
+    （``verification_agent._plan_delta_guard``），也就是**发号之后**才检查：
+    号已经发出去了，条目却被整条丢掉，于是分配账本上留下一个没有定义的
+    占位 id。把判据提到发号之前，缺定义的条目连号都拿不到。
+
+    只读词汇表，不改任何东西 —— VP 的声明字段不可变：判据写错或缺失时由
+    操作者重新表达，执行器不替它发明。
+    """
+    from verification_subagent import SUPPORTED_METHODS
+
+    gaps: List[str] = []
+    title = str(vp.get("title") or "").strip()
+    if not title:
+        gaps.append("缺少 title（没有标题就没有判据）")
+    method = str(vp.get("verification_method") or "").strip()
+    if method not in SUPPORTED_METHODS:
+        gaps.append(
+            f"verification_method {method or '(missing)'} 不在 "
+            f"{list(SUPPORTED_METHODS)} 里"
+        )
+    return gaps
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +576,8 @@ def apply_delta(
     delta: PlanDelta,
     round_number: int,
     reserved_ids: Optional[Iterable[str]] = None,
+    *,
+    avoid_ids: Iterable[str] = (),
 ) -> Dict[str, Any]:
     """就地应用增量，返回可写日志的摘要。
 
@@ -502,9 +589,16 @@ def apply_delta(
     （2026-09-19）。阶段判定权仍在规划 LLM 手里，这里只负责把它的声明带过去。
 
     ``reserved_ids`` 是历轮已经分配出去的 id（见 :data:`ALLOCATED_IDS_KEY`）：
-    新条目必须跳过它们，id 才跨轮单调。摘要里的 ``allocated_vp_ids`` 记下
+    新条目必须跳过它们，id 才跨轮单调。``avoid_ids`` 是同一个东西的另一个
+    名字（**发号账本**），两个参数取并集。摘要里的 ``allocated_vp_ids`` 记下
     本轮**实际分配出去**的 id（含随后被护栏丢弃的那些）—— 丢掉的 id 同样
     不能被下一轮复用。
+
+    **发号之前先看定义**（2026-10-24，VP-031）：产不出完整定义的条目
+    （没有标题，或方法不在 ``SUPPORTED_METHODS`` 里）连号都拿不到 —— 它既
+    不落进计划，也不占掉一个 id。理由见 :func:`vp_definition_gaps`：号已经
+    发出去了、条目却被整条丢掉，会在分配账本上留下一个"有 id、无定义"的
+    占位，而执行器对这种条目没有分派前校验，会按缺省方法把它派出去。
     """
     points = plan_data.setdefault("verification_points", [])
     summary: Dict[str, Any] = {
@@ -513,16 +607,28 @@ def apply_delta(
         "rejected_additions": len(delta.rejected_additions),
         "rejected_obsoletes": len(delta.rejected_obsoletes),
         "rejected_modifications": len(delta.rejected_modifications),
+        # 2026-10-24（VP-031）：发号之前被判"产不出完整定义"的条目。留痕
+        # 是因为它们是被**丢掉的** —— 静默丢弃的话，审计里看不出"这一轮
+        # 评估新增了几条、丢了几条、丢在哪儿"。
+        "rejected_definitionless": [],
+        # 2026-10-25（VP-031）：本次**发出去过**的号。
+        #
+        # 它与 ``added`` 不是一回事：``added`` 是"落进计划"的条目，而这里
+        # 是"发出去过"的号 —— 护栏后来整条剔除的那些也在内（号已经发出
+        # 去了，只是没落进计划）。发号账本记的是后者：这个号已经被用过，
+        # 重新发出去会让新验证点继承旧号的裁决。
         "allocated_vp_ids": [],
     }
-    reserved = {str(rid) for rid in (reserved_ids or ())}
+    reserved = {
+        str(rid).strip().upper()
+        for rid in list(reserved_ids or ()) + list(avoid_ids or ())
+        if str(rid or "").strip()
+    }
 
     for item in delta.added:
-        new_id = next_vp_id(plan_data, reserved_ids=reserved)
-        reserved.add(new_id)
-        summary["allocated_vp_ids"].append(new_id)
         vp = {
-            "id": new_id,
+            # id 在下面发 —— 只在定义完整时才发（见本函数末尾的注释）。
+            "id": "",
             "title": str(item.get("title", "")).strip(),
             "related_prd_criteria": str(item.get("related_prd_criteria", "")),
             # 2026-09-19: 默认值不再是退休的 ``automated_test``。空串会被
@@ -543,6 +649,24 @@ def apply_delta(
         for key in ADD_THROUGH_FIELDS:
             if key in item:
                 vp[key] = item[key]
+        # 2026-10-24（VP-031）：**先看定义，再发号**。
+        #
+        # 以前是"先发号、再由护栏整条丢掉"。于是分配账本上留下了一个没有
+        # 定义的占位 id（VP-031），而执行器对"有 id、无定义"的条目没有
+        # 分派前校验 —— 它按缺省方法把这条空壳派给了 coding tool，整轮取消
+        # 后被记成 FAILED。缺定义的条目现在连号都拿不到：它既不落进计划，
+        # 也不占掉一个 id。
+        gaps = vp_definition_gaps(vp)
+        if gaps:
+            summary["rejected_definitionless"].append({
+                "title": vp["title"],
+                "gaps": gaps,
+            })
+            continue
+        new_id = next_vp_id(plan_data, reserved_ids=reserved)
+        reserved.add(new_id.upper())
+        vp["id"] = new_id
+        summary["allocated_vp_ids"].append(new_id)
         points.append(vp)
         summary["added"].append(
             {"id": new_id, "title": vp["title"], "reason": vp[ADDED_REASON_FIELD]}
@@ -568,6 +692,284 @@ def apply_delta(
 
 
 # ---------------------------------------------------------------------------
+# 原子持久化（copy-then-swap）
+# ---------------------------------------------------------------------------
+#
+# 2026-10-21：``apply_delta`` 只改内存。增量评估在复用路径上跑完就返回，
+# 磁盘上的 ``verification_plan.json`` 一个字节都没动 —— 于是"作废"下一轮就
+# 复活，替换 VP 也跟着消失，修复任务照旧围绕一条已经不成立的判据生成。
+#
+# 修法不是"再写一次文件"，而是把"应用增量"和"让增量留下来"合成一步：
+# 先在深拷贝上应用，校验通过后原子替换磁盘上的计划文件，**只有写成功了**
+# 才让调用方手里的 ``plan_data`` 换内容。任何一步失败，磁盘与内存都保持
+# 调用前的原样 —— 内存永远不领先磁盘。
+
+
+class PlanDeltaPersistError(RuntimeError):
+    """增量没有落盘。
+
+    抛出这个异常时，**磁盘上的计划文件与调用方持有的 ``plan_data`` 都保持
+    调用前的原样** —— 内存不会领先磁盘（copy-then-swap 的另一半）。
+    """
+
+
+class PlanChangedDuringDelta(PlanDeltaPersistError):
+    """写前摘要复核发现计划文件已被外部改写。
+
+    它是 :class:`PlanDeltaPersistError` 的子类：同样意味着"这次增量没有
+    落盘"，只是原因不同 —— 不是写失败，而是**不该**写。磁盘上的计划已经
+    不是调用方读入时那一份了，写回会覆盖掉别人的改动，所以宁可放弃这一轮
+    增量。
+    """
+
+
+def plan_file_digest(plan_file: Path) -> Optional[str]:
+    """计划文件内容的 sha256（十六进制）；文件不存在时返回 ``None``。
+
+    这就是 :func:`apply_delta_persisted` 的 ``expected_digest`` 用的那个摘要：
+    读入计划时记下它，写回前再算一次；不一致说明计划在增量评估期间被外部
+    改过。
+    """
+    target = Path(plan_file)
+    try:
+        return hashlib.sha256(target.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PlanDeltaPersistError(f"读计划文件失败：{target}（{exc}）") from exc
+
+
+def _vp_markers(plan: Dict[str, Any]) -> Dict[str, Tuple[bool, Any]]:
+    """VP id → ``(是否作废, replacement_for)``，用于往返一致性核对。
+
+    只取这两样：它们是"作废与替换"这条链上**唯一不能丢**的标记。id 集合
+    也顺带被钉住了（字典的键就是 id 集合）。
+    """
+    markers: Dict[str, Tuple[bool, Any]] = {}
+    for vp in plan.get("verification_points") or []:
+        if not isinstance(vp, dict):
+            continue
+        markers[str(vp.get("id"))] = (
+            bool(vp.get(OBSOLETE_FIELD)),
+            vp.get(REPLACEMENT_FOR_FIELD),
+        )
+    return markers
+
+
+def _prune_summary(candidate: Dict[str, Any], summary: Dict[str, Any]) -> None:
+    """把摘要裁剪到**落盘后**还站得住的那些条目。
+
+    护栏可能把不合格的新增 VP 整条剔除。那条 VP 根本没进计划文件，摘要里
+    再留着它就是撒谎 —— 而"摘要为空"正是"不写盘"的判据（见
+    :func:`apply_delta_persisted` 第 4 步），留着会让一次全被拒的增量照样
+    落盘。
+
+    作废那一侧要多看一层：**撤回**作废标记时（护栏否掉了替换 VP → 原 VP
+    不能先死），那条 VP 还在计划里，但落盘后它并不作废。摘要里再留着
+    "已作废 VP-0NN"同样是撒谎，而且会让一次**什么都没落盘**的增量白白写
+    一次盘（写出来的内容与原来一字不差）。
+
+    所以作废的判据不是"那条 VP 还在不在"，而是"那条 VP 落盘后到底作不
+    作废"—— 摘要描述的是落盘后的内容。
+    """
+    points = [
+        vp for vp in candidate.get("verification_points") or []
+        if isinstance(vp, dict)
+    ]
+    present = {str(vp.get("id")) for vp in points}
+    obsolete_after_write = {
+        str(vp.get("id")) for vp in points if vp.get(OBSOLETE_FIELD)
+    }
+    summary["added"] = [
+        entry for entry in summary.get("added") or []
+        if str(entry.get("id")) in present
+    ]
+    summary["obsoleted"] = [
+        entry for entry in summary.get("obsoleted") or []
+        if str(entry.get("id")) in obsolete_after_write
+    ]
+
+
+def apply_delta_persisted(
+    plan_file: Path,
+    plan_data: Dict[str, Any],
+    delta: PlanDelta,
+    round_number: int,
+    *,
+    post_apply: Optional[Callable[[Dict[str, Any], Dict[str, Any]], None]] = None,
+    expected_digest: Optional[str] = None,
+    avoid_ids: Iterable[str] = (),
+    reserved_ids: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """把一次增量**原子地**落到 ``plan_file``；失败时内存不领先磁盘。
+
+    契约（九步）：
+
+    1. ``candidate = copy.deepcopy(plan_data)``；
+    2. ``summary = apply_delta(candidate, delta, round_number)``；
+    3. ``post_apply(candidate, summary)`` —— 护栏在**落盘之前**生效；
+    4. 本次**发出去过**的号并进发号账本（状态文件的 ``allocated_vp_ids``）
+       —— 护栏把新增整条剔除时计划一个字节都不动，但号已经发出去，必须
+       记下来；
+    5. ``summary["added"]`` 与 ``summary["obsoleted"]`` 都为空 → 不写盘，
+       直接返回；
+    6. ``payload = json.loads(json.dumps(candidate, ensure_ascii=False))`` 做
+       一次 JSON 往返校验（往返后整份内容必须与 candidate 相等），并核对 VP
+       id 集合与 ``obsolete`` / ``replacement_for`` 标记和 candidate 一致 ——
+       **写下去的就是校验过的这一份**；
+    7. ``expected_digest`` 与 ``plan_file`` 当前 sha256 不一致 → 抛
+       :class:`PlanChangedDuringDelta`，不写；
+    8. ``atomic_write_json(plan_file, payload, indent=2, ensure_ascii=False,
+       reraise=True)``；
+    9. 第 8 步成功之后才 ``plan_data.clear(); plan_data.update(payload)``
+       （copy-then-swap，调用方持有的对象引用不变），并返回 ``summary``。
+
+    第 2/3/6/7/8 步任一异常 → 抛 :class:`PlanDeltaPersistError`（第 7 步抛
+    的是它的子类 :class:`PlanChangedDuringDelta`），**磁盘与 ``plan_data``
+    都保持原样**。
+
+    Args:
+        plan_file: 计划文件（``verification_plan.json``）的路径。
+        plan_data: 调用方持有的计划对象；落盘成功后它的内容被换成磁盘上的
+            那一份（对象本身不变，引用不变）。
+        delta: 本轮增量。
+        round_number: 当前验证轮次（写进 ``obsoleted_round`` /
+            ``added_round``）。
+        post_apply: 护栏。签名 ``(candidate, summary) -> None``：它在候选
+            计划上做判定（"新增的 VP 必须过 method / schema 检查"），不合格
+            的整条剔除，并把 ``summary`` 改成与剔除后一致。护栏在写盘之前
+            跑，所以"不合格的 VP"不会先落盘再被撤。
+        expected_digest: 读入计划时记下的 sha256。写盘前复核一次：不一致
+            说明计划在增量评估期间被外部改过，放弃这一轮增量而不是覆盖它。
+        avoid_ids: **发号账本**里已经发出去的号（状态文件的
+            ``allocated_vp_ids``）。新号必须避开它们 —— 同一个号重新发出去
+            会让新验证点继承旧号的裁决（2026-10-25 的 VP-031）。
+        reserved_ids: 历轮分配出去、但不在计划里的 id（占位集合）。与
+            ``avoid_ids`` 取并集 —— 两者说的是同一件事的两种读法：占位用来
+            拒绝"复用旧号"，账本用来避开"发过的号"。
+
+    Returns:
+        可写日志的摘要（与 :func:`apply_delta` 同一个形状）：``added`` /
+        ``obsoleted`` 描述的是**落盘后**的内容。
+    """
+    target = Path(plan_file)
+
+    # 1) copy-then-swap 的前半段：先在深拷贝上做，内存此刻还没被碰过。
+    candidate = copy.deepcopy(plan_data)
+
+    # 1.5) 发号账本里的号一律避开。
+    #
+    # 2026-10-25（VP-031）：账本是"这个号已经发出去过"的唯一记录，而它
+    # 就写在**这个**状态文件里 —— 所以落盘这一步自己就知道该避开哪些号，
+    # 不必指望调用方记得传。调用方传的 ``avoid_ids`` 只是额外的约束，
+    # 两边取并集。
+    avoid = list(avoid_ids or ()) + list(reserved_ids or ())
+    for allocated_id in load_delta_state(target.parent).get("allocated_vp_ids") or []:
+        key = str(allocated_id or "").strip()
+        if key and key not in avoid:
+            avoid.append(key)
+
+    # 2) 应用增量。
+    try:
+        summary = apply_delta(
+            candidate, delta, round_number, avoid_ids=avoid,
+            reserved_ids=reserved_ids,
+        )
+    except Exception as exc:
+        raise PlanDeltaPersistError(f"应用增量失败：{exc}") from exc
+
+    # 3) 护栏：新增的 VP 必须在落盘前过完检查。
+    if post_apply is not None:
+        try:
+            post_apply(candidate, summary)
+        except Exception as exc:
+            raise PlanDeltaPersistError(f"增量护栏失败：{exc}") from exc
+
+    # 3.5) 摘要只描述落盘后还站得住的条目（护栏剔除掉的不算"已新增"）。
+    _prune_summary(candidate, summary)
+
+    # 4) 发号账本：本次发出的号必须记进 ``allocated_vp_ids``。
+    #
+    # 2026-10-25（VP-031）：这个键磁盘上早就有（就在这个状态文件里），却
+    # 从来没有写者 —— 全仓没有任何代码读写它。于是"这个号已经发出去过"
+    # 无处可查，下一次发号会重新拿到同一个号（计划最高 VP-030 → 又发
+    # VP-031），新验证点于是继承旧号的裁决。
+    #
+    # 这一步**在"写盘"之前**，因为它记的是"号发出去了"，不是"条目落盘
+    # 了"：护栏把新增整条剔除时（VP-031 的来历）计划一个字节都不会动，
+    # 但号已经发出去 —— 那个号必须被记下来，不能再发第二次。
+    #
+    # 记的是**发出去过**的号（``summary["allocated_vp_ids"]``），不是
+    # "落进计划"的号（``summary["added"]``）。
+    #
+    # 只往**已经存在**的状态文件里并：那个文件归调用方所有（agent 每轮都
+    # 写它），本函数不创建它 —— 计划落盘这一步的契约是"计划目录里除计划
+    # 文件外不留下本函数产生的文件"
+    # （``tests/integration/test_plan_delta_persisted.py`` 钉的就是这一条）。
+    # 文件不存在时本次并账被跳过，号仍在摘要里，调用方可以自己落盘。
+    issued = [
+        str(vp_id).strip()
+        for vp_id in (summary.get("allocated_vp_ids") or [])
+        if str(vp_id or "").strip()
+    ]
+    if issued and (target.parent / _DELTA_STATE_FILENAME).is_file():
+        record_allocated_vp_ids(target.parent, issued)
+
+    # 5) 全部被拒 → 不写盘，内存也不动。
+    if not summary["added"] and not summary["obsoleted"]:
+        return summary
+
+    # 5) JSON 往返校验：写下去的就是校验过的这一份。
+    #    ``json.dumps`` 除了 ``TypeError``（不可序列化） / ``ValueError``
+    #    （循环引用）还会抛 ``RecursionError``（结构深到编码器自己撑不住）。
+    #    契约是"这一步任一异常 → PlanDeltaPersistError" —— 漏出去一个裸异常，
+    #    调用方拿到的就不是"这次增量没有落盘"这个可处理的信号。
+    try:
+        payload = json.loads(json.dumps(candidate, ensure_ascii=False))
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise PlanDeltaPersistError(
+            f"计划内容无法通过 JSON 往返校验：{exc}"
+        ) from exc
+    if payload != candidate:
+        # 往返之后内容变了（元组变列表、整型键变字符串键……）：写下去的就不是
+        # 调用方手里那份计划了，落盘等于悄悄换了一份计划。
+        raise PlanDeltaPersistError(
+            "计划内容 JSON 往返后与原内容不一致，拒绝落盘"
+        )
+    if _vp_markers(payload) != _vp_markers(candidate):
+        raise PlanDeltaPersistError(
+            "计划内容 JSON 往返后发生变化（VP 集合或作废/替换标记漂了），"
+            "拒绝落盘"
+        )
+
+    # 6) 写前摘要复核：计划在增量评估期间被别人改过 → 放弃这一轮。
+    if expected_digest is not None:
+        current = plan_file_digest(target)
+        if current != expected_digest:
+            raise PlanChangedDuringDelta(
+                f"计划文件在增量评估期间被改写：期望摘要 {expected_digest}，"
+                f"实际 {current}"
+            )
+
+    # 7) 原子替换：临时文件 + fsync + os.replace，读者不会看到半个文件。
+    try:
+        atomic_io.atomic_write_json(
+            target, payload, indent=2, ensure_ascii=False, reraise=True,
+        )
+    except OSError as exc:
+        raise PlanDeltaPersistError(f"计划文件落盘失败：{exc}") from exc
+    except (TypeError, ValueError) as exc:
+        raise PlanDeltaPersistError(f"计划文件落盘失败：{exc}") from exc
+
+    # 8) 只有写成功了才让内存生效（调用方持有的对象引用不变）。
+    plan_data.clear()
+    plan_data.update(payload)
+
+    # 9) 摘要：描述落盘后的内容。
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # 评估状态（跨轮记忆"哪些任务已经看过"）
 # ---------------------------------------------------------------------------
 
@@ -584,11 +986,26 @@ def load_delta_state(plan_dir: Path) -> Dict[str, Any]:
 
 
 def save_delta_state(plan_dir: Path, state: Dict[str, Any]) -> None:
+    """写增量评估状态。
+
+    ``allocated_vp_ids``（**发号账本**）与"看过哪些任务"住在同一个文件
+    里，而写这个文件的调用方各写各的：``verification_agent`` 写的是"看过
+    哪些任务"，发号账本由 :func:`record_allocated_vp_ids` 写。谁后写谁
+    覆盖整份文件 —— 账本会被"看过哪些任务"那次写冲掉，"已经发出去过"这个
+    事实于是只活在一轮里。
+
+    所以这里做**合并**：调用方没带这个键时，保留磁盘上已有的账本。
+    """
     path = Path(plan_dir) / _DELTA_STATE_FILENAME
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(state)
+        if "allocated_vp_ids" not in payload:
+            existing = load_delta_state(plan_dir).get("allocated_vp_ids")
+            if existing:
+                payload["allocated_vp_ids"] = list(existing)
         path.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8",
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8",
         )
     except OSError:
         pass  # 记忆文件写不进去不影响本轮评估
@@ -638,3 +1055,36 @@ def merge_allocated_ids(
         if _ID_RE.match(text):
             ids.add(text)
     return sorted(ids, key=_vp_id_sort_key)
+
+
+def record_allocated_vp_ids(
+    plan_dir: Path, vp_ids: Iterable[str],
+) -> List[str]:
+    """把发出去的号并进发号账本，返回合并后的账本。
+
+    这个键是"这个号已经发出去过"的**唯一**记录。下一次发号必须避开它
+    （见 :func:`next_vp_id` 的 ``avoid_ids``）：一个被跳过、从未落进计划的
+    号（VP-031 那样）如果被重新发出去，新验证点会继承它在 SQLite 里的旧
+    结论 —— 一次都没跑就记成失败，或者一次都没跑就被当成"验证通过"。
+
+    账本是**累加**的：这一轮发出的号并进去，之前发出去的号不会被抹掉。
+
+    **只往已经存在的状态文件里并**（见
+    :func:`apply_delta_persisted` 第 4 步的说明）：增量状态文件归调用方
+    所有，本函数不创建它。文件不存在时账本只存在于返回值里。
+    """
+    state = load_delta_state(plan_dir)
+    allocated: List[str] = []
+    for item in state.get("allocated_vp_ids") or []:
+        key = str(item or "").strip()
+        if key and key not in allocated:
+            allocated.append(key)
+    for vp_id in vp_ids or ():
+        key = str(vp_id or "").strip()
+        if key and key not in allocated:
+            allocated.append(key)
+    path = Path(plan_dir) / _DELTA_STATE_FILENAME
+    if path.is_file():
+        state["allocated_vp_ids"] = allocated
+        save_delta_state(plan_dir, state)
+    return allocated

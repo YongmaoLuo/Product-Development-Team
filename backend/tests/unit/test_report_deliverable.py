@@ -508,6 +508,14 @@ def _run_hook(workspace, target, *, read_only=True, report_path=None):
     """
     env = {
         "PATH": "/usr/bin:/bin",
+        # The guard decides what counts as scratch space with
+        # ``tempfile.gettempdir()`` -- in ITS OWN process.  The production
+        # hook is spawned by the CLI, which inherits TMPDIR, so the guard
+        # and the process that configured it agree on where scratch is.  A
+        # hand-built env without TMPDIR breaks that agreement on any
+        # platform that has one (macOS puts it under /var/folders), and the
+        # guard then refuses the write the caller is entitled to.
+        "TMPDIR": tempfile.gettempdir(),
         "PDT_PROJECT_DIR": str(workspace["project"]),
         "PDT_PLANS_DIR": str(workspace["plans"]),
         "PDT_FORMAL_REPO_PATH": str(workspace["project"]),

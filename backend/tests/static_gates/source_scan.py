@@ -124,6 +124,24 @@ SCAN_ROOTS: tuple[Path, ...] = (
     Path("docs"),
     Path(".claude"),
     Path(".github"),
+    # ``tmp/`` is where the application writes while it runs: the
+    # verification servers' logs, the state databases, and the per-run
+    # plan directories a plan's ``services[].start_cmd`` creates. The
+    # plan directories are excluded by the ``plans`` entry in
+    # :data:`EXCLUDED_DIRS`, so what is read here is the rest of it.
+    #
+    # ``.playwright-mcp/`` is where the browser-automation tooling
+    # writes the page snapshots it captures. The captures are not
+    # tracked; the directory is, so that it is a directory the gates
+    # read rather than one they never look at.
+    #
+    # Both of them are here for the reason the docstring above gives:
+    # the list is meant to be every tracked top-level directory. A
+    # tracked directory that no gate reads is a directory whose contents
+    # can be published without being checked, and the only thing that
+    # catches it is ``test_every_tracked_directory_is_scanned``.
+    Path("tmp"),
+    Path(".playwright-mcp"),
 )
 
 #: Directory names that look like first-party source but must never

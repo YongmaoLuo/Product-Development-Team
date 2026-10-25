@@ -401,6 +401,24 @@ def _median(values: list[float]) -> float:
     return (s[n // 2 - 1] + s[n // 2]) / 2
 
 
+# This benchmark compares the wall-clock latency of a real server boot in
+# the current tree with the same boot in the committed baseline, and
+# asserts the two within 200 ms.  Both numbers are measurements of a
+# boot, so this is exactly what the ``time_sensitive`` marker is for:
+# "sharing CPU with a parallel lane makes the very bound they assert
+# unmeasurable, so they fail for a reason that has nothing to do with the
+# code under test" (the marker text in ``backend/pytest.ini``).
+#
+# Measured on a loaded host, one boot of this server took 1.8 s and
+# another 4.3 s -- several times the 200 ms tolerance the comparison
+# asserts -- and on IDENTICAL trees the same comparison measured 675 ms
+# apart in one full-suite run and 107 ms apart in another.  No estimator
+# over a handful of samples can resolve a 200 ms difference against that
+# spread, so the fix is not a cleverer statistic: the benchmark belongs in
+# the serial lane ("time_sensitive or perf", ``--timeout=1800``), the
+# lane CI already runs it in and the only one that has the machine to
+# itself.
+@pytest.mark.time_sensitive
 def test_backend_startup_latency_within_10ms(tmp_path: Path) -> None:
     """Upgrade (provider-order cache) must not add >10 ms to startup time."""
     order_file = _make_order_file(tmp_path)
@@ -456,6 +474,17 @@ def test_backend_startup_latency_within_10ms(tmp_path: Path) -> None:
     # round.  The order inside a round alternates, so a monotone load
     # drift does not systematically favour one side.
     with _cc_switch_serving(chain) as cc_switch_base:
+        # The baseline copy is extracted FIRST and the two halves are
+        # measured ALTERNATELY, so neither half pays the cold-cache cost
+        # the other one would otherwise pay.  Measuring the whole
+        # current tree and then the whole baseline makes the first half
+        # systematically slower -- the page cache, the interpreter's
+        # import caches and the machine's load are all colder for it --
+        # and that ordering bias, not the code, is what the comparison
+        # then reports as a regression.  The contract is unchanged: the
+        # same endpoint, the same stand-in CC Switch, the same HOME, the
+        # same three samples per half, the same median, the same
+        # tolerance.  Only the order the two halves are asked in moves.
         pairs: list[tuple[float, float]] = []
         for index in range(3):
             if index % 2 == 0:

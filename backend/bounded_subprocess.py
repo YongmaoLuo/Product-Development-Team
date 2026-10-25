@@ -57,6 +57,11 @@ Notes
 * Pipes are drained after the kill with a bounded second wait.  A
   descendant that called ``setsid`` itself can escape the group; the
   bound is what stops its inherited pipe from blocking us forever.
+* The child is told which directory it is in.  ``$PWD`` is an ordinary
+  environment variable and is inherited like one, so a child started
+  with ``cwd=X`` still carries the *parent's* ``$PWD`` unless somebody
+  rewrites it.  See :func:`_child_environment` for why that matters and
+  what is done about it.
 """
 
 from __future__ import annotations
@@ -155,6 +160,48 @@ def _wait_bounded(proc: subprocess.Popen, timeout: float) -> bool:
         return True
 
 
+def _child_environment(
+    cwd: Optional[str],
+    env: Optional[Dict[str, str]],
+) -> Optional[Dict[str, str]]:
+    """The environment the child starts with, with ``$PWD`` made true.
+
+    ``$PWD`` is an ordinary environment variable, and it is inherited
+    like one: a child started with ``cwd=X`` still carries the
+    *parent's* ``$PWD`` unless somebody rewrites it.  The child's
+    working directory is the kernel's answer to ``getcwd()``; ``$PWD``
+    is a claim about it, and the claim is inherited along with
+    everything else.
+
+    Some shells repair the claim themselves — bash checks ``$PWD``
+    against the working directory and replaces it when it does not
+    match — but not all of them do, and the tools that believe the
+    claim instead of asking the kernel are exactly the ones a task's
+    ``test_command`` runs: a git hook, npm, poetry.  A child that was
+    told to run in the project directory and was handed somebody else's
+    ``$PWD`` reports a directory that is not the one it is in, and a
+    hook that resolves its repository root from ``$PWD`` writes into
+    the wrong tree.
+
+    So the claim is set here, where the directory is known: ``$PWD``
+    names the directory the child is in, and ``$OLDPWD`` — which would
+    name the directory the child came *from*, a directory it has no
+    relationship to — is dropped.
+
+    ``None`` is returned when there is nothing to say.  No ``cwd`` and
+    no ``env`` means the child inherits the parent's environment
+    exactly as ``subprocess`` would have given it, and inventing an
+    environment for it would change behaviour for every caller that
+    never asked about directories.
+    """
+    if not cwd and env is None:
+        return None
+    child = dict(os.environ if env is None else env)
+    child["PWD"] = os.path.abspath(cwd) if cwd else os.getcwd()
+    child.pop("OLDPWD", None)
+    return child
+
+
 def run_bounded(
     command: Union[str, list],
     *,
@@ -176,6 +223,11 @@ def run_bounded(
     executes a shell pipeline authored by a task's ``test_command``.
     The shell is the thing being bounded, and it is the reason the
     timeout needs a process group to work.
+
+    The child is told which directory it is in: ``$PWD`` is rewritten to
+    match *cwd* and ``$OLDPWD`` is dropped, so a command that believes
+    the variable rather than asking the kernel is not misled.  See
+    :func:`_child_environment`.
     """
     # ``shell=True`` is deliberate and load-bearing, not an oversight:
     # the callers execute a task's ``test_command``, which is a shell
@@ -192,7 +244,7 @@ def run_bounded(
         command,
         shell=shell,
         cwd=cwd,
-        env=env,
+        env=_child_environment(cwd, env),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=text,

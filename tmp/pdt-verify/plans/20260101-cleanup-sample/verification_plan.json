@@ -1,0 +1,16 @@
+{
+  "verification_points": [
+    {
+      "id": "VP-001",
+      "title": "Cleanup-sample e2e lifecycle verification",
+      "related_prd_criteria": "After EXEC_PORT=8001 lifecycle + teardown: zero forbidden JSON sidecars under plans/20260101-cleanup-sample/",
+      "verification_method": "automated_test",
+      "priority": "high",
+      "expected_result": "Defense 1 (source grep), Defense 1b (filesystem teardown walk), and Defense 2 (SQLite schema whitelist) all pass for the cleanup-sample plan",
+      "test_command": "backend/.venv/bin/python3 -m pytest backend/tests/test_server_json_cleanup.py -v --e2e -k 'e2e'",
+      "target_url": "",
+      "timeout_seconds": 30,
+      "execution_group": 0
+    }
+  ]
+}

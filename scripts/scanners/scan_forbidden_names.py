@@ -937,15 +937,26 @@ def iter_commit_blobs(repo: Path, sha: str) -> Iterator[tuple[str, bytes]]:
     private name is as published in a ``.yaml`` or a ``.md`` as in a
     ``.py``. Non-blob entries -- submodule commits, nested trees -- are
     dropped by *type* rather than being handed to ``cat-file`` and failing.
+
+    The listing is read with ``-z``. Without it git *quotes* a path that
+    holds a character it considers unusual -- an em dash, a quote, a
+    backslash -- and the quoted spelling is not the path: the blob spec
+    built from it names nothing, ``cat-file`` answers "missing", and the
+    scan refuses to report a clean result over a partial read. The NUL
+    form is the raw path, with the entries separated by a byte that cannot
+    occur in a name, so nothing has to be unescaped and nothing can be
+    truncated at a space.
     """
-    tree = _git(repo, ["ls-tree", "-r", sha])
+    tree = _git(repo, ["ls-tree", "-r", "-z", sha])
     paths: list[str] = []
-    for line in tree.decode("utf-8", "replace").splitlines():
-        meta, _, path = line.partition("\t")
-        fields = meta.split()
-        if len(fields) < 3 or fields[1] != "blob":
+    for entry in tree.split(b"\0"):
+        if not entry:
             continue
-        paths.append(path)
+        meta, _, path = entry.partition(b"\t")
+        fields = meta.split()
+        if len(fields) < 3 or fields[1] != b"blob":
+            continue
+        paths.append(path.decode("utf-8", "replace"))
 
     if not paths:
         return

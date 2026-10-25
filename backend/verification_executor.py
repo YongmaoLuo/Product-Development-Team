@@ -59,7 +59,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from base_executor import BaseExecutor, _build_layers, _now_iso, stable_fingerprint
 from utils.atomic_io import atomic_write_json
@@ -402,6 +402,17 @@ class VerificationExecutor(BaseExecutor):
         # Verdicts map keyed by VP id. Populated by _load_or_init_state.
         self._verdicts: Dict[str, Dict[str, Any]] = {}
 
+        # 2026-10-25（VP-031）：**计划没有定义的验证点**，它们的裁决不得
+        # 以失败的身份出现在报告里。
+        #
+        # ``_orphaned_vps``：本轮被隔离的孤儿裁决（id → 它带的 status），
+        # 只用于留痕与告警。
+        # ``_orphan_ledger``：跨轮记住"这些号已经作废过"，下一次装载不再
+        # 接受它们的旧结论（即便有人把旧 id 写回计划，新验证点也不能
+        # 继承上一轮的 FAILED）。
+        self._orphaned_vps: Dict[str, str] = {}
+        self._orphan_ledger: Set[str] = set()
+
         # Index lists derived from ``_verdicts``. Kept in verdict-
         # recording order and exposed via the ``failed_vps`` /
         # ``skipped_vps`` properties so the orchestrator / dashboard
@@ -494,6 +505,14 @@ class VerificationExecutor(BaseExecutor):
         → ``overall_status = FAILED`` → 修复环永远收敛不了。
         判据与执行侧共用 :meth:`_plan_retired_vps`，两边不可能再漂移。
 
+        2026-10-25（VP-031）：**计划没有定义**的验证点同样不进这里。
+        那是另一种"计划不再要求它"—— 不是计划把它作废了，而是计划**从
+        来没有写过它**。2026-10-25 的计划只有 30 条（``VP-001``..
+        ``VP-030``），报告里却出现了第 31 条（``VP-031: FAILED``，
+        ``actual_result`` 还是上一轮的原文）：它是上一轮的一条孤儿裁决，
+        每轮原样流进报告，再被修复生成器读成"本轮失败"，修复环因此
+        永远收敛不了。判据与分桶侧共用 :meth:`_orphaned_vp_ids`。
+
         Returns:
             A list of ``{"vp_id": str, "status": str, "reasons": list,
             "evidence": dict, ...}`` dicts. The ``vp_id`` key is
@@ -502,6 +521,7 @@ class VerificationExecutor(BaseExecutor):
             inside the verdict body).
         """
         retired = self._plan_retired_vps()
+        orphaned = self._orphaned_vp_ids()
         out: List[Dict[str, Any]] = []
         for vp_id, verdict in self._verdicts.items():
             # ``str()``: ``_plan_retired_vps`` keys on ``str(vp["id"])`` and
@@ -509,6 +529,10 @@ class VerificationExecutor(BaseExecutor):
             # arrived as a non-str from a persisted store must not silently
             # miss the filter (failing open is the bug being fixed here).
             if str(vp_id) in retired:
+                continue
+            # 同理：孤儿判据按 ``strip()`` 后的 id 比较，两道面用同一套
+            # 拼写（见 :meth:`_orphaned_vp_ids`）。
+            if str(vp_id).strip() in orphaned:
                 continue
             entry = dict(verdict)  # defensive copy
             entry["vp_id"] = vp_id
@@ -1122,6 +1146,12 @@ class VerificationExecutor(BaseExecutor):
                 self._current_vp = progress_state.get("current_vp")
                 self._completed_vps = list(progress_state.get("completed_vps") or [])
                 self._updated_at = progress_state.get("updated_at")
+                # 2026-10-25（VP-031）：**先读账本、再隔离孤儿、最后才派生
+                # 索引桶** —— 顺序不能换：桶是从 ``_verdicts`` 派生的，
+                # 孤儿必须在派生之前就离开这张表，否则它会进失败桶
+                # （修复环的输入）并原样进报告。
+                self._load_orphan_ledger(row.get("executor_state"))
+                self._quarantine_orphan_verdicts()
                 self._backfill_index_lists_from_verdicts()
                 # Mirror into BaseExecutor's in-memory fields so a
                 # caller that goes through the base-class run loop
@@ -1130,6 +1160,7 @@ class VerificationExecutor(BaseExecutor):
                 self._completed_items = list(self._completed_vps)
                 self._failed_items = list(self._failed_vps)
                 self._skipped_items = list(self._skipped_vps)
+                self._persist_orphan_ledger()
                 return
 
         if self.state_file.exists():
@@ -1138,6 +1169,9 @@ class VerificationExecutor(BaseExecutor):
                     data = json.load(f)
                 self._pending_vps = list(data.get("pending_vps", []))
                 self._verdicts = dict(data.get("verdicts", {}))
+                # 2026-10-25（VP-031）：与 SQLite 分支同一套顺序与理由。
+                self._load_orphan_ledger(data.get("orphaned_vp_ids"))
+                self._quarantine_orphan_verdicts()
                 self._backfill_index_lists_from_verdicts()
                 # Mirror into BaseExecutor's in-memory fields so a
                 # caller that goes through the base-class run loop
@@ -1146,6 +1180,7 @@ class VerificationExecutor(BaseExecutor):
                 self._completed_items = list(self._completed_vps)
                 self._failed_items = list(self._failed_vps)
                 self._skipped_items = list(self._skipped_vps)
+                self._persist_orphan_ledger()
                 return
             except (OSError, json.JSONDecodeError):
                 # Corrupt or partially-written state file: fall back
@@ -1267,6 +1302,16 @@ class VerificationExecutor(BaseExecutor):
         # ``superseded_by`` 的父 VP 尤其不能摘 —— 它的 SPLIT 裁决是"父不重跑"
         # 这条契约的承重件，摘掉等于让拆分过的大 VP 每轮重跑一次。
         retired = self._plan_retired_vps()
+        # 2026-10-25（VP-031）：**计划没有定义**的验证点不进任何桶。
+        #
+        # 判据是"计划有没有写过这个点"，不是"这条结论有没有出处"——
+        # 一条从不在计划里的 id 不是失败信号，而是"计划里没有这个点"这个
+        # 结构性事实。它不进 failed（修复环的输入），也不进 completed
+        # （那等于把没验过的东西记成验证通过）。
+        #
+        # 与 :meth:`collect_verdicts` 共用同一道闸 —— 两份"什么叫该排除"
+        # 正是 2026-10-14 的 VP-009 漂移出来的。
+        orphaned = self._orphaned_vp_ids()
 
         # 2026-10-23: 分桶规则来自 :func:`verification_buckets.
         # derive_index_buckets` —— 与读侧（报告 / 卡片 / API）、``record_verdict``、
@@ -1274,7 +1319,19 @@ class VerificationExecutor(BaseExecutor):
         # 桶的判断，于是同一个裁决两处说法不同（``BLOCKED`` 在 ``_record_result``
         # 里进失败桶，在这里却因为「不认识这个 status」而哪儿都不是）。两份规则
         # 必然漂移 —— 漂移的产物是「同一个 VP 既在失败桶又在完成桶」。
-        buckets = derive_index_buckets(self._verdicts, retired=retired)
+        #
+        # 2026-10-25（VP-031）：**孤儿裁决先排除再分桶**。计划里从没写过这个
+        # id 的裁决不是失败信号，而是「计划里没有这个点」这个结构性事实 ——
+        # 它不进任何桶（失败桶是修复环的输入，完成桶等于把没验过的东西记成
+        # 验证通过）。过滤放在分桶**之前**，所以它同样不进 skipped / deferred。
+        buckets = derive_index_buckets(
+            {
+                vp_id: verdict
+                for vp_id, verdict in self._verdicts.items()
+                if str(vp_id).strip() not in orphaned
+            },
+            retired=retired,
+        )
         self._completed_vps = buckets[BUCKET_COMPLETED]
         self._failed_vps = buckets[BUCKET_FAILED]
         self._skipped_vps = buckets[BUCKET_SKIPPED]
@@ -1474,6 +1531,9 @@ class VerificationExecutor(BaseExecutor):
             "plan_id": self.plan_id,
             "pending_vps": self._pending_vps,
             "verdicts": self._verdicts,
+            # 2026-10-25（VP-031）：发号账本随状态一起落盘 —— 下一次装载
+            # 必须记得"这些号已经作废过"。
+            "orphaned_vp_ids": sorted(self._orphan_ledger),
         }
         atomic_write_json(self.state_file, payload, logger=logger)
         # Mirror the in-memory VP view to the SQLite column so the
@@ -1949,6 +2009,247 @@ class VerificationExecutor(BaseExecutor):
             self._definition_fingerprint_for_vp_id(vp_id)
         )
         return stamped
+
+    # 计划定义（2026-10-25，VP-031）
+    # ------------------------------------------------------------------
+    #
+    # 计划里的验证点有两种"不再被要求"的方式：
+    #
+    #   * 计划**把它作废了**（``obsolete`` / ``superseded_by``）——
+    #     :meth:`_plan_retired_vps` 管这一种；
+    #   * 计划**从来没有写过它** —— 这一种由本节管。
+    #
+    # 第二种更隐蔽：一条从不在计划里的 id 永远不会被"作废标记"退休，
+    # 于是它的裁决每轮原样流进报告与失败桶，而执行侧的 items 只来自
+    # 计划里的 VP —— 它既不会被重跑，也不会被清除。修复环因此永远
+    # 收敛不了（VP-031，2026-10-25）。
+
+    def _plan_defined_vp_ids(self) -> Optional[Set[str]]:
+        """The VP ids the plan itself defines — or ``None`` when it says nothing.
+
+        ``None`` means **"we do not know what the plan asks for"**, so
+        nothing may be voided on the plan's behalf. The two ways of not
+        knowing are kept apart, exactly as
+        ``orchestrator._undefined_vp_ids`` does:
+
+          * the plan is unreadable / declares no verification point at all
+            → an unknown plan cannot say that a point is undefined;
+          * the plan is readable and declares its points → the ids below
+            are the authority on "the plan asks for this".
+
+        Ids are compared as ``str`` + stripped — the same spelling the
+        verdict-side filters use, so every filter talks about the same
+        points.
+        """
+        vps = self._plan_vps()
+        if not isinstance(vps, list) or not vps:
+            # The plan says nothing: nothing is voided.
+            return None
+        defined: Set[str] = set()
+        for vp in vps:
+            if not isinstance(vp, dict):
+                continue
+            vp_id = str(vp.get("id") or "").strip()
+            if vp_id:
+                defined.add(vp_id)
+        if not defined:
+            # A plan whose points carry no id cannot have one voided either.
+            return None
+        return defined
+
+    def _orphaned_vp_ids(self) -> Set[str]:
+        """The verdict ids the plan never defines — **the one gate**.
+
+        Shared by :meth:`collect_verdicts` (report side) and
+        :meth:`_backfill_index_lists_from_verdicts` (bucket side) so the two
+        can never drift apart — 2026-10-14's VP-009 was exactly two copies
+        of "what counts as retired" disagreeing.
+
+        A verdict for an id the plan does not define is not a failure of
+        anything: there is no criterion behind it, so it must enter no
+        bucket (completed / failed / skipped / deferred) and no report.
+
+        The one exception is a **structural record of the run** — a split
+        parent or a crashed in-flight VP (see
+        :meth:`_is_structural_record`). Those do not conclude anything
+        about a criterion; they report what the *run* did. The plan's id
+        set has no say over them, so they are not orphans.
+        """
+        defined = self._plan_defined_vp_ids()
+        if defined is None:
+            # Fail-closed: an unknown plan defines nothing away.
+            return set()
+        orphans: Set[str] = set()
+        for vp_id, verdict in self._verdicts.items():
+            key = str(vp_id).strip()
+            if not key or key in defined:
+                continue
+            if self._is_structural_record(verdict):
+                continue
+            orphans.add(key)
+        return orphans
+
+    @staticmethod
+    def _is_structural_record(verdict: Any) -> bool:
+        """Is this verdict a record of the run rather than a conclusion?
+
+        Two of them, both carrying contracts that landed before this gate:
+
+          * ``SPLIT`` — "this VP was split into children, the children
+            carry the verdicts" (2026-09-14). Its only job is to keep the
+            parent out of the re-run set, so the parent is bucketed
+            ``skipped`` (= BaseExecutor's ``completed_set``) and a resumed
+            round runs only the children.
+          * ``recovered_from_crash`` — "the process died while verifying
+            this VP" (the crash-recovery pass). It reports the run, and
+            the repair loop surfaces the label as its own counter.
+
+        Neither says anything about a criterion, so the plan's id set does
+        not gate them: a plan that never listed the id cannot call the
+        record meaningless — the run itself is the evidence.
+        """
+        if not isinstance(verdict, dict):
+            return False
+        if verdict.get("status") == "SPLIT":
+            return True
+        reasons = verdict.get("reasons")
+        if isinstance(reasons, (list, tuple)):
+            for reason in reasons:
+                if str(reason).strip() == "recovered_from_crash":
+                    return True
+        evidence = verdict.get("evidence")
+        if isinstance(evidence, dict) and evidence.get("recovered_from_crash"):
+            return True
+        return False
+
+    def _quarantine_orphan_verdicts(self) -> None:
+        """Move verdicts the plan never defines out of the projection.
+
+        Called right after the verdict map is hydrated (SQLite or the legacy
+        state file) and **before** the index lists are derived — the buckets
+        come from ``_verdicts``, so an orphan has to have left that map
+        before they are derived.
+
+        Two reasons to drop a verdict here:
+
+          * the plan does not define the id — the verdict answers a
+            criterion nobody wrote down;
+          * the id is in the **orphan ledger** — it was already voided in an
+            earlier round, so its old conclusion must not be inherited even
+            if the plan has since taken the id back (the VP is re-run and
+            earns a fresh verdict).
+
+        The verdict itself stays where it was written (SQLite); this map is
+        only a projection of it.
+
+        The ledger entry is **not** retired when the plan takes the id
+        back: the old conclusion lives in the store, and the store cannot
+        tell it apart from a fresh one. So the id keeps being re-run and
+        re-earning a fresh verdict — the price of never inheriting a stale
+        conclusion. Both reasons are logged separately, because "the plan
+        never defined it" and "it was voided earlier" are different facts.
+        """
+        defined = self._plan_defined_vp_ids()
+        if defined is None:
+            # Fail-closed: the plan's wishes are unknown, so nothing may be
+            # voided on its behalf.
+            return
+        for vp_id in list(self._verdicts.keys()):
+            key = str(vp_id).strip()
+            if not key:
+                continue
+            if key in defined and key not in self._orphan_ledger:
+                continue
+            verdict = self._verdicts.pop(vp_id, None)
+            status = verdict.get("status") if isinstance(verdict, dict) else None
+            self._orphaned_vps[key] = str(status) if status else "UNKNOWN"
+            self._orphan_ledger.add(key)
+            if key in defined:
+                logger.warning(
+                    "[Verification] plan_id=%s: verdict for %s (%s) was voided "
+                    "in an earlier round — dropped so the point earns a "
+                    "fresh one",
+                    self.plan_id, key, self._orphaned_vps[key],
+                )
+            else:
+                logger.warning(
+                    "[Verification] plan_id=%s: verdict for %s (%s) is not "
+                    "defined by the plan — dropped from the report projection",
+                    self.plan_id, key, self._orphaned_vps[key],
+                )
+
+    def _load_orphan_ledger(self, raw: Any) -> None:
+        """Read the persisted orphan ledger (``orphaned_vp_ids``).
+
+        Accepts either the ledger itself (a list of ids) or the blob that
+        carries it (``{"orphaned_vp_ids": [...]}`` — the shape stored in
+        the SQLite ``executor_state`` column).
+        """
+        if isinstance(raw, dict):
+            raw = raw.get("orphaned_vp_ids")
+        if not isinstance(raw, (list, tuple, set)):
+            return
+        for item in raw:
+            key = str(item or "").strip()
+            if key:
+                self._orphan_ledger.add(key)
+
+    def _persist_orphan_ledger(self) -> None:
+        """Write the orphan ledger into the persisted state.
+
+        The ledger has to outlive the round: its whole purpose is that the
+        **next** load does not inherit an old conclusion for an id the plan
+        once voided. The canonical store is the SQLite
+        ``plan_verification.executor_state`` column; the legacy state file
+        carries the same key for the pre-SQLite path.
+
+        Writing it must never cost an audit trail: the legacy path
+        rewrites only the ledger key and leaves the stored verdicts alone,
+        and the SQLite path **merges** into the ``executor_state`` blob
+        instead of replacing it.
+        """
+        ledger = sorted(self._orphan_ledger)
+        if not ledger:
+            return
+        if self.verif_repo is not None and self.plan_id:
+            # ``executor_state`` has no other writer in the framework, and
+            # the repository exposes no public writer for it; the private
+            # ``_update`` is the same single-statement UPDATE the public
+            # writers use. Guarded so a repo without it degrades to the
+            # legacy path instead of raising.
+            update = getattr(self.verif_repo, "_update", None)
+            if callable(update):
+                blob: Dict[str, Any] = {}
+                try:
+                    row = self.verif_repo.summary(self.plan_id) or {}
+                    existing = row.get("executor_state")
+                    if isinstance(existing, dict):
+                        blob = dict(existing)
+                except Exception:  # noqa: BLE001 — 读不到就按空写，账本本身才是关键
+                    blob = {}
+                blob["orphaned_vp_ids"] = ledger
+                try:
+                    update(self.plan_id, executor_state=blob)
+                except Exception as exc:  # noqa: BLE001 — 账本写不进去不阻断验证
+                    logger.warning(
+                        "[Verification] plan_id=%s: could not persist the "
+                        "orphan ledger: %r", self.plan_id, exc,
+                    )
+                return
+        try:
+            data: Dict[str, Any] = {}
+            if self.state_file.exists():
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+            data["orphaned_vp_ids"] = ledger
+            atomic_write_json(self.state_file, data, logger=logger)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger.warning(
+                "[Verification] plan_id=%s: could not persist the orphan "
+                "ledger to the state file: %r", self.plan_id, exc,
+            )
 
     def _build_execution_layers(
         self,

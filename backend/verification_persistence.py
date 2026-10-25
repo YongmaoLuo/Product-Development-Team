@@ -17,6 +17,61 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 
+#: The name of the durable audit file inside a plan's log directory.
+#:
+#: It sits next to the per-round logs and holds the events that must
+#: not be lost: the ones that record a decision about the *plan* rather
+#: than about one verification point (a refused criterion replacement,
+#: a delta that could not be written). The per-round log is tied to a
+#: round; this file is not — and its name deliberately does not start
+#: with ``verification_``, so the per-round cleanup (``logs/`` globbing
+#: ``verification_*``) never mistakes it for a round artifact.
+AUDIT_LOG_FILENAME = "audit_events.jsonl"
+
+
+def write_audit_event(
+    plan_dir: Path,
+    vp_id: str,
+    event_type: str,
+    data: Dict[str, Any],
+) -> bool:
+    """Append one audit event to the plan's durable audit trail.
+
+    :meth:`VerificationPersistenceManager.write_verification_point_log`
+    needs an open round log; an event that must not be lost cannot
+    depend on that, so this writes to a file of its own inside the
+    plan's log directory. The entry carries the same fields as a
+    round-log entry, so a reader does not have to know which of the
+    two it is looking at.
+
+    Args:
+        plan_dir: The plan's directory (``plans/{id}``).
+        vp_id: The verification point id the event belongs to — a
+            synthetic id for an event that is about the plan.
+        event_type: The event name (e.g. ``plan_delta_persist_failed``).
+        data: The event payload.
+
+    Returns:
+        ``True`` when the event reached the disk, ``False`` when it
+        could not be written. The caller decides what an unwritable
+        audit trail means; the event itself is never raised.
+    """
+    try:
+        logs_dir = Path(plan_dir) / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "verification_point_id": vp_id,
+            "event_type": event_type,
+            "timestamp": datetime.now().isoformat(),
+            "data": data,
+        }
+        with open(logs_dir / AUDIT_LOG_FILENAME, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        return True
+    except OSError:
+        return False
+
+
 class VerificationPersistenceManager:
     """
     Manages multi-file persistence for verification reports.
@@ -130,6 +185,27 @@ class VerificationPersistenceManager:
             # verifier's hot loop. (publish_safe already swallows,
             # but the import itself can fail.)
             pass
+
+    def write_audit_event(
+        self, vp_id: str, event_type: str, data: Dict[str, Any]
+    ) -> bool:
+        """Write one audit event to the plan's durable audit trail.
+
+        The sibling of :meth:`write_verification_point_log` for the
+        events that must not be lost: it does not need an open round
+        log, so it can be called from a path that runs before (or
+        after) the round's own log exists.
+
+        Args:
+            vp_id: Verification point ID (a synthetic id for an event
+                that is about the plan rather than about one point).
+            event_type: Event type (e.g. ``plan_delta_persist_failed``).
+            data: Event data to log.
+
+        Returns:
+            ``True`` when the event reached the disk.
+        """
+        return write_audit_event(self.plan_dir, vp_id, event_type, data)
 
     def write_screenshot_reference(
         self,

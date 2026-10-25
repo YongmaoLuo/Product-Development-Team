@@ -71,6 +71,7 @@ from fast_lane import (
 from coding_tool import JsonSession
 from framework.ids import derive_plan_id
 from framework.task_graph import DanglingTaskDependency
+from hooks.config import write_for_plan
 from task import SubTask
 from task_manager import CycleInTaskGraph, TaskManager
 from tasks_generator import TasksGenerationError, TasksGenerator
@@ -106,6 +107,13 @@ class ImportPlanRequest(BaseModel):
     tasks: Any = None
     raw: Any = None
     requirement: Any = None
+    #: Where a human-in-the-loop question about this plan is delivered, and
+    #: the session the plan was created in.  Both are optional, and a
+    #: caller that sends neither is a caller with no session to ask —
+    #: which is the normal case for a ``curl``.  See
+    #: :func:`bind_hook_for_plan`.
+    hook_destination: Optional[str] = None
+    hook_session_id: Optional[str] = None
 
 
 class RevisePlanRequest(BaseModel):
@@ -228,6 +236,57 @@ def _mark_ready(plan_id: str, plan_dir: Path) -> None:
                 "plan_id": plan_id,
             },
         )
+
+
+def bind_hook_for_plan(
+    plan_dir: Path,
+    destination: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record who a human-in-the-loop question about this plan goes to.
+
+    *Who* is asked is a property of the plan, not of the backend: a plan
+    created from a Claude Code session asks the group that session lives
+    in, and a plan created by a bare ``curl`` has no session and
+    therefore nobody to ask.  So the origin is stored next to the plan,
+    in ``<plan_dir>/hitl_config.json``.
+
+    The reader and the writer of that file both live in
+    ``hooks.config`` and nowhere else; this function is only the caller
+    that hands the origin over, and it is shared by both plan-creation
+    doors — this lane and the interview in ``routes/phases.py``.
+
+    A plan created without a session gets an **empty** hook list, not an
+    error: that is the documented degradation, and it is written down
+    rather than left implicit, so a later reader can tell "nobody was
+    asked" from "nobody ever wrote this down".
+
+    The write is **not** allowed to fail the creation.  A plan whose
+    hook configuration cannot be persisted is still a plan, and a plan
+    with no hooks is a state a plan already knows how to be in — its
+    decisions are simply unroutable, which notifies nobody and blocks
+    nothing.  A failed plan creation, on the other hand, is a plan that
+    does not exist.  The failure is therefore logged loudly and the
+    creation continues.
+    """
+    origin = {
+        # An empty source is how ``hooks.config`` spells "this plan did
+        # not come from a session"; a hook needs a session to have come
+        # from as well as a place to be delivered to.
+        "source": "plan_creation" if (session_id or "").strip() else "",
+        "session_id": (session_id or "").strip(),
+        "destination": (destination or "").strip(),
+    }
+    try:
+        return write_for_plan(plan_dir, origin)
+    except Exception as exc:  # noqa: BLE001 - logged, never swallowed silently
+        _server.logger.error(
+            "hitl_hook_binding_failed: cannot bind the hook of plan %s (%s); "
+            "the plan keeps no hook configuration",
+            plan_dir,
+            type(exc).__name__,
+        )
+        return {}
 
 
 @router.post("/api/plan/import")
@@ -377,6 +436,11 @@ def import_plan(req: ImportPlanRequest):
 
     written = _persist_tasks(plan_dir, seed, tasks_data)
     _mark_ready(plan_id, plan_dir)
+    # The plan's hook binding: the session it was created in, and where a
+    # human-in-the-loop question about it goes.  Recorded once the plan
+    # exists — a plan that never reached ``ready`` is not a plan, and
+    # has nobody to ask.
+    bind_hook_for_plan(plan_dir, req.hook_destination, req.hook_session_id)
     # Remember the conversation the import ran in, so a later revision
     # of this plan resumes it instead of starting over. Written last:
     # a plan that never reached ``ready`` has nothing to revise.

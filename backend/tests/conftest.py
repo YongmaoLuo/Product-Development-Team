@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -750,6 +751,242 @@ def isolated_provider_state():
         set_shared_cooldown(None)
 
 
+# ---------------------------------------------------------------------------
+# HITL persistence isolation
+# ---------------------------------------------------------------------------
+#
+# The HITL feature (human-in-the-loop decisions) gives the backend a
+# persistence surface of its own: the ``plan_decisions`` table in the
+# state database, plus the per-plan artifacts a decision asks about.  A
+# decision row outlives the call that wrote it — it is asked by one
+# thread and answered by another, minutes later — so a row that
+# survives the test that wrote it is read by the *next* test as if it
+# were a live question.  That failure is order-dependent: it reproduces
+# only on the runs where the two tests happen to be adjacent, and the
+# evidence points at the wrong code.
+#
+# Two things are pinned below, and they are the difference between a
+# named failure and a flake:
+#
+#   1. **The redirect is proven, not assumed.**  ``isolated_plans_dir``
+#      sets the environment variables and then asks the *production*
+#      resolvers where they would write.  A resolver that stops
+#      honouring its variable — a new persistence path that resolves
+#      its root some other way — fails the test loudly, at the point
+#      where the redirect broke, instead of writing into the operator's
+#      tree and surfacing three tests later as an unexplained row.
+#
+#   2. **A knob the fixture cannot redirect is refused.**  The HITL
+#      package will grow its own persistence (a decision configuration
+#      file, for one).  The day it reads a ``PDT_*`` variable, that
+#      variable has to be redirectable; the session-scoped guard below
+#      refuses to start a run in which the package reads one the
+#      fixture does not know about, and names it.
+#
+# Nothing in this section creates a file.  The fixture only *points*
+# paths at the per-test tmp root, because a test that asserts on the
+# contents of ``tmp_path`` (there is one that requires nothing but
+# ``tasks.json`` to be in there) would otherwise see the fixture's own
+# artefacts.
+
+
+def _resolve_plans_dir() -> Path:
+    """The path the application writes its per-plan artifacts to.
+
+    Imported lazily: ``config_paths`` is a leaf module, but the conftest
+    is imported by every test tree, and a slimmed session may not ship
+    the backend package at all.
+    """
+    import config_paths
+
+    return config_paths.resolve_plans_dir()
+
+
+def _resolve_state_db_path() -> Path:
+    """The path the application writes its state database to."""
+    import config_paths
+
+    return config_paths.resolve_state_db_path()
+
+
+#: The persistence roots the suite redirects, and the environment
+#: variable that relocates each one.  The third element is the
+#: *production* resolver — the function the application itself calls to
+#: obtain the path — so the guard asks the application where it would
+#: write rather than assuming the variable was honoured.
+_HITL_PERSISTENCE_ROOTS = (
+    ("plans root", "PDT_PLANS_DIR", _resolve_plans_dir),
+    ("state db", "PDT_STATE_DB_PATH", _resolve_state_db_path),
+)
+
+#: The knobs the fixture is able to redirect, by name.  A ``PDT_*``
+#: variable outside this set cannot be pointed at the per-test tmp
+#: root, which is why the session guard below treats one as an error
+#: rather than as a detail.
+_HITL_REGISTERED_KNOBS = frozenset(
+    env_var for _name, env_var, _resolve in _HITL_PERSISTENCE_ROOTS
+)
+
+#: The shapes a ``PDT_*`` variable is read in.  Three spellings, because
+#: three spellings are in use across the backend
+#: (``os.getenv("X")``, ``os.environ.get("X")``, ``os.environ["X"]``).
+_PDT_KNOB_PATTERNS = (
+    re.compile(r"""os\.getenv\(\s*["'](PDT_[A-Z0-9_]+)["']"""),
+    re.compile(r"""os\.environ\.get\(\s*["'](PDT_[A-Z0-9_]+)["']"""),
+    re.compile(r"""os\.environ\[\s*["'](PDT_[A-Z0-9_]+)["']"""),
+)
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    """True when ``path`` is ``root`` or lives under it.
+
+    Both sides are resolved first: on macOS ``/tmp`` is a symlink to
+    ``/private/tmp``, so a string comparison would call a path inside
+    the per-test root "outside" it.
+    """
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def _assert_hitl_persistence_isolated(tmp_root: Path) -> None:
+    """Fail loudly when a persistence root escaped the per-test redirect.
+
+    Called by ``isolated_plans_dir`` for every test, so the failure it
+    reports is the *first* thing that went wrong rather than a stray
+    row three tests later.  Each root is checked twice: the variable
+    has to point inside the per-test root, and the resolver the
+    application calls has to agree with it.
+    """
+    for name, env_var, resolve in _HITL_PERSISTENCE_ROOTS:
+        raw = os.environ.get(env_var)
+        assert raw, (
+            f"the {name} was not redirected: {env_var} is unset, so the "
+            f"suite would write into the operator's tree"
+        )
+        assert _is_within(Path(raw), tmp_root), (
+            f"the {name} points outside the per-test root: {env_var}={raw!r} "
+            f"is not under {tmp_root!s}"
+        )
+        resolved = Path(resolve())
+        assert _is_within(resolved, tmp_root), (
+            f"the {name} resolver ignored {env_var}: it resolves to "
+            f"{resolved!s}, which is not under the per-test root "
+            f"{tmp_root!s}. A persistence path that no longer honours the "
+            f"override has to be fixed before the suite can be trusted."
+        )
+
+
+def _assert_decision_table_starts_empty(db_path: Path) -> None:
+    """The ``plan_decisions`` table of the per-test database must be empty.
+
+    The database is a per-test file, so in the normal case it does not
+    exist yet when a test starts and the table cannot hold a row.  This
+    check is the backstop for the case where it does: a decision row
+    left over from another test means the database is shared after all,
+    and the next test would read a stranger's decision as if it were
+    live.  Failing here — with the row count named — is the difference
+    between a diagnosis and a flake.
+    """
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return
+    conn = sqlite3.connect(str(db_path))
+    try:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='plan_decisions'"
+        ).fetchone()
+        if table is None:
+            return
+        count = conn.execute("SELECT COUNT(*) FROM plan_decisions").fetchone()[0]
+    except sqlite3.OperationalError:
+        # A database that cannot be read is not this check's business;
+        # the test that needs it reports the real error.
+        return
+    finally:
+        conn.close()
+    assert count == 0, (
+        f"the per-test state database {db_path} already holds {count} "
+        f"plan_decisions row(s) before the test started: the database is "
+        f"shared, so a decision written by one test would be read by the "
+        f"next"
+    )
+
+
+def _hitl_sources() -> list[Path]:
+    """The HITL sources whose ``PDT_*`` knobs the fixture must redirect.
+
+    ``backend/hitl`` (the decision model and store), ``backend/hooks``
+    (the one reader and writer of ``<plan_dir>/hitl_config.json``) and
+    the module paths a HITL route would plausibly take.  Absent paths
+    are skipped: the point of the scan is what the HITL code *reads*,
+    not that the HITL code exists yet.
+    """
+    candidates = [
+        _BACKEND_DIR / "hitl",
+        _BACKEND_DIR / "hooks",
+        _BACKEND_DIR / "hitl.py",
+        _BACKEND_DIR / "routes" / "hitl.py",
+    ]
+    return [candidate for candidate in candidates if candidate.exists()]
+
+
+def _scan_pdt_knobs(source: Path) -> set[str]:
+    """Return the ``PDT_*`` variables the module(s) at ``source`` read.
+
+    ``source`` may be a single module or a package directory (scanned
+    recursively).  Reading the source rather than importing it is
+    deliberate: the scan must work for a module that cannot be
+    imported in this process, and it must not have side effects.
+    """
+    source = Path(source)
+    if source.is_dir():
+        files = sorted(source.rglob("*.py"))
+    elif source.is_file():
+        files = [source]
+    else:
+        return set()
+    found: set[str] = set()
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):  # pragma: no cover
+            continue
+        for pattern in _PDT_KNOB_PATTERNS:
+            found.update(pattern.findall(text))
+    return found
+
+
+def _unregistered_hitl_knobs(knobs) -> list[str]:
+    """Return the knobs the fixture cannot redirect, by name."""
+    return sorted(set(knobs) - _HITL_REGISTERED_KNOBS)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _hitl_persistence_knobs_are_registered():
+    """Refuse to run when the HITL package reads an unregistered knob.
+
+    A ``PDT_*`` variable the fixture does not know about cannot be
+    redirected, so the suite would read and write the operator's tree
+    through it.  Catching that here — at session start, with the knob
+    named — is what keeps a new HITL persistence path from becoming the
+    kind of failure that only shows up on the runs where two tests
+    happen to be adjacent.
+    """
+    for source in _hitl_sources():
+        unregistered = _unregistered_hitl_knobs(_scan_pdt_knobs(source))
+        assert not unregistered, (
+            f"the HITL source {source} reads {unregistered!r}, which the "
+            f"test fixture does not redirect: add the knob to "
+            f"_HITL_PERSISTENCE_ROOTS and redirect it in "
+            f"isolated_plans_dir, or the suite will write into the "
+            f"operator's tree"
+        )
+
+
 @pytest.fixture(autouse=True)
 def isolated_plans_dir(monkeypatch, tmp_path):
     """Redirect PLANS_DIR to tmp_path for isolation.
@@ -757,6 +994,21 @@ def isolated_plans_dir(monkeypatch, tmp_path):
     Defensive: some test sessions import a slimmed ``server`` module
     that does not expose ``PLANS_DIR``.  In that case the fixture is a
     no-op rather than failing collection.
+
+    2026-10-21 (HITL): the fixture now also *proves* the redirect took
+    effect, and proves that the HITL persistence surface starts empty.
+    The two checks are the reason a new persistence path fails loudly
+    instead of turning into a flake three tests later:
+
+      * every registered persistence root must resolve inside this
+        test's ``tmp_path`` — checked through the production
+        resolvers, not through the variables this fixture sets;
+      * the ``plan_decisions`` table of the per-test database must hold
+        no rows when the test starts, so a decision asked by one test
+        cannot be answered by another.
+
+    Neither check creates a file: the fixture only points paths at the
+    per-test root.
     """
     import server
     if hasattr(server, "PLANS_DIR"):
@@ -791,6 +1043,12 @@ def isolated_plans_dir(monkeypatch, tmp_path):
     # without an explicit directory still writes into the repo's live
     # ``plans/`` tree.
     monkeypatch.setenv("PDT_PLANS_DIR", str(tmp_path / "plans"))
+    # 2026-10-21 (HITL): prove the redirect above took effect, and that
+    # the decision table of the per-test database starts empty.  See the
+    # section comment above for why the proof is worth the handful of
+    # path resolutions it costs.
+    _assert_hitl_persistence_isolated(tmp_path)
+    _assert_decision_table_starts_empty(_resolve_state_db_path())
     yield tmp_path / "plans"
 
 
