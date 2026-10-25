@@ -37,6 +37,7 @@ from arch_reviewer import ArchReviewer
 from fastapi import FastAPI, HTTPException, Request
 from interviewer import Interviewer
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 from prd_generator import PRDGenerator
 from prd_refiner import PRDRefiner
 from prd_review import PRDReviewer
@@ -48,6 +49,38 @@ from test_design_generator import TestDesignGenerator
 from test_design_refiner import TestDesignRefiner
 from test_design_reviewer import TestDesignReviewer
 from framework.ids import InvalidPlanIdError, derive_plan_id, validate_plan_id
+from plan_artifacts import PLAN_DOC_FILENAME, detect
+from plan_state import (
+    DEDICATED_PHASE_TRANSITIONS,
+    PHASE_TRANSITIONS,
+    VERIFICATION_PHASE_TRANSITIONS,
+)
+from verification_plan_doc import PlanDocError
+from verification_plan_doc import generate as generate_plan_doc
+from verification_plan_doc import refine as refine_plan_doc
+from verification_plan_doc import (
+    OBJECT_SECTION,
+    BaselineDoc,
+    StructureError,
+    parse_baseline,
+    parse_plan_doc,
+    validate_structure,
+)
+from verification_plan_review import (
+    PRD_FILENAME,
+    PRD_REVIEW_FILENAME,
+    RESOLVED_STATUSES,
+    STATUS_PENDING,
+    ReviewItem,
+    ReviewState,
+    doc_sha256,
+    extract_items,
+    is_resolved,
+    record_action,
+    review_path,
+)
+from verification_plan_review import load as load_plan_review_state
+from verification_workspace import RefResolutionError, resolve_ref_commit
 import json
 import re
 import sqlite3
@@ -1637,6 +1670,29 @@ def generate_tasks(plan_id: str):
     if not plan_dir.exists():
         raise HTTPException(404, "Plan not found")
 
+    # 产物门禁（五个调用点之一）。
+    #
+    # 目录里已经有计划书（``verification-plan.md``）时，这个 plan 属于**验证
+    # 分支** —— 往里写 ``tasks.json`` 就是在替人择一，还会当场造出「两类产物
+    # 同时存在」的冲突，让后面每一个入口都 409。框架不替人决定，也不删任何
+    # 文件：两个产物的**相对路径**交回去，由操作者裁决。
+    #
+    # 判定来自 :func:`plan_artifacts.detect`（唯一入口）；错误语义与其它四个
+    # 调用点逐字相同。
+    #
+    # 载荷构造器住在 ``routes.plans``（那里同时是状态接口与列表的所在地）。
+    # 这里是**函数内**导入的：路由模块之间在模块级互相导入会绕成环
+    # （``server`` 在文件底部才导入它们），函数内导入则是在请求到达时求值，
+    # 那时一切都已加载完毕。
+    from routes.plans import artifact_conflict_payload
+
+    artifacts = detect(plan_dir)
+    if artifacts.plan_doc_path is not None:
+        raise HTTPException(
+            409,
+            artifact_conflict_payload(plan_id, artifacts),
+        )
+
     # VP-006: block downstream phases while the PRD is a placeholder.
     _reject_if_placeholder_prd(plan_dir, plan_id)
 
@@ -1994,3 +2050,1192 @@ def get_tasks(plan_id: str):
             )
 
     return {"plan_id": plan_id, "tasks": tasks, "counts": counts}
+
+
+# ---------------------------------------------------------------------------
+# 验证分支：计划书生成入口
+# ---------------------------------------------------------------------------
+#
+# 验证分支在 PRD 审完之后产出的是**计划书**（``verification-plan.md``），不是
+# 任务清单（``tasks.json``）。这个端点是那条路上的唯一入口。
+#
+# 它守住三道门，每道门都在**写盘之前**：
+#
+#   1. **产物冲突** —— 目录里已有 ``tasks.json`` → 409 ``artifact_conflict``。
+#      响应里给出两个产物的**相对路径**（不泄露本机绝对路径），并且不删任何
+#      文件：「这个 plan 到底要执行开发任务、还是要按计划书直接验证」只有人
+#      能回答，框架不替人猜，也不替人删。
+#   2. **PRD 未审完** → 409 ``prd_review_incomplete``。没审完的 PRD 不值得
+#      花一次模型调用。
+#   3. **阶段不匹配** → 409 ``stage_mismatch``。
+#
+# 生成的文档不满足十章节契约 → 422，且**不落盘**（生成器先校验、后落盘）。
+#
+# 基线只有**一个**来源：计划状态里记录的那份（``verification.baseline``）。
+# 这个端点**没有基线参数** —— 请求里带进来的基线字段会被丢掉（架构决策点
+# 3：生成与启动接口都不接受基线参数）。
+
+
+def _read_json_object(path: Path) -> Optional[Dict[str, Any]]:
+    """读一个 JSON 对象文件。
+
+    读不出来（文件缺失 / 不是合法 JSON / 顶层不是对象）时返回 ``None`` ——
+    在这里「读不懂」与「没有」是同一件事：都判不出内容。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _verification_required_prd_indices(
+    plan_dir: Path, raw_items: List[Any]
+) -> Optional[set]:
+    """必须被审过的 PRD 决策点序号集合。
+
+    ``prd.json`` 在 → 用它的决策点序号（与既有 PRD 门禁同一口径）；不在 →
+    用 ``review.json`` 里的条目序号。返回 ``None`` 表示「判不出来」
+    （``prd.json`` 存在但损坏）——按未解决处理。
+    """
+    prd_path = plan_dir / PRD_FILENAME
+    if prd_path.exists():
+        prd = _read_json_object(prd_path)
+        if prd is None:
+            return None
+        points = prd.get("decision_points")
+        if not isinstance(points, list):
+            points = []
+        return {
+            point.get("index") for point in points if isinstance(point, dict)
+        }
+    return {raw.get("index") for raw in raw_items if isinstance(raw, dict)}
+
+
+def _verification_prd_pending(plan_dir: Path) -> Optional[List[Any]]:
+    """PRD 审核里还没解决的决策点序号。
+
+    这是 :func:`verification_plan_review.prd_is_resolved` 的**路由侧镜像**，
+    唯一的一处不同是 skip 的语义：那个函数按**分支**区分（验证分支认 skip、
+    开发分支只认 accepted），而这个端点只服务验证分支，所以这里一律按
+    「accepted 或 skipped 算已解决」判断 —— 这正是 prd.md 的要求：最小 PRD
+    的每一条决策点 accept **或** skip 之后才能生成计划书。
+
+    为什么要镜像而不是直接调那个函数：它按「目录里有没有计划书」判断分支，
+    而计划书正是**这个端点**要生成的 —— 调它的时候分支还没落地，skip 会被
+    当成没解决。两处的判据（哪些决策点必须被审过、什么状态算已解决）逐字
+    一致，所以镜像不会给出与它不同的答案。
+
+    返回 ``None`` 表示「判不出来」（审核文件缺失 / 损坏）——按未解决处理；
+    返回空列表表示全部已解决。
+    """
+    review = _read_json_object(plan_dir / PRD_REVIEW_FILENAME)
+    if review is None:
+        return None
+    raw_items = review.get("items")
+    if not isinstance(raw_items, list):
+        raw_items = []
+    statuses: Dict[Any, str] = {}
+    for raw in raw_items:
+        if isinstance(raw, dict):
+            statuses[raw.get("index")] = str(raw.get("status") or STATUS_PENDING)
+    required = _verification_required_prd_indices(plan_dir, raw_items)
+    if required is None:
+        return None
+    pending = [
+        index
+        for index in required
+        if statuses.get(index) not in RESOLVED_STATUSES
+    ]
+    pending.sort(key=repr)
+    return pending
+
+
+def _plan_generation_target_allowed(phase: str) -> bool:
+    """这个阶段能不能进 ``tasks_generation``（计划书生成）。
+
+    与 :meth:`plan_state.PlanState._transition_to` 的合法性判定同一口径：主表
+    + 验证子表 + 专用表。为什么要在这里先问一遍：阶段不匹配必须在**写盘
+    之前**被拒 ——「被拒绝的请求不写盘」是这条链路的契约，而阶段判定发生
+    在文档生成之后。
+    """
+    allowed = set(PHASE_TRANSITIONS.get(phase, []))
+    allowed.update(VERIFICATION_PHASE_TRANSITIONS.get(phase, []))
+    allowed.update(DEDICATED_PHASE_TRANSITIONS.get(phase, []))
+    return "tasks_generation" in allowed
+
+
+def _recorded_baseline(state: Any) -> Optional[Dict[str, Any]]:
+    """计划状态里记录下来的基线；没有记录时返回 ``None``。
+
+    基线冻在 ``verification.baseline`` 里 —— 与 ``verification_gate`` 读的
+    是同一处。计划书文档不在此列：文档是评审覆盖的内容，评审之后被改写的
+    文档是另一份文档。
+    """
+    verification = state.get_state().get("verification") or {}
+    recorded = verification.get("baseline")
+    return recorded if isinstance(recorded, dict) else None
+
+
+@router.post("/api/verification-plan/{plan_id}/generate")
+def generate_verification_plan(plan_id: str, req: _server.RefineRequest = None):
+    """生成验证计划书（验证分支的产物）。
+
+    Args:
+        plan_id: 计划 id。
+        req: 请求体。目前只有 ``feedback`` 一个字段，而**生成**这一步用不上
+            它（提示词只吃 plan_id 与基线）—— 改文档是 refine 端点的事。这里
+            仍然接受它，是为了让请求体形状与其它生成端点一致。
+
+    Returns:
+        200 ``{"plan_id", "document_path", "current_phase"}``。
+        ``document_path`` 是**相对路径**（``verification-plan.md``），不泄露
+        本机绝对路径。
+
+    Raises:
+        HTTPException: 404 ``plan_not_found``（计划目录不存在）；409
+            ``artifact_conflict``（目录里已有 ``tasks.json``）；409
+            ``prd_review_incomplete``（PRD 审核还有没解决的决策点）；409
+            ``stage_mismatch``（当前阶段不能进计划书生成）；422
+            ``baseline_missing``（计划状态里没有记录基线）；422
+            ``verification_plan_invalid``（生成的文档不满足十章节契约，且
+            没有落盘）；504（生成超时）。
+    """
+    plan_dir = _server._plan_dir(plan_id)
+    if not plan_dir.exists():
+        raise HTTPException(
+            404,
+            {
+                "error": "plan_not_found",
+                "detail": "Plan not found",
+                "plan_id": plan_id,
+            },
+        )
+
+    # 门 1 —— 产物不冲突。``tasks.json`` 在场说明这个 plan 要走开发分支，
+    # 而验证分支的产物是计划书。框架不替人择一，也不删任何文件：两个产物
+    # 的**相对路径**交回去，由操作者裁决。
+    #
+    # 载荷与其它四个调用点逐字相同（共用 ``routes.plans`` 里的构造器）。那里
+    # 的导入是**函数内**的：路由模块之间在模块级互相导入会绕成环（``server``
+    # 在文件底部才导入它们），函数内导入是在请求到达时求值，那时一切都已加载
+    # 完毕。
+    from routes.plans import artifact_conflict_payload
+
+    artifacts = detect(plan_dir)
+    if artifacts.tasks_path is not None:
+        raise HTTPException(
+            409,
+            artifact_conflict_payload(plan_id, artifacts),
+        )
+
+    # 门 2 —— PRD 已审完（accepted 或 skipped 都算已解决）。
+    pending = _verification_prd_pending(plan_dir)
+    if pending is None or pending:
+        raise HTTPException(
+            409,
+            {
+                "error": "prd_review_incomplete",
+                "detail": (
+                    "PRD 审核还没解决：最小 PRD 的每一条决策点都要 accept 或 "
+                    "skip，才能生成验证计划书。"
+                ),
+                "plan_id": plan_id,
+                # 判不出来时是空的 —— 那是「读不懂」，不是「还有几条没审」。
+                "pending": list(pending) if pending else [],
+                "review_readable": pending is not None,
+            },
+        )
+
+    # 门 3 —— 阶段能进计划书生成。
+    state = _server.PlanState(plan_dir)
+    current_phase = state.get_current_phase()
+    if not _plan_generation_target_allowed(current_phase):
+        raise HTTPException(
+            409,
+            {
+                "error": "stage_mismatch",
+                "reason": "stage_mismatch",
+                "detail": (
+                    f"当前阶段 {current_phase} 不能进计划书生成；PRD 审完之后"
+                    "（prd_review）才生成计划书。"
+                ),
+                "plan_id": plan_id,
+                "current_phase": current_phase,
+            },
+        )
+
+    # 基线：只从计划状态里读。这个端点没有基线参数，注入进来的基线字段
+    # 不会、也不允许改变这里读到的那一份。
+    baseline = _recorded_baseline(state)
+    if baseline is None:
+        raise HTTPException(
+            422,
+            {
+                "error": "baseline_missing",
+                "detail": (
+                    "计划状态里没有记录基线（verification.baseline），无法生成"
+                    "计划书：计划书的 baseline: 行必须与已记录的基线一致，而本"
+                    "端点不接受基线参数。"
+                ),
+                "plan_id": plan_id,
+            },
+        )
+    context = {
+        "plan_id": plan_id,
+        "baseline": {
+            "repo": baseline.get("repo_dir"),
+            "ref": baseline.get("ref"),
+            "pr": baseline.get("pr_number"),
+        },
+    }
+
+    coding_tool = _server.create_coding_tool(scene="tasks_generation")
+    try:
+        generate_plan_doc(plan_dir, context, coding_tool)
+    except PlanDocError as exc:
+        # 文档不合法：生成器先校验后落盘，所以磁盘上不会留下这份文档。
+        _server.logger.warning(
+            "Verification plan generation produced an invalid document for "
+            "plan %s: %s",
+            plan_id,
+            exc,
+        )
+        raise HTTPException(
+            422,
+            {
+                "error": "verification_plan_invalid",
+                "detail": (
+                    "生成的验证计划书不满足十章节契约，已丢弃，没有落盘。"
+                ),
+                "plan_id": plan_id,
+                "errors": [
+                    {
+                        "section": error.section,
+                        "line": error.line,
+                        "code": error.code,
+                        "message": error.message,
+                    }
+                    for error in exc.errors
+                ],
+            },
+        )
+    except TimeoutError as exc:
+        _server.logger.warning(
+            "Verification plan generation timed out: %s", exc
+        )
+        raise HTTPException(
+            504,
+            {
+                "error": "Verification plan generation timed out",
+                "detail": str(exc),
+                "retry_after": 60,
+            },
+        )
+
+    # 阶段推进：专用入口（PRD skip 的那条边）→ 「计划书待审」。
+    #
+    # 顺序有讲究：文档先落盘，阶段后推进。专用入口判「PRD 是否已解决」时
+    # 按分支区分 skip 的语义 —— 目录里有了计划书，验证分支才算落地，skip
+    # 这时才算数。文档没落盘之前调它，整条 skip 的 PRD 会被误判成没审完。
+    try:
+        state.start_verification_plan_generation()
+        state.transition_to("verification_plan_review")
+    except ValueError as exc:
+        raise HTTPException(
+            409,
+            {
+                "error": "stage_mismatch",
+                "reason": "stage_mismatch",
+                "detail": str(exc),
+                "plan_id": plan_id,
+                "current_phase": state.get_current_phase(),
+            },
+        )
+
+    return {
+        "plan_id": plan_id,
+        "document_path": PLAN_DOC_FILENAME,
+        "current_phase": state.get_current_phase(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 验证分支：计划书的只读入口（人工审核用）
+# ---------------------------------------------------------------------------
+#
+# 审核者要看到三样东西：文档原文、结构校验结果、条目列表。两个只读端点各给
+# 一份：``GET /api/verification-plan/{plan_id}`` 给文档，
+# ``GET /api/verification-plan/{plan_id}/review/items`` 给条目。两者读的是同一份
+# 磁盘上的文档 —— 审核界面上看到的原文与被审的原文必须是同一份，否则就成了
+# 「审的是 A、看到的是 B」。
+#
+# 基线只有一个来源：文档里那一行 ``baseline:``。审核通过之后冻结的基线就是它，
+# 所以 accept 之前必须让审核者看见它 —— ``PLAN-OBJECT`` 条目带着它（架构决策点
+# 3：审核对象与派生视图）。
+#
+# 结构非法不是接口错误：200 + 非空 ``structure_errors``。审核者要看到的是
+# 「这份文档哪里不对」，不是一句 500。
+
+
+#: 携带基线的审核条目 id（「被验证对象」条目覆盖基线行本身）。
+_PLAN_OBJECT_ITEM_ID = "PLAN-OBJECT"
+
+
+def _verification_plan_bytes(plan_dir: Path) -> Optional[bytes]:
+    """计划书的**原始字节**；文件不在时返回 ``None``。
+
+    哈希是按文件字节算的，所以这一层给的是字节而不是解码后的文本：解码会丢掉
+    「这份字节不是合法 UTF-8」这件事，而哈希必须与落盘审核状态里记的那一份
+    逐字节相同。
+    """
+    try:
+        return (plan_dir / PLAN_DOC_FILENAME).read_bytes()
+    except OSError:
+        return None
+
+
+def _verification_plan_content(plan_dir: Path) -> Optional[str]:
+    """计划书原文；文件不在时返回 ``None``。
+
+    按**原始字节**读、按 UTF-8 解码：审核状态是按文件字节算哈希的，换行被
+    归一化过的文本算出来的哈希与审核状态对不上，审核会被无声地作废。
+
+    字节不是合法 UTF-8 时按替换字符解码而不是抛错：审核者要看到的是那份
+    文档此刻的样子，不是 500。
+    """
+    raw = _verification_plan_bytes(plan_dir)
+    if raw is None:
+        return None
+    return raw.decode("utf-8", errors="replace")
+
+
+def _verification_plan_baseline_payload(doc: BaselineDoc) -> Dict[str, Any]:
+    """基线三字段：仓库目录、ref、PR 号。
+
+    只有这三个字段：``commit_sha`` 与解析后的工作区都**不**在这里 —— 基线是
+    「审核覆盖的那一行」，把它变成一个真实的工作区属于冻结阶段的事（那时才
+    做，且只做一次）。
+    """
+    return {
+        "repo_dir": str(doc.repo_dir),
+        "ref": doc.ref,
+        "pr_number": doc.pr_number,
+    }
+
+
+def _verification_plan_baseline(content: str) -> Optional[Dict[str, Any]]:
+    """计划书里的基线。
+
+    结构合法时走 :func:`verification_plan_doc.parse_plan_doc`；结构非法时仍
+    尽力把「被验证对象」章节里的基线行取出来 —— 审核者恰恰在文档有问题时最
+    需要知道「被验证的到底是哪个仓库、哪个 ref」。取不出来才返回 ``None``。
+    """
+    try:
+        parsed = parse_plan_doc(content)
+    except StructureError:
+        return _verification_plan_baseline_lenient(content)
+    return _verification_plan_baseline_payload(parsed.baseline)
+
+
+def _verification_plan_baseline_lenient(content: str) -> Optional[Dict[str, Any]]:
+    """结构非法时的基线提取：只找「被验证对象」章节里的那一行。"""
+    body: List[Tuple[int, str]] = []
+    in_object = False
+    for lineno, raw in enumerate(content.splitlines(), start=1):
+        stripped = raw.strip()
+        if stripped.startswith("## "):
+            if in_object:
+                break
+            in_object = stripped[3:].strip() == OBJECT_SECTION
+            continue
+        if in_object:
+            body.append((lineno, raw))
+    if not body:
+        return None
+    try:
+        doc = parse_baseline(
+            "\n".join(text for _lineno, text in body),
+            line_number=body[0][0],
+            section=OBJECT_SECTION,
+        )
+    except StructureError:
+        return None
+    return _verification_plan_baseline_payload(doc)
+
+
+def _verification_plan_review_statuses(
+    plan_dir: Path,
+) -> Dict[int, Tuple[str, str]]:
+    """已落盘的审核状态：条目序号 → (状态, 原因)。
+
+    审核状态是文档的**派生视图**：文档字节变了，
+    :func:`verification_plan_review.load` 会把全部条目退回 pending —— 旧审核
+    不再覆盖当前文档。
+    """
+    state = load_plan_review_state(plan_dir)
+    if state is None:
+        return {}
+    return {item.index: (item.status, item.note) for item in state.items}
+
+
+def _verification_plan_review_payload(
+    plan_dir: Path, parsed: Any
+) -> List[Dict[str, Any]]:
+    """审核条目的负载：形状固定五键，``PLAN-OBJECT`` 多带一份基线。
+
+    条目本身（id / 标题 / 序号）来自**当前文档** —— 审核状态是文档的派生视图，
+    文档改了条目集合就跟着改；状态与原因取自已落盘的审核状态。
+
+    两个端点（读条目 / 记动作）共用这一份构造：审核界面上看到的条目与被记的
+    条目必须是同一份形状。
+    """
+    statuses = _verification_plan_review_statuses(plan_dir)
+    baseline = _verification_plan_baseline_payload(parsed.baseline)
+    payload: List[Dict[str, Any]] = []
+    for item in extract_items(parsed):
+        entry = item.to_dict()
+        status, note = statuses.get(item.index, (entry["status"], entry["note"]))
+        entry["status"] = status
+        entry["note"] = note
+        if item.id == _PLAN_OBJECT_ITEM_ID:
+            entry["baseline"] = baseline
+        payload.append(entry)
+    return payload
+
+
+@router.get("/api/verification-plan/{plan_id}")
+def get_verification_plan(plan_id: str):
+    """读取验证计划书：原文 + 结构校验结果 + 基线。
+
+    Args:
+        plan_id: 计划 id。
+
+    Returns:
+        200 ``{"content", "structure_errors", "baseline"}``。``content`` 是
+        磁盘上的原文（逐字）；``structure_errors`` 是全部结构违规（合法时是
+        空列表，每条是 ``{section, line, code, message}``）；``baseline`` 是
+        文档里那一行基线（``repo_dir`` / ``ref`` / ``pr_number``），取不出来
+        时是 ``None``。
+
+        结构非法**不是**接口错误：200 + 非空 ``structure_errors``。审核者要
+        看到的是「这份文档哪里不对」，不是一句 500。
+
+    Raises:
+        HTTPException: 404 ``plan_not_found``（计划目录不存在）；404
+            ``document_not_found``（目录在，计划书不在）。
+    """
+    plan_dir = _server._plan_dir(plan_id)
+    if not plan_dir.exists():
+        raise HTTPException(
+            404,
+            {
+                "error": "plan_not_found",
+                "detail": "Plan not found",
+                "plan_id": plan_id,
+            },
+        )
+    content = _verification_plan_content(plan_dir)
+    if content is None:
+        raise HTTPException(
+            404,
+            {
+                "error": "document_not_found",
+                "detail": "验证计划书不存在",
+                "plan_id": plan_id,
+            },
+        )
+    return {
+        "content": content,
+        "structure_errors": [
+            {
+                "section": error.section,
+                "line": error.line,
+                "code": error.code,
+                "message": error.message,
+            }
+            for error in validate_structure(content)
+        ],
+        "baseline": _verification_plan_baseline(content),
+    }
+
+
+@router.get("/api/verification-plan/{plan_id}/review/items")
+def get_verification_plan_review_items(plan_id: str):
+    """读取计划书的审核条目列表。
+
+    条目是文档的**派生视图**：5 个计划级条目（id 与顺序是契约）+ 文档里每个
+    验证点一个条目。条目形状固定 ``{index, id, title, status, note}``；
+    ``PLAN-OBJECT`` 多带一份 ``baseline`` —— 它覆盖的正是文档里那行
+    ``baseline:``，accept 之前必须让审核者看见将被冻结的基线。
+
+    ``status`` / ``note`` 取自已落盘的审核状态（``verification-plan-review.
+    json``）。文档字节变了，那些状态一律作废（全部回到 pending）—— 旧审核
+    不再覆盖当前文档。
+
+    Args:
+        plan_id: 计划 id。
+
+    Returns:
+        200 ``{"items": [...], "doc_sha256": "..."}``。文档结构非法时条目是空
+        列表（仍是 200）：条目是从合法文档里提取的，非法文档没有条目可提取 ——
+        结构错误由文档端点逐条给出。
+
+        ``doc_sha256`` 是当前计划书的字节哈希。审核者要把这一版**记下来**再
+        去提交动作：文档在这期间被改过，动作端点会 409 ``document_changed``
+        要求重读条目（审核不能覆盖一份已经变过的文档）。
+
+    Raises:
+        HTTPException: 404 ``plan_not_found``（计划目录不存在）；404
+            ``document_not_found``（目录在，计划书不在）。
+    """
+    plan_dir = _server._plan_dir(plan_id)
+    if not plan_dir.exists():
+        raise HTTPException(
+            404,
+            {
+                "error": "plan_not_found",
+                "detail": "Plan not found",
+                "plan_id": plan_id,
+            },
+        )
+    raw = _verification_plan_bytes(plan_dir)
+    if raw is None:
+        raise HTTPException(
+            404,
+            {
+                "error": "document_not_found",
+                "detail": "验证计划书不存在",
+                "plan_id": plan_id,
+            },
+        )
+    content = raw.decode("utf-8", errors="replace")
+    try:
+        parsed = parse_plan_doc(content)
+    except StructureError as exc:
+        _server.logger.warning(
+            "Verification plan %s has an invalid structure; it has no review "
+            "items: %s",
+            plan_id,
+            exc,
+        )
+        return {"items": [], "doc_sha256": doc_sha256(raw)}
+
+    return {
+        "items": _verification_plan_review_payload(plan_dir, parsed),
+        "doc_sha256": doc_sha256(raw),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 验证分支：计划书的审核动作（逐条 accept / skip / reset / revise）
+# ---------------------------------------------------------------------------
+#
+# 门禁是**逐条**的：每一条都要被处置过（accept，或者带原因的 skip），pending
+# 阻断。所以动作落在条目上，不落在文档上 —— 文档只有一个状态，条目有七个。
+#
+# 三个动作各有各的语义：
+#
+#   * ``accept`` —— 这条没问题，审过；
+#   * ``skip`` —— 本次不验这条，但**必须带原因**：没有原因的 skip 在报告里无法
+#     归因，等于把条目悄悄扔掉；
+#   * ``reset`` —— 这条先不算数，退回待审，原因一并清空；
+#   * ``revise`` —— 这条要改，退回待审，但**留着** note：那条 note 是后续
+#     refine 要用的反馈，丢了就没人知道要改什么。
+#
+# 审核状态与文档**字节**绑定（``doc_sha256``）：文档被改过之后，之前那份审核
+# 针对的是另一份文档。请求带着的哈希对不上当前文档 → 409 ``document_changed``，
+# 要求重读条目再操作 —— 审核不能覆盖一份已经变过的文档。
+
+
+#: 计划书审核动作的合法取值。
+_VERIFICATION_PLAN_REVIEW_ACTIONS: Tuple[str, ...] = (
+    "accept",
+    "skip",
+    "reset",
+    "revise",
+)
+
+
+class _VerificationPlanReviewActionRequest(BaseModel):
+    """计划书审核动作的请求体。
+
+    Attributes:
+        action: ``accept`` / ``skip`` / ``reset`` / ``revise``。
+        note: 原因。``skip`` 必须给非空原因；``revise`` 的 note 是 refine 反馈。
+        doc_sha256: **可选**：审核者读到的那一版文档的字节哈希。不带它时，
+            端点只能拿已落盘的审核状态去比「文档是不是被改过」。
+    """
+
+    action: str
+    note: str = ""
+    doc_sha256: Optional[str] = None
+
+
+def _write_plan_review_note(
+    plan_dir: Path, state: Any, item_index: int, note: str
+) -> None:
+    """把 refine 反馈写回条目（``revise`` 动作）。
+
+    :func:`verification_plan_review.record_action` 的动作词汇里没有 ``revise``
+    —— 模块自己的注释说得很清楚：「改文档是另一条链路（改文档会改哈希，审核
+    随之失效），不在这里假装能改」。所以这里借 ``reset`` 落状态（退回待审、清空
+    原因），再把 note 补回去。
+
+    写出的形状与模块内部一致（``ReviewState.to_dict``），读回仍走模块自己的
+    ``load``；落盘走临时文件再替换，避免半截文件。
+    """
+    for item in state.items:
+        if item.index == item_index:
+            item.note = note
+    path = review_path(plan_dir)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(state.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+@router.post("/api/verification-plan/{plan_id}/review/item/{item_index}")
+def review_verification_plan_item(
+    plan_id: str,
+    item_index: int,
+    req: _VerificationPlanReviewActionRequest,
+):
+    """记录一次计划书审核动作（逐条）。
+
+    一次动作只动**一条**：``accept`` / ``skip`` / ``reset`` / ``revise``。动作
+    落盘走 :func:`verification_plan_review.record_action` —— 与生产路径同一条。
+
+    Args:
+        plan_id: 计划 id。
+        item_index: 条目序号（0 起，计划级条目在前、验证点条目按文档顺序在后）。
+        req: ``{action, note, doc_sha256}``。``doc_sha256`` 是审核者读到的那一版
+            文档的哈希，可选。
+
+    Returns:
+        200 ``{"items": [...], "doc_sha256": "...", "resolved": false}``。
+        ``items`` 是全量条目（形状与 ``GET .../review/items`` 一致）；``doc_sha256``
+        是当前文档的字节哈希；``resolved`` 是这份审核是否已经完备（全部条目
+        accepted / skipped）。
+
+    Raises:
+        HTTPException: 404 ``plan_not_found``（计划目录不存在）；404
+            ``document_not_found``（目录在，计划书不在）；404 ``item_not_found``
+            （条目序号不存在）；400 ``unknown_action``（动作不认识）；400
+            ``skip_note_required``（skip 缺非空原因）；409
+            ``document_changed``（请求带的哈希对不上当前文档，要求重读条目）；
+            422 ``verification_plan_invalid``（计划书结构非法，条目无从提取）。
+    """
+    plan_dir = _server._plan_dir(plan_id)
+    if not plan_dir.exists():
+        raise HTTPException(
+            404,
+            {
+                "error": "plan_not_found",
+                "detail": "Plan not found",
+                "plan_id": plan_id,
+            },
+        )
+
+    raw = _verification_plan_bytes(plan_dir)
+    if raw is None:
+        raise HTTPException(
+            404,
+            {
+                "error": "document_not_found",
+                "detail": "验证计划书不存在",
+                "plan_id": plan_id,
+            },
+        )
+
+    action = str(req.action or "").strip().lower()
+    if action not in _VERIFICATION_PLAN_REVIEW_ACTIONS:
+        raise HTTPException(
+            400,
+            {
+                "error": "unknown_action",
+                "detail": (
+                    f"未知的审核动作：{req.action!r}"
+                    f"（可用：{', '.join(_VERIFICATION_PLAN_REVIEW_ACTIONS)}）"
+                ),
+                "plan_id": plan_id,
+                "item_index": item_index,
+            },
+        )
+
+    reason = str(req.note or "").strip()
+    if action == "skip" and not reason:
+        raise HTTPException(
+            400,
+            {
+                "error": "skip_note_required",
+                "detail": "skip 必须带非空原因（note）：没有原因的 skip 无法在报告里归因",
+                "plan_id": plan_id,
+                "item_index": item_index,
+            },
+        )
+
+    content = raw.decode("utf-8", errors="replace")
+    try:
+        parsed = parse_plan_doc(content)
+    except StructureError as exc:
+        _server.logger.warning(
+            "Verification plan %s has an invalid structure; it has no review "
+            "items to review: %s",
+            plan_id,
+            exc,
+        )
+        raise HTTPException(
+            422,
+            {
+                "error": "verification_plan_invalid",
+                "detail": (
+                    "计划书结构非法，没有可审核的条目；结构错误由文档端点逐条给出"
+                ),
+                "plan_id": plan_id,
+            },
+        )
+
+    if not any(item.index == item_index for item in extract_items(parsed)):
+        raise HTTPException(
+            404,
+            {
+                "error": "item_not_found",
+                "detail": f"审核条目序号不存在：{item_index}",
+                "plan_id": plan_id,
+                "item_index": item_index,
+            },
+        )
+
+    # 哈希闸门：审核不能覆盖一份已经变过的文档。
+    current_sha = doc_sha256(raw)
+    expected = str(req.doc_sha256 or "").strip()
+    if expected:
+        stale = expected != current_sha
+    else:
+        # 没带哈希时退一步看已落盘的审核状态：它记着上一次审核针对的那份文档，
+        # 对不上就说明文档在这之后被改过。
+        stored = load_plan_review_state(plan_dir)
+        stale = bool(
+            stored is not None
+            and stored.doc_sha256
+            and stored.doc_sha256 != current_sha
+        )
+    if stale:
+        raise HTTPException(
+            409,
+            {
+                "error": "document_changed",
+                "detail": (
+                    "计划书在这次审核之后被改过，之前那份审核针对的是另一份文档。"
+                    "请重读条目（GET /api/verification-plan/{plan_id}/review/items）"
+                    "再操作。"
+                ),
+                "plan_id": plan_id,
+                "item_index": item_index,
+                "doc_sha256": current_sha,
+            },
+        )
+
+    try:
+        # ``revise`` 借 ``reset`` 落状态（退回待审），note 由下面补回去。
+        state = record_action(
+            plan_dir,
+            item_index,
+            "reset" if action == "revise" else action,
+            reason,
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            404,
+            {
+                "error": "document_not_found",
+                "detail": "验证计划书不存在",
+                "plan_id": plan_id,
+            },
+        )
+    except StructureError:
+        raise HTTPException(
+            422,
+            {
+                "error": "verification_plan_invalid",
+                "detail": "计划书结构非法，没有可审核的条目",
+                "plan_id": plan_id,
+            },
+        )
+    except ValueError as exc:
+        # ``record_action`` 自己的校验（动作未知 / 序号不存在 / skip 缺原因）。
+        # 上面已经逐条挡过，这里是兜底。
+        raise HTTPException(
+            400,
+            {
+                "error": "invalid_review_action",
+                "detail": str(exc),
+                "plan_id": plan_id,
+                "item_index": item_index,
+            },
+        )
+
+    if action == "revise":
+        _write_plan_review_note(plan_dir, state, item_index, reason)
+
+    # 审核完备的那一刻，基线被冻结。冻结不了 = 这次审核不通过（409），
+    # 刚落盘的那一条退回待审：审核完备与基线已记录必须同时成立，不能留下
+    # 「审核完备却没有基线」的中间态。
+    try:
+        freeze_baseline_if_resolved(plan_dir)
+    except BaselineFreezeError as exc:
+        _rollback_plan_review_action(plan_dir, item_index)
+        raise HTTPException(
+            409,
+            {
+                "error": exc.code,
+                "detail": exc.detail,
+                "plan_id": plan_id,
+                "item_index": item_index,
+                "resolved": False,
+            },
+        )
+
+    return {
+        "items": _verification_plan_review_payload(plan_dir, parsed),
+        "doc_sha256": current_sha,
+        "resolved": is_resolved(state, raw),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 验证分支：审核完备时的基线冻结
+# ---------------------------------------------------------------------------
+#
+# 基线是机器事实，只有一个来源：「被验证对象」章节里那一行 ``baseline:``。
+# 它在**审核完备的那次写入**上被冻结：那一刻是唯一确定「这份文档被审过了」
+# 的时刻——早一刻还有条目没处置，晚一刻文档就可能被改。
+#
+# 冻结做三件事：
+#
+#   1. 重新解析那一行。**不读请求体、不读 query、不读独立文件**——同一份
+#      事实只能有一个来源，读别处就等于有第二份基线。
+#   2. 把 ``ref`` 解析成 ``commit_sha``（``git rev-parse``）。这一步是文档
+#      解析刻意不做的那一步：解析器只做语法与字段校验，不访问 git，因此它
+#      能在任何环境重跑；冻结只发生在一个有仓库可用的入口。
+#   3. 与任何已记录的基线逐字段比较：不一致就拒绝这次审核通过，旧值不被
+#      覆盖；一致（或没有记录）就写进 ``PlanState.verification.baseline``。
+#
+# 仓库目录不存在、``ref`` 解析不出来，同样阻止审核通过：被验证对象说不清，
+# 就不该开始验证。
+
+
+#: 基线的四个字段。写入与比较都按这四个字段走。
+_BASELINE_FIELDS: Tuple[str, ...] = (
+    "repo_dir",
+    "ref",
+    "commit_sha",
+    "pr_number",
+)
+
+
+class BaselineFreezeError(RuntimeError):
+    """基线冻结失败。
+
+    Attributes:
+        code: 机器可读的错误码（``baseline_mismatch`` /
+            ``baseline_unresolvable`` / ``baseline_missing``）。
+        detail: 给人看的一句话。
+    """
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+def freeze_baseline_if_resolved(plan_dir: Path) -> Optional[Dict[str, Any]]:
+    """审核完备时把计划书里的基线冻结进计划状态。
+
+    审核不完备时什么都不做（返回 ``None``）——基线只在「审核完备的那次写入」
+    上被冻结，早一刻冻结的是一份还没被审完的文档。
+
+    Args:
+        plan_dir: 计划目录。
+
+    Returns:
+        冻结下来的基线（四个字段）；审核不完备、或没有计划书时为 ``None``。
+
+    Raises:
+        BaselineFreezeError: 基线冻结不了——
+            ``baseline_mismatch``（与已记录的基线逐字段对不上，旧值不被
+            覆盖）、``baseline_unresolvable``（仓库目录不存在或 ``ref`` 解析
+            不出来）、``baseline_missing``（文档里取不出合法的基线行）。
+    """
+    plan_dir = Path(plan_dir)
+    raw = _verification_plan_bytes(plan_dir)
+    if raw is None:
+        return None
+    current_sha = doc_sha256(raw)
+
+    state = _server.PlanState(plan_dir)
+    # 已记录的基线：只有仍对应当前文档的那一份才算数（文档被改写后旧基线
+    # 已失效，它不得挡住下一次按新文档的基线行重写）。
+    recorded = state.get_verification_baseline()
+
+    if not is_resolved(load_plan_review_state(plan_dir), raw):
+        return None
+
+    try:
+        parsed = parse_plan_doc(raw.decode("utf-8", errors="replace"))
+    except StructureError as exc:
+        raise BaselineFreezeError(
+            "baseline_missing",
+            f"计划书结构非法，取不出合法的基线行：{exc}",
+        ) from exc
+
+    doc_baseline = parsed.baseline
+    repo_dir = Path(doc_baseline.repo_dir)
+    ref = doc_baseline.ref
+    try:
+        commit_sha = resolve_ref_commit(repo_dir, ref)
+    except RefResolutionError as exc:
+        raise BaselineFreezeError(
+            "baseline_unresolvable",
+            f"基线的 ref 解析不出来，审核不通过：{exc}",
+        ) from exc
+
+    candidate: Dict[str, Any] = {
+        "repo_dir": str(repo_dir),
+        "ref": ref,
+        "commit_sha": commit_sha,
+        "pr_number": doc_baseline.pr_number,
+    }
+
+    if recorded is not None:
+        mismatched = [
+            field
+            for field in _BASELINE_FIELDS
+            if recorded.get(field) != candidate.get(field)
+        ]
+        if mismatched:
+            raise BaselineFreezeError(
+                "baseline_mismatch",
+                "已记录的基线与本次冻结的基线不一致（"
+                f"字段：{', '.join(mismatched)}），旧值不被覆盖",
+            )
+
+    state.set_verification_baseline(candidate, doc_sha256=current_sha)
+    return candidate
+
+
+def _rollback_plan_review_action(plan_dir: Path, item_index: int) -> None:
+    """把刚落盘的那一次审核动作退回待审。
+
+    基线冻结失败 = 这次审核不通过：这一条不算数，退回 pending，操作者修好
+    仓库或 ref 之后重新提交即可。审核完备与基线已记录必须同时成立——留下
+    「审核完备却没有基线」的中间态，计划就会卡在一个谁也推不动的位置。
+
+    回滚是尽力而为：回滚本身失败时只记日志，不掩盖原始的冻结失败。
+    """
+    try:
+        record_action(plan_dir, item_index, "reset", "")
+    except Exception as exc:  # noqa: BLE001 - 回滚失败不能盖掉冻结失败
+        _server.logger.warning(
+            "Verification plan %s: rolling back review item %s failed: %s",
+            plan_dir.name,
+            item_index,
+            exc,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 验证分支：计划书的改写入口
+# ---------------------------------------------------------------------------
+#
+# 审核者对计划书的反馈要**改写整篇文档**，不是改一个字段。改写走这个端点：
+# ``POST /api/verification-plan/{plan_id}/refine``。
+#
+# 改写让旧审核失效
+# ----------------
+# 审核状态与文档**字节**绑定：文档一改，字节就变了，之前那份审核针对的是另
+# 一份文档 —— 它既不覆盖新内容，也不再有效。所以改写之后全部条目回到
+# ``pending``，一条都不算数。
+#
+# 基线随之失效
+# ------------
+# 基线是**为某一份文档**冻结的（它记着自己被冻结时那份文档的字节哈希）。改写
+# 之后哈希对不上，旧基线不再有效：它不得继续用于进入验证，验证门禁随之关闭。
+# 改写过的计划书必须重新审一遍。
+#
+# 先校验后落盘
+# ------------
+# 改写结果不满足十章节契约时 → 422，**旧文档原样保留**。非法文档落到磁盘上只
+# 会变成下一个读它的人踩的坑。
+
+
+def _reset_plan_review_to_pending(
+    plan_dir: Path, doc_sha: str, parsed: Any
+) -> None:
+    """把审核状态整体退回待审，并绑定新文档的哈希。
+
+    文档被改写之后，之前的审核针对的是另一份文档：它既不覆盖新内容，也不再
+    有效。所以全部条目回到 ``pending``，原因一并清掉 —— 旧原因说的是旧文档。
+
+    写出的形状与模块内部一致（``ReviewState.to_dict``），读回仍走模块自己的
+    ``load``；先写临时文件再替换，避免半截文件。
+    """
+    items = [
+        ReviewItem(index=item.index, id=item.id, title=item.title)
+        for item in extract_items(parsed)
+    ]
+    state = ReviewState(items=items, doc_sha256=doc_sha)
+    path = review_path(plan_dir)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(state.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+@router.post("/api/verification-plan/{plan_id}/refine")
+def refine_verification_plan(plan_id: str, req: _server.RefineRequest = None):
+    """按反馈改写验证计划书。
+
+    Args:
+        plan_id: 计划 id。
+        req: ``{feedback}``。反馈不能为空 —— 没有反馈就没有要改的东西。
+
+    Returns:
+        200 ``{"document_path", "doc_sha256", "items"}``。``document_path`` 是
+        **相对路径**（``verification-plan.md``），不泄露本机绝对路径；
+        ``doc_sha256`` 是改写后那份文档的字节哈希；``items`` 是审核条目 —— 改写
+        之后**全部**回到 ``pending``。
+
+    Raises:
+        HTTPException: 400 ``feedback_required``（反馈为空）；404
+            ``plan_not_found``（计划目录不存在）；404 ``document_not_found``
+            （目录在，计划书不在）；422 ``verification_plan_invalid``（改写结果
+            不满足十章节契约，旧文档原样保留）；504（改写超时）。
+    """
+    plan_dir = _server._plan_dir(plan_id)
+    if not plan_dir.exists():
+        raise HTTPException(
+            404,
+            {
+                "error": "plan_not_found",
+                "detail": "Plan not found",
+                "plan_id": plan_id,
+            },
+        )
+
+    if _verification_plan_bytes(plan_dir) is None:
+        raise HTTPException(
+            404,
+            {
+                "error": "document_not_found",
+                "detail": "验证计划书不存在",
+                "plan_id": plan_id,
+            },
+        )
+
+    feedback = str(getattr(req, "feedback", None) or "").strip()
+    if not feedback:
+        raise HTTPException(
+            400,
+            {
+                "error": "feedback_required",
+                "detail": (
+                    "反馈不能为空：没有反馈就没有要改的东西，也不值得花一次模型"
+                    "调用。"
+                ),
+                "plan_id": plan_id,
+            },
+        )
+
+    coding_tool = _server.create_coding_tool(scene="tasks_generation")
+    try:
+        refine_plan_doc(plan_dir, feedback, coding_tool)
+    except PlanDocError as exc:
+        # 改写结果不合法：改写器先校验后落盘，所以磁盘上留下的仍是旧文档。
+        _server.logger.warning(
+            "Verification plan refinement produced an invalid document for "
+            "plan %s: %s",
+            plan_id,
+            exc,
+        )
+        raise HTTPException(
+            422,
+            {
+                "error": "verification_plan_invalid",
+                "detail": (
+                    "改写后的验证计划书不满足十章节契约，已丢弃，旧文档原样保留。"
+                ),
+                "plan_id": plan_id,
+                "errors": [
+                    {
+                        "section": error.section,
+                        "line": error.line,
+                        "code": error.code,
+                        "message": error.message,
+                    }
+                    for error in exc.errors
+                ],
+            },
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            404,
+            {
+                "error": "document_not_found",
+                "detail": "验证计划书不存在",
+                "plan_id": plan_id,
+            },
+        )
+    except TimeoutError as exc:
+        _server.logger.warning("Verification plan refinement timed out: %s", exc)
+        raise HTTPException(
+            504,
+            {
+                "error": "Verification plan refinement timed out",
+                "detail": str(exc),
+                "retry_after": 60,
+            },
+        )
+
+    # 文档字节变了 → 旧审核不再覆盖它 → 全部条目回 pending（并绑定新哈希）。
+    raw = _verification_plan_bytes(plan_dir)
+    if raw is None:  # pragma: no cover — 刚写下的文档不会凭空消失
+        raise HTTPException(
+            404,
+            {
+                "error": "document_not_found",
+                "detail": "验证计划书不存在",
+                "plan_id": plan_id,
+            },
+        )
+    new_sha = doc_sha256(raw)
+    try:
+        parsed = parse_plan_doc(raw.decode("utf-8", errors="replace"))
+    except StructureError as exc:  # pragma: no cover — 落盘前已通过结构校验
+        _server.logger.warning(
+            "Verification plan %s is invalid right after refinement: %s",
+            plan_id,
+            exc,
+        )
+        raise HTTPException(
+            422,
+            {
+                "error": "verification_plan_invalid",
+                "detail": "改写后的验证计划书结构非法",
+                "plan_id": plan_id,
+            },
+        )
+
+    _reset_plan_review_to_pending(plan_dir, new_sha, parsed)
+
+    return {
+        "document_path": PLAN_DOC_FILENAME,
+        "doc_sha256": new_sha,
+        "items": _verification_plan_review_payload(plan_dir, parsed),
+    }

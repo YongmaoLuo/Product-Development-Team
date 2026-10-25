@@ -91,6 +91,10 @@ from verification_ac_coverage import (  # noqa: E402
     find_uncovered_criteria,
     render_gap_feedback as render_acceptance_gap_feedback,
 )
+# 2026-10-25（验证分支输入路径）：分支判定只有一个判据 ——
+# plan 目录里躺着的是验证计划书还是任务清单。判定收敛在
+# ``plan_artifacts`` 里（纯函数、只读目录、每次重算），这里只消费结果。
+from plan_artifacts import is_verification_branch  # noqa: E402
 # 2026-10-23（工作树指纹）：依据核对读的是**活的**工作树。多个验证进程
 # 可以共用同一个 worktree，读取 citations/checkpoints 期间可能有并发写入
 # （"变异负控"）——那时核对读到的是一棵不属于这个 VP 的树。指纹让"树动过
@@ -232,6 +236,24 @@ class ApiTestSchemaViolation(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.violations: List[Dict[str, Any]] = list(violations or [])
+
+
+class VerificationBranchPlanError(RuntimeError):
+    """验证分支的机器计划读不出来，或结构上不是一份计划。
+
+    验证分支的验证点集合**不是**模型生成的：它是人工审核过的验证计划书
+    （十章节契约）翻译出来的机器格式 JSON，并且在 ``/start`` 管线里与计划书
+    逐条比对过（等价门禁）。所以验证回路对它的职责只有一件 ——
+    **读出来并校验**。
+
+    读不出来时唯一正确的动作是停下来报错。退回 LLM 重新生成等于把审核过
+    的那批验证点换成一批谁都没审过的：报告里"验了什么"从此与审核时说的不
+    是同一件事，而没有任何一步会告诉操作者这件事发生过。
+
+    与 :class:`ApiTestSchemaViolation` 的分工：那一条管的是「计划读出来了，
+    但里面的 ``api_test`` 验证点运行器认不出来」；这一条管的是「计划本身
+    读不出来 / 不是一份计划」。
+    """
 
 
 # Boundary: the parent ``VerificationAgent`` does NOT directly import
@@ -1827,12 +1849,24 @@ class Orchestrator:
         """
         Phase 1: Generate verification plan from PRD/arch/test documents.
 
+        验证分支不走生成路径（2026-10-25）：那条路上读的是审核过的验证计划书
+        翻译出来、并且过了等价门禁的机器计划 JSON —— 验证回路对它只有「读出
+        来并校验」一件事。读不出来就报错（见
+        :meth:`_load_verification_branch_plan`）。
+
         Args:
             retry_llm: Number of retries for LLM calls
 
         Returns:
             Verification plan dict
         """
+        # 2026-10-25（验证分支输入路径）：验证分支的验证点集合不是这里生成
+        # 的 —— 它是审核过的计划书翻译出来、逐条比对过的一份 JSON。生成它会
+        # 把审核过的那批验证点换成一批谁都没审过的，而没有任何一步会告诉
+        # 操作者这件事发生过。所以验证分支直接读盘上那份。
+        if is_verification_branch(self.plan_dir):
+            return self._load_verification_branch_plan()
+
         print("[Verification] Phase 1: Generating verification plan...")
 
         # Reuse the on-disk plan when present and structurally valid so a
@@ -2237,6 +2271,99 @@ class Orchestrator:
                     return self._generate_minimal_plan(documents)
 
         return self._generate_minimal_plan(documents)
+
+    def _load_verification_branch_plan(self) -> dict:
+        """验证分支的机器计划：读盘上那一份，校验它，**不问模型**。
+
+        与开发分支的「磁盘复用」路径相比，只有三处不同，其余处理一致：
+
+        * **不退回 LLM** —— 读不出来 / 校验不过一律抛错；
+        * **不做增量评估**（``_maybe_evaluate_plan_delta``）—— 增量条目是
+          「这轮多了什么任务」的产物，而任务清单是开发分支的产物；验证分支
+          没有任务清单，凭空加出来的验证点也不在审核过的计划书里；
+        * **不做方法归一化**（``_normalize_legacy_methods``）—— 那一趟是为
+          「模型生成的计划」准备的：模型用的是框架的方法词表
+          （``api_test`` / ``code_review`` / …），词表外的方法说明它是早就
+          退休的方法。而验证分支的机器计划里，方法字段是**计划书里人写的
+          自由文本**（"单元测试" / "以手工核验为主"），它与框架词表之间的
+          映射是另一件事。拿退休检查去处理它，会把审核过的每一条验证点都
+          标成 ``obsolete`` —— 验证回路于是"跑完了"，一条也没验。
+
+        盘上那份**原样留着**：它是审核过的产物，这一趟只读不写。
+
+        Returns:
+            盘上那份计划（就地归一化过阶段字段与服务声明）。
+
+        Raises:
+            VerificationBranchPlanError: 计划文件不存在 / 读不出来 / 不是
+                一个对象 / 没有验证点 / 有一条验证点没有 id。
+            ApiTestSchemaViolation: ``api_test`` 验证点的断言不合规 ——
+                运行器认不出来，那条 VP 永远判不了。
+        """
+        path = self.verification_plan_file
+        if not path.exists():
+            raise VerificationBranchPlanError(
+                f"验证分支缺少机器计划：{path} 不存在。验证分支的验证点集合"
+                "来自审核过的验证计划书，不退回 LLM 重新生成。"
+            )
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                plan = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise VerificationBranchPlanError(
+                f"验证分支的机器计划读不出来：{path} —— {exc}"
+            ) from exc
+
+        if not isinstance(plan, dict):
+            raise VerificationBranchPlanError(
+                f"验证分支的机器计划不是一个对象：{path}"
+            )
+
+        points = plan.get("verification_points")
+        if not isinstance(points, list) or not points:
+            raise VerificationBranchPlanError(
+                f"验证分支的机器计划里没有验证点数组（verification_points）："
+                f"{path}"
+            )
+        for vp in points:
+            if not isinstance(vp, dict) or not str(vp.get("id") or "").strip():
+                raise VerificationBranchPlanError(
+                    f"验证分支的机器计划里有一条验证点没有 id：{path}"
+                )
+
+        # 阶段归一化（纯函数：不问模型、不碰磁盘）。老计划没有
+        # ``verification_phase``，一律按 Phase 1 处理。
+        _phase_summary = normalize_plan_phases(plan)
+        self._last_phase_summary = _phase_summary
+        _log_phase_distribution("验证分支磁盘计划", _phase_summary)
+
+        # 服务声明：解析 + 引用检查。执行器解析 ``{{svc.<name>.<field>}}``
+        # 占位符时读的就是这里解析出来的声明 —— 不跑这一趟，占位符永远解析
+        # 不成，api_test 验证点会对着字面量 ``{{svc.quota.url}}`` 发请求。
+        self._normalize_service_declarations(plan)
+
+        # api_test 断言契约：运行器认不出来的 VP 一条都不许进执行阶段
+        # （它会被永远判成 FAILED —— 那是计划缺陷，不是产品缺陷）。
+        _api_violations = self._api_schema_report(plan)
+        if _api_violations:
+            _ids = ", ".join(v["id"] for v in _api_violations)
+            _first_issues = "; ".join(
+                f"{v['id']}: {d}"
+                for v in _api_violations
+                for d in v["issues"]
+            )
+            raise ApiTestSchemaViolation(
+                f"验证分支的机器计划里 api_test 验证点不合规（运行器词表漂移"
+                f"或手工改动）：{_ids}. First issues: {_first_issues}",
+                violations=_api_violations,
+            )
+
+        print(
+            f"[Verification] Verification branch: loaded "
+            f"{len(points)} VPs from {path.name} — no Phase-1 LLM call"
+        )
+        return plan
 
     def _enrich_vps_with_execution_metadata(self, plan_data: dict) -> dict:
         """Annotate each verification point with ``timeout_seconds`` and ``execution_group``.

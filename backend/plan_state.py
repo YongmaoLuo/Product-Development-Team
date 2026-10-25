@@ -26,6 +26,16 @@ from typing import Optional, List, Dict, Any
 
 from framework import clock as _framework_clock
 from config_paths import resolve_plans_dir, resolve_state_db_path
+from plan_artifacts import (
+    BRANCH_CONFLICT,
+    BRANCH_DEV,
+    BRANCH_VERIFICATION,
+    PLAN_DOC_FILENAME,
+    ArtifactConflictError,
+    detect,
+)
+from verification_gate import verification_branch_ready
+from verification_plan_review import doc_sha256, prd_is_resolved
 
 
 
@@ -93,6 +103,16 @@ VALID_PHASES = [
     # the manual path still works.
     "queued",
     "executing",
+    # 2026-10-25: the verification branch's plan-doc review gate.
+    #
+    # A verification-branch plan does not run the dev task list first: it
+    # ships a ``verification-plan.md`` (the human review object) and waits
+    # for every item to be accepted / skipped. This phase is that wait.
+    #
+    # It is a *non-terminal* phase: the operator can send the plan back to
+    # ``tasks_generation`` (regenerate the doc) or stop it. The only way
+    # out towards verification is the review gate itself.
+    "verification_plan_review",
     "verification",
     "verification_running",
     "verify_first_pass",
@@ -113,6 +133,19 @@ VALID_PHASES = [
 ]
 
 TERMINAL_PHASES = {"completed", "failed", "stopped"}
+
+#: 稳定标签映射：阶段名 → 展示用的稳定标签。
+#:
+#: 2026-10-25: 新增 ``verification_plan_review``（计划书待审）。展示面此前按
+#: 文档存在性**猜**状态，会把这个阶段误标成 ``reviewed``；现在标签集中定义在
+#: 这一处，状态接口与列表接口共用同一份映射 —— 同一阶段的标签不可能在两个
+#: 接口里对不上。
+#:
+#: 未命中时回退为阶段名本身：标签是**补充**，不是阶段名的替身。往这张表里加
+#: 一行就多一个稳定标签，不加也只是回退，不会让任何阶段没有名字。
+PHASE_LABELS: Dict[str, str] = {
+    "verification_plan_review": "计划书待审",
+}
 
 #: Historical phase values that are no longer written anywhere, mapped
 #: onto the phase that replaced them.
@@ -186,7 +219,26 @@ PHASE_TRANSITIONS = {
     "test_refining": ["test_review"],
     "test_approved": ["test_refining", "preflight_review", "tasks_generation", "executing"],
     "preflight_review": ["tasks_generation", "prd_review", "arch_review", "test_review"],
-    "tasks_generation": ["ready", "queued", "executing"],
+    # 2026-10-25: the verification branch generates a *plan doc* instead
+    # of a task list. The doc lands on disk first, then the plan parks in
+    # ``verification_plan_review`` waiting for a human to accept / skip
+    # every item.
+    "tasks_generation": ["ready", "queued", "executing", "verification_plan_review"],
+    # The review phase's own exits. Three meanings:
+    #   * ``verification`` — the review is complete and the baseline is
+    #     frozen; the plan enters the verification sub-machine;
+    #   * ``tasks_generation`` — regenerate the plan doc (the review found
+    #     something wrong with it);
+    #   * ``stopped`` — the operator parks the plan.
+    #
+    # The row lives in the MAIN table, next to the edge that enters the
+    # phase: ``transition_to`` unions both tables before it looks a target
+    # up, so which table holds a row is not a behavioural difference — and
+    # the review phase is a top-level workflow phase anyway (it is entered
+    # from ``tasks_generation`` and it sits in ``VALID_PHASES`` next to the
+    # other workflow phases). The verification sub-table's row set is
+    # frozen by ``tests/unit/test_state_machine_completed_transition.py``.
+    "verification_plan_review": ["verification", "tasks_generation", "stopped"],
     # 2026-10-23: ``stopped`` is reachable from every phase the
     # operator can stop a plan in. A stop that cannot park the phase
     # leaves a plan that still reads as live — the stop does not hold.
@@ -241,6 +293,45 @@ VERIFICATION_PHASE_TRANSITIONS = {
     "failed": ["executing", "ready"],
     "stopped": ["executing", "ready"],
 }
+
+
+#: 专用入口才承认的转移边。
+#:
+#: 2026-10-25: 验证分支的最小 PRD 允许整条 skip，所以 PRD 审完之后需要一条
+#: ``prd_review → tasks_generation`` 的边 —— 跳过 ``prd_approved``（没有一条
+#: 决策点被 accept 的 PRD 进不了那个阶段）直接进计划书生成。
+#:
+#: 这条边**不进** :data:`PHASE_TRANSITIONS`，也不进
+#: :data:`VERIFICATION_PHASE_TRANSITIONS`：通用入口
+#: （``POST /api/plan/{id}/phase``）走的是 :meth:`PlanState.transition_to`，
+#: 它只认那两张表。PRD skip 路径因此只有专用入口
+#: :meth:`PlanState.start_verification_plan_generation` 能走 —— 通用入口能走
+#: 的话，「这条边存在」就不再意味着「验证分支的最小 PRD 被整条 skip 掉了」。
+DEDICATED_PHASE_TRANSITIONS: Dict[str, List[str]] = {
+    "prd_review": ["tasks_generation"],
+}
+
+
+def _is_gated_verification_phase(phase: str) -> bool:
+    """Is this phase behind the "execution must be complete" gate?
+
+    The gate exists so a plan cannot start verifying before its dev tasks
+    have run. The verification branch has no dev tasks — it ships a plan
+    doc instead — so ``verification_plan_review`` (the human review gate
+    for that doc) is NOT behind the gate.
+
+    2026-10-25: the criterion used to be a bare
+    ``phase.startswith("verification")``. Adding a phase whose name starts
+    with the same prefix, without excluding it, would have made the phase
+    block itself: the doc is written during ``tasks_generation`` and the
+    plan would raise "Cannot transition ... without 'execution' in
+    completed_phases" at the exact moment the doc lands on disk.
+
+    The exclusion is deliberately narrow — every other ``verification*``
+    phase keeps the criterion word for word (and the two ``verify_*``
+    phases never matched the prefix to begin with).
+    """
+    return phase.startswith("verification") and phase != "verification_plan_review"
 
 
 class PlanState:
@@ -444,8 +535,45 @@ class PlanState:
         }
 
     def _infer_phase(self) -> str:
-        if (self.plan_dir / "tasks.json").exists():
+        """Infer the phase from the artifacts sitting in the plan directory.
+
+        The artifact verdict comes from :func:`plan_artifacts.detect` — the
+        ONE place that decides "which branch is this plan on". This method
+        used to stat the files itself, which is how the branch verdict ended
+        up computed in three places and drifted.
+
+        Order matters and is fixed:
+
+        1. ``tasks.json`` (dev branch) → ``ready``;
+        2. ``verification-plan.md`` (verification branch) →
+           ``verification_plan_review`` — the doc exists, so the plan is
+           waiting for a human to accept / skip its items. It must NOT fall
+           back to ``prd_review`` / ``ready``;
+        3. the legacy chain (``test-design.md`` / ``arch-design.md`` /
+           ``review.json`` / ``prd.json`` / ``interview.json``) — unchanged,
+           word for word.
+
+        The VP manifest (``verification_plan.json``) is **not** the plan doc:
+        it is the machine translation of the doc, and it never puts a plan
+        into the review phase.
+
+        Raises:
+            ArtifactConflictError: both ``tasks.json`` and
+                ``verification-plan.md`` are present. Which one the plan
+                meant is a question only a human can answer, so the
+                framework refuses to guess instead of picking one.
+        """
+        artifacts = detect(self.plan_dir)
+        if artifacts.branch == BRANCH_CONFLICT:
+            raise ArtifactConflictError(
+                (artifacts.tasks_path, artifacts.plan_doc_path),
+                expected=None,
+                actual=artifacts.branch,
+            )
+        if artifacts.branch == BRANCH_DEV:
             return "ready"
+        if artifacts.branch == BRANCH_VERIFICATION:
+            return "verification_plan_review"
         if (self.plan_dir / "test-design.md").exists():
             return "test_approved"
         if (self.plan_dir / "arch-design.md").exists():
@@ -654,6 +782,29 @@ class PlanState:
         self._save_state()
 
     def transition_to(self, phase: str):
+        """Move the plan to ``phase``.
+
+        The legal targets come from :data:`PHASE_TRANSITIONS` and
+        :data:`VERIFICATION_PHASE_TRANSITIONS`. The **dedicated** edges —
+        the ones only :meth:`start_verification_plan_generation` may take —
+        are deliberately NOT part of this entry: the generic
+        ``POST /api/plan/{id}/phase`` route goes through here, and the PRD
+        skip path must not be reachable from it.
+        """
+        self._transition_to(phase)
+
+    def _transition_to(
+        self,
+        phase: str,
+        *,
+        extra_allowed: Optional[List[str]] = None,
+    ):
+        """The transition machinery, with an optional extra set of targets.
+
+        ``extra_allowed`` is how the dedicated edges get in: the caller
+        names them explicitly, so they can never leak into the generic
+        entry point.
+        """
         if phase not in VALID_PHASES:
             raise ValueError(f"Invalid phase: {phase}. Must be one of {VALID_PHASES}")
 
@@ -666,6 +817,8 @@ class PlanState:
         # Validate transition legality (check both main and verification tables)
         allowed = set(PHASE_TRANSITIONS.get(current, []))
         allowed.update(VERIFICATION_PHASE_TRANSITIONS.get(current, []))
+        if extra_allowed:
+            allowed.update(extra_allowed)
         if current and phase not in allowed:
             raise ValueError(
                 f"Illegal transition from '{current}' to '{phase}'. "
@@ -674,9 +827,37 @@ class PlanState:
 
         # Enforce execution completion before verification
         # Special case: allow transition from 'executing' directly to verification phases
-        if phase.startswith("verification") and current != "executing" and "execution" not in self._state.get("completed_phases", []):
+        #
+        # 2026-10-25: the prefix criterion now EXCLUDES
+        # ``verification_plan_review``. That phase is the verification
+        # branch's plan-doc review gate: a verification-branch plan never
+        # runs the dev task list, so there is no ``execution`` to wait for.
+        # Without the exclusion the phase would block itself — the doc is
+        # written during ``tasks_generation`` and the plan would raise
+        # "Cannot transition ... without 'execution' in completed_phases"
+        # at the exact moment the doc lands on disk.
+        #
+        # The exclusion is deliberately narrow: every other
+        # ``verification*`` phase (and the two ``verify_*`` phases, which
+        # never matched the prefix to begin with) keeps the criterion
+        # word for word.
+        #
+        # 2026-10-25: the criterion itself widened by one disjunct — the
+        # verification branch has no execution output at all, so
+        # "``execution`` in completed_phases" is permanently false there
+        # and the plan could never enter verification. The gate is now
+        # "``execution`` in completed_phases **or** the verification
+        # branch is ready" (the one predicate both gates ask). On the dev
+        # branch the right-hand side is permanently false, so the original
+        # verdict applies word for word.
+        if (
+            _is_gated_verification_phase(phase)
+            and current != "executing"
+            and not self._execution_gate_open()
+        ):
             raise ValueError(
-                f"Cannot transition to '{phase}' without 'execution' in completed_phases. "
+                f"Cannot transition to '{phase}' without 'execution' in completed_phases "
+                f"and without a ready verification branch. "
                 f"Current completed_phases: {self._state.get('completed_phases', [])}"
             )
 
@@ -686,7 +867,7 @@ class PlanState:
         self._state["current_phase"] = phase
 
         # Auto-append 'execution' to completed_phases when leaving 'executing' for verification (idempotent)
-        if current == "executing" and phase.startswith("verification") and "execution" not in self._state["completed_phases"]:
+        if current == "executing" and _is_gated_verification_phase(phase) and "execution" not in self._state["completed_phases"]:
             self._state["completed_phases"].append("execution")
 
         # Auto-append 'execution' to completed_phases for terminal states (idempotent)
@@ -857,11 +1038,68 @@ class PlanState:
         """Get the reason why verification stopped."""
         return self._state.get("verification", {}).get("stop_reason")
 
+    def _execution_gate_open(self) -> bool:
+        """Is the "execution must be complete" gate open?
+
+        Two ways through, one per branch:
+
+        * **开发分支**：``execution`` 必须在 ``completed_phases`` 里。这条判定
+          逐字不变。
+        * **验证分支**：没有执行产出，所以它问的是另一个事实——基线已冻结且
+          审核完备（:func:`verification_gate.verification_branch_ready`）。
+
+        开发分支上右半边恒假（目录里有 ``tasks.json``，产物判定就是 dev 分支），
+        所以原判定逐字生效；验证分支上左半边恒假，右半边才是它能走的那条路。
+        两道门禁（阶段门禁与 :meth:`start_verification`）问的是同一个事实，
+        所以两处调用的是这一个方法。
+        """
+        if "execution" in self._state.get("completed_phases", []):
+            return True
+        return verification_branch_ready(self.plan_dir)
+
     def start_verification(self):
-        """Start verification phase after execution completes."""
-        if "execution" not in self._state.get("completed_phases", []):
-            raise ValueError("Cannot start verification: 'execution' not in completed_phases")
+        """Start verification phase after execution completes.
+
+        The dev branch reaches verification after its tasks ran; the
+        verification branch reaches it straight from the plan-doc review
+        (see :meth:`_execution_gate_open`).
+        """
+        if not self._execution_gate_open():
+            raise ValueError(
+                "Cannot start verification: 'execution' not in completed_phases "
+                "and the verification branch is not ready"
+            )
         self.transition_to("verification")
+
+    def start_verification_plan_generation(self) -> None:
+        """验证分支的专用入口：PRD 审完之后进入**计划书生成**。
+
+        验证分支的最小 PRD 允许整条 skip，所以 PRD 审完之后不一定进得了
+        ``prd_approved``（那要求每一条决策点都被 accept）。这条入口给的是另一条
+        路：PRD 的审核**已解决**就直接进 ``tasks_generation``（计划书在那里生成）。
+
+        「已解决」由 :func:`verification_plan_review.prd_is_resolved` 回答，它按
+        分支区分 skip 的语义：验证分支的 ``skipped`` 算数，开发分支只认
+        ``accepted``——开发分支的既有门禁逐字不变。
+
+        这条边（``prd_review → tasks_generation``）**不在**通用转移表里：通用
+        入口（``POST /api/plan/{id}/phase``）不许走它，只有这个方法能走。
+
+        Raises:
+            ValueError: PRD 审核未解决；或者当前阶段没有通向
+                ``tasks_generation`` 的边。
+        """
+        if not prd_is_resolved(self.plan_dir):
+            raise ValueError(
+                "Cannot start verification plan generation: the PRD review is "
+                "not resolved (every decision point must be accepted, or "
+                "skipped on the verification branch)"
+            )
+        current = self._state.get("current_phase", "")
+        self._transition_to(
+            "tasks_generation",
+            extra_allowed=DEDICATED_PHASE_TRANSITIONS.get(current, []),
+        )
 
     def verification_passed(self):
         """Mark verification as passed."""
@@ -967,6 +1205,79 @@ class PlanState:
         """Set maximum verification rounds allowed."""
         self._state["verification"]["max_rounds"] = max_rounds
         self._save_state()
+
+    # --- 基线（verification.baseline）---
+    #
+    # 基线是**机器事实**：它只有一个来源——验证计划书「被验证对象」章节里
+    # 那一行 ``baseline:``，在审核完备的那一刻被解析、写入这里。工作区与
+    # 门禁只消费这一份记录，不再读文档。
+    #
+    # 基线是**为某一份文档**冻结的：文档被改写（``doc_sha256`` 变化）之后，
+    # 旧基线不再对应当前文档。因此基线连同「它被冻结时那份文档的字节哈希」
+    # 一起记录，哈希对不上即为失效。
+
+    def get_verification_baseline(self) -> Optional[Dict[str, Any]]:
+        """读回冻结的基线。
+
+        返回 ``None`` 的两种情形：
+
+        * 计划状态里没有记录过基线；
+        * 记录的基线属于**另一份**文档（文档被改写后它已失效）——失效的基线
+          不得继续用于进入验证，也不得挡住下一次审核通过时按新文档的基线行
+          重写。
+
+        失效的基线仍留在状态里（``verification.baseline``）：「被审过的基线」
+        是一次批准的事实，不因为文档改写而被抹掉；只是它不再有效。
+
+        Returns:
+            基线的四个字段（``repo_dir`` / ``ref`` / ``commit_sha`` /
+            ``pr_number``），没有有效基线时为 ``None``。
+        """
+        verification = self._state.get("verification") or {}
+        baseline = verification.get("baseline")
+        if not isinstance(baseline, dict):
+            return None
+        if not self._verification_baseline_is_current(verification):
+            return None
+        return dict(baseline)
+
+    def set_verification_baseline(
+        self, baseline: Dict[str, Any], doc_sha256: str = ""
+    ) -> None:
+        """把冻结的基线写进计划状态。
+
+        Args:
+            baseline: 基线的四个字段（``repo_dir`` / ``ref`` / ``commit_sha`` /
+                ``pr_number``）。
+            doc_sha256: 这份基线被冻结时**那一份文档**的字节哈希。基线因此
+                有了归属：文档被改写后哈希对不上，旧基线即失效。不给时基线
+                没有归属（照写照用，不做失效判定）。
+        """
+        verification = self._state.setdefault("verification", {})
+        verification["baseline"] = dict(baseline)
+        verification["baseline_doc_sha256"] = str(doc_sha256 or "")
+        self._save_state()
+
+    def _verification_baseline_is_current(
+        self, verification: Dict[str, Any]
+    ) -> bool:
+        """已记录的基线是否仍对应当前文档。
+
+        没有归属（没记录过 ``baseline_doc_sha256``）的基线照用：它是别的写
+        路径留下的，没有任何依据说它失效——失效判定只认「文档被改写」这一
+        个事实。
+        """
+        recorded_sha = str(verification.get("baseline_doc_sha256") or "")
+        if not recorded_sha:
+            return True
+        return recorded_sha == self._plan_doc_sha256()
+
+    def _plan_doc_sha256(self) -> str:
+        """当前验证计划书的字节哈希；文件不在时返回空串。"""
+        try:
+            return doc_sha256((self.plan_dir / PLAN_DOC_FILENAME).read_bytes())
+        except OSError:
+            return ""
 
     def set_verification_status(
         self,

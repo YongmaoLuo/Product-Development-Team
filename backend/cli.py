@@ -6,8 +6,11 @@ CLI for autonomous coding skill.
 """
 
 import argparse
+import json
 import os
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -17,6 +20,7 @@ from rollback_manager import RollbackManager
 from config_registry import ConfigRegistry
 from config_loader import load_config_by_name
 from execution_logger import get_logger
+from request_guard import REQUEST_HEADER, REQUEST_HEADER_VALUE
 
 #: What ``secrets show`` prints in place of a keychain index the
 #: environment does not carry. A named state rather than a blank cell:
@@ -63,7 +67,18 @@ BASELINE_UNREADABLE_NOTE = (
 #: can be a plain function over a plain argument list — it has to answer
 #: before the parser exists, because the answer is what decides the
 #: parser's own shape.
-SUBCOMMANDS = ("rollback", "configs", "secrets")
+#:
+#: The verification branch's two names are in here for the same reason
+#: ``secrets`` is: a leading token that is not listed would be read as
+#: the requirement, and ``autonomous-coding verification verify p1``
+#: would start a development run called "verification".
+SUBCOMMANDS = (
+    "rollback",
+    "configs",
+    "secrets",
+    "verification-plan",
+    "verification",
+)
 
 
 def _leading_subcommand(argv) -> Optional[str]:
@@ -83,11 +98,24 @@ def _leading_subcommand(argv) -> Optional[str]:
     return first if first in SUBCOMMANDS else None
 
 
-def main():
-    """Main entry point for CLI."""
-    from env_config import load_env
+def build_parser(argv=None) -> argparse.ArgumentParser:
+    """Build the CLI's parser.
 
-    load_env()
+    Kept apart from :func:`main` so the grammar can be inspected and
+    exercised on its own: the shape of this parser — which top-level
+    options exist, which subcommand owns which positional — is the
+    CLI's public contract, and a contract that can only be reached
+    through ``main()`` is a contract that can only be tested by running
+    a command.
+
+    ``argv`` is the argument list the leading-subcommand decision is
+    made from; it defaults to the process's own. The decision has to be
+    made *here* rather than in the subparsers, because it decides
+    whether the ``requirement`` positional exists at all (see below),
+    and that question is asked before any subparser is created.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
 
     parser = argparse.ArgumentParser(
         description="Autonomous Coding CLI - Fully autonomous software development",
@@ -102,6 +130,9 @@ Examples:
   autonomous-coding --config harmonyos "Create a UI component" -w ./app
   autonomous-coding secrets verify
   autonomous-coding secrets show
+  autonomous-coding verification-plan generate p1
+  autonomous-coding verification-plan review p1 --item 3 --status skip --note "no service"
+  autonomous-coding verification verify p1
         """
     )
 
@@ -120,7 +151,7 @@ Examples:
     # lets the subcommand and the requirement stop overlapping. The
     # attribute is still set, so every reader of the namespace finds
     # it; only the subcommand branch ever sees it as None.
-    leading_subcommand = _leading_subcommand(sys.argv[1:])
+    leading_subcommand = _leading_subcommand(argv)
     if leading_subcommand is None:
         parser.add_argument("requirement", nargs="?", help="The high-level requirement")
     parser.set_defaults(requirement=None)
@@ -180,6 +211,81 @@ Examples:
     secrets_subparsers.add_parser(
         'show', help='List the keychain index each provider secret is filed under')
 
+    # Verification branch: the plan document (任务 17-21)
+    #
+    # The vocabulary is closed — ``generate``, ``get``, ``items``,
+    # ``review``, ``refine`` — and a name outside it is refused by
+    # argparse with a nonzero exit. A subcommand that fell through to
+    # the autonomous path instead would be read as a requirement, and
+    # the operator would be starting a development run by mistyping a
+    # verification one.
+    verification_plan_parser = subparsers.add_parser(
+        'verification-plan',
+        help='Verification branch: the verification plan document')
+    verification_plan_subparsers = verification_plan_parser.add_subparsers(
+        dest='verification_plan_command', help='Verification plan commands')
+
+    vp_generate_parser = verification_plan_subparsers.add_parser(
+        'generate', help='Generate the verification plan document')
+    vp_generate_parser.add_argument('plan_id', help='Plan id')
+
+    vp_get_parser = verification_plan_subparsers.add_parser(
+        'get', help='Read the verification plan document')
+    vp_get_parser.add_argument('plan_id', help='Plan id')
+
+    vp_items_parser = verification_plan_subparsers.add_parser(
+        'items', help='List the review items of the verification plan')
+    vp_items_parser.add_argument('plan_id', help='Plan id')
+
+    vp_review_parser = verification_plan_subparsers.add_parser(
+        'review', help='Record one review action on one item')
+    vp_review_parser.add_argument('plan_id', help='Plan id')
+    vp_review_parser.add_argument(
+        '--item', type=int, required=True, dest='item',
+        help='Item index, numbered as the API numbers them (from 0)')
+    # The flag is ``--status`` because that is what the operator is
+    # doing; the body's field is ``action`` because that is what the
+    # endpoint reads. ``--action`` is accepted as a spelling of the
+    # same thing, because the endpoint's own name for it is the one an
+    # operator reading the API docs will reach for.
+    vp_review_parser.add_argument(
+        '--status', '--action', dest='status', required=True,
+        help='Review action for this item (the server decides which are legal)')
+    vp_review_parser.add_argument(
+        '--note', default='',
+        help='Reason for the action; the server requires one for a skip')
+    vp_review_parser.add_argument(
+        '--doc-sha256', dest='doc_sha256', default=None,
+        help='Hash of the document version that was read (the server '
+             'refuses an action against a document that changed since)')
+
+    vp_refine_parser = verification_plan_subparsers.add_parser(
+        'refine', help='Rewrite the verification plan document from feedback')
+    vp_refine_parser.add_argument('plan_id', help='Plan id')
+    vp_refine_parser.add_argument(
+        '--feedback', required=True,
+        help='What to change in the plan document')
+
+    # Verification branch: the run itself (任务 22)
+    verification_parser = subparsers.add_parser(
+        'verification', help='Verification branch: run the verification')
+    verification_subparsers = verification_parser.add_subparsers(
+        dest='verification_command', help='Verification commands')
+
+    verification_verify_parser = verification_subparsers.add_parser(
+        'verify', help='Start the verification run for a plan')
+    verification_verify_parser.add_argument('plan_id', help='Plan id')
+
+    return parser
+
+
+def main():
+    """Main entry point for CLI."""
+    from env_config import load_env
+
+    load_env()
+
+    parser = build_parser()
     args = parser.parse_args()
 
     # Handle rollback commands
@@ -201,6 +307,14 @@ Examples:
         print("Please specify a secrets command: verify or show")
         print("Use 'autonomous-coding secrets --help' for more information")
         exit(1)
+
+    # Handle the verification branch's plan-document commands
+    if args.command == 'verification-plan':
+        sys.exit(handle_verification_plan_command(args))
+
+    # Handle the verification branch's run commands
+    if args.command == 'verification':
+        sys.exit(handle_verification_command(args))
 
     # Handle main autonomous coding
     workspace_dir = args.workspace
@@ -727,6 +841,372 @@ def cmd_secrets_show() -> int:
         "index, and no keychain item is read here."
     )
     return 0
+
+
+# ---------------------------------------------------------------------------
+# The verification branch: a thin wrapper over the API
+# ---------------------------------------------------------------------------
+#
+# The verification branch is entered through HTTP endpoints — the plan
+# document's own endpoints (任务 17-21) and the run's start endpoint
+# (任务 22). The CLI is the E2E-1 entry point into the same branch, and
+# it is a **wrapper**: it parses arguments, sends the request, and prints
+# what came back.
+#
+# It holds no rule of its own, and that is the load-bearing decision
+# rather than a shorthand. The stage gate, the item vocabulary, the
+# baseline freeze and the doc-hash race all live on the server, where
+# the API path and the CLI path reach the same code. A second copy of
+# any of them here would be a second thing that can be right while the
+# server is wrong — and it would be right *only* in the CLI, which is
+# the one path nobody tests against the other. So the CLI sends the
+# request and reports the answer, and where it does decide something
+# (which URL, which body field) the decision is the spelling the
+# endpoint already uses.
+
+#: The server this CLI talks to when nothing says otherwise. Loopback,
+#: because the server binds loopback by default
+#: (:func:`backend.config_paths.resolve_server_host`) and a web UI with
+#: no authentication is not something to reach from another machine by
+#: accident.
+DEFAULT_API_HOST = "127.0.0.1"
+
+#: The port the server binds with when nothing says otherwise. The same
+#: default the server itself uses (``PDT_PORT`` or 8000).
+DEFAULT_API_PORT = "8000"
+
+#: How long one API call may take.
+#:
+#: Minutes, not seconds, and the reason is the plan-document endpoints:
+#: they call a model before they answer, so a timeout shorter than the
+#: server's own would turn a slow generation into a misleading "cannot
+#: reach the server" — the one failure an operator cannot act on.
+API_TIMEOUT_SECONDS = 900
+
+
+class ApiCommandError(Exception):
+    """An API call that did not succeed.
+
+    Attributes:
+        status_code: The HTTP status, or ``None`` when the call never
+            reached a server (a refused connection, a timeout).
+        error_code: The server's machine-readable code — ``plan_not_found``,
+            ``item_not_found``, ``unknown_action`` — when it sent one.
+        detail: The server's human-readable detail, when it sent one.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        error_code: Optional[str] = None,
+        detail: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+        self.detail = detail
+
+
+def _api_base_url() -> str:
+    """Return the base URL of the PDT server this CLI talks to.
+
+    ``PDT_API_BASE_URL`` wins outright — an operator pointing the CLI at
+    a server on another box, or at a tunnel, must not have to also get
+    the port right. Otherwise the port comes from ``PDT_PORT``, the same
+    variable the server binds with, so a deployment that moved its
+    server to another port has one variable to set rather than two.
+
+    The host is loopback and is not read from ``PDT_HOST``: that
+    variable says what the server *binds*, and ``0.0.0.0`` — the
+    documented way to expose the server to a LAN — is not an address a
+    client can connect to.
+    """
+    explicit = (os.environ.get("PDT_API_BASE_URL") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    port = (os.environ.get("PDT_PORT") or "").strip() or DEFAULT_API_PORT
+    return "http://{}:{}".format(DEFAULT_API_HOST, port)
+
+
+def _decode_api_body(raw: bytes) -> Dict:
+    """Return the JSON object in ``raw``; an empty dict if there is none.
+
+    A body that is not JSON is not an error here: the CLI's job is to
+    forward the server's answer, and a body it cannot parse is a body
+    it forwards as an empty object rather than a crash. The status code
+    is what decides success, and it was decided before this was called.
+    """
+    text = raw.decode("utf-8", "replace").strip() if raw else ""
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    return {"detail": payload}
+
+
+def _api_error_from_response(status: int, body: Dict) -> ApiCommandError:
+    """Return the error a failed response stands for.
+
+    FastAPI wraps an ``HTTPException``'s detail in ``{"detail": ...}``,
+    and the endpoints raise with a dict carrying ``error`` (the
+    machine-readable code) and ``detail`` (the sentence). Both are
+    lifted out here so the terminal shows the same code the API's own
+    documentation names — an operator grepping a CI log for
+    ``plan_not_found`` has to find it.
+    """
+    inner = body.get("detail")
+    if not isinstance(inner, dict):
+        inner = body
+    error_code = inner.get("error")
+    text = inner.get("detail")
+    if not isinstance(text, str):
+        text = None
+    label = error_code or "http_{}".format(status)
+    message = "{} (HTTP {})".format(label, status)
+    if text:
+        message = "{}: {}".format(message, text)
+    return ApiCommandError(
+        message, status_code=status, error_code=error_code, detail=text
+    )
+
+
+def _api_request(method: str, path: str, payload=None) -> Dict:
+    """Send one API call and return the JSON object it answered with.
+
+    Args:
+        method: The HTTP method.
+        path: The path, beginning with ``/``.
+        payload: The JSON body, or ``None`` for a request without one.
+
+    Returns:
+        The server's JSON body. An empty dict when the body was empty
+        or was not JSON — see :func:`_decode_api_body`.
+
+    Raises:
+        ApiCommandError: The server answered with a 4xx or a 5xx, or
+            the server could not be reached at all. The two are
+            different failures and are told apart by
+            :attr:`ApiCommandError.status_code`: one is the server
+            refusing, the other is nobody answering.
+    """
+    url = "{}{}".format(_api_base_url(), path)
+    body = None
+    # The server's request guard refuses every ``/api/*`` call that does
+    # not carry its header — a browser page from another origin cannot
+    # set one without a preflight the server never grants. This command
+    # is a local script, which is exactly what the guard admits, so it
+    # sends the header. The names come from the guard itself rather
+    # than from a second copy here: a CLI that spelled the header
+    # differently from the server would be refused by every call, and
+    # the failure would read as "the API is down".
+    headers = {
+        "Accept": "application/json",
+        REQUEST_HEADER: REQUEST_HEADER_VALUE,
+    }
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(
+        url, data=body, method=method, headers=headers
+    )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=API_TIMEOUT_SECONDS
+        ) as response:
+            raw = response.read()
+            status = getattr(response, "status", None) or response.getcode()
+    except urllib.error.HTTPError as exc:
+        raw = b""
+        try:
+            raw = exc.read()
+        except Exception:  # noqa: BLE001 — a body we cannot read is a body we do not have
+            raw = b""
+        raise _api_error_from_response(exc.code, _decode_api_body(raw))
+    except urllib.error.URLError as exc:
+        raise ApiCommandError(
+            "cannot reach the PDT server at {}: {}".format(url, exc.reason)
+        )
+    except OSError as exc:
+        # A timeout, a reset connection, a DNS failure that did not
+        # arrive as a URLError. None of them is the server's answer, and
+        # none of them may be reported as one.
+        raise ApiCommandError(
+            "cannot reach the PDT server at {}: {}".format(url, exc)
+        )
+
+    if status is not None and status >= 400:
+        raise _api_error_from_response(status, _decode_api_body(raw))
+    return _decode_api_body(raw)
+
+
+def _emit_result(command: str, plan_id: str, payload: Dict) -> None:
+    """Print one command's answer as a single JSON object.
+
+    The command's own name and the plan id go in beside the server's
+    answer, so a script driving several plans in a row can tell whose
+    answer it is holding — and so a human reading a terminal can tell
+    which of two similar lines is the one they asked for. The server's
+    fields are forwarded as they came: the CLI does not know what
+    ``current_phase`` may be, and must not pretend to.
+    """
+    body = {"command": command, "plan_id": plan_id}
+    for key, value in payload.items():
+        if key != "plan_id":
+            body[key] = value
+    print(json.dumps(body, ensure_ascii=False))
+
+
+def cmd_verification_plan_generate(plan_id: str) -> Dict:
+    """Generate the verification plan document; return the server's answer."""
+    payload = _api_request(
+        "POST", "/api/verification-plan/{}/generate".format(plan_id), {}
+    )
+    _emit_result("verification-plan generate", plan_id, payload)
+    return payload
+
+
+def cmd_verification_plan_get(plan_id: str) -> Dict:
+    """Read the verification plan document; return the server's answer."""
+    payload = _api_request("GET", "/api/verification-plan/{}".format(plan_id))
+    _emit_result("verification-plan get", plan_id, payload)
+    return payload
+
+
+def cmd_verification_plan_items(plan_id: str) -> Dict:
+    """List the plan's review items; return the server's answer."""
+    payload = _api_request(
+        "GET", "/api/verification-plan/{}/review/items".format(plan_id)
+    )
+    _emit_result("verification-plan items", plan_id, payload)
+    return payload
+
+
+def cmd_verification_plan_review(
+    plan_id: str,
+    item: int,
+    status: str,
+    note: str = "",
+    doc_sha256: Optional[str] = None,
+) -> Dict:
+    """Record one review action; return the server's answer.
+
+    The item index goes into the path exactly as it was given. The CLI
+    does not renumber it, does not check it against the item list, and
+    does not know whether it exists — the endpoint answers that, with
+    ``item_not_found``, and an answer the CLI made up would be a second
+    opinion about a plan the CLI has not read.
+    """
+    body: Dict[str, object] = {"action": status, "note": note}
+    if doc_sha256:
+        body["doc_sha256"] = doc_sha256
+    payload = _api_request(
+        "POST",
+        "/api/verification-plan/{}/review/item/{}".format(plan_id, item),
+        body,
+    )
+    _emit_result("verification-plan review", plan_id, payload)
+    return payload
+
+
+def cmd_verification_plan_refine(plan_id: str, feedback: str) -> Dict:
+    """Rewrite the plan document from feedback; return the server's answer."""
+    payload = _api_request(
+        "POST",
+        "/api/verification-plan/{}/refine".format(plan_id),
+        {"feedback": feedback},
+    )
+    _emit_result("verification-plan refine", plan_id, payload)
+    return payload
+
+
+def cmd_verification_verify(plan_id: str) -> Dict:
+    """Start the verification run; return the server's answer.
+
+    The body is empty on purpose. The endpoint owns its defaults — the
+    round budget, whether the run may repair and re-execute — and a CLI
+    that filled them in would be pinning values the operator never
+    asked for, on the one path where a wrong value costs a whole run.
+    """
+    payload = _api_request(
+        "POST", "/api/verification/{}/start".format(plan_id), {}
+    )
+    _emit_result("verification verify", plan_id, payload)
+    return payload
+
+
+def handle_verification_plan_command(args) -> int:
+    """Dispatch the ``verification-plan`` subcommands; return an exit code.
+
+    An API failure is reported on stderr and exits nonzero. The error
+    goes to stderr rather than stdout because stdout carries the answer:
+    a caller that pipes this command into a JSON reader gets the
+    server's answer and nothing else, and a failure never arrives as a
+    line of stdout that looks like one.
+    """
+    command = getattr(args, "verification_plan_command", None)
+    try:
+        if command == 'generate':
+            cmd_verification_plan_generate(args.plan_id)
+            return 0
+        if command == 'get':
+            cmd_verification_plan_get(args.plan_id)
+            return 0
+        if command == 'items':
+            cmd_verification_plan_items(args.plan_id)
+            return 0
+        if command == 'review':
+            cmd_verification_plan_review(
+                args.plan_id,
+                args.item,
+                args.status,
+                args.note,
+                args.doc_sha256,
+            )
+            return 0
+        if command == 'refine':
+            cmd_verification_plan_refine(args.plan_id, args.feedback)
+            return 0
+    except ApiCommandError as exc:
+        print("error: {}".format(exc), file=sys.stderr)
+        return 1
+
+    print(
+        "Please specify a verification-plan command: generate, get, items, "
+        "review, or refine",
+        file=sys.stderr,
+    )
+    print(
+        "Use 'autonomous-coding verification-plan --help' for more information",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def handle_verification_command(args) -> int:
+    """Dispatch the ``verification`` subcommands; return an exit code."""
+    command = getattr(args, "verification_command", None)
+    try:
+        if command == 'verify':
+            cmd_verification_verify(args.plan_id)
+            return 0
+    except ApiCommandError as exc:
+        print("error: {}".format(exc), file=sys.stderr)
+        return 1
+
+    print(
+        "Please specify a verification command: verify", file=sys.stderr
+    )
+    print(
+        "Use 'autonomous-coding verification --help' for more information",
+        file=sys.stderr,
+    )
+    return 1
 
 
 if __name__ == "__main__":

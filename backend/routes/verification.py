@@ -43,6 +43,11 @@ from verification_buckets import (
     derive_index_buckets,
 )
 
+# ``plan_artifacts`` 是叶子模块（只依赖 pathlib / typing），所以这里可以安全地
+# 模块级导入 —— 判定「这条 plan 走哪条分支」只有一个入口，见
+# :func:`plan_artifacts.detect`。
+from plan_artifacts import BRANCH_CONFLICT, detect
+
 router = APIRouter()
 
 
@@ -609,6 +614,409 @@ def _repair_resume_response(plan_id, plan_dir, conn, req):
     }
 
 
+def _verification_review_ready(plan_dir: Path) -> bool:
+    """这个 plan 目录是否已经就绪，可以从「计划书待审」进入验证。
+
+    2026-10-25。``/start`` 的唯一放行判定是 ``try_mark_phase`` 的**源阶段
+    集合**，而阶段词汇表变大不会让新阶段自动被接纳——所以「验证分支已就绪」
+    这个事实必须由 :func:`verification_gate.verification_branch_ready` 回答，
+    答案只以「多一个源阶段」的形式进入 CAS。
+
+    谓词异常一律折叠为假：读不懂的计划与没准备好的计划，对调用方是同一件事
+    ——**还没到能跑的时候**。折叠之后仍然走既有的 409 ``stage_mismatch``：
+    不新增错误码，也不产生 500。
+
+    Args:
+        plan_dir: plan 目录。
+
+    Returns:
+        就绪为 ``True``；不就绪（含异常）为 ``False``。本函数**不抛异常**。
+    """
+    try:
+        from verification_gate import verification_branch_ready
+
+        return bool(verification_branch_ready(plan_dir))
+    except Exception:  # noqa: BLE001 - 读不懂 = 还没到能跑的时候
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 验证分支的前奏（2026-10-25）
+# ---------------------------------------------------------------------------
+#
+# ``/start`` 原来只做两件事：CAS（阶段放行）与启动验证循环。验证分支在这两件
+# 事之前还缺一整条管线：
+#
+# * 机器计划得与审核过的计划书**逐条相等** —— 审过的与实际被验的必须是同一批
+#   验证点；
+# * 基线得还是审核时冻结的那个 commit —— PR head 移动过，要验的东西就换了；
+# * 验证得在**被验证对象自己的 worktree** 里跑，而不是在 plan 的旧目录里；
+# * ``project_dir`` 得指向那个 worktree —— 执行链只读这一列。
+#
+# 顺序是固定的，而且顺序本身就是契约：
+#
+#     产物判定 → 翻译 + 等价校验 → 基线漂移校验 → 物化 worktree → 注册
+#     project_dir → 既有循环
+#
+# 任何一步失败都**中止**，且中止之前不产生副作用：worktree 没建、project_dir
+# 没改写、循环没启动。
+#
+# 为什么「翻译」排在「漂移校验」前面：翻译要问一次模型，那是要花时间的，而
+# PR head 在模型思考期间移动是完全现实的事。所以漂移校验有两次 —— 放行前那次
+# （不白花一次模型调用）与物化前那次（权威的那次）。两次之间隔着的就是那次
+# 模型调用。
+
+#: 验证分支的机器计划：验证回路读的那一份（与验证 agent 写出的同名同格式）。
+MACHINE_PLAN_FILENAME = "verification_plan.json"
+
+
+def _verification_branch_prelude(
+    plan_id: str,
+    plan_dir: Path,
+    *,
+    review_ready: bool,
+) -> Optional[JSONResponse]:
+    """验证分支的前奏：把「能开始验证」这件事做完，再让循环跑起来。
+
+    Args:
+        plan_id: plan id。
+        plan_dir: plan 目录。
+        review_ready: 「验证分支已就绪」（审核完备 + 基线与 ref 一致）。不就绪
+            的计划不进这条管线 —— 它的答案由既有的 409 ``stage_mismatch`` 给出，
+            不新增错误码。
+
+    Returns:
+        ``None`` 表示放行（继续既有循环）；``JSONResponse`` 表示中止（4xx）。
+    """
+    from plan_artifacts import BRANCH_VERIFICATION, detect
+
+    artifacts = detect(plan_dir)
+    if artifacts.branch != BRANCH_VERIFICATION:
+        # 开发分支（以及产物冲突、目录为空）完全走原路径：不建 worktree、
+        # 不改写 project_dir、也不问模型。产物冲突的 409 映射由产物判定那条
+        # 线负责 —— 本任务只按 ``detect`` 返回的 branch 分流。
+        return None
+
+    if not review_ready:
+        # 审核不完备 / 基线与 ref 对不上 → 交给既有的 409 ``stage_mismatch``。
+        return None
+
+    failure = _prepare_machine_plan(plan_id, plan_dir)
+    if failure is not None:
+        return failure
+
+    return _materialise_verification_workspace(plan_id, plan_dir)
+
+
+def _prepare_machine_plan(plan_id: str, plan_dir: Path) -> Optional[JSONResponse]:
+    """机器计划：盘上已有的那一份，或模型现译的那一份；两者都要与计划书相等。
+
+    **先校验，后落盘**：等价性门禁报出差异时什么都不写 —— 一份与审核过的
+    计划书对不上的机器计划留在盘上，只会成为下一个读它的人踩的坑。
+
+    盘上已有机器计划时直接用它（不重复问一次模型）：它是上一轮管线写下的
+    产物，而门禁会拿它与**当前**计划书逐条比对 —— 计划书改了，比对就会报出
+    差异。
+
+    Returns:
+        ``None`` 表示机器计划就绪（已落盘）；``JSONResponse`` 表示中止。
+    """
+    from plan_artifacts import PLAN_DOC_FILENAME
+    from verification_plan_doc import StructureError, parse_plan_doc
+    from verification_plan_translator import validate_equivalence
+
+    doc_path = plan_dir / PLAN_DOC_FILENAME
+    try:
+        text = doc_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "verification_plan_invalid",
+                "detail": f"验证计划书读不出来：{exc}",
+                "plan_id": plan_id,
+            },
+        )
+
+    try:
+        parsed = parse_plan_doc(text)
+    except StructureError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "verification_plan_invalid",
+                "detail": "验证计划书不满足十章节契约。",
+                "plan_id": plan_id,
+                "section": exc.section,
+                "line": exc.line,
+                "code": exc.code,
+                "message": exc.message,
+            },
+        )
+
+    machine_plan_path = plan_dir / MACHINE_PLAN_FILENAME
+    existed = machine_plan_path.exists()
+    machine_plan, failure = _machine_plan_for(plan_id, plan_dir, parsed, machine_plan_path)
+    if failure is not None:
+        return failure
+
+    divergences = validate_equivalence(parsed, machine_plan)
+    if divergences:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "verification_plan_equivalence_failed",
+                "detail": (
+                    "机器计划与审核过的验证计划书对不上（验证点集合 / 判据 / "
+                    "执行范围 / 证据编号），不落盘。"
+                ),
+                "plan_id": plan_id,
+                "divergences": [
+                    {
+                        "dimension": item.dimension,
+                        "item_id": item.item_id,
+                        "detail": item.detail,
+                    }
+                    for item in divergences
+                ],
+            },
+        )
+
+    if not existed:
+        # 只有管线**自己**译出来的那一份才写盘：盘上已有的那一份原样留着。
+        machine_plan_path.write_text(
+            json.dumps(machine_plan, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    return None
+
+
+def _machine_plan_for(
+    plan_id: str,
+    plan_dir: Path,
+    parsed: Any,
+    machine_plan_path: Path,
+) -> Tuple[Optional[Dict[str, Any]], Optional[JSONResponse]]:
+    """机器计划的来源：盘上已有的那一份，或模型现译的那一份。
+
+    Returns:
+        ``(机器计划, 失败响应)``。两者恰有一个是 ``None``。
+    """
+    from verification_plan_translator import TranslationError, translate
+
+    if machine_plan_path.exists():
+        try:
+            loaded = json.loads(machine_plan_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return None, JSONResponse(
+                status_code=422,
+                content={
+                    "error": "verification_plan_invalid",
+                    "detail": f"盘上的机器计划读不出来：{exc}",
+                    "plan_id": plan_id,
+                },
+            )
+        if not isinstance(loaded, dict):
+            return None, JSONResponse(
+                status_code=422,
+                content={
+                    "error": "verification_plan_invalid",
+                    "detail": "盘上的机器计划不是一个对象。",
+                    "plan_id": plan_id,
+                },
+            )
+        return loaded, None
+
+    # 盘上没有 → 现译。模型只补**执行细节**，验证点集合以文档为准（翻译阶段
+    # 零漂移：多一条、少一条、改 id，一律抛错）。
+    tool = _server.create_coding_tool(cwd=str(plan_dir), scene="verification")
+    try:
+        translated = translate(parsed, _repo_facts(plan_dir), tool)
+    except TranslationError as exc:
+        return None, JSONResponse(
+            status_code=422,
+            content={
+                "error": "verification_plan_translation_failed",
+                "detail": str(exc),
+                "plan_id": plan_id,
+            },
+        )
+    return _with_evidence_refs(parsed, translated), None
+
+
+def _repo_facts(plan_dir: Path) -> Dict[str, Any]:
+    """仓库级事实：模型补执行细节时要用的那些。
+
+    ``services`` 是空数组 —— 验证分支没有 ``tasks.json``，也就没有服务声明；
+    端口那种事实不在这条分支上出现。
+
+    ``test_files`` 是仓库里的测试文件清单：模型要写的是「一条可执行命令」，
+    而命令指向哪个测试文件只有仓库知道。把清单给它，它就不必猜。
+    """
+    facts: Dict[str, Any] = {"services": [], "test_files": []}
+    baseline = _recorded_baseline(plan_dir)
+    if baseline is None:
+        return facts
+    repo_dir = Path(str(baseline.get("repo_dir") or "")).expanduser()
+    if not repo_dir.is_dir():
+        return facts
+    facts["repo_root"] = str(repo_dir)
+    tests_root = repo_dir / "tests"
+    if not tests_root.is_dir():
+        return facts
+    found = sorted(
+        str(path.relative_to(repo_dir))
+        for path in tests_root.rglob("*.py")
+        if path.is_file()
+    )
+    facts["test_files"] = found[:200]
+    return facts
+
+
+def _recorded_baseline(plan_dir: Path) -> Optional[Dict[str, Any]]:
+    """计划状态里记录下来的基线；没有记录时返回 ``None``。
+
+    与 :mod:`verification_gate` 读的是同一处 —— 基线只有这一个来源。
+    """
+    from plan_state import PlanState
+
+    verification = PlanState(plan_dir).get_state().get("verification") or {}
+    recorded = verification.get("baseline")
+    return recorded if isinstance(recorded, dict) else None
+
+
+def _with_evidence_refs(parsed: Any, translated: Dict[str, Any]) -> Dict[str, Any]:
+    """给每条验证点的 ``expected_result`` 配上证据编号。
+
+    机器格式的规范形式是 ``E1,E2 | 正文``：编号在前，正文在后。翻译搬的是
+    文档里的**正文**，编号得由管线自己配上 —— 编号的来源是文档（审核过的那
+    一份），不是模型。
+    """
+    by_id = {item.id: item for item in parsed.items}
+    points: List[Dict[str, Any]] = []
+    for entry in translated.get("verification_points") or []:
+        vp = dict(entry)
+        item = by_id.get(str(vp.get("id") or ""))
+        if item is not None and item.evidence:
+            refs = ",".join(sorted(item.evidence))
+            vp["expected_result"] = f"{refs} | {item.expected_result}"
+        points.append(vp)
+    result = dict(translated)
+    result["verification_points"] = points
+    return result
+
+
+def _materialise_verification_workspace(
+    plan_id: str,
+    plan_dir: Path,
+) -> Optional[JSONResponse]:
+    """基线 → 漂移校验 → 物化 worktree → 注册 ``project_dir``。
+
+    漂移校验排在翻译**之后**是有意的：翻译要问一次模型，那是要花时间的，而
+    PR head 在模型思考期间移动是完全现实的事。这次校验是权威的那一次 ——
+    放行前那次只是不白花一次模型调用。
+
+    Returns:
+        ``None`` 表示工作区已就绪；``JSONResponse`` 表示中止。
+    """
+    from framework.ids import InvalidPlanIdError
+    from verification_workspace import (
+        BaselineError,
+        RefResolutionError,
+        WorkspaceConflictError,
+        WorkspaceRootError,
+        ensure_workspace,
+        register_project_dir,
+        resolve_baseline,
+        resolve_ref_commit,
+    )
+
+    try:
+        baseline = resolve_baseline(plan_dir)
+    except BaselineError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "baseline_missing",
+                "detail": str(exc),
+                "plan_id": plan_id,
+            },
+        )
+
+    try:
+        current = resolve_ref_commit(baseline.repo_dir, baseline.ref)
+    except RefResolutionError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "baseline_unresolvable",
+                "detail": str(exc),
+                "plan_id": plan_id,
+            },
+        )
+
+    if current != baseline.commit_sha:
+        # 与既有的 409 同一个形状：不新增错误码。
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "conflict",
+                "reason": "stage_mismatch",
+                "detail": (
+                    f"基线漂移：{baseline.ref} 现在解析到 {current}，"
+                    f"而审核冻结的是 {baseline.commit_sha}。"
+                ),
+                "plan_id": plan_id,
+            },
+        )
+
+    try:
+        workspace = ensure_workspace(plan_id, baseline)
+    except WorkspaceConflictError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "conflict",
+                "reason": "workspace_conflict",
+                "detail": str(exc),
+                "plan_id": plan_id,
+            },
+        )
+    except (RefResolutionError, BaselineError) as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "baseline_unresolvable",
+                "detail": str(exc),
+                "plan_id": plan_id,
+            },
+        )
+    except (WorkspaceRootError, InvalidPlanIdError) as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "workspace_root_invalid",
+                "detail": str(exc),
+                "plan_id": plan_id,
+            },
+        )
+
+    try:
+        register_project_dir(plan_id, workspace.path)
+    except (WorkspaceRootError, InvalidPlanIdError) as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "workspace_root_invalid",
+                "detail": str(exc),
+                "plan_id": plan_id,
+            },
+        )
+
+    return None
+
+
 @router.post("/api/verification/{plan_id}/start")
 def start_verification(plan_id: str, req: _server.StartVerificationRequest = None):
     """Start verification via the routing/verification repositories."""
@@ -620,6 +1028,25 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
         _ensure_verification_plan(plan_id)
     except ArchivedPlanError:
         return JSONResponse(status_code=410, content={"error": "archived"})
+
+    # 产物门禁（五个调用点之一）。
+    #
+    # 两类产物（``tasks.json`` / ``verification-plan.md``）同时存在时，这条 plan
+    # 到底走哪条分支**还没人裁决**。这时候**不能进 CAS**：CAS 成功就是阶段推进，
+    # 阶段一动就把人的裁决权抹掉了 —— 框架替人择一，正是这条门禁要防的事。
+    #
+    # 判定来自 :func:`plan_artifacts.detect`（唯一入口）；错误语义与其它四个
+    # 调用点逐字相同。载荷构造器住在 ``routes.plans``（状态接口与列表的所在地），
+    # 那里是**函数内**导入的：路由模块之间在模块级互相导入会绕成环（``server``
+    # 在文件底部才导入它们），函数内导入是在请求到达时求值，那时一切都已加载。
+    from routes.plans import artifact_conflict_payload
+
+    artifacts = detect(plan_dir)
+    if artifacts.branch == BRANCH_CONFLICT:
+        return JSONResponse(
+            status_code=409,
+            content=artifact_conflict_payload(plan_id, artifacts),
+        )
 
     # --- round budget resolution (2026-09-20) ---------------------------
     # An explicit ``max_rounds`` in the body wins — that is the supported
@@ -735,6 +1162,43 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
     if _repair_resume is not None:
         return _repair_resume
 
+    # 2026-10-25: the verification branch's own entry ticket.
+    #
+    # A plan on the verification branch sits at ``verification_plan_review``
+    # — the plan doc exists and waits for a human to accept / skip its
+    # items. That phase is NOT one of the accepted source phases below,
+    # so the CAS refuses the start with ``409 stage_mismatch`` — the very
+    # "the state machine let it through, the API says 409 forever"
+    # shape the shared predicate exists to prevent.
+    #
+    # The predicate answers "is the verification branch ready?" — the
+    # same question the state machine asks, so the two gates cannot
+    # disagree. It enters the CAS as **one more source phase**, and only
+    # when it holds: a plan that is not ready keeps the old source set
+    # and the old 409. No new error code is introduced.
+    _review_ready = _verification_review_ready(plan_dir)
+
+    # 2026-10-25: the verification branch's pipeline, **before** the CAS.
+    #
+    # The order is the contract: the machine plan has to match the reviewed
+    # document, the baseline still has to point at the reviewed commit, and
+    # the round has to run inside the worktree of the object under
+    # verification — all of that *before* the phase moves, so a failure
+    # leaves nothing behind: the phase stays where it was, no worktree was
+    # created, ``project_dir`` was not rewritten and no loop was started.
+    #
+    # The development branch goes through the original path untouched: no
+    # worktree, no rewritten ``project_dir``, no model call.
+    _prelude = _verification_branch_prelude(
+        plan_id, plan_dir, review_ready=_review_ready,
+    )
+    if _prelude is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return _prelude
+
     try:
         current = verification.current(plan_id)
         # 2026-10-20: an interrupted round is RESUMED, not replaced.
@@ -838,7 +1302,17 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
             # in exactly that case the current phase is an acceptable
             # source. Every other plan keeps the old source set: a
             # round that is genuinely running must not be re-entered.
-            + (("verification_running",) if _recovered else ()),
+            + (("verification_running",) if _recovered else ())
+            # 2026-10-25: the verification branch adds ONE more source
+            # phase, and only when the branch is ready (see
+            # ``_verification_review_ready`` above). The shape is
+            # deliberately the same as the ``_recovered`` entry above:
+            # the development branch's source set stays item-for-item
+            # identical, and a verification branch that is not ready
+            # keeps the old source set — so it still answers the
+            # existing ``409 stage_mismatch`` instead of a new error
+            # code.
+            + (("verification_plan_review",) if _review_ready else ()),
             "verification_running",
         )
         verification.init_round(plan_id, round_n=next_round, max_rounds=max_rounds)
@@ -1143,6 +1617,11 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
     return {
         "plan_id": plan_id,
         "status": "started",
+        # 2026-10-25: where the round actually runs. On the verification
+        # branch that is the worktree of the object under verification (the
+        # pipeline registered it), not the plan's old directory — so the
+        # caller sees the same directory the executor will.
+        "project_dir": str(project_dir),
         # 2026-10-20: the round this start runs and whether it picked
         # an interrupted round up (``resumed``) instead of starting
         # the next one. The round number is the contract a plan's

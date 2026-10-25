@@ -24,7 +24,130 @@ import time
 # this module (see the wiring at the bottom of server.py).
 import server as _server
 
+# ``plan_artifacts`` 是叶子模块（只依赖 pathlib / typing），所以这里可以安全地
+# 模块级导入 —— 判定「这条 plan 走哪条分支」只有一个入口，见
+# :func:`plan_artifacts.detect`。
+from plan_artifacts import (  # noqa: E402
+    BRANCH_CONFLICT,
+    PLAN_DOC_FILENAME,
+    TASKS_FILENAME,
+    ArtifactSet,
+    detect,
+)
+
 router = APIRouter()
+
+#: The plan-doc review phase — the verification branch's human review gate
+#: (introduced by task 14; the phase name lives in ``plan_state``'s
+#: vocabulary, this is only the constant the read paths below need).
+_PLAN_DOC_REVIEW_PHASE = "verification_plan_review"
+
+
+# ---------------------------------------------------------------------------
+# 产物冲突：五个调用点共用的错误语义
+# ---------------------------------------------------------------------------
+#
+# 一个 plan 目录里可能同时躺着两类互斥的产物：``tasks.json``（开发分支）与
+# ``verification-plan.md``（验证分支）。两类都在时，「这条 plan 到底想干什么」
+# **只有人能回答** —— 框架替它择一，等于替用户做决定；框架直接拒绝，至少把
+# 两条路都交回去，由操作者裁决。
+#
+# 判定收敛在 :func:`plan_artifacts.detect` 这一个纯函数里（任务 1）。这里收的是
+# **判定结果的消费者**：五个调用点（任务生成、单计划状态、计划书生成、
+# ``/start``、计划列表）都接上它，冲突时给出**逐字相同**的 409
+# ``artifact_conflict``。漏接一个，某个入口就会自己择一个把事情做下去。
+#
+# 响应体里只有 plan 的**相对名**（``tasks.json`` / ``verification-plan.md``）：
+# 调用方拿它去自己的 plan 目录里找文件，不必知道服务器把 plan 放在哪 ——
+# 绝对路径既泄露本机布局，也让响应在别的机器上不可用。
+
+#: 产物冲突的机器可读错误码（五个调用点共用一个字符串）。
+ARTIFACT_CONFLICT_ERROR = "artifact_conflict"
+
+#: 冲突时交回去的两个产物：**相对名**，不是路径。
+CONFLICT_ARTIFACTS: Tuple[str, ...] = (TASKS_FILENAME, PLAN_DOC_FILENAME)
+
+#: 列表里冲突计划的桶。列表是集合接口 —— 它不能为了一个 plan 把整张列表变成
+#: 409（那会让侧栏对所有其它 plan 一起失明），所以它用这个桶表达同一件事。
+CONFLICT_BUCKET = "conflict"
+
+
+def artifact_conflict_payload(
+    plan_id: str,
+    artifacts: "ArtifactSet",
+) -> Dict[str, Any]:
+    """从判定结果拼出 409 响应体（五个调用点逐字相同）。
+
+    Args:
+        plan_id: plan id。
+        artifacts: :func:`plan_artifacts.detect` 的判定结果。
+
+    Returns:
+        响应体字典。``artifacts`` 是**两个**候选产物的相对名（冲突时两个都在），
+        ``existing_artifacts`` 是盘上**实际存在**的那几个，``branch`` 是判定出的
+        分支。三个字段都不含绝对路径。
+    """
+    existing = [
+        name
+        for name, path in (
+            (TASKS_FILENAME, artifacts.tasks_path),
+            (PLAN_DOC_FILENAME, artifacts.plan_doc_path),
+        )
+        if path is not None
+    ]
+    if artifacts.branch == BRANCH_CONFLICT:
+        detail = (
+            "这个 plan 目录里同时存在开发任务清单（tasks.json）与验证计划书"
+            "（verification-plan.md）：两条分支互斥，而「这条 plan 到底想干什么」"
+            "只有人能回答。框架不替你择一，也不删除任何文件 —— 由操作者裁决"
+            "保留哪一个。"
+        )
+    else:
+        detail = (
+            "这个 plan 已经有 %s，它属于%s；另一条分支的产物与它互斥。"
+            "框架不替你择一，也不删除任何文件 —— 由操作者裁决保留哪一个。"
+            % (
+                "、".join(existing),
+                "开发分支" if TASKS_FILENAME in existing else "验证分支",
+            )
+        )
+    return {
+        "error": ARTIFACT_CONFLICT_ERROR,
+        "detail": detail,
+        "plan_id": plan_id,
+        "artifacts": list(CONFLICT_ARTIFACTS),
+        "existing_artifacts": existing,
+        "branch": artifacts.branch,
+    }
+
+
+def _stable_phase_label(phase: Optional[str]) -> Optional[str]:
+    """The stable label of ``phase``; ``None`` when the phase has none.
+
+    The labels live in **one** place — ``plan_state.PHASE_LABELS`` (task
+    14) — and every display surface reads them from there, so the same
+    phase cannot be labelled two ways in two endpoints.
+    """
+    from plan_state import PHASE_LABELS
+
+    key = str(phase or "")
+    if not key:
+        return None
+    return PHASE_LABELS.get(key)
+
+
+def _phase_label(phase: Optional[str]) -> str:
+    """The label to display for ``phase``.
+
+    The stable label when the phase has one, the phase name otherwise: a
+    label is a **supplement** to the phase name, never a replacement for
+    it (see ``plan_state.PHASE_LABELS``). An unknown phase therefore
+    still has a name — it just does not have a pretty one.
+    """
+    stable = _stable_phase_label(phase)
+    if stable is not None:
+        return stable
+    return str(phase or "")
 
 
 def _read_task_rows(plan_id: str) -> Dict[str, Dict[str, Any]]:
@@ -160,10 +283,23 @@ def _build_plan_status(plan_id: str) -> Any:
     ``plan_verification``, ``plan_tasks``, and the two in-memory
     liveness records — are read here, together, and reconciled once.
     See :mod:`plan_status` for why that matters.
+
+    Raises:
+        HTTPException: 409 ``artifact_conflict`` —— 目录里两类产物同时存在。
+            「这条 plan 到底想干什么」还没人裁决时，状态快照是不能给的：给出
+            一个阶段就是替人择一。判定来自 :func:`plan_artifacts.detect`，
+            五个调用点共用同一套错误语义。
     """
     from dataclasses import replace
 
     from plan_status import PlanStatus, find_divergences
+
+    artifacts = detect(_server._plan_dir(plan_id))
+    if artifacts.branch == BRANCH_CONFLICT:
+        raise HTTPException(
+            409,
+            artifact_conflict_payload(plan_id, artifacts),
+        )
 
     phase = ""
     v_status = ""
@@ -198,6 +334,15 @@ def _build_plan_status(plan_id: str) -> Any:
         # A status read must never raise — an operator asking "where is
         # this plan" is exactly the wrong moment to hand them a 500.
         _server.logger.exception("[plan_status] state.db read failed plan=%s", plan_id)
+
+    # The plan-doc review gate sits BEFORE the verification sub-machine:
+    # a plan waiting for a human to accept / skip its plan-doc items has
+    # not started a verification round, so its verdict is "pending" — not
+    # an empty string the display surface has to guess at. A recorded
+    # verdict always wins over this default, and the reconciliation
+    # below may still replace it with a terminal one.
+    if phase == _PLAN_DOC_REVIEW_PHASE and not v_status:
+        v_status = "pending"
 
     # Reconcile the two verification stores BEFORE the snapshot is built.
     # ``plan_routing.verification`` is CAS-advanced by the state machine
@@ -359,6 +504,14 @@ def _plan_status_payload(plan_id: str) -> Dict[str, Any]:
     this plan" should still get an answer).
     """
     payload = _build_plan_status(plan_id).to_dict()
+    # The phase under the key the plans listing uses (``current_phase``)
+    # plus its stable label. The two interfaces name the same facts the
+    # same way — a consumer reading both must not have to know which key
+    # holds the phase in which one — and they read the label from the
+    # same table (``plan_state.PHASE_LABELS``), so the same phase can
+    # never be labelled two ways.
+    payload["current_phase"] = payload.get("phase", "")
+    payload["current_phase_label"] = _phase_label(payload.get("phase"))
     for key, handler in (
         ("summary", _plan_summary_section),
         ("execution", _server.get_execution_progress),
@@ -1153,6 +1306,11 @@ def _list_plans_body(
         plan_dir = _server._plan_dir(plan_id)
         is_archived = bool(row.get("archived"))
 
+        # 产物冲突：两类产物同时存在 → 这个 plan 到底走哪条分支，**还没人
+        # 裁决**。判定来自 :func:`plan_artifacts.detect`（唯一入口）。
+        artifacts = detect(plan_dir)
+        conflicted = artifacts.branch == BRANCH_CONFLICT
+
         has_interview = (plan_dir / "interview.json").exists() if plan_dir.exists() else False
         has_prd = (
             (plan_dir / "prd.json").exists() or (plan_dir / "prd.md").exists()
@@ -1206,9 +1364,36 @@ def _list_plans_body(
             # phases), so preferring it would reintroduce exactly the
             # two-vocabulary split v5 removed.
             exec_row = execution_by_plan.get(plan_id)
-            current_phase = str(row.get("current_phase") or "") or status
+            routing_phase = str(row.get("current_phase") or "")
+            current_phase = routing_phase or status
             if not include_terminal and current_phase in terminal_phases:
                 continue
+
+            # An **explicit bucket**: a phase that has a stable label
+            # (``plan_state.PHASE_LABELS``) is a phase the listing must
+            # not guess — the guess is made from which documents happen
+            # to exist on disk, and it does not know the plan-doc review
+            # phase, so that phase was labelled ``reviewed`` (a phase
+            # that never happened). The bucket is named after the phase,
+            # and the phase column is the authority.
+            #
+            # Only a phase that actually has a stable label is bucketed
+            # this way. Every other phase keeps the historical guess, so
+            # the listing's bucket vocabulary does not change under the
+            # reader — and a plan with NO routing row keeps the guess as
+            # its only answer, because there is no recorded phase to
+            # bucket by.
+            #
+            # The bucket is decided LAST (see below): for a phase with a
+            # stable label the phase column is the authority on "where is
+            # this plan", so the bucket is named after the phase even if
+            # an execution happens to be live — the entry still carries
+            # ``pid`` for that.
+            explicit_bucket = (
+                routing_phase
+                if _stable_phase_label(routing_phase) is not None
+                else None
+            )
 
             exec_pid = None
             exec_status = None
@@ -1233,6 +1418,9 @@ def _list_plans_body(
             else:
                 exec_pid = None
 
+            if explicit_bucket is not None:
+                status = explicit_bucket
+
             steps_dict = {
                 "interview": has_interview,
                 "prd": has_prd,
@@ -1241,6 +1429,12 @@ def _list_plans_body(
                 "test": has_test,
                 "tasks": has_tasks,
             }
+
+        # 冲突桶盖过阶段桶 / 启发式桶：分支还没人裁决时，那些桶都是在替人择一。
+        # 归档计划保留「archived」桶 —— 它的生命周期已经结束，那里的冲突是历史，
+        # 不是待办（载荷照样带上，信息不丢）。
+        if conflicted and not is_archived:
+            status = CONFLICT_BUCKET
 
         # Human-readable fields.  For archived plans use the
         # requirement_first_line captured at archive-scan time;
@@ -1313,6 +1507,15 @@ def _list_plans_body(
             entry["requirement_first_line"] = requirement_text
         else:
             entry["current_phase"] = current_phase
+            # The same stable label the status interface returns, read
+            # from the same table — one phase, one label, two endpoints.
+            entry["current_phase_label"] = _phase_label(current_phase)
+        if conflicted:
+            # 列表这一层的 409：与其它四个调用点**逐字相同**的载荷，挂在条目
+            # 上。集合接口不能整张列表变 409，所以这里是「桶 + 载荷」。
+            entry["artifact_conflict"] = artifact_conflict_payload(
+                plan_id, artifacts,
+            )
         plans.append(entry)
     return plans
 
