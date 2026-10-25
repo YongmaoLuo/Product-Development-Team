@@ -2288,6 +2288,126 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
+  # NEGATIVE CONTROLS (P0-1, P0-3)
+  #
+  # ``scripts/negctl_p0_1.sh`` and ``scripts/negctl_p0_3.sh`` are the
+  # negative controls for the P0-1 and P0-3 fixes. A behavioural suite
+  # shows that a fix works; only the control shows that the bug was
+  # there. Each control reads the PRE-FIX source out of git and asserts
+  # that the shape the fix removed really existed — so a green suite
+  # measures a difference that existed to begin with, rather than a
+  # difference between two versions of the same code.
+  #
+  # They are a job of their own for two reasons. A control that only runs
+  # on the machine of the person who wrote it proves nothing to anybody
+  # else; and a control that cannot fail is not a control, so its failure
+  # has to close something. Hence the job — and hence the entry in the
+  # merge gate's ``needs`` below, without which a red control would
+  # block nothing.
+  #
+  # The checkout is deep (``fetch-depth: 0``) because both controls read
+  # their baseline out of history: ``actions/checkout``'s default of 1
+  # is a shallow clone in which the baseline commit does not exist. The
+  # controls exit non-zero rather than skipping when the baseline cannot
+  # be read, so a shallow checkout would make this job red on a tree that
+  # is fine — the loud failure is by design, but the clone is the fix.
+  #
+  # The baseline is pinned to an immutable revision, for the reason the
+  # controls' own integration tests state: a moving ref such as
+  # ``origin/main`` stops holding the pre-fix source the moment this
+  # branch merges, and a control whose baseline moves fails on merge day
+  # — which would close the merge gate for every pull request after this
+  # one. The pinned revision is an ancestor of ``main``, so a full clone
+  # always contains it, and it holds the pre-fix shape of both files.
+  #
+  # The pin is what CI uses; the scripts also find a pre-fix baseline
+  # for themselves when the variable is unset, so a clone that fetched
+  # only this branch can still run the controls.
+  # ---------------------------------------------------------------------------
+
+  negctl:
+    name: Negative controls (P0-1, P0-3)
+    runs-on: ubuntu-latest
+    # Pull requests only, like the other PR gates: the controls exist to
+    # close a merge, and the merge gate this job feeds is itself
+    # pull_request-only (see the merge-gate job's comment).
+    if: github.event_name == 'pull_request'
+    # After the unit lane: the controls run behavioural suites of their
+    # own, and running them beside the shards would spend a second
+    # matrix on a tree whose unit lane has not been shown to be green.
+    needs: unit-tests
+    # A cap, like every other test lane in this workflow (the unit
+    # shards get 40, the keychain E2E gets 20). The controls run two
+    # pytest suites of their own, so this job is a test lane, and an
+    # uncapped test lane is the failure mode this repository has already
+    # paid for: the job runs until GitHub cancels it at ~45 minutes with
+    # no log uploaded and no job that names itself, and the merge gate
+    # waits out the whole of it. The cap turns a wedge into a red job
+    # that says so.
+    #
+    # 20 minutes is the install plus both suites with room to spare:
+    # the suites are 4 and 7 tests, and the expensive part of the job
+    # is `uv sync`, which the uv cache above keeps at a couple of
+    # seconds once it is warm.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The controls read their pre-fix baseline out of git history;
+          # a shallow clone does not contain it.
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold — measured 2.0 s where the cached path is 0.19 s.
+      #
+      # actions/cache is GitHub's own action, deliberately not
+      # astral-sh/setup-uv: an action that can write into the runner is a
+      # supply-chain surface, and this repository's gates are written
+      # against exactly one third-party action today.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      # `uv sync` installs backend/uv.lock *and* creates backend/.venv.
+      # The controls need that venv: they refuse to run pytest on the
+      # system interpreter, and their analyser runs on the same one.
+      # `--locked` is load-bearing for the same reason as in every other
+      # lane — without it uv silently re-resolves instead of installing
+      # the lock.
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          uv sync --project backend --locked
+
+      # Two steps, one control each. They are independent claims about
+      # independent fixes, and a single step running both would report
+      # only the first failure — a red run would then name no control.
+      - name: Negative control P0-1 (verdict parse retry)
+        env:
+          P0_1_PREFIX_REV: "1daa2ddd757a3ecaa50c3989942e760409a49143"
+        run: bash scripts/negctl_p0_1.sh
+
+      - name: Negative control P0-3 (same-failure triage)
+        env:
+          P0_3_PREFIX_REV: "1daa2ddd757a3ecaa50c3989942e760409a49143"
+        run: bash scripts/negctl_p0_3.sh
+
+  # ---------------------------------------------------------------------------
   # NIGHTLY REGRESSION — daily cron, blocks release on failure
   # ---------------------------------------------------------------------------
 
@@ -2639,6 +2759,7 @@ jobs:
       - e2e-on-demand
       - e2e-keychain
       - existing-test
+      - negctl
     runs-on: ubuntu-latest
     steps:
       - name: Fail unless every upstream job succeeded

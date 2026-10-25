@@ -1,0 +1,26 @@
+{
+  "case": "infra_watchdog",
+  "description": "The verification sub-agent stopped making progress and the watchdog killed its subprocess. A malfunctioned attempt, not a broken deliverable: the round is retried and never counted. Round 1 of the same verification point had already timed out.",
+  "verdict": {
+    "verdict": "FAILED",
+    "failure_class": "infra",
+    "failure_class_source": "deterministic",
+    "actual_result": "sub-agent subprocess killed by watchdog (kill_count=1): the sub-agent produced no progress for 600s",
+    "evidence_quote": "killed by watchdog"
+  },
+  "failure_history": [
+    {
+      "round": 1,
+      "verdict": "FAILED",
+      "actual_result": "attempt timed out after 1800s with no verdict payload",
+      "failure_class": "infra",
+      "failure_class_source": "deterministic",
+      "evidence_quote": "timed out after 1800s"
+    }
+  ],
+  "verification_plan": {},
+  "expected_disposition": {
+    "disposition": "retry_not_counted",
+    "defaulted": false
+  }
+}

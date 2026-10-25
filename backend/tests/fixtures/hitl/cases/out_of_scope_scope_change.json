@@ -1,0 +1,19 @@
+{
+  "case": "out_of_scope_scope_change",
+  "description": "The scope was revised and the task now asks for a capability the plan never agreed to build. Nothing is broken and nothing is worth retrying: the demand is outside the agreed scope, so the attempt is skipped, it does not count against the same-cause counter, and the question is put to a human. Raised at the execution stage, because the agent meets the demand before it does the work, so the question hangs off the task rather than off a check.",
+  "source": "execution",
+  "verdict": {
+    "verdict": "FAILED",
+    "failure_class": "out_of_scope",
+    "failure_class_source": "llm",
+    "actual_result": "task T-004 asks for a tenant-routing decision layer; the scope agreed for this plan covers the read-only report endpoint only, so no tenant-routing behaviour was ever agreed to be built",
+    "evidence_quote": "the scope agreed for this plan covers the read-only report endpoint only"
+  },
+  "failure_history": [],
+  "verification_plan": {},
+  "expected_disposition": {
+    "disposition": "hitl_pending",
+    "defaulted": false,
+    "target_vp_id": null
+  }
+}

@@ -112,7 +112,6 @@ def test_skipped_is_coerced_to_failed():
         ({}, "missing required field"),
         ({"verdict": 1}, "must be a str"),
         ({"verdict": "MAYBE"}, "must be 'PASSED' or 'FAILED'"),
-        ({"verdict": "passed"}, "must be 'PASSED' or 'FAILED'"),
     ],
 )
 def test_malformed_verdicts_raise(payload, fragment: str):
@@ -120,6 +119,31 @@ def test_malformed_verdicts_raise(payload, fragment: str):
         parse_verdict(payload)
 
     assert fragment in str(exc.value)
+
+
+# ``{"verdict": "passed"}`` is deliberately NOT in the list above, and its
+# absence is the point rather than an oversight.
+#
+# ``parse_verdict`` normalises the text before it judges it: the verdict
+# vocabulary is closed (``PASSED`` / ``FAILED``, with ``SKIPPED`` coerced
+# to ``FAILED``), but a model spells the same verdict in lowercase, in
+# mixed case, or with surrounding whitespace, and the caller must not have
+# to normalise a second time. So ``"passed"`` is not a malformed verdict
+# — it is the canonical verdict written in a different case, and
+# ``parse_verdict`` returns ``"PASSED"`` for it.
+#
+# That behaviour is pinned by the acceptance contract of the task that
+# introduced the normalisation, in
+# ``tests/unit/test_verdict_parsing_normalized.py::test_normalize_case``:
+# ``parse_verdict({"verdict": "passed"}) == "PASSED"``. The two files
+# disagreed, and the disagreement was not a matter of taste: a verdict of
+# ``"passed"`` is either accepted and canonicalised, or it is an error the
+# caller retries — and the retry is a second LLM round spent on a verdict
+# the model already gave.
+#
+# The list above keeps the four shapes that really are malformed: the
+# payload is not a dict, the field is missing, the field is not text, and
+# the text is not a verdict anybody can act on. Case is not one of them.
 
 
 def test_a_self_reported_exit_code_is_not_even_read():

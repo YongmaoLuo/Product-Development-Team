@@ -97,6 +97,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import socket
 import sys
 import urllib.error
 import urllib.request
@@ -112,6 +113,37 @@ STATUS_FAILED = "FAILED"
 
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 300
+
+# ---------------------------------------------------------------------------
+# Transport signals (2026-10-24)
+# ---------------------------------------------------------------------------
+#
+# A request that never reached the service is not a failed assertion.
+# The difference matters: an assertion failure says the *deliverable*
+# does not meet the contract, a transport failure says the *environment*
+# was not there to be asked. Swallowing the second into the first makes
+# a service that dropped its listener look like broken work — and the
+# four-class triage then files it as ``deliverable_defect``, the class
+# that counts against the same-cause threshold.
+#
+# So every transport failure is reported with a machine-readable
+# ``signal``. The names are the vocabulary ``verification.failure_triage``
+# classifies; every one of them maps to ``infra`` there, so none of them
+# can fall through to the conservative default.
+TRANSPORT_SIGNAL_CONNECTION_REFUSED = "connection_refused"
+TRANSPORT_SIGNAL_TIMEOUT = "timeout"
+TRANSPORT_SIGNAL_DNS_ERROR = "dns_error"
+TRANSPORT_SIGNAL_TRANSPORT_ERROR = "transport_error"
+
+#: Every signal this runner can emit. Public so a consumer (or a test)
+#: can check that the triage knows all of them — a signal nobody
+#: classifies is a ``None``, and a ``None`` becomes the default.
+TRANSPORT_SIGNALS = frozenset({
+    TRANSPORT_SIGNAL_CONNECTION_REFUSED,
+    TRANSPORT_SIGNAL_TIMEOUT,
+    TRANSPORT_SIGNAL_DNS_ERROR,
+    TRANSPORT_SIGNAL_TRANSPORT_ERROR,
+})
 
 #: How much of a response body is kept in the evidence / artifact.
 MAX_BODY_CHARS = 4000
@@ -498,6 +530,46 @@ def _request_timeout(vp: Dict[str, Any]) -> int:
     return max(1, min(value, MAX_TIMEOUT_SECONDS))
 
 
+def _transport_signal(exc: BaseException) -> str:
+    """The machine-readable name of the transport failure *exc* is.
+
+    The exception type decides, and the text only breaks the ties the
+    type cannot: ``urllib`` wraps the real cause in ``URLError.reason``,
+    so both the wrapper and the cause are looked at.
+
+    Returns one of :data:`TRANSPORT_SIGNALS`; never raises, and never
+    returns ``None`` — an unnamed transport failure is still a
+    transport failure, and a name nobody classifies would fall back to
+    the class that counts.
+    """
+    candidates: List[BaseException] = [exc]
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, BaseException):
+        candidates.append(reason)
+
+    for candidate in candidates:
+        # ``socket.timeout`` is an alias of ``TimeoutError`` on Python 3.10+.
+        if isinstance(candidate, (socket.timeout, TimeoutError)):
+            return TRANSPORT_SIGNAL_TIMEOUT
+        if isinstance(candidate, ConnectionRefusedError):
+            return TRANSPORT_SIGNAL_CONNECTION_REFUSED
+        if isinstance(candidate, socket.gaierror):
+            return TRANSPORT_SIGNAL_DNS_ERROR
+
+    text = " ".join(str(candidate) for candidate in candidates).lower()
+    if "connection refused" in text or "errno 61" in text:
+        return TRANSPORT_SIGNAL_CONNECTION_REFUSED
+    if "timed out" in text or "timeout" in text:
+        return TRANSPORT_SIGNAL_TIMEOUT
+    if (
+        "name or service not known" in text
+        or "nodename nor servname" in text
+        or "temporary failure in name resolution" in text
+    ):
+        return TRANSPORT_SIGNAL_DNS_ERROR
+    return TRANSPORT_SIGNAL_TRANSPORT_ERROR
+
+
 def run_api_verification(
     vp: Dict[str, Any], *, artifact_dir: Optional[Path] = None,
 ) -> ApiRunResult:
@@ -560,18 +632,29 @@ def run_api_verification(
         except Exception:  # noqa: BLE001
             raw_body = ""
     except Exception as exc:  # noqa: BLE001 - network/timeout/DNS/…
+        # 2026-10-24: the request never reached the service, so not one
+        # assertion ran.  Say so with a machine-readable ``signal`` —
+        # the verdict must not read as "the deliverable broke".
+        signal = _transport_signal(exc)
         result.reasons = [
             f"请求未能完成：{type(exc).__name__}: {exc}",
             f"request: {method} {url}",
+            f"transport_signal: {signal}",
         ]
         result.evidence = {
             "vp_id": vp_id,
             "request": request_record,
             "error": f"{type(exc).__name__}: {exc}",
+            "signal": signal,
+            # No assertion was evaluated: the request never arrived.
+            # A reader must not mistake this for "the assertions passed".
+            "assertions_executed": 0,
         }
         _write_artifact(artifact_dir, vp_id, {
             "vp_id": vp_id, "request": request_record,
             "error": f"{type(exc).__name__}: {exc}",
+            "signal": signal,
+            "assertions_executed": 0,
             "assertions": vp.get("assertions"),
         })
         return result

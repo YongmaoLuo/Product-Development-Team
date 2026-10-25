@@ -1,0 +1,34 @@
+{
+  "case": "out_of_scope_env_missing",
+  "description": "A verification point asserts against a live service the plan never provisioned. The environment did not break and is not worth retrying: the requirement was never in scope, so the check is skipped, it does not count against the same-cause counter, and the question is put to a human. Raised at the verification stage, so the question hangs off the check that found the problem. This is the sample that separates out_of_scope from infra: an infra failure is an environment that broke and is worth another attempt, and this one never had the environment in the first place.",
+  "source": "verification",
+  "verdict": {
+    "verdict": "FAILED",
+    "failure_class": "out_of_scope",
+    "failure_class_source": "llm",
+    "actual_result": "VP-002 asserts the export endpoint against a live object store; the environment provisioned for this plan is the local test environment only, so no object store is available to this attempt",
+    "evidence_quote": "the environment provisioned for this plan is the local test environment only"
+  },
+  "failure_history": [],
+  "verification_plan": {
+    "plan_id": "fixture-plan-005",
+    "verification_points": [
+      {
+        "id": "VP-002",
+        "verification_method": "api_test",
+        "criterion": "the export endpoint writes the report to a live object store",
+        "request": {
+          "method": "POST",
+          "url": "/api/v1/export"
+        },
+        "replacement": null,
+        "diff": null
+      }
+    ]
+  },
+  "expected_disposition": {
+    "disposition": "hitl_pending",
+    "defaulted": false,
+    "target_vp_id": "VP-002"
+  }
+}

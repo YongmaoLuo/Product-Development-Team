@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Any
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 import re
@@ -44,6 +44,16 @@ from verification_cancel import VerificationCancelled
 # error, and this dispatch must say so *before* it stamps the plan
 # ``executing`` and spawns a subprocess that can only fail.
 from project_dir_guard import ProjectDirInvalidError, validate_project_dir
+
+# The human-in-the-loop side of a verification round.  Imported by value
+# — ``expire_due`` in particular — so that the deadline sweep this
+# module runs can be replaced by a test without reaching into
+# ``hitl.service`` behind its back.
+from config_paths import resolve_state_db_path
+from hitl.models import Decision, DecisionMode, DecisionStatus
+from hitl.service import expire_due, list_decisions
+from hitl.store import HitlStore
+from hitl.waiter import wait_for_decision
 
 
 def _verification_event_logger(plan_dir: Path):
@@ -1471,6 +1481,511 @@ def _cleanup_dead_verification_processes(
         )
 
 
+# ---------------------------------------------------------------------------
+# HITL deadlines
+# ---------------------------------------------------------------------------
+#
+# 2026-10-22: a verification round that asks a human a question has to
+# live with the answer not coming, and the two kinds of question end
+# differently.
+#
+# An ``auto`` question carries a default answer, so when its deadline
+# passes the default becomes the answer and the round carries on.
+# ``hitl.service.expire_due`` owns that transition; the tick below is
+# what decides *when*.
+#
+# A ``strict`` question has no substitute for a human, so its default
+# answer must never be used — not even when the deadline passes.  What
+# happens instead is that the round *stops*: the question becomes
+# ``paused`` (still answerable), and the plan gets a
+# ``pause_state.json`` naming it, so the resume path can find the
+# question again instead of guessing which one it was.
+#
+# The verification tick is the only thing that runs while a round is
+# blocked on a human, so it is where both deadlines are noticed.
+
+#: The reason a pause checkpoint carries when a strict question ran out
+#: of time without anybody answering it.
+HITL_STRICT_TIMEOUT_REASON = "hitl_strict_timeout"
+
+
+def _hitl_now() -> datetime:
+    """The clock the HITL deadlines are read against.
+
+    A function of its own, so a test can inject a clock instead of
+    sleeping through one: a deadline is seconds wide, and a test that
+    has to wait for it is a test that flakes.  Production reads the
+    wall clock.
+    """
+    return datetime.now(timezone.utc)
+
+
+def _expire_hitl_decisions(now: datetime) -> int:
+    """Resolve the ``auto`` questions whose deadline has passed.
+
+    ``hitl.service.expire_due`` knows *how* an overdue question
+    resolves — an ``auto`` question nobody answered ends ``defaulted``,
+    with its stored default as the answer; a ``strict`` one is not
+    touched at all.  This knows *when*: the verification tick is a
+    periodic entry, and a round that is waiting for a human must not
+    keep waiting on a question that already has an answer.
+
+    A failure here is logged and swallowed.  The sweep writes to a
+    database another thread may be writing to, and a watchdog that died
+    on its first expiry would leave every later question waiting
+    forever — silently, because the tick's caller swallows what the
+    tick raises.
+
+    Returns how many questions the sweep resolved.
+    """
+    try:
+        return expire_due(now=now)
+    except Exception as exc:  # noqa: BLE001 — a failed sweep must not end the tick
+        _server.logger.exception(
+            "[verification_watchdog] hitl expiry sweep failed: %s", exc,
+        )
+        return 0
+
+
+def _handle_hitl_strict_timeout(plan_id: str, now: datetime) -> Optional[str]:
+    """Pause the strict questions whose deadline passed; record the pause.
+
+    A ``strict`` question is one the backend may not answer in a
+    human's place.  When its deadline passes there is nothing to fall
+    back to, so the question cannot end by itself — and it must not be
+    ended by its default option either.  What *can* happen is that the
+    round stops waiting:
+
+      * the question becomes ``paused`` — it is still open, and a later
+        answer is taken (``hitl.service.answer_decision`` moves a
+        paused row to ``answered``);
+      * the plan gets a ``pause_state.json`` naming that question, so
+        the resume path can find it again.
+
+    Every overdue strict question of the plan that is the round's own
+    is paused, and the checkpoint names the oldest of them: the pause is
+    the round's, and the round was waiting on the question that ran out
+    of time first.
+
+    Only the questions the *executor* did not ask are the round's
+    — a question the execution side asked is the executor's, and the
+    executor's own gate is what holds its work up (see
+    :func:`_overdue_strict_decisions`).
+
+    Returns the id of the question that caused the pause, or ``None``
+    when nothing was overdue.
+    """
+    try:
+        with HitlStore(resolve_state_db_path()) as store:
+            overdue = _overdue_strict_decisions(store, plan_id, now)
+            paused = [
+                decision.decision_id
+                for decision in overdue
+                if store.mark_paused(
+                    decision.decision_id, note=HITL_STRICT_TIMEOUT_REASON
+                )
+            ]
+    except Exception as exc:  # noqa: BLE001 — a failed sweep must not end the tick
+        _server.logger.exception(
+            "[verification_watchdog] strict timeout handling failed plan=%s: %s",
+            plan_id, exc,
+        )
+        return None
+
+    if not paused:
+        return None
+
+    cause = paused[0]
+    _write_hitl_pause_checkpoint(plan_id, cause)
+    return cause
+
+
+def _overdue_strict_decisions(
+    store: HitlStore, plan_id: str, now: datetime
+) -> List[Decision]:
+    """The plan's pending strict questions whose deadline has passed.
+
+    Only ``pending`` rows are considered: a question that has already
+    been answered, defaulted or paused is settled, and a settled
+    question is nobody's business any more.
+
+    Only questions the *executor* did not ask are considered, for
+    the same reason :func:`_open_verification_decisions` waits on
+    the verification side's and no others: a question the execution
+    side asked belongs to the executor, and the executor's own gate
+    (``hitl.service.blocked_task_ids``) is what holds that work up.
+    Pausing such a question here would take it out of the ``pending``
+    list the operator's to-do reads — the plan would sit on a problem
+    nobody can see any more — and the checkpoint written beside it
+    would name a question this round never asked about.
+
+    The two sides are the architecture's own (``verification |
+    execution``).  A question the executor asked carries
+    :data:`EXECUTOR_DECISION_SOURCE`; every other question is the
+    round's — the verification side's own questions, and the questions
+    asked through the generic route that nobody claimed (the route
+    records its own source for a decision *nobody else claimed*).  The
+    architecture has no third side, and a question nobody claimed is a
+    question the round is answerable for: the plan's strict-expiry
+    rule — a ``pause_state.json`` of kind ``verification`` naming the
+    question — is what happens to it.
+    """
+    return [
+        decision
+        for decision in list_decisions(
+            plan_id, DecisionStatus.PENDING.value, store=store
+        )
+        if decision.source != EXECUTOR_DECISION_SOURCE
+        and decision.mode == DecisionMode.STRICT.value
+        and _deadline_has_passed(decision, now)
+    ]
+
+
+def _deadline_has_passed(decision: Decision, now: datetime) -> bool:
+    """True when the question's deadline has arrived by ``now``.
+
+    The deadline is the *end* of the waiting window, so the window is
+    half-open: before it the question is still open, at it the answer
+    is late.  A question with no deadline never expires — it waits for
+    a human for as long as it takes.
+    """
+    raw = decision.deadline_at
+    if not raw:
+        return False
+    text = str(raw).strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        deadline = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        # A deadline that cannot be read is a deadline that cannot be
+        # compared, and an undecidable deadline is not an expired one:
+        # the question waits rather than resolving itself on a guess.
+        return False
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    else:
+        deadline = deadline.astimezone(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    return deadline <= now
+
+
+def _write_hitl_pause_checkpoint(plan_id: str, decision_id: str) -> None:
+    """Record the strict timeout in the plan's pause checkpoint.
+
+    ``pause_state.write_pause_checkpoint`` owns the document's shape;
+    this decides what goes into it.  Three fields carry the meaning:
+    the kind (``verification`` — the pause happened on the
+    verification side), the reason (``hitl_strict_timeout``) and the
+    question that caused it, so the resume path can find that question
+    again instead of guessing which one it was.
+
+    The interrupted round is recorded too, so a later start resumes
+    *that* round rather than starting a new one.
+    """
+    from pause_state import write_pause_checkpoint
+
+    plan_dir = _server._plan_dir(plan_id)
+    project_dir: Optional[str] = None
+    try:
+        resolved = _server._get_project_dir(plan_id)
+        project_dir = str(resolved) if resolved else None
+    except Exception as exc:  # noqa: BLE001 — a checkpoint without a dir is still one
+        _server.logger.exception(
+            "[verification_watchdog] project dir lookup failed plan=%s: %s",
+            plan_id, exc,
+        )
+
+    state = _server._verification_state.get(plan_id) or {}
+    round_n = state.get("verification_round")
+    write_pause_checkpoint(
+        plan_dir,
+        kind="verification",
+        project_dir=project_dir,
+        reason=HITL_STRICT_TIMEOUT_REASON,
+        interrupted_tasks=[],
+        unfinished_tasks=[],
+        verification_round=round_n if isinstance(round_n, int) else None,
+        decision_id=decision_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Waiting for a human
+# ---------------------------------------------------------------------------
+#
+# 2026-10-23: a round that asks a human a question has to WAIT for the
+# answer — and while it waits it has to look alive.
+#
+# Two facts made the wait impossible before this:
+#
+# * ``hitl.waiter`` existed and worked, but nothing called it.  A
+#   question asked of a human was asked and then forgotten: the round
+#   walked past it and carried on as if nobody had been asked.
+# * The watchdog judges a round that produces nothing for 900 seconds to
+#   be dead (``VERIFICATION_WATCHDOG_STALENESS_SECONDS``).  A round
+#   blocked on a human produces nothing *by definition* — it is
+#   waiting, not working — so an unwatched wait is a wait the watchdog
+#   kills.
+#
+# The wait therefore does two things at once: it blocks the round until
+# the question is settled, and it beats every 60 seconds so the block is
+# visible to the watchdog.  The beat is written in the two places that
+# mean "alive": the decision's own ``heartbeat_at`` (the row says the
+# question is being waited for) and the round's registry handle (the
+# ``hitl_wait`` stage the liveness probe reads).
+
+#: The decision source a verification round waits on.
+VERIFICATION_DECISION_SOURCE = "verification"
+
+#: The decision source the *executor* asks its questions from.
+#:
+#: The architecture names the two sides a question can be asked from —
+#: ``verification | execution`` — and this is the other one.  It lives
+#: next to :data:`VERIFICATION_DECISION_SOURCE` on purpose: the two are
+#: one vocabulary, not two, and the code that has to tell the sides
+#: apart should not have to look them up in two places.
+EXECUTOR_DECISION_SOURCE = "execution"
+
+#: The registry stage a round carries while it waits for a human.
+#:
+#: The stage is what the liveness probe reads: a handle whose
+#: ``last_progress_ts`` is fresh says "this plan is doing something",
+#: and ``hitl_wait`` says *what* it is doing — waiting for a human,
+#: rather than working.
+HITL_WAIT_STAGE = "hitl_wait"
+
+#: The registry identity of the handle a wait registers.
+#:
+#: A wait is not a verification point, so it does not borrow a VP's
+#: identity: ``register_sub_agent`` reuses a handle with the same
+#: ``(vp_id, attempt)`` and would reset a live sub-agent's stage and
+#: drop the tool reference the watchdog needs in order to kill it.  A
+#: wait gets an identity of its own instead.
+HITL_WAIT_VP_ID = "hitl-wait"
+
+#: How often the wait re-reads the question.
+HITL_WAIT_POLL_INTERVAL = 2.0
+
+#: How much waiting passes between two heartbeats.
+#:
+#: 60 seconds sits well inside the 900-second window the watchdog
+#: judges a silent round by, so one missed beat is not a missed window.
+HITL_WAIT_HEARTBEAT_INTERVAL = 60.0
+
+#: The status a round rests in while it waits for a human.
+#:
+#: Not ``running``: a round that is waiting is not a round the watchdog
+#: should judge.  Not a terminal status either: the *round* is over,
+#: the *plan* is not — the plan is waiting for an answer.
+HITL_WAIT_VERIFICATION_STATUS = "paused"
+
+#: The states a question is still *open* in.
+#:
+#: ``pending`` is a question nobody has answered yet; ``paused`` is a
+#: question nobody answered *and* that the backend may not answer in a
+#: human's place.  Both are open: both may still be answered, and a
+#: round that walks past either of them is a round that forgot it had
+#: asked.
+_HITL_OPEN_STATUSES = (DecisionStatus.PENDING.value, DecisionStatus.PAUSED.value)
+
+
+def _open_verification_decisions(
+    store: HitlStore, plan_id: str, round_number: Optional[int]
+) -> List[Decision]:
+    """The plan's open verification questions, oldest first.
+
+    "Open" is the same pair of states the heartbeat is written over:
+    ``pending`` and ``paused``.  A paused question is not a settled
+    one — it is a question nobody answered yet, which a human may still
+    answer — so the round must not walk past it either.
+
+    Only questions the *verification* side asked are waited on: a
+    question the execution side asked belongs to the executor, and the
+    executor's own gate (``hitl.service.blocked_task_ids``) is what
+    holds that work up.
+
+    A question with no round attached is waited on whatever round is
+    running.  It says something about the plan rather than about one
+    round, and the round that is running is the one that has to hear
+    the answer.
+    """
+    return [
+        decision
+        for decision in list_decisions(plan_id, None, store=store)
+        if decision.source == VERIFICATION_DECISION_SOURCE
+        and decision.status in _HITL_OPEN_STATUSES
+        and (
+            round_number is None
+            or decision.round is None
+            or decision.round == round_number
+        )
+    ]
+
+
+def _wait_for_open_verification_decisions(
+    plan_id: str,
+    round_number: Optional[int] = None,
+    *,
+    poll_interval: float = HITL_WAIT_POLL_INTERVAL,
+    heartbeat_interval: float = HITL_WAIT_HEARTBEAT_INTERVAL,
+) -> Optional[Decision]:
+    """Wait for the plan's open verification questions.
+
+    The questions are waited for one at a time, oldest first: they are
+    asked in order, and a human answers them in order.
+
+    Returns the question that stopped the round, or ``None`` when the
+    round may carry on.  Only a **paused** question stops it: that is a
+    question nobody answered and that nobody may answer in a human's
+    place, so the round waits for a human and the plan waits with it.
+    A question that was answered, or that fell back to its default, is
+    a question the round has its answer to; a question that was
+    ``unroutable`` is one nobody was ever asked, and it blocks nothing.
+
+    The wait itself ends on any of the settled states — including
+    ``unroutable`` — and on the deadline.
+    """
+    with HitlStore(resolve_state_db_path()) as store:
+        for decision in _open_verification_decisions(
+            store, plan_id, round_number
+        ):
+            settled = _wait_for_one_verification_decision(
+                plan_id,
+                decision,
+                store,
+                poll_interval=poll_interval,
+                heartbeat_interval=heartbeat_interval,
+            )
+            if settled.status == DecisionStatus.PAUSED.value:
+                return settled
+    return None
+
+
+def _wait_for_one_verification_decision(
+    plan_id: str,
+    decision: Decision,
+    store: HitlStore,
+    *,
+    poll_interval: float,
+    heartbeat_interval: float,
+) -> Decision:
+    """Wait for one question, and beat while waiting.
+
+    The handle is registered for the duration of the wait and
+    unregistered when the wait ends: a handle that outlives its wait is
+    a handle the watchdog will one day kill, and one the liveness probe
+    will one day read as a live sub-agent.
+    """
+    handle = _server.sub_agent_registry.register_sub_agent(
+        plan_id, HITL_WAIT_VP_ID, 1,
+    )
+    try:
+        _mark_hitl_wait_progress(plan_id, handle)
+        return wait_for_decision(
+            decision.decision_id,
+            store=store,
+            on_heartbeat=lambda: _mark_hitl_wait_progress(plan_id, handle),
+            poll_interval=poll_interval,
+            heartbeat_interval=heartbeat_interval,
+        )
+    finally:
+        _server.sub_agent_registry.unregister(plan_id, handle)
+
+
+def _mark_hitl_wait_progress(plan_id: str, handle) -> None:
+    """Say "the round is alive" where the watchdog looks for it.
+
+    ``mark_progress`` refreshes the handle's ``last_progress_ts`` and
+    carries the stage.  It is a no-op for a handle that is no longer
+    registered, so a wait whose handle was cleaned up underneath it
+    does not raise — it simply stops being visible.
+    """
+    try:
+        _server.sub_agent_registry.mark_progress(
+            plan_id, handle, stage=HITL_WAIT_STAGE
+        )
+    except Exception:  # noqa: BLE001 — a beat that fails is not a wait that fails
+        _server.logger.exception(
+            "[hitl_wait] the progress mark failed plan=%s", plan_id,
+        )
+
+
+def _pause_verification_for_human(
+    plan_id: str, decision: Decision, round_number: Optional[int]
+) -> None:
+    """Rest the round on the question that is waiting for a human.
+
+    The *round* stops; the *plan* does not.  Three things say so:
+
+    * the **in-memory status** becomes ``paused``, so the watchdog stops
+      watching a round that is not running.  A round that returned with
+      its status still ``running`` is a round whose thread is dead, and
+      the watchdog reads that as a dead round and fails the plan;
+    * the **phase** returns to ``verification`` — the same resting
+      phase the operator's stop uses — so the loop's fallback does not
+      stamp the plan ``completed`` while it waits for an answer;
+    * the **routing row** follows the phase, for the same reason the
+      stop path moves it.
+
+    The pause checkpoint itself is *not* written here: the watchdog
+    tick owns that document, and it writes the moment it pauses the
+    question — which is what names the question the round was waiting
+    for.
+    """
+    _server.logger.warning(
+        "[hitl_wait] round %s stopped — waiting for a human plan=%s "
+        "decision=%s status=%s",
+        round_number, plan_id, decision.decision_id, decision.status,
+    )
+
+    state = _server._verification_state.get(plan_id)
+    if state:
+        state["verification_status"] = HITL_WAIT_VERIFICATION_STATUS
+        state["stop_reason"] = f"hitl_wait:{decision.status}"
+        state["updated_at"] = datetime.now().isoformat()
+
+    try:
+        _server.PlanState(_server._plan_dir(plan_id)).transition_to(
+            "verification"
+        )
+    except Exception:  # noqa: BLE001 — a phase that cannot move is not a reason to crash
+        _server.logger.exception(
+            "[hitl_wait] the phase could not be moved to 'verification' "
+            "plan=%s", plan_id,
+        )
+
+    try:
+        from state_machine.db.connection import open as _open_db_pause
+        from state_machine.db.schema import migrate as _migrate_pause
+        from state_machine.repositories.routing_repository import (
+            RoutingRepository as _RoutingRepoPause,
+        )
+
+        conn = _open_db_pause(_server._state_db_path())
+        try:
+            _migrate_pause(conn)
+            _RoutingRepoPause(conn).try_mark_phase(
+                plan_id,
+                (
+                    "verification_running",
+                    "verification_rerunning",
+                    "verification_repairing",
+                ),
+                "verification",
+            )
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — the routing row is a mirror, not the truth
+        _server.logger.exception(
+            "[hitl_wait] the routing phase could not be moved to "
+            "'verification' plan=%s", plan_id,
+        )
+
+
 def _lazy_check_verification(plan_id: str) -> None:
     """Probe a single running verification by inspecting its background thread
     AND the freshness of its log / results files.
@@ -1519,9 +2034,46 @@ def _lazy_check_verification(plan_id: str) -> None:
     stuck at ``verification_running`` — operators should be able to
     grep ``[verification_watchdog]`` in server.log and reconstruct
     the detection decision per tick.
+
+    2026-10-22: the tick now also owns the plan's human-in-the-loop
+    deadlines, and it does so **before** the detection ladder, in this
+    order:
+
+    * the expiry sweep (``hitl.service.expire_due``) resolves the
+      ``auto`` questions whose deadline has passed — a round waiting
+      for a human must not keep waiting on a question that already has
+      an answer;
+    * a ``strict`` question whose deadline passed is *paused* rather
+      than answered (see :func:`_handle_hitl_strict_timeout`).  There
+      is no default answer the backend may use in a human's place, so
+      the round stops here: the plan's phase does not advance, and the
+      pause is recorded in ``pause_state.json`` so the round can be
+      resumed once a human answers.  The question has to be the round's
+      own for that: a question the *executor* asked is left ``pending``
+      and keeps the executor's gate holding its task and the tasks
+      downstream of it.
+
+    Both are best-effort: a failure is logged and the tick carries on.
     """
+    now = _hitl_now()
+    _expire_hitl_decisions(now)
+    paused_decision_id = _handle_hitl_strict_timeout(plan_id, now)
+
     state = _server._verification_state.get(plan_id)
     if not state or state.get("verification_status") != "running":
+        return
+
+    if paused_decision_id is not None:
+        # The round is waiting for a human, not dead.  Nothing below
+        # this line may fire: the ladder would read the round's
+        # silence as a dead round and advance the plan's phase out of
+        # verification — which is exactly what a strict timeout must
+        # not do.
+        _server.logger.warning(
+            "[verification_watchdog] strict timeout — the round is paused "
+            "plan=%s decision=%s",
+            plan_id, paused_decision_id,
+        )
         return
 
     _server.logger.debug(
@@ -3422,6 +3974,54 @@ def _round_failed_vp_ids(orch: Any, report: Any) -> set:
         return None
 
 
+def _reconcile_failure_history(plan_id: str) -> Dict[str, Any]:
+    """对账这个计划的失败记录，把"判据层已经判掉"的记录标记出来。
+
+    2026-10-25（VP-031）。一个没有定义的验证点（不在
+    ``verification_plan.json`` 里）会在
+    ``verification_failure_history.json`` 里留下一条记录，而那条记录
+    每轮都从文件里原样回来 —— 于是同一个 id 每轮都变成一条修复任务，
+    而交付物那边没有任何东西可修。
+
+    对账把这类记录标上 ``superseded_by``：**原记录保留**（审计不丢 ——
+    它确实发生过，操作者要看的正是"这里有个没有定义的验证点"），但它
+    不再进入失败集合。
+
+    幂等：已经标记过的记录不再被报告一次，跑两遍结论一样。
+
+    Returns:
+        对账的摘要（``superseded`` / ``live`` / ``plan_known``），
+        出错时是空 dict —— 对账失败绝不能把一轮验证带跑。
+    """
+    try:
+        from verification import failure_history as _fh
+
+        summary = _fh.reconcile_history(_server._plan_dir(plan_id))
+    except Exception:  # noqa: BLE001 — 对账失败不是一轮失败
+        _server.logger.exception(
+            "[verification_reconcile] failure-history reconciliation failed "
+            "plan=%s — the round continues with the records as they are",
+            plan_id,
+        )
+        return {}
+
+    superseded = summary.get("superseded") or []
+    if superseded:
+        _server.logger.info(
+            "[verification_reconcile] %s failure record(s) reconciled away "
+            "plan=%s — they stay in the file for the audit but no longer "
+            "count as failures: %s",
+            len(superseded),
+            plan_id,
+            ", ".join(
+                f"{item.get('id')}(round {item.get('round')}, "
+                f"{item.get('failure_class')})"
+                for item in superseded
+            ),
+        )
+    return summary
+
+
 def _split_parent_ids(all_tasks: Dict[str, Dict[str, Any]]) -> set:
     """Ids in ``all_tasks`` that the breakdown flow has split into children.
 
@@ -4818,6 +5418,12 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
     # persists across rounds — otherwise same_failure_repeated detection
     # (which closes the loop after two identical failed VPs) never fires
     # because the state is reset every iteration.
+    #
+    # 2026-10-25 (VP-031): 对账在**建 orchestrator 之前**跑一次 ——
+    # orchestrator 在构造时读失败历史，所以它读到的必须是已经对过账的
+    # 视图：判据层判掉的记录（没有定义的验证点、被取消的尝试）不该再
+    # 进它的失败集合。
+    _reconcile_failure_history(plan_id)
     try:
         coding_tool = _server.create_coding_tool(
             tool, cwd=str(project_dir), scene="verification",
@@ -4939,6 +5545,30 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                     round_num, plan_id,
                 )
                 return
+
+            # 2026-10-23: a question the round asked a human is a
+            # question the round WAITS for.  The judgment below must not
+            # run while a question is still open: the answer is what the
+            # judgment is waiting for.  The wait beats every 60 seconds
+            # so the watchdog can see that a round blocked on a human is
+            # waiting and not dead.
+            blocked = _wait_for_open_verification_decisions(
+                plan_id, round_num,
+            )
+            if blocked is not None:
+                # Nobody answered, and nobody may answer in a human's
+                # place: the round stops here and the plan waits for the
+                # answer.  The watchdog tick owns the pause checkpoint.
+                _pause_verification_for_human(plan_id, blocked, round_num)
+                return
+
+            # 2026-10-25 (VP-031): 生成修复任务**之前**对一次账。
+            #
+            # 这一步把上一轮落下的失败记录按判据层重新判一遍：判为
+            # criterion_defect / infra 的记录被标上 ``superseded_by``，
+            # 原记录留在文件里（审计不丢），但不再进入失败集合 —— 同一个
+            # id 的旧记录不得每轮重新出现。幂等，跑几遍结论一样。
+            _reconcile_failure_history(plan_id)
 
             result = orch.check_cycle_conditions(report, round_number=round_num)
 

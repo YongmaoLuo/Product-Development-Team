@@ -1,13 +1,13 @@
 """Schema management for the state-machine WAL base layer.
 
-The :func:`migrate` factory creates the five ``plan_*`` tables plus
+The :func:`migrate` factory creates the six ``plan_*`` tables plus
 the ``schema_version`` bootstrap table the state-machine refactor
 relies on.  Every ``CREATE TABLE`` uses ``IF NOT EXISTS`` so the
 function is safe to call repeatedly — calling ``migrate`` on an
 already-migrated database is a no-op (the second call still returns
 without raising).
 
-The five ``plan_*`` tables
+The six ``plan_*`` tables
 -------------------------
 The state-machine refactor uses one SQLite database as the single
 source of truth for plan-level state.  Each table owns one concern:
@@ -17,6 +17,7 @@ source of truth for plan-level state.  Each table owns one concern:
   * ``plan_verification`` (verification round / status)
   * ``plan_artifacts``    (artifact status / content_hash)
   * ``plan_tasks``        (per-task runtime state — task #v4 split)
+  * ``plan_decisions``    (human-in-the-loop decisions — HITL)
 
 v4 (2026-09-09) splits the per-task
 runtime state OUT of ``plan_execution.task_progress`` JSON column into
@@ -48,6 +49,38 @@ it gone there is exactly one workflow-state column in the database.
 Like v5 the drop is a full table rebuild and is one-way — take a copy
 of ``state.db`` before the first v6 boot.
 
+v7 (2026-10-21) adds ``plan_decisions`` — the storage for
+human-in-the-loop decisions.  A decision is asked by one actor (an
+executor thread, a verification thread, a route handler) and answered
+by another (a human, on another thread and possibly on another
+machine); the two never share memory, so the only place they can meet
+is this database.  The row carries the whole fact — the question, the
+options, the deadline and the answer — so an answer outlives the
+process that asked the question.  It is a pure addition: no existing
+column changes shape and no existing row is touched, so it needs no
+rebuild and no backfill.  The context columns added to it later
+(``vp_id`` / ``failure_class`` / ``round`` / ``answer_note``) follow
+the same rule — they are appended with ``ALTER TABLE ... ADD
+COLUMN``, which leaves every existing row exactly as it was — so they
+need no version bump either.
+
+Unlike v5 and v6 this table is NOT applied through the version-gated
+schema step, and :data:`CURRENT_SCHEMA_VERSION` stays at 6.  The
+reason is that the version number is a *cache* of "the shape-changing
+migrations have been applied", and the shape-changing migrations are
+exactly the ones that need a rebuild (v5, v6) or a data lift (v4).
+A new table is neither: ``CREATE TABLE IF NOT EXISTS`` is safe to
+re-run, and the table's presence is a better logbook than a version
+row — which is why :func:`_ensure_plan_decisions` guards on the table
+itself and runs on every ``migrate`` call.  Bumping the version would
+instead re-run the v5 and v6 rebuilds (each of which takes a write
+lock) on every existing database, to no end: neither rebuild has
+anything to do.  The presence guard is what makes the table appear on
+a database that was created before it existed, and it is why a
+database that somehow reached the current version without the table
+heals itself on the next ``migrate`` instead of failing every later
+read with *"no such table: plan_decisions"*.
+
 The ``schema_version`` table is the migration-logbook: a single
 INTEGER column primary key recording which schema version is live.
 This is the bootstrap version (1) so the first ``INSERT`` is
@@ -62,7 +95,11 @@ import sqlite3
 __all__ = ["migrate", "CURRENT_SCHEMA_VERSION"]
 
 #: Schema version this module produces.  Bumped in tandem with any
-#: DDL change so the upgrade script can branch on it.
+#: DDL change so the upgrade script can branch on it.  The v7
+#: ``plan_decisions`` table is the documented exception: it is a pure
+#: addition applied by the unconditional, presence-guarded
+#: :func:`_ensure_plan_decisions` step rather than by the
+#: version-gated schema pass — see the module docstring for why.
 CURRENT_SCHEMA_VERSION = 6
 
 
@@ -226,13 +263,121 @@ CREATE INDEX IF NOT EXISTS idx_plan_tasks_plan_status
   ON plan_tasks(plan_id, status)
 """
 
+#: Human-in-the-loop decisions (schema v7, 2026-10-21).
+#:
+#: A decision is asked by one actor and answered by another, and those
+#: two may live in different threads — or in different processes
+#: entirely.  They share no memory, so the only place they can meet is
+#: this database, and the row has to carry the whole fact on its own:
+#: what was asked, which answers were on the table, what the fallback
+#: would have been, when the answer is due, and who gave it.
+#:
+#: Column notes:
+#:   * ``decision_id``   — the identity of the *question*, minted when
+#:     the question is asked and kept when it is answered, so an audit
+#:     trail can cite the exchange rather than a wall-clock moment.
+#:   * ``options``      — JSON array of the answers that were offered.
+#:     JSON rather than a join table: the option set belongs to the
+#:     question, it never changes afterwards, and a new option set
+#:     must not need a schema change.
+#:   * ``default_option`` — the answer to fall back to when the
+#:     deadline passes.  ``NULL`` means "there is no default": the
+#:     decision then ends ``unroutable`` rather than being answered
+#:     on the human's behalf.
+#:   * ``mode``         — ``auto`` (a missed deadline falls back to
+#:     ``default_option``) or ``strict`` (a missed deadline ends the
+#:     decision ``unroutable``).  Closed vocabulary, mirrored by
+#:     :class:`hitl.models.DecisionMode`.
+#:   * ``status``       — closed vocabulary, mirrored by
+#:     :class:`hitl.models.DecisionStatus`.
+#:   * ``answer``       — the answer, JSON-encoded so it can be a
+#:     bare option or a richer object.
+#:   * ``deadline_at``  — when the answer is due.  Derived from
+#:     ``timeout_sec`` at creation time and stored, so a reader does
+#:     not have to re-derive it (and cannot get it wrong).
+#:   * ``heartbeat_at`` — the last sign of life from the process
+#:     holding the decision open.  A decision whose owner died is
+#:     then distinguishable from one nobody is working on.
+#:   * ``audit_seq``    — a counter bumped on every write, so two
+#:     readers can order two rows without trusting the wall clock.
+#:   * ``vp_id``        — the verification point the question is about,
+#:     when it is about one.
+#:   * ``failure_class``— the class of the failure that raised it
+#:     (``criterion_defect`` / ``deliverable_defect`` / ...).
+#:   * ``round``        — which round of the verification loop raised
+#:     it.  The three above are what makes a decision *about* a
+#:     specific failure rather than about the plan in general: an
+#:     audit reader has to be able to find the decisions taken about
+#:     one verification point.
+#:   * ``answer_note``  — the free-form remark that travels with the
+#:     answer.  It is a column and not only a line in the jsonl
+#:     mirror because the mirror is a *copy*: its write failures are
+#:     swallowed on purpose, so a note that lived only there could be
+#:     lost while the answer it explains stayed committed.
+#:
+#: The four context columns are appended rather than interleaved, so
+#: that a table created by this DDL and one upgraded in place (see
+#: :func:`_add_missing_plan_decision_columns`) carry the same column
+#: order — a reader comparing ``PRAGMA table_info`` output sees one
+#: shape, not two.
+#:
+#: Deliberately NO foreign key to ``plan_execution``: a decision may be
+#: raised before a plan has an execution row at all (an interview-stage
+#: question), and the audit trail of a human answer must not vanish
+#: when an execution row cascades away.
+_DDL_PLAN_DECISIONS = """
+CREATE TABLE IF NOT EXISTS plan_decisions (
+  decision_id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  task_id TEXT,
+  question TEXT NOT NULL,
+  options TEXT NOT NULL,
+  default_option TEXT,
+  mode TEXT NOT NULL DEFAULT 'auto',
+  timeout_sec INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',
+  answer TEXT,
+  answered_by TEXT,
+  answered_at TEXT,
+  deadline_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  heartbeat_at TEXT,
+  audit_seq INTEGER NOT NULL DEFAULT 0,
+  vp_id TEXT,
+  failure_class TEXT,
+  round INTEGER,
+  answer_note TEXT
+)
+"""
+
+#: The columns added to ``plan_decisions`` after the table shipped, and
+#: the type each one carries.  They are applied to an existing table
+#: by :func:`_add_missing_plan_decision_columns`; the types here are
+#: the same ones the DDL above declares, so an upgraded table and a
+#: freshly created one are the same shape.
+_PLAN_DECISION_CONTEXT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("vp_id", "TEXT"),
+    ("failure_class", "TEXT"),
+    ("round", "INTEGER"),
+    ("answer_note", "TEXT"),
+)
+
+#: The only lookup shape a reader needs: "this plan's decisions, by
+#: state" — the question every HITL reader asks first.
+_DDL_PLAN_DECISIONS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_plan_decisions_plan_status
+  ON plan_decisions(plan_id, status)
+"""
+
 _DDL_SCHEMA_VERSION = """
 CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER PRIMARY KEY
 )
 """
 
-# Order matters: the five ``plan_*`` tables come first, then the
+# Order matters: the six ``plan_*`` tables come first, then the
 # ``schema_version`` bootstrap table.  The order is pinned so the
 # ``ORDER BY name`` test returns a deterministic list.
 _DDL_ORDER: tuple[str, ...] = (
@@ -242,6 +387,8 @@ _DDL_ORDER: tuple[str, ...] = (
     _DDL_PLAN_ARTIFACTS,
     _DDL_PLAN_TASKS,
     _DDL_PLAN_TASKS_INDEX,
+    _DDL_PLAN_DECISIONS,
+    _DDL_PLAN_DECISIONS_INDEX,
     _DDL_SCHEMA_VERSION,
 )
 
@@ -546,8 +693,80 @@ def _v6_drop_execution_current_phase(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_plan_decisions(conn: sqlite3.Connection) -> None:
+    """Create ``plan_decisions`` when it is missing.
+
+    Self-describing, in the same spirit as the v5 and v6 steps: the
+    *presence of the table* is the logbook, not the ``schema_version``
+    row.  That matters because :func:`migrate` deliberately skips the
+    schema-shape DDL on a database whose recorded version is already
+    current (the 2026-09-23 hot-path fix).  A database that reached
+    that state without the table — a backup restored between two
+    schema changes, a table dropped by hand, a partially-applied
+    upgrade — would then keep failing every later read with *"no such
+    table: plan_decisions"*, and no amount of re-running ``migrate``
+    would fix it.
+
+    One lookup on ``sqlite_master`` per ``migrate`` call turns that
+    into a no-op.  The DDL is ``IF NOT EXISTS``, so two processes
+    racing here serialise on SQLite's write lock and the loser gets a
+    no-op rather than an error.
+
+    A table that *is* there is not necessarily the current shape: a
+    database written by an older backend keeps the columns it was
+    created with, so it is upgraded in place rather than left behind
+    (see :func:`_add_missing_plan_decision_columns`).
+    """
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='plan_decisions'"
+    ).fetchone()
+    if row is not None:
+        _add_missing_plan_decision_columns(conn)
+        return
+    conn.execute(_DDL_PLAN_DECISIONS)
+    conn.execute(_DDL_PLAN_DECISIONS_INDEX)
+
+
+def _add_missing_plan_decision_columns(conn: sqlite3.Connection) -> None:
+    """Add the context columns a table created before them is missing.
+
+    ``CREATE TABLE IF NOT EXISTS`` cannot change a table that already
+    exists, so a database written by an older backend would keep the
+    18 columns it was created with — and every write that carries
+    ``vp_id`` / ``failure_class`` / ``round`` / ``answer_note`` would
+    fail against it.  The upgrade is therefore *additive*: read the
+    live column set with ``PRAGMA table_info`` and ``ALTER TABLE`` the
+    missing ones in.
+
+    The read is what makes it safe to run on every ``migrate``: a
+    current table has all four columns, so the step costs one
+    ``PRAGMA`` and no write lock — the hot path a per-request
+    connection open depends on is untouched.
+
+    ``ALTER TABLE ... ADD COLUMN`` appends, so an upgraded table ends
+    up with the same column order as one created by the DDL above.
+    """
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(plan_decisions)")
+    }
+    for name, column_type in _PLAN_DECISION_CONTEXT_COLUMNS:
+        if name in existing:
+            continue
+        try:
+            conn.execute(
+                f"ALTER TABLE plan_decisions ADD COLUMN {name} {column_type}"
+            )
+        except sqlite3.OperationalError:
+            # Another process added the column between the PRAGMA and
+            # the ALTER (SQLite's write lock serialises the two, so
+            # this is the only way to lose the race).  The column is
+            # there, which is all this step wanted.
+            pass
+
+
 def migrate(conn: sqlite3.Connection) -> None:
-    """Create the five ``plan_*`` tables and the ``schema_version`` row.
+    """Create the six ``plan_*`` tables and the ``schema_version`` row.
 
     Idempotent: uses ``CREATE TABLE IF NOT EXISTS`` for every DDL
     statement.  Calling ``migrate`` repeatedly on the same database
@@ -602,6 +821,16 @@ def migrate(conn: sqlite3.Connection) -> None:
     # on a database with no legacy rows, costs one empty SELECT — far
     # cheaper than the write lock the old always-full migrate took.
     _v4_backfill(conn)
+
+    # The HITL decision table is ensured on EVERY call, for the same
+    # reason the v4 data lift is: it is a self-describing, idempotent
+    # step whose guard is the presence of the table itself rather than
+    # the version row.  See ``_ensure_plan_decisions`` for why the
+    # version-gated fast path cannot be trusted to have created it.
+    # The same step brings an *existing* table up to the current shape
+    # (the context columns are added to it), so an operator's database
+    # written by an older backend is upgraded rather than left behind.
+    _ensure_plan_decisions(conn)
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:

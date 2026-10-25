@@ -1377,6 +1377,52 @@ def _seed_plan_routing_phase(plan_id: str, phase: str) -> None:
         )
 
 
+def _pending_decisions_block(plan_id: str) -> Dict[str, Any]:
+    """The plan's outstanding human decisions.
+
+    This is the block the three projections that answer "how is this
+    plan doing" carry: the plan summary, the execution progress and
+    the verification progress.  They share it so a consumer that has
+    learned to read one has learned to read the other two — a plan
+    waiting for a human has to look the same wherever it is looked
+    at.
+
+    Only ``pending`` decisions are listed.  An answered, defaulted or
+    unroutable decision is settled: it is history, not work, and
+    listing it would send the operator to answer a question nobody is
+    waiting for any more.
+
+    A decision table that cannot be read degrades to an empty block
+    rather than a 500.  These endpoints answer "how is this plan
+    doing", and a locked or missing decision table must not turn that
+    question into a failed request — the honest answer is "nothing is
+    outstanding", and the log says what actually happened.
+    """
+    try:
+        from hitl.service import list_decisions
+
+        decisions = list_decisions(plan_id, "pending")
+    except Exception as exc:  # noqa: BLE001
+        # Deliberately broad: the import, the database and the row
+        # decoder can each fail, and none of them is a reason to
+        # refuse the whole projection.
+        _server.logger.warning(
+            "pending_decisions_read_failed plan=%s: %s", plan_id, exc,
+        )
+        return {"count": 0, "items": []}
+
+    items = [
+        {
+            "decision_id": decision.decision_id,
+            "question": decision.question,
+            "source": decision.source,
+            "created_at": decision.created_at,
+        }
+        for decision in decisions
+    ]
+    return {"count": len(items), "items": items}
+
+
 @router.get("/api/plan/{plan_id}/summary")
 def get_plan_summary(request: Request, plan_id: str):
     """Aggregated plan summary — route wrapper owning the DB handle.
@@ -1641,6 +1687,12 @@ def _get_plan_summary_body(
             "sync_targets": sync_targets,
         },
         "artifacts": artifacts_manifest,
+        # The decisions that are still waiting for a human.  The same
+        # block the two progress projections carry, so a consumer that
+        # polls any of the three reads the same shape.  Always present
+        # — an empty block means "nothing is outstanding", which is an
+        # answer, not a missing key.
+        "pending_decisions": _pending_decisions_block(plan_id),
         # Compact per-plan LLM usage (2026-09-21). Cached report only —
         # /summary is polled frequently, and re-aggregating would take a
         # CC Switch DB snapshot on every poll. Full report:

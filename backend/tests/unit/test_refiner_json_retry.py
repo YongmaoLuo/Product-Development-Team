@@ -86,7 +86,17 @@ def _refiner(responses: List[Any], logger: Optional[Any] = None) -> TaskRefiner:
     return r
 
 
-TASK = {"id": "t1", "title": "t", "description": "d", "status": "pending"}
+# A task row as a plan carries it: it states what "done" looks like, so
+# the necessity audit can judge its acceptance.  A row that states no
+# acceptance at all is refused the split before the model is asked —
+# see tests/integration/test_refiner_necessity_step0.py.
+TASK = {
+    "id": "t1",
+    "title": "t",
+    "description": "d",
+    "status": "pending",
+    "acceptance_criteria": "the refiner asks again and the parsed reply is used",
+}
 
 
 def test_unparseable_reply_is_reasked_and_recovers() -> None:

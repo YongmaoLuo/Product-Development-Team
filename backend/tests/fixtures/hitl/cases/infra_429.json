@@ -1,0 +1,17 @@
+{
+  "case": "infra_429",
+  "description": "Round 1 of a verification attempt: the provider answered 429 mid-round. The environment malfunctioned, the deliverable was never implicated, so the attempt is retried and never counted against the same-cause counter.",
+  "verdict": {
+    "verdict": "FAILED",
+    "failure_class": "infra",
+    "failure_class_source": "deterministic",
+    "actual_result": "HTTP 429 Too Many Requests: provider rate limit exceeded, retry after 30s",
+    "evidence_quote": "429 Too Many Requests"
+  },
+  "failure_history": [],
+  "verification_plan": {},
+  "expected_disposition": {
+    "disposition": "retry_not_counted",
+    "defaulted": false
+  }
+}

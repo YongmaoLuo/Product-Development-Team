@@ -1,0 +1,56 @@
+{
+  "case": "criterion_schema_rejected",
+  "description": "Four frozen rounds of the same api_test verification point rejected at schema time: the request method is not one the runner speaks, so the criterion cannot be run as written and no amount of reworking the deliverable will change that. The same cause four times over is the loop a human has to break, so the case escalates and counts.",
+  "verdict": {
+    "verdict": "FAILED",
+    "failure_class": "criterion_defect",
+    "failure_class_source": "deterministic",
+    "actual_result": "schema: request.method must be one of ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT'], got 'FETCH'",
+    "evidence_quote": "request.method must be one of"
+  },
+  "failure_history": [
+    {
+      "round": 1,
+      "verdict": "FAILED",
+      "actual_result": "schema: request.method must be one of ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT'], got 'FETCH'",
+      "failure_class": "criterion_defect",
+      "failure_class_source": "deterministic",
+      "evidence_quote": "request.method must be one of"
+    },
+    {
+      "round": 2,
+      "verdict": "FAILED",
+      "actual_result": "schema: request.method must be one of ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT'], got 'FETCH'",
+      "failure_class": "criterion_defect",
+      "failure_class_source": "deterministic",
+      "evidence_quote": "request.method must be one of"
+    },
+    {
+      "round": 3,
+      "verdict": "FAILED",
+      "actual_result": "schema: request.method must be one of ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT'], got 'FETCH'",
+      "failure_class": "criterion_defect",
+      "failure_class_source": "deterministic",
+      "evidence_quote": "request.method must be one of"
+    }
+  ],
+  "verification_plan": {
+    "plan_id": "fixture-plan-003",
+    "verification_points": [
+      {
+        "id": "VP-001",
+        "verification_method": "api_test",
+        "criterion": "the plan list endpoint answers 200 with an empty plan array",
+        "request": {
+          "method": "FETCH",
+          "url": "/api/v1/plans"
+        },
+        "replacement": null
+      }
+    ]
+  },
+  "expected_disposition": {
+    "disposition": "escalate_counted",
+    "defaulted": false
+  }
+}

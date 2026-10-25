@@ -105,6 +105,23 @@ def _run_guard(file_path: str, *, pdt_project_dir: str, pdt_formal_repo: str = "
     env.pop("PDT_PROJECT_DIR", None)
     env.pop("PDT_FORMAL_REPO_PATH", None)
     env.pop("PDT_PLANS_DIR", None)
+    # The rest of the guard's inputs, for the same reason.  A sub-agent
+    # session exports the whole set (the task's declaration slip, the
+    # read-only stamp, the report carve-out, the lock identity), and a
+    # stale value changes what the guard decides -- the case under test is
+    # about containment, not about whatever the launching shell happened
+    # to declare.
+    for _leaked in (
+        "PDT_REPORT_PATH",
+        "PDT_READONLY_TASK",
+        "PDT_ALLOWED_WRITE_FILES",
+        "PDT_UNDECLARED_WRITE_DIR",
+        "PDT_DECLARED_MANIFEST_HASH",
+        "PDT_LOCK_CLI",
+        "PDT_LOCK_BROKER",
+        "PDT_LOCK_TASK_ID",
+    ):
+        env.pop(_leaked, None)
     if pdt_project_dir:
         env["PDT_PROJECT_DIR"] = pdt_project_dir
     if pdt_formal_repo:

@@ -12,6 +12,7 @@ Phases:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 
@@ -20,6 +21,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional, List, Dict, Any, Tuple
@@ -39,7 +41,12 @@ from verification_executor import VerificationExecutor
 from verification_persistence import VerificationPersistenceManager
 from verification_profile import ExecutionProfileGenerator
 from verification_split import SplitDecision
-from verification_subagent import VerificationSubAgent, Verdict
+from verification_subagent import (
+    DEFAULT_FAILURE_CLASS,
+    DEFAULT_FAILURE_CLASS_SOURCE,
+    VerificationSubAgent,
+    Verdict,
+)
 from verification_buckets import blocked_reason
 from binary_freshness import (
     FreshnessReport,
@@ -127,6 +134,69 @@ def _resolve_apply_to_verdict():
     if live is not None and live is not _ORIGINAL_APPLY_TO_VERDICT:
         return live
     return apply_to_verdict
+
+
+#: The machine-readable signal a verification point's **missing definition**
+#: carries (2026-10-24, VP-031).
+#:
+#: It is the name ``verification.failure_triage`` maps to
+#: ``criterion_defect``: a verification point with an id but no criterion is
+#: a broken criterion, not a broken deliverable. So it escalates to a human
+#: and it does **not** become a repair task — reworking the deliverable can
+#: never satisfy a criterion that was never written down.
+VP_DEFINITION_MISSING_SIGNAL = "vp_definition_missing"
+
+
+def vp_dispatch_gaps(
+    vp: Any,
+    definitions: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[str]:
+    """Why this verification point must not be dispatched (empty = may dispatch).
+
+    A verification point is judged against a **declared criterion**: an id, a
+    title that says what is being asserted, and a method the framework can
+    run.  A node that carries an id but none of those is not a verification
+    point — it is a placeholder.  Dispatching it would have the framework
+    **invent** a criterion: the plan-to-executor conversion defaults a
+    missing method to ``code_review`` (see
+    :meth:`Orchestrator._convert_plan_to_executor_schema`), so the empty
+    shell would be sent to the coding tool, and a review of nothing produces
+    nothing worth recording.
+
+    That is exactly what happened to ``VP-031`` (2026-10-24): the round was
+    cancelled while the dispatch was in flight, and the attempt was filed as
+    FAILED — a broken criterion counted as a broken deliverable, and it
+    produced a repair task for a criterion that never existed.
+
+    ``definitions`` is the plan file's ``{vp_id: entry}`` map, and it is the
+    **authority**: the id must be one the plan declares, and the plan's own
+    entry is what says whether the criterion is complete.  ``None`` means
+    "there is no plan on disk" — nothing to compare against, so every point
+    would look undefined and the caller stands the guard down.
+
+    The gaps are returned, never raised: the caller turns them into a BLOCKED
+    verdict that names what is missing.
+    """
+    if not isinstance(vp, dict):
+        return ["verification point is not an object"]
+    gaps: List[str] = []
+    vp_id = str(vp.get("id") or "").strip()
+    if not vp_id:
+        # Without an id there is nothing to look up — the point is not
+        # a verification point at all, whatever else it carries.
+        return ["verification point has no id"]
+    if definitions is None:
+        return gaps
+    entry = definitions.get(vp_id)
+    if entry is None:
+        gaps.append(
+            f"{vp_id} is not defined in verification_plan.json's "
+            f"verification_points"
+        )
+        return gaps
+    from verification_plan_delta import vp_definition_gaps
+    gaps.extend(vp_definition_gaps(entry))
+    return gaps
 
 
 class ApiTestSchemaViolation(RuntimeError):
@@ -859,6 +929,63 @@ class _BinaryRebuildCoordinator:
         return result
 
 
+# ---------------------------------------------------------------------------
+# api_test — the service has to be there before the question is asked
+# ---------------------------------------------------------------------------
+#
+# 2026-10-24: the round-start preflight starts the declared services
+# **once**.  A service that dies half-way through the round is then left
+# to the VPs that need it, and the first one to arrive finds a dead
+# port: the request is refused at the TCP level, **not one assertion
+# runs**, and the verdict still comes out as a plain FAILED — which the
+# four-class triage files as ``deliverable_defect``, the class that
+# counts against the same-cause threshold.  The environment was broken;
+# the deliverable was not.
+#
+# So an api_test checks its declared service immediately before it asks,
+# starts it if it is down, and blocks the point (rather than faking an
+# assertion failure) when it cannot be brought up.
+
+#: The signal an api_test carries when the service it needs is not
+#: answering.  It is one of ``verification.failure_triage``'s known
+#: signals, so tier A decides it by rule: ``infra``, which does not
+#: count against the same-cause threshold.
+API_TEST_SERVICE_NOT_READY_SIGNAL = "service_not_ready"
+
+#: The port of a request URL, or ``None`` when the URL names none.
+#: ``{{svc.<name>.url}}`` has already been resolved by the time an
+#: api_test runs, so the URL is the only place the port is left.
+_URL_PORT_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://[^/]*?:(\d{1,5})")
+
+
+def _port_from_url(url: str) -> Optional[int]:
+    """The port a request URL points at, or ``None``."""
+    match = _URL_PORT_RE.match(str(url or "").strip())
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):  # pragma: no cover - the regex is tight
+        return None
+
+
+def _health_endpoint_answers(health_url: str, timeout: float = 3.0) -> bool:
+    """Whether the service's health endpoint answers with a 2xx/3xx.
+
+    A port that accepts a connection is not a service that works: the
+    2026-09-23 outage had ``/health`` answering 200 while every data
+    endpoint returned 500.  So the port check is corroborated by the
+    endpoint the plan declared.
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(health_url, timeout=timeout) as resp:
+            return 200 <= int(resp.status) < 400
+    except Exception:  # noqa: BLE001 - any failure means "not answering"
+        return False
+
+
 class Orchestrator:
     """Three-phase verification orchestrator for quality assurance.
 
@@ -1055,6 +1182,23 @@ class Orchestrator:
         #: who was adopted, which ports are blocked). ``None`` for
         #: legacy plans, which use the scrape-and-restart path instead.
         self._service_runtime_map: Optional[Any] = None
+        #: 2026-10-24 (repair-r3-16): **why** a port is blocked.  The
+        #: preflight's diagnosis (exit code, first error, log tail) used
+        #: to die in a ``logger.warning`` with the process; a blocked
+        #: port now carries its reason all the way into the verdict's
+        #: evidence, so the next round — and the operator — can read it.
+        self._blocked_service_details: Dict[int, str] = {}
+        #: 2026-10-24: per-round single-flight for the **recoverable**
+        #: service gate.  A round has a dozen VPs pointing at the same
+        #: declared service; they must share ONE start attempt, or they
+        #: start a dozen copies that fight over the port — and the
+        #: losers of that fight are the ones whose start command exits
+        #: with EADDRINUSE, which is how "the service can start" turns
+        #: into "the service cannot start".
+        self._service_recovery_locks: Dict[int, threading.Lock] = {}
+        self._service_recovery_guard = threading.Lock()
+        #: port → whether this round's recovery attempt brought it up.
+        self._service_recovery_outcomes: Dict[int, bool] = {}
         #: 阶段归一化摘要（Phase 1/2 计数 + 被兜底提升的 VP），由
         #: :meth:`generate_verification_plan` 填充，供审计/展示读取。
         self._last_phase_summary: Dict[str, Any] = {}
@@ -1417,7 +1561,11 @@ class Orchestrator:
                 )
         return plan_data
 
-    def _maybe_evaluate_plan_delta(self, plan_data: dict) -> Dict[str, Any]:
+    def _maybe_evaluate_plan_delta(
+        self,
+        plan_data: dict,
+        expected_digest: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """每轮验证开始前评估 VP 方案的增量（新增 / 废弃）。
 
         （2026-09-16）：验证是以黑盒角度进行的，VP 阶段的一个 VP 对应的
@@ -1433,12 +1581,26 @@ class Orchestrator:
 
         只在**确实有新增任务**时才调用 LLM（第一轮只记基线），失败绝不阻断
         验证——评估是增益，不是门禁。
+
+        增量必须**落盘**（2026-10-22）：以前这里调的是裸 ``apply_delta``
+        （只改内存），磁盘上的 ``verification_plan.json`` 一个字节都没动 ——
+        于是"作废"下一轮必然复活，替换 VP 也跟着消失，修复任务照旧围绕一条
+        已经不成立的判据生成。现在走 :func:`apply_delta_persisted`：读-改-写
+        合成一步，失败时磁盘与内存都保持原样。
+
+        Args:
+            plan_data: 调用方持有的计划对象（复用路径上是从磁盘读进来的
+                那份）。落盘成功后它的内容被换成磁盘上的那一份。
+            expected_digest: 读入计划时记下的 sha256。写盘前复核一次：
+                计划在增量评估期间被外部改过就放弃这一轮增量，而不是覆盖
+                掉别人的改动。
         """
         try:
             from verification_plan_delta import (
                 DELTA_SYSTEM_PROMPT,
+                PlanDeltaPersistError,
                 allocated_vp_ids,
-                apply_delta,
+                apply_delta_persisted,
                 build_delta_prompt,
                 collect_acceptance,
                 collect_new_tasks,
@@ -1458,6 +1620,18 @@ class Orchestrator:
             # actual_result，被拿去和新 expected_result 比对后判成「验证对象
             # 错位」。占位只落在 delta state，**不改写基础计划**。
             reserved = allocated_vp_ids(state)
+            # 2026-10-25（VP-031）：**发号账本**。
+            #
+            # 这些号已经发出去过 —— 有的落进了计划，有的没有（VP-031 那样
+            # 被护栏整条丢掉，只剩一个号）。它们必须被避开：重新发同一个号，
+            # 新验证点会继承那个号在 SQLite 里的旧裁决 —— 一次都没跑就记成
+            # 失败，或者一次都没跑就被当成"验证通过"而跳过。
+            #
+            # 账本与上面那份占位读的是**同一个键**（``allocated_vp_ids``）：
+            # 一份是过滤过的 id 集合（跳过非 VP-0NN 的脏值），一份是原样的
+            # 列表。两边都要 —— 占位用来拒绝"复用旧号"，账本用来避开"发过的
+            # 号"。
+            avoid_ids = state.get("allocated_vp_ids") or []
             new_tasks, all_ids = collect_new_tasks(
                 self.plan_dir, seen or [],
             )
@@ -1490,71 +1664,69 @@ class Orchestrator:
                 scene="verification_plan_delta",
             )
             delta = parse_delta_payload(raw, plan_data, reserved_ids=reserved)
-            summary = apply_delta(
-                plan_data, delta, round_number, reserved_ids=reserved,
+
+            # 2026-10-22：增量必须**落盘**。
+            #
+            # 以前这里调的是裸 ``apply_delta`` —— 只改内存。复用路径跑完就
+            # 返回，磁盘上的 ``verification_plan.json`` 一个字节都没动，于是
+            # "作废"下一轮必然复活，替换 VP 也跟着消失。
+            #
+            # ``apply_delta_persisted`` 是"应用增量 + 让增量留下来"合成的一
+            # 步：先在深拷贝上应用，校验通过后原子替换磁盘上的计划文件，
+            # **只有写成功了**才让本函数手里的 ``plan_data`` 换内容。任何一
+            # 步失败，磁盘与内存都保持调用前的原样 —— 内存永远不领先磁盘。
+            try:
+                summary = apply_delta_persisted(
+                    self.verification_plan_file,
+                    plan_data,
+                    delta,
+                    round_number,
+                    post_apply=self._plan_delta_guard,
+                    expected_digest=expected_digest,
+                    avoid_ids=avoid_ids,
+                    reserved_ids=reserved,
+                )
+            except PlanDeltaPersistError as exc:
+                # 这次增量**没有**落盘（写失败，或计划在评估期间被外部改写）。
+                # 磁盘与内存都还是原样：验证继续用现有计划（增量评估是增益，
+                # 不是门禁），而且增量状态不更新 —— 任务不算"已看过"，下一
+                # 轮会再评估一次，这次增量不会因为一次写失败就永远丢掉。
+                logger.warning(
+                    "[Verification] plan delta was NOT persisted: %s; "
+                    "continuing with the existing plan", exc,
+                )
+                self._safe_log_freshness_event(
+                    "__plan_delta__", "plan_delta_persist_failed",
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                )
+                return {}
+
+            # 摘要里带上"这次增量真的落盘了吗"：审计时能一眼分清"评估过"
+            # 与"生效了"（全被拒的增量不写盘）。
+            summary["persisted"] = bool(
+                summary.get("added") or summary.get("obsoleted")
             )
 
-            # 新增的 VP 必须和初次生成时一样过护栏（2026-09-18 定下）：
-            # 每轮跑之前都要先过护栏，因为这一轮会生成新的 VP。
-            #
-            # 护栏的内容随方法收敛而变：VP 不再有 test_command，所以查的是
-            # **method 的契约** —— 不支持的 method，以及 api_test 的
-            # request/assertions 是否合规。违规的**整条丢弃**：宁可少一条
-            # VP，也不要一条永远跑不出结论的验收点。
-            if summary["added"]:
-                added_ids = [a["id"] for a in summary["added"]]
-                by_id = {
-                    str(vp.get("id")): vp
-                    for vp in plan_data.get("verification_points") or []
-                    if isinstance(vp, dict)
-                }
-                candidates = {
-                    "verification_points": [by_id[i] for i in added_ids if i in by_id],
-                }
-                bad_ids = {
-                    f["id"] for f in self._api_schema_report(candidates)
-                }
-                from verification_subagent import SUPPORTED_METHODS
-                for vp in candidates["verification_points"]:
-                    if str(vp.get("verification_method") or "") not in SUPPORTED_METHODS:
-                        bad_ids.add(str(vp.get("id")))
-                if bad_ids:
-                    plan_data["verification_points"] = [
-                        vp for vp in plan_data.get("verification_points") or []
-                        if str(vp.get("id")) not in bad_ids
-                    ]
-                    summary["added"] = [
-                        a for a in summary["added"] if a["id"] not in bad_ids
-                    ]
-                    summary["rejected_by_guard"] = sorted(bad_ids)
-
-                # 2026-09-19: 新增条目也要过阶段归一化。主生成路径本来就会
-                # 跑它 —— 那条"声明驱动"的规则是"Phase 1 上写了
-                # e2e / full_ci 就说明它自己声明了'我是全量关卡'，就地提升
-                # 到 Phase 2"。增量路径漏了这一步，于是一条整仓门禁型的新增
-                # 会被按 Phase 1 排进去，在每条子功能都还没验完时就开跑，
-                # 把整轮堵死（那一轮的「Nightly CI 全过」就是这个下场）。
-                try:
-                    from verification_phases import (
-                        normalize_plan_phases as _normalize_phases,
-                    )
-                    _phase_summary = _normalize_phases(plan_data)
-                    if _phase_summary.get("phase_promoted"):
-                        summary["phase_promoted"] = _phase_summary["phase_promoted"]
-                except Exception:
-                    logger.warning(
-                        "[plan_delta] phase normalization failed; "
-                        "added VPs keep their declared phase",
-                        exc_info=True,
-                    )
+            # 2026-10-25（VP-031）：发号账本。**本函数是这个状态文件的
+            # 主人**（"看过哪些任务"每轮都写它），所以账本也在这里落盘 ——
+            # 而且要写**合并后**的整份账本：只写这一轮新发的号会把之前
+            # 发出去的号抹掉。
+            ledger: List[str] = []
+            for vp_id in list(state.get("allocated_vp_ids") or []) + list(
+                summary.get("allocated_vp_ids") or []
+            ):
+                key = str(vp_id or "").strip()
+                if key and key not in ledger:
+                    ledger.append(key)
 
             save_delta_state(self.plan_dir, {
                 "seen_task_ids": all_ids,
                 "round": round_number,
-                # 本轮分配出去的 id 累加进去 —— 下一轮据此跳过它们，id 才
-                # 跨轮单调（2026-10-24）。
-                "allocated_vp_ids": merge_allocated_ids(state, summary),
                 "last_delta": summary,
+                # 本轮分配出去的 id 累加进去 —— 下一轮据此跳过它们，id 才
+                # 跨轮单调（2026-10-24）。写的是**合并后**的整份账本：只写
+                # 这一轮新发的号会把之前发出去的号抹掉。
+                "allocated_vp_ids": ledger,
             })
             self._safe_log_freshness_event(
                 "__plan_delta__", "plan_delta_evaluated", summary,
@@ -1564,6 +1736,7 @@ class Orchestrator:
                     "[Verification] 计划增量评估："
                     f"新增 {len(summary['added'])} 条、"
                     f"废弃 {len(summary['obsoleted'])} 条"
+                    + ("（已落盘）" if summary.get("persisted") else "")
                 )
             return summary
         except Exception as exc:  # noqa: BLE001 — 评估失败绝不阻断验证
@@ -1576,6 +1749,75 @@ class Orchestrator:
                 {"error": f"{type(exc).__name__}: {exc}"},
             )
             return {}
+
+    def _plan_delta_guard(
+        self, candidate: dict, summary: Dict[str, Any],
+    ) -> None:
+        """增量护栏：在**落盘之前**判定新增的 VP 能不能用。
+
+        它拿到的是 :func:`verification_plan_delta.apply_delta_persisted` 的
+        **候选计划**（深拷贝），不是调用方手里那份 —— 护栏在写盘之前跑，
+        所以"不合格的 VP"不会先落盘再被撤。
+
+        判定内容与主生成路径一致：
+
+        * ``api_test`` 的 request/assertions 必须过 schema；
+        * ``verification_method`` 必须在 ``SUPPORTED_METHODS`` 里；
+        * 不合格的**整条丢弃**（宁可少一条 VP，也不要一条永远跑不出结论的
+          验收点），丢弃的 id 记进 ``summary["rejected_by_guard"]``；
+        * 新增条目还要过阶段归一化（见下）。
+
+        新增的 VP 必须和初次生成时一样过护栏（2026-09-18 定下）：每轮跑之前
+        都要先过护栏，因为这一轮会生成新的 VP。护栏的内容随方法收敛而变：
+        VP 不再有 test_command，所以查的是 **method 的契约** —— 不支持的
+        method，以及 api_test 的 request/assertions 是否合规。
+        """
+        if not summary.get("added"):
+            return
+
+        added_ids = [a["id"] for a in summary["added"]]
+        by_id = {
+            str(vp.get("id")): vp
+            for vp in candidate.get("verification_points") or []
+            if isinstance(vp, dict)
+        }
+        candidates = {
+            "verification_points": [by_id[i] for i in added_ids if i in by_id],
+        }
+        bad_ids = {f["id"] for f in self._api_schema_report(candidates)}
+        from verification_subagent import SUPPORTED_METHODS
+        for vp in candidates["verification_points"]:
+            if str(vp.get("verification_method") or "") not in SUPPORTED_METHODS:
+                bad_ids.add(str(vp.get("id")))
+        if bad_ids:
+            candidate["verification_points"] = [
+                vp for vp in candidate.get("verification_points") or []
+                if str(vp.get("id")) not in bad_ids
+            ]
+            summary["added"] = [
+                a for a in summary["added"] if a["id"] not in bad_ids
+            ]
+            summary["rejected_by_guard"] = sorted(bad_ids)
+
+        # 2026-09-19: 新增条目也要过阶段归一化。主生成路径本来就会跑它 ——
+        # 那条"声明驱动"的规则是"Phase 1 上写了 e2e / full_ci 就说明它自己
+        # 声明了'我是全量关卡'，就地提升到 Phase 2"。增量路径漏了这一步，
+        # 于是一条整仓门禁型的新增会被按 Phase 1 排进去，在每条子功能都还
+        # 没验完时就开跑，把整轮堵死（那一轮的「Nightly CI 全过」就是这个
+        # 下场）。
+        try:
+            from verification_phases import (
+                normalize_plan_phases as _normalize_phases,
+            )
+            _phase_summary = _normalize_phases(candidate)
+            if _phase_summary.get("phase_promoted"):
+                summary["phase_promoted"] = _phase_summary["phase_promoted"]
+        except Exception:
+            logger.warning(
+                "[plan_delta] phase normalization failed; "
+                "added VPs keep their declared phase",
+                exc_info=True,
+            )
 
     # -----------------------------------------------------------------------
     # Phase 1: Planning
@@ -1602,8 +1844,16 @@ class Orchestrator:
         # at least as authoritative as a fresh regeneration.
         if self.verification_plan_file.exists():
             try:
-                with open(self.verification_plan_file, "r", encoding="utf-8") as f:
-                    disk_plan = json.load(f)
+                # 2026-10-22：读入时记下计划文件的 sha256，作为增量落盘的
+                # ``expected_digest`` 透传下去（写回前复核一次：计划在增量
+                # 评估期间被外部改写过就放弃这一轮增量，而不是覆盖它）。
+                #
+                # 摘要取自**本次读到的字节**，不是另算一次文件内容：另算会
+                # 留下一个窗口 —— 文件在"读"与"算"之间被改写时，算出来的摘要
+                # 描述的是新内容，写回时就会把别人的改动覆盖掉。
+                _plan_bytes = self.verification_plan_file.read_bytes()
+                expected_digest = hashlib.sha256(_plan_bytes).hexdigest()
+                disk_plan = json.loads(_plan_bytes)
                 if isinstance(disk_plan, dict) and disk_plan.get("verification_points"):
                     print(
                         f"[Verification] Reusing on-disk plan "
@@ -1628,7 +1878,13 @@ class Orchestrator:
                     # 修复轮新增的任务（repair-r*）不会自动带出 VP，没有这一步
                     # "修好了一个没人验的东西"在机制上不可见。评估只允许
                     # 新增/废弃，绝不动已有 VP（见 verification_plan_delta）。
-                    self._maybe_evaluate_plan_delta(disk_plan)
+                    #
+                    # 2026-10-22：增量现在会**落盘**（此前只改内存，于是"作废"
+                    # 下一轮必然复活）。写回前用读入时记下的 sha256 复核磁盘
+                    # 上的计划没被别人改过。
+                    self._maybe_evaluate_plan_delta(
+                        disk_plan, expected_digest=expected_digest,
+                    )
                     # 2026-09-18 C1：服务声明在增量评估**之后**解析，
                     # 这样 delta 新加进来的 VP 也会被引用检查覆盖。
                     self._normalize_service_declarations(disk_plan)
@@ -3422,13 +3678,38 @@ class Orchestrator:
         ``plans/<id>/vp_artifacts/<vp_id>/api_response.json`` so an
         operator can check the verdict's basis afterwards.
 
+        2026-10-24: two things changed around that purity, both of
+        them about *where* the verdict comes from rather than what it
+        says.
+
+        * The service is checked **before** the request goes out, and
+          started if it is down (see
+          :meth:`_ensure_api_test_services`).  A request to a dead
+          port answers nothing, so there is no verdict to compute.
+        * A request that fails at the transport layer carries a
+          machine-readable ``signal``, and the verdict is classified by
+          that signal: the environment failed, not the deliverable.
+
         Never raises — :func:`verification_api_runner.run_api_verification`
         turns every failure mode into a FAILED verdict carrying its
-        reason.
+        reason, and the guard below turns an unreachable service into a
+        BLOCKED verdict.
         """
         from verification_api_runner import run_api_verification
 
         vp_id = str(vp.get("id", "unknown"))
+
+        # The service has to be there before the question is asked.
+        blocked_ports, detail = self._ensure_api_test_services(vp)
+        if blocked_ports:
+            self._safe_log_freshness_event(
+                vp_id, "api_test_service_blocked",
+                {"ports": blocked_ports, "detail": detail},
+            )
+            return self._build_api_test_blocked_verdict(
+                vp_id, blocked_ports, detail,
+            )
+
         try:
             result = run_api_verification(
                 vp,
@@ -3447,15 +3728,464 @@ class Orchestrator:
             }
 
         verdict = result.to_verdict_dict()
+        self._classify_api_test_verdict(verdict, result)
         self._safe_log_freshness_event(
             vp_id, "api_test_executed",
             {
                 "status": verdict["status"],
                 "status_code": result.evidence.get("status_code"),
                 "assertions_failed": result.evidence.get("assertions_failed"),
+                "signal": result.evidence.get("signal"),
             },
         )
         return verdict
+
+    # ------------------------------------------------------------------
+    # api_test — the service guard
+    # ------------------------------------------------------------------
+
+    def _declared_services_for_vp(self, vp: dict) -> Dict[str, Any]:
+        """The declared services this ``api_test`` VP depends on.
+
+        Two independent ways a VP names a service, and both are read:
+        the ``uses_services`` names the plan declares, and the port in
+        the request URL.  The second one matters because the URL is
+        where the port survives — a VP that names its service correctly
+        carries the ``{{svc.<name>.url}}`` placeholder, which the
+        dispatcher has already resolved by the time the VP gets here.
+        """
+        declarations = getattr(self, "_service_declarations", {}) or {}
+        if not declarations:
+            return {}
+
+        wanted: Dict[str, Any] = {}
+        uses = vp.get("uses_services")
+        if isinstance(uses, list):
+            for name in uses:
+                key = str(name).strip()
+                decl = declarations.get(key) or declarations.get(key.lower())
+                if decl is not None:
+                    wanted[str(decl.name)] = decl
+
+        port = _port_from_url(str(((vp.get("request") or {}).get("url")) or ""))
+        if port is not None:
+            for decl in declarations.values():
+                try:
+                    declared_port = int(getattr(decl, "port", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if declared_port == port:
+                    wanted[str(decl.name)] = decl
+        return wanted
+
+    @staticmethod
+    def _declared_port(decl: Any) -> int:
+        """The port a declaration names, or 0 when it names none."""
+        try:
+            return int(getattr(decl, "port", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _declared_service_is_usable(decl: Any) -> bool:
+        """Whether the declared service is there to be asked.
+
+        Two questions, and both have to pass: is something listening on
+        the port, and does the service answer the health endpoint the
+        plan declared?  A process that holds the port while its data
+        plane is dead is exactly the 2026-09-23 failure this area
+        exists for — the port answers, the endpoint does not.
+        """
+        from service_freshness import probe_port
+
+        port = Orchestrator._declared_port(decl)
+        if port <= 0:
+            return False
+        try:
+            probe = probe_port(port)
+        except Exception:  # noqa: BLE001 - a probe never raises
+            return False
+        if not probe.listening:
+            return False
+        health_url = str(getattr(decl, "health_url", "") or "")
+        if not health_url:
+            return True
+        return _health_endpoint_answers(health_url)
+
+    def _ensure_api_test_services(self, vp: dict) -> Tuple[List[int], str]:
+        """Make sure the services this VP declares are up before it asks.
+
+        The round-start preflight starts the declared services **once**,
+        at the beginning of the round.  A service that dies half-way
+        through the round is then left to the VPs that need it: the
+        first one to arrive finds a dead port and every api_test after
+        it finds the same dead port.
+
+        So the check happens here, immediately before the request: a
+        service that is not answering is started with its own declared
+        ``start_cmd`` (:func:`service_manager.ensure_services`), and
+        only a service that is still not answering afterwards blocks
+        the point.
+
+        Returns ``(blocked_ports, detail)``.  ``blocked_ports`` is
+        empty when every declared service is usable; ``detail`` says
+        why the ones that are not could not be brought up.
+        """
+        declarations = self._declared_services_for_vp(vp)
+        if not declarations:
+            return [], ""
+
+        unusable = [
+            decl for decl in declarations.values()
+            if not self._declared_service_is_usable(decl)
+        ]
+        if not unusable:
+            return [], ""
+
+        try:
+            from service_manager import ensure_services
+
+            runtime_map = ensure_services(
+                self.project_dir,
+                declarations,
+                round_number=getattr(self, "_current_round", 0) or 0,
+            )
+        except Exception as exc:  # noqa: BLE001 - a guard never raises
+            ports = sorted({
+                self._declared_port(decl) for decl in unusable
+            } - {0})
+            return ports, (
+                f"could not start the declared service(s): "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        still: List[Any] = []
+        details: List[str] = []
+        for decl in declarations.values():
+            runtime = (runtime_map.runtimes or {}).get(str(decl.name))
+            if runtime is not None and getattr(runtime, "ready", False):
+                # ``service_manager`` called it ready, and it only does
+                # that after the declared health endpoint answered — so
+                # it has already answered the question this guard is
+                # asking.  Asking again would turn a slow service into a
+                # false BLOCKED.
+                continue
+            if self._declared_service_is_usable(decl):
+                continue
+            still.append(decl)
+            why = (getattr(runtime, "detail", "") or "") or "not ready"
+            details.append(f"port {getattr(decl, 'port', '?')}: {why}")
+        if not still:
+            return [], ""
+
+        return sorted({
+            self._declared_port(decl) for decl in still
+        } - {0}), "; ".join(details)
+
+    def _build_api_test_blocked_verdict(
+        self, vp_id: str, ports: List[int], detail: str,
+    ) -> dict:
+        """A BLOCKED verdict for an api_test whose service never came up.
+
+        The envelope is the one the round-start preflight already uses
+        (:meth:`_build_service_freshness_blocked_verdict`), so a reader
+        sees the same shape whichever gate blocked the point.  Two
+        things are added, and both of them are what makes this gate's
+        verdict actionable instead of a dead end:
+
+        * the machine-readable ``signal``, so the failure is classified
+          by rule rather than by whoever reads the log;
+        * the class, which is ``infra`` — the environment failed, so
+          the attempt is worth another try and does **not** count
+          against the same-cause threshold.
+
+        2026-10-24 (repair-r3-16): the body now lives in
+        :meth:`_build_service_gate_blocked_verdict`, which the
+        round-start gate uses too — one shape for "the service was not
+        reachable", whichever gate noticed.
+        """
+        verdict = self._build_service_gate_blocked_verdict(
+            vp_id, ports, detail,
+        )
+        verdict["actual_result"] = (
+            f"service not ready on port(s) {ports}: "
+            f"{detail or 'no listener'}; the api_test request was not "
+            f"sent — the environment was not reachable, so no assertion "
+            f"ran and the deliverable is not implicated."
+        )
+        return verdict
+
+    # ------------------------------------------------------------------
+    # The service gate — recoverable, and diagnosable when it blocks
+    # ------------------------------------------------------------------
+
+    def _build_service_gate_blocked_verdict(
+        self, vp_id: str, ports: List[int], detail: str,
+    ) -> dict:
+        """A BLOCKED verdict for a service that is still unreachable.
+
+        Same envelope as the other gates, plus the two things that make
+        it actionable rather than a dead end:
+
+        * ``signal`` — the machine-readable marker the four-class triage
+          reads (``service_not_ready`` → infra): the environment
+          failed, so the attempt is worth retrying and does **not**
+          count against the same-cause threshold;
+        * ``service_detail`` — the diagnosis the service manager
+          already produced (exit code, first error, log tail).  A
+          verdict that carries only a port number leaves the next round
+          with nothing to act on, which is exactly how this failed five
+          rounds in a row.
+        """
+        from verification.failure_triage import INFRA, SOURCE_DETERMINISTIC
+
+        verdict = self._build_service_freshness_blocked_verdict(vp_id, ports)
+        evidence = verdict.get("evidence")
+        if not isinstance(evidence, dict):
+            evidence = {}
+        evidence["signal"] = API_TEST_SERVICE_NOT_READY_SIGNAL
+        evidence["blocked_ports"] = list(ports)
+        if detail:
+            evidence["service_detail"] = detail
+        verdict["evidence"] = evidence
+        verdict["actual_result"] = (
+            f"service not ready on port(s) {ports} after a recovery "
+            f"attempt: {detail or 'no listener'}; the environment was "
+            f"not reachable, so no assertion ran and the deliverable is "
+            f"not implicated."
+        )
+        verdict["failure_class"] = INFRA
+        verdict["failure_class_source"] = SOURCE_DETERMINISTIC
+        return verdict
+
+    def _vp_service_ports(self, vp: dict) -> set:
+        """The ports a VP touches.
+
+        Two sources, and both are needed:
+
+        * the ports in the VP's own text — the legacy path, where the
+          preflight scraped the ports out of the command text;
+        * the ports of the declared services the VP names.  A VP that
+          uses the declaration carries a ``{{svc.<name>.url}}``
+          placeholder instead of a literal port, so the declaration
+          table is the only place its port survives.
+        """
+        from service_freshness import extract_service_ports
+
+        ports = set(extract_service_ports(
+            {"verification_points": [vp]}, self.project_dir,
+        ))
+        uses = vp.get("uses_services")
+        if isinstance(uses, list):
+            for name in uses:
+                key = str(name).strip()
+                decl = (
+                    self._service_declarations.get(key)
+                    or self._service_declarations.get(key.lower())
+                )
+                if decl is not None:
+                    ports.add(self._declared_port(decl))
+        return ports
+
+    def _service_gate_verdict(self, vp: dict) -> Optional[dict]:
+        """The round-start service gate, asked per VP — and asked again.
+
+        2026-10-24 (repair-r3-16).  The gate used to be a **one-shot
+        decision**: the round-start preflight tried to bring the plan's
+        declared services up once, and whatever it concluded at that
+        instant became the verdict of every VP that touched the port —
+        for the whole round, with no second attempt.
+
+        That is what made VP-001 fail five rounds in a row with
+        ``blocked_ports`` and not one assertion executed: the service
+        was slow to start, the preflight gave up on it, and the VPs
+        inherited the give-up instead of trying themselves.
+
+        So the gate tries **again** before it blocks:
+
+          * the service may already be up — the preflight looked before
+            the service finished starting;
+          * otherwise the declared service is started once more, and
+            the VPs that arrive together share that one attempt (see
+            :meth:`_recover_service_port`).
+
+        Only a service that is still unreachable after the recovery
+        blocks the VP — and then the verdict says **why**: the
+        machine-readable ``signal`` the four-class triage reads
+        (``service_not_ready`` → infra → retry, do not count) and the
+        diagnosis the service manager already produced.
+
+        Returns the BLOCKED verdict, or ``None`` when the VP may run.
+        """
+        if not self._blocked_service_ports:
+            return None
+
+        vp_id = str(vp.get("id", "unknown"))
+        blocked = sorted(
+            self._vp_service_ports(vp) & self._blocked_service_ports
+        )
+        if not blocked:
+            return None
+
+        still_blocked, detail = self._recover_blocked_service_ports(
+            vp, blocked,
+        )
+        if not still_blocked:
+            # The service came up on the retry: the VP runs, and its own
+            # request and assertions decide the verdict.
+            self._safe_log_freshness_event(
+                vp_id, "service_gate_recovered", {"ports": blocked},
+            )
+            return None
+
+        self._safe_log_freshness_event(
+            vp_id, "service_freshness_blocked",
+            {"ports": still_blocked, "detail": detail},
+        )
+        return self._build_service_gate_blocked_verdict(
+            vp_id, still_blocked, detail,
+        )
+
+    def _recover_blocked_service_ports(
+        self, vp: dict, ports: List[int],
+    ) -> Tuple[List[int], str]:
+        """Try once more to bring the blocked ports up.
+
+        One attempt per port per round, shared by every VP that needs
+        it: a round has a dozen VPs pointing at the same declared
+        service, and a dozen start attempts do not make a service come
+        up — they make a dozen copies fight over the port, and the
+        losers of that fight are the ones whose start command exits with
+        EADDRINUSE.
+
+        Returns ``(still_blocked, detail)``.
+        """
+        still: List[int] = []
+        details: List[str] = []
+        for port in sorted(ports):
+            recovered, detail = self._recover_service_port(port)
+            if recovered:
+                continue
+            still.append(port)
+            if detail:
+                details.append(f"port {port}: {detail}")
+        return still, "; ".join(details)
+
+    def _service_recovery_lock_for(self, port: int) -> threading.Lock:
+        """The lock that serialises this round's recovery of one port."""
+        with self._service_recovery_guard:
+            lock = self._service_recovery_locks.get(port)
+            if lock is None:
+                lock = threading.Lock()
+                self._service_recovery_locks[port] = lock
+            return lock
+
+    def _recover_service_port(self, port: int) -> Tuple[bool, str]:
+        """Bring one port up — at most once per round.
+
+        The lock is what makes "at most once" true: the first caller
+        starts the service, every other caller waits for that attempt
+        and then reads its outcome instead of starting a second copy.
+        """
+        with self._service_recovery_lock_for(port):
+            outcome = self._service_recovery_outcomes.get(port)
+            if outcome is not None:
+                return outcome, self._blocked_service_details.get(port, "")
+
+            declarations = {
+                name: decl
+                for name, decl in self._service_declarations.items()
+                if self._declared_port(decl) == port
+            }
+            if not declarations:
+                # A port this plan never declared (the legacy
+                # scrape-the-command path): there is no start command to
+                # retry with, so the preflight's verdict stands.
+                self._service_recovery_outcomes[port] = False
+                return False, self._blocked_service_details.get(port, "")
+
+            # The service may have finished starting after the preflight
+            # looked.  Ask it before starting anything: a service that
+            # is already up must not be restarted by its own gate.
+            for decl in declarations.values():
+                if self._declared_service_is_usable(decl):
+                    self._service_recovery_outcomes[port] = True
+                    self._blocked_service_ports.discard(port)
+                    self._blocked_service_details.pop(port, None)
+                    return True, ""
+
+            try:
+                from service_manager import ensure_services
+
+                runtime_map = ensure_services(
+                    self.project_dir, declarations,
+                    round_number=getattr(self, "_current_round", 0) or 0,
+                )
+            except Exception as exc:  # noqa: BLE001 - a guard never raises
+                detail = (
+                    f"could not start the declared service(s): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self._service_recovery_outcomes[port] = False
+                self._blocked_service_details[port] = detail
+                return False, detail
+
+            detail = ""
+            ready = False
+            for decl in declarations.values():
+                runtime = (runtime_map.runtimes or {}).get(str(decl.name))
+                if runtime is not None and getattr(runtime, "ready", False):
+                    ready = True
+                    break
+                if runtime is not None:
+                    detail = getattr(runtime, "detail", "") or detail
+            if not ready:
+                # The manager only calls a service ready after its
+                # health endpoint answered, but ask the service directly
+                # before giving up — the port may have come up between
+                # the manager's check and this one.
+                for decl in declarations.values():
+                    if self._declared_service_is_usable(decl):
+                        ready = True
+                        break
+
+            if ready:
+                self._service_recovery_outcomes[port] = True
+                self._blocked_service_ports.discard(port)
+                self._blocked_service_details.pop(port, None)
+                return True, ""
+
+            detail = detail or "not ready"
+            self._service_recovery_outcomes[port] = False
+            self._blocked_service_details[port] = detail
+            return False, detail
+
+    @staticmethod
+    def _classify_api_test_verdict(verdict: dict, result: Any) -> None:
+        """Classify a verdict the runner produced, in place.
+
+        A verdict that carries a ``signal`` never reached the service,
+        so the failure belongs to the environment.  The class comes
+        from :func:`verification.failure_triage.classify_deterministic`
+        — a rule, not a guess — and the source says the class was
+        decided by that rule rather than assumed.
+        """
+        evidence = getattr(result, "evidence", None) or {}
+        signal = evidence.get("signal")
+        if not signal:
+            return
+        from verification.failure_triage import (
+            SOURCE_DETERMINISTIC,
+            classify_deterministic,
+        )
+
+        failure_class = classify_deterministic(
+            signal, str(evidence.get("error") or ""),
+        )
+        if not failure_class:
+            return
+        verdict["failure_class"] = failure_class
+        verdict["failure_class_source"] = SOURCE_DETERMINISTIC
 
     def _run_full_ci_vp(self, vp: dict) -> dict:
         """Grade a ``full_ci`` VP without an LLM (2026-09-18, D2).
@@ -3709,15 +4439,39 @@ class Orchestrator:
                     "evidence": error_msg,
                 }
 
-        # Log verification point completion
+        # Log verification point completion — the single vp_complete
+        # emission for this VP. The payload is built by
+        # ``_vp_complete_payload`` so its shape has one definition;
+        # this call site supplies only what varies per run.
         self.persistence.write_verification_point_log(
             vp_id,
             "vp_complete",
- {
-                "status": result.get("status", "UNKNOWN"),
-                "actual_result": str(result.get("actual_result", ""))[:500],
-                "evidence": str(result.get("evidence", ""))[:500]
-            }
+            self._vp_complete_payload(
+                vp_id,
+                # ``getattr`` rather than ``self._current_round``: this
+                # method is reached by tests that build an Orchestrator
+                # without running ``__init__``, and a missing round
+                # number must not cost them the whole completion event.
+                getattr(self, "_current_round", 0) or 1,
+                # ``result`` reaches this point from several branches
+                # (the manual_check short-circuit, monkey-patched
+                # executors, the timeout/split paths, the defensive
+                # catch) and only the canonical sub-agent branch built
+                # it from a Verdict. Re-expressing it as one here means
+                # the payload builder has a single input type, and the
+                # three classification fields ride along on the branch
+                # that produced them while the others fall back to the
+                # conservative defaults rather than inventing a class.
+                Verdict(
+                    verdict=str(result.get("status", "UNKNOWN")),
+                    reasons=[str(result.get("actual_result", ""))],
+                    failure_class=result.get("failure_class", DEFAULT_FAILURE_CLASS),
+                    failure_class_source=result.get(
+                        "failure_class_source", DEFAULT_FAILURE_CLASS_SOURCE
+                    ),
+                    evidence_quote=result.get("evidence_quote", ""),
+                ),
+            ),
         )
 
         return result
@@ -3853,6 +4607,11 @@ class Orchestrator:
           surfaced in the persistence log via
           ``sub_agent_completed`` for auditability, not in the
           per-VP result dict.
+        * ``failure_class`` / ``failure_class_source`` /
+          ``evidence_quote`` are carried through unchanged so the
+          result dict is self-sufficient for classification. See the
+          fallback block below for what a verdict without them
+          resolves to.
 
         2026-10-11: ``actual_result`` used to be ``reasons[0]``
         only. That is systematically wrong: the sub-agent emits
@@ -3885,12 +4644,79 @@ class Orchestrator:
         else:
             actual_result = f"verdict={status}"
         evidence = " | ".join(str(e) for e in verdict.evidence) if verdict.evidence else ""
+
+        # The three classification fields travel with the projection
+        # because a caller holding only the result dict cannot recompute
+        # them: ``failure_class`` is what the loop counts, the source
+        # says whether that class was earned or assumed, and the quote
+        # is the anchor a human needs before acting on the claim.
+        #
+        # The fallback keys on a **missing attribute**, not on an empty
+        # one. That distinction is load-bearing in both directions: a
+        # verdict that predates these fields has genuinely not been
+        # classified, and absence must not read as ``out_of_scope`` /
+        # ``infra`` / ``criterion_defect`` (each of which refuses to
+        # count the attempt) — it reads as ``deliverable_defect``, the
+        # class that does count, marked ``"defaulted"`` so a reader can
+        # tell it was assumed. But a *passed* verdict carries an empty
+        # class on purpose, and reading that empty string as "default
+        # it" would report every green VP as a broken deliverable.
+        raw_class = getattr(verdict, "failure_class", None)
+        failure_class = DEFAULT_FAILURE_CLASS if raw_class is None else str(raw_class)
+
+        raw_source = getattr(verdict, "failure_class_source", None)
+        failure_class_source = (
+            DEFAULT_FAILURE_CLASS_SOURCE if raw_source is None else str(raw_source)
+        )
+
+        raw_quote = getattr(verdict, "evidence_quote", None)
+        evidence_quote = "" if raw_quote is None else str(raw_quote)
         return {
             "id": vp_id,
             "status": status,
             "reasons": list(verdict.reasons) if verdict.reasons else [],
             "evidence": {"details": evidence, "raw": list(verdict.evidence) if verdict.evidence else []},
             "actual_result": actual_result,
+            "failure_class": failure_class,
+            "failure_class_source": failure_class_source,
+            "evidence_quote": evidence_quote,
+        }
+
+    @staticmethod
+    def _vp_complete_payload(
+        vp_id: str, round_number: int, verdict: Verdict
+    ) -> dict:
+        """Build the one ``vp_complete`` payload for a finished VP.
+
+        The event log is what the loop, the progress endpoints and the
+        notifier read to decide whether a point finished, so the payload
+        has exactly one definition. Every field is derived from the
+        :class:`Verdict` through :meth:`_verdict_to_result` rather than
+        recomputed here, so the event log and the result dict can never
+        disagree about what a verdict said.
+
+        The key set is **closed**, not additive: ``vp_id`` (which point),
+        ``round`` (which attempt — the log is per-round, but a reader
+        holding events from several rounds cannot otherwise tell which
+        round a stale completion belongs to), the status and the three
+        classification fields the consumers cannot recompute, and
+        ``actual_result``. The previous payload carried the joined
+        evidence string here; it is not part of the contract and
+        nothing read it off this event — the per-VP evidence lives on
+        the result dict and in the ``verdict`` records.
+        """
+        result = Orchestrator._verdict_to_result(vp_id, verdict)
+        return {
+            "vp_id": vp_id,
+            "round": round_number,
+            "status": result["status"],
+            "failure_class": result["failure_class"],
+            "failure_class_source": result["failure_class_source"],
+            "evidence_quote": result["evidence_quote"],
+            # Bounded because this lands in a JSONL event log that is
+            # read whole on every progress request; an unbounded
+            # multi-reason join grows that read without bound.
+            "actual_result": str(result["actual_result"])[:500],
         }
 
     async def _split_vp_on_timeout(self, vp: dict, partial_result: dict) -> Optional[dict]:
@@ -4876,6 +5702,94 @@ class Orchestrator:
         )
         return report
 
+    def _plan_vp_definitions(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        """The verification points as ``verification_plan.json`` defines them.
+
+        The plan file is the **authority** on what a verification point is:
+        the id has to be one the plan declares, and the plan's own entry is
+        what says whether the criterion is complete.  The in-memory plan
+        cannot answer that — the plan-to-executor conversion defaults a
+        missing method to ``code_review``, so a definition-less entry
+        arrives at the dispatcher wearing a method it never declared.
+
+        ``None`` means "there is no plan on disk" (missing or unreadable).
+        The dispatch guard stands down in that case: with nothing to
+        compare against, every verification point would look undefined,
+        and blocking the whole round would be worse than the defect it
+        guards against.
+        """
+        try:
+            raw = json.loads(self.verification_plan_file.read_bytes())
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            logger.warning(
+                "[Verification] %s is unreadable; the VP definition guard "
+                "stands down for this round",
+                self.verification_plan_file,
+            )
+            return None
+        if not isinstance(raw, dict):
+            return None
+        points = raw.get("verification_points")
+        if not isinstance(points, list):
+            return None
+        return {
+            str(vp.get("id")): vp
+            for vp in points
+            if isinstance(vp, dict)
+        }
+
+    def _build_vp_definition_blocked_verdict(
+        self, vp_id: str, gaps: List[str],
+    ) -> Dict[str, Any]:
+        """The verdict for a verification point that has no criterion to judge.
+
+        BLOCKED, not FAILED: nothing ran, so there is no evidence to grade
+        and no deliverable to blame.  The class is ``criterion_defect`` —
+        the criterion is what is missing — and it is decided **by rule**
+        (the signal names it in ``verification.failure_triage``), so it
+        counts against the same-cause threshold and escalates to a human
+        instead of becoming a repair task.  That is the contract of
+        this plan's acceptance item (f).
+
+        The verdict also says what to do about it: the operator voids or
+        re-expresses the verification point.  The executor never invents a
+        criterion on its own — an assertion nobody wrote down cannot be
+        verified by anybody.
+        """
+        from verification.failure_triage import (
+            CRITERION_DEFECT,
+            SOURCE_DETERMINISTIC,
+            classify_deterministic,
+        )
+
+        detail = "; ".join(gaps)
+        failure_class = (
+            classify_deterministic(VP_DEFINITION_MISSING_SIGNAL, detail)
+            or CRITERION_DEFECT
+        )
+        return {
+            "status": "BLOCKED",
+            "reasons": [
+                f"verification point {vp_id} has no usable definition: {detail}"
+            ],
+            "actual_result": (
+                f"验证点 {vp_id} 没有可判定的判据（{detail}）。"
+                "执行器不会替它发明判据：请由计划属主作废或重新表达这条"
+                "验证点（判据写错或缺失属于 criterion_defect，不生成修复"
+                "任务）。"
+            ),
+            "evidence": {
+                "signal": VP_DEFINITION_MISSING_SIGNAL,
+                "vp_id": vp_id,
+                "gaps": list(gaps),
+            },
+            "failure_class": failure_class,
+            "failure_class_source": SOURCE_DETERMINISTIC,
+            "framework_checks": [],
+        }
+
     def _build_verification_executor(self, plan_data: dict) -> "VerificationExecutor":
         """Build a :class:`VerificationExecutor` wired to this agent.
 
@@ -4892,10 +5806,31 @@ class Orchestrator:
         agent's other entry points are not affected.
         """
         executor_plan = self._convert_plan_to_executor_schema(plan_data)
+        #: The plan file's own definitions — the authority on what a
+        #: verification point is.  Read once per round: Phase 1 has already
+        #: written the file by the time the executor is built, and the
+        #: round's plan does not change under it.
+        plan_definitions = self._plan_vp_definitions()
 
         async def _sub_agent_runner(vp_node: dict) -> dict:
             vp = dict(vp_node)
             vp_id = str(vp.get("id", "unknown"))
+            # 2026-10-24（VP-031）：**分派前**先问"这条验证点有判据吗"。
+            #
+            # 有 id、没有定义的条目不是验证点，是占位。派给它等于让框架
+            # 发明判据：计划转执行器 schema 时会给缺 method 的条目套上缺省
+            # 方法 ``code_review``，于是这条空壳被派给了 coding tool ——
+            # 整轮随后在分派飞行中被取消，那一次尝试被记成 FAILED：一条
+            # 从没写下来过的判据，被算成了"交付物坏了"。
+            #
+            # 门禁在最前面：它必须先于任何一次 coding tool 调用（连
+            # 二进制重建那条路上的子 agent 也不能碰到）。
+            _gaps = vp_dispatch_gaps(vp, plan_definitions)
+            if _gaps:
+                self._safe_log_freshness_event(
+                    vp_id, VP_DEFINITION_MISSING_SIGNAL, {"gaps": _gaps},
+                )
+                return self._build_vp_definition_blocked_verdict(vp_id, _gaps)
             # Binary freshness pre-check (runs before every VP).
             # Audit-logged via ``write_verification_point_log`` so the
             # operator can audit stale-binary detection per VP from
@@ -5008,38 +5943,22 @@ class Orchestrator:
                     "vp=%s binary freshness check errored: %s; proceeding",
                     vp_id, exc,
                 )
-            # Service-freshness gate (2026-09-16): the round-start
-            # preflight could not bring a service port back to life →
-            # any VP referencing that port is BLOCKED up front rather
-            # than spending a sub-agent on a guaranteed
-            # connection-refused. Ports are matched with the same
-            # extractor the preflight used, so the semantics agree.
-            if self._blocked_service_ports:
-                from service_freshness import extract_service_ports
-                vp_ports = set(extract_service_ports(
-                    {"verification_points": [vp]}, self.project_dir,
-                ))
-                # 2026-09-18 C1: a VP that references a declared service
-                # by name carries no literal port (the placeholder is
-                # resolved at dispatch time), so match on the
-                # declaration table as well — otherwise the one VP that
-                # uses the declaration *correctly* is the one VP the
-                # blocked-port gate cannot see.
-                uses = vp.get("uses_services")
-                if isinstance(uses, list):
-                    for name in uses:
-                        decl = self._service_declarations.get(str(name).lower())
-                        if decl is not None:
-                            vp_ports.add(decl.port)
-                blocked = sorted(vp_ports & self._blocked_service_ports)
-                if blocked:
-                    self._safe_log_freshness_event(
-                        vp_id, "service_freshness_blocked",
-                        {"ports": blocked},
-                    )
-                    return self._build_service_freshness_blocked_verdict(
-                        vp_id, blocked,
-                    )
+            # Service-freshness gate (2026-09-16; **recoverable** since
+            # 2026-10-24).  The round-start preflight could not bring a
+            # service port back to life → the gate tries ONCE more
+            # before it blocks, and blocks with a verdict that says why
+            # (the machine-readable ``signal`` the four-class triage
+            # reads, plus the start attempt's diagnosis).
+            #
+            # The gate is asked through ``asyncio.to_thread`` for the
+            # same reason the binary check above is: the recovery may
+            # start a service, and that takes seconds the event loop
+            # must not spend.
+            gate_verdict = await asyncio.to_thread(
+                self._service_gate_verdict, vp,
+            )
+            if gate_verdict is not None:
+                return gate_verdict
             if "method" in vp and "verification_method" not in vp:
                 vp["verification_method"] = vp["method"]
             # 2026-09-18（VP 判定重构）：api_test 由框架确定性地执行，
@@ -5280,6 +6199,9 @@ class Orchestrator:
         Never raises — a broken preflight must not take the round down.
         """
         self._blocked_service_ports = set()
+        self._blocked_service_details = {}
+        self._service_recovery_locks = {}
+        self._service_recovery_outcomes = {}
         self._service_runtime_map = None
         try:
             if self._service_declarations:
@@ -5335,8 +6257,22 @@ class Orchestrator:
             round_number=self._current_round,
         )
         self._service_runtime_map = runtime_map
+        # 2026-10-24 (repair-r3-16): the reason a service is not up
+        # belongs in the event, not only in a log line that dies with the
+        # process.  ``to_dict`` buries it under
+        # ``services.<name>.detail``; ``unready_details`` says it
+        # outright, keyed by the port the gate will block.
+        unready_details = {
+            str(runtime.port): runtime.detail
+            for runtime in runtime_map.runtimes.values()
+            if not runtime.ready
+        }
         self._safe_log_freshness_event(
-            "__preflight__", "services_ensured", runtime_map.to_dict(),
+            "__preflight__", "services_ensured",
+            {
+                **runtime_map.to_dict(),
+                "unready_details": unready_details,
+            },
         )
         print(
             "[Verification] Declared services: "
@@ -5347,6 +6283,9 @@ class Orchestrator:
             self._blocked_service_ports = set(runtime_map.unready_ports)
             for name, runtime in sorted(runtime_map.runtimes.items()):
                 if not runtime.ready:
+                    self._blocked_service_details[runtime.port] = (
+                        runtime.detail
+                    )
                     logger.warning(
                         "[service_manager] service %s on port %s is not "
                         "ready: %s", name, runtime.port, runtime.detail,
@@ -5694,14 +6633,23 @@ class Orchestrator:
             evidence = v.get("evidence", "")
             if not isinstance(evidence, str):
                 evidence = json.dumps(evidence, ensure_ascii=False)
-            results.append(
-                {
-                    "id": vp_id,
-                    "status": status,
-                    "actual_result": actual_result,
-                    "evidence": evidence,
-                }
-            )
+            result = {
+                "id": vp_id,
+                "status": status,
+                "actual_result": actual_result,
+                "evidence": evidence,
+            }
+            # 2026-10-24（api_test 的分类不能在这里丢掉）：裁决里带的
+            # failure_class / failure_class_source 是四分类判定的结果 ——
+            # "环境不可达"（infra）与"交付物坏了"（deliverable_defect）
+            # 在同因阈值上的待遇完全相反。不带过去的话，历史里每一条失败
+            # 都记成 deliverable_defect，也就是那条会计数、会生成修复任务
+            # 的类（见 verification/orchestrator.py 的 _extract_failure_records）。
+            for key in ("failure_class", "failure_class_source"):
+                value = v.get(key)
+                if value:
+                    result[key] = str(value)
+            results.append(result)
 
         # Stable, plan-order output: re-sort by the plan's original
         # index so downstream consumers (the report, the bridge UI)

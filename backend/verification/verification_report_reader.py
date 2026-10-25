@@ -318,6 +318,18 @@ def extract_failed_vps_with_paths(
       every ``logs/*.log`` under the plan directory.
     * ``test_command_path`` / ``test_command_summary`` /
       ``expected_result_summary`` — the plan overlay, same shape rule.
+    * ``failure_class`` / ``failure_class_source`` — the class the report
+      recorded for the failure, and where that class came from. The
+      repair gate reads the class off the record
+      (:func:`repair_generator.select_repairable_failed_vps`), so a
+      reader that dropped it would turn every failure into a broken
+      deliverable — and hand an out-of-scope check to the repair model.
+    * ``definition_missing`` — whether the point still has a definition
+      in the plan (2026-10-25, VP-031). A FAILED entry for a point the
+      plan does not define is not a broken deliverable: the criterion
+      was never written down, so there is nothing a rework could
+      satisfy. The record is **kept** — the evidence paths are what an
+      operator reads — but the gate refuses it.
 
     Why this exists: ``extract_failed_vps_from_report`` inlines
     ``actual_result`` / ``evidence`` and the repair prompt truncates each
@@ -332,6 +344,18 @@ def extract_failed_vps_with_paths(
     Returns an empty list when the report is missing, unreadable, or
     contains no FAILED entries.
     """
+    # The class rule lives in ``verification.failure_history`` — the
+    # module the history records and the repair gate read it from — so
+    # the reader, the history and the gate cannot drift apart. The
+    # import is inside the function for the same reason
+    # ``repair_generator`` keeps its copy there: ``verification``'s
+    # ``__init__`` imports the orchestrator, and the orchestrator
+    # imports this module.
+    from verification.failure_history import (
+        failure_class_of,
+        failure_class_source_of,
+    )
+
     if not report_path.exists():
         return []
 
@@ -342,15 +366,30 @@ def extract_failed_vps_with_paths(
         return []
 
     plan: Dict[str, Dict[str, Any]] = {}
+    plan_known = False
     if plan_path is not None and plan_path.exists():
         try:
             with open(plan_path, "r", encoding="utf-8") as f:
                 plan_data = json.load(f)
-            plan = {
-                str(vp.get("id", "")): vp
-                for vp in (plan_data.get("verification_points") or [])
-                if vp.get("id")
-            }
+            points = plan_data.get("verification_points")
+            if isinstance(points, list):
+                plan = {
+                    str(vp.get("id", "")): vp
+                    for vp in points
+                    if isinstance(vp, dict) and vp.get("id")
+                }
+                # 2026-10-25 (VP-031, second pass): a plan is
+                # authoritative about which points exist only when it
+                # **defines** some. A plan that parses but carries no
+                # ``verification_points`` (absent key, or an empty list)
+                # has no say in the question "is this point defined?" —
+                # reading it as "it defines none" turns **every** failure
+                # in the report into ``criterion_defect``, which is a
+                # conclusion about the criterion that nothing supports.
+                #
+                # So: unknown stays unknown, and the record keeps the
+                # class it states (or the default).
+                plan_known = bool(plan)
         except (OSError, json.JSONDecodeError):
             plan = {}
 
@@ -393,6 +432,19 @@ def extract_failed_vps_with_paths(
             actual = str(r.get("actual_result", "") or "")
             verdict_evidence = str(r.get("evidence", "") or "")
 
+            # 2026-10-25 (VP-031): 这个 id 在验证计划里还有没有定义？
+            #
+            # 报告里的一条 FAILED 不等于"交付物坏了"。round 3 的
+            # VP-031 从来没有判据 —— 它不在 ``verification_plan.json``
+            # 里，所以报告里那条 FAILED 说的不是"产物不对"，而是
+            # "这条判据根本没有"。核对定义这件事只能在这里做：reader
+            # 是唯一同时拿着报告和计划的地方。
+            #
+            # 记录**不删**：证据路径留着，操作者要看的正是这条失败说了
+            # 什么。判据层拿到的是"没有定义"这个事实，修复层据此不放行。
+            definition_missing = bool(plan_known and vp_id not in plan)
+            defined_vp_ids = set(plan) if plan_known else None
+
             evidence_paths: List[str] = []
             if actual:
                 evidence_paths.append(
@@ -411,6 +463,26 @@ def extract_failed_vps_with_paths(
                 "actual_result_summary": _summarize(actual),
                 "evidence_summary": _summarize(verdict_evidence),
                 "evidence_paths": evidence_paths,
+                # 2026-10-23 (VP-026): the class the verdict recorded, so
+                # the repair gate can tell a broken deliverable from an
+                # out-of-scope check. A report that names no class reads
+                # as ``deliverable_defect`` — the class that counts —
+                # and the source says the class was assumed, not earned.
+                #
+                # 2026-10-25 (VP-031): the class is judged against the
+                # plan, so a FAILED entry for a point that has no
+                # definition reads as ``criterion_defect`` — it is not a
+                # broken deliverable, it is a missing criterion.
+                "failure_class": failure_class_of(
+                    r, defined_vp_ids=defined_vp_ids, vp_id=vp_id,
+                ),
+                "failure_class_source": failure_class_source_of(
+                    r, defined_vp_ids=defined_vp_ids, vp_id=vp_id,
+                ),
+                # 2026-10-25 (VP-031): the fact the class was derived
+                # from, said out loud — a record that carries no class
+                # can still carry this one.
+                "definition_missing": definition_missing,
             }
             if vp_plan:
                 # 2026-10-11: point at whichever key actually carries the

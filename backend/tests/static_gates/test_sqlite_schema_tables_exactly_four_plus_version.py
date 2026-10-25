@@ -1,5 +1,5 @@
 """VP-006 - acceptance_4 anchor test 2: SQLite schema table set must
-equal exactly the four ``plan_*`` tables plus the migration logbook
+equal exactly the ``plan_*`` tables plus the migration logbook
 ``schema_version``.
 
 Background
@@ -9,9 +9,9 @@ for plan-level state.  The ``sqlite_master`` table name set for the
 state-machine database MUST be EXACTLY::
 
     {plan_routing, plan_execution, plan_verification, plan_artifacts,
-     schema_version}
+     plan_tasks, plan_decisions, schema_version}
 
-i.e. four ``plan_*`` "concern" tables plus one ``schema_version``
+i.e. the ``plan_*`` "concern" tables plus one ``schema_version``
 migration logbook table.  No legacy ``plans``, ``plan_meta``, or
 ``plan_activity`` tables are allowed; no extra ``plan_*`` tables are
 allowed either.
@@ -22,6 +22,16 @@ The brief calls this out as:
         {plan_routing, plan_execution, plan_verification,
          plan_artifacts} | migration version tables
 
+The count in this file's name is where that number came from, not what
+the set holds today: the four concern tables the brief names, plus the
+migration logbook.  Two concern tables have been added since the brief
+was written -- ``plan_tasks`` (the per-task runtime table lifted out of
+``tasks.json``) and ``plan_decisions`` (the human-in-the-loop store) --
+and the file name and the test name were kept rather than renamed, so
+that the anchor this file provides keeps pointing at the same gate.
+The *expectation* is the set below, and the set is what the schema has
+to equal.
+
 What the test does
 ------------------
 1. Build a fresh SQLite state-machine DB in ``tmp_path`` using the
@@ -31,7 +41,7 @@ What the test does
    system tables).
 3. Assert the resulting set equals :data:`EXPECTED_SCHEMA_TABLES`
    exactly - no extras (legacy tables must not appear), no missing
-   (the four plan_* + schema_version must all be present).
+   (every plan_* table + schema_version must all be present).
 """
 
 from __future__ import annotations
@@ -54,16 +64,18 @@ from state_machine.db.schema import migrate  # noqa: E402
 # Expected schema
 # ---------------------------------------------------------------------------
 #
-# The four ``plan_*`` tables own one concern each:
+# The ``plan_*`` tables own one concern each:
 #   * plan_routing      - current phase / substage / version
 #   * plan_execution    - run / pid / attempt counts
 #   * plan_verification - verification round / status
 #   * plan_artifacts    - artifact status / content_hash
-# plus the ``schema_version`` migration logbook, and the v4
+# plus the ``schema_version`` migration logbook, the v4
 # ``plan_tasks`` table (per-task runtime status lifted out of
 # tasks.json by the task #v4 split — see
 # ``state_machine/db/schema.py`` and ``task_manager``'s
-# ``_persist_status_to_sqlite``).
+# ``_persist_status_to_sqlite``), and the v7 ``plan_decisions`` table
+# (the human-in-the-loop decision store — see the same schema module's
+# ``_ensure_plan_decisions``).
 EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
     {
         "plan_routing",
@@ -71,6 +83,7 @@ EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
         "plan_verification",
         "plan_artifacts",
         "plan_tasks",
+        "plan_decisions",
         "schema_version",
     }
 )
@@ -90,15 +103,15 @@ pytestmark = [
 
 @pytest.mark.acceptance_4
 def test_sqlite_schema_tables_exactly_four_plus_version(tmp_path: Path) -> None:
-    """``sqlite_master`` table name set must equal exactly the four
+    """``sqlite_master`` table name set must equal exactly the
     ``plan_*`` tables plus the migration logbook ``schema_version``.
 
     Implementation:
 
       1. Open a fresh SQLite database at ``tmp_path / state.db``
          using the production helper :func:`open_db`.
-      2. Run :func:`migrate` to create the canonical four tables and
-         the ``schema_version`` migration row.
+      2. Run :func:`migrate` to create the canonical concern tables
+         and the ``schema_version`` migration row.
       3. Query ``sqlite_master`` for user tables (excluding
          ``sqlite_*`` system tables).
       4. Assert the set equals :data:`EXPECTED_SCHEMA_TABLES`
@@ -122,7 +135,7 @@ def test_sqlite_schema_tables_exactly_four_plus_version(tmp_path: Path) -> None:
         f"schema table set must equal exactly "
         f"{set(EXPECTED_SCHEMA_TABLES)!r}; got {sorted(names)!r}.  "
         f"Legacy tables (plans, plan_meta, plan_activity) must not "
-        f"appear, and the four plan_* + schema_version tables must "
+        f"appear, and every plan_* table + schema_version must "
         f"all be present."
     )
 

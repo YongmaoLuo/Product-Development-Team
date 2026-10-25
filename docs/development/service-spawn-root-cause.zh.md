@@ -317,27 +317,26 @@ cd backend && .venv/bin/python -m pytest tests/unit/test_credentials_fd_protocol
 
 | 条款 | 测试 | 符号 | 源码 |
 | --- | --- | --- | --- |
-| C1 | `test_clause_c1_fifo_is_decided_by_fstat` | `_is_pipe` | `backend/credentials.py:711` |
-| C2 | `test_clause_c2_fifo_alone_is_not_sufficient` | `_is_pipe` | `backend/credentials.py:707` |
-| C3 | `test_clause_c3_payload_is_returned_only_after_eof` | `_drain_published_pipe` | `backend/credentials.py:717` |
-| C4 | `test_clause_c4_fd_is_closed_before_the_payload_is_parsed` | `read_secret_fd` | `backend/credentials.py:1261` |
-| C5 | `test_clause_c5_unpublished_descriptor_raises_value_error` | `read_secret_fd` | `backend/credentials.py:1261` |
-| C6 | `test_clause_c6_unpublished_descriptor_is_not_read` | `_drain_published_pipe` | `backend/credentials.py:717` |
-| C7 | `test_clause_c7_unpublished_descriptor_is_not_closed` | `read_secret_fd` | `backend/credentials.py:1261` |
-| C8 | `test_clause_c8_flags_of_a_live_writer_pipe_are_unchanged` | `_drain_published_pipe` | `backend/credentials.py:789` |
-| C9 | `test_clause_c9_flags_of_a_regular_file_are_unchanged` | `_is_pipe` | `backend/credentials.py:695` |
-| C10 | `test_clause_c10_flags_of_a_kqueue_descriptor_are_unchanged` | `_drain_published_pipe` | `backend/credentials.py:789` |
-| C11 | `test_clause_c11_the_pre_fix_shape_changed_those_flags` | `_drain_published_pipe` | `backend/credentials.py:789` |
-| C12 | `test_clause_c12_kqueue_is_a_fifo_to_fstat_and_the_comment_says_so` | `_is_pipe` | `backend/credentials.py:711` |
-| C13 | `test_clause_c13_the_source_points_at_the_root_cause_document` | `_drain_published_pipe` | `backend/credentials.py:717` |
-| C14 | `test_clause_c14_a_failed_f_setfl_still_takes_effect_and_the_source_says_so` | `_drain_published_pipe` | `backend/credentials.py:751` |
-| C15 | `test_clause_c15_pdt_secret_fd_variable_names_are_not_removed` | `secret_fd_env_var` | `backend/credentials.py:1145` |
-| C16 | `test_clause_c16_drain_never_touches_descriptor_flags` | `_drain_published_pipe` | `backend/credentials.py:789` |
-| C17 | `test_clause_c17_the_guard_rejects_the_shape_it_exists_to_reject` | `_drain_published_pipe` | `backend/credentials.py:789` |
+| C1 | `test_clause_c1_fifo_is_decided_by_fstat` | `_is_pipe` | `backend/credentials.py:734` |
+| C2 | `test_clause_c2_fifo_alone_is_not_sufficient` | `_is_pipe` | `backend/credentials.py:730` |
+| C3 | `test_clause_c3_payload_is_returned_only_after_eof` | `_drain_published_pipe` | `backend/credentials.py:740` |
+| C4 | `test_clause_c4_fd_is_closed_before_the_payload_is_parsed` | `read_secret_fd` | `backend/credentials.py:1416` |
+| C5 | `test_clause_c5_unpublished_descriptor_raises_value_error` | `read_secret_fd` | `backend/credentials.py:1416` |
+| C6 | `test_clause_c6_unpublished_descriptor_is_not_read` | `_drain_published_pipe` | `backend/credentials.py:740` |
+| C7 | `test_clause_c7_unpublished_descriptor_is_not_closed` | `read_secret_fd` | `backend/credentials.py:1416` |
+| C8 | `test_clause_c8_flags_of_a_live_writer_pipe_are_unchanged` | `_drain_published_pipe` | `backend/credentials.py:812` |
+| C9 | `test_clause_c9_flags_of_a_regular_file_are_unchanged` | `_is_pipe` | `backend/credentials.py:718` |
+| C10 | `test_clause_c10_flags_of_a_kqueue_descriptor_are_unchanged` | `_drain_published_pipe` | `backend/credentials.py:812` |
+| C11 | `test_clause_c11_the_pre_fix_shape_changed_those_flags` | `_drain_published_pipe` | `backend/credentials.py:812` |
+| C12 | `test_clause_c12_kqueue_is_a_fifo_to_fstat_and_the_comment_says_so` | `_is_pipe` | `backend/credentials.py:734` |
+| C13 | `test_clause_c13_the_source_points_at_the_root_cause_document` | `_drain_published_pipe` | `backend/credentials.py:740` |
+| C14 | `test_clause_c14_a_failed_f_setfl_still_takes_effect_and_the_source_says_so` | `_drain_published_pipe` | `backend/credentials.py:774` |
+| C15 | `test_clause_c15_pdt_secret_fd_variable_names_are_not_removed` | `secret_fd_env_var` | `backend/credentials.py:1216` |
+| C16 | `test_clause_c16_drain_never_touches_descriptor_flags` | `_drain_published_pipe` | `backend/credentials.py:812` |
+| C17 | `test_clause_c17_the_guard_rejects_the_shape_it_exists_to_reject` | `_drain_published_pipe` | `backend/credentials.py:812` |
 | C18 | `test_clause_c18_the_acceptance_table_matches_this_module` | `test_clause_c18_the_acceptance_table_matches_this_module` | `backend/tests/unit/test_credentials_fd_protocol.py:1133` |
-| C19 | `test_clause_c19_drain_never_attempts_to_change_the_flags` | `_drain_published_pipe` | `backend/credentials.py:789` |
-| C20 | `test_clause_c20_no_read_can_block` | `_drain_published_pipe` | `backend/credentials.py:802` |
-
+| C19 | `test_clause_c19_drain_never_attempts_to_change_the_flags` | `_drain_published_pipe` | `backend/credentials.py:812` |
+| C20 | `test_clause_c20_no_read_can_block` | `_drain_published_pipe` | `backend/credentials.py:825` |
 条款与判据原文的对应：
 
 - **C1**「仅当 fd 为 FIFO（fstat 判定）」——FIFO 由 `os.fstat` + `stat.S_ISFIFO` 判定。

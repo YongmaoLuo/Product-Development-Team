@@ -53,6 +53,8 @@ there.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -473,6 +475,18 @@ def stop_service(
         "name": runtime.name, "port": runtime.port, "killed": [],
         "signalled": [], "port_free": False, "detail": "",
     }
+    # Diagnostic (2026-10-24): every stop goes through here, so this line
+    # is the one place that names *who* asked for it. A verification round
+    # lost its declared service 15s after it became ready and nobody could
+    # say which path signalled it; the caller name is what answers that.
+    try:
+        _caller = sys._getframe(1).f_code.co_name
+    except Exception:  # pragma: no cover - diagnostics must not raise
+        _caller = "?"
+    logger.info(
+        "[service_manager] stop_service port=%s name=%s pid=%s pgid=%s caller=%s",
+        runtime.port, runtime.name, runtime.pid, runtime.pgid, _caller,
+    )
     if runtime.port in PROTECTED_PORTS:
         result["detail"] = (
             f"refusing to stop port {runtime.port}: backend-runtime port"
@@ -1088,6 +1102,87 @@ def _failure_detail(
 # Orchestration
 # ---------------------------------------------------------------------------
 
+#: Where the per-port start locks live, relative to the project the
+#: service belongs to.  The lock is per **port**, not per plan: two
+#: callers that want to bring up the same port are competing for the
+#: same resource, whoever they are.
+#:
+#: Under ``.pdt/`` because that is where this repository keeps the
+#: runtime state a checkout *produces* rather than ships — and a
+#: workspace keeps its file locks under ``.pdt/locks/`` (see
+#: :mod:`config_paths`).  ``.pdt/`` is gitignored, so a lock file is
+#: never something a commit can pick up.
+_PORT_LOCK_DIRNAME = ".pdt/service-locks"
+
+#: How long a caller waits for the port lock before it gives up and
+#: proceeds without it.  Bounded on purpose — an unbounded wait turns a
+#: stuck lock into a stuck round, which is worse than the race the lock
+#: exists to prevent.
+_PORT_LOCK_TIMEOUT_SECONDS = 300.0
+
+
+@contextlib.contextmanager
+def _port_lock(project_dir: Path, port: int):
+    """Serialise the callers that want to bring up *this* port.
+
+    2026-10-24 (repair-r3-16).  ``ensure_services`` is called from the
+    round-start preflight **and** from the per-VP recovery, and a round
+    runs its VPs concurrently.  Two callers that both find the port free
+    both start a service on it: the second one loses the race and exits
+    with EADDRINUSE, so the round concludes that the service "cannot
+    start" when it very well can.
+
+    The lock is held across the probe **and** the start, so the second
+    caller re-probes after the first one finished and finds the service
+    the first one started — and adopts it (rule 2 of the ownership
+    rules above) instead of starting a second copy on top of it.
+
+    ``flock`` is held per open file description, so two threads of ONE
+    process each opening their own descriptor serialise correctly —
+    which is the case that matters here, because a round's VPs run on a
+    thread pool.
+
+    Never raises: a lock that cannot be created or taken is logged and
+    the caller proceeds without it.  The failure mode of *no* lock is
+    the one that already existed (two copies fighting over the port);
+    the failure mode of a stuck lock would be a stuck round.
+    """
+    lock_dir = Path(project_dir) / _PORT_LOCK_DIRNAME
+    lock_path = lock_dir / f"port-{port}.lock"
+    fd = None
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        logger.warning(
+            "[service_manager] could not open the port lock %s: %s; "
+            "proceeding without it", lock_path, exc,
+        )
+        yield
+        return
+    try:
+        deadline = time.monotonic() + _PORT_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "[service_manager] gave up waiting for the port "
+                        "lock %s after %.0fs; proceeding without it",
+                        lock_path, _PORT_LOCK_TIMEOUT_SECONDS,
+                    )
+                    break
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:  # noqa: BLE001 - unlocking a free lock is a no-op
+            pass
+        os.close(fd)
+
 
 def ensure_services(
     project_dir: Path,
@@ -1106,6 +1201,11 @@ def ensure_services(
          with the declared command, not the captured one).
       3. Port held by anything else → **refuse**: no kill, service
          reported unready with a reason, its VPs get BLOCKED.
+
+    One service at a time, and **one caller at a time per port**: the
+    probe and the start happen under the port's lock, so a second
+    caller re-probes instead of racing the first one onto the same
+    port.  See :func:`_port_lock` for why that matters.
 
     Never raises; a failure is a per-service ``ready=False``.
     """
@@ -1137,75 +1237,88 @@ def ensure_services(
             )
             result.runtimes[name] = runtime
             continue
-        try:
-            probe = probe_port(decl.port)
-        except Exception as exc:  # noqa: BLE001 - probe never raises
-            runtime.detail = f"probe failed: {exc}"
-            result.runtimes[name] = runtime
-            continue
-
-        if probe.listening:
-            if not matches_declaration(decl, probe):
-                # Rule 3: the port is held by something we cannot identify,
-                # so we neither adopt it nor kill it — **we get out of the
-                # way**. Start our own copy on a free port and point every
-                # VP at that. (2026-09-18 decision: a process whose
-                # cmdline matches the declaration is ours to kill; anything
-                # else is unknown and must not be touched — the round
-                # gets out of its way instead.)
-                foreign = '; '.join(probe.cmdlines) or 'unknown'
-                runtime = _relocate_service(
-                    decl, project_dir, foreign_cmdline=foreign,
-                )
+        with _port_lock(project_dir, decl.port):
+            try:
+                probe = probe_port(decl.port)
+            except Exception as exc:  # noqa: BLE001 - probe never raises
+                runtime.detail = f"probe failed: {exc}"
                 result.runtimes[name] = runtime
                 continue
 
-            stale = (
-                not ignore_freshness
-                and newest_source is not None
-                and probe.process_start_epoch is not None
-                and probe.process_start_epoch < newest_source
-            )
-            if not stale:
-                runtime.origin = "adopted"
-                runtime.ready = True
+            if probe.listening:
+                if not matches_declaration(decl, probe):
+                    # Rule 3: the port is held by something we cannot
+                    # identify, so we neither adopt it nor kill it — **we
+                    # get out of the way**. Start our own copy on a free
+                    # port and point every VP at that. (2026-09-18
+                    # decision: a process whose cmdline matches the
+                    # declaration is ours to kill; anything else is
+                    # unknown and must not be touched — the round gets
+                    # out of its way instead.)
+                    foreign = '; '.join(probe.cmdlines) or 'unknown'
+                    runtime = _relocate_service(
+                        decl, project_dir, foreign_cmdline=foreign,
+                    )
+                    result.runtimes[name] = runtime
+                    continue
+
+                stale = (
+                    not ignore_freshness
+                    and newest_source is not None
+                    and probe.process_start_epoch is not None
+                    and probe.process_start_epoch < newest_source
+                )
+                if not stale:
+                    runtime.origin = "adopted"
+                    runtime.ready = True
+                    runtime.pid = probe.pids[0] if probe.pids else None
+                    runtime.start_epoch = probe.process_start_epoch
+                    runtime.pgid = (
+                        _process_group_of(runtime.pid)
+                        if runtime.pid else None
+                    )
+                    runtime.detail = (
+                        "adopted a live, fresh, matching listener"
+                    )
+                    result.runtimes[name] = runtime
+                    continue
+
+                # Matching but stale: restart it. Its cmdline matched the
+                # declaration, so killing it is the identified-process case
+                # the safety model allows.
+                logger.info(
+                    "[service_manager] restarting stale listener port=%s "
+                    "pid=%s start_epoch=%s newest_source=%s",
+                    decl.port, probe.pids[0] if probe.pids else None,
+                    probe.process_start_epoch, newest_source,
+                )
+                runtime.origin = "ready_foreign"
                 runtime.pid = probe.pids[0] if probe.pids else None
-                runtime.start_epoch = probe.process_start_epoch
                 runtime.pgid = (
                     _process_group_of(runtime.pid) if runtime.pid else None
                 )
-                runtime.detail = "adopted a live, fresh, matching listener"
-                result.runtimes[name] = runtime
-                continue
-
-            # Matching but stale: restart it. Its cmdline matched the
-            # declaration, so killing it is the identified-process case
-            # the safety model allows.
-            runtime.origin = "ready_foreign"
-            runtime.pid = probe.pids[0] if probe.pids else None
-            runtime.pgid = (
-                _process_group_of(runtime.pid) if runtime.pid else None
-            )
-            stop_info = stop_service(runtime, decl)
-            if not stop_info["port_free"]:
-                runtime.ready = False
-                runtime.detail = (
-                    f"stale matching listener could not be stopped: "
-                    f"{stop_info['detail']}"
+                stop_info = stop_service(runtime, decl)
+                if not stop_info["port_free"]:
+                    runtime.ready = False
+                    runtime.detail = (
+                        f"stale matching listener could not be stopped: "
+                        f"{stop_info['detail']}"
+                    )
+                    result.runtimes[name] = runtime
+                    continue
+                restarted = start_service(decl, project_dir)
+                restarted.origin = (
+                    "ready_foreign" if restarted.ready else "failed"
                 )
-                result.runtimes[name] = runtime
+                restarted.detail = (
+                    f"restarted stale listener (was pid {runtime.pid}); "
+                    f"{restarted.detail}"
+                )
+                result.runtimes[name] = restarted
                 continue
-            restarted = start_service(decl, project_dir)
-            restarted.origin = "ready_foreign" if restarted.ready else "failed"
-            restarted.detail = (
-                f"restarted stale listener (was pid {runtime.pid}); "
-                f"{restarted.detail}"
-            )
-            result.runtimes[name] = restarted
-            continue
 
-        runtime = start_service(decl, project_dir)
-        result.runtimes[name] = runtime
+            runtime = start_service(decl, project_dir)
+            result.runtimes[name] = runtime
 
     result.duration_seconds = time.monotonic() - start
     return result

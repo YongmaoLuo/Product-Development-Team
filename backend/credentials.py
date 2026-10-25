@@ -134,6 +134,20 @@ The handoff is therefore an **anonymous pipe**, with three parts:
     the secret, and it is not a path, and it stops being meaningful the
     moment the pipe is closed.
 
+    **A number in the environment is an address, not a key.** It names
+    a slot in the descriptor table of the process that published it,
+    and that table is per-process: the number travels to every
+    descendant as a string, while the pipe behind it travels only when
+    it is handed over deliberately. A descendant that reads the number
+    without checking what it names is reading whatever its own table
+    happens to have at that position, and three things can happen next,
+    all of them bad — the read blocks on somebody else's still-open
+    pipe, the read succeeds on the wrong file, or the descriptor is
+    closed on the way out and its owner later fails with ``Bad file
+    descriptor``. So the reader checks what the number names before
+    it reads, and leaves the descriptor alone when the answer is "not
+    the pipe I published".
+
 ``read_secret_fd``
     reads the pipe to EOF, closes the descriptor, and returns the
     decoded object. One consumer per pipe: the descriptor is spent.
@@ -309,6 +323,15 @@ _FD_ENV_PREFIX = "PDT_SECRET_FD_"
 #: read to EOF, so this only decides how many syscalls a payload costs;
 #: a credential fits in the first one.
 _FD_READ_CHUNK = 4096
+
+#: The lowest descriptor number a published secret pipe can have.
+#:
+#: ``os.pipe()`` hands out the lowest free descriptor, and the three
+#: standard streams are already open in any process that could publish
+#: one — so a published pipe is never 0, 1 or 2. A number in that range
+#: therefore arrived from somewhere else, and reading it would be reading
+#: this process's own stdin, stdout or stderr.
+_MIN_PUBLISHED_FD = 3
 
 
 @dataclass(frozen=True)
@@ -826,9 +849,14 @@ def _resolve_from_inherited_fd(name: str) -> Tuple[Optional[str], str]:
 
     A descriptor that is *named* but unusable — a parent that published
     and then died before the child read, a number that is not an
-    integer, a payload that is not the object the writer promised —
-    also reports ``(None, SOURCE_MISSING)`` and lets the caller try the
-    next source.
+    A descriptor that is *named* but unusable — a parent that published
+    and then died before the child read, a number that is not an
+    integer, a number that names something other than a published pipe,
+    a payload that is not the object the writer promised — also reports
+    ``(None, SOURCE_MISSING)`` and lets the caller try the next source.
+    A refusal costs the deployment nothing: the resolution order is
+    inherited descriptor, then environment, then missing, and the
+    environment fallback is still there.
 
     A descriptor that is named but is **not** the pipe this module
     published is the same case, and it is the one that bites. The
@@ -837,8 +865,24 @@ def _resolve_from_inherited_fd(name: str) -> Tuple[Optional[str], str]:
     process owns — very often the event loop's own selector. Closing
     that is what took the server down before it was ready, so a
     descriptor this module did not publish is left exactly as it was
-    found: not read, not closed. There was no handoff, so there is no
-    value, and the process carries on.
+    found: not read, not closed, and not left in a different blocking
+    mode. There was no handoff, so there is no value, and the process
+    carries on.
+
+    A refused descriptor is **not** spent. :func:`read_secret_fd` closes
+    the descriptor it consumed and leaves every other one exactly as it
+    found it, because a descriptor number in the environment is an
+    address in the publishing process's descriptor table and may well
+    name something this process owns. Closing a descriptor this module
+    does not own is not a cleanup; it is damage.
+
+    The refusal is logged, and it is logged loudly. A number that cannot
+    be used is a deployment problem — the launcher published a
+    descriptor that never arrived, or an ancestor exported a number that
+    means nothing here — and the operator has no other way to find out.
+    The line says which number it was about and what that number turned
+    out to be, because "the secret is missing" on its own is a symptom
+    with no cause.
 
     The variable naming the descriptor is left in place. It holds a
     number naming a closed pipe, so it carries nothing, and removing it
@@ -853,24 +897,51 @@ def _resolve_from_inherited_fd(name: str) -> Tuple[Optional[str], str]:
     try:
         fd = int(raw_fd)
     except ValueError:
-        log.debug("inherited fd for %s is not an integer: %r", name, raw_fd)
+        log.warning(
+            "inherited fd for %s is not an integer (%r); a descriptor number "
+            "in the environment is an address in the publishing process's "
+            "descriptor table, not a key — falling through to the next source",
+            name,
+            raw_fd,
+        )
         return (None, SOURCE_MISSING)
 
     if not _is_pipe(fd):
         # The number arrived without the pipe behind it. Whatever it
         # names here belongs to this process, and is not ours to close.
-        log.debug("inherited fd for %s does not name a pipe: %r", name, raw_fd)
+        # The refusal is worth a line an operator can act on: it says
+        # which number it was about and what that number turned out to
+        # be, because "the secret is missing" on its own is a symptom
+        # with no cause.
+        log.warning(
+            "inherited fd %d for %s does not name a pipe (found: %s); a "
+            "descriptor number in the environment is an address in the "
+            "publishing process's descriptor table, not a key — falling "
+            "through to the next source",
+            fd,
+            name,
+            _describe_fd(fd),
+        )
         return (None, SOURCE_MISSING)
 
     try:
         payload = read_secret_fd(fd)
     except (OSError, ValueError) as exc:
-        # A pipe whose writer never arrived, a payload the writer
-        # should not have produced, and a descriptor that is not the
-        # published pipe at all are the same problem here: this source
-        # has no value. All three are worth a log line, because all
-        # three mean the handoff did not arrive intact.
-        log.debug("inherited fd for %s did not yield a value: %s", name, exc)
+        # A pipe whose writer never arrived, a number that named
+        # something other than a published pipe, and a payload the writer
+        # should not have produced, are the same problem here: this
+        # source has no value. All three are worth a log line, because
+        # all three mean the handoff did not arrive intact — and only
+        # one of them is visible from the outside.
+        log.warning(
+            "inherited fd %d for %s did not yield a value (%s); a descriptor "
+            "number in the environment is an address in the publishing "
+            "process's descriptor table, not a key — falling through to the "
+            "next source",
+            fd,
+            name,
+            exc,
+        )
         return (None, SOURCE_MISSING)
 
     value = payload.get(name)
@@ -1258,6 +1329,90 @@ def publish_secret_fd(name: str) -> int | None:
     return read_fd
 
 
+def _describe_fd(fd: int) -> str:
+    """Return a short name for whatever ``fd`` currently refers to.
+
+    Used in the messages that explain a refusal. The *kind* is what
+    tells an operator whether the number named a pipe that was never
+    published, a file, or a socket — three different deployment
+    problems that all arrive as "the secret is missing".
+    """
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError:
+        return "closed"
+    if stat.S_ISFIFO(mode):
+        return "pipe"
+    if stat.S_ISREG(mode):
+        return "regular file"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    return "unknown"
+
+
+def _assert_published_pipe(fd: int) -> None:
+    """Raise :class:`ValueError` unless ``fd`` can be a published secret pipe.
+
+    A descriptor number in the environment is an **address** in the
+    descriptor table of the process that published it — not a key that
+    can be used as it stands. The number travels to every descendant as
+    a string; the pipe behind it does not travel at all unless it was
+    handed over deliberately, which is exactly what a CI gate does not
+    do. A descendant that reads the number blindly is reading whatever
+    its own table has at that position — pytest's saved copy of stdout,
+    an asyncio selector, an execnet worker's channel — and the three
+    ways that goes wrong are all bad:
+
+    * a read that blocks forever on somebody else's still-open pipe,
+      until a watchdog kills the whole worker;
+    * a read that succeeds on the wrong file, so the caller believes a
+      secret arrived;
+    * a close that takes the stranger's descriptor away from it, and
+      the owner then fails with ``Bad file descriptor`` at its next use.
+
+    Three checks, each closing one of those:
+
+    * the number must be above the standard streams
+      (:data:`_MIN_PUBLISHED_FD`);
+    * the descriptor must be open in *this* process;
+    * on POSIX it must be a pipe, because a published secret travels on
+      a pipe and nothing else this module makes is one — the same
+      question :func:`_is_pipe` asks, and the same answer.
+
+    Whether the pipe has a live writer is not checked here — the read
+    checks that, because only the read can tell.
+
+    **The flags of the descriptor are never touched — not even read.**
+    The refusal path used to put the descriptor into non-blocking mode
+    so that the read could not hang, and to put it back afterwards. That
+    is not a shape that can keep its promise: the non-blocking flag lives
+    on the open file description, every duplicate of the descriptor
+    shares it, and a *failed* ``F_SETFL`` still takes effect — so on a
+    descriptor whose ``fcntl`` fails (a macOS kqueue descriptor, for
+    instance) the restore does not restore, and the stranger's
+    descriptor is left changed. The guarantee now comes from a readiness
+    question asked before every read instead, which asks without
+    touching the descriptor at all — see :func:`_drain_published_pipe`.
+    """
+    if isinstance(fd, bool) or not isinstance(fd, int):
+        raise ValueError(f"descriptor {fd!r} is not an integer")
+    if fd < _MIN_PUBLISHED_FD:
+        raise ValueError(
+            f"descriptor {fd} is a standard stream; a published secret "
+            f"pipe is never one of 0, 1 or 2"
+        )
+    if not _is_pipe(fd):
+        raise ValueError(
+            f"descriptor {fd} does not name a pipe (found: {_describe_fd(fd)})"
+        )
+
+
 def read_secret_fd(fd: int) -> dict[str, str]:
     """Read a published secret from ``fd``; return it, and close ``fd``.
 
@@ -1267,6 +1422,13 @@ def read_secret_fd(fd: int) -> dict[str, str]:
     the process — whose read would then block forever, waiting on a
     writer that went away the moment the payload was written. Closing on
     the way out turns that into a fast failure.
+
+    A descriptor that is not a published pipe is refused, and refused
+    *without being touched*: it is not read, not closed, and not left
+    in a different blocking mode. See :func:`_assert_published_pipe`
+    for why that distinction is the whole contract, and
+    :func:`_resolve_from_inherited_fd` for what a refusal means to the
+    caller.
 
     A descriptor this module did **not** publish is a different matter,
     and it is not this module's to close. A descriptor number is only
@@ -1279,6 +1441,18 @@ def read_secret_fd(fd: int) -> dict[str, str]:
     :func:`_drain_published_pipe` for how "the pipe we published" is
     established, and ``docs/development/service-spawn-root-cause.md``
     for what happens when it is not.
+
+    The read cannot block, and that is not a precaution but a
+    consequence of what the publisher guarantees.
+    :func:`publish_secret_fd` writes the payload and closes the write
+    end *before* it hands the read end over, so a pipe this module
+    published is already at EOF when the reader gets it — a read on it
+    returns the payload and then EOF, and never waits. A pipe that
+    still has a writer is somebody else's channel, and it is refused:
+    that refusal is what keeps a stray descriptor number from hanging
+    the process that happens to inherit it. The non-blocking guarantee
+    comes from a readiness question asked before every read, so no read
+    of this function can wedge a server's startup.
 
     The return is a flat object of strings, keyed by logical name. Flat
     because the only thing that goes through this pipe is a secret
@@ -1293,6 +1467,8 @@ def read_secret_fd(fd: int) -> dict[str, str]:
     would turn a bug at the handoff into an authentication error at the
     far end of a notification send.
     """
+    _assert_published_pipe(fd)
+
     raw = _drain_published_pipe(fd)
     if raw is None:
         raise ValueError(
@@ -1305,7 +1481,6 @@ def read_secret_fd(fd: int) -> dict[str, str]:
     # it spent, and a descriptor this function leaves behind is a
     # descriptor the caller has no way to find again.
     os.close(fd)
-
     payload = json.loads(raw.decode("utf-8", "surrogateescape"))
     if not isinstance(payload, dict) or not all(
         isinstance(key, str) and isinstance(item, str)

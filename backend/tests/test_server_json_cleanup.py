@@ -1160,6 +1160,11 @@ _CORE_SCHEMA_TABLES: frozenset[str] = frozenset(
         # into this relational table — see
         # state_machine/db/schema.py "The five plan_* tables".
         "plan_tasks",
+        # v7 (2026-10-21) HITL
+        # the human-in-the-loop decision store, created by
+        # state_machine/db/schema.py "_ensure_plan_decisions" on every
+        # migrate() call — the same call that creates the tables above.
+        "plan_decisions",
         "schema_version",
     }
 )

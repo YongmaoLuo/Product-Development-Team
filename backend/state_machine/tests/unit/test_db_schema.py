@@ -61,6 +61,21 @@ def _pragma_busy_timeout(conn: sqlite3.Connection) -> int:
     return conn.execute("PRAGMA busy_timeout").fetchone()[0]
 
 
+def _is_read_statement(statement: str) -> bool:
+    """Whether a recorded statement only reads.
+
+    ``SELECT`` is a read.  So is ``PRAGMA table_info(...)``: it asks
+    SQLite what columns a table has and changes nothing.  The v7
+    ``plan_decisions`` guard asks exactly that question on every
+    connection open -- including the fast path -- so the fast path
+    issues it too.  The contract this file pins is that the fast path
+    stays read-only (no DDL, no write lock), not the narrower "every
+    statement is a SELECT" it used to state.
+    """
+    text = statement.lstrip().upper()
+    return text.startswith("SELECT") or text.startswith("PRAGMA TABLE_INFO(")
+
+
 def _pragma_synchronous(conn: sqlite3.Connection) -> int:
     """Return the current value of ``PRAGMA synchronous`` (0..3)."""
     return conn.execute("PRAGMA synchronous").fetchone()[0]
@@ -173,7 +188,7 @@ def test_open_rejects_unwritable_db_path(tmp_path: Path) -> None:
 
 
 def test_migrate_creates_five_tables_and_version(tmp_path: Path) -> None:
-    """``migrate`` creates five plan_* tables plus the ``schema_version`` table.
+    """``migrate`` creates the ``plan_*`` tables plus ``schema_version``.
 
     Schema v4 normalisation (2026-09-09): per-task state lives in its own
     ``plan_tasks`` table (one row per task) instead of being smuggled
@@ -181,6 +196,13 @@ def test_migrate_creates_five_tables_and_version(tmp_path: Path) -> None:
     ``plan_execution.task_progress`` JSON.  This adds a fifth plan_*
     table on top of the previous four (artifacts / execution /
     routing / verification).
+
+    Schema v7 (2026-10-21) adds a sixth: ``plan_decisions``, the
+    human-in-the-loop decision store (see
+    ``state_machine/db/schema.py``'s ``_ensure_plan_decisions``).  The
+    test's name keeps the count it was written with, the way the
+    backend's copy of the same gate keeps its own name: the anchor
+    should keep pointing at the same gate.
     """
     from state_machine.db.connection import open as open_db
     from state_machine.db.schema import migrate
@@ -192,6 +214,7 @@ def test_migrate_creates_five_tables_and_version(tmp_path: Path) -> None:
         names = _table_names(conn)
         assert names == [
             "plan_artifacts",
+            "plan_decisions",
             "plan_execution",
             "plan_routing",
             "plan_tasks",
@@ -297,7 +320,7 @@ def test_migrate_fast_path_issues_no_ddl_once_current(tmp_path: Path) -> None:
         )
         assert proxy.statements, "the fast path should still do its two reads"
         assert all(
-            s.lstrip().upper().startswith("SELECT") for s in proxy.statements
+            _is_read_statement(s) for s in proxy.statements
         ), f"the fast path must be reads only; observed: {proxy.statements}"
     finally:
         conn.close()

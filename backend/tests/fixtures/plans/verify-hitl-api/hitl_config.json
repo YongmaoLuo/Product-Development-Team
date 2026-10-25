@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "mode": "auto",
+  "timeout_sec": 1800,
+  "hooks": [
+    {
+      "kind": "cmd",
+      "command": "true"
+    }
+  ]
+}

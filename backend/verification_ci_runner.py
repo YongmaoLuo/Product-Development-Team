@@ -76,6 +76,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from bounded_subprocess import run_bounded
+from credentials import _FD_ENV_PREFIX as _SECRET_FD_ENV_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +338,34 @@ def ci_timeout(vp: Dict[str, Any]) -> int:
     return max(1, value)
 
 
+def ci_subprocess_env() -> Dict[str, str]:
+    """The environment a CI gate runs in, without the descriptor addresses.
+
+    A ``PDT_SECRET_FD_*`` variable carries the *number* of a pipe the
+    launcher published to the backend. That number is an address in the
+    publisher's descriptor table, and it means nothing in any other
+    process — but the variable itself is inherited by everything this
+    backend starts, including the gate.
+
+    The gate is not given those pipes: it is a plain subprocess, so it
+    never receives the descriptors themselves. Forwarding the numbers
+    therefore hands the gate an address that resolves to whatever
+    happens to occupy that slot in *its* table — and a reader that
+    trusted the number would block on a stranger's pipe or close a
+    stranger's descriptor. The gate has no use for the variables, so
+    they are dropped here rather than passed down.
+
+    Everything else is inherited unchanged. The gate is the repository's
+    own CI entry, and it is entitled to the environment it would have
+    run in by hand.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(_SECRET_FD_ENV_PREFIX)
+    }
+
+
 def run_ci_verification(
     vp: Dict[str, Any],
     *,
@@ -377,6 +406,7 @@ def run_ci_verification(
             cwd=str(project_dir),
             text=True,
             timeout=timeout,
+            env=ci_subprocess_env(),
         )
         exit_code = completed.returncode
         stdout = completed.stdout or ""

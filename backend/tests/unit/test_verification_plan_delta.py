@@ -186,6 +186,7 @@ def test_applied_vps_land_in_phase_one_with_audit_fields() -> None:
     delta = parse_delta_payload({
         "add": [{
             "title": "新行为验收", "reason": "repair-r1-02 引入",
+            "verification_method": "code_review",
             "test_command": "pytest tests/test_x.py -k test_y",
         }],
     }, plan)
@@ -204,8 +205,10 @@ def test_multiple_additions_get_distinct_ids() -> None:
     plan = _plan(_vp("VP-001"))
     delta = parse_delta_payload({
         "add": [
-            {"title": "a", "reason": "r1", "test_command": "pytest a"},
-            {"title": "b", "reason": "r2", "test_command": "pytest b"},
+            {"title": "a", "reason": "r1", "verification_method": "code_review",
+             "test_command": "pytest a"},
+            {"title": "b", "reason": "r2", "verification_method": "code_review",
+             "test_command": "pytest b"},
         ],
     }, plan)
     apply_delta(plan, delta, round_number=2)
@@ -300,8 +303,12 @@ def test_added_vp_without_a_method_does_not_default_to_the_retired_one() -> None
     """省略 method 时不再凭空造出退休的 ``automated_test``。
 
     那个默认值会让一条 method 缺失的新增变成**永远跑不出结论**的 VP：方法
-    已不在 ``SUPPORTED_METHODS`` 里，只能被 retired / SKIPPED。空串会让
-    ``_maybe_evaluate_plan_delta`` 的护栏把它整条丢掉。
+    已不在 ``SUPPORTED_METHODS`` 里，只能被 retired / SKIPPED。
+
+    2026-10-24（VP-031）：这条曾经以"空 method 落进计划、再由护栏整条丢掉"
+    的形态存在 —— 但 id 已经发出去��了。发出去的号没有定义，就是分配账本上
+    的一个占位，而执行器对"有 id、无定义"的条目没有分派前校验。现在发号
+    之前先看这条新增能不能产出完整定义：不能，就**不发号**。
     """
     from verification_plan_delta import apply_delta, parse_delta_payload
 
@@ -309,13 +316,60 @@ def test_added_vp_without_a_method_does_not_default_to_the_retired_one() -> None
     delta = parse_delta_payload(
         {"add": [{"title": "没有写方法", "reason": "依据"}]}, plan,
     )
-    apply_delta(plan, delta, round_number=2)
+    summary = apply_delta(plan, delta, round_number=2)
 
-    new_vp = plan["verification_points"][-1]
-    assert new_vp["verification_method"] == "", (
-        f"missing method must stay empty so the guard drops the whole VP, "
-        f"got {new_vp['verification_method']!r}"
+    assert summary["added"] == [], (
+        "a method-less addition cannot be executed, so it must not land"
     )
+    assert [vp["id"] for vp in plan["verification_points"]] == ["VP-001"], (
+        "a method-less addition must not consume a VP id: the id would be "
+        "allocated without a definition behind it"
+    )
+    assert summary["rejected_definitionless"], (
+        "the rejection must leave a trace: a definition-less addition is "
+        "dropped silently otherwise"
+    )
+
+
+def test_allocator_never_emits_definitionless_id() -> None:
+    """分配器不给"产不出完整定义"的条目发号。
+
+    2026-10-24（VP-031）：增量条目缺 method（或方法已退休）时曾经照样拿到
+    一个 id（VP-031），随后被护栏整条丢掉 —— 于是分配账本上留下一个**没有
+    定义**的占位 id，而执行器对"有 id、无定义"的条目没有分派前校验，直接
+    按缺省方法把它派给了 coding tool。
+
+    现在：``next_vp_id`` 只由**能同时产出完整定义**的 added 条目调用 ——
+    产不出完整定义的条目连号都拿不到。
+    """
+    from verification_plan_delta import apply_delta, parse_delta_payload
+
+    plan = _plan(_vp("VP-001"))
+    delta = parse_delta_payload({
+        "add": [
+            {"title": "没有写方法的条目", "reason": "依据"},
+            {"title": "方法已退休的条目", "reason": "依据",
+             "verification_method": "automated_test"},
+            {"title": "完整的新增", "reason": "依据",
+             "verification_method": "code_review"},
+        ],
+        "obsolete": [],
+    }, plan)
+
+    summary = apply_delta(plan, delta, round_number=3)
+
+    ids = [vp["id"] for vp in plan["verification_points"]]
+    assert ids == ["VP-001", "VP-002"], (
+        f"only an addition that yields a complete definition may consume an "
+        f"id; landed: {ids}"
+    )
+    assert [entry["id"] for entry in summary["added"]] == ["VP-002"]
+    assert len(summary["rejected_definitionless"]) == 2, (
+        f"both definition-less additions must be recorded; "
+        f"got {summary['rejected_definitionless']!r}"
+    )
+    for entry in summary["rejected_definitionless"]:
+        assert entry["gaps"], "a rejection must say what was missing"
 
 
 def test_added_vp_has_no_test_command_field() -> None:
@@ -752,12 +806,18 @@ def test_round_two_delta_allocates_fresh_ids() -> None:
     base = _plan(*[_vp(f"VP-{i:03d}") for i in range(1, 21)])
 
     # 第 3 轮：增量新增两条
+    #
+    # 两条都带一个受支持的方法：发号之前先看这条新增能不能产出**完整**
+    # 定义（见 ``vp_definition_gaps``）—— 产不出来的条目连号都拿不到，
+    # 所以"只写标题"的新增在这里根本走不到发号那一步。
     round3 = json.loads(json.dumps(base))
     summary3 = apply_delta(
         round3,
         parse_delta_payload({"add": [
-            {"title": "第一轮新增 A", "reason": "依据"},
-            {"title": "第一轮新增 B", "reason": "依据"},
+            {"title": "第一轮新增 A", "reason": "依据",
+             "verification_method": "code_review"},
+            {"title": "第一轮新增 B", "reason": "依据",
+             "verification_method": "code_review"},
         ]}, round3),
         round_number=3,
     )
@@ -769,7 +829,8 @@ def test_round_two_delta_allocates_fresh_ids() -> None:
     summary4 = apply_delta(
         round4,
         parse_delta_payload({"add": [
-            {"title": "第二轮新增 C", "reason": "依据"},
+            {"title": "第二轮新增 C", "reason": "依据",
+             "verification_method": "code_review"},
         ]}, round4, reserved_ids=reserved),
         round_number=4,
         reserved_ids=reserved,
@@ -796,7 +857,11 @@ def test_delta_state_persists_allocated_vp_ids(tmp_path: Path) -> None:
     plan = _plan(_vp("VP-001"))
     summary = apply_delta(
         plan,
-        parse_delta_payload({"add": [{"title": "x", "reason": "依据"}]}, plan),
+        parse_delta_payload(
+            {"add": [{"title": "x", "reason": "依据",
+                      "verification_method": "code_review"}]},
+            plan,
+        ),
         round_number=3,
     )
     state["allocated_vp_ids"] = merge_allocated_ids(state, summary)
@@ -812,7 +877,8 @@ def test_delta_state_persists_allocated_vp_ids(tmp_path: Path) -> None:
     summary2 = apply_delta(
         plan2,
         parse_delta_payload(
-            {"add": [{"title": "y", "reason": "依据"}]}, plan2,
+            {"add": [{"title": "y", "reason": "依据",
+                      "verification_method": "code_review"}]}, plan2,
             reserved_ids=reserved,
         ),
         round_number=4,
@@ -910,8 +976,26 @@ def test_agent_delta_allocates_fresh_ids_across_rounds(tmp_path: Path) -> None:
         "the second delta round reused an id allocated by the first one"
     )
 
-    # 占位只落在 delta state —— 基础计划文件一个字节都不能变
+    # 占位（发号账本）落在 delta state —— 基础计划文件里是**这一轮增量
+    # 落盘后的内容**，不是基础计划本身。
+    #
+    # 增量是**原子落盘**的（``apply_delta_persisted``）：作废下一轮就复活、
+    # 替换 VP 跟着消失，都是"增量只活在内存里"造成的。所以磁盘上的计划
+    # 带着本轮新增的 VP —— 而**发号账本**仍然只住在 delta state，基础计划
+    # 里没有被写进任何"占位"。
     on_disk = json.loads(plan_file.read_text(encoding="utf-8"))
     assert [vp["id"] for vp in on_disk["verification_points"]] == [
-        f"VP-{i:03d}" for i in range(1, 21)
-    ]
+        *[
+            f"VP-{i:03d}" for i in range(1, 21)
+        ],
+        "VP-022",
+    ], (
+        "the delta is persisted into the plan file atomically, so the "
+        "round's addition is on disk; the id ledger stays in delta state"
+    )
+    assert load_delta_state(plan_dir)["allocated_vp_ids"] == [
+        "VP-021", "VP-022",
+    ], (
+        "the ledger of issued ids must outlive the round and must never "
+        "lose an id that was already handed out"
+    )

@@ -2632,6 +2632,14 @@ def _verification_progress_body(
                 "[verification_progress] round_activity failed plan=%s", plan_id,
             )
 
+    # The plan's outstanding human decisions.  The same block the plan
+    # summary and the execution progress carry, so a consumer that
+    # polls the progress endpoints reads the same shape it reads from
+    # the summary.  Imported here rather than at module scope:
+    # ``routes.plans`` reaches back into the sibling route modules,
+    # and a module-level import between them would be a cycle.
+    from routes.plans import _pending_decisions_block
+
     return {
         "plan_id": plan_id,
         "verification_status": verification_status,
@@ -2644,6 +2652,9 @@ def _verification_progress_body(
         "skipped_vps": skipped_vps,
         "pending_vps": pending_vps,
         "vps": vps,
+        # Always present — an empty block means "nothing is
+        # outstanding", which is an answer, not a missing key.
+        "pending_decisions": _pending_decisions_block(plan_id),
         # 2026-09-11 plan v12 (cards.py repair_tasks):
         # ``repair_tasks`` comes from two layers — first the in-memory
         # ``_verification_state`` (live, may be empty after server

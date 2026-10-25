@@ -7,11 +7,20 @@ Analyzes task execution results and refines the task list.
 
 import copy
 import json
-from typing import List, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from coding_tool import CodingTool, JsonSession, query_json_in_session
 from config import AgentConfig
 from config_registry import ConfigRegistry
+from failure_classification import INFRA
+from file_lock_manager import domains_overlap
+from refiner_necessity import (
+    ACTION_BLOCK,
+    ACTION_ENV_INFRA,
+    ACTION_REJECT_SPLIT,
+    ACTION_SERIALIZE,
+    audit_tasks,
+)
 from task import SubTask
 from framework.task_output_validator import TaskOutputValidator
 from framework import watchdog_signal
@@ -108,6 +117,53 @@ def _refiner_tasks_from_response(response, fallback: List[Dict]) -> List[Dict]:
 _NO_TASKS = object()
 
 
+# ---------------------------------------------------------------------------
+# Step 0 — the necessity audit
+# ---------------------------------------------------------------------------
+
+
+class RefinedTaskList(list):
+    """The task list a refinement returns, carrying the step-0 audit.
+
+    A plain list, so every consumer keeps working: the dispatcher
+    compares it with the pre-refinement list, writes it to
+    ``tasks.json`` and iterates it.  The audit rides along as an
+    attribute rather than as a key on a task, because a key on a task
+    changes that task's JSON — and the dispatcher decides whether the
+    refiner changed anything by comparing the two JSONs, so an audit
+    key would make every round look like a change.
+
+    ``necessity_audit`` holds the decision of the round:
+
+    ``findings``
+        Every finding of the audit, as plain dictionaries.
+    ``dropped_duplicates``
+        The tasks dropped as duplicates (Q1).
+    ``reject_split``
+        ``{"task_id", "reason"}`` when the task's acceptance cannot be
+        decided (Q2).  The split is refused; the task goes back to the
+        generation side to have its criterion fixed.
+    ``infra``
+        ``{"task_id", "reason"}`` when the task needs an environment the
+        project does not have (Q3).
+    ``serialized``
+        ``{task_id: [task ids it waits for]}`` for the write domains
+        that collide (Q4).
+    ``blocked``
+        The conflicts that could not be ordered (Q4).
+    ``error``
+        The audit's own failure, if it had one.  A failed audit is
+        recorded and the split continues — the audit must never be the
+        reason a plan stops being refined.
+    """
+
+    def __init__(self, iterable=(), necessity: Optional[Dict[str, Any]] = None):
+        super().__init__(iterable)
+        self.necessity_audit: Dict[str, Any] = (
+            necessity if necessity is not None else {}
+        )
+
+
 class RefinerExhausted(Exception):
     """Raised when the refiner cannot produce a valid task list."""
 
@@ -119,6 +175,12 @@ class RefinerExhausted(Exception):
 
 class TaskRefiner:
     """Refines task list based on execution results."""
+
+    #: The decision of the most recent necessity audit.  It is also on
+    #: the returned task list (``RefinedTaskList.necessity_audit``);
+    #: this attribute is here for the caller that wants to read the
+    #: decision without holding on to the returned list.
+    last_necessity_audit: Dict[str, Any] = {}
 
     def __init__(
         self,
@@ -143,6 +205,8 @@ class TaskRefiner:
         file_context: str = "",
         project_dir: Optional[str] = None,
         plan_id: Optional[str] = None,
+        all_tasks: Optional[List[Dict]] = None,
+        project_index: Optional[Dict] = None,
     ) -> List[Dict]:
         """
         Refine task list based on last execution result.
@@ -161,7 +225,53 @@ class TaskRefiner:
                 If omitted, the constructor's ``project_dir`` is used.
             plan_id: Plan identifier used to write the watchdog signal
                 when the refiner exhausts its correction budget.
+            all_tasks: The batch the failed task belongs to, when it is
+                wider than ``tasks``.  The necessity audit compares a
+                task with the rest of its batch — that is how a
+                duplicate (Q1) and a colliding write domain (Q4) are
+                recognised.  Defaults to ``tasks``.
+            project_index: What the project provides — the services,
+                ports, environment variables and file sources the audit
+                compares a task's requirements against.  ``None`` (the
+                default) means "the audit knows nothing about the
+                project", so it stays silent about what it cannot
+                judge; the questions that need nothing but task
+                metadata (Q1, Q4) are still answered.
+
+        Returns:
+            The refined task list.  It is a
+            :class:`RefinedTaskList`, so the step-0 audit of this round
+            is on it as ``necessity_audit``.
         """
+        # -- Step 0: the necessity audit --------------------------------
+        #
+        # This runs before the refiner talks to the model, because
+        # everything that follows assumes the task was worth running.
+        # The split produces a failure to classify, and a task that was
+        # a duplicate — or one whose acceptance could never be decided —
+        # would be filed as a deliverable defect and then counted as
+        # "the same cause twice".
+        #
+        # The verdict is obeyed as it stands: a task whose acceptance
+        # cannot be decided is not split, whatever else the row does or
+        # does not declare.  There is no carve-out for rows the audit
+        # finds hard to judge — a verdict that is recorded but not
+        # obeyed would put the failure back into the triage, which is
+        # exactly what this step exists to prevent.
+        necessity = self._audit_necessity(
+            tasks=tasks,
+            all_tasks=all_tasks,
+            project_index=project_index,
+            last_task_id=last_task_id,
+        )
+        tasks = self._apply_necessity(tasks, necessity)
+        if self._necessity_blocks_split(necessity, last_task_id):
+            # There is nothing to split: the task was dropped as a
+            # duplicate, refused because its acceptance cannot be
+            # decided, held for an environment the project lacks, or
+            # blocked because its conflict could not be ordered.
+            return self._refined(tasks, necessity, last_task_id)
+
         base_context = self._build_refiner_context(
             requirement=requirement,
             tasks=tasks,
@@ -279,14 +389,24 @@ class TaskRefiner:
                 new_tasks = self._finalize_candidate(tasks, new_tasks, last_task_id)
 
                 if validator is None:
-                    return new_tasks
+                    return self._refined(
+                        self._reapply_serialization(new_tasks, necessity),
+                        necessity,
+                        last_task_id,
+                    )
 
                 snapshot = [SubTask(**t) for t in new_tasks]
                 fixed_snapshot = validator.auto_fix(snapshot)
                 final_report = validator.validate(fixed_snapshot)
 
                 if final_report.status == "passed":
-                    return [t.model_dump() for t in fixed_snapshot]
+                    return self._refined(
+                        self._reapply_serialization(
+                            [t.model_dump() for t in fixed_snapshot], necessity
+                        ),
+                        necessity,
+                        last_task_id,
+                    )
 
                 # Secondary correction: feed validation errors back to the LLM.
                 error_lines = "\n".join(final_report.reasons)
@@ -335,7 +455,369 @@ class TaskRefiner:
                     )
                 except Exception:
                     pass
+            # The audit's decisions still stand — a duplicate that was
+            # dropped stays dropped — so they ride along with the
+            # unchanged list.
+            return self._refined(tasks, necessity, last_task_id)
+
+    # ------------------------------------------------------------------
+    # Step 0 — the necessity audit
+    # ------------------------------------------------------------------
+
+    def _audit_necessity(
+        self,
+        tasks: List[Dict],
+        all_tasks: Optional[List[Dict]] = None,
+        project_index: Optional[Dict] = None,
+        last_task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Ask whether the failed task is worth splitting at all.
+
+        The audit is a **gate**, not a dependency.  It runs before the
+        refiner talks to the model, because everything after it assumes
+        the task was worth running: the split it produces is a failure
+        to classify, and a task that was a duplicate — or whose
+        acceptance could never be decided — would be filed as a
+        deliverable defect and then counted as "the same cause twice".
+
+        A failing audit is recorded and the split goes on.  The audit
+        is a check on the plan, not the plan's engine: letting it stop
+        a refinement would turn a broken rule into a broken plan.
+
+        A verdict is obeyed as it stands.  There is no carve-out for
+        rows the audit finds hard to judge: a task whose acceptance
+        cannot be decided is refused the split whatever else the row
+        does or does not declare.  A verdict that is recorded but not
+        obeyed would put the failure straight back into the triage,
+        which is the thing this step exists to prevent.
+
+        The round's decision is the verdict of the task being refined,
+        because one round refines one task: a verdict about another
+        task of the batch is recorded in ``findings`` like every other
+        finding, and it is acted on in the round that task is
+        refined.
+
+        Returns the decision envelope — see
+        :class:`RefinedTaskList` for what each key holds.
+        """
+        decision: Dict[str, Any] = {
+            "findings": [],
+            "dropped_duplicates": [],
+            "reject_split": None,
+            "infra": None,
+            "env_blocked": [],
+            "serialized": {},
+            "resolved_files": {},
+            "blocked": [],
+            "error": None,
+        }
+        batch = list(all_tasks) if all_tasks is not None else list(tasks or [])
+        try:
+            audit = audit_tasks(batch, project_index)
+        except Exception as exc:
+            decision["error"] = f"{type(exc).__name__}: {exc}"[:500]
+            self.last_necessity_audit = decision
+            self._log_necessity(decision, last_task_id, failed=True)
+            return decision
+
+        decision["findings"] = [
+            {
+                "rule": finding.rule,
+                "task_id": finding.task_id,
+                "action": finding.action,
+                "detail": finding.detail,
+            }
+            for finding in audit.findings
+        ]
+        decision["dropped_duplicates"] = sorted(audit.droppable_task_ids)
+        decision["env_blocked"] = sorted(audit.env_blocked_task_ids)
+        decision["resolved_files"] = {
+            task_id: list(paths)
+            for task_id, paths in (audit.resolved_files or {}).items()
+        }
+        decision["serialized"] = self._serialization_plan(audit, batch)
+
+        focus = str(last_task_id) if last_task_id is not None else None
+        for finding in audit.findings:
+            if finding.action == ACTION_REJECT_SPLIT:
+                if decision["reject_split"] is None and (
+                    focus is None or finding.task_id == focus
+                ):
+                    # The verdict is obeyed as it stands: a task whose
+                    # acceptance cannot be decided is not split, whatever
+                    # else the row does or does not declare.
+                    decision["reject_split"] = {
+                        "task_id": finding.task_id,
+                        "reason": finding.detail,
+                    }
+            elif finding.action == ACTION_ENV_INFRA:
+                if decision["infra"] is None and (
+                    focus is None or finding.task_id == focus
+                ):
+                    decision["infra"] = {
+                        "task_id": finding.task_id,
+                        "reason": finding.detail,
+                        "marker": INFRA,
+                    }
+            elif finding.action == ACTION_BLOCK:
+                decision["blocked"].append(
+                    {"task_id": finding.task_id, "reason": finding.detail}
+                )
+
+        self.last_necessity_audit = decision
+        self._log_necessity(decision, last_task_id)
+        return decision
+
+    def _log_necessity(
+        self,
+        decision: Dict[str, Any],
+        last_task_id: Optional[str] = None,
+        failed: bool = False,
+    ) -> None:
+        """Write the round's audit into the refiner's event log.
+
+        The audit is a decision about the plan, so it belongs next to
+        the other decisions the refiner records: a reader of the log
+        can see why a task was not split without having to re-run the
+        audit.
+        """
+        if not self.logger:
+            return
+        try:
+            if failed:
+                self.logger.error(
+                    "refiner_necessity_audit_failed",
+                    f"Necessity audit failed for task [{last_task_id}]; "
+                    f"continuing with the split",
+                    task_id=last_task_id,
+                    data={"error": decision.get("error")},
+                )
+                return
+            self.logger.info(
+                "refiner_necessity_audit",
+                f"Necessity audit for task [{last_task_id}]: "
+                f"{len(decision.get('findings') or [])} finding(s), "
+                f"{len(decision.get('dropped_duplicates') or [])} dropped",
+                task_id=last_task_id,
+                data={
+                    "findings": decision.get("findings"),
+                    "dropped_duplicates": decision.get("dropped_duplicates"),
+                    "reject_split": decision.get("reject_split"),
+                    "infra": decision.get("infra"),
+                    "serialized": decision.get("serialized"),
+                    "blocked": decision.get("blocked"),
+                    "error": decision.get("error"),
+                },
+            )
+        except Exception:
+            # The log is a witness, not a gate: a logger that refuses
+            # the entry must not cost the plan its refinement.
+            pass
+
+    def _apply_necessity(
+        self,
+        tasks: List[Dict],
+        necessity: Dict[str, Any],
+    ) -> List[Dict]:
+        """The task list the audit leaves behind.
+
+        Three things change: the duplicates are gone, the colliding
+        tasks declare one merged write domain, and the later task of a
+        colliding pair waits for the earlier one.  A task the audit
+        held for the environment carries the environment marker, so the
+        failure it produces is not filed as a deliverable defect.
+
+        The caller's dictionaries are never written to.  The dispatcher
+        compares its own list with the returned one to decide whether
+        anything changed, and a key added in place would make both
+        sides look identical — hiding a real change, such as a dropped
+        duplicate.
+        """
+        dropped = set(necessity.get("dropped_duplicates") or ())
+        resolved = necessity.get("resolved_files") or {}
+        serialized = necessity.get("serialized") or {}
+        env_blocked = set(necessity.get("env_blocked") or ())
+
+        kept: List[Dict] = []
+        for task in tasks or []:
+            task_id = self._task_id_of(task)
+            if task_id is not None and task_id in dropped:
+                continue
+            extra: Dict[str, Any] = {}
+            merged = resolved.get(task_id) if task_id is not None else None
+            if merged:
+                # One declaration for both tasks of the pair: two
+                # different but overlapping declarations lock two
+                # different lock files, so each task would believe it
+                # holds the lock.
+                extra["files_to_modify"] = list(merged)
+            deps = serialized.get(task_id) if task_id is not None else None
+            if deps:
+                extra["depends_on"] = self._merged_depends_on(
+                    task.get("depends_on") if isinstance(task, dict) else None,
+                    deps,
+                )
+            if task_id is not None and task_id in env_blocked:
+                extra["failure_class"] = INFRA
+            if extra and isinstance(task, dict):
+                updated = copy.deepcopy(task)
+                updated.update(extra)
+                kept.append(updated)
+                continue
+            kept.append(task)
+        return kept
+
+    def _necessity_blocks_split(
+        self,
+        necessity: Dict[str, Any],
+        last_task_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Why this task must not be split, or ``None``.
+
+        * **Q1** — the task is a duplicate of one already in the batch:
+          it is dropped, and there is nothing left to split.
+        * **Q2** — its acceptance cannot be decided: splitting it would
+          produce children nobody can judge.
+        * **Q3** — it needs an environment the project does not have:
+          the failure would be environmental, and the split would only
+          reproduce it.
+        * **Q4** — the conflict could not be ordered: there is no
+          schedule to split into.
+        """
+        focus = str(last_task_id) if last_task_id is not None else None
+        if focus is None:
+            # Without a focus there is no task to refuse.  The findings
+            # are still recorded.
+            return None
+        if focus in set(necessity.get("dropped_duplicates") or ()):
+            return "duplicate"
+        reject = necessity.get("reject_split") or {}
+        if reject.get("task_id") == focus:
+            return "reject_split"
+        infra = necessity.get("infra") or {}
+        if infra.get("task_id") == focus:
+            return "env_infra"
+        for entry in necessity.get("blocked") or ():
+            if entry.get("task_id") == focus:
+                return "block"
+        return None
+
+    def _reapply_serialization(
+        self,
+        tasks: List[Dict],
+        necessity: Dict[str, Any],
+    ) -> List[Dict]:
+        """Put the serialization back after the split.
+
+        The model's reply replaces the task list, and it knows nothing
+        about the collision the audit found: its answer carries the
+        dependencies it was shown, which are not necessarily the
+        serialized ones.  A collision that is not serialized is a
+        collision that runs — two tasks writing the same bytes at the
+        same time — so the edge is put back here, where the final list
+        is known.
+
+        A task that was split into children has no id of its own
+        anymore; its children inherit the wait, because they are the
+        same work.
+        """
+        serialized = necessity.get("serialized") or {}
+        if not serialized:
             return tasks
+        result: List[Dict] = []
+        for task in tasks or []:
+            task_id = self._task_id_of(task)
+            deps: List[str] = []
+            if task_id is not None:
+                deps = list(serialized.get(task_id) or [])
+                if not deps:
+                    for parent_id, parent_deps in serialized.items():
+                        if not parent_deps or not isinstance(task_id, str):
+                            continue
+                        if task_id.startswith(f"{parent_id}-"):
+                            deps.extend(parent_deps)
+            if not deps or not isinstance(task, dict):
+                result.append(task)
+                continue
+            updated = copy.deepcopy(task)
+            updated["depends_on"] = self._merged_depends_on(
+                updated.get("depends_on"), deps
+            )
+            result.append(updated)
+        return result
+
+    def _refined(
+        self,
+        tasks: List[Dict],
+        necessity: Dict[str, Any],
+        last_task_id: Optional[str] = None,
+    ) -> RefinedTaskList:
+        """The round's result, with the audit riding on it."""
+        refined = RefinedTaskList(tasks or [], necessity=copy.deepcopy(necessity))
+        self.last_necessity_audit = refined.necessity_audit
+        return refined
+
+    @staticmethod
+    def _serialization_plan(audit: Any, batch: Sequence[Any]) -> Dict[str, List[str]]:
+        """Which task must wait for which, for the colliding domains.
+
+        The audit says *that* two tasks collide — a ``serialize``
+        finding on the later one, and one merged write domain for the
+        pair — but not which task the later one waits for.  The pair is
+        recovered from the merged domains: the tasks that share the
+        later task's merged domain and come before it in the batch are
+        the ones it has to wait for.
+
+        Waiting on *all* of them, rather than on the single task the
+        audit named, keeps the order total: with three tasks writing
+        the same bytes, the last one waits for the first two, and none
+        of the three can run at the same time.  Every edge points
+        backwards in the batch, so the wait can never close a cycle.
+        """
+        later_ids = [
+            finding.task_id
+            for finding in getattr(audit, "findings", [])
+            if finding.action == ACTION_SERIALIZE
+        ]
+        resolved = getattr(audit, "resolved_files", {}) or {}
+        if not later_ids or not resolved:
+            return {}
+        order: Dict[str, int] = {}
+        for position, raw in enumerate(batch or ()):
+            task_id = raw.get("id") if isinstance(raw, dict) else None
+            if task_id is not None and str(task_id) not in order:
+                order[str(task_id)] = position
+        plan: Dict[str, List[str]] = {}
+        for later_id in later_ids:
+            merged = resolved.get(later_id) or []
+            later_pos = order.get(later_id)
+            if not merged or later_pos is None:
+                continue
+            deps: List[str] = []
+            for other_id, other_merged in resolved.items():
+                if other_id == later_id:
+                    continue
+                other_pos = order.get(other_id)
+                if other_pos is None or other_pos >= later_pos:
+                    continue
+                if not _merged_domains_overlap(merged, other_merged):
+                    continue
+                if other_id not in deps:
+                    deps.append(other_id)
+            if deps:
+                plan[later_id] = deps
+        return plan
+
+    @staticmethod
+    def _merged_depends_on(existing: Any, extra: Sequence[str]) -> List[str]:
+        """The dependency list with ``extra`` appended, order kept."""
+        deps: List[str] = []
+        if isinstance(existing, (list, tuple)):
+            deps = [str(dep) for dep in existing]
+        for dep in extra or ():
+            if dep and str(dep) not in deps:
+                deps.append(str(dep))
+        return deps
 
     def _build_refiner_context(
         self,
@@ -981,3 +1463,24 @@ class TaskRefiner:
                         deduped.append(d)
                 nt["depends_on"] = deduped
         return rewrites
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
+def _merged_domains_overlap(left: Sequence[str], right: Sequence[str]) -> bool:
+    """Whether two merged write domains claim any of the same bytes.
+
+    A merged domain is the union of the declarations of a colliding
+    pair, so two merged domains overlap when any path of one overlaps
+    any path of the other — the same rule
+    :func:`file_lock_manager.domains_overlap` applies to a single pair
+    of paths, and the same rule a task's own declaration is judged by.
+    """
+    for a in left or ():
+        for b in right or ():
+            if domains_overlap(a, b):
+                return True
+    return False

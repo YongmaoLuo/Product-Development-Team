@@ -224,6 +224,15 @@ def _refiner_block(failure, occurrence):
     agent = AutonomousAgent.__new__(AutonomousAgent)
     agent.logger = None
     agent._refinement_count = 0
+    # ``__new__`` skips ``__init__``, so the fake carries exactly the
+    # attributes the method under test reads -- and ``project_dir`` is one
+    # of them: ``_refine_after_failure`` hands the refiner a necessity
+    # index built from the project, and building that index needs the
+    # directory.  ``None`` is the honest value here -- it says "the audit
+    # knows nothing about this project", which is the reading
+    # ``_necessity_project_index`` already gives an absent project -- and
+    # it keeps the fake's shape equal to the real object's.
+    agent.project_dir = None
     agent._failure_occurrences = {}
     agent._persist_refiner_output = MagicMock()
     task = SubTask(

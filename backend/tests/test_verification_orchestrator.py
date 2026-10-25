@@ -47,6 +47,7 @@ from verification_agent import (  # noqa: E402
 from verification_config import TimeoutPolicy  # noqa: E402
 
 from verification import VerificationOrchestrator
+from verification.triage_agent import TriageConclusion
 from plan_state import PlanState
 from coding_tool import ApiError
 
@@ -151,6 +152,86 @@ def _read_state(plan_dir):
 
 
 # =============================================================================
+# The same-failure triage double
+# =============================================================================
+
+def _recorded_failure_text(point, failure_history):
+    """The recorded failure text the judge was shown, verbatim.
+
+    The shipped judge may only quote text that is really there — a
+    quote of something it was never shown is a malfunction, not an
+    answer. The double follows the same rule: the point's
+    ``actual_result`` or ``evidence``, or — when the point carries
+    neither — the most recent history entry's.
+
+    Args:
+        point: The verification point as the judge was shown it.
+        failure_history: The recorded failures of that point.
+
+    Returns:
+        The quotable text, or ``""`` when the record carries none.
+    """
+    sources = [point, *reversed(list(failure_history or []))]
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for field in ("actual_result", "evidence"):
+            text = str(source.get(field) or "").strip()
+            if text:
+                return text
+    return ""
+
+
+class _StubTriageJudge:
+    """A triage judge that ran and could not characterise the failure.
+
+    2026-10-23 (VP-019): reaching the same-failure threshold no longer
+    stops the chain by itself. The threshold buys ONE triage call, and
+    the triage's verdict decides between stopping the chain and
+    diverting into the repair path.
+
+    The tests below are about the *threshold* — two rounds of the same
+    failure set — so the verdict they need is the one that stops: the
+    triage ran to completion (``available=True``) but could not name
+    the failure (``conclusive=False``). The chain then stops with a
+    structured reason, and the human who opens the plan can read which
+    point failed, which class it was and what the triage said.
+
+    The opposite verdict — a triage that *malfunctioned*
+    (``available=False``) — must not stop the chain at all: a broken
+    triage says nothing about the failure. That contract is pinned by
+    ``tests/integration/test_same_failure_triage.py``, which drives the
+    shipped judge through its three malfunctions.
+
+    The judge quotes the recorded failure text it was shown, verbatim,
+    so the anchor it carries is one that really is in the record.
+    """
+
+    #: What the judge says when it cannot characterise the failure.
+    RATIONALE = "the triage could not characterise the failure"
+
+    def __init__(self, failure_class="deliverable_defect"):
+        self._failure_class = failure_class
+        self.calls = []
+
+    def judge(self, vp, failure_history, round_number=0):
+        point = vp if isinstance(vp, dict) else {}
+        self.calls.append({
+            "vp": dict(point),
+            "failure_history": list(failure_history or []),
+            "round_number": round_number,
+        })
+        return TriageConclusion(
+            vp_id=str(point.get("id") or ""),
+            failure_class=self._failure_class,
+            conclusive=False,
+            evidence_quote=_recorded_failure_text(point, failure_history),
+            rationale=self.RATIONALE,
+            available=True,
+        )
+
+
+# =============================================================================
 # State Transitions — All Scenarios
 # =============================================================================
 
@@ -247,6 +328,13 @@ class TestStateTransitions:
         threshold of 3, made the stop condition unreachable under the
         shipped ``max_rounds=3`` — every failing plan burned a full extra
         round and ended with ``max_rounds_reached`` instead.
+
+        2026-10-23 (VP-019): the threshold alone no longer terminates
+        the chain — it buys one triage call, and the triage's verdict
+        decides. The judge injected here is the one that ran and could
+        not name the failure, so the chain stops with a structured
+        reason. (A judge that *malfunctioned* must not stop it; that is
+        pinned by ``tests/integration/test_same_failure_triage.py``.)
         """
         _write_plan_state(temp_plan_dir, phase="executing",
                           verification_round=1, max_rounds=3)
@@ -256,8 +344,10 @@ class TestStateTransitions:
              patch("verification.orchestrator.RepairTaskGenerator") as MockRG, \
              patch("verification.verification_report_reader.extract_failed_vps_with_paths") as MockExtract, \
              patch("repair_generator.RepairTaskAssembler") as MockAssembler:
+            judge = _StubTriageJudge()
             orch = VerificationOrchestrator(
-                temp_plan_dir, temp_project_dir, mock_coding_tool
+                temp_plan_dir, temp_project_dir, mock_coding_tool,
+                triage_judge=judge,
             )
             orch.verification_agent.run_full_verification.return_value = report
             orch.repair_generator.generate_repair_contents.return_value = []
@@ -272,11 +362,18 @@ class TestStateTransitions:
             # First cycle: enters repair, sets _previous_failed_ids
             orch.start_verification_cycle(round_number=2)
             orch.check_cycle_conditions(report)
+            assert judge.calls == [], (
+                "the first failure is not a repeat yet — no triage is due"
+            )
 
             # Second cycle with IDENTICAL failure → must terminate
             orch.start_verification_cycle(round_number=2)
             result = orch.check_cycle_conditions(report)
 
+            assert len(judge.calls) == 1, (
+                "the threshold buys exactly one triage call — not one per "
+                "round and not one per point"
+            )
             assert result["status"] == "loop_stopped", (
                 "Two rounds with the SAME failure set must stop the loop — "
                 "that is the documented stop condition"
@@ -292,6 +389,16 @@ class TestStateTransitions:
             assert orch._consecutive_same_failure_rounds == 1, (
                 "Counter counts repeats: the 2nd identical round is 1"
             )
+            assert result["stop_reason"]["reason"] == (
+                "same_failure_no_triage_conclusion"
+            ), (
+                "the triage ran and could not name the failure — the "
+                "reason says so, and says which point and which class"
+            )
+            assert result["stop_reason"]["vp_id"] == "VP-001"
+            assert result["stop_reason"]["failure_class"] == (
+                "deliverable_defect"
+            ), "the class is part of the failure's identity, so it travels"
 
     # ------------------------------------------------------------------
     # Scenario C — 第3次循环失败达到 max_rounds
@@ -332,6 +439,12 @@ class TestStateTransitions:
         threshold of 3 could not fire at all under the shipped
         ``max_rounds=3`` — it needed a fourth round — which is why every
         failing plan ended with ``max_rounds_reached``.
+
+        2026-10-23 (VP-019): the threshold buys one triage call, and
+        the triage's verdict decides whether the chain stops. The judge
+        injected here is the one that ran and could not name the
+        failure, so the chain stops — and the reason says which point,
+        which class and what the triage said.
         """
         _write_plan_state(temp_plan_dir, phase="executing",
                           verification_round=0, max_rounds=3)
@@ -340,8 +453,10 @@ class TestStateTransitions:
              patch("verification.orchestrator.RepairTaskGenerator") as MockRG, \
              patch("verification.verification_report_reader.extract_failed_vps_with_paths") as MockExtract, \
              patch("repair_generator.RepairTaskAssembler") as MockAssembler:
+            judge = _StubTriageJudge()
             orch = VerificationOrchestrator(
-                temp_plan_dir, temp_project_dir, mock_coding_tool
+                temp_plan_dir, temp_project_dir, mock_coding_tool,
+                triage_judge=judge,
             )
             orch.repair_generator.generate_repair_contents.return_value = []
 
@@ -355,7 +470,11 @@ class TestStateTransitions:
             failed_report = {
                 "overall_status": "FAILED",
                 "verification_results": [
-                    {"id": "VP-006", "status": "FAILED"},
+                    {
+                        "id": "VP-006",
+                        "status": "FAILED",
+                        "actual_result": "AssertionError: expected 200, got 401",
+                    },
                 ],
                 "requirement_deviations": [],
             }
@@ -366,10 +485,18 @@ class TestStateTransitions:
             assert r1["status"] != "loop_stopped"
             assert orch._consecutive_same_failure_rounds == 0
             assert r1.get("repair_tasks")
+            assert judge.calls == [], (
+                "the first failure is not a repeat yet — no triage is due"
+            )
 
-            # Round 2 — same failures → 1 repeat >= MAX=1 → terminate
+            # Round 2 — same failures → the threshold is reached → the
+            # triage is asked, and its verdict stops the chain.
             orch.start_verification_cycle(round_number=2)
             r2 = orch.check_cycle_conditions(failed_report)
+            assert len(judge.calls) == 1, (
+                "the threshold buys exactly one triage call — not one per "
+                "round and not one per point"
+            )
             assert r2["status"] == "loop_stopped", (
                 "Round 2 repeating round 1's failure set MUST terminate — "
                 "two identical rounds is the documented stop condition"
@@ -378,6 +505,16 @@ class TestStateTransitions:
             assert r2["stop_reason"] == "same_failure_repeated_after_max_attempts"
             assert r2["should_stop"] is True
             assert r2["repair_tasks"] == []
+            assert r2["stop_reason"]["reason"] == (
+                "same_failure_no_triage_conclusion"
+            ), (
+                "the triage ran and could not name the failure — the "
+                "reason says so, and says which point and which class"
+            )
+            assert r2["stop_reason"]["vp_id"] == "VP-006"
+            assert r2["stop_reason"]["failure_class"] == (
+                "deliverable_defect"
+            ), "a report that names no class reads as a deliverable defect"
 
     def test_loop_tracking_survives_a_fresh_orchestrator(
         self, temp_plan_dir, temp_project_dir, mock_coding_tool
@@ -821,6 +958,11 @@ class TestPersistence:
         # the 2026-09-12 rule ("stay alive after 1 consecutive repeat"),
         # which — with a threshold of 3 and ``max_rounds=3`` — could
         # never fire at all.
+        #
+        # 2026-10-23 (VP-019): the threshold buys one triage call, and
+        # the triage's verdict decides whether the chain stops. The judge
+        # injected here is the one that ran and could not name the
+        # failure, so the chain stops and the plan is parked.
         _write_plan_state(temp_plan_dir, phase="executing",
                           verification_round=1, max_rounds=3)
 
@@ -828,8 +970,10 @@ class TestPersistence:
              patch("verification.orchestrator.RepairTaskGenerator") as MockRG, \
              patch("verification.verification_report_reader.extract_failed_vps_with_paths") as MockExtract, \
              patch("repair_generator.RepairTaskAssembler") as MockAssembler:
+            judge = _StubTriageJudge()
             orch = VerificationOrchestrator(
-                temp_plan_dir, temp_project_dir, mock_coding_tool
+                temp_plan_dir, temp_project_dir, mock_coding_tool,
+                triage_judge=judge,
             )
             orch.repair_generator.generate_repair_contents.return_value = []
 
@@ -843,7 +987,11 @@ class TestPersistence:
             failed_report = {
                 "overall_status": "FAILED",
                 "verification_results": [
-                    {"id": "VP-001", "status": "FAILED"}
+                    {
+                        "id": "VP-001",
+                        "status": "FAILED",
+                        "actual_result": "AssertionError: expected 200, got 401",
+                    }
                 ],
                 "requirement_deviations": [],
             }
@@ -852,12 +1000,20 @@ class TestPersistence:
             orch.start_verification_cycle(round_number=2)
             orch.check_cycle_conditions(failed_report)
             orch.confirm_repair_and_rerun()
+            assert judge.calls == [], (
+                "the first failure is not a repeat yet — no triage is due"
+            )
 
-            # Second check with the same failure — counter increments to
-            # 1, which meets the threshold, so the chain terminates.
+            # Second check with the same failure — the count reaches the
+            # threshold, so the triage is asked; its verdict stops the
+            # chain.
             orch.start_verification_cycle(round_number=2)
             result = orch.check_cycle_conditions(failed_report)
 
+            assert len(judge.calls) == 1, (
+                "the threshold buys exactly one triage call — not one per "
+                "round and not one per point"
+            )
             assert (
                 orch._consecutive_same_failure_rounds == 1
             ), "Counter counts repeats: the 2nd identical round is 1"

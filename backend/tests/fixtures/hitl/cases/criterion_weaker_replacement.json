@@ -1,0 +1,40 @@
+{
+  "case": "criterion_weaker_replacement",
+  "description": "The criterion of VP-002 cannot be run as written, and the proposed replacement verifies it with a weaker method than the one it replaces. The replacement is refused, the criterion still has to be fixed by a human, and the attempt counts.",
+  "verdict": {
+    "verdict": "FAILED",
+    "failure_class": "criterion_defect",
+    "failure_class_source": "llm",
+    "actual_result": "VP-002: the criterion cannot be run as written; the referenced check does not exist; the proposed replacement verification_method 'ui_validation' replaces 'code_review'",
+    "evidence_quote": "the criterion cannot be run as written"
+  },
+  "failure_history": [
+    {
+      "round": 1,
+      "verdict": "FAILED",
+      "actual_result": "VP-002: the criterion cannot be run as written; the referenced check does not exist",
+      "failure_class": "criterion_defect",
+      "failure_class_source": "llm",
+      "evidence_quote": "the criterion cannot be run as written"
+    }
+  ],
+  "verification_plan": {
+    "plan_id": "fixture-plan-004",
+    "verification_points": [
+      {
+        "id": "VP-002",
+        "verification_method": "code_review",
+        "criterion": "the error path of the retry helper is covered by the repository's own gate",
+        "request": null,
+        "replacement": {
+          "verification_method": "ui_validation",
+          "expected_not_looser": false
+        }
+      }
+    ]
+  },
+  "expected_disposition": {
+    "disposition": "escalate_counted",
+    "defaulted": false
+  }
+}

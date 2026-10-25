@@ -89,7 +89,15 @@ def _refiner(responses: List[Any], logger: Optional[Any] = None) -> TaskRefiner:
     return r
 
 
-TASK = {"id": "t1", "title": "t", "description": "d", "status": "pending"}
+TASK = {
+    "id": "t1", "title": "t", "description": "d", "status": "pending",
+    # The refiner's step-0 necessity audit refuses to split a task whose
+    # acceptance cannot be judged (Q2) — a task with no acceptance
+    # criterion never reaches the model at all.  The criterion is
+    # spelled out here so that this file exercises what it is about:
+    # the SHAPE of the model's reply.
+    "acceptance_criteria": "the task reports a green test run",
+}
 CHILD_1 = {"id": "9-1", "title": "first", "description": "d", "status": "pending"}
 CHILD_2 = {"id": "9-2", "title": "second", "description": "d", "status": "pending"}
 PARENT = {"id": "9", "title": "p", "description": "d", "status": "pending"}
