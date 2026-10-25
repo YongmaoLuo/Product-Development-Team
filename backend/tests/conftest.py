@@ -1119,6 +1119,85 @@ def hermetic_cc_switch_current_provider(monkeypatch):
     yield
 
 
+#: ``(thread, process)`` for every application worker started during the
+#: current test.  ``process`` is the object the worker waits on, when the
+#: thread is an execution monitor; it stays ``None`` for the rest.
+#:
+#: It lives at module scope on purpose: the autouse fixture below owns the
+#: *reclaim* at teardown, but a test that starts a worker needs to reclaim
+#: it **before it ends**, not after — a worker that is still running when
+#: the next test starts resolves its runtime paths (the state.db path is
+#: resolved on every call) against the next test and writes there.  That
+#: is the 2026-09-14 ``database disk image is malformed`` flake.
+_TRACKED_WORKERS: "list[tuple[threading.Thread, object]]" = []
+
+
+def _reclaim_workers(timeout: float = 10.0) -> "list[threading.Thread]":
+    """Release every fake process a parked worker waits on, then join it.
+
+    This is the "release, then join" half of the containment rule the
+    autouse ``clean_execution_state`` fixture enforces at teardown, exposed
+    so a test can apply it **while it still owns the worker**.  The order
+    matters: releasing only wakes the worker, and the worker still has to
+    run its tail — and that tail is where the state.db is opened and
+    written.  Joining turns "usually finishes in time" into an ordering
+    guarantee.
+
+    Returns the workers that were still alive when the join gave up.
+    """
+    for _thread, process in list(_TRACKED_WORKERS):
+        hook = getattr(process, "release", None) or getattr(
+            process, "terminate", None
+        )
+        if callable(hook):
+            try:
+                hook()
+            except Exception:  # noqa: BLE001 - best-effort unblock only
+                pass
+    # The join has to see the workers a released worker *spawns while it
+    # runs*: the execution monitor spawns the usage-report thread from
+    # its own tail, so a snapshot taken before the first join would leave
+    # that thread running past teardown.  Iterate until no live worker is
+    # left, so a worker that spawns a worker is reclaimed too.
+    joined: set[int] = set()
+    while True:
+        pending = [
+            thread
+            for thread, _process in _TRACKED_WORKERS
+            if thread.ident is not None
+            and thread.is_alive()
+            and id(thread) not in joined
+        ]
+        if not pending:
+            break
+        for thread in pending:
+            joined.add(id(thread))
+            thread.join(timeout=timeout)
+    return [thread for thread, _process in _TRACKED_WORKERS if thread.is_alive()]
+
+
+@pytest.fixture
+def reclaim_workers():
+    """Release, then join, the application workers this test started.
+
+    The autouse ``clean_execution_state`` fixture applies the same rule at
+    teardown — but teardown is too late for a worker whose tail writes to
+    the state database, because that path is resolved **on every call**:
+    a worker still running when the next test starts writes into the NEXT
+    test's database (2026-09-14: ``database disk image is malformed``).
+    A test that starts such a worker therefore has to reclaim it while it
+    still owns it.
+
+    The fake process a worker waits on must expose ``release()`` (or
+    ``terminate()``) for the release half to work — see
+    ``tests/api/test_execution_state_persistence.py`` for a fake that parks
+    its worker on purpose and is still reclaimable.
+
+    Returns the workers that were still alive when the join gave up.
+    """
+    return _reclaim_workers
+
+
 @pytest.fixture(autouse=True)
 def clean_execution_state(monkeypatch):
     """Clear global execution state after each test, and reclaim its workers.
@@ -1206,10 +1285,11 @@ def clean_execution_state(monkeypatch):
             )
         return
 
-    #: ``(thread, process)`` for every application worker started during
-    #: this test. ``process`` is the object the worker waits on, when the
-    #: thread is an execution monitor; it stays ``None`` for the rest.
-    workers: "list[tuple[threading.Thread, object]]" = []
+    #: The application workers started during this test.  Module scope, so
+    #: a test can reclaim its own worker before it ends — see
+    #: :func:`reclaim_workers`.
+    workers = _TRACKED_WORKERS
+    workers.clear()
     real_thread = threading.Thread
 
     def _is_app_worker(target) -> bool:
@@ -1248,25 +1328,7 @@ def clean_execution_state(monkeypatch):
     monkeypatch.setattr(threading, "Thread", _RecordingThread)
     yield
 
-    for thread, process in workers:
-        hook = getattr(process, "release", None) or getattr(
-            process, "terminate", None
-        )
-        if callable(hook):
-            try:
-                hook()
-            except Exception:  # noqa: BLE001 - best-effort unblock only
-                pass
-    for thread, _ in workers:
-        if thread.ident is None:
-            # Built but never started — several tests construct a Thread as
-            # a "dead worker" stand-in for the watchdog paths. Nothing is
-            # running, so there is nothing to reclaim (and joining an
-            # unstarted thread raises).
-            continue
-        # A released worker has nothing slow left to do; the generous cap
-        # only covers scheduler starvation on a loaded machine.
-        thread.join(timeout=10)
+    stuck = _reclaim_workers()
 
     # Before the assertion below, which ends this fixture when it fires
     # and would leave every registered descriptor open. A descriptor a
@@ -1281,8 +1343,6 @@ def clean_execution_state(monkeypatch):
     # run's health probe. Both are reclaimed here, before any assertion
     # below can end this fixture.
     verification_problems = _reclaim_verification_resources()
-
-    stuck = [thread for thread, _ in workers if thread.is_alive()]
 
     if hasattr(server, "_execution_state"):
         server._execution_state.clear()

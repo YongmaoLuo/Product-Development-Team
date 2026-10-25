@@ -150,6 +150,77 @@ def _phase_label(phase: Optional[str]) -> str:
     return str(phase or "")
 
 
+def _artifact_status(
+    *,
+    has_tasks: bool,
+    has_review: bool,
+    has_prd: bool,
+    has_interview: bool,
+) -> str:
+    """The status this plan's ARTEFACTS put it in.
+
+    The answer for a plan that is NOT running — the phase it is in once
+    the execution store has refuted the routing row's claim that it is.
+
+    Shared by the listing and the single-plan status endpoint so the two
+    readers cannot answer differently about the same plan: they used to
+    (the listing fell back to this, the status endpoint repeated the
+    routing row instead), and one plan with two answers is the whole
+    problem this module exists to kill.
+
+    Note the vocabulary is the listing's ``status`` vocabulary, not the
+    phase vocabulary — ``reviewed`` / ``prd`` / ``interviewed`` / ``new``
+    are not valid phases.  Only ``ready`` is in both.
+    """
+    if has_tasks:
+        return "ready"
+    if has_review:
+        return "reviewed"
+    if has_prd:
+        return "prd"
+    if has_interview:
+        return "interviewed"
+    return "new"
+
+
+def _artifact_status_for_plan(plan_id: str) -> str:
+    """:func:`_artifact_status` for the plan's directory on disk."""
+    plan_dir = _server._plan_dir(plan_id)
+    if not plan_dir.exists():
+        return "new"
+    return _artifact_status(
+        has_tasks=(plan_dir / "tasks.json").exists(),
+        has_review=(plan_dir / "review.json").exists(),
+        has_prd=(
+            (plan_dir / "prd.json").exists()
+            or (plan_dir / "prd.md").exists()
+        ),
+        has_interview=(plan_dir / "interview.json").exists(),
+    )
+
+
+def _execution_record(
+    conn: sqlite3.Connection, plan_id: str,
+) -> Optional[Dict[str, Any]]:
+    """The ``plan_execution`` row for *plan_id*, or ``None``.
+
+    ``None`` means "no execution record at all" — the executor never
+    touched this plan, or its row was never written.  That is the only
+    thing the runtime-phase rule needs to know, and it is the same
+    question the listing asks with its bulk snapshot.
+    """
+    try:
+        from state_machine.repositories.execution_repository import (
+            ExecutionRepository,
+        )
+    except Exception:  # pragma: no cover - import guard
+        return None
+    try:
+        return ExecutionRepository(conn).summary(plan_id)
+    except Exception:
+        return None
+
+
 def _read_task_rows(plan_id: str) -> Dict[str, Dict[str, Any]]:
     """``task_id -> row`` from ``plan_tasks``; ``{}`` when unreadable."""
     try:
@@ -292,7 +363,12 @@ def _build_plan_status(plan_id: str) -> Any:
     """
     from dataclasses import replace
 
-    from plan_status import PlanStatus, find_divergences
+    from plan_status import (
+        PlanStatus,
+        find_divergences,
+        is_runtime_phase,
+        resolve_phase,
+    )
 
     artifacts = detect(_server._plan_dir(plan_id))
     if artifacts.branch == BRANCH_CONFLICT:
@@ -310,11 +386,22 @@ def _build_plan_status(plan_id: str) -> Any:
     # the except path leaves it unassigned. A status read must degrade,
     # not raise NameError on top of the failure it is already handling.
     route: Optional[Dict[str, Any]] = None
+    exec_row: Optional[Dict[str, Any]] = None
     try:
         conn, routing, verification = _server._open_verification_state()
         try:
             route = routing.current(plan_id)
             record = verification.current(plan_id)
+            # ``executing`` is the ONE phase an execution record can
+            # refute, so it is the only one worth a second query here:
+            # this route is polled several times a minute per plan, and
+            # a resting plan must not pay for a read it cannot use.
+            # The in-memory record is free, so it is checked first.
+            if (
+                is_runtime_phase(str((route or {}).get("current_phase") or ""))
+                and _server._execution_state.get(plan_id) is None
+            ):
+                exec_row = _execution_record(conn, plan_id)
         finally:
             conn.close()
         if route:
@@ -334,6 +421,37 @@ def _build_plan_status(plan_id: str) -> Any:
         # A status read must never raise — an operator asking "where is
         # this plan" is exactly the wrong moment to hand them a 500.
         _server.logger.exception("[plan_status] state.db read failed plan=%s", plan_id)
+
+    # ``executing`` is the one phase in the vocabulary that does not
+    # describe a plan's ARTEFACTS — it describes a PROCESS: "the executor
+    # is running this plan right now".  So it is the one phase the
+    # execution store can refute, and a reader that repeats it without
+    # checking is what let the same plan read ``ready`` in the listing
+    # and ``executing`` here.
+    #
+    # The judgement itself lives in ``plan_status.resolve_phase`` — this
+    # is only its I/O half.  The listing calls the same function with
+    # the same fallback, so the two readers cannot disagree.
+    #
+    # "An execution record exists" means a ``plan_execution`` row OR an
+    # in-memory ``_execution_state`` entry: the executor seeds the
+    # in-memory record before it stamps the phase, and persists the row
+    # before it spawns the subprocess, so a plan that IS running always
+    # has one of the two.
+    exec_recorded = (
+        exec_row is not None
+        or _server._execution_state.get(plan_id) is not None
+    )
+    fallback = ""
+    if not exec_recorded and is_runtime_phase(phase):
+        # The fallback is the status the plan's ARTEFACTS put it in —
+        # the same answer the listing falls back to.  Computed only in
+        # this rare case: a resting plan must not pay for it on a route
+        # that is polled several times a minute per plan.
+        fallback = _artifact_status_for_plan(plan_id)
+    phase = resolve_phase(
+        phase, execution_recorded=exec_recorded, fallback=fallback,
+    )
 
     # The plan-doc review gate sits BEFORE the verification sub-machine:
     # a plan waiting for a human to accept / skip its plan-doc items has
@@ -1242,6 +1360,8 @@ def _list_plans_body(
     lifetime. It may legitimately be ``None`` (no ``state.db`` yet), in
     which case the legacy directory-listing path below still answers.
     """
+    from plan_status import resolve_phase
+
     terminal_phases = {
         "completed", "failed", "stopped",
         "verification_passed",
@@ -1337,15 +1457,12 @@ def _list_plans_body(
             exec_pid = None
             status = "archived"
         else:
-            status = "new"
-            if has_tasks:
-                status = "ready"
-            elif has_review:
-                status = "reviewed"
-            elif has_prd:
-                status = "prd"
-            elif has_interview:
-                status = "interviewed"
+            status = _artifact_status(
+                has_tasks=has_tasks,
+                has_review=has_review,
+                has_prd=has_prd,
+                has_interview=has_interview,
+            )
 
             # ``current_phase`` used to be read from the ``plan_execution``
             # row — the "display-only mirror" of the routing phase — with
@@ -1364,10 +1481,12 @@ def _list_plans_body(
             # phases), so preferring it would reintroduce exactly the
             # two-vocabulary split v5 removed.
             exec_row = execution_by_plan.get(plan_id)
+
+            # The execution record is read BEFORE the phase is decided,
+            # because whether the recorded phase can be believed depends
+            # on it (see the runtime-phase check below).
             routing_phase = str(row.get("current_phase") or "")
             current_phase = routing_phase or status
-            if not include_terminal and current_phase in terminal_phases:
-                continue
 
             # An **explicit bucket**: a phase that has a stable label
             # (``plan_state.PHASE_LABELS``) is a phase the listing must
@@ -1408,6 +1527,58 @@ def _list_plans_body(
                     pid_from_repo = exec_row.get("exec_pid")
                     if isinstance(pid_from_repo, int):
                         exec_pid = pid_from_repo
+
+            # ``executing`` is the one phase in the vocabulary that does
+            # not describe a plan's ARTEFACTS — it describes a PROCESS:
+            # "the executor is running this plan right now".  So it is the
+            # one phase the execution store can refute, and the store is
+            # read here for that reason.
+            #
+            # The routing row can hold such a phase with nothing running
+            # behind it.  The way it happens: a plan directory carrying a
+            # legacy ``plan_state.json`` is imported once by
+            # ``plan_state.PlanState._load_state``, which copies the
+            # JSON's ``current_phase`` into ``plan_routing`` verbatim.  A
+            # fixture left behind by a test run — or a plan whose executor
+            # was killed and whose row was never reconciled — then carries
+            # "executing" forever.
+            #
+            # The listing answered ``status=ready`` (no pid, no execution
+            # row) with ``current_phase=executing`` for those: two answers
+            # for one plan, and anything that counts ``current_phase`` to
+            # answer "how many plans are running?" over-counts by every
+            # one of them.
+            #
+            # A plan the executor never touched cannot be executing, so
+            # with no execution record at all the runtime claim is not
+            # merely stale — it is impossible, and the phase falls back to
+            # the same artifact-derived ``status`` this route already
+            # falls back to when a plan has no routing row.  A plan that
+            # IS running keeps its phase: the in-memory
+            # ``_execution_state`` entry exists from before the phase is
+            # stamped, and the persisted row from before the subprocess
+            # is spawned.
+            #
+            # ``verification_running`` is deliberately NOT included: a
+            # verification round records its liveness in
+            # ``plan_verification`` / ``_verification_state``, not in
+            # ``plan_execution``, so "no execution row" says nothing
+            # about it.
+            #
+            # The judgement itself lives in
+            # ``plan_status.resolve_phase`` — the single-plan status
+            # endpoint calls the SAME function with the same fallback, so
+            # the two readers cannot answer differently about one plan.
+            current_phase = resolve_phase(
+                current_phase,
+                execution_recorded=(
+                    exec_row is not None or exec_state is not None
+                ),
+                fallback=status,
+            )
+
+            if not include_terminal and current_phase in terminal_phases:
+                continue
 
             if (
                 exec_status == "running"

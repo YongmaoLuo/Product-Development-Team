@@ -73,6 +73,20 @@ FINISHED_PHASES = (
     "stopped",
 )
 
+#: The one phase in ``plan_state.VALID_PHASES`` whose truth depends on a
+#: LIVE EXECUTION rather than on the plan's artefacts on disk.
+#:
+#: Every other phase ("interview", "prd_review", "ready", "completed", …)
+#: says what the plan IS; this one says what is HAPPENING.  That makes it
+#: the only phase the execution store can refute, and the only one a reader
+#: has to check against it before repeating it as an answer.
+#:
+#: ``verification_running`` is a near neighbour and is deliberately NOT
+#: here: a verification round keeps its liveness in ``plan_verification`` /
+#: ``_verification_state``, never in ``plan_execution``, so the absence of
+#: an execution row says nothing about whether it is running.
+RUNTIME_PHASE = "executing"
+
 
 def _norm(value: Optional[str]) -> str:
     return (value or "").strip().lower()
@@ -252,6 +266,67 @@ def from_payload(payload: Mapping[str, Any]) -> PlanStatus:
 # ---------------------------------------------------------------------------
 # Invariants
 # ---------------------------------------------------------------------------
+
+
+def is_runtime_phase(phase: Optional[str]) -> bool:
+    """True iff *phase* is the one phase that asserts a live execution.
+
+    See :data:`RUNTIME_PHASE`.
+    """
+    return _norm(phase) == RUNTIME_PHASE
+
+
+def resolve_phase(
+    phase: Optional[str],
+    *,
+    execution_recorded: bool,
+    fallback: str = "",
+) -> str:
+    """The phase a reader may report for this plan.
+
+    Pure — no I/O, no clock, no environment.
+
+    ``phase`` is what the routing row says.  ``fallback`` is what the
+    reader reports instead when the recorded phase is
+    :data:`RUNTIME_PHASE` and nothing is running behind it.
+
+    Why this lives here
+    -------------------
+    ``executing`` is the one phase in the vocabulary that does not
+    describe a plan's ARTEFACTS — it describes a PROCESS: "the executor
+    is running this plan right now".  A routing row can hold such a phase
+    with nothing running behind it: a plan directory carrying a legacy
+    ``plan_state.json`` is imported once by
+    ``plan_state.PlanState._load_state``, which copies the JSON's
+    ``current_phase`` into ``plan_routing`` verbatim; an executor killed
+    before anyone reconciled the row leaves the same shape.
+
+    Two readers report a plan's phase — the listing (``GET /api/plans``)
+    and the single-plan snapshot (``GET /api/plan/{id}/status``) — and
+    they used to answer that question independently.  One of them had the
+    check and the other did not, so the same plan read ``ready`` in one
+    answer and ``executing`` in the other: one plan, two answers.  This
+    function is the one judgement both call, so there is one answer.
+
+    Like :func:`find_divergences`, the judgement is pure and the I/O
+    stays with the caller: reading the execution record needs a database
+    and (in the serving process) the in-memory liveness dict, neither of
+    which this module may touch.
+
+    ``execution_recorded`` is "does an execution record exist for this
+    plan at all": a ``plan_execution`` row OR an in-memory
+    ``_execution_state`` entry.  The executor seeds the in-memory record
+    before it stamps the phase and persists the row before it spawns the
+    subprocess, so a plan that IS running always has one of the two.
+
+    ``verification_running`` is deliberately NOT included: a
+    verification round records its liveness in ``plan_verification`` /
+    ``_verification_state``, not in ``plan_execution``, so "no execution
+    row" says nothing about it.
+    """
+    if is_runtime_phase(phase) and not execution_recorded:
+        return fallback
+    return str(phase or "")
 
 
 def find_divergences(status: PlanStatus) -> Tuple[Divergence, ...]:

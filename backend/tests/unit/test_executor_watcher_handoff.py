@@ -43,7 +43,7 @@ from __future__ import annotations
 import ast
 import json
 import sys
-import time
+import threading
 from pathlib import Path
 
 import pytest
@@ -103,17 +103,34 @@ def _seed_plan(db_path: Path, plan_id: str, project_dir: Path) -> None:
 
 
 class _FakeProcess:
-    """Minimal stand-in for the executor ``subprocess.Popen`` handle."""
+    """Minimal stand-in for the executor ``subprocess.Popen`` handle.
+
+    ``wait()`` parks until the test releases it, exactly like the
+    reclaimable fake in ``tests/api/test_execution_state_persistence.py``:
+    the watcher thread is the production execution monitor, and parking it
+    is how a test observes the "running" state.  Parking must not outlive
+    the test — ``release`` / ``terminate`` are the hooks
+    ``tests/conftest.py::clean_execution_state`` (and any test that wants
+    to reclaim its own worker early) call to unblock it.
+    """
 
     def __init__(self) -> None:
         self.pid = 424242
         self.returncode = 0
+        self._block = threading.Event()
 
     def poll(self):
         return self.returncode
 
-    def wait(self):
+    def wait(self, timeout=None):
+        self._block.wait(timeout)
         return self.returncode
+
+    def terminate(self):
+        self._block.set()
+
+    def release(self):
+        self._block.set()
 
 
 def _local_bindings(fn: ast.FunctionDef) -> set[str]:
@@ -221,10 +238,11 @@ def isolated_server(tmp_path, monkeypatch):
         "_count_unfinished_tasks",
         lambda *a, **k: {"total": 1, "pending_or_unstarted": 0, "failed": 0},
     )
+    fake = _FakeProcess()
     monkeypatch.setattr(
         server,
         "_spawn_executor_subprocess",
-        lambda **kwargs: (_FakeProcess(), tmp_path / "executor.log"),
+        lambda **kwargs: (fake, tmp_path / "executor.log"),
     )
 
     calls: list[tuple] = []
@@ -235,29 +253,50 @@ def isolated_server(tmp_path, monkeypatch):
     )
 
     server._execution_state.pop(plan_id, None)
-    yield server, plan_id, project_dir, calls
+    yield server, plan_id, project_dir, calls, fake
     server._execution_state.pop(plan_id, None)
 
 
-def _await(calls: list, timeout: float = 10.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline and not calls:
-        time.sleep(0.02)
-    assert calls, "auto-verification hand-off never fired within the timeout"
+def _release_and_join(fake, calls, reclaim) -> list[tuple]:
+    """Release the parked executor handle, then join the watcher thread.
+
+    The watcher thread IS the production execution monitor
+    (``routes/execution.py``).  Its tail opens the state database through
+    ``_state_db_path()`` — resolved **on every call** — and writes to it,
+    so a monitor that is still running when this test ends writes into the
+    NEXT test's database instead of its own.  That is the 2026-09-14
+    ``database disk image is malformed`` flake.
+
+    Releasing then joining makes the ordering a guarantee rather than a
+    timing hope, and it is the same "release, then join" rule the autouse
+    ``clean_execution_state`` fixture applies at teardown — applied here
+    while this test still owns the worker.
+    """
+    fake.release()
+    stuck = reclaim()
+    assert not stuck, (
+        f"the execution monitor still runs after the release: {stuck!r} — a "
+        "worker that outlives its test writes into the next test's state.db"
+    )
+    return calls
 
 
-def test_auto_verification_fires_on_clean_exit(isolated_server):
+def test_auto_verification_fires_on_clean_exit(isolated_server, reclaim_workers):
     """Baseline: rc=0 with every task terminal reaches ``_run_auto_verification_loop``."""
-    server, plan_id, project_dir, calls = isolated_server
+    server, plan_id, project_dir, calls, fake = isolated_server
 
     server.start_execution(
         plan_id,
         server.StartExecutionRequest(project_dir=str(project_dir)),
     )
-    _await(calls)
+    calls = _release_and_join(fake, calls, reclaim_workers)
+
+    assert calls, "auto-verification hand-off never fired"
 
 
-def test_auto_verification_fires_even_if_status_persist_fails(isolated_server, monkeypatch):
+def test_auto_verification_fires_even_if_status_persist_fails(
+    isolated_server, monkeypatch, reclaim_workers
+):
     """A failure in the best-effort ``exec_status`` persist must not skip verification.
 
     Before the fix, *any* exception raised between ``state["ended_at"]``
@@ -265,7 +304,7 @@ def test_auto_verification_fires_even_if_status_persist_fails(isolated_server, m
     ``except Exception`` — which swallowed it silently and skipped the
     hand-off entirely.
     """
-    server, plan_id, project_dir, calls = isolated_server
+    server, plan_id, project_dir, calls, fake = isolated_server
 
     from state_machine.repositories.execution_repository import ExecutionRepository
 
@@ -278,4 +317,9 @@ def test_auto_verification_fires_even_if_status_persist_fails(isolated_server, m
         plan_id,
         server.StartExecutionRequest(project_dir=str(project_dir)),
     )
-    _await(calls)
+    calls = _release_and_join(fake, calls, reclaim_workers)
+
+    assert calls, (
+        "the auto-verification hand-off was skipped when the exec_status "
+        "persist raised"
+    )

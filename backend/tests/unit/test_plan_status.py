@@ -235,6 +235,33 @@ def _seed_tasks(db: Path, plan_id: str, rows) -> None:
         conn.close()
 
 
+def _seed_execution_record(db: Path, plan_id: str) -> None:
+    """Give the plan the ``plan_execution`` row a real run leaves behind.
+
+    ``executing`` is the one phase whose truth depends on a LIVE
+    execution rather than on the plan's artefacts, so a plan sitting in
+    that phase necessarily has an execution record — a
+    ``plan_execution`` row or an in-memory ``_execution_state`` entry.
+    A plan claiming ``executing`` with neither is a plan that cannot be
+    running, and the readers say so rather than repeating the claim.
+    """
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+    )
+
+    conn = open_db(db)
+    try:
+        migrate(conn)
+        ExecutionRepository(conn).insert(
+            plan_id, exec_status="running", exec_pid=4242,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def clean_execution_state():
     """Restore ``_execution_state`` / ``_verification_state`` after a test."""
@@ -396,6 +423,7 @@ def test_the_endpoint_serves_the_snapshot(tmp_path, monkeypatch, state_db,
     (tmp_path / plan_id).mkdir()
     monkeypatch.setattr(server, "PLANS_DIR", tmp_path)
     _seed_routing(state_db, plan_id, "executing")
+    _seed_execution_record(state_db, plan_id)
     _seed_verification(state_db, plan_id, status="running")
     _seed_tasks(state_db, plan_id, [
         {"id": "1", "title": "work", "status": "in_progress"},
@@ -430,6 +458,7 @@ def test_the_payload_carries_the_three_body_sections(
     (tmp_path / plan_id).mkdir()
     monkeypatch.setattr(server, "PLANS_DIR", tmp_path)
     _seed_routing(state_db, plan_id, "executing")
+    _seed_execution_record(state_db, plan_id)
     _seed_verification(state_db, plan_id, status="running")
     _seed_tasks(state_db, plan_id, [
         {"id": "1", "title": "work", "status": "in_progress"},
@@ -458,6 +487,7 @@ def test_a_failing_section_degrades_to_none_not_500(
     (tmp_path / plan_id).mkdir()
     monkeypatch.setattr(server, "PLANS_DIR", tmp_path)
     _seed_routing(state_db, plan_id, "executing")
+    _seed_execution_record(state_db, plan_id)
     _seed_verification(state_db, plan_id, status="running")
 
     def _boom(_plan_id):
