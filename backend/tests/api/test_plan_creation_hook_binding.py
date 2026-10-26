@@ -42,6 +42,7 @@ are replaced per test.
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -180,8 +181,19 @@ def test_import_writes_hook(isolated_plans_dir, checkout, monkeypatch):
         f"the hook configuration must be written into the plan's own "
         f"directory: {plan_dir!s}"
     )
-    assert load_for_plan(plan_dir)["hooks"] == [
-        {"kind": "cc_connect", "destination": "grp-1", "session_id": "s-1"}
+    # The hook is the delivery command itself, so what is asserted is
+    # the argv the dispatcher will run: the delivery module, and the
+    # project and session the plan was created for.  The argv is read
+    # back with ``shlex.split`` rather than by re-implementing the
+    # quoting.
+    hooks = load_for_plan(plan_dir)["hooks"]
+    assert len(hooks) == 1
+    assert hooks[0]["kind"] == "cmd"
+    assert shlex.split(hooks[0]["command"])[3:] == [
+        "--project",
+        "grp-1",
+        "--session",
+        "s-1",
     ]
 
 
@@ -243,8 +255,19 @@ def test_interview_writes_hook(isolated_plans_dir, interview):
         f"the hook configuration must be written into the plan's own "
         f"directory: {plan_dir!s}"
     )
-    assert load_for_plan(plan_dir)["hooks"] == [
-        {"kind": "cc_connect", "destination": "grp-1", "session_id": "s-1"}
+    # The hook is the delivery command itself, so what is asserted is
+    # the argv the dispatcher will run: the delivery module, and the
+    # project and session the plan was created for.  The argv is read
+    # back with ``shlex.split`` rather than by re-implementing the
+    # quoting.
+    hooks = load_for_plan(plan_dir)["hooks"]
+    assert len(hooks) == 1
+    assert hooks[0]["kind"] == "cmd"
+    assert shlex.split(hooks[0]["command"])[3:] == [
+        "--project",
+        "grp-1",
+        "--session",
+        "s-1",
     ]
 
 

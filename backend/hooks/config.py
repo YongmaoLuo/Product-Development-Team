@@ -54,7 +54,8 @@ The document
       "captured_at": "2026-10-21T10:00:00Z",
       "source": "plan_creation",        # where the plan came from
       "hooks": [                         # who gets asked
-        {"kind": "cc_connect", "destination": "grp-1", "session_id": "s-1"}
+        {"kind": "cmd",
+         "command": "'/path/to/python3' -m backend.hooks.session_send --project grp-1 --session s-1"}
       ]
     }
 
@@ -66,11 +67,13 @@ and the mode recorded with a decision cannot disagree about what
 A hook element names its transport in ``kind`` and carries the fields
 that kind needs: ``destination`` for ``cc_connect`` / ``feishu`` /
 ``telegram``, ``url`` for ``http``, ``command`` for ``cmd``, and an
-optional per-hook ``timeout_sec``.  This module writes the
-``cc_connect`` element a plan's origin implies and reads back every
-kind — a reader that dropped ``url`` would leave an ``http`` hook with
-nowhere to POST to.  Which entries are deliverable is the
-dispatcher's question; this one only reports what the plan stored.
+optional per-hook ``timeout_sec``.  This module writes the ``cmd``
+element a plan's origin implies — the delivery command itself, with
+the interpreter that is running and the destination the plan names —
+and reads back every kind, a reader that dropped ``url`` would leave
+an ``http`` hook with nowhere to POST to.  Which entries are
+deliverable is the dispatcher's question; this one only reports what
+the plan stored.
 
 ``source`` and ``captured_at`` are provenance: they record *where* the
 configuration came from and *when* it was captured.  They are written
@@ -84,6 +87,8 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Union
@@ -111,7 +116,19 @@ DEFAULT_MODE = DecisionMode.AUTO.value
 DEFAULT_TIMEOUT_SEC = 1800
 
 #: The transport kind of a hook that delivers to a cc-connect group.
+#: It is not written any more — the plan's hook is a command — but a
+#: stored document may still carry one, so the reader passes it through
+#: rather than dropping it on the floor.
 HOOK_KIND_CC_CONNECT = "cc_connect"
+
+#: The transport kind of a hook that runs a command: the delivery
+#: entry point, with the plan's destination in its arguments.
+HOOK_KIND_CMD = "cmd"
+
+#: The module the delivery command runs.  It is run with ``-m``, so it
+#: is importable only where the ``backend`` package is — the project
+#: root — and the process that runs it must be started there.
+_SESSION_SEND_MODULE = "backend.hooks.session_send"
 
 #: The text fields a hook element may carry, in contract order.  Each
 #: kind uses the ones that apply to it: ``destination`` for
@@ -175,7 +192,9 @@ def write_for_plan(
         from a session, empty for one created outside one).  An empty
         source means there is no session to ask.
     ``session_id``
-        The session the plan was created in, when there was one.
+        The session the plan was created in, when there was one.  The
+        command that delivers a decision is addressed to that session,
+        so a plan without one has nowhere to send a reply to.
     ``destination``
         Where the question goes (a cc-connect group id).  A hook
         without a destination is not deliverable, so it is not a hook.
@@ -378,20 +397,57 @@ def _hooks_for(
     """The hook list the plan's origin implies.
 
     A hook is a delivery target: it needs a session the plan came
-    from *and* a place to ask.  A plan created outside a session (a
-    ``curl`` call) has neither, so it gets no hooks — and a plan with
-    no hooks asks nobody, which is the correct answer rather than a
-    gap to be filled in from somewhere else.
+    from, a place to ask, and the source that says the plan came from
+    somewhere at all.  A plan created outside a session (a ``curl``
+    call) has none of them, so it gets no hooks — and a plan with no
+    hooks asks nobody, which is the correct answer rather than a gap
+    to be filled in from somewhere else.
+
+    The hook is the **command** that delivers, not a description of a
+    transport: the dispatcher runs what is stored here, and a
+    description it would have to interpret is one more thing that can
+    disagree with the dispatcher about what a delivery is.  So the
+    command is written down whole, once, when the plan is created.
     """
-    if not source or not destination:
+    if not source or not session_id or not destination:
         return []
     return [
         {
-            "kind": HOOK_KIND_CC_CONNECT,
-            "destination": destination,
-            "session_id": session_id,
+            "kind": HOOK_KIND_CMD,
+            "command": _session_send_command(
+                destination=destination, session_id=session_id
+            ),
         }
     ]
+
+
+def _session_send_command(*, destination: str, session_id: str) -> str:
+    """The command that delivers a decision to ``destination``.
+
+    The command is the delivery entry point
+    (:mod:`backend.hooks.session_send`) run with the interpreter that
+    is running this process.  That interpreter is not written down by
+    hand: a path copied from one machine is wrong on every other one,
+    and the plan's own file is the only thing that travels between
+    machines.
+
+    The two values the plan carries — where to send and in which
+    session — are quoted with :func:`shlex.quote`.  A destination is
+    somebody else's string, and one that looks like a shell command
+    (``grp; touch /tmp/x``) has to reach the delivery CLI as one
+    argument rather than become one.
+    """
+    return " ".join(
+        [
+            shlex.quote(sys.executable),
+            "-m",
+            _SESSION_SEND_MODULE,
+            "--project",
+            shlex.quote(destination),
+            "--session",
+            shlex.quote(session_id),
+        ]
+    )
 
 
 def _hooks_from(hooks: Any) -> List[Dict[str, Any]]:

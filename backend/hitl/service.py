@@ -427,12 +427,20 @@ def _event_payload(decision: Decision) -> Dict[str, Any]:
     deadline a human is racing.  A decision's *kind* travels in its
     ``source`` field — the plan's four disposition kinds — so that is
     what ``kind`` carries here.
+
+    The **question** travels too, in the words shown to the human: the
+    message a destination is asked to deliver has to carry it, and a
+    payload that left it out could only say *that* a question was
+    asked.  An empty question is carried as the empty string rather
+    than dropped — the key is present, and the receiving side shows a
+    placeholder.
     """
     return {
         "plan_id": decision.plan_id,
         "decision_id": decision.decision_id,
         "task_id": decision.task_id,
         "kind": decision.source,
+        "question": decision.question,
         "options": list(decision.options),
         "default_option": decision.default_option,
         "deadline_at": decision.deadline_at,
