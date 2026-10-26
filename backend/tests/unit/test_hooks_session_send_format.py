@@ -24,6 +24,13 @@ The format itself is pinned exactly: the wording, the labels and the
 enumeration are the contract with the reader on the other end, so a
 reformat is a change to what a human is shown, not a refactor.
 
+And the format is **Markdown**, for a reason that is not a style
+preference: ``cc-connect`` decides how to render a message by looking
+for Markdown markers in it.  A message without markers arrives as a
+plain text bubble; a message with them arrives as an interactive card.
+The markers are therefore part of what the reader is shown, and they
+are pinned here too.
+
 The module is deliberately pure — no I/O, no clock, no environment.
 That is what lets the later delivery CLI reuse it without dragging a
 side effect along.
@@ -87,12 +94,14 @@ def test_message_has_the_agreed_shape():
     message = format_message(_event())
 
     assert message == (
-        "[HITL] 计划 p1 需要你的决定\n"
-        "决策 ID：d1\n"
-        "问题：是否合入？\n"
-        "选项：1) accept 2) revise\n"
-        "默认答案：accept\n"
-        "截止时间：2026-10-26T12:00:00Z"
+        "**⏳ HITL 决策待处理** · `p1`\n"
+        "\n"
+        "> 是否合入？\n"
+        "\n"
+        "- **决策 ID**：`d1`\n"
+        "- **选项**：1) accept 2) revise\n"
+        "- **默认答案**：accept（超时未答时采用）\n"
+        "- **截止时间**：2026-10-26T12:00:00Z"
     )
 
 
@@ -127,18 +136,20 @@ def test_missing_fields_are_named_per_line():
 
     One placeholder for the whole message would leave the reader
     guessing *which* fact is missing, and a message that says
-    "（未提供）" five times is not more informative than one that says
+    "（未提供）" six times is not more informative than one that says
     it once.
     """
     message = format_message({})
 
     assert message == (
-        f"[HITL] 计划 {PLACEHOLDER} 需要你的决定\n"
-        f"决策 ID：{PLACEHOLDER}\n"
-        f"问题：{PLACEHOLDER}\n"
-        f"选项：{PLACEHOLDER}\n"
-        f"默认答案：{PLACEHOLDER}\n"
-        f"截止时间：{PLACEHOLDER}"
+        f"**⏳ HITL 决策待处理** · `{PLACEHOLDER}`\n"
+        "\n"
+        f"> {PLACEHOLDER}\n"
+        "\n"
+        f"- **决策 ID**：`{PLACEHOLDER}`\n"
+        f"- **选项**：{PLACEHOLDER}\n"
+        f"- **默认答案**：{PLACEHOLDER}\n"
+        f"- **截止时间**：{PLACEHOLDER}"
     )
 
 
@@ -172,11 +183,88 @@ def test_options_that_are_not_a_list_are_treated_as_missing():
     """
     message = format_message(_event(options="accept"))
 
-    assert f"选项：{PLACEHOLDER}" in message
+    assert f"**选项**：{PLACEHOLDER}" in message
 
 
 def test_empty_options_are_treated_as_missing():
     """An empty option list is no options at all."""
     message = format_message(_event(options=[]))
 
-    assert f"选项：{PLACEHOLDER}" in message
+    assert f"**选项**：{PLACEHOLDER}" in message
+
+
+# ---------------------------------------------------------------------------
+# The message is Markdown, so that it is rendered as a card
+# ---------------------------------------------------------------------------
+
+#: The markers ``cc-connect`` looks for when it decides how to render a
+#: message it was handed — its ``markdownIndicators`` list.  A message
+#: carrying none of them is delivered as plain text; a message carrying
+#: one of them is delivered as an interactive card.  The list is copied
+#: here rather than imported because it belongs to another project, and
+#: a copy that drifts is a copy this test can still catch: the two
+#: markers the message is built on are asserted by name below.
+FEISHU_MARKDOWN_INDICATORS = (
+    "```",
+    "**",
+    "~~",
+    "`",
+    "\n- ",
+    "\n* ",
+    "\n1. ",
+    "\n# ",
+    "---",
+)
+
+#: The markers the message is built on.  Both are needed: ``**`` is
+#: what makes the title bold, and ``\n- `` is what makes the fields a
+#: list — and the second one only counts when the dash starts a line.
+REQUIRED_MARKDOWN_INDICATORS = ("**", "\n- ")
+
+#: Every Markdown marker the message carries, so that a test can take
+#: them all off and see what a reader would be left with.
+_MARKDOWN_MARKERS = ("**", "`", "> ", "- ", "·")
+
+
+def test_message_carries_a_feishu_markdown_indicator():
+    """The message is rendered as a card, not as a plain text bubble.
+
+    ``cc-connect`` does not ask what a message is — it looks at it.  A
+    message whose text carries none of the markers in its
+    ``markdownIndicators`` list is delivered as plain text, and a
+    message that carries one of them is delivered as an interactive
+    card.  This message used to carry none of them, which is why it
+    arrived as a wall of text; the markers are pinned here so that
+    cannot happen again by accident.
+    """
+    message = format_message(_event())
+
+    for indicator in REQUIRED_MARKDOWN_INDICATORS:
+        assert indicator in message, (
+            "the message carries no {0!r}, so it is delivered as plain "
+            "text instead of a card".format(indicator)
+        )
+
+    assert any(
+        indicator in message for indicator in FEISHU_MARKDOWN_INDICATORS
+    ), "the message carries none of the markers cc-connect looks for"
+
+
+def test_message_is_readable_without_its_markdown_markers():
+    """The message still reads as text when the markers are gone.
+
+    Somebody copies the message into another chat, or quotes it in a
+    reply, and the Markdown is lost on the way.  What is left has to
+    still say what is being asked, about what, and by when — otherwise
+    the message only reads well in the one place it was written for.
+    """
+    message = format_message(_event())
+
+    plain = message
+    for marker in _MARKDOWN_MARKERS:
+        plain = plain.replace(marker, "")
+
+    assert "p1" in plain
+    assert "是否合入？" in plain
+    assert "1) accept" in plain
+    assert "2026-10-26T12:00:00Z" in plain

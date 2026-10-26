@@ -48,18 +48,35 @@ The shape of the message
 ------------------------
 ::
 
-    [HITL] 计划 p1 需要你的决定
-    决策 ID：d1
-    问题：是否合入？
-    选项：1) accept 2) revise
-    默认答案：accept
-    截止时间：2026-10-26T12:00:00Z
+    **⏳ HITL 决策待处理** · `p1`
 
-Six fields, six lines, in the order a person reads them: what is being
-asked, about what, the answers on the table, the answer that happens
-by default, and how long there is to reply.  The options are numbered
-because the reply names one — ``1`` means the first option, and the
-numbering has to be stable enough for a person to use it.
+    > 是否合入？
+
+    - **决策 ID**：`d1`
+    - **选项**：1) accept 2) revise
+    - **默认答案**：accept（超时未答时采用）
+    - **截止时间**：2026-10-26T12:00:00Z
+
+The message is Markdown, and that is not decoration.  ``cc-connect``
+looks at the content it was handed and decides how to render it: a
+message with no Markdown markers in it arrives as a plain text bubble,
+and a message with them arrives as an interactive card — Feishu schema
+2.0, where the title is bold, the question is a quote and the fields
+are a list.  The markers are therefore part of the contract with the
+reader: a decision that arrives as a wall of plain text is a decision
+nobody reads carefully.
+
+Six fields, six places the reader can look: what is being asked, about
+what, the answers on the table, the answer that happens by default,
+and how long there is to reply.  The options are numbered because the
+reply names one — ``1`` means the first option, and the numbering has
+to be stable enough for a person to use it.
+
+The message also has to read as plain text, because somebody copies it
+somewhere else — another chat, a ticket, a quoting reply — and the
+Markdown markers are gone with it.  What is left has to still be
+sentences a person can act on, which is why the labels are words and
+the question is a sentence of its own.
 
 Degradation is the default, never an exception
 ----------------------------------------------
@@ -95,17 +112,31 @@ from typing import Any, List, Optional
 #: and empty".
 PLACEHOLDER = "（未提供）"
 
-#: The header line: the plan a decision belongs to, and the words
-#: around it.  It opens every message so a reader in a chat group can
-#: tell what the message is before they read the question.
-_PLAN_LINE = "[HITL] 计划 {plan_id} 需要你的决定"
+#: The header: the title of the message, and the plan the decision
+#: belongs to.  It opens every message so a reader in a chat group can
+#: tell what the message is before they read the question.  The title
+#: is bold and the plan id is code — the markers are what make
+#: ``cc-connect`` render the message as a card instead of a plain text
+#: bubble, and the two of them are what a reader's eye lands on first.
+_HEADER_LINE = "**⏳ HITL 决策待处理** · `{plan_id}`"
 
-#: The label each of the remaining fields is written under.
-_DECISION_LABEL = "决策 ID"
-_QUESTION_LABEL = "问题"
-_OPTIONS_LABEL = "选项"
-_DEFAULT_LABEL = "默认答案"
-_DEADLINE_LABEL = "截止时间"
+#: The question, as a quote.  It is the one part of the message that is
+#: a sentence rather than a label and a value, and a quote is what
+#: separates it from the fields below.
+_QUESTION_LINE = "> {question}"
+
+#: The fields, as a list.  Each label is bold so that a reader can find
+#: the value without reading the line, and the identifiers are code so
+#: that a long id is not mistaken for a word.
+_DECISION_LINE = "- **决策 ID**：`{decision_id}`"
+_OPTIONS_LINE = "- **选项**：{options}"
+_DEFAULT_LINE = "- **默认答案**：{default_option}"
+_DEADLINE_LINE = "- **截止时间**：{deadline_at}"
+
+#: What the default answer is for, said next to it.  It is only there
+#: when there is a default answer to explain: a line that reads
+#: "（未提供）（超时未答时采用）" says nothing twice.
+_DEFAULT_NOTE = "（超时未答时采用）"
 
 
 def format_message(event: Mapping[str, Any]) -> str:
@@ -114,6 +145,11 @@ def format_message(event: Mapping[str, Any]) -> str:
     ``event`` is the decision event as JSON: ``plan_id``,
     ``decision_id``, ``question``, ``options``, ``default_option`` and
     ``deadline_at``.  Any of them may be missing.
+
+    The message is Markdown.  It has to be: ``cc-connect`` renders a
+    message that carries no Markdown markers as a plain text bubble,
+    and one that carries them as an interactive card, and the card is
+    what makes a decision readable in a busy chat group.
 
     The function never raises.  A field that is absent, empty or of an
     unexpected shape shows :data:`PLACEHOLDER` on its own line; an
@@ -132,7 +168,8 @@ def format_message(event: Mapping[str, Any]) -> str:
     Returns
     -------
     str
-        Six lines: the header, and one line per field.
+        The Markdown message: a title line, the question as a quote,
+        and one list item per field.
     """
     fields = event if isinstance(event, Mapping) else {}
 
@@ -143,14 +180,20 @@ def format_message(event: Mapping[str, Any]) -> str:
     default_option = _text(fields.get("default_option"))
     deadline_at = _text(fields.get("deadline_at"))
 
+    default_line = _DEFAULT_LINE.format(default_option=default_option)
+    if default_option != PLACEHOLDER:
+        default_line += _DEFAULT_NOTE
+
     return "\n".join(
         [
-            _PLAN_LINE.format(plan_id=plan_id),
-            f"{_DECISION_LABEL}：{decision_id}",
-            f"{_QUESTION_LABEL}：{question}",
-            f"{_OPTIONS_LABEL}：{options}",
-            f"{_DEFAULT_LABEL}：{default_option}",
-            f"{_DEADLINE_LABEL}：{deadline_at}",
+            _HEADER_LINE.format(plan_id=plan_id),
+            "",
+            _QUESTION_LINE.format(question=question),
+            "",
+            _DECISION_LINE.format(decision_id=decision_id),
+            _OPTIONS_LINE.format(options=options),
+            default_line,
+            _DEADLINE_LINE.format(deadline_at=deadline_at),
         ]
     )
 
