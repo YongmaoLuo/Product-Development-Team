@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from typing import Iterator
 
 import pytest
@@ -254,3 +255,134 @@ def test_completed_phases_json_decode(client, state_db_path):
     # as a JSON array on the wire.
     assert isinstance(body["completed_phases"], list)
     assert body["completed_phases"] != '["a","b"]'
+
+
+# ---------------------------------------------------------------------------
+# The isolation the 2026-09-14 flake needed
+# ---------------------------------------------------------------------------
+#
+# ``database disk image is malformed`` on this file had one cause: a
+# background worker that outlived the test that started it.  The
+# production execution monitor (``backend/routes/execution.py``) resolves
+# the state database path **on every call** — ``open_db(_state_db_path())``
+# then ``migrate()`` — so a monitor that woke up inside a later test
+# opened that test's database and wrote into it, while that test was
+# building the very same file.  Two symptoms, one defect: the reduced
+# ``plan_routing`` schema collided with the production one
+# (``IntegrityError``), and a concurrent writer on a half-built file gave
+# ``database disk image is malformed``.
+#
+# The rule the suite now enforces: **a test hands back every worker it
+# starts, before it ends.**  The autouse ``clean_execution_state``
+# fixture applies it at teardown; the test below applies it while it
+# still owns the worker, which is the only moment the ordering is a
+# guarantee rather than a hope.
+
+
+class _ParkedExecutor:
+    """A fake executor handle that parks the worker on purpose.
+
+    Same shape as the reclaimable fake in
+    ``tests/api/test_execution_state_persistence.py``: ``wait()`` blocks
+    until ``release()`` / ``terminate()`` lets it through, so the worker
+    can be held at the exact point where it would wake up.
+    """
+
+    def __init__(self) -> None:
+        self._gate = threading.Event()
+
+    def wait(self, timeout=None) -> int:
+        self._gate.wait(timeout)
+        return 0
+
+    def poll(self):
+        return None
+
+    def release(self) -> None:
+        self._gate.set()
+
+    def terminate(self) -> None:
+        self._gate.set()
+
+
+def test_a_worker_that_outlives_its_test_cannot_write_into_the_next_db(
+    state_db_path, tmp_path, monkeypatch, reclaim_workers
+):
+    """A reclaimed worker writes into its own database, never the next one.
+
+    The worker below is the production monitor's shape: it parks on the
+    executor handle, and when it wakes it resolves the state database
+    path **at that moment** and writes to whatever file is current.
+
+    The test then hands the runtime paths over to a "next test" — a
+    different database file — and asserts that the next test's file is
+    untouched.  That is the property the 2026-09-14 flake broke: without
+    the release-then-join, the worker is still running when the next
+    test starts, wakes up there, and writes into the next test's
+    database.
+    """
+    import server
+
+    # This test's own database, built the way this file builds it.
+    _create_state_db(state_db_path)
+
+    # The "next test"'s database: a different file, in the same tmp dir.
+    next_db = tmp_path / "next-test" / "state.db"
+    next_db.parent.mkdir(parents=True, exist_ok=True)
+    _create_state_db(next_db)
+
+    wrote_to = []
+
+    def _worker() -> None:
+        """The monitor's tail: the path is resolved HERE, at call time."""
+        fake.wait()
+        target = server._state_db_path()
+        wrote_to.append(str(target))
+        conn = sqlite3.connect(str(target))
+        try:
+            conn.execute("CREATE TABLE leaked_writer (x INTEGER)")
+            conn.commit()
+        finally:
+            conn.close()
+
+    fake = _ParkedExecutor()
+    worker = threading.Thread(target=_worker, name="parked-monitor")
+    worker.start()
+
+    # Release, then join — while this test still owns the worker.  This
+    # is the ordering guarantee: the worker's late write belongs to THIS
+    # test, because the worker is finished before the paths move on.
+    fake.release()
+    stuck = reclaim_workers()
+    assert not stuck, (
+        f"worker(s) still running after the release-then-join: {stuck!r} — a "
+        "worker that outlives its test writes into the next test's state.db"
+    )
+
+    # The worker did wake up and did write — into the database that was
+    # current while it still belonged to this test.
+    assert wrote_to == [str(state_db_path)], (
+        f"the worker wrote to {wrote_to!r}, not to this test's own "
+        f"state.db ({state_db_path})"
+    )
+
+    # Now the runtime paths move on, the way they do when the next test
+    # starts: the state database becomes the next test's file.
+    monkeypatch.setattr(server, "_state_db_path", lambda *a, **k: next_db)
+    _create_state_db(next_db, rows=[("next-test-plan", "prd_review", "[]")])
+
+    conn = sqlite3.connect(str(next_db))
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    finally:
+        conn.close()
+
+    assert "leaked_writer" not in tables, (
+        "a worker from the previous test wrote into the next test's state.db "
+        f"(tables: {sorted(tables)}) — the next test's database is corrupt"
+    )
