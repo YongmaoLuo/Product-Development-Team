@@ -5924,24 +5924,33 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                         )
                         # 2026-09-08: auto-split succeeded — transition
                         # plan state so the orchestrator re-runs the new
-                        # task list on next dispatch. ``executing → ready``
+                        # task list on next dispatch. ``executing → queued``
                         # is allowed per PHASE_TRANSITIONS.
+                        #
+                        # 2026-10-25 (R10): the write path speaks the
+                        # current vocabulary — ``queued`` is the one
+                        # waiting phase, ``ready`` is only an input
+                        # alias (see ``backend/phase_vocabulary.py``).
+                        # Writing the alias would still land on
+                        # ``queued``, but it would do so through the
+                        # deprecated word and fire the deprecation log
+                        # on every auto-split.
                         plan_state = getattr(self, "plan_state", None)
                         if plan_state is not None:
                             try:
                                 plan_state.reload()
-                                plan_state.transition_to("ready")
+                                plan_state.transition_to("queued")
                                 if self.logger:
                                     self.logger.info(
                                         "task_hard_timeout_ready",
-                                        f"task={task.id} auto-split → plan transitioned to ready",
+                                        f"task={task.id} auto-split → plan transitioned to queued",
                                         task_id=task.id,
                                     )
                             except Exception as trans_exc:
                                 if self.logger:
                                     self.logger.warning(
                                         "task_hard_timeout_ready_failed",
-                                        f"could not transition to ready after "
+                                        f"could not transition to queued after "
                                         f"task={task.id} split: {trans_exc}",
                                         task_id=task.id,
                                     )

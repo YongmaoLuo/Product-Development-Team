@@ -35,6 +35,15 @@ from plan_artifacts import (  # noqa: E402
     detect,
 )
 
+# ``phase_vocabulary`` 是纯词汇模块（只依赖 logging / typing，不 import
+# ``plan_state``），所以这里可以安全地模块级导入：等待相位的历史别名
+# （``ready``）必须在**读路径**上归一化成现行词汇（``queued``），否则列表会
+# 把旧词原样透出给前端与调度器 —— 同一个等待状态，两套词汇。
+from phase_vocabulary import (  # noqa: E402
+    log_deprecated_ready,
+    normalize_waiting_phase,
+)
+
 router = APIRouter()
 
 #: The plan-doc review phase — the verification branch's human review gate
@@ -170,10 +179,13 @@ def _artifact_status(
 
     Note the vocabulary is the listing's ``status`` vocabulary, not the
     phase vocabulary — ``reviewed`` / ``prd`` / ``interviewed`` / ``new``
-    are not valid phases.  Only ``ready`` is in both.
+    are not valid phases.  Only ``queued`` is in both: it is the single
+    waiting phase, so the bucket for "tasks exist, nobody started them"
+    is spelled the same way the phase is (``ready`` is only its legacy
+    input alias and must not be emitted).
     """
     if has_tasks:
-        return "ready"
+        return "queued"
     if has_review:
         return "reviewed"
     if has_prd:
@@ -1486,7 +1498,25 @@ def _list_plans_body(
             # because whether the recorded phase can be believed depends
             # on it (see the runtime-phase check below).
             routing_phase = str(row.get("current_phase") or "")
+            # 2026-10-25 (R10): ``ready`` 是 ``queued`` 的历史别名。存量
+            # ``plan_routing`` 行里还存着它，而启动时的迁移（``phase_migration``）
+            # 可能还没跑过、或跑在另一个库上 —— **读路径必须自己兜住**，否则
+            # 列表会把旧词原样透出给前端与调度器。
+            #
+            # 归一化只动**相位词汇**，不动这一行的其它语义：这一行仍然返回
+            # （不跳过、不 500），桶（``status``）仍按下面的既有规则算。命中
+            # 别名时留一条 warning —— 旧数据要清得掉，先得知道它在哪儿。
+            routing_phase, aliased = normalize_waiting_phase(routing_phase)
+            if aliased:
+                log_deprecated_ready(_server.logger, plan_id, "plans.list")
             current_phase = routing_phase or status
+            # 启发式兜底也可能说出旧词：等待桶在等待相位合并之前叫
+            # ``ready``。相位字段同样不能说旧词汇，所以这里 **静默** 归一
+            # 化：启发式是当场算出来的，不是存量数据，不值得为它刷一条
+            # 弃用日志（真正的旧数据来自上面那一行）。
+            current_phase, _ = normalize_waiting_phase(current_phase)
+            if not include_terminal and current_phase in terminal_phases:
+                continue
 
             # An **explicit bucket**: a phase that has a stable label
             # (``plan_state.PHASE_LABELS``) is a phase the listing must

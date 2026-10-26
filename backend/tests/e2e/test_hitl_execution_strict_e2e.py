@@ -268,14 +268,22 @@ def _write_plan(plans_dir: Path, plan_id: str) -> Path:
     return plan_dir
 
 
-def _seed_ready_plan(state_db: Path, plan_id: str) -> None:
-    """Put the plan in the ``ready`` phase the execution start wants.
+def _seed_queued_plan(state_db: Path, plan_id: str) -> None:
+    """Put the plan in the ``queued`` phase the execution start CAS accepts.
 
     A plan that has never been through the interview has no routing
     row, and the start endpoint's compare-and-set refuses to move a
     plan it cannot find.  The row is written straight into the
     database the server owns: the server reads routing state from the
     database on every request, so it sees the row without being told.
+
+    The phase is ``queued``, not ``ready``.  The start route's
+    whitelist (``server._EXECUTION_START_SOURCE_PHASES``) lists the
+    waiting phase under its current name, and a routing row parked at
+    the retired word is refused with ``409 stage_mismatch`` before the
+    executor is ever spawned.  ``ready`` is still a legal *input*
+    alias — the plan-state JSON mirror normalises it on the way in —
+    but the routing row the CAS reads has to carry the canonical word.
     """
     # ``isolation_level=None`` -- the connection is in autocommit mode,
     # which is what the production migrator requires for its DDL to
@@ -292,7 +300,7 @@ def _seed_ready_plan(state_db: Path, plan_id: str) -> None:
             "INSERT OR IGNORE INTO plan_routing "
             "(plan_id, current_phase, substage, version, updated_at) "
             "VALUES (?, ?, NULL, 0, ?)",
-            (plan_id, "ready", _now_iso()),
+            (plan_id, "queued", _now_iso()),
         )
         connection.commit()
     finally:
@@ -714,7 +722,7 @@ def test_strict_suspends_task_and_downstream(server):
     handle, client = server
     plan_id = "hitl-exec-strict-suspend"
     plan_dir = _write_plan(handle.plans_dir, plan_id)
-    _seed_ready_plan(handle.state_db, plan_id)
+    _seed_queued_plan(handle.state_db, plan_id)
 
     decision = _ask_question(client, plan_id, "B")
     _start_execution(client, plan_id, plan_dir)
@@ -812,7 +820,7 @@ def test_answer_releases(server):
     handle, client = server
     plan_id = "hitl-exec-strict-release"
     plan_dir = _write_plan(handle.plans_dir, plan_id)
-    _seed_ready_plan(handle.state_db, plan_id)
+    _seed_queued_plan(handle.state_db, plan_id)
 
     suspended = _suspended_plan(client, plan_id, plan_dir)
     decision = suspended["decision"]
@@ -858,7 +866,7 @@ def test_decision_survives_restart(server):
     handle, client = server
     plan_id = "hitl-exec-strict-restart"
     plan_dir = _write_plan(handle.plans_dir, plan_id)
-    _seed_ready_plan(handle.state_db, plan_id)
+    _seed_queued_plan(handle.state_db, plan_id)
 
     suspended = _suspended_plan(client, plan_id, plan_dir)
     decision = suspended["decision"]

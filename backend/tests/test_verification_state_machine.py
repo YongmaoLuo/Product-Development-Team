@@ -309,8 +309,13 @@ class TestStateMachineLegalTransitionsReachable:
             ("interview_complete", "prd_generation"),
             ("prd_generation", "prd_review"),
             ("prd_approved", "tasks_generation"),
-            ("tasks_generation", "ready"),
+            ("tasks_generation", "queued"),
             ("ready", "executing"),
+            # 2026-10-25 (R10): 别名边 —— ``ready`` 是 ``queued`` 的输入
+            # 别名（磁盘上的历史状态照旧可读），但等待相位唯一拼写是
+            # ``queued``，所以这条边的落点也是 ``queued``。表里
+            # ``PHASE_TRANSITIONS["ready"]``（plan_state.py:262）接住它。
+            ("ready", "queued"),
             # Verification table edges that the guard accepts
             # directly (the convenience methods call into
             # transition_to under the hood).
@@ -326,9 +331,12 @@ class TestStateMachineLegalTransitionsReachable:
             ("completed", "verification_passed"),
             ("completed", "verification_failed"),
             # Backward transitions the guard allows.
-            ("failed", "ready"),
+            # 2026-10-25 (R10): 落点是等待相位 —— 唯一拼写 ``queued``，
+            # ``ready`` 只作输入别名，所以这些边回到「等人」时写的是
+            # ``queued``。
+            ("failed", "queued"),
             ("failed", "executing"),
-            ("stopped", "ready"),
+            ("stopped", "queued"),
             ("stopped", "executing"),
         ]
 

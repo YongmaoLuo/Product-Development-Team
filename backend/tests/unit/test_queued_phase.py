@@ -2,13 +2,25 @@
 
 Semantics:
 
-* ``ready`` — tasks are generated and approved; a human decides when to
-  start and authorizes the run. Never auto-started.
-* ``queued`` — the plan was handed to the scheduler explicitly, so the
-  scheduler may start it on its own. It starts queued plans one at a
-  time per workspace, so two
-  plans sharing a working tree can never run concurrently.
+* ``queued`` — the one waiting phase. The plan was handed to the
+  scheduler explicitly, so the scheduler may start it on its own. It
+  starts queued plans one at a time per workspace, so two plans sharing
+  a working tree can never run concurrently.
+* ``ready`` — an *input* alias, not a second waiting phase.
+  ``phase_vocabulary.normalize_waiting_phase`` folds it into ``queued``
+  on read and the write path no longer produces it. It stays in
+  ``plan_state``'s transition table (the manual path is unchanged), but
+  the card vocabularies and the execution-start whitelist must not
+  carry it: one state, one spelling.
 * ``ready → executing`` stays legal: the manual path is unchanged.
+
+2026-10-26 (R10): ``ready`` and ``queued`` were two names for one
+state ("tasks are generated, waiting for a human to decide"). The write
+path now produces ``queued`` only, and everything that *renders* or
+*starts* a plan speaks that one spelling. The assertions below were
+re-aligned to that design — not deleted, not weakened: both card
+vocabularies must spell the waiting phase 「排队中」, and ``ready`` must
+be absent from the card vocabulary and from the start whitelist.
 
 These tests pin the backend half (vocabulary, transitions, schedulable
 set, execution-start CAS, card labels). Whatever consumes this API from
@@ -134,12 +146,23 @@ def test_scheduler_sql_selects_exactly_the_schedulable_phases():
 
 def test_execution_start_accepts_a_queued_plan():
     """The execution-start CAS must accept the queued phase — otherwise a
-    queued plan can never actually be started by the scheduler."""
+    queued plan can never actually be started by the scheduler.
+
+    2026-10-26 (R10): ``ready`` left the whitelist. It is an input
+    alias — ``phase_vocabulary.normalize_waiting_phase`` folds it into
+    ``queued`` on read — so the write path no longer produces it.
+    Keeping it here would open a back door for a phase nobody writes:
+    a row could reach the CAS at ``ready`` and start, bypassing the one
+    spelling every other layer agrees on.
+    """
     import server
 
     assert "queued" in server._EXECUTION_START_SOURCE_PHASES
-    assert "ready" in server._EXECUTION_START_SOURCE_PHASES, (
-        "the manual gate must stay startable"
+    assert "ready" not in server._EXECUTION_START_SOURCE_PHASES, (
+        "'ready' is normalised to 'queued' by "
+        "phase_vocabulary.normalize_waiting_phase; keeping it in the "
+        "start whitelist leaves a back door open for a phase the write "
+        "path no longer produces"
     )
 
 
@@ -170,12 +193,21 @@ def test_execution_start_cas_accepts_the_queued_phase_end_to_end(tmp_path):
 
 
 def test_card_labels_render_the_queued_gate():
+    """The waiting phase renders as 「排队中」 in both card vocabularies.
+
+    2026-10-26 (R10): the wording was 「已排队」; it is now 「排队中」 —
+    the same spelling in the header table and in the execution sub-line,
+    so an operator never sees two names for the state the plan is in.
+    """
     from notifications import cards
 
-    assert "已排队" in cards._PHASE_LABEL.get("queued", ""), (
+    assert "排队中" in cards._PHASE_LABEL.get("queued", ""), (
         f"card header label missing for queued: {cards._PHASE_LABEL.get('queued')!r}"
     )
-    assert "已排队" in cards._EXECUTION_PHASE_LABEL.get("queued", "")
+    assert "排队中" in cards._EXECUTION_PHASE_LABEL.get("queued", ""), (
+        f"card execution label missing for queued: "
+        f"{cards._EXECUTION_PHASE_LABEL.get('queued')!r}"
+    )
 
 
 def test_card_phase_label_map_is_exhaustive_for_phases_we_show():
@@ -185,10 +217,19 @@ def test_card_phase_label_map_is_exhaustive_for_phases_we_show():
     the operator an English ``queued`` on a Chinese card — the failure
     mode ``test_card_compact_phase_map_knows_queued`` used to pin with a
     source-text grep.
+
+    2026-10-26 (R10): the waiting phase is spelled ``queued`` in every
+    card vocabulary, so ``ready`` is not a phase the card renders — it
+    is only an input alias. The map must not carry it: two spellings of
+    one state is exactly the history this file exists to prevent.
     """
     from notifications import cards
 
-    for phase in ("ready", "queued", "executing"):
+    for phase in ("queued", "executing"):
         assert cards._PHASE_LABEL.get(phase, ""), (
             f"no card label for the schedulable phase {phase!r}"
         )
+    assert "ready" not in cards._PHASE_LABEL, (
+        "the card vocabulary must not carry the legacy waiting phase: "
+        "the waiting phase is rendered as 'queued' only"
+    )

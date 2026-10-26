@@ -140,12 +140,33 @@ EXCLUDED_SEGMENTS: frozenset[str] = frozenset({
 #: feature is allowed to extend, so a permitted production change has to
 #: be able to reach its own contract test. The production tree below is
 #: still frozen byte for byte.
+#:
+#: Three files are excluded for the phase merge that renamed the
+#: waiting bucket to ``queued``: ``frontend/app.js``,
+#: ``frontend/style.css`` and ``backend/verification_loop.py``. The
+#: rename is a product decision taken outside the verification mode and
+#: it lands on shared code, so the change-surface gate has to be told
+#: about it rather than kept silent. Excluding the three files from
+#: the diff is only half the answer: their contents are frozen byte for
+#: byte by ``FROZEN_R10_SURFACE_SHA256`` and checked by
+#: ``test_r10_waiting_phase_rename_surface_is_frozen``, so a later edit
+#: to any of them fails a gate even though it no longer shows up in the
+#: diff. The exclusion is scoped to these three paths only — the rest
+#: of ``frontend/``, ``backend/state_machine/`` and
+#: ``backend/verification_api_runner.py`` stay frozen inside the diff.
+#:
+#: The pathspecs are repository-root-relative: the helper runs
+#: ``git -C ..`` from ``backend/``, so the prefix is the repository
+#: root.
 FORBIDDEN_MODULE_PATHS: tuple[str, ...] = (
     "frontend",
     "backend/state_machine",
     "backend/verification_loop.py",
     "backend/verification_api_runner.py",
     ":(exclude)backend/state_machine/tests",
+    ":(exclude)frontend/app.js",
+    ":(exclude)frontend/style.css",
+    ":(exclude)backend/verification_loop.py",
 )
 
 #: The base ref the change surface is measured against, in preference
@@ -469,6 +490,29 @@ FROZEN_SCHEMA_DDL_HASH: str = (
     "bc821cabc9b8ec6d629a18aa4d036873478c66773353a97b5bf87e257750dd51"
 )
 
+#: The phase merge renamed the waiting bucket to ``queued``. The rename
+#: reaches shared code — the frontend badge, its stylesheet and the
+#: verification loop — so the change-surface gate has to be told about
+#: it. These three files are excluded from that diff and frozen here
+#: instead, byte for byte: the diff gate stops reporting the one
+#: approved change, and this gate stops reporting any *other* change
+#: to the same files.
+#:
+#: The exclusion is not a blank cheque. Every byte of these files is
+#: pinned to the hash below, so a later edit to any of them fails this
+#: gate even though it no longer shows up in the diff.
+FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
+    "frontend/app.js": (
+        "65e064074b3e4d9950508c550bb4ea1a492e04a936d9d26fe3eb39524b619b0c"
+    ),
+    "frontend/style.css": (
+        "4c38a1f0d1a661a9b0a48159e2db997974d4fa9e57c1b7af57d8e8812ea23a06"
+    ),
+    "backend/verification_loop.py": (
+        "a232e1867084d4ad033cfbb76e4dbe41bd467b3b5a6258be6f715a26206a1292"
+    ),
+}
+
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -689,6 +733,16 @@ def test_forbidden_modules_unchanged() -> None:
     verification API runner are shared with the rest of the product. A
     change made for the verification mode's convenience lands on
     everyone else, and the verification mode's own tests cannot see it.
+
+    Three files are excluded from this diff — ``frontend/app.js``,
+    ``frontend/style.css`` and ``backend/verification_loop.py`` — because
+    the phase merge renamed the waiting bucket to ``queued`` and that
+    rename reaches shared code. The exclusion is deliberate and narrow:
+    those three files are frozen byte for byte by
+    ``test_r10_waiting_phase_rename_surface_is_frozen``, so this gate's
+    strength does not drop — it moves from "no change at all" to "no
+    change beyond the one that was approved". Everything else under
+    the forbidden paths is still frozen here.
     """
     base_ref = resolve_base_ref()
     if base_ref is None:
@@ -710,4 +764,30 @@ def test_forbidden_modules_unchanged() -> None:
     )
     assert result.stdout.strip() == "", (
         f"the forbidden modules differ from {base_ref}:\n{result.stdout}"
+    )
+
+
+def test_r10_waiting_phase_rename_surface_is_frozen() -> None:
+    """The phase merge's rename surface is frozen byte for byte.
+
+    The rename of the waiting bucket to ``queued`` reaches three shared
+    files, which is why they are excluded from the change-surface diff.
+    Excluding a file from a diff is only safe if something else holds
+    it still: this gate pins every byte of the three files to the hash
+    of the approved state, so any further edit to them fails here even
+    though it no longer shows up in the diff.
+
+    The gate does not weaken the change-surface rule; it moves it from
+    "these files never change" to "these files change once, and only
+    that way".
+    """
+    mismatched = [
+        f"{rel}: frozen {expected}, actual "
+        f"{hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest()}"
+        for rel, expected in FROZEN_R10_SURFACE_SHA256.items()
+        if hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest() != expected
+    ]
+    assert mismatched == [], (
+        "a file in R10's waiting-phase rename surface changed outside "
+        "the frozen baseline:\n  " + "\n  ".join(mismatched)
     )

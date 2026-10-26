@@ -181,8 +181,10 @@ def test_a_plan_with_no_execution_record_is_not_reported_as_executing():
 
     entry = _entry(never_ran)
 
-    # The plan has tasks and no execution: the listing says ``ready``.
-    assert entry["status"] == "ready", entry
+    # The plan has tasks and no execution: the listing says ``queued``
+    # (the single waiting phase; ``ready`` is only its legacy input alias
+    # and must not be emitted).
+    assert entry["status"] == "queued", entry
     assert entry["pid"] is None, entry
     # And it must not ALSO claim the executor is running it.
     assert entry["current_phase"] != "executing", (

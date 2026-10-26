@@ -395,8 +395,8 @@ def _recorded_stop_reason(row: dict) -> str | None:
 
     ``_persist_verification_terminal`` records it in the ``results``
     envelope (``{"status", "stop_reason", "recorded_by"}``); the
-    ``verification_stop_reason`` column is left NULL on this path — an
-    earlier plan's row has it NULL too, and
+    ``verification_stop_reason`` column is left NULL on this path —
+    an earlier plan's row has it NULL too, and
     ``_reconcile_orphaned_verification_stages`` resolves the reason in
     Python for exactly that reason. Asserting on the column would pin
     the wrong shape.
@@ -647,11 +647,18 @@ def test_dead_end_does_not_park_on_ready_when_the_loop_continues(
 
 
 def test_dead_end_still_parks_for_the_operator_by_default(tmp_path, monkeypatch):
-    """Control: the operator-facing dead end keeps its resumable rollback."""
+    """Control: the operator-facing dead end keeps its resumable rollback.
+
+    The waiting phase is spelled ``queued`` (2026-10-25 R10), and the
+    whitelist ``POST /api/execution/{plan_id}/start`` CASes against
+    (``server._EXECUTION_START_SOURCE_PHASES``) knows only that
+    spelling — so the operator-facing dead end has to park on
+    ``queued`` for the documented resume to actually be accepted.
+    """
     server, plan_id, db_path = _seed_plan(
         tmp_path, monkeypatch, stage="verification_repairing", pending_tasks=3
     )
 
     server._dead_end_terminal(plan_id, "no_repair_tasks", chain_ending=False)
 
-    assert _routing_stage(db_path, plan_id) == "ready"
+    assert _routing_stage(db_path, plan_id) == "queued"

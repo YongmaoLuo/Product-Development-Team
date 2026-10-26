@@ -34,6 +34,7 @@ same import style the existing
 
 import pytest
 
+from phase_vocabulary import normalize_waiting_phase
 from plan_state import (
     PHASE_TRANSITIONS,
     VERIFICATION_PHASE_TRANSITIONS,
@@ -155,6 +156,10 @@ def test_completed_reaches_both_verification_verdicts(
         # fix leaves untouched. Only targets that neither table declares
         # belong in this list.
         "executing",
+        # ``ready`` is the legacy alias of ``queued``. It stays in this list
+        # so the alias path keeps its own node; the assertions below are
+        # made against the *normalized* name, because ``transition_to``
+        # normalizes the target before looking it up in the table.
         "ready",
         "verification_running",
         "verification_repairing",
@@ -168,15 +173,20 @@ def test_completed_reaches_both_verification_verdicts(
 )
 def test_completed_rejects_invalid_target(completed_plan, invalid_target):
     """An undeclared target raises ``ValueError`` naming the legal set."""
-    assert invalid_target not in _allowed_targets("completed"), (
-        f"test bug: {invalid_target!r} is declared legal out of 'completed'"
+    # ``transition_to`` normalizes the waiting-phase alias (``ready`` ->
+    # ``queued``) *before* the legality lookup, so the error message names
+    # the normalized target. Assert against that name, not the raw input.
+    expected_target = normalize_waiting_phase(invalid_target)[0]
+
+    assert expected_target not in _allowed_targets("completed"), (
+        f"test bug: {expected_target!r} is declared legal out of 'completed'"
     )
 
     with pytest.raises(ValueError) as excinfo:
         completed_plan.transition_to(invalid_target)
 
     message = str(excinfo.value)
-    assert "completed" in message and invalid_target in message, (
+    assert "completed" in message and expected_target in message, (
         f"the error must name both endpoints, got {message!r}"
     )
     # The plan must not have moved.
@@ -214,12 +224,18 @@ def test_other_phase_transitions_unchanged():
     """The rest of the verification table keeps its existing definition."""
     expected_rows = {
         "ready": ["verification", "verification_running"],
+        # 2026-10-25 (R10): ``queued`` is the one and only waiting phase —
+        # the verification sub-machine's ``executing`` / ``failed`` /
+        # ``stopped`` rows can all reach it. The legacy ``ready`` stays in
+        # the table (old on-disk states must stay readable) and
+        # ``transition_to`` normalizes the target to ``queued``.
         "executing": [
             "verification",
             "completed",
             "failed",
             "stopped",
             "ready",
+            "queued",
         ],
         # 2026-10-23: every verification phase gained a ``stopped``
         # edge. A stop has to be able to park the plan it stopped —
@@ -285,8 +301,8 @@ def test_other_phase_transitions_unchanged():
         # plan_state.py:179). Kept in sync here so the table-pinning
         # test reflects the live contract.
         "verification_loop_stopped": ["failed", "verification_passed"],
-        "failed": ["executing", "ready"],
-        "stopped": ["executing", "ready"],
+        "failed": ["executing", "ready", "queued"],
+        "stopped": ["executing", "ready", "queued"],
     }
 
     for source, targets in expected_rows.items():

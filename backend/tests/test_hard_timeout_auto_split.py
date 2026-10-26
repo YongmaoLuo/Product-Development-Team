@@ -13,7 +13,7 @@
     ``_split_vp_on_timeout`` first, then to ``_llm_split_vp_on_hard_timeout``
     if the deterministic split declined.
   * Task executor routes ``HardTimeoutError`` to
-    ``_refine_after_failure`` + ``plan_state.transition_to("ready")``.
+    ``_refine_after_failure`` + ``plan_state.transition_to("queued")``.
   * ``_extract_failed_ids`` includes ``timeout`` / ``SPLIT`` /
     ``hard_timeout`` statuses.
   * ``snapshot_round_results`` + ``clear_round_results`` correctly
@@ -640,18 +640,18 @@ def test_llm_split_decision_returns_none_on_hard_timeout(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 10. Agent.py: HardTimeoutError branch exists + transitions to ready
+# 10. Agent.py: HardTimeoutError branch exists + transitions to queued
 # ---------------------------------------------------------------------------
 
 
 def test_agent_py_has_hard_timeout_branch():
     """The HardTimeoutError branch in _execute_task_with_retry must
-    exist and include ``transition_to("ready")`` after refine.
+    exist and include ``transition_to("queued")`` after refine.
     """
     agent_path = Path(__file__).parent.parent / "agent.py"
     src = agent_path.read_text(encoding="utf-8")
     assert "except HardTimeoutError" in src
-    assert 'transition_to("ready")' in src
+    assert 'transition_to("queued")' in src
 
 
 def test_agent_py_imports_hard_timeout_error():

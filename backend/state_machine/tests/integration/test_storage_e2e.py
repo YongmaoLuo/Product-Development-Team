@@ -242,7 +242,7 @@ def test_full_plan_lifecycle_routes_through_plan_routing() -> None:
         "prd_review",
         "prd_approved",
         "tasks_generation",
-        "ready",
+        "queued",
         "executing",
         "completed",
         "verification",

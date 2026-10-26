@@ -15,7 +15,8 @@ What is pinned here:
   3. ``verification_passed`` stays an empty row (the security
      boundary) and ``verification_loop_stopped`` is untouched;
   4. ``stopped`` stays a terminal phase whose only exits are the
-     manual resume (``executing`` / ``ready``).
+     manual resume (``executing`` / ``queued``; ``ready`` is the
+     legacy input alias of ``queued``).
 """
 
 from __future__ import annotations
@@ -142,12 +143,18 @@ def test_verification_loop_stopped_is_untouched():
 
 
 def test_stopped_is_terminal_with_only_manual_exits():
-    """``stopped`` is terminal — the exits are the manual resume."""
+    """``stopped`` is terminal — the exits are the manual resume.
+
+    2026-10-25 (R10): 等待相位唯一拼写是 ``queued`` —— ``ready`` 只作输入
+    别名（磁盘上的历史状态照旧可读），所以「回到等人」这条边的落点是
+    ``queued``。``ready`` 仍然留在表里：既有行照旧要能读，所以这里是
+    「集合含三个值」，不是「只剩 executing / queued」。
+    """
     assert "stopped" in TERMINAL_PHASES
     assert "stopped" in VALID_PHASES
-    assert set(PHASE_TRANSITIONS["stopped"]) == {"executing", "ready"}
+    assert set(PHASE_TRANSITIONS["stopped"]) == {"executing", "ready", "queued"}
     assert set(VERIFICATION_PHASE_TRANSITIONS["stopped"]) == {
-        "executing", "ready",
+        "executing", "ready", "queued",
     }
 
 

@@ -44,6 +44,7 @@ from pathlib import Path
 
 import pytest
 
+from phase_vocabulary import normalize_waiting_phase
 from plan_state import PlanState
 from scripts.migrate_20260805_deadlock import migrate_20260805_deadlock
 
@@ -275,6 +276,13 @@ def test_migration_then_rejects_invalid_repeat_transition(
     )
 
     state_before_illegal = state_path.read_bytes()
+    # ``ready`` is the legacy alias of ``queued`` (R10): ``transition_to``
+    # normalizes the target *before* the legality check, so the error
+    # message names the normalized phase.  The expected target therefore
+    # has to go through the same normalization — otherwise a legal-looking
+    # ``ready`` input is compared against a message that never says
+    # ``ready``.
+    expected_target = normalize_waiting_phase(invalid_target)[0]
     with pytest.raises(ValueError) as excinfo:
         ps.transition_to(invalid_target)
 
@@ -282,7 +290,7 @@ def test_migration_then_rejects_invalid_repeat_transition(
     # plan_state.py raises ``Illegal transition from 'X' to 'Y'``
     # so both sides of the edge must appear in the message.
     message = str(excinfo.value)
-    assert "verification_passed" in message and invalid_target in message, (
+    assert "verification_passed" in message and expected_target in message, (
         f"ValueError must name both endpoints; got {message!r}"
     )
 

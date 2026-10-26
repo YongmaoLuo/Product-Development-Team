@@ -81,6 +81,7 @@ from prd_generator import PRDGenerator
 from prd_review import PRDReviewer
 from prd_refiner import PRDRefiner
 from plan_state import PlanState
+from phase_migration import migrate_ready_to_queued
 from arch_generator import ArchGenerator, ArchHardGateError
 from self_review import SelfReviewUnavailableError
 from arch_reviewer import ArchReviewer
@@ -1001,6 +1002,38 @@ async def _lifespan(app):
     On shutdown: stop the heartbeat monitor and kill any in-flight
     execution subprocesses.
     """
+    # 2026-10-25 (R10): startup phase migration — ``ready`` → ``queued``.
+    #
+    # ``queued`` is the only waiting phase now (see ``phase_vocabulary``),
+    # but the data on disk may still carry the legacy word.  A plan parked
+    # on ``ready`` is a hole: the scheduler only picks up ``queued``, and
+    # ``ready`` shows up in no "waiting on someone" mental model either —
+    # it is neither running nor waiting.
+    #
+    # The migration hangs off the startup hook on purpose: it has to reach
+    # the plans that already exist, not only the ones created from now on.
+    # It runs *before* ``RuntimeState`` is built so that everything the
+    # app does afterwards reads the converged data.
+    #
+    # A failed migration must NOT keep the backend from starting: this is a
+    # data sweep, and a sweep that could not finish this round is retried
+    # on the next boot (it converges on the values it finds, it does not
+    # repeat what it already did).  So the exception is logged and the boot
+    # continues.
+    try:
+        _phase_counts = migrate_ready_to_queued(
+            _state_db_path(), PLANS_DIR, logger=logger
+        )
+        logger.warning(
+            "[phase_migration] rows_migrated=%d state_files_migrated=%d",
+            _phase_counts.get("rows_migrated", 0),
+            _phase_counts.get("state_files_migrated", 0),
+        )
+    except Exception:
+        logger.exception(
+            "[phase_migration] startup migration failed; continuing boot"
+        )
+
     # 2026-09-06: TC-006 dependency-injection refactor — the lifespan
     # is the canonical constructor for ``RuntimeState``. The three
     # orthogonal collaborators (``config``, ``in_flight_guard``,
@@ -1959,10 +1992,20 @@ _TERMINAL_PHASES = ("completed", "failed", "stopped")
 
 #: Routing phases ``POST /api/execution/{id}/start`` may CAS FROM.
 #:
-#: * ``ready`` — the manual gate (operator approves, then starts).
 #: * ``queued`` — 2026-09-15: a plan the operator
 #:   handed to the scheduler. Extracted to a module constant so the
 #:   contract is testable without standing up the endpoint's subprocess.
+#:   2026-10-25 (R10): ``queued`` is now the **only** waiting phase —
+#:   ``ready`` used to mean "tasks are generated, waiting for a human"
+#:   and the write path no longer produces it (see
+#:   :mod:`phase_vocabulary`). It was removed from this whitelist
+#:   because a whitelist entry the write path cannot produce is a door
+#:   to rows nobody can create — and a start that CASes from ``ready``
+#:   would move the row to ``executing`` while the rest of the system
+#:   (the scheduler, the plan list) treats ``queued`` as the only
+#:   waiting phase. Legacy rows still sitting at ``ready`` are
+#:   migrated to ``queued`` at startup (:mod:`phase_migration`); a row
+#:   that reaches the CAS at ``ready`` anyway is refused with 409.
 #: * ``failed`` / ``stopped`` / ``verification_failed`` /
 #:   ``verification_loop_stopped`` — re-entry after a round that did not
 #:   pass. These four were a single routing value (``terminal_failed``)
@@ -1972,7 +2015,6 @@ _TERMINAL_PHASES = ("completed", "failed", "stopped")
 #: * ``completed`` / ``verification_passed`` — likewise the single old
 #:   ``terminal_done``.
 _EXECUTION_START_SOURCE_PHASES = (
-    "ready",
     "queued",
     "failed",
     "stopped",
@@ -2831,6 +2873,30 @@ from routes.fast_lane import (  # noqa: E402,F401
 app.include_router(_routes_fast_lane.router)
 
 
+# --- routes/plan_lifecycle.py -----------------------------------
+# The plan-level lifecycle facade: ``POST /api/plan/{id}/lifecycle/stop``
+# and ``POST /api/plan/{id}/lifecycle/start``.  It is the door that lets
+# an out-of-process caller say "stop this plan" / "start this plan"
+# without knowing which layer is currently running - the dispatch itself
+# lives in ``plan_lifecycle_service`` and reads this process's live
+# state.
+#
+# Mounted here for the same reason the routers above are: this block
+# runs before the frontend catch-all at the bottom of the file.  Both
+# routes are POSTs and the catch-all is a GET, so the ordering is
+# belt-and-braces rather than load-bearing today - it stops being that
+# the moment someone adds the GET that reads a lifecycle state back.
+from routes import plan_lifecycle as _routes_plan_lifecycle  # noqa: E402
+from routes.plan_lifecycle import (  # noqa: E402,F401
+    StartPlanRequest,
+    StopPlanRequest,
+    start_plan,
+    stop_plan,
+)
+
+app.include_router(_routes_plan_lifecycle.router)
+
+
 # --- routes/execution.py -----------------------------------------
 from routes import execution as _routes_execution  # noqa: E402
 from routes.execution import (  # noqa: E402,F401
@@ -2941,7 +3007,7 @@ from verification_loop import (  # noqa: E402,F401
     _make_repair_on_complete,
     _persist_verification_terminal,
     _count_unfinished_execution_tasks,
-    _rollback_dead_end_to_ready,
+    _rollback_dead_end_to_queued,
     _round_is_pure_split,
     _dead_end_terminal,
     _repair_generation_failed,

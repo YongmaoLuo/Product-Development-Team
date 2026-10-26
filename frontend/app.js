@@ -15,11 +15,11 @@ window.verificationState = null;
 // --- Sidebar ---
 
 function phaseLabel(status) {
-    return { new: "新建", interviewed: "需求收集", prd: "PRD已生成", reviewed: "审阅中", ready: "就绪" }[status] || status;
+    return { new: "新建", interviewed: "需求收集", prd: "PRD已生成", reviewed: "审阅中", queued: "排队中" }[status] || status;
 }
 
 function phaseClass(status) {
-    const known = ["new", "interviewed", "prd", "reviewed", "ready"];
+    const known = ["new", "interviewed", "prd", "reviewed", "queued"];
     return known.includes(status) ? `phase-${status}` : "phase-default";
 }
 
@@ -521,7 +521,7 @@ async function loadPlans() {
             <div class="plan-card-header">
                 <span class="plan-id">${escapeHtml(p.id)}</span>
                 <span class="plan-status ${escapeHtml(p.status)}">${escapeHtml(
-                { new: "新建", interviewed: "已访谈", prd: "已生成PRD", reviewed: "已审阅", ready: "就绪" }[p.status] || p.status
+                { new: "新建", interviewed: "已访谈", prd: "已生成PRD", reviewed: "已审阅", queued: "排队中" }[p.status] || p.status
             )}</span>
             </div>
             <div class="plan-requirement">${escapeHtml(p.requirement || "无需求描述")}</div>
@@ -592,7 +592,7 @@ async function resumePlan(planId) {
         } else {
             showTestReviewView(planId);
         }
-    } else if (phase === "test_approved" || phase === "tasks_generation" || phase === "ready" || phase === "executing" || phase.startsWith("verification")) {
+    } else if (phase === "test_approved" || phase === "tasks_generation" || phase === "queued" || phase === "ready" || phase === "executing" || phase.startsWith("verification")) {
         showTasksView(planId);
     } else {
         showInterview(planId);
@@ -1494,7 +1494,7 @@ async function customExecuteRepairs() {
 async function resumeVerificationPanel(planId) {
     const planPhase = currentPlanState?.current_phase || "";
     const isVerificationPhase = planPhase.startsWith("verification");
-    const canStartVerification = ["ready", "executing"].includes(planPhase);
+    const canStartVerification = ["queued", "executing"].includes(planPhase);
     const shouldShowPanel = isVerificationPhase || canStartVerification;
 
     try {

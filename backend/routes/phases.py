@@ -55,6 +55,15 @@ from plan_state import (
     PHASE_TRANSITIONS,
     VERIFICATION_PHASE_TRANSITIONS,
 )
+
+# ``phase_vocabulary`` 是纯词汇模块（只依赖 logging / typing，不 import
+# ``plan_state``），所以这里可以安全地模块级导入：两个**写入口**也必须把
+# 等待相位的历史别名（``ready``）归一化成现行词汇（``queued``）——
+# 库里不该再出现 ``ready``，但直接 400 会让老调用方全挂。
+from phase_vocabulary import (  # noqa: E402
+    log_deprecated_ready,
+    normalize_waiting_phase,
+)
 from verification_plan_doc import PlanDocError
 from verification_plan_doc import generate as generate_plan_doc
 from verification_plan_doc import refine as refine_plan_doc
@@ -1585,8 +1594,19 @@ def update_plan_state(plan_id: str, req: _server.PlanStateUpdateRequest):
     if req.test_enabled is not None:
         state.enable_test(req.test_enabled)
     if req.current_phase is not None:
+        # 2026-10-25 (R10): ``ready`` 是 ``queued`` 的历史别名。这个写入口
+        # 仍可能收到它（前端、旧脚本、别的仓都还在传），但库里不该再出现
+        # ``ready`` —— 直接 400 会让老调用方全挂。所以这里做**归一化**：
+        # 请求照旧成功，落库与响应只说现行词汇。
+        #
+        # 归一化放在**入口**而不是只依赖 ``PlanState.transition_to``：命中别名
+        # 时要按**调用点**留痕（来源 ``api.plan_state``），否则日志里只有
+        # 「有人传了旧词」，清不掉旧数据 —— 得知道是哪个接口写进来的。
+        target, aliased = normalize_waiting_phase(req.current_phase)
+        if aliased:
+            log_deprecated_ready(_server.logger, plan_id, "api.plan_state")
         try:
-            state.transition_to(req.current_phase)
+            state.transition_to(target)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
 
@@ -1614,6 +1634,17 @@ def transition_plan_phase(plan_id: str, req: _server.PlanPhaseTransitionRequest)
     target = req.target_phase
     if not target:
         raise HTTPException(400, "target_phase is required")
+
+    # 2026-10-25 (R10): ``ready`` 是 ``queued`` 的历史别名 —— 与
+    # ``/api/plan/{id}/state`` 是同一件事、同一个说法，所以两个写入口做
+    # 同一份归一化。命中别名时按**调用点**留痕（来源 ``api.plan_phase``）：
+    # 旧数据要清得掉，先得知道是哪个接口写进来的。
+    #
+    # 归一化后的值往下走（转移、回显的 ``requested_phase``），所以旧词汇既
+    # 不落库、也不从响应里漏出去。
+    target, aliased = normalize_waiting_phase(target)
+    if aliased:
+        log_deprecated_ready(_server.logger, plan_id, "api.plan_phase")
 
     state = _server.PlanState(plan_dir)
     current = state.get_state().get("current_phase", "interview")

@@ -73,6 +73,10 @@ class TestAPIToServiceFlow:
         plan_dir = _setup_plan(plan_id)
 
         # Step 1: API layer receives HTTP request
+        #
+        # ``ready`` is posted on purpose: it is the historical alias of
+        # the waiting phase, and the write entry point normalises it
+        # into ``queued`` (the word the store and the response use).
         resp = client.post(
             f"/api/plan/{plan_id}/state",
             json={"current_phase": "ready", "arch_enabled": True, "test_enabled": False},
@@ -84,12 +88,12 @@ class TestAPIToServiceFlow:
 
         # Verify response structure
         assert "current_phase" in data
-        assert data["current_phase"] == "ready"
+        assert data["current_phase"] == "queued"
 
         # Verify business layer processed the state correctly — read back
         # through a fresh PlanState (SQLite plan_routing row is canonical).
         saved_state = PlanState(plan_dir).get_state()
-        assert saved_state["current_phase"] == "ready"
+        assert saved_state["current_phase"] == "queued"
         assert saved_state["flags"]["arch_enabled"] is True
         assert saved_state["flags"]["test_enabled"] is False
 
