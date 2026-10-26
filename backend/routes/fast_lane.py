@@ -108,7 +108,11 @@ class ImportPlanRequest(BaseModel):
     raw: Any = None
     requirement: Any = None
     #: Where a human-in-the-loop question about this plan is delivered, and
-    #: the session the plan was created in.  Both are optional, and a
+    #: the session the plan was created in.  ``hook_destination`` is the
+    #: cc-connect project the question is delivered to and
+    #: ``hook_session_id`` is the cc-connect session key inside it — the
+    #: two values the delivery command is given, and the whole of what
+    #: this body decides about the delivery.  Both are optional, and a
     #: caller that sends neither is a caller with no session to ask —
     #: which is the normal case for a ``curl``.  See
     #: :func:`bind_hook_for_plan`.
@@ -255,6 +259,17 @@ def bind_hook_for_plan(
     ``hooks.config`` and nowhere else; this function is only the caller
     that hands the origin over, and it is shared by both plan-creation
     doors — this lane and the interview in ``routes/phases.py``.
+
+    **How** the question is delivered is decided by the same writer, and
+    it is a command rather than a description of a transport.  The hook
+    this origin implies is a ``cmd`` hook: the command runs
+    ``backend.hooks.session_send`` with the plan's destination and its
+    session as its arguments, and that module is what turns a
+    cc-connect project and a cc-connect session key into a delivered
+    message.  So ``destination`` is the cc-connect project the question
+    goes to and ``session_id`` is the cc-connect session key inside it —
+    the two values the command is given, and nothing else about the
+    delivery is decided here.
 
     A plan created without a session gets an **empty** hook list, not an
     error: that is the documented degradation, and it is written down

@@ -41,10 +41,10 @@ Three cases, one per fact the product owes a caller:
    not dressed up as answered or defaulted — it is ``unroutable``,
    which waits for nobody and blocks nothing.
 3. ``test_creation_binds_destination`` — the binding a plan-creation
-   request carries lands in that plan's ``hitl_config.json``, the
-   outlet tries the destination that binding names, and a creation
-   request that carries no session context lands as an empty hook
-   list.
+   request carries lands in that plan's ``hitl_config.json`` as the
+   delivery command it is, the delivery reaches the transport that
+   command is pointed at, and a creation request that carries no
+   session context lands as an empty hook list.
 
 Who plays the caller
 --------------------
@@ -99,6 +99,14 @@ are subprocesses rather than threads because the point of the hanging
 one is that it *keeps* the connection open — a thread in the test
 process would be a different failure from the one being pinned.
 
+The third case delivers through a *command*, and the command is
+pointed at a stub transport written into the test's own work
+directory.  The product is told which transport to run through the
+environment, so the case neither needs a real one installed nor risks
+sending anything to a real group, and what the stub was handed is
+recorded in that directory and read back — so the delivery is asserted
+from the transport's side as well as from the dispatcher's.
+
 The three layers are asserted at once, because a single layer is a
 single layer's opinion: the HTTP response, the SQLite row (read with
 ``sqlite3`` directly, not through the service), and the files in the
@@ -111,6 +119,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -200,6 +209,67 @@ QUESTION_BODY: Dict[str, Any] = {
     "default_option": "accept",
     "task_id": "T-e2e-hooks",
 }
+
+# ---------------------------------------------------------------------------
+# The stub transport
+# ---------------------------------------------------------------------------
+
+#: The stub transport's file name.  It lives in the test's own work
+#: directory: the repository is not a place a test writes to.
+STUB_FILENAME = "cc-connect-stub"
+
+#: Where the stub records what it was handed.  It is in the work
+#: directory too, for the same reason.
+CAPTURE_FILENAME = "cc-connect-capture.txt"
+
+#: The variable that pins which transport the delivery runs.  The
+#: product reads it; the stub does not.
+TRANSPORT_BIN_ENV = "PDT_CC_CONNECT_BIN"
+
+#: The variable that tells the stub where to record what it was
+#: handed.  The stub reads it; the product does not.
+TRANSPORT_CAPTURE_ENV = "PDT_CC_CONNECT_CAPTURE"
+
+#: How long a poll waits for the delivery to land.  The delivery runs
+#: on a thread of its own, so the wait is a real wait — and it is
+#: bounded, because an unbounded wait is a hung test.
+DELIVERY_TIMEOUT_SEC = 20.0
+
+#: The stub transport.  It stands in for the real one: the product
+#: runs ``cc-connect send -p <project> -s <session> --stdin`` with the
+#: message on stdin, and the stub records what it was handed.
+#:
+#: Nothing about the machine this runs on is written into it — the
+#: capture path comes from the environment, so the same stub works on
+#: every developer's box.
+_STUB_SOURCE = '''\
+#!/bin/sh
+# A stand-in for the real transport.
+#
+# The product delivers a decision by running
+# ``cc-connect send -p <project> -s <session> --stdin`` with the
+# message on stdin.  This stub does from the delivery's point of view
+# what the real one does: it records the destination it was addressed
+# to, and the message it was given.
+#
+# The capture is appended to rather than truncated, so a second
+# delivery would be visible instead of replacing the first.
+
+printf '%s\\n' "$@" >> "$PDT_CC_CONNECT_CAPTURE"
+cat >> "$PDT_CC_CONNECT_CAPTURE"
+'''
+
+
+def _write_stub_transport(workdir: Path) -> Path:
+    """Write the stub transport into ``workdir`` and return its path.
+
+    The stub is executable: the product runs it directly, the way it
+    runs any other command.
+    """
+    path = workdir / STUB_FILENAME
+    path.write_text(_STUB_SOURCE, encoding="utf-8")
+    path.chmod(0o755)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +446,12 @@ def boot_real_server(workdir: Path) -> Tuple[str, subprocess.Popen]:
     The subprocess gets its own SQLite file, its own plans tree and its
     own port, so everything this suite asserts about is the state a
     real deployment would have written.
+
+    The delivery transport is the stub in ``workdir``: the product is
+    pointed at it through ``PDT_CC_CONNECT_BIN``, so the case neither
+    needs a real transport installed nor risks sending anything to a
+    real group.  What the stub was handed is recorded in
+    ``workdir/cc-connect-capture.txt``.
     """
     state_db = workdir / "state.db"
     plans_dir = workdir / "plans"
@@ -383,6 +459,8 @@ def boot_real_server(workdir: Path) -> Tuple[str, subprocess.Popen]:
     logs_dir = workdir / "logs"
     for directory in (plans_dir, backups_dir, logs_dir):
         directory.mkdir(parents=True, exist_ok=True)
+
+    stub_path = _write_stub_transport(workdir)
 
     port = _free_port()
     env = dict(os.environ)
@@ -404,6 +482,11 @@ def boot_real_server(workdir: Path) -> Tuple[str, subprocess.Popen]:
             # that call, so the binding this suite asserts is written
             # either way.
             "PDT_DEFAULT_CODING_TOOL": "vendor-c",
+            # The transport the delivery runs, and where it records
+            # what it was handed.  The product reads the first of
+            # these; the stub reads the second.
+            TRANSPORT_BIN_ENV: str(stub_path),
+            TRANSPORT_CAPTURE_ENV: str(workdir / CAPTURE_FILENAME),
             "PYTHONPATH": f"{BACKEND_DIR}{os.pathsep}{env.get('PYTHONPATH', '')}",
         }
     )
@@ -586,6 +669,33 @@ def _wait_for_audit(
             return lines
         time.sleep(0.1)
     return _read_jsonl(path)
+
+
+def _wait_for_delivery(
+    plan_dir: Path, capture: Path, *, timeout: float = DELIVERY_TIMEOUT_SEC
+) -> List[Dict[str, Any]]:
+    """Block until the delivery has been made and recorded.
+
+    Two things have to be there before the delivery counts as made: the
+    dispatch audit has to hold the line for the event, and the
+    transport has to have recorded what it was handed.  The wait is for
+    both, because either one alone is a single layer's opinion — an
+    audit line says the dispatch finished, and the capture says the
+    message arrived.
+
+    The delivery runs on a worker thread, so neither is there when the
+    request comes back: the request is answered when the question is
+    written down, not when the slowest destination answers.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        lines = _read_jsonl(plan_dir / HOOK_AUDIT_FILENAME)
+        if lines and capture.exists():
+            recorded = capture.read_text(encoding="utf-8", errors="replace")
+            if recorded.strip():
+                return lines
+        time.sleep(0.1)
+    return _read_jsonl(plan_dir / HOOK_AUDIT_FILENAME)
 
 
 def _decision_row(state_db: Path, decision_id: str) -> Optional[sqlite3.Row]:
@@ -938,7 +1048,7 @@ def test_empty_hooks_unroutable(server):
 
 def test_creation_binds_destination(server):
     """The binding on a plan-creation request reaches that plan's
-    configuration, and the outlet tries the destination it names.
+    configuration, and the outlet delivers the question to it.
 
     The plan-creation doors record the origin of the plan next to the
     plan, in the plan's own ``hitl_config.json``: which session it was
@@ -947,14 +1057,19 @@ def test_creation_binds_destination(server):
     is the right answer for a bare ``curl``, and a state the plan
     directory records rather than leaves implicit.
 
-    The outlet the binding names is a ``cc_connect`` destination, and
-    that transport is not deliverable in this build: the dispatcher
-    records it as not implemented rather than pretending it reached
-    anybody.  What the case pins is that the binding travels all the
-    way to the outlet — the destination the creation request named is
-    the destination the dispatch tried — and that a question which
-    reached nobody is settled as ``unroutable`` rather than left
-    waiting.
+    The binding is a **command**, not a description of a transport: the
+    plan's file says what to run, and the dispatcher runs it.  What the
+    case pins is that the binding travels all the way to the outlet —
+    the project and the session the creation request named are the
+    ones the delivery is addressed to — and that a delivery which
+    reached its transport leaves the question ``pending``, waiting for
+    the human it was addressed to, rather than settling it as though
+    nobody had been asked.
+
+    The delivery runs on a worker thread, so the audit line and the
+    transport's own record are read after a wait rather than straight
+    after the request: the request is answered when the question is
+    written down, not when the slowest destination answers.
     """
     base_url, workdir = server
 
@@ -988,15 +1103,23 @@ def test_creation_binds_destination(server):
         "plan created in a session records where it came from"
     )
     assert config["captured_at"], "the configuration records no capture time"
-    assert config["hooks"] == [
-        {
-            "kind": "cc_connect",
-            "destination": "grp-e2e",
-            "session_id": "sess-e2e",
-        }
-    ], (
+
+    hooks = config["hooks"]
+    assert len(hooks) == 1, (
         "the configuration's hook list does not match the creation "
-        f"request: {config['hooks']!r}"
+        f"request: {hooks!r}"
+    )
+    hook = hooks[0]
+    assert hook["kind"] == "cmd", (
+        "the configuration's hook is not a delivery command: "
+        f"{hook!r}"
+    )
+    # The command is read back as the argv the dispatcher will run —
+    # not as a second implementation of the quoting.
+    argv = shlex.split(hook["command"])
+    assert argv[3:] == ["--project", "grp-e2e", "--session", "sess-e2e"], (
+        "the delivery command does not carry the binding the creation "
+        f"request named: {hook['command']!r}"
     )
 
     # The plan really was created: its routing row is in the database.
@@ -1010,7 +1133,7 @@ def test_creation_binds_destination(server):
     assert rows, "the creation request did not create a plan"
 
     # The binding travels to the outlet: the destination the creation
-    # request named is the destination the dispatch tried.
+    # request named is the destination the delivery is addressed to.
     bound_plan_dir = workdir / "plans" / bound_plan
     status, body, _ = _post_json(
         base_url, f"/api/hitl/{bound_plan}/decisions", QUESTION_BODY
@@ -1018,14 +1141,17 @@ def test_creation_binds_destination(server):
     assert status == 200, f"the creation call failed: {body}"
     decision = json.loads(body)
 
-    # That transport is not deliverable in this build, so the question
-    # reached nobody — and a question nobody was asked is settled, not
-    # left waiting.
-    assert decision["status"] == "unroutable", (
-        "a question that reached nobody is reported as "
-        f"{decision['status']!r}; it must be unroutable"
+    # Somebody can be asked, so the question waits for the answer it
+    # was asked for: it is not settled as though nobody had been asked.
+    assert decision["status"] == "pending", (
+        "a question that reached its destination is reported as "
+        f"{decision['status']!r}; it must be pending"
     )
-    audit_lines = _read_jsonl(bound_plan_dir / HOOK_AUDIT_FILENAME)
+
+    # The delivery ran on a worker thread, so the audit line and the
+    # transport's own record are read after a wait.
+    capture = workdir / CAPTURE_FILENAME
+    audit_lines = _wait_for_delivery(bound_plan_dir, capture)
     assert len(audit_lines) == 1, (
         f"the dispatch wrote {len(audit_lines)} audit lines for one event"
     )
@@ -1034,20 +1160,56 @@ def test_creation_binds_destination(server):
         f"the audit records {len(entries)} destinations; the plan binds "
         "exactly one"
     )
-    assert entries[0]["kind"] == "cc_connect"
-    assert entries[0]["target"] == "grp-e2e", (
-        "the outlet tried a destination the creation request never "
+    assert entries[0]["kind"] == "cmd", (
+        f"the audit records a delivery of another kind: {entries[0]!r}"
+    )
+    assert entries[0]["outcome"] == "delivered", (
+        "the delivery did not reach the transport: "
+        f"{entries[0]!r}"
+    )
+    assert entries[0]["target"] != "grp-e2e", (
+        "the audit records the destination as the target; the target is "
+        f"the command that was run: {entries[0]!r}"
+    )
+    assert "backend.hooks.session_send" in entries[0]["target"], (
+        "the audit does not record the command that was run: "
+        f"{entries[0]!r}"
+    )
+    assert "--project grp-e2e --session sess-e2e" in entries[0]["target"], (
+        "the audit does not record the binding the creation request "
         f"named: {entries[0]!r}"
     )
-    assert entries[0]["outcome"] == "skipped"
-    assert entries[0]["reason"] == "unsupported_kind"
+    assert audit_lines[0]["delivered"] == 1, (
+        "the dispatch did not count the delivery: "
+        f"{audit_lines[0]!r}"
+    )
+
+    # The transport was handed the destination the creation request
+    # named, and the question itself.
+    recorded = capture.read_text(encoding="utf-8", errors="replace")
+    assert "grp-e2e" in recorded, (
+        "the transport was not addressed to the destination the creation "
+        f"request named: {recorded!r}"
+    )
+    assert "sess-e2e" in recorded, (
+        "the transport was not addressed to the session the creation "
+        f"request named: {recorded!r}"
+    )
+    assert QUESTION_BODY["question"] in recorded, (
+        f"the delivery carried no question: {recorded!r}"
+    )
 
     row = _decision_row(workdir / "state.db", decision["decision_id"])
     assert row is not None, "the decision was not written to the database"
-    assert row["status"] == "unroutable"
-    assert row["answer"] is None, (
-        "a decision nobody was asked about was given an answer"
+    assert row["status"] == "pending", (
+        f"the stored decision is {row['status']!r}; it was delivered, so "
+        "it waits for its answer"
     )
+    assert row["answer"] is None, (
+        "a decision nobody has answered was given an answer"
+    )
+    assert row["answered_by"] is None
+    assert row["answered_at"] is None
 
     # A creation request that carries no session context binds
     # nothing: the plan asks nobody.

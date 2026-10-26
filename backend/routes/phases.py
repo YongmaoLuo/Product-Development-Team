@@ -99,6 +99,15 @@ class StartInterviewRequest(_server.StartInterviewRequest):
     optional and mean exactly what they mean on ``POST /api/plan/import``:
     a plan started without them asks nobody, which is the right answer
     for a plan started by a bare ``curl`` rather than a failure.
+
+    ``hook_destination`` is the cc-connect project the question is
+    delivered to and ``hook_session_id`` is the cc-connect session key
+    inside it.  They are the two arguments of the delivery command: the
+    hook this origin implies is a ``cmd`` hook whose command runs
+    ``backend.hooks.session_send`` with those two values, and that
+    module is what actually delivers the message.  The protocol is the
+    same as the fast lane's — same field names, same types, same
+    defaults.
     """
 
     hook_destination: Optional[str] = None

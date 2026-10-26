@@ -33,6 +33,7 @@ disagree.
 """
 
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -68,20 +69,29 @@ def test_write_then_load(tmp_path):
     assert written["mode"] == DEFAULT_MODE
     assert written["timeout_sec"] == DEFAULT_TIMEOUT_SEC
     assert written["source"] == "plan_creation"
-    assert written["hooks"] == [
-        {"kind": "cc_connect", "destination": "grp-1", "session_id": "s-1"}
+
+    # The hook is the delivery command itself, so what is asserted is
+    # the argv the dispatcher will run: the delivery module, and the
+    # project and session the plan was created for.  The argv is read
+    # back with ``shlex.split`` rather than by re-implementing the
+    # quoting — the command is what the dispatcher runs, so the argv is
+    # the thing that has to be right.
+    hooks = written["hooks"]
+    assert len(hooks) == 1
+    assert hooks[0]["kind"] == "cmd"
+    assert shlex.split(hooks[0]["command"])[3:] == [
+        "--project",
+        "grp-1",
+        "--session",
+        "s-1",
     ]
 
     loaded = load_for_plan(plan_dir)
 
-    assert loaded == {
-        "version": SCHEMA_VERSION,
-        "mode": DEFAULT_MODE,
-        "timeout_sec": DEFAULT_TIMEOUT_SEC,
-        "hooks": [
-            {"kind": "cc_connect", "destination": "grp-1", "session_id": "s-1"}
-        ],
-    }
+    assert loaded["version"] == SCHEMA_VERSION
+    assert loaded["mode"] == DEFAULT_MODE
+    assert loaded["timeout_sec"] == DEFAULT_TIMEOUT_SEC
+    assert loaded["hooks"] == written["hooks"]
 
     # The provenance the load contract does not expose is still on disk:
     # it is what an operator reads to find out where a plan came from.
@@ -358,9 +368,10 @@ def test_write_failure_is_logged_not_raised(tmp_path):
         blocker / "plan", {"source": "plan_creation", "destination": "grp-1"}
     )
 
-    assert written["hooks"] == [
-        {"kind": "cc_connect", "destination": "grp-1", "session_id": ""}
-    ]
+    # The origin names no session, so there is nobody to ask and the
+    # hook list is empty — a plan with no hooks is a state a plan
+    # already knows how to be in.
+    assert written["hooks"] == []
 
     # The plan directory exists, but the config path is occupied by a
     # directory, so the write itself cannot happen.
@@ -372,6 +383,4 @@ def test_write_failure_is_logged_not_raised(tmp_path):
         occupied, {"source": "plan_creation", "destination": "grp-1"}
     )
 
-    assert written["hooks"] == [
-        {"kind": "cc_connect", "destination": "grp-1", "session_id": ""}
-    ]
+    assert written["hooks"] == []
