@@ -8,11 +8,13 @@ Writes JSON-lines to plans/{plan_id}/execution.log with automatic rotation.
 
 import json
 import os
+import re
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from capacity_wait import WAIT_MANUAL_TOPUP, WAIT_UNKNOWN, WAIT_WINDOW
 from config_paths import resolve_plans_dir
 
 
@@ -165,6 +167,179 @@ def register_event_type(event_name: str, render_prefix: str) -> bool:
 #: log for no benefit, because the split-and-parse of a big blob
 #: dominates and the answer almost never needs it.
 _TAIL_INITIAL_BYTES = 256 * 1024  # 256 KiB
+
+
+#: The name of the synthetic entry that reports a log which could not be
+#: read whole.  It is not an event that was logged — it is the reader
+#: saying "I could not read the log", and it must not be mistaken for
+#: one of the log's own events.
+LOG_UNREADABLE_EVENT = "execution_log_unparsable"
+
+#: How much of an unreadable line is carried in the entry that reports
+#: it.  Enough to recognise the line; not the whole file.
+_UNREADABLE_RAW_LIMIT = 2000
+
+
+def _salvaged_field(line: str, field: str) -> Optional[str]:
+    """The value of a string field in a line that could not be parsed.
+
+    A line that could not be parsed is not thereby silent: a write that
+    was cut short keeps the fields that were written before the cut.
+    Recovering them is what turns "I could not read this line" into "I
+    could not read *this event*", which is the difference between an
+    answer and a shrug.
+    """
+    match = re.search(r'"%s"\s*:\s*"([^"]*)"' % re.escape(field), line)
+    return match.group(1) if match else None
+
+
+def _salvaged_event(line: str) -> Optional[str]:
+    """The event name a broken log line names, or ``None``."""
+    return _salvaged_field(line, "event")
+
+
+def _salvaged_level(line: str) -> Optional[str]:
+    """The level a broken log line names, or ``None`` when it names none."""
+    level = _salvaged_field(line, "level")
+    if level and level.upper() in _LEVEL_ORDER:
+        return level.upper()
+    return None
+
+
+def _unreadable_entry(event: str, raw: str) -> Dict[str, Any]:
+    """The entry for a log line that names ``event`` and cannot be parsed.
+
+    The line is in the log and it names this event, so the event
+    happened — what is missing is its payload.  The entry says exactly
+    that, and carries the raw line so the details can still be read.
+    """
+    return {
+        "ts": _salvaged_field(raw, "ts"),
+        "level": _salvaged_level(raw) or "WARNING",
+        "event": event,
+        "message": (
+            "A line of this plan's log names this event but could not be "
+            "parsed, so its details are unavailable."
+        ),
+        "data": {
+            "unparsable": True,
+            "raw": raw[:_UNREADABLE_RAW_LIMIT],
+        },
+    }
+
+
+def _unreadable_log_entry(event: str, count: int, raw: str) -> Dict[str, Any]:
+    """The entry that says the log could not be read whole.
+
+    Used when the caller asked about an event, nothing about that event
+    could be read, and the log nevertheless carried lines that could
+    not be read either.  "The event did not happen" and "the log could
+    not be read" are different answers, and only one of them may be
+    served as an empty result.
+    """
+    return {
+        "ts": None,
+        "level": "WARNING",
+        "event": LOG_UNREADABLE_EVENT,
+        "message": (
+            f"{count} line(s) of this plan's log could not be parsed, so "
+            f"the log was not read whole and {event!r} may be in it."
+        ),
+        "data": {
+            "unparsable": True,
+            "unparsable_lines": count,
+            "requested_event": event,
+            "raw": raw[:_UNREADABLE_RAW_LIMIT],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# The kind of a park, normalised for the reader
+# ---------------------------------------------------------------------------
+#
+# The operator's question is "why is this plan parked", and the log
+# answers it with two fields: ``needs_manual_topup`` and
+# ``waited_sec``.  Two fields have to be combined before they mean
+# anything, and every reader that combines them has to reach the same
+# answer — a reader that reaches a different one pages somebody for a
+# window, or sits out a hard cap waiting for a timer that does not
+# exist.  So the answer is computed ONCE, here, and shipped as one
+# word: ``wait_kind``.
+#
+#   ``manual_topup``
+#       The budget was paid for and is spent: somebody has to put it
+#       back.  Nothing was waited out, and nothing will be.
+#   ``window``
+#       The budget comes back on a timer, and the wait was measured
+#       against that timer.
+#   ``unknown``
+#       The two fields do not decide.  NOT a window: an invented window
+#       is a person told to wait for a timer that does not exist, which
+#       is the thing this label exists to prevent.
+#
+# The raw fields are left exactly as the writer wrote them.  In
+# particular ``waited_sec`` keeps its ``0.0``: ``0.0`` is FALSE in
+# Python, so a payload assembled with "only write what has a value"
+# drops the very number that says "nothing was waited out" — and a
+# reader left with ``needs_manual_topup`` alone is back to deriving.
+
+
+def _flag_says_yes(value: Any) -> bool:
+    """Whether a flag field says "yes" — without the string's surprises.
+
+    ``bool("false")`` is ``True``.  A payload that spelled the flag out
+    as a word would then be read as a hard cap, and somebody would be
+    paged for a window that closes by itself.  So the words are read as
+    words.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1", "on")
+    return False
+
+
+def _wait_kind(data: Any) -> Optional[str]:
+    """The normalised kind of a park — or ``None`` when this is not one.
+
+    A park is a payload that carries the wait's fields.  Everything
+    else is left alone: the label is a fact about a park, and putting
+    it on unrelated entries would be noise.
+
+    The rule has no threshold and no default.  ``needs_manual_topup``
+    decides it; failing that, only a wait that really waited a window
+    out is a window.  Everything else is ``unknown``.
+    """
+    if not isinstance(data, dict):
+        return None
+    if "needs_manual_topup" not in data and "waited_sec" not in data:
+        return None
+    if _flag_says_yes(data.get("needs_manual_topup")):
+        return WAIT_MANUAL_TOPUP
+    try:
+        waited = float(data.get("waited_sec") or 0.0)
+    except (TypeError, ValueError):
+        waited = 0.0
+    if waited > 0:
+        return WAIT_WINDOW
+    return WAIT_UNKNOWN
+
+
+def _with_wait_kind(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """The entry, with its park labelled — the raw fields untouched.
+
+    The label goes onto a COPY: the payload the writer wrote is handed
+    back field for field, and the reader gets one more key beside it
+    rather than a rewritten payload.
+    """
+    data = entry.get("data")
+    kind = _wait_kind(data)
+    if kind is None:
+        return entry
+    return {**entry, "data": {**data, "wait_kind": kind}}
 
 
 def _read_tail(log_file: Path, limit: int) -> List[Dict[str, Any]]:
@@ -392,17 +567,93 @@ class ExecutionLogger:
         """Read and filter log entries from disk.
 
         Returns list of parsed log entry dicts, newest first within limit.
+
+        A line that cannot be parsed is not dropped in silence.  When
+        the caller asked about a specific event, a line that names that
+        event comes back as an entry whose payload is unavailable
+        (``data.unparsable``), and a log that could not be read whole
+        says so — because "the event did not happen" and "the log could
+        not be read" are different answers, and only one of them may be
+        served as an empty result.
+
+        Without an event filter nothing is added: the entries are the
+        entries that could be read, and the count of the ones that could
+        not is in :meth:`read_logs_detailed`.
+        """
+        return ExecutionLogger.read_logs_detailed(
+            plan_id,
+            plans_dir=plans_dir,
+            level=level,
+            task_id=task_id,
+            event=event,
+            limit=limit,
+            since=since,
+        )["entries"]
+
+    @staticmethod
+    def read_logs_detailed(
+        plan_id: str,
+        plans_dir: Optional[Path] = None,
+        level: Optional[str] = None,
+        task_id: Optional[str] = None,
+        event: Optional[str] = None,
+        limit: int = 100,
+        since: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Read log entries and report how completely the log could be read.
+
+        ``read_logs`` answers "which entries are in there".  This one
+        also answers "could the log be read at all" — because a log
+        whose lines do not parse is not a log with no entries in it: it
+        is a log whose contents are unknown, and a reader told
+        "zero entries" about it has been told a falsehood.  The events a
+        reader asks this endpoint for are frequently the ones that say
+        why a run stopped, so that falsehood is the expensive one.
+
+        Returns:
+            A dict with:
+
+            ``entries``
+                The entries, in file order, capped at ``limit``.  When
+                an ``event`` filter is given, the entries also carry
+                what could not be read: a line that names that event
+                comes back as an entry with its payload flagged
+                unavailable, and — when nothing about the event could be
+                read at all — one entry saying the log was not read
+                whole.  An entry whose payload carries the wait's
+                fields also carries the normalised ``wait_kind`` beside
+                them, so a reader does not have to derive it: the
+                fields the writer wrote are handed back untouched.
+            ``log_exists``
+                Whether ``execution.log`` was there at all.
+            ``unparsable_lines``
+                How many non-empty lines could not be read as a log
+                entry.
+            ``unparsable_matching_lines``
+                How many of those lines name the requested ``event``.
+                A non-zero count means the event IS in the log: the line
+                says which event it was about, and only its payload is
+                missing.
         """
         if plans_dir is None:
             plans_dir = resolve_plans_dir()
 
         log_file = plans_dir / plan_id / "execution.log"
-        if not log_file.exists():
-            return []
+        report: Dict[str, Any] = {
+            "entries": [],
+            "log_exists": log_file.exists(),
+            "unparsable_lines": 0,
+            "unparsable_matching_lines": 0,
+        }
+        if not report["log_exists"]:
+            return report
 
         min_level = _LEVEL_ORDER.get(level.upper(), 0) if level else 0
 
-        entries = []
+        # ``items`` holds what the file said, in file order: an entry
+        # that could be read, or the raw line of one that could not.
+        items: List[Tuple[str, Any]] = []
+        unreadable: List[str] = []
         try:
             with open(log_file, "r", encoding="utf-8") as f:
                 for line in f:
@@ -412,6 +663,16 @@ class ExecutionLogger:
                     try:
                         entry = json.loads(line)
                     except json.JSONDecodeError:
+                        entry = None
+                    if not isinstance(entry, dict):
+                        # A line that does not parse, or that parses into
+                        # something that is not a log entry (a bare list,
+                        # a quoted string).  Either way it cannot answer
+                        # a question, and it must not reach the
+                        # ``entry.get`` calls below.
+                        report["unparsable_lines"] += 1
+                        unreadable.append(line)
+                        items.append(("raw", line))
                         continue
 
                     # Apply filters
@@ -430,12 +691,57 @@ class ExecutionLogger:
                         if entry.get("ts", "") < since:
                             continue
 
-                    entries.append(entry)
+                    items.append(("entry", entry))
         except OSError:
             pass
 
+        if not event:
+            # No filter: the entries are the entries that could be read.
+            # The lines that could not are counted in the report, and a
+            # caller who wants them named asks about an event.
+            report["entries"] = [
+                _with_wait_kind(payload)
+                for kind, payload in items if kind == "entry"
+            ][-limit:]
+            return report
+
+        merged: List[Dict[str, Any]] = []
+        for kind, payload in items:
+            if kind == "entry":
+                merged.append(_with_wait_kind(payload))
+                continue
+            # A line that names the requested event IS about that event.
+            # Reporting it — with the payload flagged unavailable — is
+            # the honest answer; dropping it turns "I could not read
+            # this" into "it is not there".
+            if _salvaged_event(payload) != event:
+                continue
+            # The filters apply to a line nobody could read only where
+            # the line itself says enough to be judged.  A line whose
+            # level or timestamp could not be recovered is kept: a
+            # filter that cannot be evaluated must not be the thing
+            # that hides the answer.
+            level = _salvaged_level(payload)
+            if min_level > 0 and level is not None:
+                if _LEVEL_ORDER.get(level, 1) < min_level:
+                    continue
+            stamp = _salvaged_field(payload, "ts")
+            if since and stamp is not None and stamp < since:
+                continue
+            report["unparsable_matching_lines"] += 1
+            merged.append(_unreadable_entry(event, payload))
+
+        if not merged and unreadable:
+            # Nothing about the event could be read, and the log was not
+            # read whole: "the event did not happen" is not an answer
+            # this log supports.  Say what is true instead.
+            merged.append(
+                _unreadable_log_entry(event, len(unreadable), unreadable[0]),
+            )
+
         # Return newest entries within limit
-        return entries[-limit:]
+        report["entries"] = merged[-limit:]
+        return report
 
     @staticmethod
     def current_activity(

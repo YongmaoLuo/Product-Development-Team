@@ -24,8 +24,9 @@ import shlex
 import signal
 import socket
 import sys
+import time
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import pytest
 
@@ -991,10 +992,17 @@ def test_health_url_fails_when_nothing_serves_it():
 # ---------------------------------------------------------------------------
 
 
-def _write_ledger(plan_dir: Path, entries: list) -> None:
+def _write_ledger(
+    plan_dir: Path, entries: list, project_dir: Path = None,
+) -> None:
     plan_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"plan_id": plan_dir.name, "services": entries}
+    if project_dir is not None:
+        # The workspace the services were started in — the ledger says
+        # whose process a leftover is.
+        payload["project_dir"] = str(project_dir)
     sm.ledger_path(plan_dir).write_text(
-        json.dumps({"plan_id": plan_dir.name, "services": entries}),
+        json.dumps(payload),
         encoding="utf-8",
     )
 
@@ -1243,6 +1251,230 @@ def test_reap_skips_entries_without_a_usable_port(tmp_path: Path):
     assert "no usable port" in report.skipped[0]["reason"]
 
 
+def _register_live_owner(plan_dir: Path, prefix: str = "round") -> str:
+    """Register an owner token that is alive for the rest of the test."""
+    token = sm.new_owner_token(prefix)
+    sm.register_service_owner(plan_dir, token)
+    return token
+
+
+def _caller_token() -> str:
+    """A token that owns nothing — the caller of an orphan sweep."""
+    return sm.new_owner_token("sweep")
+
+
+def test_reap_skips_entries_owned_by_a_newer_run(tmp_path: Path, monkeypatch):
+    """A round that is still running owns its services.
+
+    2026-10-24, live: the plan's api service came up at 15:44:32 and was
+    SIGTERMed at 15:45:19, before its own round's first api_test ran at
+    15:48:43 — an *older* round's exit-time reap read the newer round's
+    entries out of the one ledger the plan directory has and stopped them.
+    The ledger now says which round started what, and a reap only touches
+    the entries its own round owns (or entries whose owner is gone).
+    """
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    newer = _register_live_owner(plan_dir)
+
+    _write_ledger(plan_dir, [_entry(owner_token=newer)])
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+    monkeypatch.setattr(
+        sm, "stop_service",
+        lambda *a, **k: stopped.append(1) or {"port_free": True, "detail": ""},
+    )
+
+    report = sm.reap_services(
+        plan_dir, "plan-x", owner_token=sm.new_owner_token("round"),
+    )
+
+    assert stopped == [], (
+        "an older round's reap stopped the services a live round owns — "
+        "that is the 2026-10-24 defect: the api service was killed 47s "
+        "after it came up, before its own round's first test ran"
+    )
+    assert report.reaped == []
+    assert report.skipped[0]["reason"] == "owned by a live run"
+    # The entry stays in the ledger: its owner is the one that reaps it.
+    assert sm.read_ledger(plan_dir)["services"][0]["owner_token"] == newer
+
+
+def test_reap_still_kills_entries_owned_by_the_caller(tmp_path: Path, monkeypatch):
+    """The anti-vacuity control: the owner's own reap still kills."""
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    caller = _register_live_owner(plan_dir)
+
+    _write_ledger(plan_dir, [_entry(owner_token=caller)])
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+    monkeypatch.setattr(
+        sm, "stop_service",
+        lambda *a, **k: stopped.append(1) or {"port_free": True, "detail": ""},
+    )
+
+    report = sm.reap_services(plan_dir, "plan-x", owner_token=caller)
+
+    assert len(stopped) == 1, "the round that started a service must stop it"
+    assert report.reaped == ["chart"]
+    assert not sm.ledger_path(plan_dir).exists()
+
+
+def test_reap_leaves_unattributed_entries_alone_while_a_round_runs(
+    tmp_path: Path, monkeypatch,
+):
+    """An entry nobody claims may belong to the round that is running.
+
+    The ledger is written by the *project's* own ``service_manager``
+    (see ``verification_agent._load_service_manager``), so a project
+    that has not picked up the owner token yet writes unattributed
+    entries. While a round is running, those entries may be that
+    round's services — stopping them is the 2026-10-24 defect with
+    one more step of indirection.
+    """
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    _register_live_owner(plan_dir)
+
+    _write_ledger(plan_dir, [_entry()])
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+    monkeypatch.setattr(
+        sm, "stop_service",
+        lambda *a, **k: stopped.append(1) or {"port_free": True, "detail": ""},
+    )
+
+    report = sm.reap_services(plan_dir, "plan-x")
+
+    assert stopped == [], (
+        "an unattributed entry was stopped while a round was running — it "
+        "may be that round's service"
+    )
+    assert report.reaped == []
+    assert sm.read_ledger(plan_dir)["services"][0]["name"] == "chart"
+
+
+def test_reap_kills_entries_whose_owner_is_gone(tmp_path: Path, monkeypatch):
+    """An owner that died without reaping leaves services nobody owns.
+
+    The token is deregistered (or its process is gone), so the entry is
+    reapable — otherwise a crashed round would strand its services on
+    their ports forever.
+    """
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    gone = sm.new_owner_token("round")
+    sm.register_service_owner(plan_dir, gone)
+    sm.release_service_owner(plan_dir, gone)
+
+    _write_ledger(plan_dir, [_entry(owner_token=gone)])
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+    monkeypatch.setattr(
+        sm, "stop_service",
+        lambda *a, **k: stopped.append(1) or {"port_free": True, "detail": ""},
+    )
+
+    report = sm.reap_services(plan_dir, "plan-x", owner_token=_caller_token())
+
+    assert len(stopped) == 1, (
+        "an entry whose owner is gone is an orphan; nobody else will reap it"
+    )
+    assert report.reaped == ["chart"]
+
+
+def test_the_shutdown_sweep_reaps_what_the_leaving_process_started(
+    tmp_path: Path, monkeypatch,
+):
+    """The backend's own rounds are over when the backend exits.
+
+    The owner tokens name a pid — and while the backend is shutting
+    down, that pid is still alive. Without releasing this process'
+    owners before the sweep, the sweep would treat the backend's own
+    services as the property of a running round and leave them holding
+    their ports after the backend exited (the C3 promise).
+    """
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    token = sm.new_owner_token("verification_loop")
+    sm.register_service_owner(plan_dir, token)
+
+    _write_ledger(plan_dir, [_entry(owner_token=token)])
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+    monkeypatch.setattr(
+        sm, "stop_service",
+        lambda *a, **k: stopped.append(1) or {"port_free": True, "detail": ""},
+    )
+
+    reports = sm.reap_all_plans(
+        tmp_path, reason="server_shutdown", release_own_owners=True,
+    )
+
+    assert len(stopped) == 1, (
+        "the backend exited leaving the service it started on its port"
+    )
+    assert reports[0].reaped == ["chart"]
+
+
+def test_the_startup_sweep_leaves_another_processs_round_alone(
+    tmp_path: Path, monkeypatch,
+):
+    """A second backend may be running rounds against the same tree."""
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    other = sm.new_owner_token("verification_loop")
+    # pid 1 is always alive and is never this process — the shape of
+    # "another backend is running rounds against this plans tree".
+    sm.register_service_owner(plan_dir, other, pid=1)
+
+    _write_ledger(plan_dir, [_entry(owner_token=other)])
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+    monkeypatch.setattr(
+        sm, "stop_service",
+        lambda *a, **k: stopped.append(1) or {"port_free": True, "detail": ""},
+    )
+
+    sm.reap_all_plans(tmp_path, reason="startup_sweep")
+
+    assert stopped == [], (
+        "the startup sweep stopped a service another backend process is "
+        "still using"
+    )
+
+
 def test_reap_all_plans_only_visits_plans_with_a_ledger(tmp_path: Path):
     _write_ledger(tmp_path / "a", [_entry()])
     _write_ledger(tmp_path / "b", [_entry(name="api", port=8080)])
@@ -1314,7 +1546,11 @@ def test_reap_end_to_end_frees_a_real_port(tmp_path: Path):
         f"the relocated stub never started: {runtime.detail!r}"
     )
     runtime_map = sm.ServiceRuntimeMap(runtimes={"stub": runtime})
-    sm.record_runtimes(tmp_path, tmp_path.name, runtime_map, project_dir=tmp_path)
+    # The ledger is written directly, not through ``record_runtimes``:
+    # ``record_runtimes`` also *pins* the process (a pin says "a live
+    # round is using this one right now"), and this test is about
+    # reaping an orphan, not about a round's own service.
+    _write_ledger(tmp_path, [runtime.to_dict()])
     assert sm.ledger_path(tmp_path).exists()
 
     try:
@@ -1385,11 +1621,10 @@ def test_reap_clears_the_ledger_despite_a_lingering_client(tmp_path):
             start_cmd="stub", cwd=str(tmp_path),
             origin="spawned",
         )
-        sm.record_runtimes(
-            tmp_path, tmp_path.name,
-            sm.ServiceRuntimeMap(runtimes={"stub": runtime}),
-            project_dir=tmp_path,
-        )
+        # The ledger is written directly: a pin means "a live round is
+        # using this process", and this test is about the reaping of an
+        # orphan (see ``test_reap_end_to_end_frees_a_real_port``).
+        _write_ledger(tmp_path, [runtime.to_dict()])
         report = sm.reap_services(tmp_path, grace_seconds=10.0)
 
         assert report.reaped == ["stub"], (
@@ -1401,3 +1636,1708 @@ def test_reap_clears_the_ledger_despite_a_lingering_client(tmp_path):
     finally:
         client.close()
         _force_cleanup(pid)
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-25 — our own leftover on the declared port is reclaimed
+# ---------------------------------------------------------------------------
+#
+# The shape this exists for (plan 20261024-vp-quota-parked, 2026-10-24):
+# the declared port was held by an instance an *earlier round of the same
+# plan* had started.  That instance served another data plane, so every
+# request to it answered "404 Plan not found" — and the round's effective
+# declarations still pointed at the declared port, because the framework
+# had relocated this round's own copy to a free port and left the
+# declaration where it was.  The VPs therefore talked to the leftover.
+#
+# The old answer was rule 3: "never kill a process we cannot identify, so
+# relocate around it".  The new answer is: identify *our own* leftovers
+# and take the declared port back, so the effective port stays stable.
+
+
+def _shell_decl(**overrides) -> ServiceDeclaration:
+    """A declaration shaped like the ones production writes.
+
+    A shell line: setup first (activate a virtualenv, export the data
+    plane), the program last.  The running process only carries the
+    program — so the *whole line* can never match it, which is exactly
+    why the leftover used to look like a stranger.
+    """
+    base = dict(
+        name="api",
+        port=3000,
+        start_cmd=(
+            "source venv/bin/activate && export PDT_PLANS_DIR=/old/plans "
+            "&& exec python -m api.server"
+        ),
+        cwd=".",
+    )
+    base.update(overrides)
+    return ServiceDeclaration(**base)
+
+
+def _holder_probe(port: int, pid: int, cmdline: str) -> PortProbe:
+    """A probe that says "somebody is listening on *port*"."""
+    return PortProbe(
+        port=port, listening=True, pids=[pid], cmdlines=[cmdline],
+    )
+
+
+def _ledger_with_holder(
+    plan_dir: Path,
+    *,
+    port: int,
+    pid: int,
+    project_dir: Path,
+    plan_id: str = "20261024-vp-quota-parked",
+    owner_token: str = "",
+    start_cmd: str = (
+        "source venv/bin/activate && export PDT_PLANS_DIR=/old/plans "
+        "&& exec python -m api.server"
+    ),
+) -> None:
+    """Write the ledger an earlier round of this plan would have left.
+
+    The entry carries the *declared* start command, the way production
+    writes it — so the data plane the leftover was serving is readable
+    from the ledger.
+
+    The ledger is written **directly**, not through ``record_runtimes``:
+    this fixture is a leftover of a round that is *over*, and a round
+    that is over leaves no live pin behind (a pin says "this process is
+    in use right now").  Writing it through ``record_runtimes`` would
+    pin the very process these tests are about to reclaim.
+    """
+    runtime = sm.ServiceRuntime(
+        name="api", port=port, pid=pid, pgid=pid,
+        start_cmd=start_cmd, cwd=".",
+        origin="spawned", ready=True, owner_token=owner_token,
+    )
+    _write_ledger(plan_dir, [runtime.to_dict()], project_dir=project_dir)
+
+
+def _stub_reclaim_spy(monkeypatch) -> tuple:
+    """Record the stops and the starts ``ensure_services`` performs.
+
+    Returns ``(stopped, started)`` — the pids that were signalled and the
+    ports this round's own copy was started on.
+    """
+    stopped: list = []
+    started: list = []
+
+    def _fake_stop(runtime, decl=None, **kwargs):
+        stopped.append(runtime.pid)
+        return {
+            "name": runtime.name, "port": runtime.port, "killed": [],
+            "signalled": [f"pid {runtime.pid}"], "port_free": True,
+            "detail": "stub",
+        }
+
+    def _fake_start(decl, project_dir, timeout_seconds=None):
+        started.append(decl.port)
+        return sm.ServiceRuntime(
+            name=decl.name, port=decl.port, pid=5151, pgid=5151,
+            start_cmd=decl.start_cmd, cwd=decl.cwd,
+            origin="spawned", ready=True, detail="stub",
+        )
+
+    monkeypatch.setattr(sm, "stop_service", _fake_stop)
+    monkeypatch.setattr(sm, "start_service", _fake_start)
+    return stopped, started
+
+
+def test_our_own_leftover_is_reclaimed_instead_of_relocated(tmp_path, monkeypatch):
+    """The declared port comes back to us — the round does not move.
+
+    The ledger of this plan says the holder of the port is a process we
+    started in an earlier round.  It is ours, so it is ours to stop, and
+    this round's copy takes the *declared* port: the effective
+    declarations the VPs read stay valid.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    plan_dir = tmp_path / "plans" / "20261024-vp-quota-parked"
+    plan_dir.mkdir(parents=True)
+    _ledger_with_holder(
+        plan_dir, port=3000, pid=4242, project_dir=project,
+    )
+
+    decl = _shell_decl()
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _holder_probe(3000, 4242, "/usr/bin/python3 -m api.server"),
+    )
+    stopped, started = _stub_reclaim_spy(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: 38921)
+
+    result = sm.ensure_services(
+        project, {"api": decl}, plan_dir=plan_dir, plan_id=plan_dir.name,
+    )
+
+    assert stopped == [4242], (
+        f"our own leftover must be stopped; stopped {stopped!r}"
+    )
+    assert started == [3000], (
+        f"this round's copy must take the DECLARED port, so the effective "
+        f"declarations stay valid; started on {started!r}"
+    )
+    runtime = result.runtimes["api"]
+    assert runtime.port == 3000
+    assert runtime.declared_port == 3000
+    assert runtime.reclaimed is True, (
+        f"the reclaim must be recorded on the runtime; got {runtime.to_dict()!r}"
+    )
+    assert runtime.reclaim_reason, "a reclaim without a reason is not an audit trail"
+    assert runtime.ready
+    assert result.blocked_ports == []
+
+
+def test_a_leftover_of_another_workspace_is_relocated_not_reclaimed(
+    tmp_path, monkeypatch,
+):
+    """Another workspace's process is not ours to stop — rule 3 stands."""
+    project = tmp_path / "project"
+    project.mkdir()
+    other_workspace = tmp_path / "other-project"
+    other_workspace.mkdir()
+    plan_dir = tmp_path / "plans" / "20261024-vp-quota-parked"
+    plan_dir.mkdir(parents=True)
+    _ledger_with_holder(
+        plan_dir, port=3000, pid=4242, project_dir=other_workspace,
+    )
+
+    decl = _shell_decl()
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _holder_probe(3000, 4242, "/usr/bin/python3 -m api.server"),
+    )
+    stopped, started = _stub_reclaim_spy(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: 38921)
+
+    result = sm.ensure_services(
+        project, {"api": decl}, plan_dir=plan_dir, plan_id=plan_dir.name,
+    )
+
+    assert stopped == [], "a process of another workspace must never be signalled"
+    assert started == [38921], "and the round gets out of its way instead"
+    runtime = result.runtimes["api"]
+    assert runtime.reclaimed is False
+    assert runtime.port == 38921
+    assert runtime.declared_port == 3000
+
+
+def test_a_service_a_live_round_still_owns_is_not_reclaimed(tmp_path, monkeypatch):
+    """A running round's service is not a leftover — it is in use."""
+    project = tmp_path / "project"
+    project.mkdir()
+    plan_dir = tmp_path / "plans" / "20261024-vp-quota-parked"
+    plan_dir.mkdir(parents=True)
+    # A round that is running right now: its owner is this process, so it
+    # is alive.
+    sm.register_service_owner(plan_dir, "run-live", current=True)
+    _ledger_with_holder(
+        plan_dir, port=3000, pid=4242, project_dir=project,
+        owner_token="run-live",
+    )
+
+    decl = _shell_decl()
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _holder_probe(3000, 4242, "/usr/bin/python3 -m api.server"),
+    )
+    stopped, started = _stub_reclaim_spy(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: 38921)
+
+    result = sm.ensure_services(
+        project, {"api": decl}, plan_dir=plan_dir, plan_id=plan_dir.name,
+    )
+
+    assert stopped == [], (
+        f"a service a live round owns must not be stopped; stopped {stopped!r}"
+    )
+    assert started == [38921]
+    assert result.runtimes["api"].reclaimed is False
+
+
+def test_a_leftover_of_our_own_program_in_our_workspace_is_reclaimed(
+    tmp_path, monkeypatch,
+):
+    """No ledger, but the shape still says "ours".
+
+    The holder runs the program our declaration starts, out of our own
+    workspace.  That is a leftover of this workspace — the round needs
+    the declared port more than the leftover does.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    plan_dir = tmp_path / "plans" / "20261024-vp-quota-parked"
+    plan_dir.mkdir(parents=True)
+
+    decl = _shell_decl()
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _holder_probe(3000, 4242, "/usr/bin/python3 -m api.server"),
+    )
+    monkeypatch.setattr(sm, "_process_cwd", lambda pid: str(project))
+    stopped, started = _stub_reclaim_spy(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: 38921)
+
+    result = sm.ensure_services(
+        project, {"api": decl}, plan_dir=plan_dir, plan_id=plan_dir.name,
+    )
+
+    assert stopped == [4242], (
+        f"a leftover of our own program in our own workspace must be "
+        f"stopped; stopped {stopped!r}"
+    )
+    assert started == [3000], "and the declared port must come back to us"
+    assert result.runtimes["api"].reclaimed is True
+
+
+def test_a_stranger_on_the_declared_port_is_still_relocated(tmp_path, monkeypatch):
+    """The safety rule is untouched: a stranger is never signalled."""
+    project = tmp_path / "project"
+    project.mkdir()
+    plan_dir = tmp_path / "plans" / "20261024-vp-quota-parked"
+    plan_dir.mkdir(parents=True)
+
+    decl = _shell_decl()
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _holder_probe(
+            3000, 4242, "/usr/bin/postgres -D /var/db",
+        ),
+    )
+    monkeypatch.setattr(sm, "_process_cwd", lambda pid: str(project))
+    stopped, started = _stub_reclaim_spy(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: 38921)
+
+    result = sm.ensure_services(
+        project, {"api": decl}, plan_dir=plan_dir, plan_id=plan_dir.name,
+    )
+
+    assert stopped == [], "a stranger must never be signalled"
+    assert started == [38921], "the round relocates around it, as before"
+    runtime = result.runtimes["api"]
+    assert runtime.reclaimed is False
+    assert runtime.port == 38921
+
+
+def test_the_reclaim_reason_names_the_data_plane_the_leftover_served(
+    tmp_path, monkeypatch,
+):
+    """The reason says *why* the leftover was in the way.
+
+    A leftover that serves another plans dir is the whole incident: it
+    cannot see this plan's fixture, so every request to it answers
+    "404 Plan not found".  The reason has to name that, because it is
+    the fact that made the reclaim necessary.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    plan_dir = tmp_path / "plans" / "20261024-vp-quota-parked"
+    plan_dir.mkdir(parents=True)
+    _ledger_with_holder(
+        plan_dir, port=3000, pid=4242, project_dir=project,
+    )
+
+    decl = _shell_decl(
+        start_cmd=(
+            "source venv/bin/activate && export PDT_PLANS_DIR=/new/plans "
+            "&& exec python -m api.server"
+        ),
+    )
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _holder_probe(3000, 4242, "/usr/bin/python3 -m api.server"),
+    )
+    _stub_reclaim_spy(monkeypatch)
+
+    result = sm.ensure_services(
+        project, {"api": decl}, plan_dir=plan_dir, plan_id=plan_dir.name,
+    )
+
+    runtime = result.runtimes["api"]
+    assert "reclaimed" in runtime.reclaim_reason
+    assert "PDT_PLANS_DIR" in runtime.reclaim_reason, (
+        f"the reason must name the data plane the leftover was serving: "
+        f"{runtime.reclaim_reason!r}"
+    )
+    assert "/old/plans" in runtime.reclaim_reason
+    assert "/new/plans" in runtime.reclaim_reason
+    assert runtime.reclaim_reason in runtime.detail, (
+        f"the reason must reach the detail the operator reads: "
+        f"{runtime.detail!r}"
+    )
+
+
+def test_the_reclaimed_instance_is_ours_to_reap(tmp_path, monkeypatch):
+    """A reclaimed instance is spawned by us — the ledger must claim it."""
+    project = tmp_path / "project"
+    project.mkdir()
+    plan_dir = tmp_path / "plans" / "20261024-vp-quota-parked"
+    plan_dir.mkdir(parents=True)
+    _ledger_with_holder(
+        plan_dir, port=3000, pid=4242, project_dir=project,
+    )
+
+    decl = _shell_decl()
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _holder_probe(3000, 4242, "/usr/bin/python3 -m api.server"),
+    )
+    _stub_reclaim_spy(monkeypatch)
+
+    result = sm.ensure_services(
+        project, {"api": decl}, plan_dir=plan_dir, plan_id=plan_dir.name,
+    )
+
+    runtime = result.runtimes["api"]
+    assert runtime.spawned_by_ac, (
+        f"the reclaimed instance was started by this round, so the ledger "
+        f"has to claim it: {runtime.to_dict()!r}"
+    )
+    assert runtime.to_dict()["reclaimed"] is True
+    assert runtime.to_dict()["reclaim_reason"]
+
+
+def test_a_live_rounds_service_is_not_reclaimed_even_when_it_looks_like_ours(
+    tmp_path, monkeypatch,
+):
+    """A running round's service is in use — the shape must not override it.
+
+    The holder here looks exactly like a leftover: it runs our program,
+    out of our workspace, on a port our ledger records.  But the ledger
+    says a round that is **running right now** owns it, so it is not a
+    leftover — it is a service another round is using.  The verdict the
+    ledger gives has to hold: the weaker "same program, same workspace"
+    shape must not talk its way past it, because that is how a running
+    round loses its api server.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    plan_dir = tmp_path / "plans" / "20261024-vp-quota-parked"
+    plan_dir.mkdir(parents=True)
+    sm.register_service_owner(plan_dir, "run-live", current=True)
+    _ledger_with_holder(
+        plan_dir, port=3000, pid=4242, project_dir=project,
+        owner_token="run-live",
+    )
+
+    decl = _shell_decl()
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _holder_probe(3000, 4242, "/usr/bin/python3 -m api.server"),
+    )
+    # The holder's cwd is our workspace — the shape a leftover has.
+    monkeypatch.setattr(sm, "_process_cwd", lambda pid: str(project))
+    stopped, started = _stub_reclaim_spy(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: 38921)
+
+    result = sm.ensure_services(
+        project, {"api": decl}, plan_dir=plan_dir, plan_id=plan_dir.name,
+    )
+
+    assert stopped == [], (
+        f"a service a live round owns must not be signalled, whatever it "
+        f"looks like; stopped {stopped!r}"
+    )
+    assert started == [38921], (
+        f"the round gets out of its way instead; started on {started!r}"
+    )
+    assert result.runtimes["api"].reclaimed is False
+
+
+# ---------------------------------------------------------------------------
+# The declared service stays healthy until the last VP (2026-10-25, repair-r1-22)
+# ---------------------------------------------------------------------------
+#
+# The 2026-10-24 production round started the plan's ``api`` service and
+# then had twelve ``api_test`` VPs fail with a connection refusal --
+# against an address the round had never verified.  The address was
+# re-derived from the runtime map every time the plan was resolved, and
+# the map is a *record*: anything that merges into it may rewrite it.
+#
+# So the round now binds every service to the instance its own
+# ``ensure`` produced, and each VP's request is built from that
+# instance.  This is the end-to-end version of that contract, with a
+# **real** service: the round brings up an HTTP server, the runtime map
+# is then rewritten to an address the round never verified, and three
+# ``api_test`` VPs are dispatched.  The VPs must reach the instance the
+# ``ensure`` produced -- before the fix they followed the map to the
+# foreign port and every one of them failed with a connection refusal --
+# and the service must still be serving when the last VP is done.
+
+
+@pytest.mark.timeout(180)
+def test_declared_service_stays_healthy_until_the_last_vp(tmp_path: Path):
+    """The service the round ensured serves every VP, and is still up
+    after the last one."""
+    import sys as _sys
+
+    from verification_agent import VerificationAgent
+
+    port = _free_port()
+    script = (
+        "import http.server,socketserver;"
+        f"socketserver.TCPServer(('127.0.0.1',{port}),"
+        "http.server.SimpleHTTPRequestHandler).serve_forever()"
+    )
+    decl = ServiceDeclaration(
+        name="api",
+        port=port,
+        start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
+        cwd=".",
+        health_url=f"http://127.0.0.1:{port}/",
+        ready_timeout_seconds=30,
+    )
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    agent = VerificationAgent(
+        plan_dir=plan_dir,
+        project_dir=project_dir,
+        coding_tool=None,
+    )
+    agent._service_declarations = {"api": decl}
+    agent.start_verification_round(1)
+
+    runtime = None
+    try:
+        runtime_map = agent._preflight_declared_services({"services": []})
+        runtime = runtime_map.runtimes["api"]
+        assert runtime.ready is True, runtime.detail
+        assert runtime.port == port
+
+        # The map is a **record** of what the ensure found; anything that
+        # merges into it may rewrite it.  The address the VPs are
+        # dispatched to must not follow it.
+        foreign_port = _free_port()
+        agent._service_runtime_map.runtimes["api"] = sm.ServiceRuntime(
+            name="api",
+            port=foreign_port,
+            declared_port=port,
+            pid=999,
+            pgid=999,
+            start_epoch=1.0,
+            start_cmd=decl.start_cmd,
+            cwd=".",
+            origin="spawned",
+            ready=True,
+        )
+
+        plan = {
+            "verification_points": [
+                {
+                    "id": f"VP-{index:03d}",
+                    "verification_method": "api_test",
+                    "uses_services": ["api"],
+                    "request": {"method": "GET", "url": "{{svc.api.url}}/"},
+                    "assertions": [{"status": 200}],
+                }
+                for index in (1, 2, 3)
+            ]
+        }
+        resolved = agent._resolve_service_placeholders(plan)
+
+        for vp in resolved["verification_points"]:
+            verdict = agent._run_api_test_vp(vp)
+            assert verdict["status"] == "PASSED", verdict
+            artifact = json.loads(
+                (
+                    plan_dir / "vp_artifacts" / vp["id"] / "api_response.json"
+                ).read_text(encoding="utf-8"),
+            )
+            assert artifact["request"]["url"] == f"http://127.0.0.1:{port}/"
+
+        # The service that served them is still up, and it is still the
+        # one the round is bound to.
+        assert sm.probe_port(port).listening is True
+        assert agent._service_bindings["api"].port == port
+    finally:
+        if runtime is not None and runtime.pid:
+            _force_cleanup(runtime.pid)
+
+
+# ---------------------------------------------------------------------------
+# Round pins (2026-10-25, repair-r1-23)
+# ---------------------------------------------------------------------------
+#
+# 2026-10-25, production: the plan's api service came up at 21:54:08
+# (pid 585, port 58396) and was SIGTERMed at 21:54:11 — three seconds
+# later, by a sweep that did not know a round was running.  The ledger
+# entry named the process, but its ``owner_token`` was **empty**, so the
+# sweep read the entry as an orphan: "nobody claims it" is what a
+# crashed round looks like too.
+#
+# A **pin** is that fact written the other way round.  The round pins the
+# processes it is using (pid, pgid, boot id, port); the pin expires on
+# its own; and it does not need an owner token to be effective — which is
+# the whole point, because the empty token is exactly what let the sweep
+# through.  A reap reads the pins before it decides to kill.
+#
+# The pin file is a sibling of the ledger and of the owner registry, so
+# the two module instances (the project's copy of ``service_manager`` and
+# the harness' one) share it the same way: through the disk.
+
+
+def _pin(
+    pid: int = 4242,
+    port: int = 3000,
+    *,
+    round_token: str = "",
+    writer_pid: Optional[int] = None,
+    ttl: float = 3600.0,
+    name: str = "api",
+) -> dict:
+    """One pin, in the shape a round writes it."""
+    now = time.time()
+    return {
+        "name": name,
+        "pid": pid,
+        "pgid": pid,
+        "boot_id": f"{pid}@{int(now)}",
+        "port": port,
+        "declared_port": port,
+        "round_token": round_token,
+        "writer_pid": os.getpid() if writer_pid is None else writer_pid,
+        "created_at": now,
+        "expires_at": now + ttl,
+    }
+
+
+def _write_pins(plan_dir: Path, pins: list) -> None:
+    """Write the pin file the way a round does."""
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    (plan_dir / ".round_pins.json").write_text(
+        json.dumps({"updated_at": "2026-10-25T00:00:00", "pins": pins}),
+        encoding="utf-8",
+    )
+
+
+def _pinned_runtime(pid: int = 4242, port: int = 3000) -> "sm.ServiceRuntime":
+    """A runtime as the round sees it: started by us, and ready."""
+    return sm.ServiceRuntime(
+        name="api", port=port, pid=pid, pgid=pid, start_epoch=1.0,
+        origin="spawned", ready=True,
+    )
+
+
+def _alive_process(monkeypatch, *pids) -> None:
+    """Say which pids are live processes.
+
+    The pids in these tests are made up (4242, 900 …), so a test that
+    means "a live round is using this process" has to say so: a pin
+    protects a *process*, and there is nothing to protect when the
+    process is gone.  This process (the one that writes the pin) is
+    always alive — it is the round's own process.
+    """
+    alive = {int(p) for p in pids} | {os.getpid()}
+    monkeypatch.setattr(sm, "_pid_alive", lambda pid: int(pid) in alive)
+
+
+def test_own_stale_holder_is_reclaimed_on_the_declared_port(tmp_path, monkeypatch):
+    """Our own leftover comes back to us — a *live* one does not.
+
+    The declared port is what the VPs' effective declarations point at,
+    so a leftover of our own has to be taken back (rule 3) rather than
+    relocated around: the leftover served another data plane, so every
+    request to it answered "404 Plan not found".
+
+    "Stale" is what the round pin decides.  A holder a **live** round
+    has pinned is in use, not a leftover — stopping it is how a running
+    round loses its api server between two VPs (2026-10-25, repair-r1-23).
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    decl = _shell_decl()
+
+    # --- the stale leftover -------------------------------------------
+    plan_dir = tmp_path / "plans" / "20261024-vp-quota-parked"
+    plan_dir.mkdir(parents=True)
+    _ledger_with_holder(
+        plan_dir, port=3000, pid=4242, project_dir=project,
+    )
+    # The round that started it is long over: its pin has expired.
+    _write_pins(plan_dir, [_pin(pid=4242, port=3000, ttl=-1.0)])
+
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _holder_probe(3000, 4242, "/usr/bin/python3 -m api.server"),
+    )
+    stopped, started = _stub_reclaim_spy(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: 38921)
+
+    result = sm.ensure_services(
+        project, {"api": decl}, plan_dir=plan_dir, plan_id=plan_dir.name,
+    )
+
+    assert stopped == [4242], (
+        f"a stale leftover of ours must be stopped; stopped {stopped!r}"
+    )
+    assert started == [3000], (
+        f"this round's copy must take the DECLARED port, so the effective "
+        f"declarations stay valid; started on {started!r}"
+    )
+    assert result.runtimes["api"].reclaimed is True
+
+    # --- the holder a live round is using ------------------------------
+    # The same leftover, but a live round has pinned it.  The ledger
+    # entry carries no owner token — that is the production shape — so
+    # the pin is the only thing that says "this one is in use".
+    live_dir = tmp_path / "plans" / "20261024-vp-quota-live"
+    live_dir.mkdir(parents=True)
+    _ledger_with_holder(
+        live_dir, port=3000, pid=4242, project_dir=project,
+    )
+    live_token = "run-live"
+    sm.register_service_owner(live_dir, live_token, current=True)
+    _write_pins(
+        live_dir, [_pin(pid=4242, port=3000, round_token=live_token)],
+    )
+    # The pinned process is running: a pin protects a live process.
+    _alive_process(monkeypatch, 4242)
+
+    stopped, started = _stub_reclaim_spy(monkeypatch)
+
+    live_result = sm.ensure_services(
+        project, {"api": decl}, plan_dir=live_dir, plan_id=live_dir.name,
+    )
+
+    assert stopped == [], (
+        f"a service a live round has pinned is in use, not a leftover; "
+        f"stopped {stopped!r}"
+    )
+    assert started == [38921], "the round gets out of its way instead"
+    assert live_result.runtimes["api"].reclaimed is False
+
+
+def test_reap_skips_pinned_pid(tmp_path, monkeypatch):
+    """The production shape: the ledger has no owner, the pin has the round.
+
+    The 2026-10-25 sweep found the ledger entry with an empty
+    ``owner_token`` and read it as an orphan.  The pin is the answer to
+    that: it names the process, and it does not need a token.
+    """
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    _write_ledger(plan_dir, [_entry(pid=4242, pgid=4242, owner_token="")])
+    # The round that is using the service pins it.  The pin was written
+    # by a process that is still alive, so the pin holds.
+    sm.pin_services_for_round(
+        plan_dir, "", [_pinned_runtime()], ttl_sec=600,
+    )
+    _alive_process(monkeypatch, 4242)
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+    monkeypatch.setattr(
+        sm, "stop_service",
+        lambda *a, **k: stopped.append(1) or {"port_free": True, "detail": ""},
+    )
+
+    report = sm.reap_services(plan_dir, "plan-x")
+
+    assert stopped == [], (
+        "a pinned service was stopped — the round that is using it would "
+        "lose it between two VPs (2026-10-25: pid 585, 3s after ready)"
+    )
+    assert report.reaped == []
+    assert report.reap_skipped_pinned, report.to_dict()
+    assert report.skipped[0]["reason"] == "reap_skipped_pinned"
+    # The entry stays in the ledger: the round that owns it reaps it.
+    assert sm.read_ledger(plan_dir)["services"]
+
+
+def test_startup_sweep_respects_live_pin(tmp_path, monkeypatch):
+    """The tree-wide sweep reads the pins before it kills anything."""
+    plans_dir = tmp_path / "plans"
+    plan_dir = plans_dir / "plan-x"
+    plan_dir.mkdir(parents=True)
+    _write_ledger(plan_dir, [_entry(pid=4242, pgid=4242, owner_token="")])
+    sm.pin_services_for_round(
+        plan_dir, "", [_pinned_runtime()], ttl_sec=600,
+    )
+    _alive_process(monkeypatch, 4242)
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+    monkeypatch.setattr(
+        sm, "stop_service",
+        lambda *a, **k: stopped.append(1) or {"port_free": True, "detail": ""},
+    )
+
+    reports = sm.reap_all_plans(plans_dir, reason="startup_sweep")
+
+    assert len(reports) == 1, reports
+    assert stopped == [], "the startup sweep stopped a pinned service"
+    assert reports[0].reaped == []
+    assert reports[0].reap_skipped_pinned, reports[0].to_dict()
+
+
+def test_pin_expiry_allows_reclaim(tmp_path, monkeypatch):
+    """An expired pin protects nothing — the orphan is reaped."""
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    _write_ledger(plan_dir, [_entry(pid=4242, pgid=4242, owner_token="")])
+    sm.pin_services_for_round(
+        plan_dir, "", [_pinned_runtime()], ttl_sec=0.0,
+    )
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+
+    def _fake_stop(runtime, *args, **kwargs):
+        stopped.append(runtime.pid)
+        return {"port_free": True, "detail": "stopped"}
+
+    monkeypatch.setattr(sm, "stop_service", _fake_stop)
+
+    report = sm.reap_services(plan_dir, "plan-x")
+
+    assert stopped == [4242], (
+        "an expired pin must not keep a service alive for ever"
+    )
+    assert report.reaped == ["chart"]
+    assert report.reap_skipped_pinned == []
+
+
+def test_pin_removed_after_round_exit(tmp_path, monkeypatch):
+    """The round's own exit reap stops its service — and drops its pin."""
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    token = _register_live_owner(plan_dir)
+    _write_ledger(plan_dir, [_entry(pid=4242, pgid=4242, owner_token=token)])
+    sm.pin_services_for_round(
+        plan_dir, token, [_pinned_runtime()], ttl_sec=600,
+    )
+    assert sm.round_pins_path(plan_dir).exists()
+    _alive_process(monkeypatch, 4242)
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+    monkeypatch.setattr(
+        sm, "stop_service",
+        lambda *a, **k: stopped.append(1) or {"port_free": True, "detail": ""},
+    )
+
+    report = sm.reap_services(plan_dir, "plan-x", owner_token=token)
+
+    assert report.reaped == ["chart"]
+    assert not sm.round_pins_path(plan_dir).exists(), (
+        "the round is over — its pin must not keep the service alive"
+    )
+
+
+def test_a_stale_pin_does_not_shield_the_next_rounds_service(
+    tmp_path, monkeypatch,
+):
+    """The pin of the round before must not shield the next round.
+
+    The rounds of one plan share one plan directory, so the pin of the
+    round before is still in the file when the next round starts.
+    Matched by *port* it would look like a shield, and the new round's
+    service would survive its own exit reap — the service would outlive
+    the round that started it.
+
+    The pid is the stronger witness: it names the process, the port
+    only the socket.  So the pin that names the ledger's process wins,
+    and the one that only shares the port does not.
+    """
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    _write_ledger(plan_dir, [_entry(pid=900, pgid=900, owner_token="run-2")])
+    _write_pins(plan_dir, [
+        # The round before: its writer is still alive, so its pin is in
+        # force — but it names a process of its own.
+        _pin(pid=4242, port=3000, round_token=""),
+        # This round's own pin: the process the ledger names.
+        _pin(pid=900, port=3000, round_token="run-2"),
+    ])
+    _alive_process(monkeypatch, 4242, 900)
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+
+    def _fake_stop(runtime, *args, **kwargs):
+        stopped.append(runtime.pid)
+        return {"port_free": True, "detail": "stopped"}
+
+    monkeypatch.setattr(sm, "stop_service", _fake_stop)
+
+    report = sm.reap_services(plan_dir, "plan-x", owner_token="run-2")
+
+    assert stopped == [900], (
+        "the round's own service must be reaped by the round's own exit "
+        f"reap; stopped {stopped!r}"
+    )
+    assert report.reaped == ["chart"]
+    assert report.reap_skipped_pinned == []
+
+
+def test_a_pin_whose_process_is_gone_protects_nothing(
+    tmp_path, monkeypatch,
+):
+    """A pin protects a *process* — when that process is gone, it is spent.
+
+    The pin of a round that died can outlive the round (its writer is
+    the backend, which lives on).  A spent pin must not go on shielding
+    whatever lands on the port next.
+    """
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    _write_ledger(plan_dir, [_entry(pid=4242, pgid=4242, owner_token="")])
+    sm.pin_services_for_round(
+        plan_dir, "", [_pinned_runtime()], ttl_sec=600,
+    )
+    # The pinned process is gone; the process that wrote the pin (this
+    # one) is not.
+    _alive_process(monkeypatch)
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+
+    def _fake_stop(runtime, *args, **kwargs):
+        stopped.append(runtime.pid)
+        return {"port_free": True, "detail": "stopped"}
+
+    monkeypatch.setattr(sm, "stop_service", _fake_stop)
+
+    report = sm.reap_services(plan_dir, "plan-x")
+
+    assert stopped == [4242], (
+        "a pin of a process that is gone protects nothing; "
+        f"stopped {stopped!r}"
+    )
+    assert report.reaped == ["chart"]
+    assert report.reap_skipped_pinned == []
+    assert not sm.round_pins_path(plan_dir).exists(), (
+        "a spent pin must be dropped, not left to shield the next round"
+    )
+
+
+def test_a_pin_on_the_declared_port_does_not_cover_a_relocated_service(
+    tmp_path, monkeypatch,
+):
+    """A pin protects a *process* — the declared port is not it.
+
+    A round that had to relocate serves somewhere else.  The pin of the
+    round that holds the declared port says nothing about the relocated
+    one, and it must not shield it: the relocated service would outlive
+    the round that started it.
+    """
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    _write_ledger(plan_dir, [_entry(
+        port=38921, pid=900, pgid=900, owner_token="",
+        declared_port=3000,
+    )])
+    # The round that holds the declared port.
+    _write_pins(plan_dir, [_pin(pid=585, port=3000, round_token="")])
+    _alive_process(monkeypatch, 585, 900)
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    stopped = []
+
+    def _fake_stop(runtime, *args, **kwargs):
+        stopped.append(runtime.pid)
+        return {"port_free": True, "detail": "stopped"}
+
+    monkeypatch.setattr(sm, "stop_service", _fake_stop)
+
+    report = sm.reap_services(plan_dir, "plan-x")
+
+    assert stopped == [900], (
+        "the pin of another round does not shield the service that was "
+        f"relocated; stopped {stopped!r}"
+    )
+    assert report.reaped == ["chart"]
+    assert report.reap_skipped_pinned == []
+
+
+# ---------------------------------------------------------------------------
+# A relocation that could not place the service (2026-10-25, repair-r1-29)
+# ---------------------------------------------------------------------------
+#
+# The production round asked a port (51725) that nothing had ever
+# listened on.  The address had come from somewhere, and the round's
+# own record did not say where: when a relocation gives up, the runtime
+# it hands back still carries the **declared** port and only says
+# ``origin="failed"`` in prose.  A downstream reader that asks "is it
+# ready?" and does not read the prose has an address in its hand.
+#
+# So the failure is now **explicit** — a field, not a sentence — and
+# every port the relocation tried is written into the address event
+# stream, so "where did this port come from" is answerable from the
+# file even for the ports that did not work.
+
+
+def _stub_failed_start(monkeypatch, *, pid=None):
+    """A ``start_service`` that never becomes ready."""
+
+    def _fake(decl, project_dir, timeout_seconds=None):
+        return sm.ServiceRuntime(
+            name=decl.name, port=decl.port, pid=pid, ready=False,
+            start_cmd=decl.start_cmd, detail="never became ready",
+        )
+
+    monkeypatch.setattr(sm, "start_service", _fake)
+
+
+def test_a_failed_relocation_is_explicitly_unusable(project, monkeypatch):
+    """The runtime says "no address" in a field, not only in prose.
+
+    ``ready=False`` says "the service did not come up".  ``unusable``
+    says something stronger: the port this record names is **not an
+    address at all** — it is the declared port, and somebody else holds
+    it.  The two are different facts, and only the second one may not
+    be used as a fallback.
+    """
+    _stub_failed_start(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: 38921)
+    monkeypatch.setattr(sm, "stop_service", lambda *a, **k: {"port_free": True})
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["/usr/bin/postgres"], start_epoch=1e12),
+    )
+
+    result = sm.ensure_services(project, {"chart": _decl()})
+
+    runtime = result.runtimes["chart"]
+    assert runtime.ready is False
+    assert runtime.origin == "failed"
+    assert runtime.unusable is True, (
+        "a relocation that could not place the service must say so in a "
+        "field; the port it names is somebody else's"
+    )
+    assert runtime.failure_reason, "the unusable runtime must say why"
+    assert "relocating failed" in runtime.failure_reason
+    assert runtime.usable is False
+
+
+def test_a_relocated_service_is_usable(project, monkeypatch):
+    """The other half of the same contract: a service that did come up
+    is usable, and says so."""
+    _stub_start(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: 38921)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["/usr/bin/postgres"], start_epoch=1e12),
+    )
+
+    result = sm.ensure_services(project, {"chart": _decl()})
+
+    runtime = result.runtimes["chart"]
+    assert runtime.ready is True
+    assert runtime.unusable is False
+    assert runtime.usable is True
+
+
+def test_a_failed_relocation_still_blocks_the_declared_port(project, monkeypatch):
+    """The declared port stays blocked.
+
+    Somebody else holds it, so it is the one port a VP must never be
+    sent to.  Marking the runtime unusable must not unblock it.
+    """
+    _stub_failed_start(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: 38921)
+    monkeypatch.setattr(sm, "stop_service", lambda *a, **k: {"port_free": True})
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["/usr/bin/postgres"], start_epoch=1e12),
+    )
+
+    result = sm.ensure_services(project, {"chart": _decl()})
+
+    assert result.blocked_ports == [3000], (
+        "the port the stranger holds must stay blocked"
+    )
+
+
+def test_every_candidate_port_a_relocation_tried_is_recorded(
+    project, tmp_path, monkeypatch,
+):
+    """Every port the relocation tried is in the address event stream.
+
+    The chain that produced an address has to be reconstructible from
+    the file alone — including the candidates that did **not** work,
+    because those are the ports somebody will later ask about.
+    """
+    plan_dir = tmp_path / "plan-x"
+    plan_dir.mkdir()
+    ports = iter([38921, 38922, 38923])
+    _stub_failed_start(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: next(ports))
+    monkeypatch.setattr(sm, "stop_service", lambda *a, **k: {"port_free": True})
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["/usr/bin/postgres"], start_epoch=1e12),
+    )
+
+    runtime_map = sm.ensure_services(
+        project, {"chart": _decl()}, plan_dir=plan_dir, plan_id="plan-x",
+    )
+    sm.record_runtimes(
+        plan_dir, "plan-x", runtime_map, project_dir=project,
+    )
+
+    attempts = [
+        e for e in sm.read_address_events(plan_dir)
+        if e.get("event") == "relocate_attempt"
+    ]
+    assert [e["new_port"] for e in attempts] == [38921, 38922, 38923], (
+        "every candidate port must be in the stream; got "
+        f"{[e.get('new_port') for e in attempts]!r}"
+    )
+    for event in attempts:
+        assert event["declared_port"] == 3000, (
+            "a candidate event must name the port it moved away from"
+        )
+    assert runtime_map.runtimes["chart"].candidate_ports == [
+        38921, 38922, 38923,
+    ]
+
+
+def test_the_failure_reason_names_the_candidate_ports(project, monkeypatch):
+    """The reason the relocation failed lists the ports it tried.
+
+    The runtime's own record is what an operator reads when the round
+    says "the service could not be placed"; the ports it tried belong
+    in that sentence.
+    """
+    ports = iter([38921, 38922, 38923])
+    _stub_failed_start(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: next(ports))
+    monkeypatch.setattr(sm, "stop_service", lambda *a, **k: {"port_free": True})
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["/usr/bin/postgres"], start_epoch=1e12),
+    )
+
+    result = sm.ensure_services(project, {"chart": _decl()})
+
+    reason = result.runtimes["chart"].failure_reason
+    for port in (38921, 38922, 38923):
+        assert str(port) in reason, (
+            f"the failure reason must name the candidate port {port}; "
+            f"got {reason!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# The round does not adopt a service it could not place (2026-10-25, repair-r1-29)
+# ---------------------------------------------------------------------------
+#
+# Marking the runtime unusable is only half of the fix.  The other half
+# is that **no reader adopts it**: the round's effective address table,
+# the binding its VPs are dispatched to, and the gates a re-ensure has
+# to pass all refuse a runtime that says "this names no address".
+#
+# And the declared port is not a fallback for it.  The declared port is
+# the stranger's — falling back to it would aim the round's VPs at the
+# process squatting the port, which is how a round ends up graded on
+# somebody else's server.
+
+
+def _unusable_runtime(name="chart", port=3000):
+    """The runtime a failed relocation hands back."""
+    runtime = sm.ServiceRuntime(
+        name=name, port=port, declared_port=port, pid=None,
+        start_cmd="npx next dev -p 3000", cwd=".", origin="failed",
+        ready=False, detail="the declared port is held by somebody else",
+    )
+    runtime.unusable = True
+    runtime.failure_reason = runtime.detail
+    return runtime
+
+
+def _agent_with(tmp_path: Path, *, runtime=None):
+    """A round that already ensured (and failed to ensure) one service."""
+    from verification_agent import VerificationAgent
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(exist_ok=True)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(exist_ok=True)
+    agent = VerificationAgent(
+        plan_dir=plan_dir,
+        project_dir=project_dir,
+        coding_tool=None,
+    )
+    agent._service_declarations = {"chart": _decl()}
+    if runtime is not None:
+        agent._service_runtime_map = sm.ServiceRuntimeMap(
+            runtimes={"chart": runtime},
+        )
+    return agent
+
+
+def test_the_round_does_not_adopt_an_unusable_runtime(tmp_path: Path):
+    """The effective address table has no entry for it.
+
+    Not the declared port: the declared port is the stranger's, and a
+    round that falls back to it is a round that talks to the stranger.
+    """
+    agent = _agent_with(tmp_path, runtime=_unusable_runtime())
+
+    assert "chart" not in agent._effective_declarations()
+
+
+def test_a_runtime_that_is_only_not_ready_keeps_the_declared_port(
+    tmp_path: Path,
+):
+    """The contrast: "not up yet" is not "not ours".
+
+    A service that simply did not come up **still owns** its declared
+    port, so the declared address stays the effective one and the
+    blocked-port gate is what says BLOCKED.  The two cases are not
+    conflated.
+    """
+    runtime = sm.ServiceRuntime(
+        name="chart", port=3000, declared_port=3000, pid=None,
+        start_cmd="npx next dev -p 3000", cwd=".", origin="spawned",
+        ready=False, detail="did not come up",
+    )
+    agent = _agent_with(tmp_path, runtime=runtime)
+
+    assert agent._effective_declarations()["chart"].port == 3000
+
+
+def test_binding_an_unusable_runtime_is_refused(tmp_path: Path):
+    agent = _agent_with(tmp_path)
+
+    assert agent._bind_service_runtime("chart", _unusable_runtime()) is None
+    assert "chart" not in agent._service_bindings
+
+
+def test_a_reensure_reporting_an_unusable_runtime_is_not_adopted(
+    tmp_path: Path,
+):
+    """A re-ensure that reports "could not be placed" is refused — and
+    the refusal says *why*, not merely "not ready"."""
+    agent = _agent_with(tmp_path)
+
+    passed, detail = agent._service_reensure_gates(
+        "chart", _unusable_runtime(),
+    )
+
+    assert passed is False
+    assert "unusable" in detail
+
+
+def test_a_vp_that_needs_an_unusable_service_is_blocked(
+    tmp_path: Path, monkeypatch,
+):
+    """A VP that needs a service the round could not place is BLOCKED.
+
+    Not FAILED: there is nowhere to send it.  The service is named by a
+    placeholder that cannot resolve, so no port is left to match on —
+    the block is by name.
+    """
+    import asyncio
+
+    agent = _agent_with(tmp_path, runtime=_unusable_runtime())
+    agent._blocked_service_ports = {3000}
+
+    # The stranger is still sitting on the declared port: the recovery
+    # probes it, finds it alive, and leaves it alone.
+    monkeypatch.setattr(
+        "service_freshness.probe_port",
+        lambda port: _probe(port, ["/usr/bin/postgres"], start_epoch=1e12),
+    )
+
+    dispatched: list = []
+
+    async def fake_run_single_vp(vp):
+        dispatched.append(vp.get("id"))
+        return {"status": "PASSED"}
+
+    monkeypatch.setattr(agent, "_run_single_vp_async", fake_run_single_vp)
+
+    plan = {
+        "verification_points": [
+            {
+                "id": "VP-001",
+                "verification_method": "code_review",
+                "target_url": "curl {{svc.chart.url}}/api",
+            }
+        ]
+    }
+    resolved = agent._resolve_service_placeholders(plan)
+
+    assert "127.0.0.1:3000" not in (
+        resolved["verification_points"][0]["target_url"]
+    ), (
+        "the declared port is the stranger's — no path may fall back to it"
+    )
+
+    executor = agent._build_verification_executor(resolved)
+
+    async def drive():
+        return [
+            await executor.sub_agent_runner(vp)
+            for vp in executor.verification_plan["vps"]
+        ]
+
+    results = asyncio.run(drive())
+
+    assert dispatched == [], dispatched
+    assert results[0]["status"] == "BLOCKED", results[0]
+    assert results[0]["evidence"].get("unusable_services") == ["chart"], (
+        "the verdict has to name the service that could not be placed — a "
+        "blocked port on its own does not say who was missing"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The acceptance command names these four (2026-10-25, repair-r1-34)
+# ---------------------------------------------------------------------------
+#
+# The four cases below are the ones this round's acceptance command
+# selects.  Each one reaches the same fact — a relocation that could
+# not place the service — through a **different door**, so no single
+# reader can be broken without one of them going red:
+#
+#   * the producer marks the runtime unusable;
+#   * the round's address table refuses the service;
+#   * no reader falls back to the declared port;
+#   * the ports the relocation tried are in the log.
+#
+# The behaviour was implemented in repair-r1-29; what was missing were
+# the cases the acceptance command names.  They reach it differently
+# from their siblings above: the producer is called **directly** (not
+# through ``ensure_services``), and the runtime that reaches the
+# consumers is the one a real failed relocation produced rather than a
+# hand-built one.
+
+
+def _failed_relocation(project, monkeypatch, ports=(38921, 38922, 38923)):
+    """The runtime a relocation that could not place the service hands back.
+
+    ``_relocate_service`` is called directly — the producer of the
+    runtime, without the ``ensure`` around it — so the contract is
+    pinned where it is written.
+    """
+    port_iter = iter(ports)
+    _stub_failed_start(monkeypatch)
+    monkeypatch.setattr(sm, "allocate_free_port", lambda: next(port_iter))
+    monkeypatch.setattr(sm, "stop_service", lambda *a, **k: {"port_free": True})
+    return sm._relocate_service(
+        _decl(), project, foreign_cmdline="/usr/bin/postgres -D /var/db",
+    )
+
+
+def test_failed_relocation_runtime_is_unusable(project, monkeypatch):
+    """The runtime a failed relocation hands back names **no** address.
+
+    ``ready=False`` says "the service did not come up".  ``unusable``
+    says something stronger: the port this record carries is the
+    **declared** one, and the declared one belongs to somebody else —
+    so it is not an address, and no reader may send a request to it.
+    """
+    runtime = _failed_relocation(project, monkeypatch)
+
+    assert runtime.origin == "failed"
+    assert runtime.ready is False
+    assert runtime.unusable is True, (
+        "a relocation that could not place the service must say so in a "
+        "field; the port it names is somebody else's"
+    )
+    assert runtime.usable is False, (
+        "the declared port is not an address — nothing may be sent to it"
+    )
+    assert runtime.port == 3000, (
+        "the runtime names the declared port, which is the stranger's"
+    )
+    assert runtime.declared_port == 3000
+    assert runtime.failure_reason, "the unusable runtime must say why"
+    assert "relocating failed" in runtime.failure_reason
+
+
+def test_effective_declarations_rejects_failed_runtime(
+    tmp_path, project, monkeypatch,
+):
+    """The round's address table has no entry for a service that failed.
+
+    The table the VPs read is built from the runtime map, and a runtime
+    that names no address must not appear in it.  The runtime here is
+    the one a real failed relocation produced — not a hand-built one —
+    so the producer and the consumer are pinned together.
+    """
+    runtime = _failed_relocation(project, monkeypatch)
+
+    agent = _agent_with(tmp_path, runtime=runtime)
+
+    effective = agent._effective_declarations()
+    assert "chart" not in effective, (
+        f"a service that could not be placed must not be in the round's "
+        f"address table; got {effective!r}"
+    )
+    assert "chart" in (agent._service_runtime_map.runtimes or {}), (
+        "the runtime map still names the service — the table refused it, "
+        "it did not simply lose it"
+    )
+
+
+def test_no_fallback_to_declared_port(tmp_path, project, monkeypatch):
+    """The declared port is never used as an address for a failed service.
+
+    The declared port is the stranger's.  Every reader that could hand
+    it out refuses it: the address table, the binder the VPs are
+    dispatched through, and the runtime's own answer to "may a request
+    be sent here?".  A fallback would aim the round at the process
+    squatting the port — which is how a round ends up graded on
+    somebody else's server.
+    """
+    runtime = _failed_relocation(project, monkeypatch)
+    agent = _agent_with(tmp_path, runtime=runtime)
+
+    assert runtime.usable is False, (
+        "the runtime's own answer must be 'not an address'"
+    )
+    assert "chart" not in agent._effective_declarations(), (
+        "the address table must not fall back to the declared port"
+    )
+    assert agent._bind_service_runtime("chart", runtime) is None, (
+        "the binder must refuse a runtime that names no address"
+    )
+    assert "chart" not in agent._service_bindings
+
+    # The binder's own refusal, on the case the ``unusable`` flag
+    # exists for: a runtime that says it is **ready** and still names
+    # no address — the port it carries is the stranger's.  (A runtime
+    # that simply did not come up is refused by the readiness check, so
+    # it says nothing about the guard.)
+    ready_but_not_ours = sm.ServiceRuntime(
+        name="chart", port=3000, declared_port=3000, pid=None,
+        start_cmd="npx next dev -p 3000", cwd=".", origin="spawned",
+        ready=True, detail="the declared port is held by somebody else",
+    )
+    ready_but_not_ours.unusable = True
+    assert agent._bind_service_runtime("chart", ready_but_not_ours) is None, (
+        "a runtime that says 'this names no address' must not be bound, "
+        "even when it says it is ready"
+    )
+
+    unusable = agent._unusable_services()
+    assert "chart" in unusable, (
+        f"the service that could not be placed must be named; got "
+        f"{unusable!r}"
+    )
+    assert unusable["chart"]["port"] == 3000, (
+        "the service must be reported against the port that is not ours"
+    )
+
+
+def test_retry_candidates_logged(project, tmp_path, monkeypatch):
+    """Every port the relocation tried is in the plan's log.
+
+    The chain that produced an address has to be reconstructible from
+    the file alone — including the candidates that did **not** work,
+    because those are the ports somebody will later ask about.  Each
+    event names the port it tried and the declared port it moved away
+    from, so the file answers "where did this port come from" on its
+    own.
+    """
+    plan_dir = tmp_path / "plan-candidates"
+    plan_dir.mkdir()
+    ports = (38921, 38922, 38923)
+
+    runtime = _failed_relocation(project, monkeypatch, ports=ports)
+    runtime_map = sm.ServiceRuntimeMap(runtimes={"chart": runtime})
+    sm.record_runtimes(
+        plan_dir, "plan-candidates", runtime_map, project_dir=project,
+    )
+
+    attempts = [
+        e for e in sm.read_address_events(plan_dir)
+        if e.get("event") == "relocate_attempt"
+    ]
+    assert [e["new_port"] for e in attempts] == list(ports), (
+        f"every candidate port must be in the log; got "
+        f"{[e.get('new_port') for e in attempts]!r}"
+    )
+    for event in attempts:
+        assert event["declared_port"] == 3000, (
+            "a candidate event must name the port it moved away from"
+        )
+        assert str(event["new_port"]) in event["reason"], (
+            f"the event must name the port it tried; got {event['reason']!r}"
+        )
+    assert list(runtime.candidate_ports) == list(ports), (
+        "the runtime's own record must carry the ports it tried"
+    )
+    for port in ports:
+        assert str(port) in runtime.failure_reason, (
+            f"the failure reason must name the candidate port {port}; got "
+            f"{runtime.failure_reason!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-25 — the data plane a service is serving
+# ---------------------------------------------------------------------------
+#
+# "The service is up" and "the service is serving the round's data" are
+# two different claims, and the round used to ask only the first one.
+#
+# The 2026-10-24 production round was graded on exactly that gap: the
+# port answered, ``/health`` said 200 ``status: ok``, and the database
+# behind it held **zero** routing rows — so every assertion that
+# followed ran against an empty table, and the round reported the
+# project as broken.
+#
+# So the readiness wait asks the second question as well, and the
+# answer is recorded on the runtime: "it came up" and "it came up
+# serving data" have to be two separately readable facts.
+
+#: A real HTTP server that answers ``/health`` and ``/health/data``.
+#:
+#: It is a *real* server on purpose: the probe has to travel the same
+#: road a VP's request travels, and a stubbed function would prove
+#: nothing about that.
+class _DataPlaneServer:
+    def __init__(
+        self, *, rows: int = 4, health_status: int = 200,
+        data_status: int = 200,
+    ):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.rows = rows
+        self.health_status = health_status
+        self.data_status = data_status
+        #: One entry per request: the path that was asked for.
+        self.requests: list = []
+        server = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):  # noqa: N802 - the handler API's own name
+                server.requests.append(self.path)
+                if self.path.split("?")[0].endswith("/health/data"):
+                    status = server.data_status
+                    body = json.dumps({
+                        "status": "ok",
+                        "plan_routing_rows": server.rows,
+                        "instance": {"boot_id": "boot-1234"},
+                    }).encode()
+                else:
+                    status = server.health_status
+                    body = b'{"status": "ok"}'
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):  # noqa: A003 - silence the log
+                pass
+
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever, daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def port(self) -> int:
+        return int(self._httpd.server_address[1])
+
+    def close(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+
+
+def _data_plane_decl(server: _DataPlaneServer) -> ServiceDeclaration:
+    """A declaration that points at *server*."""
+    return _decl(
+        name="api",
+        port=server.port,
+        start_cmd="true",
+        health_url=f"http://127.0.0.1:{server.port}/health",
+    )
+
+
+def test_the_data_plane_probe_reads_the_instance_fact_sheet():
+    """The probe answers with the instance's own fact sheet.
+
+    ``/health/data`` publishes three things: the state of the data
+    plane, how many routing rows it holds, and — in its ``instance``
+    block — which process is answering.
+    """
+    server = _DataPlaneServer(rows=4)
+    try:
+        evidence = sm.data_plane_evidence(server.port)
+    finally:
+        server.close()
+
+    assert evidence.verdict == sm.DATA_PLANE_PROVED, evidence.to_dict()
+    assert evidence.proved is True
+    assert evidence.blocked is False
+    assert evidence.plan_routing_rows == 4
+    assert evidence.boot_id == "boot-1234"
+    assert evidence.status == "ok"
+
+
+def test_an_empty_data_plane_is_not_a_proof():
+    """200 with zero rows is an answer — and it is not a good one."""
+    server = _DataPlaneServer(rows=0)
+    try:
+        evidence = sm.data_plane_evidence(server.port)
+    finally:
+        server.close()
+
+    assert evidence.verdict == sm.DATA_PLANE_EMPTY, evidence.to_dict()
+    assert evidence.plan_routing_rows == 0
+    assert evidence.blocked is True
+
+
+def test_a_service_without_a_data_plane_is_not_gated():
+    """404 — the instance does not publish a data plane at all.
+
+    A project service with no database behind it is not a service
+    serving the wrong database, so it is never gated on one.
+    """
+    server = _DataPlaneServer(data_status=404)
+    try:
+        evidence = sm.data_plane_evidence(server.port)
+    finally:
+        server.close()
+
+    assert evidence.verdict == sm.DATA_PLANE_ABSENT, evidence.to_dict()
+    assert evidence.blocked is False
+
+
+def test_a_broken_data_plane_is_not_a_proof():
+    """The endpoint exists but cannot answer: that is not usable data."""
+    server = _DataPlaneServer(data_status=503)
+    try:
+        evidence = sm.data_plane_evidence(server.port)
+    finally:
+        server.close()
+
+    assert evidence.verdict == sm.DATA_PLANE_BROKEN, evidence.to_dict()
+    assert evidence.blocked is True
+
+
+def test_readiness_needs_a_data_plane_with_routing_rows(monkeypatch):
+    """A service that is up and serving nothing is not ready.
+
+    The round has four routing rows to serve; an instance that reports
+    none is not serving them, so it must not become the round's
+    address — every assertion that followed would be graded against an
+    empty table.
+    """
+    monkeypatch.setattr(
+        "service_freshness.expected_routing_rows", lambda *a, **k: 4,
+    )
+    server = _DataPlaneServer(rows=0)
+    try:
+        ready = sm.wait_until_ready(
+            _data_plane_decl(server), timeout_seconds=2,
+        )
+    finally:
+        server.close()
+
+    assert ready is False, (
+        "a service that serves no routing rows must not be ready"
+    )
+
+
+def test_readiness_accepts_a_service_serving_routing_rows(monkeypatch):
+    """The same service, serving the round's rows, is ready."""
+    monkeypatch.setattr(
+        "service_freshness.expected_routing_rows", lambda *a, **k: 4,
+    )
+    server = _DataPlaneServer(rows=4)
+    try:
+        ready, evidence = sm.wait_until_ready_with_evidence(
+            _data_plane_decl(server), timeout_seconds=2,
+        )
+    finally:
+        server.close()
+
+    assert ready is True
+    assert evidence.verdict == sm.DATA_PLANE_PROVED, evidence.to_dict()
+    assert evidence.plan_routing_rows == 4
+
+
+def test_a_service_without_a_data_plane_is_still_ready(monkeypatch):
+    """No data plane of its own → never gated on one."""
+    monkeypatch.setattr(
+        "service_freshness.expected_routing_rows", lambda *a, **k: 4,
+    )
+    server = _DataPlaneServer(data_status=404)
+    try:
+        ready, evidence = sm.wait_until_ready_with_evidence(
+            _data_plane_decl(server), timeout_seconds=2,
+        )
+    finally:
+        server.close()
+
+    assert ready is True
+    assert evidence.verdict == sm.DATA_PLANE_ABSENT, evidence.to_dict()
+
+
+def test_the_runtime_carries_the_data_plane(monkeypatch):
+    """The round's log has to be able to say "it came up serving data".
+
+    ``services_ensured`` is written from the runtime map, so the
+    evidence has to be on the runtime: ``status``,
+    ``plan_routing_rows`` and ``boot_id`` — the three facts a reader
+    needs to tell "it came up" from "it came up serving *this* data".
+    """
+    monkeypatch.setattr(
+        "service_freshness.expected_routing_rows", lambda *a, **k: 4,
+    )
+    server = _DataPlaneServer(rows=4)
+    try:
+        runtime = sm.ServiceRuntime(
+            name="api", port=server.port, origin="spawned", ready=True,
+        )
+        sm._record_data_plane(runtime)
+    finally:
+        server.close()
+
+    assert runtime.data_plane is not None
+    assert runtime.data_plane.plan_routing_rows == 4
+    assert runtime.data_plane.boot_id == "boot-1234"
+
+    payload = sm.ServiceRuntimeMap(runtimes={"api": runtime}).to_dict()
+    recorded = payload["data_plane"]["api"]
+    assert recorded["plan_routing_rows"] == 4
+    assert recorded["boot_id"] == "boot-1234"
+    assert recorded["status"] == "ok"

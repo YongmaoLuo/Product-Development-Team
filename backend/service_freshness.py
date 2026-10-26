@@ -48,16 +48,19 @@ probe degrades to "attempt restart" rather than crashing the round.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -457,6 +460,327 @@ def _parse_ps_lstart(raw: str) -> Optional[float]:
         except ValueError:
             continue
     return None
+
+
+# ---------------------------------------------------------------------------
+# Data-plane identity (2026-10-24)
+# ---------------------------------------------------------------------------
+#
+# "Something is listening on the port" and "the thing listening is the
+# instance this round started, reading the fixture this round seeded"
+# are two different questions, and the 2026-10-24 production round was
+# graded on the first one: the port was busy, HTTP answered 200 with
+# ``status: ok``, and the answer came from a **different data plane**
+# than the one the round's assertions were about.  Every later
+# phase/plan assertion then ran against the wrong database — a false
+# pass on an empty one.
+#
+# The previous round's fix ("a dead service is re-ensured") only asked
+# whether the TCP port was alive, so it could not see this: a live
+# listener answers 200 just as happily as the right one does.
+#
+# So the round now identifies the instance by its **data plane**:
+# the port it listens on, the pid behind it, and the number of
+# ``plan_routing`` rows its ``/health/data`` reports — read through the
+# very same HTTP path an ``api_test`` VP uses, because a probe that
+# took a different route could answer a different question than the
+# VP's request does.
+
+#: The endpoint that reports the data plane's own state.
+DATA_PLANE_PROBE_PATH = "/health/data"
+
+#: How long the probe waits.  Shorter than an api_test's own timeout
+#: (30s by default): this probe runs before **every** api_test VP, so a
+#: service that never answers must not hold the round hostage.
+DATA_PLANE_PROBE_TIMEOUT_SECONDS = 5.0
+
+#: Sentinel for "the caller did not say" — ``None`` is a real answer
+#: ("there is no expected count"), so the two cannot share a value.
+_UNSET = object()
+
+
+def http_probe(
+    host: str,
+    port: int,
+    path: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = DATA_PLANE_PROBE_TIMEOUT_SECONDS,
+) -> Tuple[int, str]:
+    """One HTTP GET against a local service — **without taking its port**.
+
+    The connection is an HTTP/1.1 **keep-alive** one: the request does
+    not carry ``Connection: close``, so the *client* is the side that
+    closes, and the socket that lands in ``TIME_WAIT`` is the client's
+    (an ephemeral port of this machine).
+
+    ``urllib.request`` always asks the server to close first (it sends
+    ``Connection: close``), and a server that closes first leaves
+    **its own** socket in ``TIME_WAIT`` — bound to the service's
+    listening port.  Nothing is listening on that port any more, but
+    the port is not free: a plain ``bind()`` on it fails with
+    ``EADDRINUSE``, so a plan that starts a service there cannot, and
+    a stop that promised "the port is free" was lying.
+
+    A probe must not consume the port it probes.  That is the whole
+    reason this helper exists: the probe asks the service a question
+    over a connection the **service** did not have to tear down.
+
+    Returns ``(status_code, body)``.  A non-200 is an answer too — it
+    is not an exception, so the caller judges it.  Raises whatever the
+    transport raises when the service cannot be reached at all.
+    """
+    import http.client
+
+    conn = http.client.HTTPConnection(host, int(port), timeout=timeout)
+    try:
+        conn.request("GET", path, headers=dict(headers or {}))
+        response = conn.getresponse()
+        body = response.read().decode("utf-8", errors="replace")
+        return int(response.status), body
+    finally:
+        conn.close()
+
+
+def http_probe_url(
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = DATA_PLANE_PROBE_TIMEOUT_SECONDS,
+) -> Tuple[int, str]:
+    """One HTTP GET against a service named by its URL — keep-alive.
+
+    The same probe as :func:`http_probe`, for a caller that holds a
+    URL rather than a host and a port (a declared health URL).  The
+    URL is split, never fetched by ``urllib``: ``urllib`` asks the
+    server to close first, and that leaves the service's own port in
+    ``TIME_WAIT`` (see :func:`http_probe`).
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    host = parts.hostname or "127.0.0.1"
+    if parts.port:
+        port = int(parts.port)
+    elif parts.scheme == "https":
+        port = 443
+    else:
+        port = 80
+    path = parts.path or "/"
+    if parts.query:
+        path = f"{path}?{parts.query}"
+    return http_probe(
+        host, port, path, headers=headers, timeout=timeout,
+    )
+
+
+@dataclass
+class DataPlaneFingerprint:
+    """Who is answering on a port, and which data plane they serve.
+
+    The identity of an instance is ``(port, pid)``; the data plane it
+    serves is the number of ``plan_routing`` rows it reports.  Both
+    are needed: the pid says *who* answered, the row count says
+    *what they answered about*.
+    """
+
+    port: int
+    #: The pid behind the port, when it could be determined.
+    pid: Optional[int] = None
+    #: ``plan_routing`` rows the instance reported on ``/health/data``.
+    #: ``None`` when the instance did not answer with a count.
+    routing_rows: Optional[int] = None
+    #: How many rows the round's fixture database holds.  ``None`` when
+    #: the fixture could not be read — the row count then carries no
+    #: verdict and only the identity (port + pid) does.
+    expected_rows: Optional[int] = None
+    status: str = ""
+    error: str = ""
+
+    @property
+    def answered(self) -> bool:
+        """Did the instance answer the data-plane probe at all?"""
+        return self.routing_rows is not None
+
+    def answers_fixture(self, expected_rows: Any = _UNSET) -> bool:
+        """Is this observation the fixture's data plane?
+
+        ``expected_rows`` defaults to the count this fingerprint was
+        taken with.  A count of ``None`` means "unknown" and carries no
+        verdict — the identity alone then decides.
+        """
+        if not self.answered:
+            return False
+        expected = (
+            self.expected_rows if expected_rows is _UNSET else expected_rows
+        )
+        if expected is None:
+            return True
+        return self.routing_rows == expected
+
+    def matches(
+        self, observed: Optional["DataPlaneFingerprint"], *,
+        expected_rows: Any = _UNSET,
+    ) -> bool:
+        """Is *observed* the round's instance, still serving the fixture?
+
+        The **data plane** decides when the fixture's row count is known
+        — that is the whole point of the fingerprint, and the pid alone
+        could not catch the production round (the same process was
+        answering, with another database behind it).  The instance
+        identity (port + pid) decides when it is not.
+
+        A same-address observation from a **different** process is never
+        the round's instance, whatever it reports: something else took
+        the port over.
+        """
+        if observed is None or not observed.answered:
+            return False
+        expected = (
+            self.expected_rows if expected_rows is _UNSET else expected_rows
+        )
+        if (
+            observed.port == self.port
+            and self.pid is not None
+            and observed.pid is not None
+            and observed.pid != self.pid
+        ):
+            return False
+        if expected is not None:
+            return observed.routing_rows == expected
+        # No row count to compare: the identity decides.
+        if observed.port != self.port:
+            return False
+        return (
+            self.pid is None
+            or observed.pid is None
+            or observed.pid == self.pid
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "port": self.port,
+            "pid": self.pid,
+            "routing_rows": self.routing_rows,
+            "expected_rows": self.expected_rows,
+            "status": self.status,
+            "error": self.error,
+        }
+
+
+def _probe_headers() -> Dict[str, str]:
+    """The headers a VP's own request carries.
+
+    The request guard (:mod:`request_guard`) requires a custom header on
+    the API paths, so the probe sends it too: the probe has to travel
+    the same road the VP's request travels.
+    """
+    try:
+        from request_guard import REQUEST_HEADER, REQUEST_HEADER_VALUE
+    except Exception:  # pragma: no cover - defensive
+        return {}
+    return {REQUEST_HEADER: REQUEST_HEADER_VALUE}
+
+
+def _listener_pid(port: int) -> Optional[int]:
+    """The pid of whoever is listening on *port* (``None`` when unknown)."""
+    try:
+        probe = probe_port(port)
+    except Exception:  # noqa: BLE001 - the pid is a nicety, not a verdict
+        return None
+    pids = list(probe.pids or [])
+    return pids[0] if pids else None
+
+
+def probe_data_plane(
+    port: int,
+    *,
+    expected_rows: Optional[int] = None,
+    host: str = "127.0.0.1",
+    path: str = DATA_PLANE_PROBE_PATH,
+    timeout: float = DATA_PLANE_PROBE_TIMEOUT_SECONDS,
+    include_pid: bool = True,
+) -> DataPlaneFingerprint:
+    """Ask the service on *port* which data plane it is serving.
+
+    The request takes the **same** route an ``api_test`` VP takes:
+    over TCP to the loopback address, carrying the request guard's
+    header.  Never raises — an unreachable service, a non-JSON answer
+    or a non-200 status all come back as a fingerprint with ``error``
+    set and no ``routing_rows``.
+
+    The request travels over a **keep-alive** connection (see
+    :func:`http_probe`): a probe must not leave the service's own port
+    in ``TIME_WAIT``, or the service's port stops being bindable after
+    the service is stopped.
+    """
+    fingerprint = DataPlaneFingerprint(port=port, expected_rows=expected_rows)
+    try:
+        status_code, raw = http_probe(
+            host, port, path,
+            headers=_probe_headers(),
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 - a probe never raises
+        fingerprint.error = f"{type(exc).__name__}: {exc}"
+        return fingerprint
+    if status_code != 200:
+        fingerprint.error = f"HTTP {status_code}"
+        fingerprint.status = "http_error"
+        return fingerprint
+    try:
+        body = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001 - a probe never raises
+        fingerprint.error = f"invalid JSON: {type(exc).__name__}: {exc}"
+        return fingerprint
+    if not isinstance(body, dict):
+        fingerprint.error = "the data-plane probe did not answer with an object"
+        return fingerprint
+    fingerprint.status = str(body.get("status") or "")
+    rows = body.get("plan_routing_rows")
+    if isinstance(rows, bool) or not isinstance(rows, int):
+        fingerprint.error = "the answer carried no plan_routing_rows count"
+        return fingerprint
+    fingerprint.routing_rows = int(rows)
+    if include_pid:
+        fingerprint.pid = _listener_pid(port)
+    return fingerprint
+
+
+def expected_routing_rows(db_path: Optional[Path] = None) -> Optional[int]:
+    """How many ``plan_routing`` rows the round's fixture database holds.
+
+    The fixture is the state database the round's own service reads
+    (``PDT_STATE_DB_PATH``, else ``<repo>/.pdt/state.db``).  A service
+    reading a *different* database reports a different count — and
+    that difference is what tells the round it is talking to the wrong
+    instance.
+
+    ``None`` when the fixture cannot be read: the caller then has no
+    row-count verdict and falls back to the instance identity alone.
+    """
+    try:
+        if db_path is None:
+            from config_paths import resolve_state_db_path
+            path = resolve_state_db_path()
+        else:
+            path = Path(db_path)
+    except Exception:  # noqa: BLE001 - defensive
+        return None
+    try:
+        if not path.exists():
+            return None
+        from state_machine.db.connection import open as open_db
+        conn = open_db(path)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM plan_routing"
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - an unreadable fixture is "unknown"
+        return None
+    return int(row[0]) if row else None
 
 
 # ---------------------------------------------------------------------------

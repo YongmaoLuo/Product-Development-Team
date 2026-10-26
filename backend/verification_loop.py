@@ -25,6 +25,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 
 # Late binding into the application module: ``server`` owns the shared
 # helpers, request models and module globals, and the suite monkeypatches
@@ -1010,6 +1011,13 @@ def _mark_failed_dead(plan_id: str) -> None:
     known to be gone, so the plan's orphaned ``in_progress`` task rows
     are handed back to the scheduler too (see
     :func:`_reap_orphaned_in_progress_tasks`).
+
+    The verdict is written to the row, not only to memory.  The process
+    that notices the crash is the next one to go away, and after a
+    restart the row is all that is left: a row that carries only
+    ``exec_status='failed'`` comes back as a failure with no reason
+    (``stop_reason`` NULL), and a row that carries nothing comes back
+    as ``running`` — a crash that reads as something else entirely.
     """
     from datetime import datetime
     from state_machine.db.connection import open as open_db
@@ -1027,12 +1035,31 @@ def _mark_failed_dead(plan_id: str) -> None:
         state["status"] = "failed"
         state["stop_reason"] = "process_died_unexpectedly"
         state["ended_at"] = datetime.now().isoformat()
+        # The premise of this whole function is that the executor is
+        # gone.  A pid left in the in-memory state belongs to a dead
+        # process, and every "is this execution alive?" reader believes
+        # a pid means alive — the same ghost the row-level
+        # terminal-status rule forbids (accident B, 2026-10-23).
+        state["pid"] = None
 
     try:
         persist_conn = open_db(_server._state_db_path())
         try:
             migrate(persist_conn)
-            ExecutionRepository(persist_conn).update_status(plan_id, "failed")
+            # The whole verdict goes to the row: the status, the reason
+            # and the (now meaningless) pid.  ``update_status`` alone
+            # wrote the status and left ``stop_reason`` NULL, so the
+            # restart that follows this crash read back "failed, and
+            # nobody knows why" — the crash had lost the one field
+            # that distinguishes it from any other failure.
+            ExecutionRepository(persist_conn).update_fields(
+                plan_id,
+                exec_status="failed",
+                stop_reason="process_died_unexpectedly",
+                # The executor is gone; a pid left on a row that says
+                # ``failed`` reads as a live execution to every reader.
+                exec_pid=None,
+            )
         finally:
             persist_conn.close()
     except ExecPlanNotFoundError:
@@ -4485,6 +4512,1482 @@ def _record_verification_terminal(
     )
 
 
+# ---------------------------------------------------------------------------
+# The verification-round lease (2026-10-25)
+# ---------------------------------------------------------------------------
+#
+# One plan, one verification round.
+#
+# The 2026-10-24 acceptance round of the parked plan ran THREE
+# overlapping rounds (21:18, 21:42, 21:45).  The 21:42 round emitted no
+# ``services_ensured`` event at all and finished its nine ``api_test``
+# VPs between 21:53:05 and 21:53:21 — while the 21:45 round's own
+# ``services_ensured`` only completed at 21:54:08.  So one round's VPs
+# ran against a service that had not been brought up yet, reading a
+# fixture another round was rewriting underneath them: two rounds, two
+# views of the same plan, and no single authority over either the
+# fixture or ``state.db``.  That is why the progress view could not be
+# trusted — "the interrupted task is still ``in_progress`` and its two
+# downstream tasks are still ``pending``" is only a fact when exactly
+# one round is writing.
+#
+# The lease is that authority.  It is a FILE, not a lock inside one
+# process, because the rounds that overlap are not necessarily threads
+# of one process: two backend instances (or a backend and a CLI run)
+# can drive the same plan.
+#
+#   * the lock is created with ``O_CREAT | O_EXCL`` — the creation
+#     itself is the atomic step, so two runs racing for the same plan
+#     cannot both believe they won;
+#   * the file records the holder's ``pid``, ``started_at`` and
+#     ``heartbeat``, so a reader can tell a live holder from a corpse;
+#   * a run that cannot take the lease waits a BOUNDED number of
+#     seconds and then ends explicitly, with the reason
+#     ``round_already_running``, without dispatching a single VP;
+#   * the holder releases the lease in a ``finally``, so every exit
+#     path (passed, failed, cancelled, crash) gives the plan back;
+#   * a lock whose recorded pid is dead is STALE: it is broken (with a
+#     log line) rather than waited on, so a killed round does not lock
+#     its plan out forever.
+
+#: The lease file's name inside the plan directory.  It is part of the
+#: plan's on-disk contract: an operator who sees it knows a round owns
+#: the plan, and — after checking the pid inside it — may delete it to
+#: unblock a plan whose round died without releasing.
+_VERIFICATION_ROUND_LOCK_FILENAME = "verification_round.lock"
+
+#: How long a run waits for the lease before it gives up.  Bounded on
+#: purpose: the alternative — waiting forever — turns a lost round into
+#: a hung one, and a hung round holds the plan just as badly.
+_VERIFICATION_ROUND_LEASE_WAIT_SECONDS = 30.0
+
+#: How often the waiter re-reads the lock file while it waits.
+_VERIFICATION_ROUND_LEASE_POLL_SECONDS = 0.5
+
+#: How often the holder refreshes the recorded heartbeat.
+_VERIFICATION_ROUND_LEASE_HEARTBEAT_SECONDS = 10.0
+
+#: A lock file that carries no readable pid — what a holder killed
+#: between the ``O_EXCL`` create and the write leaves behind — is only
+#: broken once it is this old.  Before that, the holder may simply not
+#: have written its record yet.
+_VERIFICATION_ROUND_LEASE_UNREADABLE_AFTER_SECONDS = 60.0
+
+
+def _verification_round_lock_path(plan_dir: Path) -> Path:
+    """The path of the plan's verification-round lease file."""
+    return Path(plan_dir) / _VERIFICATION_ROUND_LOCK_FILENAME
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Whether ``pid`` names a process that still exists.
+
+    ``os.kill(pid, 0)`` is the cheapest question there is: it raises
+    ``ProcessLookupError`` for a pid the OS has already handed back and
+    succeeds for a live one.  ``PermissionError`` means the process
+    exists but belongs to somebody else — alive, as far as the lease is
+    concerned.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _read_verification_round_lock(path: Path) -> Optional[Dict[str, Any]]:
+    """Read the lock file, or ``None`` when it carries no usable record.
+
+    ``None`` covers three cases that mean the same thing to the caller:
+    the file is unreadable, it is not JSON, or it is JSON that is not an
+    object.  The difference between "absent" and "unusable" matters to
+    :func:`_stale_lock_reason`, which is why the caller checks the
+    file's existence separately.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _stale_lock_reason(
+    path: Path, holder: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Why the lock at ``path`` is provably stale — ``None`` if it is not.
+
+    Two ways a lock can be stale:
+
+    * the holder's pid is gone.  That process died without running its
+      ``finally`` — killed, crashed, or the machine went down — and
+      nothing else will ever release the lock;
+    * the file carries no pid at all and is old enough that nobody can
+      still be writing it.  That is what a holder killed between the
+      ``O_EXCL`` create and the write leaves behind.
+
+    A lock whose pid is alive is NOT stale, even if the pid was reused
+    by an unrelated process: the lease's contract is "a live process
+    holds this", and breaking a live holder's lock is the one failure
+    this mechanism must not have.
+    """
+    if holder is None:
+        try:
+            age = time.time() - path.stat().st_mtime
+        except OSError:
+            return None
+        if age >= _VERIFICATION_ROUND_LEASE_UNREADABLE_AFTER_SECONDS:
+            return "unreadable_lock_older_than_%ds" % int(
+                _VERIFICATION_ROUND_LEASE_UNREADABLE_AFTER_SECONDS,
+            )
+        return None
+    raw_pid = holder.get("pid")
+    try:
+        holder_pid = int(raw_pid)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if holder_pid <= 0:
+        return None
+    if not _pid_is_alive(holder_pid):
+        return "holder_pid_%d_is_dead" % holder_pid
+    return None
+
+
+class _VerificationRoundLease:
+    """The exclusive, plan-level lease ONE verification round holds.
+
+    The object is the holder's side of the contract:
+
+    * :meth:`heartbeat` refreshes the recorded liveness stamp;
+    * :meth:`release` gives the plan back — and it gives it back ONLY
+      if this object still owns the file, so a holder that was already
+      displaced never deletes the new holder's lock.
+    """
+
+    __slots__ = (
+        "plan_dir", "path", "token", "pid", "started_at",
+        "_released", "_stop", "_thread",
+    )
+
+    def __init__(
+        self,
+        plan_dir: Path,
+        path: Path,
+        token: str,
+        pid: int,
+        started_at: str,
+    ) -> None:
+        self.plan_dir = Path(plan_dir)
+        self.path = Path(path)
+        self.token = token
+        self.pid = pid
+        self.started_at = started_at
+        self._released = False
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # -- the record on disk --------------------------------------------
+    def _record(self, heartbeat: str) -> Dict[str, Any]:
+        return {
+            "plan_id": self.plan_dir.name,
+            "pid": self.pid,
+            "started_at": self.started_at,
+            "heartbeat": heartbeat,
+            "token": self.token,
+        }
+
+    def holder(self) -> Dict[str, Any]:
+        """What the lock file says about the holder, right now."""
+        return _read_verification_round_lock(self.path) or {}
+
+    def heartbeat(self) -> bool:
+        """Refresh the recorded heartbeat.  ``False`` if the lease is gone.
+
+        The write is in place and opens the file WITHOUT ``O_CREAT``:
+        a holder that was already released must not be able to
+        resurrect the lock it gave back.
+        """
+        if self._released:
+            return False
+        current = _read_verification_round_lock(self.path)
+        if not current or current.get("token") != self.token:
+            return False
+        record = self._record(datetime.now().isoformat())
+        try:
+            fd = os.open(str(self.path), os.O_WRONLY | os.O_TRUNC)
+        except OSError:
+            return False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(record, fh)
+        except OSError:
+            return False
+        return True
+
+    def start_heartbeat(
+        self, interval: float = _VERIFICATION_ROUND_LEASE_HEARTBEAT_SECONDS,
+    ) -> None:
+        """Refresh the heartbeat in the background while the round runs."""
+        if self._thread is not None:
+            return
+
+        def _beat() -> None:
+            while not self._stop.wait(max(0.5, float(interval))):
+                if not self.heartbeat():
+                    return
+
+        thread = threading.Thread(
+            target=_beat,
+            name=f"verification-round-lease-{self.plan_dir.name}",
+            daemon=True,
+        )
+        self._thread = thread
+        thread.start()
+
+    def release(self) -> None:
+        """Give the plan back to the next round.
+
+        The heartbeat thread is stopped and joined FIRST: a heartbeat
+        that ran after the unlink could recreate the file it just gave
+        back, and a resurrected lock is a lock nobody owns.
+        """
+        self._released = True
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        current = _read_verification_round_lock(self.path)
+        if not current or current.get("token") != self.token:
+            # Somebody else's lock (or ours is already gone) — leave it.
+            return
+        try:
+            os.unlink(str(self.path))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _server.logger.warning(
+                "[verification_round_lease] could not release %s: %s",
+                self.path, exc,
+            )
+
+
+def _acquire_verification_round_lease(
+    plan_dir: Path,
+    *,
+    wait_seconds: float = _VERIFICATION_ROUND_LEASE_WAIT_SECONDS,
+    poll_seconds: float = _VERIFICATION_ROUND_LEASE_POLL_SECONDS,
+    pid: Optional[int] = None,
+) -> Tuple[Optional["_VerificationRoundLease"], Optional[Dict[str, Any]]]:
+    """Take the plan's verification-round lease, or say why it could not.
+
+    Returns ``(lease, conflict)``:
+
+    * ``(lease, None)`` — the lease is held.  The caller owns it and
+      MUST :meth:`_VerificationRoundLease.release` it;
+    * ``(None, None)`` — the lease file could not be created at all
+      (unwritable plan directory).  The round proceeds WITHOUT
+      exclusivity: the lease guards against overlapping rounds, and a
+      plan directory that cannot hold a lock file is a problem the
+      round hits anyway.  The failure is logged at ERROR level;
+    * ``(None, conflict)`` — another live round holds the plan.
+      ``conflict["reason"]`` is ``"round_already_running"`` and the
+      conflict carries the holder's pid / start time / heartbeat.
+
+    The wait is bounded: a run that cannot take the lease waits at
+    most ``wait_seconds`` and then returns the conflict.  It never
+    waits forever — a lost round must not become a hung one.
+    """
+    plan_dir = Path(plan_dir)
+    path = _verification_round_lock_path(plan_dir)
+    owner_pid = os.getpid() if pid is None else int(pid)
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+
+    while True:
+        token = uuid.uuid4().hex
+        started_at = datetime.now().isoformat()
+        record = {
+            "plan_id": plan_dir.name,
+            "pid": owner_pid,
+            "started_at": started_at,
+            "heartbeat": started_at,
+            "token": token,
+        }
+        try:
+            fd = os.open(
+                str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644,
+            )
+        except FileExistsError:
+            holder = _read_verification_round_lock(path)
+            stale_reason = _stale_lock_reason(path, holder)
+            if stale_reason:
+                _server.logger.warning(
+                    "[verification_round_lease] breaking stale lock "
+                    "plan=%s path=%s reason=%s",
+                    plan_dir.name, path, stale_reason,
+                )
+                try:
+                    os.unlink(str(path))
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                holder = holder or {}
+                return None, {
+                    "reason": "round_already_running",
+                    "plan_id": plan_dir.name,
+                    "path": str(path),
+                    "holder": holder,
+                    "holder_pid": holder.get("pid"),
+                    "started_at": holder.get("started_at"),
+                    "heartbeat": holder.get("heartbeat"),
+                }
+            time.sleep(max(0.01, float(poll_seconds)))
+            continue
+        except OSError as exc:
+            _server.logger.error(
+                "[verification_round_lease] could not create %s: %s — the "
+                "round proceeds without exclusivity", path, exc,
+            )
+            return None, None
+        else:
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(record, fh)
+            except OSError as exc:
+                _server.logger.error(
+                    "[verification_round_lease] could not write %s: %s — "
+                    "the round proceeds without exclusivity", path, exc,
+                )
+                try:
+                    os.unlink(str(path))
+                except OSError:
+                    pass
+                return None, None
+            lease = _VerificationRoundLease(
+                plan_dir, path=path, token=token, pid=owner_pid,
+                started_at=started_at,
+            )
+            lease.start_heartbeat()
+            return lease, None
+
+
+def _record_round_lease_refusal(
+    plan_id: str, plan_dir: Path, conflict: Dict[str, Any],
+) -> None:
+    """Make a refused round visible WITHOUT touching the plan's verdict.
+
+    The run that lost the race must not write a terminal verification
+    state: the round that owns the plan is still running, and a
+    terminal write from the loser would park the routing row underneath
+    the winner — the very cross-round interference this lease exists to
+    stop.  So the refusal is recorded where it cannot hurt: the server
+    log and the plan's own ``execution.log`` (the same trail the
+    ``services_ensured`` event is written to).
+    """
+    reason = str((conflict or {}).get("reason") or "round_already_running")
+    holder_pid = (conflict or {}).get("holder_pid")
+    _server.logger.warning(
+        "[verification_round_lease] %s plan=%s holder_pid=%s — this run "
+        "dispatched no VP", reason, plan_id, holder_pid,
+    )
+    try:
+        plan_logger = _verification_event_logger(plan_dir)
+        if plan_logger is not None:
+            plan_logger.warning(
+                "verification_round_lease",
+                f"{reason} — this run dispatched no VP",
+                data={
+                    "reason": reason,
+                    "holder_pid": holder_pid,
+                    "path": (conflict or {}).get("path"),
+                },
+            )
+    except Exception:  # noqa: BLE001 — logging must never break a round
+        pass
+
+
+def _record_round_instance_handover(
+    orch: Any, plan_id: str, plan_dir: Path,
+) -> None:
+    """Write the round's own handover into the plan's log.
+
+    A round's address can be taken over while the round is running.
+    The round knows it — it looked at the instance on both sides of
+    every dispatch — but a reader who only has the round's verdict
+    cannot, and the verdict is what the operator reads.
+
+    So the round writes the two snapshots down: the instance that
+    served it at the start, and the one serving it now.  The event
+    lands in the plan's own ``execution.log``, next to the events the
+    operator already reads for this plan, because a fact that only
+    lives in the round's internals is a fact the operator cannot check.
+
+    Best-effort: a round that cannot write its record still ran.
+    """
+    agent = getattr(orch, "verification_agent", None)
+    handover = None
+    getter = getattr(agent, "round_instance_handover", None)
+    if getter is not None:
+        try:
+            handover = getter()
+        except Exception:  # noqa: BLE001 — a record must never break a round
+            handover = None
+    if not isinstance(handover, dict):
+        return
+    before = handover.get("before")
+    after = handover.get("after")
+    if before is None and after is None:
+        # The round never reached a service that identifies itself, so
+        # there is no instance to have changed hands and nothing to say.
+        # "Nobody said" is an answer, and it is not the same as
+        # "somebody else said".
+        return
+    try:
+        # The event name is the agent's own, so the two cannot drift.
+        # The import is late: ``verification_agent`` is a heavy module
+        # and this module is imported by the server's own wiring.
+        from verification_agent import ROUND_INSTANCE_HANDOVER_EVENT
+
+        plan_logger = _verification_event_logger(plan_dir)
+        if plan_logger is not None:
+            plan_logger.warning(
+                ROUND_INSTANCE_HANDOVER_EVENT,
+                "The instance serving this round's address at the start, "
+                "and the one serving it now.",
+                data={
+                    "before": before,
+                    "after": after,
+                    "round": getattr(agent, "_current_round", None),
+                },
+            )
+    except Exception:  # noqa: BLE001 — logging must never break a round
+        pass
+
+
+def _dispatch_verification_round(
+    plan_id: str,
+    plan_dir: Path,
+    orch: Any,
+    round_number: int,
+    *,
+    resume: bool,
+    force: bool = False,
+    wait_seconds: float = _VERIFICATION_ROUND_LEASE_WAIT_SECONDS,
+) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+    """Run ONE verification round while holding the plan's round lease.
+
+    Returns ``(report, conflict)``:
+
+    * ``(report, None)`` — the round was dispatched; ``report`` is the
+      orchestrator's round report;
+    * ``(None, conflict)`` — another live round owns this plan.
+      ``conflict["reason"]`` is ``"round_already_running"`` and **no VP
+      was dispatched**: the orchestrator was never called.
+
+    The lease is taken around the dispatch only — the VPs run inside
+    ``start_verification_cycle`` — and it is given back in a
+    ``finally``, so a round that raises still returns the plan to the
+    next one.
+
+    ``wait_seconds`` is how long the run waits for the lease before it
+    gives up.  It is a parameter so a caller (and a test) can ask for
+    the refusal without waiting out the production window.
+    """
+    lease, conflict = _acquire_verification_round_lease(
+        plan_dir, wait_seconds=wait_seconds,
+    )
+    if conflict is not None:
+        return None, conflict
+    try:
+        # 2026-10-25 (repair-r1-33): the round gets its service
+        # preflight **before** the cycle starts.  The agent calls it
+        # right after it has brought the services up, and before the
+        # first verification point is dispatched — so a round whose
+        # services are not there spends no verification point on a
+        # connection refusal.
+        _install_round_service_preflight(orch, plan_id, plan_dir)
+        report = orch.start_verification_cycle(
+            round_number=round_number,
+            force=force,
+            resume=resume,
+        )
+    finally:
+        if lease is not None:
+            lease.release()
+    # 2026-10-25 (repair-r1-33): a round that was blocked before it
+    # dispatched anything is written down **here** — this is the one
+    # place every dispatch goes through, so the refusal is recorded
+    # exactly once, whichever caller asked for the round.  A record
+    # only one caller wrote would leave the other without one.
+    _blocked = _service_preflight_blocked_report(report)
+    if _blocked is not None:
+        _record_service_preflight_blocked(plan_id, plan_dir, _blocked)
+    # 2026-10-26: the round's own handover — the instance that served
+    # its address at the start, and the one serving it now.  It is
+    # written here because this is the one place every dispatch goes
+    # through, so the record is made exactly once.
+    _record_round_instance_handover(orch, plan_id, plan_dir)
+    return report, None
+
+
+# ---------------------------------------------------------------------------
+# The workflow-level round lease (VP-008, 2026-10-25)
+# ---------------------------------------------------------------------------
+#
+# The lease above guards ONE dispatch — the window in which
+# ``start_verification_cycle`` runs the VPs.  It does not guard the
+# WORKFLOW: between two dispatches the loop runs its judgment phase,
+# writes the round's verdict and may chain into a repair, and a second
+# round of the same plan can take the dispatch lease inside that gap.
+#
+# On 2026-10-24 that is exactly what happened.  Three rounds of one
+# plan overlapped (21:18, 21:42, 21:45); the 21:42 round emitted no
+# ``services_ensured`` event at all and finished its nine ``api_test``
+# VPs between 21:53:05 and 21:53:21, while the 21:45 round's own
+# ``services_ensured`` only completed at 21:54:08.  One round's VPs
+# therefore ran against a service that was not up yet, reading a
+# fixture another round was rewriting underneath them: two rounds, two
+# views of the same plan, and no single authority over either the
+# fixture or ``state.db``.
+#
+# The workflow lease is that authority.  It is taken at the ENTRY of
+# ``_run_auto_verification_loop`` — before the round's preflight,
+# before the services are ensured, before a single VP is dispatched —
+# and it is given back when the workflow ends.
+#
+# Its ``round_token`` is the round's SERVICE OWNER token: the same
+# token the ledger stamps on the services the round starts and the
+# same token the round's pin (VP-004) carries.  One round, one token,
+# one authority over the services it uses.
+
+#: The workflow lease's file inside the plan directory.  It is hidden
+#: (dot-prefixed) because it is machinery, not plan content: an
+#: operator browsing the plan directory should see the plan's own
+#: artefacts, not the lease.  It is DISTINCT from the dispatch-level
+#: lock above (``verification_round.lock``): that one guards a single
+#: ``start_verification_cycle``, this one guards the whole workflow.
+_VERIFICATION_WORKFLOW_LEASE_FILENAME = ".verification_round.lock"
+
+#: How long a run waits for the lease before it gives up.  Zero by
+#: default: the loser of the race must not hold its caller.  The plan
+#: is being verified by somebody else; this run's job is to say so and
+#: end, not to stand in front of the plan for half a minute.
+_VERIFICATION_WORKFLOW_LEASE_WAIT_SECONDS = 0.0
+
+#: How often the waiter re-reads the lease file while it waits.
+_VERIFICATION_WORKFLOW_LEASE_POLL_SECONDS = 0.25
+
+#: How often the holder refreshes the recorded heartbeat.
+_VERIFICATION_WORKFLOW_LEASE_HEARTBEAT_SECONDS = 10.0
+
+#: A lease whose heartbeat is older than this is treated as dead: the
+#: holder stopped saying it was alive, so the round behind it is gone
+#: (wedged, killed, its thread died) and the next round may take the
+#: plan over.  The margin over the heartbeat interval is wide on
+#: purpose — a false takeover puts two rounds back on one plan, which
+#: is the failure this lease exists to prevent.
+_VERIFICATION_WORKFLOW_LEASE_STALE_SECONDS = 120.0
+
+#: How many stale leases one run may break before it gives up and
+#: proceeds without exclusivity.  A lease that keeps looking stale and
+#: keeps surviving the unlink is being written by somebody else; the
+#: run must not spin on it.
+_VERIFICATION_WORKFLOW_LEASE_MAX_STALE_BREAKS = 3
+
+#: The event the refused round writes: it lost the race.
+ROUND_LEASE_DENIED_EVENT = "round_lease_denied"
+
+#: The event that marks the round BLOCKED because of the conflict.
+#: The same name the verification agent uses for an environment-blocked
+#: round: the question a log reader asks is "was this round about the
+#: product or about the plumbing", and the answer is a property of the
+#: round, not of one verification point.
+ROUND_BLOCKED_EVENT = "verification_round_blocked"
+
+#: Why the round was blocked.
+ROUND_CONFLICT_ERROR_KIND = "round_conflict"
+
+
+def _verification_workflow_lease_path(plan_dir: Path) -> Path:
+    """The path of the plan's workflow-level round lease."""
+    return Path(plan_dir) / _VERIFICATION_WORKFLOW_LEASE_FILENAME
+
+
+def _read_verification_workflow_lease(
+    path: Path,
+) -> Optional[Dict[str, Any]]:
+    """Read the workflow lease, or ``None`` when it carries no record.
+
+    ``None`` covers three cases that mean the same thing to the caller:
+    the file is unreadable, it is not JSON, or it is JSON that is not
+    an object.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _workflow_lease_heartbeat_age(
+    holder: Optional[Dict[str, Any]], path: Path,
+) -> Optional[float]:
+    """How long ago the holder last said it was alive, in seconds.
+
+    The recorded heartbeat is the answer; the file's mtime is the
+    fallback for a lease whose record is unreadable — a holder killed
+    between the ``O_EXCL`` create and the write leaves exactly that.
+    """
+    if holder:
+        raw = holder.get("heartbeat_at")
+        if isinstance(raw, str) and raw:
+            try:
+                moment = datetime.fromisoformat(raw)
+            except ValueError:
+                moment = None
+            if moment is not None:
+                return max(0.0, (datetime.now() - moment).total_seconds())
+    try:
+        return max(0.0, time.time() - path.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _workflow_lease_stale_reason(
+    path: Path, holder: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Why the workflow lease at ``path`` is provably stale — ``None`` if not.
+
+    Two ways a lease can be stale:
+
+    * the holder's pid is gone — the process died without running its
+      ``finally``, and nothing else will ever release the lease;
+    * the heartbeat went stale — the holder stopped refreshing it, so
+      the round behind it is wedged or dead.
+
+    A lease whose pid is alive AND whose heartbeat is fresh is NOT
+    stale, even if the pid was reused by an unrelated process: the
+    lease's contract is "a live round holds this", and displacing a
+    live holder is the one failure this mechanism must not have.
+    """
+    if holder is None:
+        age = _workflow_lease_heartbeat_age(None, path)
+        if (
+            age is not None
+            and age >= _VERIFICATION_WORKFLOW_LEASE_STALE_SECONDS
+        ):
+            return "unreadable_lease_older_than_%ds" % int(
+                _VERIFICATION_WORKFLOW_LEASE_STALE_SECONDS,
+            )
+        return None
+    raw_pid = holder.get("pid")
+    try:
+        holder_pid = int(raw_pid)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        holder_pid = 0
+    if holder_pid > 0 and not _pid_is_alive(holder_pid):
+        return "holder_pid_%d_is_dead" % holder_pid
+    age = _workflow_lease_heartbeat_age(holder, path)
+    if age is not None and age >= _VERIFICATION_WORKFLOW_LEASE_STALE_SECONDS:
+        return "heartbeat_stale_for_%ds" % int(age)
+    return None
+
+
+class _VerificationWorkflowLease:
+    """The exclusive, plan-level lease ONE verification workflow holds.
+
+    The holder's side of the contract:
+
+    * :meth:`heartbeat` refreshes the recorded liveness stamp;
+    * :meth:`release` gives the plan back — and gives it back ONLY if
+      this object still owns the file, so a holder that was already
+      displaced never deletes the new holder's lease.
+    """
+
+    __slots__ = (
+        "plan_dir", "path", "round_token", "run_id", "pid", "started_at",
+        "_released", "_stop", "_thread",
+    )
+
+    def __init__(
+        self,
+        plan_dir: Path,
+        path: Path,
+        round_token: str,
+        run_id: str,
+        pid: int,
+        started_at: str,
+    ) -> None:
+        self.plan_dir = Path(plan_dir)
+        self.path = Path(path)
+        self.round_token = round_token
+        self.run_id = run_id
+        self.pid = pid
+        self.started_at = started_at
+        self._released = False
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # -- the record on disk --------------------------------------------
+    def _record(self, heartbeat_at: str) -> Dict[str, Any]:
+        return {
+            "round_token": self.round_token,
+            "run_id": self.run_id,
+            "pid": self.pid,
+            "started_at": self.started_at,
+            "heartbeat_at": heartbeat_at,
+        }
+
+    def holder(self) -> Dict[str, Any]:
+        """What the lease file says about the holder, right now."""
+        return _read_verification_workflow_lease(self.path) or {}
+
+    def heartbeat(self) -> bool:
+        """Refresh the recorded heartbeat.  ``False`` if the lease is gone.
+
+        The write opens the file WITHOUT ``O_CREAT``: a holder that
+        was already released must not be able to resurrect the lease it
+        gave back.
+        """
+        if self._released:
+            return False
+        current = _read_verification_workflow_lease(self.path)
+        if not current or current.get("round_token") != self.round_token:
+            return False
+        record = self._record(datetime.now().isoformat())
+        try:
+            fd = os.open(str(self.path), os.O_WRONLY | os.O_TRUNC)
+        except OSError:
+            return False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(record, fh)
+        except OSError:
+            return False
+        return True
+
+    def start_heartbeat(
+        self, interval: float = _VERIFICATION_WORKFLOW_LEASE_HEARTBEAT_SECONDS,
+    ) -> None:
+        """Refresh the heartbeat in the background while the round runs."""
+        if self._thread is not None:
+            return
+
+        def _beat() -> None:
+            while not self._stop.wait(max(0.5, float(interval))):
+                if not self.heartbeat():
+                    return
+
+        thread = threading.Thread(
+            target=_beat,
+            name=f"verification-workflow-lease-{self.plan_dir.name}",
+            daemon=True,
+        )
+        self._thread = thread
+        thread.start()
+
+    def release(self) -> None:
+        """Give the plan back to the next round.
+
+        The heartbeat thread is stopped and joined FIRST: a heartbeat
+        that ran after the unlink could recreate the file it just gave
+        back, and a resurrected lease is a lease nobody owns.
+        """
+        self._released = True
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        current = _read_verification_workflow_lease(self.path)
+        if not current or current.get("round_token") != self.round_token:
+            # Somebody else's lease (or ours is already gone) — leave it.
+            return
+        try:
+            os.unlink(str(self.path))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _server.logger.warning(
+                "[verification_workflow_lease] could not release %s: %s",
+                self.path, exc,
+            )
+
+
+def _acquire_verification_workflow_lease(
+    plan_dir: Path,
+    *,
+    round_token: str = "",
+    run_id: str = "",
+    wait_seconds: float = _VERIFICATION_WORKFLOW_LEASE_WAIT_SECONDS,
+    poll_seconds: float = _VERIFICATION_WORKFLOW_LEASE_POLL_SECONDS,
+    pid: Optional[int] = None,
+) -> Tuple[Optional["_VerificationWorkflowLease"], Optional[Dict[str, Any]]]:
+    """Take the plan's workflow-level round lease, or say why it could not.
+
+    Returns ``(lease, conflict)``:
+
+    * ``(lease, None)`` — the lease is held.  The caller owns it and
+      MUST :meth:`_VerificationWorkflowLease.release` it;
+    * ``(None, None)`` — the lease file could not be created at all
+      (an unwritable plan directory).  The workflow proceeds WITHOUT
+      exclusivity: the lease guards against overlapping rounds, and a
+      plan directory that cannot hold a lease file is a problem the
+      round hits anyway.  The failure is logged at ERROR level;
+    * ``(None, conflict)`` — another live round holds the plan.
+      ``conflict["reason"]`` is ``"round_conflict"`` and the conflict
+      carries the holder's record.
+
+    The wait is bounded: a run that cannot take the lease waits at
+    most ``wait_seconds`` and then returns the conflict.  It never
+    waits forever — a lost round must not become a hung one.
+    """
+    plan_dir = Path(plan_dir)
+    path = _verification_workflow_lease_path(plan_dir)
+    owner_pid = os.getpid() if pid is None else int(pid)
+    token = str(
+        round_token or f"round-{owner_pid}-{uuid.uuid4().hex[:12]}",
+    )
+    run = str(run_id or plan_dir.name)
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+    stale_breaks = 0
+
+    while True:
+        started_at = datetime.now().isoformat()
+        record = {
+            "round_token": token,
+            "run_id": run,
+            "pid": owner_pid,
+            "started_at": started_at,
+            "heartbeat_at": started_at,
+        }
+        try:
+            fd = os.open(
+                str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644,
+            )
+        except FileExistsError:
+            holder = _read_verification_workflow_lease(path)
+            stale_reason = _workflow_lease_stale_reason(path, holder)
+            if stale_reason:
+                stale_breaks += 1
+                _server.logger.warning(
+                    "[verification_workflow_lease] breaking stale lease "
+                    "plan=%s path=%s reason=%s",
+                    plan_dir.name, path, stale_reason,
+                )
+                if stale_breaks > _VERIFICATION_WORKFLOW_LEASE_MAX_STALE_BREAKS:
+                    _server.logger.error(
+                        "[verification_workflow_lease] could not take %s — "
+                        "the workflow proceeds without exclusivity", path,
+                    )
+                    return None, None
+                try:
+                    os.unlink(str(path))
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                held = holder or {}
+                return None, {
+                    "reason": ROUND_CONFLICT_ERROR_KIND,
+                    "plan_id": plan_dir.name,
+                    "path": str(path),
+                    "holder": held,
+                    "holder_pid": held.get("pid"),
+                    "holder_round_token": held.get("round_token"),
+                    "holder_run_id": held.get("run_id"),
+                    "holder_started_at": held.get("started_at"),
+                    "holder_heartbeat_at": held.get("heartbeat_at"),
+                }
+            time.sleep(max(0.01, float(poll_seconds)))
+            continue
+        except OSError as exc:
+            _server.logger.error(
+                "[verification_workflow_lease] could not create %s: %s — "
+                "the workflow proceeds without exclusivity", path, exc,
+            )
+            return None, None
+        else:
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(record, fh)
+            except OSError as exc:
+                _server.logger.error(
+                    "[verification_workflow_lease] could not write %s: %s — "
+                    "the workflow proceeds without exclusivity", path, exc,
+                )
+                try:
+                    os.unlink(str(path))
+                except OSError:
+                    pass
+                return None, None
+            lease = _VerificationWorkflowLease(
+                plan_dir, path=path, round_token=token, run_id=run,
+                pid=owner_pid, started_at=started_at,
+            )
+            lease.start_heartbeat()
+            return lease, None
+
+
+def _record_round_lease_denied(
+    plan_id: str, plan_dir: Path, conflict: Dict[str, Any],
+) -> None:
+    """Write the ``round_lease_denied`` event: this run lost the race.
+
+    The event names the holder, because "somebody else is verifying
+    this plan" and "the plan is broken" are different problems and an
+    operator has to be able to tell them apart.
+    """
+    reason = str((conflict or {}).get("reason") or ROUND_CONFLICT_ERROR_KIND)
+    holder = (conflict or {}).get("holder") or {}
+    _server.logger.warning(
+        "[verification_workflow_lease] %s plan=%s holder_pid=%s — this run "
+        "dispatched no VP", reason, plan_id,
+        (conflict or {}).get("holder_pid"),
+    )
+    try:
+        plan_logger = _verification_event_logger(plan_dir)
+        if plan_logger is not None:
+            plan_logger.warning(
+                ROUND_LEASE_DENIED_EVENT,
+                f"{reason} — another verification round owns this plan; "
+                f"this run dispatched no VP",
+                data={
+                    "reason": reason,
+                    "plan_id": plan_id,
+                    "holder": holder,
+                    "holder_pid": (conflict or {}).get("holder_pid"),
+                    "holder_round_token": (conflict or {}).get(
+                        "holder_round_token",
+                    ),
+                    "path": (conflict or {}).get("path"),
+                },
+            )
+    except Exception:  # noqa: BLE001 — logging must never break a round
+        pass
+
+
+def _mark_round_blocked_by_round_conflict(
+    plan_id: str, plan_dir: Path, conflict: Dict[str, Any],
+) -> None:
+    """Mark the round BLOCKED(round_conflict).
+
+    The round that lost the race measured NOTHING: it ensured no
+    service, seeded no fixture and dispatched no VP.  So the round is
+    blocked, not failed — there is no verdict to repair against, and a
+    failed verdict would send the repair chain after a product that was
+    never looked at.
+
+    The mark goes into the plan's own execution log, next to the
+    ``round_lease_denied`` event.  It does NOT go into the shared
+    in-memory verification state: the round that owns the plan is
+    still running, and a loser that overwrote that state would park
+    the plan's routing row underneath the winner — the very cross-round
+    interference this lease exists to stop.
+    """
+    holder = (conflict or {}).get("holder") or {}
+    reason = (
+        "another verification round owns this plan "
+        f"(holder pid {(conflict or {}).get('holder_pid')}, "
+        f"round token {(conflict or {}).get('holder_round_token')})"
+    )
+    try:
+        plan_logger = _verification_event_logger(plan_dir)
+        if plan_logger is not None:
+            plan_logger.warning(
+                ROUND_BLOCKED_EVENT,
+                f"{ROUND_CONFLICT_ERROR_KIND}: {reason}",
+                data={
+                    "plan_id": plan_id,
+                    "status": "BLOCKED",
+                    "error_kind": ROUND_CONFLICT_ERROR_KIND,
+                    "reason_code": ROUND_CONFLICT_ERROR_KIND,
+                    "reason": reason,
+                    "holder": holder,
+                },
+            )
+    except Exception:  # noqa: BLE001 — logging must never break a round
+        pass
+
+
+# ---------------------------------------------------------------------------
+# The round's service preflight (2026-10-25, repair-r1-33)
+# ---------------------------------------------------------------------------
+#
+# A round whose services are not there does not fail fast: it spends one
+# verification point per service the plan names, and every one of them is
+# graded on a connection refusal.  The refusal reads as "the project
+# answered wrong", the round reports FAILED verdicts, and the repair
+# chain goes after a product nobody ever looked at.
+#
+# So the round asks **before** it dispatches anything whether the
+# services it is about to use are actually there.  The question belongs
+# here (the loop owns the round); the facts belong to the verification
+# agent (it owns the services, their addresses and the identity each
+# one is expected to answer with).  The two meet through a hook the
+# dispatch installs and the agent calls.
+#
+# The gate is closed by default: a service that cannot be shown to be
+# usable blocks the round.  A round that is blocked has measured
+# nothing, so it reports no verdict — a FAILED verdict would be a
+# statement about a product that was never asked.
+
+#: The event the blocked round writes: the round's services were not
+#: usable, so the round dispatched nothing.
+PREFLIGHT_FAILED_EVENT = "preflight_failed"
+
+#: Why the round was blocked.
+SERVICE_PREFLIGHT_ERROR_KIND = "service_preflight_failed"
+
+
+def _install_round_service_preflight(
+    orch: Any, plan_id: str, plan_dir: Path,
+) -> bool:
+    """Give the round its service preflight.
+
+    The agent owns the round's services; the loop owns the question
+    "may this round dispatch its verification points at all?".  The
+    agent calls the hook right after it has brought the services up,
+    and before the first verification point is dispatched.
+
+    Returns ``True`` when the hook was installed.  A round whose
+    orchestrator carries no agent runs without a preflight: the gate
+    is a safety net, not a prerequisite, and a legacy path must not
+    stop verifying because of it.
+    """
+    agent = getattr(orch, "verification_agent", None)
+    setter = getattr(agent, "set_round_service_preflight", None)
+    if setter is None:
+        return False
+    try:
+        setter(lambda: _run_service_preflight(agent, plan_id, plan_dir))
+    except Exception:  # noqa: BLE001 — a round without a gate still runs
+        return False
+    return True
+
+
+def _run_service_preflight(
+    agent: Any, plan_id: str, plan_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    """Ask whether the round's services may be used at all.
+
+    Every service the round is bound to is looked at three times over:
+
+      1. a TCP connection to the port — is anything serving there;
+      2. the health URL, asked **with the request guard's header**, so
+         the probe travels the same road a verification point's request
+         travels;
+      3. the ``instance`` block the service publishes about itself,
+         compared with the identity the round recorded when it started
+         it — is the thing answering the round's own instance.
+
+    A service that fails any of the three is re-ensured **once** and
+    looked at again: a service that died after the round started it
+    can come back.  A service that is still not there after that ends
+    the round — the return value is the failure record the round is
+    blocked with, naming the service, the port, the process and the
+    reason.
+    """
+    try:
+        targets = agent.service_preflight_targets()
+    except Exception as exc:  # noqa: BLE001 — a round that cannot read
+        # its own services cannot establish that they are usable.
+        return {
+            "service": "",
+            "port": 0,
+            "pid": None,
+            "error_kind": "preflight_error",
+            "detail": (
+                "the round could not read its own services: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }
+
+    for target in targets:
+        failure = _probe_service_for_preflight(agent, target)
+        if failure is None:
+            continue
+        if not failure.pop("start_attempted", False):
+            # The service was reachable but not usable — the round's
+            # one re-ensure is spent here.  When the **port** was dead,
+            # the shared precondition has already spent it: it is the
+            # one that brings a service back, and it asked the same
+            # question this gate asks.
+            outcome = _reensure_preflight_service(agent, target)
+            if not outcome.get("restored"):
+                failure["detail"] = (
+                    f"{failure['detail']}; the re-ensure did not bring the "
+                    f"service back ({outcome.get('detail') or 'no detail'})"
+                )
+                return failure
+            # The service may have **moved**: a re-ensure that could not
+            # place the service on its old port puts it somewhere else, so
+            # the round asks the agent again where the service is.
+            try:
+                fresh = agent.service_preflight_targets()
+            except Exception as exc:  # noqa: BLE001 — defensive
+                fresh = []
+                failure["detail"] = (
+                    f"{failure['detail']}; the round could not re-read its "
+                    f"services after the re-ensure: {exc}"
+                )
+            moved = next(
+                (
+                    t for t in fresh
+                    if str(t.get("service")) == str(target.get("service"))
+                ),
+                None,
+            )
+            if moved is not None:
+                failure = _probe_service_for_preflight(agent, moved)
+                if failure is None:
+                    continue
+        failure["detail"] = (
+            f"{failure['detail']}; the service is still not usable after "
+            f"the re-ensure"
+        )
+        return failure
+
+    # 2026-10-26: the round's services are usable — but is the round
+    # asking the **instance** it thinks it is asking?
+    #
+    # On 2026-10-26 a verification point was refused a connection on port
+    # 64469 at 02:25:01, and the round could not say whether the refusal
+    # was about the product or about a service that had been replaced
+    # behind its back.  The criterion the round was verifying was never
+    # looked at, because the round never learned who was answering it.
+    #
+    # So the round names the instance before it dispatches anything: the
+    # **epoch** — the pid and the boot id of the process serving the
+    # round's own address.  A round that talks to no service has no
+    # instance to name, so there is nothing to enforce.  A round that
+    # talks to a service and cannot name the instance behind it would be
+    # reading somebody else's data, so it dispatches nothing.
+    if targets:
+        epoch = _round_instance_epoch(agent)
+        if epoch is not None and not epoch:
+            return {
+                "service": "",
+                "port": 0,
+                "pid": None,
+                "error_kind": _epoch_unresolved_error_kind(),
+                "detail": (
+                    "the round could not name the instance serving its "
+                    "address, so it cannot say whose answers it would be "
+                    "reading; the round dispatched nothing"
+                ),
+                "start_attempted": False,
+            }
+
+    try:
+        plan_logger = _verification_event_logger(plan_dir)
+        if plan_logger is not None:
+            plan_logger.info(
+                "service_preflight",
+                f"the round's services are usable: {len(targets)} checked",
+                data={"plan_id": plan_id, "services": len(targets)},
+            )
+    except Exception:  # noqa: BLE001 — logging must never break a round
+        pass
+    return None
+
+
+def _epoch_unresolved_error_kind() -> str:
+    """The error kind a round blocked by an unnamed instance carries."""
+    try:
+        from verification_agent import EPOCH_UNRESOLVED_ERROR_KIND
+    except Exception:  # pragma: no cover - defensive
+        return "instance_epoch_unresolved"
+    return EPOCH_UNRESOLVED_ERROR_KIND
+
+
+def _round_instance_epoch(agent: Any) -> Optional[Dict[str, Any]]:
+    """The instance the round is asking — named by the agent.
+
+    The agent owns the addresses, so it owns the answer to "who is
+    serving them".  The epoch is read over ``/health/data`` — the same
+    road a verification point's request travels — so the round's idea of
+    who is answering is the service's own statement about itself.
+
+    Returns:
+        ``None`` — the agent knows nothing about epochs (a legacy
+        orchestrator): the round runs the way it has always run, and
+        nothing is enforced.
+        ``{}`` — the agent knows about epochs and **could not name the
+        instance**: an answer nobody can attribute says nothing about
+        the product, so the round must not dispatch.
+        A dict — the named instance.
+    """
+    establish = getattr(agent, "round_instance_epoch", None)
+    if not callable(establish):
+        establish = getattr(agent, "establish_instance_epoch", None)
+    if not callable(establish):
+        # A round whose agent does not know about epochs (a legacy
+        # orchestrator) is a round that has always run the way it always
+        # ran.
+        return None
+    try:
+        epoch = establish()
+    except Exception as exc:  # noqa: BLE001 - a broken reader blocks
+        _server.logger.warning(
+            "[verification_preflight] could not read the round's instance "
+            "epoch: %s", exc,
+        )
+        return {}
+    return dict(epoch) if isinstance(epoch, dict) else {}
+
+
+def _ensure_service_ready_for_preflight(
+    agent: Any, target: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Ask the round's **one** precondition about a preflight target.
+
+    The target names the service and the port; the agent knows the
+    declaration.  The agent's own method is used, so the start goes
+    through the round's adoption gates — the address the round's
+    verification points are dispatched to follows the binding, so a
+    service that came back on another port is reached **there**.
+
+    This is the same function the per-verification-point gate uses
+    (see ``verification_agent.Orchestrator.ensure_vp_services_ready``).
+    Two gates that ask the question differently are two gates that can
+    disagree, and the 2026-10-26 round dispatched twelve verification
+    points at a service its own gate had already refused.
+    """
+    service = str(target.get("service") or "")
+    try:
+        port = int(target.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    declaration = None
+    getter = getattr(agent, "service_declaration", None)
+    if callable(getter):
+        try:
+            declaration = getter(service)
+        except Exception:  # noqa: BLE001 — defensive
+            declaration = None
+    if declaration is None:
+        return {
+            "ready": False,
+            "error_kind": "no_declaration",
+            "detail": f"the round has no declaration for service {service!r}",
+            "start_attempted": False,
+        }
+    try:
+        outcome = agent.ensure_service_ready(declaration)
+    except Exception as exc:  # noqa: BLE001 — a broken gate blocks
+        return {
+            "ready": False,
+            "error_kind": "preflight_error",
+            "detail": (
+                "the round's service precondition raised: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "start_attempted": False,
+        }
+    if not isinstance(outcome, dict):
+        return {
+            "ready": False,
+            "error_kind": "preflight_error",
+            "detail": "the round's service precondition returned no result",
+            "start_attempted": False,
+        }
+    return outcome
+
+
+def _probe_service_for_preflight(
+    agent: Any, target: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Look at one service; return the failure, or ``None`` when it is usable.
+
+    The readiness question — is the service actually serving? — is asked
+    by the **one** precondition every verification path shares
+    (:func:`verification_agent.ensure_service_ready`): the same port
+    probe, the same start attempt and the same HTTP self-check.
+
+    What is left here is the question only the **round** can answer:
+    is the instance answering the round's own?
+    """
+    service = str(target.get("service") or "")
+    try:
+        port = int(target.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    pid = target.get("pid")
+    if not port:
+        return {
+            "service": service,
+            "port": 0,
+            "pid": pid,
+            "error_kind": "tcp_connect_failed",
+            "detail": f"the round has no address for the service {service!r}",
+            "start_attempted": False,
+        }
+    outcome = _ensure_service_ready_for_preflight(agent, target)
+    if not outcome.get("ready"):
+        return {
+            "service": service,
+            "port": port,
+            "pid": pid,
+            "error_kind": str(
+                outcome.get("error_kind") or "tcp_connect_failed"
+            ),
+            "detail": str(outcome.get("detail") or ""),
+            "start_attempted": bool(outcome.get("start_attempted")),
+        }
+    observed = agent.probe_service_instance(port)
+    mismatch = agent.service_identity_mismatch(
+        service, port, observed=observed,
+    )
+    if mismatch is None:
+        return None
+    reasons = mismatch.get("reasons") or []
+    return {
+        "service": service,
+        "port": port,
+        "pid": pid,
+        "error_kind": "identity_mismatch",
+        "detail": (
+            "the instance answering is not the round's own: "
+            + ("; ".join(reasons) if reasons else "the instance does not match")
+        ),
+        "mismatched_fields": list(mismatch.get("mismatched_fields") or []),
+        "start_attempted": False,
+    }
+
+
+def _reensure_preflight_service(
+    agent: Any, target: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Spend the round's one re-ensure on a service that is not there.
+
+    The re-ensure is the project's own start path — the same one the
+    round's start-up used — and its result goes through the same
+    adoption gates.  A re-ensure that fails is not retried: a round
+    that kept trying would spend a start attempt per verification
+    point, which is the very thing this gate exists to prevent.
+    """
+    service = str(target.get("service") or "")
+    port = int(target.get("port") or 0)
+    try:
+        outcome = agent.reensure_preflight_service(service, port)
+    except Exception as exc:  # noqa: BLE001 — a failed re-ensure blocks
+        return {
+            "restored": False,
+            "port": port,
+            "pid": None,
+            "detail": (
+                f"the re-ensure of {service!r} raised: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }
+    if not isinstance(outcome, dict):
+        return {
+            "restored": False,
+            "port": port,
+            "pid": None,
+            "detail": f"the re-ensure of {service!r} returned no result",
+        }
+    return outcome
+
+
+def _record_service_preflight_blocked(
+    plan_id: str, plan_dir: Path, failure: Dict[str, Any],
+) -> None:
+    """Write the round's refusal down: the service was not usable.
+
+    The event names the service, the port, the process and the reason
+    — the four facts an operator needs to act on the round — and the
+    round-blocked mark beside it says what the refusal means: the
+    round measured nothing, so it has no verdict about the product.
+    """
+    failure = failure or {}
+    service = str(failure.get("service") or "")
+    port = failure.get("port")
+    error_kind = str(failure.get("error_kind") or "")
+    detail = str(failure.get("detail") or "")
+    where = f"the service {service!r}" if service else "the round's services"
+    if port:
+        where = f"{where} on port {port}"
+    reason = f"{where} was not usable: {error_kind or 'unknown reason'}"
+    _server.logger.warning(
+        "[verification_service_preflight] %s plan=%s — this round "
+        "dispatched no VP", reason, plan_id,
+    )
+    try:
+        plan_logger = _verification_event_logger(plan_dir)
+        if plan_logger is None:
+            return
+        plan_logger.warning(
+            PREFLIGHT_FAILED_EVENT,
+            f"{SERVICE_PREFLIGHT_ERROR_KIND}: {reason} — "
+            f"this round dispatched no VP",
+            data={
+                "plan_id": plan_id,
+                "status": "BLOCKED",
+                "service": service,
+                "port": port,
+                "pid": failure.get("pid"),
+                "error_kind": error_kind,
+                "detail": detail,
+                "reason_code": SERVICE_PREFLIGHT_ERROR_KIND,
+                "reason": reason,
+            },
+        )
+        plan_logger.warning(
+            ROUND_BLOCKED_EVENT,
+            f"{SERVICE_PREFLIGHT_ERROR_KIND}: {reason}",
+            data={
+                "plan_id": plan_id,
+                "status": "BLOCKED",
+                "error_kind": SERVICE_PREFLIGHT_ERROR_KIND,
+                "reason_code": SERVICE_PREFLIGHT_ERROR_KIND,
+                "reason": reason,
+            },
+        )
+    except Exception:  # noqa: BLE001 — logging must never break a round
+        pass
+
+
+def _service_preflight_blocked_report(
+    report: Any,
+) -> Optional[Dict[str, Any]]:
+    """The failure a blocked round carries, or ``None``.
+
+    A report whose ``stop_reason`` is ``service_preflight_failed``
+    carries the failure the round was blocked with, so the loop can
+    write it down and end the round without a verdict.
+    """
+    if not isinstance(report, dict):
+        return None
+    if str(report.get("stop_reason") or "") != SERVICE_PREFLIGHT_ERROR_KIND:
+        return None
+    failure = report.get(SERVICE_PREFLIGHT_ERROR_KIND)
+    if not isinstance(failure, dict):
+        return {
+            "service": "",
+            "port": 0,
+            "pid": None,
+            "error_kind": "",
+            "detail": str(report.get("summary") or ""),
+        }
+    return failure
+
+
 class _VerificationLoopOutcome:
     """Whether the loop ended the workflow or handed it off.
 
@@ -4512,17 +6015,83 @@ class _VerificationLoopOutcome:
     The assumption was true when ``_run_repair_execution`` blocked
     inline. It stopped being true in the 2026-09-11 v14 refactor that
     made the dispatch async, and no caller was updated.
+
+    A third exit arrived with the workflow-level round lease
+    (2026-10-25, VP-008): **refused**.  Another live round owns the
+    plan, so this run dispatched nothing at all and ended.  It is not
+    terminal — the plan's verification workflow IS still running, it
+    is just not THIS run — and the difference matters: a terminal
+    outcome lets the caller promote an ``executing`` plan to
+    ``completed``, which would park the plan underneath the round that
+    actually owns it.
     """
 
-    __slots__ = ("handed_off",)
+    __slots__ = ("handed_off", "refused")
 
     def __init__(self) -> None:
         self.handed_off = False
+        self.refused = False
 
     @property
     def terminal(self) -> bool:
         """True iff no background execution will resume this workflow."""
-        return not self.handed_off
+        return not (self.handed_off or self.refused)
+
+
+def _record_dispatch_bindings(
+    plan_dir: Path, plan_id: str, *, reason: str = "",
+) -> None:
+    """Write down the addresses this round dispatched its VPs to.
+
+    The last link of the address chain (2026-10-25, repair-r1-25).  The
+    ledger says which address a service ended up on; the earlier events
+    say how it got there; this says the round actually sent its traffic
+    there.  On 2026-10-24 a request went to port 51725 and nothing on
+    disk said where that number came from — the whole point of the
+    stream is that the question has an answer.
+
+    The round's own ledger is the authority: it is written by the
+    project's copy of ``service_manager`` and read here from the same
+    plan directory, which is the only state the two share.
+
+    Never raises — a log that cannot be written is not worth losing a
+    round over.
+    """
+    try:
+        import service_manager
+    except Exception:  # noqa: BLE001 - observability must not break a round
+        return
+    try:
+        ledger = service_manager.read_ledger(Path(plan_dir))
+        entries = ledger.get("services")
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            port = entry.get("port")
+            if not isinstance(port, int):
+                continue
+            service_manager.record_address_event(
+                plan_dir, "dispatch_bound",
+                run_id=plan_id or Path(plan_dir).name,
+                round_token=str(entry.get("owner_token") or ""),
+                old_port=None, new_port=port,
+                declared_port=entry.get("declared_port") or port,
+                pid=entry.get("pid"),
+                boot_id=service_manager.boot_id_of(
+                    entry.get("pid"), entry.get("start_epoch"),
+                ),
+                reason=reason or (
+                    f"the round dispatched to service "
+                    f"{entry.get('name')!r} on port {port}"
+                ),
+            )
+    except Exception:  # noqa: BLE001 - never break a round over a log
+        _server.logger.warning(
+            "[service_manager] could not record dispatch bindings for "
+            "plan=%s", plan_id, exc_info=True,
+        )
 
 
 def _run_auto_verification_loop(plan_id: str, plan_dir: Path, project_dir: Path, max_rounds: int = _server.DEFAULT_MAX_VERIFICATION_ROUNDS, tool: Optional[str] = None, start_round: int = 1) -> _VerificationLoopOutcome:
@@ -4542,8 +6111,47 @@ def _run_auto_verification_loop(plan_id: str, plan_dir: Path, project_dir: Path,
     back via the returned :class:`_VerificationLoopOutcome` — they used
     to re-derive it from ``PlanState.get_current_phase()``, which is
     how the plan got stamped ``completed`` mid-repair.
+
+    2026-10-24: the loop now owns a *token* for its round. The ledger
+    records which round started each service, so this loop's exit reaps
+    the services this round started and leaves alone the ones a newer,
+    still-running round owns. Before the token existed, one ledger per
+    plan directory was enough to make an older round's exit stop the
+    newer round's api server 47 seconds after it came up — before that
+    round's first api_test asked it for ``/health``. The token is
+    registered on entry (so the services this round starts are stamped
+    with it) and released before the reap (so the round is over by the
+    time its own services are stopped).
+
+    2026-10-25 (VP-008): the loop now takes the plan's WORKFLOW-level
+    round lease here, at the entry of the workflow — before the round's
+    preflight, before the services are ensured, before a single VP is
+    dispatched. On 2026-10-24 three rounds of one plan overlapped
+    (21:18, 21:42, 21:45), so one round's VPs ran against a service
+    that was not up yet while another round rewrote the fixture
+    underneath them. A round that cannot take the lease ends here,
+    explicitly: it records ``round_lease_denied``, marks its round
+    BLOCKED(round_conflict) and dispatches nothing. The lease's
+    ``round_token`` IS this loop's service-owner token, so the lease,
+    the ledger and the round's pin (VP-004) all name the same round.
     """
     outcome = _VerificationLoopOutcome()
+    owner_token = _server._new_service_owner_token("verification_loop")
+    lease, conflict = _acquire_verification_workflow_lease(
+        plan_dir,
+        round_token=owner_token or (
+            f"verification_loop-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        ),
+        run_id=plan_id,
+    )
+    if conflict is not None:
+        # Another live round owns this plan. This run ensures nothing,
+        # dispatches no VP and touches no state the winner owns.
+        _record_round_lease_denied(plan_id, plan_dir, conflict)
+        _mark_round_blocked_by_round_conflict(plan_id, plan_dir, conflict)
+        outcome.refused = True
+        return outcome
+    _server._register_service_owner(plan_dir, owner_token, current=True)
     try:
         _server._run_auto_verification_loop_inner(
             plan_id, plan_dir, project_dir,
@@ -4551,8 +6159,14 @@ def _run_auto_verification_loop(plan_id: str, plan_dir: Path, project_dir: Path,
             outcome=outcome,
         )
     finally:
+        _server._release_service_owner(plan_dir, owner_token)
+        if lease is not None:
+            lease.release()
         if outcome.terminal:
-            _server._reap_managed_services(plan_id, plan_dir, "verification_loop_exit")
+            _server._reap_managed_services(
+                plan_id, plan_dir, "verification_loop_exit",
+                owner_token=owner_token,
+            )
         else:
             _server.logger.info(
                 "[service_manager] reap deferred plan=%s — a repair "
@@ -4956,10 +6570,38 @@ def _make_repair_on_complete(
                 _mark_verification_round_running(
                     plan_id, _next_round,
                 )
-                _report = _new_orch.start_verification_cycle(
-                    round_number=_next_round,
-                    force=False,
+                _report, _round_conflict = _dispatch_verification_round(
+                    plan_id, plan_dir, _new_orch, _next_round,
                     resume=True,
+                )
+                if _round_conflict is not None:
+                    # 2026-10-25: another live round owns this plan, so
+                    # this re-entry dispatched no VP.  The repair chain
+                    # stops here; the refusal is recorded in the plan's
+                    # execution log and the round that owns the plan
+                    # keeps its verdict.
+                    _record_round_lease_refusal(
+                        plan_id, plan_dir, _round_conflict,
+                    )
+                    return
+                # 2026-10-25 (repair-r1-33): the round's services were
+                # not usable, so the round dispatched nothing and
+                # measured nothing.  The judgment phase must not run on
+                # it — it would read the blocked round as a failure and
+                # send the repair chain after a product nobody ever
+                # looked at, round after round, until the budget ran
+                # out.  The chain ends here; the refusal was written
+                # down by the dispatch.
+                if _service_preflight_blocked_report(_report) is not None:
+                    return
+                # The round has run against the addresses the ledger
+                # names — write them down (2026-10-25, repair-r1-25).
+                _record_dispatch_bindings(
+                    plan_dir, plan_id,
+                    reason=(
+                        f"round {_next_round} dispatched to the addresses "
+                        f"its services were bound to"
+                    ),
                 )
                 _result = _new_orch.check_cycle_conditions(
                     _report, round_number=_next_round,
@@ -5540,10 +7182,50 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
             # failed. Round 2 burned ~5 minutes and ~600k tokens
             # re-running 20 already-passed VPs before the user
             # noticed.
-            report = orch.start_verification_cycle(
-                round_number=round_num,
-                force=False,
+            #
+            # 2026-10-25: the dispatch now goes through the plan's
+            # verification-round lease, so two rounds of the same plan
+            # cannot overlap (see the lease section above).  The lease
+            # is taken BEFORE the round's preflight — the preflight is
+            # what starts the services and seeds the fixture, and two
+            # rounds doing that at once is what produced the 2026-10-24
+            # incident.
+            report, _round_conflict = _dispatch_verification_round(
+                plan_id, plan_dir, orch, round_num,
                 resume=(round_num > 1),
+            )
+            if _round_conflict is not None:
+                # 2026-10-25: another live round owns this plan.  The
+                # lease refused us BEFORE the preflight, so no service
+                # was started, no fixture was rewritten and no VP was
+                # dispatched.  The run ends here, explicitly, and the
+                # refusal is recorded in the plan's execution log — the
+                # round that owns the plan keeps its verdict.
+                _record_round_lease_refusal(
+                    plan_id, plan_dir, _round_conflict,
+                )
+                return
+            # 2026-10-25 (repair-r1-33): the round's services were not
+            # usable, so the round dispatched nothing and measured
+            # nothing.  There is no verdict to repair against, and the
+            # judgment phase must not run: it would read the blocked
+            # round as a failure and send the repair chain after a
+            # product nobody ever looked at.  The refusal itself was
+            # written down by the dispatch.
+            _preflight_blocked = _service_preflight_blocked_report(report)
+            if _preflight_blocked is not None:
+                _record_terminal(
+                    "loop_stopped", SERVICE_PREFLIGHT_ERROR_KIND,
+                )
+                return
+            # The round has run against the addresses the ledger names —
+            # write them down (2026-10-25, repair-r1-25).
+            _record_dispatch_bindings(
+                plan_dir, plan_id,
+                reason=(
+                    f"round {round_num} dispatched to the addresses its "
+                    f"services were bound to"
+                ),
             )
 
             # 2026-09-15: the operator stopped this plan

@@ -33,8 +33,10 @@ retries the attempt instead of failing the task.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -290,14 +292,21 @@ def _retry_agent(logger):
     agent.project_dir = Path("/tmp")
     agent._task_progress_repo = None
     agent._session_task_completed_counts = {}
+    agent._quota_wait_requested = False
 
     agent.task_manager = type("TM", (), {
         "update_task_status": lambda *a, **k: None,
-        "record_task_failure": lambda *a, **k: None,
+        # Counted, not stubbed away: the 2026-10-24 contract is that a
+        # provider with no room does NOT fail the task, and the only way
+        # to see that is to watch the call.
+        "record_task_failure": MagicMock(),
+        "set_stop_reason": MagicMock(),
     })()
     agent.retry_manager = type("RM", (), {
         "get_retry_prompt_modifier": lambda *a, **k: "",
-        "record_attempt": lambda *a, **k: None,
+        # Counted for the same reason: a capacity refusal must not be
+        # charged to the task's retry budget.
+        "record_attempt": MagicMock(),
     })()
     agent.executor = type("EX", (), {
         "had_previous_timeout": lambda *a, **k: False,
@@ -322,11 +331,16 @@ class TestCapacityErrorRetriesTheAttempt:
         task = _TaskStub()
         calls = []
 
+        # 2026-10-24: the 429 is WAITED OUT, and the wait is real
+        # seconds — so the sleep seam is replaced. Nothing else about
+        # the scenario changes.
+        agent._capacity_wait_sleep = lambda seconds: None
+
         def _query(*a, **k):
             calls.append(1)
             if len(calls) == 1:
                 raise ApiError("已达到 Token Plan 用量上限", status="429")
-            # Second attempt gets a non-capacity error so the loop ends
+            # The second call gets a non-capacity error so the loop ends
             # deterministically.
             raise ApiError("invalid api key", status="401")
 
@@ -343,6 +357,12 @@ class TestCapacityErrorRetriesTheAttempt:
         assert "task_api_error" in logger.names(), (
             "the second (non-capacity) failure must still be reported as "
             "the hard-fail it is"
+        )
+        assert agent.retry_manager.record_attempt.call_count == 0, (
+            "the 429 must not be charged to the task's retry budget — it "
+            "says the provider has no room, not that the work is wrong. "
+            "The 401 that follows is a hard fail and never spent an "
+            "attempt either"
         )
 
     def test_a_non_capacity_error_still_fails_immediately(self):
@@ -365,9 +385,16 @@ class TestCapacityErrorRetriesTheAttempt:
         assert len(calls) == 1
         assert "task_api_error_provider_retry" not in logger.names()
 
-    def test_the_last_attempt_reports_the_capacity_error(self):
-        """When the retries are spent the task does fail — and the log
-        must say why, so an operator can tell it apart from a bad task."""
+    def test_the_last_attempt_reports_the_capacity_error(self, monkeypatch):
+        """A capacity error that cannot be waited out is NOT a failure.
+
+        2026-10-24: with no wait budget (``PDT_CAPACITY_WAIT_MAX_SEC=0``)
+        the first refusal is the last one, and the run marks the task as
+        waiting for quota. The task is not failed — that is what
+        stranded every downstream task when Vendor A Pro hit its Token
+        Plan cap on 2026-09-22.
+        """
+        monkeypatch.setenv("PDT_CAPACITY_WAIT_MAX_SEC", "0")
         logger = _LogRecorder()
         agent = _retry_agent(logger)
         task = _TaskStub()
@@ -382,8 +409,25 @@ class TestCapacityErrorRetriesTheAttempt:
         result = agent._execute_task_with_retry(task, max_retries=2)
 
         assert result is False
-        assert len(calls) == 2
-        assert "task_api_error" in logger.names()
+        assert len(calls) == 1, (
+            "with no wait budget there is nothing to wait for — the "
+            "refusal escalates at once instead of burning every attempt"
+        )
+        assert "task_quota_wait_exhausted" in logger.names(), (
+            "the log must say the run stopped because the provider had no "
+            "room, which is a different thing from a failed task"
+        )
+        assert "task_api_error" not in logger.names(), (
+            "this is not an API error any more — it is a wait that ran out"
+        )
+        assert agent.task_manager.record_task_failure.call_count == 0, (
+            "the task must not be failed: a provider with no room says "
+            "nothing about the work"
+        )
+        assert agent.task_manager.set_stop_reason.call_count == 1
+        reason, detail = agent.task_manager.set_stop_reason.call_args[0]
+        assert reason == "waiting_for_quota"
+        assert json.loads(detail)["providers"] == []
 
 
 # ---------------------------------------------------------------------------

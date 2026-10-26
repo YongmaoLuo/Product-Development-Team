@@ -1475,3 +1475,1039 @@ def test_wrapper_strips_only_fd_prefix(tmp_path: Path):
     assert child_env.get("PDT_SVC_ENV_PROBE_PORT") == "18091"
     assert child_env.get("PATH") == parent_env["PATH"]
     assert child_env.get("HOME") == parent_env["HOME"]
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-24 — a declared service that dies *after* the round-start
+# preflight (the twelve-VP incident)
+# ---------------------------------------------------------------------------
+#
+# The round-start preflight brings the declared services up **once**, at
+# the top of the round.  A service that dies after that stays dead for
+# the rest of the round, and every VP that talks to it is then graded
+# on the connection refusal: ``api_test`` reports FAILED, which reads
+# as "the project is broken" when the truth is "the plumbing died".
+# One dead service cost a production round twelve VPs.
+#
+# So the per-VP runner probes the ports it is about to use, and a dead
+# one is brought back before the VP runs.  A service that cannot be
+# brought back leaves its port blocked, and the **existing**
+# blocked-port gate turns the VP into BLOCKED — not FAILED.
+
+def _probe(listening: bool, port: int):
+    """A ``PortProbe`` stand-in: is anything listening on *port*?"""
+    from service_freshness import PortProbe
+
+    return PortProbe(port=port, listening=listening)
+
+
+def _run_all_vps(executor) -> list:
+    """Run every VP of *executor* through the runner, in order."""
+    async def _drive():
+        return [
+            await executor.sub_agent_runner(vp)
+            for vp in executor.verification_plan["vps"]
+        ]
+
+    return asyncio.run(_drive())
+
+
+def _declared_runner_agent(tmp_path: Path, monkeypatch, *, listening: bool):
+    """An agent whose ``api`` service the preflight started — and which
+    is now either alive or dead.
+
+    The round-start preflight is not re-run here: what the preflight
+    leaves behind is the point.  It left a **ready** runtime for
+    ``api`` on 8080, and then the service died (or did not).
+    """
+    agent = _make_agent(tmp_path)
+    plan = _declared_plan("curl {{svc.api.url}}/items")
+    agent._normalize_service_declarations(plan)
+    agent._service_runtime_map = _runtime_map(ready=[("api", 8080)])
+    monkeypatch.setattr(
+        "service_freshness.probe_port",
+        lambda port: _probe(listening, port),
+    )
+    return agent, plan
+
+
+def _passing_reviewer(agent, ran: Optional[list] = None):
+    """A stub sub-agent whose PASSED survives the evidence check.
+
+    ``code_review``'s PASSED is only kept when its citations can be
+    checked against a real file, so the stub has to leave behind the
+    same artifact the real reviewer would.
+    """
+    async def _run(vp):
+        vp_id = str(vp.get("id", "unknown"))
+        if ran is not None:
+            ran.append(vp_id)
+        source = agent.project_dir / "cited.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        directory = agent.plan_dir / "vp_artifacts" / vp_id
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "citations.json").write_text(
+            json.dumps({"citations": [
+                {"file": "cited.py", "line": 1, "snippet": "value = 1"},
+            ]}),
+            encoding="utf-8",
+        )
+        return {"status": "PASSED"}
+
+    return _run
+
+
+def test_dead_declared_service_is_re_ensured_before_a_vp(
+    tmp_path: Path, monkeypatch
+):
+    """A service that died mid-round is brought back before its VP runs.
+
+    Without the recovery the VP fires its request at a port nothing
+    listens on and the refusal is graded as a project failure.
+
+    The port answers again only once the re-ensure has run — that is
+    what "the service is back" means, and it is what the round's
+    adoption gate checks before it lets the VP go out (2026-10-25).
+    """
+    agent, plan = _declared_runner_agent(tmp_path, monkeypatch, listening=False)
+
+    import service_manager as sm
+
+    ensured: list[list[str]] = []
+    alive: list[bool] = [False]
+
+    def fake_ensure(project, declarations, round_number=0, **kwargs):
+        ensured.append(sorted(declarations))
+        alive[0] = True
+        return _runtime_map(ready=[("api", 8080)])
+
+    monkeypatch.setattr(
+        "service_freshness.probe_port",
+        lambda port: _probe(alive[0], port),
+    )
+    monkeypatch.setattr(sm, "ensure_services", fake_ensure)
+    monkeypatch.setattr(sm, "record_runtimes", lambda *a, **k: None)
+
+    ran: list[str] = []
+    monkeypatch.setattr(
+        agent, "_run_single_vp_async", _passing_reviewer(agent, ran),
+    )
+
+    executor = agent._build_verification_executor(
+        agent._resolve_service_placeholders(plan)
+    )
+    results = _run_all_vps(executor)
+
+    assert ensured == [["api"]], "the dead service was not re-ensured"
+    assert ran == ["VP-001"], "the VP did not run after the recovery"
+    assert results[0]["status"] == "PASSED"
+    assert agent._blocked_service_ports == set()
+
+
+def test_unrecoverable_declared_service_yields_blocked_not_failed(
+    tmp_path: Path, monkeypatch
+):
+    """A service that cannot be brought back blocks its VPs.
+
+    FAILED would say "the project answered wrong"; the truth is "there
+    was nothing to answer".  The blocked-port gate already knows how to
+    say that, so the recovery has to end there.
+    """
+    agent, plan = _declared_runner_agent(tmp_path, monkeypatch, listening=False)
+
+    import service_manager as sm
+
+    def fake_ensure(project, declarations, round_number=0, **kwargs):
+        return _runtime_map(unready=[("api", 8080)])
+
+    monkeypatch.setattr(sm, "ensure_services", fake_ensure)
+    monkeypatch.setattr(sm, "record_runtimes", lambda *a, **k: None)
+
+    ran: list[str] = []
+    monkeypatch.setattr(
+        agent, "_run_single_vp_async", _passing_reviewer(agent, ran),
+    )
+
+    executor = agent._build_verification_executor(
+        agent._resolve_service_placeholders(plan)
+    )
+    results = _run_all_vps(executor)
+
+    assert ran == [], "a VP ran against a service that is not there"
+    assert results[0]["status"] == "BLOCKED"
+    assert results[0]["status"] != "FAILED"
+    assert agent._blocked_service_ports == {8080}
+
+
+def test_api_test_against_a_dead_service_is_blocked_not_failed(
+    tmp_path: Path, monkeypatch
+):
+    """The production shape: an ``api_test`` VP whose service is gone.
+
+    ``api_test`` is graded by (request, response, assertions).  With no
+    service there is no response, and the refusal used to be reported
+    as FAILED — a statement about the project that the project never
+    got to make.
+    """
+    agent = _make_agent(tmp_path)
+    plan = _declared_plan()
+    plan["verification_points"] = [
+        {
+            "id": "VP-001",
+            "title": "items endpoint",
+            "verification_method": "api_test",
+            "uses_services": ["api"],
+            "request": {"method": "GET", "url": "{{svc.api.url}}/items"},
+            "assertions": [{"status": 200}],
+        }
+    ]
+    agent._normalize_service_declarations(plan)
+    agent._service_runtime_map = _runtime_map(ready=[("api", 8080)])
+    monkeypatch.setattr(
+        "service_freshness.probe_port", lambda port: _probe(False, port),
+    )
+
+    import service_manager as sm
+
+    monkeypatch.setattr(
+        sm, "ensure_services",
+        lambda project, declarations, round_number=0, **kwargs:
+            _runtime_map(unready=[("api", 8080)]),
+    )
+    monkeypatch.setattr(sm, "record_runtimes", lambda *a, **k: None)
+
+    executor = agent._build_verification_executor(
+        agent._resolve_service_placeholders(plan)
+    )
+    results = _run_all_vps(executor)
+
+    assert results[0]["status"] == "BLOCKED", results[0]
+    assert agent._blocked_service_ports == {8080}
+
+
+def test_healthy_declared_service_is_not_restarted_per_vp(
+    tmp_path: Path, monkeypatch
+):
+    """A service that is alive must not be restarted — not once per VP.
+
+    A restart re-seeds the fixture and clears the execution state, so
+    a round that restarts its service for every VP destroys the very
+    state the VPs are verifying.
+    """
+    agent = _make_agent(tmp_path)
+    plan = _declared_plan(
+        "curl {{svc.api.url}}/one",
+        "curl {{svc.api.url}}/two",
+        "curl {{svc.api.url}}/three",
+    )
+    agent._normalize_service_declarations(plan)
+    agent._service_runtime_map = _runtime_map(ready=[("api", 8080)])
+    monkeypatch.setattr(
+        "service_freshness.probe_port", lambda port: _probe(True, port),
+    )
+
+    import service_manager as sm
+
+    ensured: list[list[str]] = []
+
+    def fake_ensure(project, declarations, round_number=0, **kwargs):
+        ensured.append(sorted(declarations))
+        return _runtime_map(ready=[("api", 8080)])
+
+    monkeypatch.setattr(sm, "ensure_services", fake_ensure)
+    monkeypatch.setattr(sm, "record_runtimes", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_run_single_vp_async", _passing_reviewer(agent))
+
+    executor = agent._build_verification_executor(
+        agent._resolve_service_placeholders(plan)
+    )
+    results = _run_all_vps(executor)
+
+    assert ensured == [], "a healthy service was re-ensured"
+    assert [r["status"] for r in results] == ["PASSED"] * 3
+    assert agent._blocked_service_ports == set()
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-24 — the data plane the api_test VP is about to talk to
+# ---------------------------------------------------------------------------
+#
+# "The port answers" is not the same question as "the instance answering
+# is the one this round started, reading the fixture this round seeded".
+# The production round was graded on the first question: the port was
+# busy, HTTP answered 200 with ``status: ok``, and the answer came from
+# a data plane that was not the round's fixture — so every later
+# phase/plan assertion ran against the wrong database.
+#
+# So the round records a fingerprint at the preflight and re-checks it
+# before every api_test VP is dispatched.
+
+
+def _fingerprint(port=8080, pid=100, rows=4, expected=4):
+    """A data-plane fingerprint, as the probe would report it."""
+    from service_freshness import DataPlaneFingerprint
+
+    return DataPlaneFingerprint(
+        port=port, pid=pid, routing_rows=rows, expected_rows=expected,
+        status="ok",
+    )
+
+
+class _DataPlane:
+    """The probe's answers, in order; the last one repeats."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.ports: list = []
+
+    def __call__(self, port, **kwargs):
+        self.ports.append(port)
+        if len(self.answers) > 1:
+            return self.answers.pop(0)
+        return self.answers[0]
+
+
+def _api_test_plan() -> dict:
+    """A plan with one ``api_test`` VP against the declared ``api``."""
+    plan = _declared_plan()
+    plan["verification_points"] = [
+        {
+            "id": "VP-001",
+            "title": "items endpoint",
+            "verification_method": "api_test",
+            "uses_services": ["api"],
+            "request": {"method": "GET", "url": "{{svc.api.url}}/items"},
+            "assertions": [{"status": 200}],
+        }
+    ]
+    return plan
+
+
+def _api_test_agent(tmp_path: Path, monkeypatch, probe: _DataPlane):
+    """An agent whose ``api`` service answers *probe* on ``/health/data``."""
+    agent = _make_agent(tmp_path)
+    plan = _api_test_plan()
+    agent._normalize_service_declarations(plan)
+    monkeypatch.setattr(
+        agent, "_maybe_rebuild_before_service_start", lambda: None,
+    )
+    # The service is alive at the TCP level — the previous round's
+    # liveness recovery must not fire, or it would mask what this round
+    # is about.
+    monkeypatch.setattr(
+        "service_freshness.probe_port", lambda port: _probe(True, port),
+    )
+    monkeypatch.setattr("service_freshness.probe_data_plane", probe)
+    monkeypatch.setattr(
+        "service_freshness.expected_routing_rows", lambda *a, **k: 4,
+    )
+    return agent, plan
+
+
+def _stub_service_manager(monkeypatch, ensured: list) -> None:
+    """Stub the project's ``ensure_services`` and record the calls."""
+    import service_manager as sm
+
+    def fake_ensure(project, declarations, round_number=0, **kwargs):
+        ensured.append(sorted(declarations))
+        return _runtime_map(ready=[("api", 8080)])
+
+    monkeypatch.setattr(sm, "ensure_services", fake_ensure)
+    monkeypatch.setattr(sm, "record_runtimes", lambda *a, **k: None)
+
+
+def _spy_api_runner(monkeypatch, dispatched: list) -> None:
+    """Record every ``api_test`` dispatch; answer PASSED."""
+    import verification_api_runner as var
+
+    class _Result:
+        status = "PASSED"
+        evidence = {"status_code": 200}
+
+        def to_verdict_dict(self):
+            return {
+                "status": "PASSED",
+                "reasons": ["ok"],
+                "evidence": dict(self.evidence),
+            }
+
+    def fake_run(vp, **kwargs):
+        dispatched.append(str(vp.get("id")))
+        return _Result()
+
+    monkeypatch.setattr(var, "run_api_verification", fake_run)
+
+
+def _run_api_test_vp(agent, plan):
+    """Preflight, build the executor and run the plan's VPs."""
+    agent._preflight_service_freshness(plan)
+    executor = agent._build_verification_executor(
+        agent._resolve_service_placeholders(plan)
+    )
+    return _run_all_vps(executor)
+
+
+def test_api_test_is_blocked_when_the_instance_serves_another_data_plane(
+    tmp_path: Path, monkeypatch
+):
+    """The production shape: the port answers, with another data plane.
+
+    The api_test must not be dispatched at all — a request sent to the
+    wrong instance measures the wrong database — and the verdict must be
+    BLOCKED, never FAILED: FAILED would say "the project answered
+    wrong", and the project was never asked.
+    """
+    probe = _DataPlane(
+        _fingerprint(rows=4),             # the instance the round recorded
+        _fingerprint(pid=999, rows=0),    # what answers now
+        _fingerprint(pid=999, rows=0),    # ... and after the recovery
+    )
+    agent, plan = _api_test_agent(tmp_path, monkeypatch, probe)
+    ensured: list = []
+    _stub_service_manager(monkeypatch, ensured)
+    dispatched: list = []
+    _spy_api_runner(monkeypatch, dispatched)
+
+    results = _run_api_test_vp(agent, plan)
+
+    assert dispatched == [], "the api_test went to the wrong instance"
+    assert results[0]["status"] == "BLOCKED", results[0]
+    assert results[0]["status"] != "FAILED"
+    evidence = results[0]["evidence"]
+    assert evidence["recorded_data_plane"]["routing_rows"] == 4
+    assert evidence["observed_data_plane"]["routing_rows"] == 0
+
+
+def test_a_stale_data_plane_is_blocked_even_when_the_pid_is_unchanged(
+    tmp_path: Path, monkeypatch
+):
+    """The pid alone is not the verdict — the data plane is.
+
+    The production instance answered on the same port with the same pid
+    but with another database behind it, so the row count is what has
+    to be compared.
+    """
+    probe = _DataPlane(
+        _fingerprint(rows=4),
+        _fingerprint(pid=100, rows=0),
+        _fingerprint(pid=100, rows=0),
+    )
+    agent, plan = _api_test_agent(tmp_path, monkeypatch, probe)
+    ensured: list = []
+    _stub_service_manager(monkeypatch, ensured)
+    dispatched: list = []
+    _spy_api_runner(monkeypatch, dispatched)
+
+    results = _run_api_test_vp(agent, plan)
+
+    assert dispatched == [], "the api_test went to the wrong instance"
+    assert results[0]["status"] == "BLOCKED", results[0]
+
+
+def test_one_re_ensure_restores_the_data_plane_and_the_vp_runs(
+    tmp_path: Path, monkeypatch
+):
+    """One re-ensure, then the VP runs against the right instance.
+
+    The recovery is the one the round is allowed to spend: it re-ensures
+    the service, refreshes the declarations and the resolved
+    placeholders, and the VP then goes out to the address the service
+    actually serves.
+    """
+    probe = _DataPlane(
+        _fingerprint(rows=4),            # the instance the round recorded
+        _fingerprint(pid=999, rows=0),   # what answers now
+        _fingerprint(pid=200, rows=4),   # what answers after the recovery
+    )
+    agent, plan = _api_test_agent(tmp_path, monkeypatch, probe)
+    ensured: list = []
+    _stub_service_manager(monkeypatch, ensured)
+    dispatched: list = []
+    _spy_api_runner(monkeypatch, dispatched)
+
+    results = _run_api_test_vp(agent, plan)
+
+    assert ensured == [["api", "chart"], ["api"]], ensured
+    assert dispatched == ["VP-001"]
+    assert results[0]["status"] == "PASSED", results[0]
+
+
+def test_a_matching_data_plane_dispatches_the_vp_without_re_ensuring(
+    tmp_path: Path, monkeypatch
+):
+    """A healthy data plane is not touched.
+
+    Re-ensuring a service that is serving the right fixture would
+    re-seed it — and a round that restarts its service per VP destroys
+    the very state its VPs are verifying.
+    """
+    probe = _DataPlane(
+        _fingerprint(rows=4),
+        _fingerprint(rows=4),
+    )
+    agent, plan = _api_test_agent(tmp_path, monkeypatch, probe)
+    ensured: list = []
+    _stub_service_manager(monkeypatch, ensured)
+    dispatched: list = []
+    _spy_api_runner(monkeypatch, dispatched)
+
+    results = _run_api_test_vp(agent, plan)
+
+    assert ensured == [["api", "chart"]], ensured
+    assert dispatched == ["VP-001"]
+    assert results[0]["status"] == "PASSED", results[0]
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-25 — a re-ensure's result has to be verified before it is adopted
+# ---------------------------------------------------------------------------
+#
+# The production round ended with its api_test pointing at
+# 127.0.0.1:51725 — a port nothing had ever listened on, and a port no
+# log had ever recorded as a service's address.  There is only one way
+# that address can become a VP's request address: a re-ensure allocated
+# it, wrote it into the runtime map **without a liveness probe**, and the
+# plan's placeholders followed it there.
+#
+# So adopting a re-ensure's result goes through three gates:
+#
+#   1. the runtime says the service is **ready** and carries a **port**;
+#   2. that port accepts a **TCP connection** (1 s);
+#   3. the service's **health URL answers 200** (with the request
+#      guard's header — the same road a VP's request travels).
+#
+# A result that fails any of them is not adopted: the old map stands, the
+# address does not move, no request is sent, and the VP is BLOCKED
+# (``service_unreachable``) — never FAILED, which would say "the project
+# answered wrong" about a project that was never asked.
+
+#: The port the production round's re-ensure allocated.  Nothing listens
+#: on it — that is the whole point of the fixture.
+DEAD_RELOCATED_PORT = 51725
+
+
+def _api_test_agent_without_preflight(tmp_path: Path, monkeypatch):
+    """An agent whose round already ensured the ``api`` service.
+
+    The round-start preflight is not re-run here: what it left behind is
+    the point.  It left a **ready** runtime for ``api`` on 8080 — and
+    then the service died.
+    """
+    agent = _make_agent(tmp_path)
+    plan = _api_test_plan()
+    agent._normalize_service_declarations(plan)
+    agent._service_runtime_map = _runtime_map(ready=[("api", 8080)])
+    # The service is gone: the liveness recovery has to fire.
+    monkeypatch.setattr(
+        "service_freshness.probe_port", lambda port: _probe(False, port),
+    )
+    return agent, plan
+
+
+def test_vp_gate_blocks_when_the_data_plane_is_empty(tmp_path: Path, monkeypatch):
+    """A re-ensure that produced nothing must not become the VP's address.
+
+    The re-ensure reports the service **ready** — on a port nothing is
+    listening on.  That is the production shape: the runtime says the
+    service came up, the address is a port nobody ever bound.
+
+    The gates refuse it, and the refusal has to be visible in the
+    verdict: the request is not sent, the address does not move, the old
+    map stands, and the VP is BLOCKED with ``service_unreachable``.
+    """
+    agent, plan = _api_test_agent_without_preflight(tmp_path, monkeypatch)
+
+    import service_manager as sm
+
+    monkeypatch.setattr(
+        sm, "ensure_services",
+        lambda project, declarations, round_number=0, **kwargs:
+            _runtime_map(ready=[("api", DEAD_RELOCATED_PORT)]),
+    )
+    monkeypatch.setattr(sm, "record_runtimes", lambda *a, **k: None)
+    dispatched: list = []
+    _spy_api_runner(monkeypatch, dispatched)
+
+    executor = agent._build_verification_executor(
+        agent._resolve_service_placeholders(plan)
+    )
+    results = _run_all_vps(executor)
+
+    assert dispatched == [], "the request went to an address nothing served"
+    assert results[0]["status"] == "BLOCKED", results[0]
+    assert results[0]["status"] != "FAILED", results[0]
+    assert "service_unreachable" in " ".join(results[0]["reasons"]), results[0]
+    # The old map stands: the port nobody listens on was not adopted.
+    assert agent._service_runtime_map.runtimes["api"].port == 8080
+    # ... and the address the VPs are pointed at did not move either.
+    assert agent._effective_declarations()["api"].port == 8080
+
+
+class _HealthEndpoint:
+    """A real HTTP server that answers the health URL with 200.
+
+    The gates do not take the runtime's word for it — they talk to the
+    service.  So the success path needs a service that really answers.
+    """
+
+    def __init__(self, status: int = 200):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        #: One entry per request: the guard header the request carried.
+        self.requests: list = []
+        endpoint = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):  # noqa: N802 - the handler API's own name
+                endpoint.requests.append(
+                    self.headers.get("X-PDT-Request"),
+                )
+                body = b'{"status": "ok"}'
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):  # noqa: A003 - silence access log
+                pass
+
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever, daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def port(self) -> int:
+        return int(self._httpd.server_address[1])
+
+    def close(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+
+
+def _log_entries(plan_dir: Path) -> list:
+    """Every entry the round wrote to its verification log."""
+    entries = []
+    for log_file in sorted((plan_dir / "logs").glob("verification_*.log")):
+        for line in log_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:  # pragma: no cover - defensive
+                continue
+    return entries
+
+
+def test_a_re_ensure_that_answers_is_adopted(tmp_path: Path, monkeypatch):
+    """The other side of the gate: a re-ensure that really answers.
+
+    The three gates are a filter, not a wall.  A re-ensure that hands
+    back a live instance — one that accepts a connection and answers
+    its health URL with 200 — is adopted, the address moves to it, and
+    the round records which instance it verified.
+    """
+    endpoint = _HealthEndpoint()
+    try:
+        agent = _make_agent(tmp_path)
+        plan = _api_test_plan()
+        plan["services"] = [
+            {
+                "name": "api",
+                "port": 8080,
+                "start_cmd": "python -m api.server",
+                "cwd": ".",
+                "health_url": "http://127.0.0.1:8080/health",
+            },
+        ]
+        agent._normalize_service_declarations(plan)
+        agent._service_runtime_map = _runtime_map(ready=[("api", 8080)])
+        # The service is gone: the liveness recovery has to fire.
+        monkeypatch.setattr(
+            "service_freshness.probe_port", lambda port: _probe(False, port),
+        )
+        agent.start_verification_round(1)
+
+        import service_manager as sm
+
+        monkeypatch.setattr(
+            sm, "ensure_services",
+            lambda project, declarations, round_number=0, **kwargs:
+                _runtime_map(ready=[("api", endpoint.port)]),
+        )
+        monkeypatch.setattr(sm, "record_runtimes", lambda *a, **k: None)
+        dispatched: list = []
+        _spy_api_runner(monkeypatch, dispatched)
+
+        executor = agent._build_verification_executor(
+            agent._resolve_service_placeholders(plan)
+        )
+        results = _run_all_vps(executor)
+    finally:
+        endpoint.close()
+
+    assert dispatched == ["VP-001"], dispatched
+    assert results[0]["status"] == "PASSED", results[0]
+    # The verified instance is the one the round points at now.
+    assert agent._service_runtime_map.runtimes["api"].port == endpoint.port
+    assert agent._effective_declarations()["api"].port == endpoint.port
+    # ... and the round said which instance it verified.
+    verified = [
+        e for e in _log_entries(agent.plan_dir)
+        if e.get("event_type") == "service_reensure_verified"
+    ]
+    assert len(verified) == 1, verified
+    data = verified[0]["data"]
+    assert data["port"] == endpoint.port
+    assert data["pid"] == 100
+    assert data["boot_id"]
+    # The health URL was asked over the guarded road.
+    assert endpoint.requests == ["1"], endpoint.requests
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-25 — the re-ensure's result is adopted only when it is proven
+# ---------------------------------------------------------------------------
+#
+# The 2026-10-24 production round was graded on a question nobody had
+# asked: the service answered 200 on ``/health`` while the database
+# behind it held **zero** routing rows — so every assertion that
+# followed ran against an empty table, and the round reported the
+# project as broken.
+#
+# So a re-ensure's result is not adopted because it says ``ready``:
+# it is adopted because the instance on that port was **asked** and
+# answered.  These three cases are the ways that can go wrong:
+#
+#   1. the port has no listener — there is nothing there to ask;
+#   2. the health URL does not answer 200 — the service is not serving;
+#   3. the relocation failed — there is no instance at all, and the
+#      port the runtime names belongs to somebody else.
+#
+# In every case the round keeps its hands off the address it already
+# had: an address nobody serves is not an address a request may be
+# sent to.
+
+#: A program the service manager starts.  It answers ``/health`` and
+#: ``/health/data``, and reads both answers from files — so a test can
+#: change what a *running* instance says without restarting it.
+_SERVICE_PROGRAM = '''
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HEALTH_FILE = {health_file!r}
+ROWS_FILE = {rows_file!r}
+PORT = {port}
+
+
+def _read_int(path, default):
+    try:
+        with open(path) as fp:
+            return int(fp.read().strip())
+    except Exception:
+        return default
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        if self.path.split("?")[0].endswith("/health/data"):
+            status = 200
+            body = json.dumps({{
+                "status": "ok",
+                "plan_routing_rows": _read_int(ROWS_FILE, 0),
+                "instance": {{"boot_id": "boot-1234"}},
+            }}).encode()
+        else:
+            status = _read_int(HEALTH_FILE, 200)
+            body = b"{{\\"status\\": \\"ok\\"}}"
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+'''
+
+
+def _free_port() -> int:
+    """A port nothing is listening on right now."""
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _service_declaration(
+    tmp_path: Path, name: str, *, health: int, rows: int, timeout: int = 20,
+):
+    """A declaration whose service answers *health* and *rows*.
+
+    Returns ``(declaration, health_file, rows_file)``.  The two files
+    are how a test changes what the running instance says.
+    """
+    import shlex
+
+    from service_declaration import ServiceDeclaration
+
+    port = _free_port()
+    health_file = tmp_path / f"{name}-health"
+    rows_file = tmp_path / f"{name}-rows"
+    health_file.write_text(str(health), encoding="utf-8")
+    rows_file.write_text(str(rows), encoding="utf-8")
+    program = _SERVICE_PROGRAM.format(
+        port=port, health_file=str(health_file), rows_file=str(rows_file),
+    )
+    declaration = ServiceDeclaration(
+        name=name,
+        port=port,
+        start_cmd=f"{shlex.quote(sys.executable)} -c {shlex.quote(program)}",
+        cwd=".",
+        health_url=f"http://127.0.0.1:{port}/health",
+        ready_timeout_seconds=timeout,
+    )
+    return declaration, health_file, rows_file
+
+
+def _stop(sm, runtime, declaration) -> None:
+    """Stop a service the manager started, if it is still running."""
+    if not getattr(runtime, "pid", None):
+        return
+    try:
+        sm.stop_service(runtime, declaration)
+    except Exception:  # pragma: no cover - best-effort cleanup
+        pass
+
+
+class _ForeignListener:
+    """A process that holds a port and is nobody's business.
+
+    It answers like a service would, but its command line is the test
+    runner's — so the service manager cannot identify it as the
+    declared service, and gets out of its way.
+    """
+
+    def __init__(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):  # noqa: N802 - the handler API's own name
+                body = b'{"status": "ok"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):  # noqa: A003 - silence the log
+                pass
+
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever, daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def port(self) -> int:
+        return int(self._httpd.server_address[1])
+
+    def close(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+
+
+def test_reensure_not_adopted_when_port_has_no_listener(tmp_path, monkeypatch):
+    """A re-ensure that names a port nothing serves is not adopted.
+
+    The production round's re-ensure reported a service that was
+    **ready**, on a port (51725) nothing had ever listened on, and the
+    round adopted the address without asking.  The VPs then pointed at
+    it and were graded on the connection refusal.
+
+    So the result is asked, not believed: a port nobody serves is not
+    an address, and the round keeps the one it had.
+    """
+    import service_manager as sm
+    from service_declaration import ServiceDeclaration
+
+    # The round's own fixture holds four routing rows.
+    monkeypatch.setattr(
+        "service_freshness.expected_routing_rows", lambda *a, **k: 4,
+    )
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+
+    # The port is free and the start command exits at once: nothing ever
+    # listens there.
+    declaration = ServiceDeclaration(
+        name="api", port=_free_port(), start_cmd="false", cwd=".",
+        ready_timeout_seconds=2,
+    )
+    runtime_map = sm.ensure_services(
+        project_dir, {"api": declaration}, plan_dir=plan_dir,
+    )
+    runtime = runtime_map.runtimes["api"]
+    try:
+        assert runtime.ready is False, runtime.detail
+        assert runtime.usable is False, (
+            "a runtime that is not ready is not an address"
+        )
+        assert runtime_map.ready_names == [], (
+            "the round must not adopt an address nobody serves"
+        )
+        assert runtime.port in runtime_map.unready_ports
+        # ... and it knows what it found: no instance, no data plane.
+        assert getattr(runtime, "data_plane", None) is not None, (
+            "the re-ensure's result has to carry the data plane it found"
+        )
+        assert runtime.data_plane.proved is False
+    finally:
+        _stop(sm, runtime, declaration)
+
+
+def test_reensure_adopted_only_after_health_200(tmp_path, monkeypatch):
+    """The result is adopted once the instance answers — not before.
+
+    Three phases, one rule: the round adopts the address only after
+    the instance on it has been **asked** and has answered.
+
+      1. the health URL says 503 — the instance is up and not serving;
+      2. it says 200 and serves the round's four routing rows — adopted,
+         and the round records what it adopted;
+      3. it says 200 and serves **no** rows — not adopted.  Every
+         assertion that followed would have been graded against an
+         empty table, which is exactly how the 2026-10-24 round was
+         graded.
+    """
+    import service_manager as sm
+
+    monkeypatch.setattr(
+        "service_freshness.expected_routing_rows", lambda *a, **k: 4,
+    )
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+
+    # 1. The health URL says 503: the instance is up and not serving.
+    sick, _, _ = _service_declaration(
+        tmp_path, "api-sick", health=503, rows=4, timeout=3,
+    )
+    runtime_map = sm.ensure_services(
+        project_dir, {"api": sick}, plan_dir=plan_dir,
+    )
+    sick_runtime = runtime_map.runtimes["api"]
+    try:
+        assert sick_runtime.ready is False, sick_runtime.detail
+        assert sick_runtime.usable is False
+        assert runtime_map.ready_names == []
+    finally:
+        _stop(sm, sick_runtime, sick)
+
+    # 2. The same service answering 200 and serving the round's rows:
+    #    adopted, and the round can say what it adopted.
+    well, _, _ = _service_declaration(
+        tmp_path, "api-well", health=200, rows=4,
+    )
+    runtime_map = sm.ensure_services(
+        project_dir, {"api": well}, plan_dir=plan_dir,
+    )
+    well_runtime = runtime_map.runtimes["api"]
+    try:
+        assert well_runtime.ready is True, well_runtime.detail
+        assert well_runtime.usable is True
+        assert runtime_map.ready_names == ["api"]
+        assert well_runtime.data_plane is not None
+        assert well_runtime.data_plane.plan_routing_rows == 4
+        assert well_runtime.data_plane.boot_id == "boot-1234"
+    finally:
+        _stop(sm, well_runtime, well)
+
+    # 3. Health 200, but the instance serves no rows: not adopted.
+    hollow, _, _ = _service_declaration(
+        tmp_path, "api-hollow", health=200, rows=0, timeout=3,
+    )
+    runtime_map = sm.ensure_services(
+        project_dir, {"api": hollow}, plan_dir=plan_dir,
+    )
+    hollow_runtime = runtime_map.runtimes["api"]
+    try:
+        assert hollow_runtime.ready is False, hollow_runtime.detail
+        assert hollow_runtime.usable is False
+        assert runtime_map.ready_names == []
+        assert hollow_runtime.data_plane is not None
+        assert hollow_runtime.data_plane.verdict == sm.DATA_PLANE_EMPTY
+    finally:
+        _stop(sm, hollow_runtime, hollow)
+
+
+def test_failed_relocation_never_used(tmp_path, monkeypatch):
+    """A relocation that failed names a port that is not ours.
+
+    Somebody else holds the declared port, so the round gets out of the
+    way and starts its own copy elsewhere.  When **that** fails too,
+    the runtime it returns names the declared port — which is still
+    somebody else's.  That port must never be used as an address: the
+    runtime says so in a field, and the round blocks it.
+    """
+    import service_manager as sm
+    from service_declaration import ServiceDeclaration
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+
+    squatter = _ForeignListener()
+    try:
+        declaration = ServiceDeclaration(
+            name="api", port=squatter.port,
+            start_cmd="pdt-nonexistent-service-binary", cwd=".",
+            ready_timeout_seconds=1,
+        )
+        runtime_map = sm.ensure_services(
+            project_dir, {"api": declaration}, plan_dir=plan_dir,
+        )
+        runtime = runtime_map.runtimes["api"]
+    finally:
+        squatter.close()
+
+    assert runtime.origin == "failed", runtime.detail
+    assert runtime.unusable is True, (
+        "a relocation that could not place the service must say so in a "
+        "field; the port it names is somebody else's"
+    )
+    assert runtime.usable is False
+    assert runtime.ready is False
+    assert runtime.port == squatter.port, (
+        "the failed runtime names the declared port — and that port is "
+        "the stranger's"
+    )
+    assert runtime_map.ready_names == []
+    assert squatter.port in runtime_map.unready_ports
+    assert runtime_map.blocked_ports == [squatter.port], (
+        "the port the stranger holds must stay blocked"
+    )

@@ -117,6 +117,25 @@ VALID_PHASES = [
     "ready",
     "queued",
     "executing",
+    # 2026-10-24: ``waiting_for_quota`` — the plan is parked because
+    # every provider is out of capacity (HTTP 429). It is an
+    # execution-time state, not a workflow one: the plan has work left
+    # to do, but it cannot do it right now. Without a name for this the
+    # plan either stayed in ``executing`` (reading as live work that had
+    # silently stalled) or was pushed into a terminal phase (which
+    # throws away the work).
+    #
+    # It is NOT terminal — a parked plan can be restarted once capacity
+    # comes back — and it is deliberately NOT part of the verification
+    # sub-machine (see ``VERIFICATION_PHASE_TRANSITIONS`` below).
+    #
+    # 2026-10-26 (merge): 本分支的容量等待相位落进 main 的新词表。
+    # 它是**独立**相位，不是「等待相位」的一种 —— 「等人」在新词表里只有
+    # ``queued`` 一个名字（``ready`` 是历史别名，见 ``phase_vocabulary``），
+    # 而「等配额」说的是另一件事：工作没做完，但眼下没有 provider 有余量。
+    # 把它并进 ``queued`` 会让调度器把一个还欠着活的计划当成「等人开始」，
+    # 于是自动启动它 —— 而它一启动就会再撞一次 429。
+    "waiting_for_quota",
     # 2026-10-25: the verification branch's plan-doc review gate.
     #
     # A verification-branch plan does not run the dev task list first: it
@@ -271,7 +290,24 @@ PHASE_TRANSITIONS = {
     # 2026-10-25 (R10): ``executing`` / ``failed`` / ``stopped`` 三行都加
     # 上 ``queued`` —— 执行完、失败、停下之后都要能回到「等人」这个相位。
     # ``ready`` 仍然留着（磁盘上的历史状态照旧可读）。
-    "executing": ["completed", "failed", "stopped", "ready", "queued"],
+    #
+    # 2026-10-26 (merge): 加上 ``waiting_for_quota`` —— 执行期发现所有
+    # provider 都没余量了，计划停在这个相位上等人（容量回来再启动）。
+    "executing": ["completed", "failed", "stopped", "ready", "queued", "waiting_for_quota"],
+    # 2026-10-24: the parked-for-capacity state. Three ways out:
+    # ``executing`` (capacity came back — restart the work), ``ready``
+    # (pull it back to the manual gate), ``stopped`` (park it for
+    # good). No edge INTO it from ``ready`` — a plan that never started
+    # executing has no quota to wait for, and letting it claim the
+    # state would be a lie about what happened.
+    #
+    # 2026-10-26 (merge): 新词表里「等人」只有 ``queued`` 一个名字，``ready``
+    # 是历史别名，而 ``transition_to`` 会把目标归一化成 ``queued`` —— 所以
+    # 这里必须**同时**列出 ``ready`` 和 ``queued``：只列 ``ready`` 的话，
+    # 归一化后的目标 ``queued`` 不在允许集合里，「从等待配额退回人工闸门」
+    # 这条边会被当成非法转移而炸掉。语义与本分支原版一致（一条退到人工
+    # 闸门、一条重启、一条彻底停掉）。
+    "waiting_for_quota": ["executing", "ready", "queued", "stopped"],
     "completed": ["verification"],
     # 2026-10-23: ``failed`` → ``stopped`` — a plan whose executor
     # stamped ``failed`` can still be stopped by the operator, and the

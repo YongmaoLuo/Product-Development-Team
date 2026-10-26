@@ -158,7 +158,7 @@ def _drive_wrapper(tmp_path, monkeypatch, *, handed_off: bool):
     reap_calls: list = []
     monkeypatch.setattr(
         server, "_reap_managed_services",
-        lambda plan_id, plan_dir, reason: reap_calls.append(reason),
+        lambda plan_id, plan_dir, reason, **kwargs: reap_calls.append(reason),
     )
 
     def fake_inner(plan_id, plan_dir, project_dir, **kwargs):
@@ -190,6 +190,104 @@ def test_wrapper_defers_the_reap_when_a_repair_execution_is_in_flight(
     assert reap_calls == [], (
         "the plan's dev servers were reaped while its repair execution was "
         "still running; the reap belongs to whoever finishes the chain"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Whose services is the loop reaping? (2026-10-24)
+# ---------------------------------------------------------------------------
+
+
+def test_loop_exit_does_not_reap_a_newer_live_round(tmp_path, monkeypatch):
+    """The loop's exit must not stop a *newer* round's services.
+
+    Live incident (2026-10-24): the plan's api service was ready at
+    15:44:32 (pid 61127) and received SIGTERM at 15:45:19, while its own
+    round's first api_test did not run until 15:48:43 — so ``/health``
+    was refused at the TCP layer. The same shape had happened the round
+    before (pid 22593: started 14:41:58, killed 14:45:37).
+
+    The cause was outside the tested feature: the ledger recorded
+    "which processes the backend started for this plan", not "which
+    round started them", so an older round's exit-time reap read the
+    newer round's entries out of the one ledger the plan directory has
+    and stopped them.
+
+    This drives the real wrapper, the real ledger and the real reap.
+    """
+    import json
+
+    import server
+    import service_manager as sm
+    from service_freshness import PortProbe
+
+    plan_id = "plan-newer-round"
+    plan_dir = tmp_path / plan_id
+    plan_dir.mkdir()
+
+    # A newer round is running and owns the plan's api service.
+    newer = sm.new_owner_token("round")
+    sm.register_service_owner(plan_dir, newer)
+    sm.ledger_path(plan_dir).write_text(
+        json.dumps({
+            "plan_id": plan_id,
+            "services": [{
+                "name": "api", "port": 18090, "pid": 4242, "pgid": 4242,
+                "start_epoch": 1.0, "start_cmd": "python -m backend.server",
+                "cwd": ".", "log_path": "", "origin": "spawned",
+                "reap_on_exit": True, "owner_token": newer,
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: PortProbe(
+            port=p, listening=True, pids=[4242],
+            cmdlines=["python -m backend.server"],
+        ),
+    )
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(sm, "_process_group_of", lambda pid: pid)
+    stopped = []
+    monkeypatch.setattr(
+        sm, "stop_service",
+        lambda *a, **k: stopped.append(a) or {"port_free": True, "detail": ""},
+    )
+
+    monkeypatch.setattr(
+        server, "_run_auto_verification_loop_inner", lambda *a, **k: None,
+    )
+
+    # The anti-vacuity control: the reap must actually run, and it must
+    # run with the loop's own token — otherwise "nothing was stopped"
+    # would be true for the wrong reason.
+    reap_calls = []
+    real_reap = server._reap_services
+
+    def spy_reap(plan_dir_arg, plan_id_arg, **kwargs):
+        reap_calls.append((plan_id_arg, kwargs.get("owner_token")))
+        return real_reap(plan_dir_arg, plan_id_arg, **kwargs)
+
+    monkeypatch.setattr(server, "_reap_services", spy_reap)
+
+    server._run_auto_verification_loop(plan_id, plan_dir, tmp_path)
+
+    assert len(reap_calls) == 1, "the loop's exit must reap"
+    assert reap_calls[0][1], (
+        "the loop's reap must carry the loop's own token — without it the "
+        "reap cannot tell its services from a live round's"
+    )
+    assert stopped == [], (
+        "the loop's exit stopped the api service a newer, still-running "
+        "round owns — the service was SIGTERMed 47s after it came up and "
+        "before its own round's first api_test ran"
+    )
+    ledger = sm.read_ledger(plan_dir)
+    assert ledger["services"][0]["owner_token"] == newer, (
+        "the newer round's entry must survive in the ledger: its owner is "
+        "the one that reaps it"
     )
 
 
