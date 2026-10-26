@@ -212,7 +212,7 @@ def test_no_state_db_is_noop(monkeypatch, tmp_path):
 # Operator decision (an earlier plan parked at
 # verification_repairing with an empty repair list): a
 # ``no_repair_tasks`` stop reason means the user gate has nothing to
-# confirm.  Unfinished execution work → roll back to ``ready``
+# confirm.  Unfinished execution work → roll back to ``queued``
 # (operator resumes explicitly); nothing left → chain-ending terminal.
 
 
@@ -264,11 +264,11 @@ def test_dead_end_repairing_no_unfinished_tasks_goes_terminal(
         conn.close()
 
 
-def test_dead_end_repairing_with_unfinished_tasks_rolls_back_to_ready(
+def test_dead_end_repairing_with_unfinished_tasks_rolls_back_to_queued(
     seeded_stalled_plan,
 ):
     """repairing + no_repair_tasks + pending execution tasks → the
-    phase rolls back to ready, so the operator can resume execution
+    phase rolls back to queued, so the operator can resume execution
     explicitly (Ready != Start).
 
     2026-10-16 (schema v6): this test used to assert the phase TWICE —
@@ -289,9 +289,9 @@ def test_dead_end_repairing_with_unfinished_tasks_rolls_back_to_ready(
 
         row = RoutingRepository(conn).find(plan_id)
         assert row is not None
-        assert row["current_phase"] == "ready", (
+        assert row["current_phase"] == "queued", (
             f"a dead-ended verification_repairing row with unfinished "
-            f"work must roll back to ready, got {row['current_phase']!r}"
+            f"work must roll back to queued, got {row['current_phase']!r}"
         )
 
         # The mirror is gone, so the rollback cannot half-apply: assert

@@ -72,7 +72,13 @@ def _make_state_db(tmp_path: Path) -> Path:
 
 
 def _seed_plan(db_path: Path, plan_id: str, project_dir: Path) -> None:
-    """Insert the ``plan_routing`` / ``plan_execution`` rows ``start_execution`` needs."""
+    """Insert the ``plan_routing`` / ``plan_execution`` rows ``start_execution`` needs.
+
+    The seeded ``current_phase`` is ``queued``: ``start_execution``'s CAS only
+    accepts ``queued`` (plus the terminal re-entry phases), so a row left at
+    ``ready`` is refused with 409 and the watcher never starts. ``ready`` is
+    merely an *input* alias — the write path never produces it.
+    """
     from state_machine.db.connection import open as open_db
     from state_machine.db.schema import migrate
 
@@ -85,7 +91,7 @@ def _seed_plan(db_path: Path, plan_id: str, project_dir: Path) -> None:
             " review_rounds, flags, verification, last_updated, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                plan_id, None, "ready", 0, "[]",
+                plan_id, None, "queued", 0, "[]",
                 "{}", "{}",
                 json.dumps(
                     {"status": "pending", "round": 0, "max_rounds": 3, "stop_reason": None}

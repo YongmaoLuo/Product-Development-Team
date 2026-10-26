@@ -21,7 +21,7 @@
 
 钉住的东西
 ----------
-* ``test_infer_phase_order`` —— 四类目录的推断结果（ready / 审核阶段 / 原结果），
+* ``test_infer_phase_order`` —— 四类目录的推断结果（queued / 审核阶段 / 原结果），
   以及两类产物同时存在时的冲突报错；
 * ``test_verification_plan_json_is_not_doc`` —— VP 清单不触发审核阶段；
 * ``test_prefix_exclusion_allows_review_phase`` —— 前缀排除只排除新阶段；
@@ -109,12 +109,12 @@ def _vp_manifest(plan_dir: Path) -> None:
 
 
 def test_infer_phase_order(tmp_path):
-    """四类目录 → ready / 审核阶段 / 原结果；两类产物同时存在 → 冲突。"""
+    """四类目录 → queued / 审核阶段 / 原结果；两类产物同时存在 → 冲突。"""
     # (1) 只有 ``tasks.json`` —— 开发分支，既有判定不变。
     dev_dir = _make_plan_dir(tmp_path, "dev-only")
     (dev_dir / "tasks.json").write_text("{}", encoding="utf-8")
-    assert PlanState(dev_dir).get_current_phase() == "ready", (
-        "只有 tasks.json 时必须推断为 ready"
+    assert PlanState(dev_dir).get_current_phase() == "queued", (
+        "只有 tasks.json 时必须推断为 queued"
     )
 
     # (2) 只有计划书 —— 验证分支，停在审核阶段。

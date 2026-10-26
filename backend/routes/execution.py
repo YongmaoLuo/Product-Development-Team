@@ -789,7 +789,12 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
         except ValueError:
             current = ps.get_current_phase()
             if current in ("completed", "verification_passed", "verification_loop_stopped"):
-                ps.force_set_phase("ready")
+                # 2026-10-25 (R10): the phase a re-execution lands in
+                # must be one the start whitelist accepts — ``queued``.
+                # It used to be ``ready``, which the write path no
+                # longer produces: the plan was parked in a phase that
+                # could neither be started nor be picked up.
+                ps.force_set_phase("queued")
                 ps.transition_to("executing")
             else:
                 raise
@@ -814,7 +819,10 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
             # proceed normally.
             current = ps.get_current_phase()
             if current in ("completed", "verification_passed", "verification_loop_stopped"):
-                ps.force_set_phase("ready")
+                # 2026-10-25 (R10): same contract as the fallback
+                # above — the phase must be ``queued``, the only
+                # waiting phase the start whitelist accepts.
+                ps.force_set_phase("queued")
                 ps.transition_to("executing")
             else:
                 raise

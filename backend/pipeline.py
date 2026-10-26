@@ -102,7 +102,7 @@ class Pipeline:
             self.plan_state.transition_to("tasks_generation")
             print(f"已生成 {len(tasks_data.get('tasks', []))} 个任务")
             print(f"tasks.json 已保存到: {self.plan_dir / 'tasks.json'}\n")
-            self.plan_state.transition_to("ready")
+            self.plan_state.transition_to("queued")
         else:
             print("[跳过] 尚未满足任务生成条件\n")
 

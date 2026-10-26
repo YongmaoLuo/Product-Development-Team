@@ -261,7 +261,7 @@ def test_fresh_start_without_project_dir_still_400(env, client, spawn):
     work happens.
     """
     plans_dir, db_path = env
-    _seed_plan(plans_dir, db_path, phase="ready")
+    _seed_plan(plans_dir, db_path, phase="queued")
 
     resp = client.post(f"/api/execution/{PLAN_ID}/start", json={})
     assert resp.status_code == 400, resp.text
@@ -277,7 +277,7 @@ def test_fresh_start_keeps_the_published_response_shape(env, client, spawn):
     (see ``tests/api/test_start_endpoint.py::test_response_field_contract``).
     """
     plans_dir, db_path = env
-    plan_dir, project_dir = _seed_plan(plans_dir, db_path, phase="ready")
+    plan_dir, project_dir = _seed_plan(plans_dir, db_path, phase="queued")
 
     resp = client.post(
         f"/api/execution/{PLAN_ID}/start",

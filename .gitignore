@@ -149,6 +149,9 @@ site/
 # rather than left at the repo root.
 backend/tests/e2e/_artifacts/
 
+# E2E screenshots are runtime artifacts; never commit them.
+backend/tests/e2e/artifacts/
+
 # Project instructions for the operator running this checkout.
 #
 # Kept local on purpose: it carries the operator-policy sections (how to

@@ -135,8 +135,20 @@ class TestConcurrency:
 
         data_a = read_plan_routing_state("plan-a", state_db)
         data_b = read_plan_routing_state("plan-b", state_db)
-        assert data_a["current_phase"] in ("ready", "executing")
-        assert data_b["current_phase"] in ("ready", "executing")
+        # 2026-10-26 (R10): 断言的允许集合跟着相位词汇一起更新。
+        #
+        # worker 循环的最后一步是 ``transition_to("ready")``，而 R10 之后
+        # ``transition_to`` 在合法性检查**之前**把 ``ready`` 归一化成
+        # ``queued``（``phase_vocabulary.normalize_waiting_phase``）——
+        # ``ready`` 只是输入别名，写路径不再产生它。于是每轮循环的落点是
+        # ``queued``，断言里留着 ``ready`` 就是钉旧词汇，重跑永远不会转绿。
+        #
+        # 允许集合保留两个值：``executing`` 也是合法落点（并发下若最后一个
+        # 动作被调度截断，停在 ``executing`` 同样成立）。用例要证的仍然是
+        # 「两个计划的写入互不串扰」，所以两个 plan 各自的相位都要落在
+        # 合法集合里。
+        assert data_a["current_phase"] in ("queued", "executing")
+        assert data_b["current_phase"] in ("queued", "executing")
         assert isinstance(data_a, dict)
         assert isinstance(data_b, dict)
 

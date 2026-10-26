@@ -6,9 +6,10 @@ list — in whatever shape their own system produced it. This writes that
 material into the plan directory untouched, asks the same high-tier model
 ``POST /api/tasks/{plan_id}/generate`` uses to turn it into a
 ``SubTask`` list, audits the answer, and then **stops**. There is no
-``/start`` call here and nothing queued: the plan lands in ``ready``,
-which is the phase the product defines as "tasks exist, a human decides
-when to run them" (``plan_state.VALID_PHASES``).
+``/start`` call here: the plan lands in ``queued``, the one waiting
+phase (``plan_state.VALID_PHASES``) — the phase the scheduler collects
+from, and the phase a plan whose ``tasks.json`` exists infers for
+itself.
 
 Why generation rather than normalisation
 ----------------------------------------
@@ -41,8 +42,8 @@ Everything it touches is an existing, already-owned mechanism:
 * ``TaskManager.save_tasks`` - the writer every other task-producing path
   uses, including its cycle guard.
 * ``_server._seed_plan_routing_phase`` + ``_server.PlanState`` - the
-  plan-state store. Fast lane writes one phase and reuses the same
-  ``ready`` vocabulary the generated path lands on.
+  plan-state store. Fast lane writes one phase, and it is the same
+  ``queued`` the rest of the product parks a finished task list in.
 
 The request model lives here rather than in ``server.py`` because it is
 this feature's contract alone; ``server`` keeps the models the pre-existing
@@ -218,24 +219,32 @@ def _persist_tasks(plan_dir: Path, requirement: str, tasks_data: Dict[str, Any])
     return list(saved.get("tasks", []))
 
 
-def _mark_ready(plan_id: str, plan_dir: Path) -> None:
-    """Put the new plan in ``ready``, through the existing state store.
+def _mark_queued(plan_id: str, plan_dir: Path) -> None:
+    """Put the new plan in ``queued``, through the existing state store.
+
+    2026-10-25 (R10): the phase this lane writes is ``queued`` — the
+    one waiting phase, and the phase the scheduler collects from. The
+    lane used to write ``ready``, which is now only the *historical
+    alias* of ``queued``: a brand-new import is not legacy data, so the
+    write path must not speak the old word (every write of it would log
+    a deprecation and every reader of it would have to normalise it
+    back).
 
     ``_seed_plan_routing_phase`` is the idempotent ``INSERT OR IGNORE``
     the interview path uses; ``transition_to`` then resolves the phase
     through the same legality check every other transition goes through
     and is a no-op when the seed already landed. If SQLite is
     unavailable both fall back to the on-disk inference, which reads
-    ``tasks.json``'s existence as ``ready`` - the same answer.
+    ``tasks.json``'s existence as ``queued`` - the same answer.
     """
-    _server._seed_plan_routing_phase(plan_id, phase="ready")
+    _server._seed_plan_routing_phase(plan_id, phase="queued")
     try:
-        _server.PlanState(plan_dir).transition_to("ready")
+        _server.PlanState(plan_dir).transition_to("queued")
     except ValueError as exc:  # noqa: BLE001 - surfaced, never swallowed
         raise HTTPException(
             500,
             {
-                "error": "Plan imported but its state could not be set to ready",
+                "error": "Plan imported but its state could not be set to queued",
                 "detail": str(exc),
                 "plan_id": plan_id,
             },
@@ -306,13 +315,13 @@ def bind_hook_for_plan(
 
 @router.post("/api/plan/import")
 def import_plan(req: ImportPlanRequest):
-    """Import external upstream material as a new plan, parked in ``ready``.
+    """Import external upstream material as a new plan, parked in ``queued``.
 
     Skips interview / PRD / architecture / test-design generation — the
     caller's material stands in for all four. It does not skip validation:
     the generated list is audited, and one that would break at dispatch
     time is refused with one sentence per problem, without the plan ever
-    reaching ``ready``.
+    reaching ``queued``.
     """
     project_dir = (req.project_dir or "").strip()
     if not project_dir:
@@ -360,7 +369,7 @@ def import_plan(req: ImportPlanRequest):
     # read from the state store, and that is not a shortcut: ``_allocate_plan_id``
     # hands back a directory that did not exist a line ago, so there is
     # no prior state to read. Constructing a ``PlanState`` to ask would
-    # *create* the routing row this route is supposed to seed at ``ready``
+    # *create* the routing row this route is supposed to seed at ``queued``
     # later, at whatever phase an empty directory infers (``interview``),
     # and ``_seed_plan_routing_phase`` is INSERT OR IGNORE — so the read
     # would make the write a no-op and strand the plan in ``interview``.
@@ -450,15 +459,15 @@ def import_plan(req: ImportPlanRequest):
     warnings.extend(_harden_warnings(tasks_data))
 
     written = _persist_tasks(plan_dir, seed, tasks_data)
-    _mark_ready(plan_id, plan_dir)
+    _mark_queued(plan_id, plan_dir)
     # The plan's hook binding: the session it was created in, and where a
     # human-in-the-loop question about it goes.  Recorded once the plan
-    # exists — a plan that never reached ``ready`` is not a plan, and
+    # exists — a plan that never reached ``queued`` is not a plan, and
     # has nobody to ask.
     bind_hook_for_plan(plan_dir, req.hook_destination, req.hook_session_id)
     # Remember the conversation the import ran in, so a later revision
     # of this plan resumes it instead of starting over. Written last:
-    # a plan that never reached ``ready`` has nothing to revise.
+    # a plan that never reached ``queued`` has nothing to revise.
     store_import_session(plan_dir, session.session_id)
 
     return {

@@ -440,7 +440,7 @@ def test_spawn_failure_clears_the_pid(monkeypatch, tmp_path, state_db_reader):
     conn = open_db(tmp_path / "state.db")
     try:
         migrate(conn)
-        RoutingRepository(conn).insert(plan_id, "ready")
+        RoutingRepository(conn).insert(plan_id, "queued")
         ExecutionRepository(conn).update_fields(
             plan_id, create_if_missing=True,
             exec_pid=DEAD_PID, exec_status="running",

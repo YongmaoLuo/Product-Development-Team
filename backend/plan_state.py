@@ -17,6 +17,7 @@ SQLite (one-shot, atomic) and the file is ignored thereafter.
 import hashlib
 import importlib
 import json
+import logging
 import os
 import threading
 from datetime import datetime
@@ -26,6 +27,7 @@ from typing import Optional, List, Dict, Any
 
 from framework import clock as _framework_clock
 from config_paths import resolve_plans_dir, resolve_state_db_path
+from phase_vocabulary import log_deprecated_ready, normalize_waiting_phase
 from plan_artifacts import (
     BRANCH_CONFLICT,
     BRANCH_DEV,
@@ -44,6 +46,12 @@ from verification_plan_review import doc_sha256, prd_is_resolved
 # no string-concat bypass. This is the contract pinned by
 # backend/tests/test_plan_state_filename_constant.py.
 PLAN_STATE_FILENAME: str = "plan_state.json"
+
+#: 模块级 logger。
+#:
+#: 等待相位的弃用日志走它：``source`` 固定为 ``plan_state``，于是「谁在读
+#: 旧的 ``ready``」这个问题在日志里有一个稳定的来源名可检索。
+logger = logging.getLogger(__name__)
 
 
 def _state_db_path() -> Path:
@@ -87,20 +95,26 @@ VALID_PHASES = [
     "test_approved",
     "preflight_review",
     "tasks_generation",
+    # 2026-10-25 (R10): ``queued`` 是**唯一**的等待相位。
+    #
+    # 历史上「任务已生成、等人决定何时开始」这件事有两个名字：``ready``
+    # （人在等）与 ``queued``（交给调度器）。两套词汇说的是同一件事，于是
+    # 每处读路径都得各判一次「这是不是 ready」—— 判漏一处，就是一个卡在
+    # 旧相位里出不来、也没人认领的计划。
+    #
+    # ``ready`` 仍然留在 ``VALID_PHASES`` 里，但只作**输入别名**：既有数据
+    # 库里存着它，而 :meth:`PlanState.transition_to` 会把它归一化成
+    # ``queued``（``phase_vocabulary.normalize_waiting_phase``）。写路径不再
+    # 产生 ``ready``。
+    #
+    # 留着它的另一个理由：``_load_state_from_legacy_file`` 拿
+    # ``VALID_PHASES`` 判断旧文件里的相位是否合法 —— 从表里删掉它，旧文件里
+    # 的 ``ready`` 会被当成非法值，整条计划掉回 ``interview``。
+    #
+    # 2026-09-15 的调度器语义不变：``queued`` 是调度器的收件箱，只有停在
+    # 这个相位的计划会被自动启动（同一工作区一次一个，两条共享工作树的
+    # 计划因此不会同时跑、不会互相踩）。
     "ready",
-    # 2026-09-15: the auto-scheduling gate.
-    #
-    # ``ready`` means "tasks are generated and approved — a human decides
-    # when to start" (the operator asks the assistant, the assistant
-    # reports, the operator authorizes execution). ``queued`` is the
-    # explicit hand-off to the scheduler: only plans in this phase are
-    # auto-started, one at a time per workspace, so two plans sharing a
-    # working tree can never run concurrently and clobber each other.
-    #
-    # Transition graph: ready → queued (operator queues it),
-    # queued → ready (operator pulls it back out), queued → executing
-    # (the scheduler starts it). ``ready → executing`` is unchanged, so
-    # the manual path still works.
     "queued",
     "executing",
     # 2026-10-25: the verification branch's plan-doc review gate.
@@ -145,6 +159,9 @@ TERMINAL_PHASES = {"completed", "failed", "stopped"}
 #: 一行就多一个稳定标签，不加也只是回退，不会让任何阶段没有名字。
 PHASE_LABELS: Dict[str, str] = {
     "verification_plan_review": "计划书待审",
+    # 2026-10-25 (R10): 等待相位合并成 ``queued`` 之后，等待中的计划在
+    # 列表接口里有一个**显式桶**（「排队中」），不再靠启发式猜它属于哪一桶。
+    "queued": "排队中",
 }
 
 #: Historical phase values that are no longer written anywhere, mapped
@@ -246,19 +263,30 @@ PHASE_TRANSITIONS = {
     # 2026-09-15: ``queued`` is the auto-scheduler's inbox. The operator
     # can pull a plan back to ``ready`` (and take it off the queue), or
     # the scheduler/operator can start it directly.
+    #
+    # 2026-10-25 (R10): ``queued`` 是唯一的等待相位，``ready`` 只作输入
+    # 别名 —— 表里两个名字都在，但 ``transition_to`` 会把目标归一化成
+    # ``queued``，所以「ready → queued」这条边实际由 ``ready`` 这一行接住。
     "queued": ["ready", "executing", "stopped"],
-    "executing": ["completed", "failed", "stopped", "ready"],
+    # 2026-10-25 (R10): ``executing`` / ``failed`` / ``stopped`` 三行都加
+    # 上 ``queued`` —— 执行完、失败、停下之后都要能回到「等人」这个相位。
+    # ``ready`` 仍然留着（磁盘上的历史状态照旧可读）。
+    "executing": ["completed", "failed", "stopped", "ready", "queued"],
     "completed": ["verification"],
     # 2026-10-23: ``failed`` → ``stopped`` — a plan whose executor
     # stamped ``failed`` can still be stopped by the operator, and the
     # stop has to be able to park it.
-    "failed": ["executing", "ready", "stopped"],
-    "stopped": ["executing", "ready"],
+    "failed": ["executing", "ready", "stopped", "queued"],
+    "stopped": ["executing", "ready", "queued"],
 }
 
 VERIFICATION_PHASE_TRANSITIONS = {
     "ready": ["verification", "verification_running"],
-    "executing": ["verification", "completed", "failed", "stopped", "ready"],
+    # 2026-10-25 (R10): ``queued`` 是唯一的等待相位 —— 验证子机器里的
+    # ``executing`` / ``failed`` / ``stopped`` 同样要能回到它。表里的
+    # ``ready`` 保留（磁盘上的历史状态照旧可读），而 ``transition_to`` 会把
+    # 目标归一化成 ``queued``。
+    "executing": ["verification", "completed", "failed", "stopped", "ready", "queued"],
     # 2026-10-23: ``stopped`` is reachable from every verification
     # phase. A plan stopped in the middle of a round (or in the middle
     # of a repair) has to be able to park — otherwise the stop leaves
@@ -290,8 +318,8 @@ VERIFICATION_PHASE_TRANSITIONS = {
     # handled as an idempotent no-op earlier in ``transition_to``, and the
     # table itself must not declare one).
     "completed": ["verification_passed", "verification_failed"],
-    "failed": ["executing", "ready"],
-    "stopped": ["executing", "ready"],
+    "failed": ["executing", "ready", "queued"],
+    "stopped": ["executing", "ready", "queued"],
 }
 
 
@@ -544,11 +572,11 @@ class PlanState:
 
         Order matters and is fixed:
 
-        1. ``tasks.json`` (dev branch) → ``ready``;
+        1. ``tasks.json`` (dev branch) → ``queued``;
         2. ``verification-plan.md`` (verification branch) →
            ``verification_plan_review`` — the doc exists, so the plan is
            waiting for a human to accept / skip its items. It must NOT fall
-           back to ``prd_review`` / ``ready``;
+           back to ``prd_review`` / ``queued``;
         3. the legacy chain (``test-design.md`` / ``arch-design.md`` /
            ``review.json`` / ``prd.json`` / ``interview.json``) — unchanged,
            word for word.
@@ -556,6 +584,11 @@ class PlanState:
         The VP manifest (``verification_plan.json``) is **not** the plan doc:
         it is the machine translation of the doc, and it never puts a plan
         into the review phase.
+
+        2026-10-25 (R10): 分支 1 的结果从 ``ready`` 改成 ``queued`` ——
+        ``queued`` 是唯一的等待相位（``ready`` 只作输入别名）。检测器是**读**
+        路径：它给出的必须是现行词汇，否则一条刚建出来、还没落 routing 行的
+        计划会带着旧词进入系统。
 
         Raises:
             ArtifactConflictError: both ``tasks.json`` and
@@ -571,7 +604,7 @@ class PlanState:
                 actual=artifacts.branch,
             )
         if artifacts.branch == BRANCH_DEV:
-            return "ready"
+            return "queued"
         if artifacts.branch == BRANCH_VERIFICATION:
             return "verification_plan_review"
         if (self.plan_dir / "test-design.md").exists():
@@ -790,8 +823,28 @@ class PlanState:
         are deliberately NOT part of this entry: the generic
         ``POST /api/plan/{id}/phase`` route goes through here, and the PRD
         skip path must not be reachable from it.
+
+        2026-10-25 (R10): 入口先做**等待相位归一化**。``ready`` 是
+        ``queued`` 的历史别名 —— 既有数据库行里存着它，调用方也还在传它，
+        但写路径不再产生它。命中别名时：
+
+        * 打一条弃用日志（带 plan_id 与来源 ``plan_state``）：旧数据要能清得
+          掉，先得知道它在哪儿；
+        * 用归一化后的值继续 —— 归一化后与当前相位相同就是幂等 no-op，
+          不抛异常。
+
+        归一化在**合法性检查之前**：否则 ``transition_to('ready')`` 会拿旧词
+        去查表，而表里的等待相位写的是 ``queued``，一条本来合法的转移会以
+        「非法转移」的形式炸掉。
         """
-        self._transition_to(phase)
+        normalized, aliased = normalize_waiting_phase(phase)
+        if aliased:
+            log_deprecated_ready(
+                logger,
+                self._state.get("plan_id") or self.plan_dir.name,
+                "plan_state",
+            )
+        self._transition_to(normalized)
 
     def _transition_to(
         self,
@@ -909,12 +962,14 @@ class PlanState:
         if phase not in VALID_PHASES:
             raise ValueError(f"Invalid phase: {phase}")
 
+        # 2026-10-25 (R10): ``queued`` 进 ``phase_order`` —— 等待相位合并成
+        # ``queued`` 之后，回退到「等人」也必须是一个合法的落点。
         phase_order = [
             "interview", "interview_complete", "prd_generation",
             "prd_review", "prd_refining", "prd_approved",
             "arch_generation", "arch_review", "arch_refining", "arch_approved",
             "test_generation", "test_review", "test_refining", "test_approved",
-            "tasks_generation", "ready", "executing",
+            "tasks_generation", "ready", "queued", "executing",
         ]
         phase_idx = phase_order.index(phase)
 
@@ -979,7 +1034,7 @@ class PlanState:
             "prd_refining", "prd_approved", "arch_generation",
             "arch_review", "arch_refining", "arch_approved",
             "test_generation", "test_review", "test_refining",
-            "test_approved", "tasks_generation", "ready", "executing",
+            "test_approved", "tasks_generation", "ready", "queued", "executing",
         ]
 
     def is_prd_approved(self) -> bool:
@@ -987,19 +1042,19 @@ class PlanState:
             "prd_approved", "arch_generation", "arch_review",
             "arch_refining", "arch_approved", "test_generation",
             "test_review", "test_refining", "test_approved",
-            "tasks_generation", "ready", "executing",
+            "tasks_generation", "ready", "queued", "executing",
         ]
 
     def is_arch_approved(self) -> bool:
         return self.get_current_phase() in [
             "arch_approved", "test_generation", "test_review",
             "test_refining", "test_approved", "tasks_generation",
-            "ready", "executing",
+            "ready", "queued", "executing",
         ]
 
     def is_test_approved(self) -> bool:
         return self.get_current_phase() in [
-            "test_approved", "tasks_generation", "ready", "executing",
+            "test_approved", "tasks_generation", "ready", "queued", "executing",
         ]
 
     def is_ready_for_tasks(self) -> bool:

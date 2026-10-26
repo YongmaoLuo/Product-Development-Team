@@ -243,7 +243,7 @@ def test_list_plans_aggregates_four_tables(monkeypatch, tmp_path, clean_state):
 
     routing.insert(
         plan_id=plan_id,
-        phase="ready",
+        phase="queued",
         substage=None,
     )
     execution.insert(
@@ -308,8 +308,8 @@ def test_list_plans_aggregates_four_tables(monkeypatch, tmp_path, clean_state):
     )
     # Schema v6: current_phase comes from plan_routing (the authority),
     # not from a plan_execution mirror. The routing row above was seeded
-    # with phase="ready", so the API must report exactly that.
-    assert item.get("current_phase") == "ready", (
+    # with phase="queued", so the API must report exactly that.
+    assert item.get("current_phase") == "queued", (
         f"current_phase must come from plan_routing, got "
         f"{item.get('current_phase')!r}; full item={item!r}"
     )

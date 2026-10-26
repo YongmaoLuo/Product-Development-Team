@@ -211,6 +211,7 @@ body {
 .phase-prd { background: var(--warning-bg); color: var(--warning); }
 .phase-reviewed { background: var(--success-bg); color: var(--success); }
 .phase-ready { background: var(--primary-bg); color: var(--primary); }
+.phase-queued { background: var(--primary-bg); color: var(--primary); }
 .phase-default { background: var(--surface2); color: var(--text-dim); }
 
 .sidebar-plan-dots {
@@ -397,6 +398,10 @@ main#app > .loading {
 .plan-status.prd { background: var(--warning-bg); color: var(--warning); }
 .plan-status.reviewed { background: var(--success-bg); color: var(--success); }
 .plan-status.ready { background: var(--primary-bg); color: var(--primary); }
+/* The waiting bucket was renamed to `queued`; the badge keeps the same
+   colours it had under the old name, so a renamed bucket does not lose
+   its colour. */
+.plan-status.queued { background: var(--primary-bg); color: var(--primary); }
 
 .plan-requirement {
     font-size: 14px;

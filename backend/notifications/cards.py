@@ -185,6 +185,11 @@ VERIFICATION_TERMINAL_STATUSES = _VERIFICATION_TERMINAL_STATUSES
 # ``terminal_done``, …), which is how the card papered over the split
 # between the two state columns. ``current_phase`` is the only
 # workflow-state vocabulary now, so only its keys live here.
+#
+# 2026-10-25: ``ready`` left this table the way ``tasks_ready`` did.
+# It survives as an INPUT alias (callers may still send it; it is
+# normalised to ``queued`` upstream), but a phase the card renders has
+# exactly one spelling, and the waiting phase is spelled ``queued``.
 _PHASE_LABEL = {
     "interview": "📝 需求澄清",
     "prd_generation": "📄 PRD 生成",
@@ -194,10 +199,11 @@ _PHASE_LABEL = {
     "test_generation": "🧪 测试设计",
     "test_review": "🧪 测试审阅",
     "tasks_generation": "📋 任务生成",
-    "ready": "⏸ 就绪",
     # 2026-09-15: the queued gate — the plan is waiting
     # for the scheduler, which starts one plan at a time per workspace.
-    "queued": "🕒 已排队",
+    # 2026-10-25: the waiting phase is spelled the same way in every
+    # card vocabulary — 「排队中」.
+    "queued": "🕒 排队中",
     # Executing — single sub-state, but include the execution
     # phase hint so the user can distinguish running vs
     # failed vs completed inside the executing window.
@@ -238,9 +244,10 @@ _TERMINAL_FAILURE_PHASES = frozenset({
 # the verification family; see ``_unified_phase_section``.
 _EXECUTION_PHASE_LABEL = {
     "executing": "正在跑 tasks",
-    "ready": "准备启动",
     # 2026-09-15: queued plans are auto-started by the scheduler.
-    "queued": "已排队，等待调度",
+    # 2026-10-25: ``ready`` is an input alias, not a card phase — the
+    # waiting phase is spelled ``queued`` here too.
+    "queued": "排队中，等待调度",
     "failed": "执行失败",
     "completed": "执行已完成",
 }
@@ -1088,14 +1095,14 @@ def _resolve_header(
         "prd_generation": "PRD生成", "prd_review": "PRD审阅", "prd_approved": "PRD通过",
         "arch_generation": "架构设计", "arch_review": "架构审阅", "arch_approved": "架构通过",
         "test_generation": "测试设计", "test_review": "测试审阅", "test_approved": "测试通过",
-        "tasks_generation": "任务生成", "ready": "就绪", "queued": "已排队",
+        "tasks_generation": "任务生成", "queued": "排队中",
         "executing": "执行中",
     }.get(phase, phase)
     # Color: red if any failed task; orange if in-flight; else default blue.
     failed = tasks_info.get("failed", 0) or 0
     in_progress = tasks_info.get("in_progress", 0) or 0
     color = "blue"
-    if phase == "ready":
+    if phase == "queued":
         color = "green"
     elif phase == "completed":
         color = "green"

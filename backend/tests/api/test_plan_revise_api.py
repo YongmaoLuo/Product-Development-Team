@@ -321,7 +321,7 @@ def test_a_revision_lands_in_the_same_plan_directory(
 
     # The plan's place in the world is unchanged: same phase, nothing
     # running, no execution row.
-    assert state_db_reader.routing(plan_id)["current_phase"] == "ready"
+    assert state_db_reader.routing(plan_id)["current_phase"] == "queued"
     assert state_db_reader.execution(plan_id) is None
     assert plan_id not in server._execution_state
 

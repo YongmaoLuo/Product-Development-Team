@@ -13,7 +13,7 @@ dict.  The state-machine refactor replaces both with the
 Architecture decision point 3 pins the contract:
 
   * ``POST /api/execution/{id}/start`` must call
-    ``RoutingRepository.try_mark_phase(pid, ('ready',
+    ``RoutingRepository.try_mark_phase(pid, ('queued',
     'failed', 'completed'), 'executing', ...)`` — the
     CAS predicate makes concurrent ``start`` calls safe (1 wins, 1
     fails with 409).
@@ -27,8 +27,8 @@ Architecture decision point 3 pins the contract:
 
 TDD spec (4 tests, the same ones pinned by the task brief):
 
-  1. test_start_execution_succeeds_from_ready
-     A plan with ``stage=ready`` accepts ``start`` and the
+  1. test_start_execution_succeeds_from_queued
+     A plan with ``stage=queued`` accepts ``start`` and the
      stage CAS-advances to ``executing``; ``plan_execution`` carries
      the new ``current_phase=executing`` and ``project_dir``.
 
@@ -191,15 +191,15 @@ def _seed_plan(
 
 
 # ---------------------------------------------------------------------------
-# 1. test_start_execution_succeeds_from_ready
+# 1. test_start_execution_succeeds_from_queued
 # ---------------------------------------------------------------------------
 
 
-def test_start_execution_succeeds_from_ready(execution_env):
-    """stage=ready + POST /api/execution/{id}/start → 200 + CAS advances."""
+def test_start_execution_succeeds_from_queued(execution_env):
+    """stage=queued + POST /api/execution/{id}/start → 200 + CAS advances."""
     plans_dir, conn, _db_path = execution_env
     plan_id = "20260810-tasks-ready-plan"
-    _seed_plan(plans_dir, conn, plan_id, "ready")
+    _seed_plan(plans_dir, conn, plan_id, "queued")
 
     project_dir = plans_dir / "project" / plan_id
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -257,12 +257,12 @@ def test_start_execution_409_when_already_executing(execution_env):
     to two executors racing on the same plan.  The CAS in
     ``RoutingRepository.try_mark_phase`` rejects the second call
     because ``stage='executing'`` is NOT in
-    ``expected_phases=('ready', 'failed',
+    ``expected_phases=('queued', 'failed',
     'completed')``.
     """
     plans_dir, conn, _db_path = execution_env
     plan_id = "20260810-twice-start"
-    _seed_plan(plans_dir, conn, plan_id, "ready")
+    _seed_plan(plans_dir, conn, plan_id, "queued")
 
     project_dir = plans_dir / "project" / plan_id
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -350,7 +350,7 @@ def test_progress_reflects_db_state_immediately(execution_env):
     """
     plans_dir, conn, _db_path = execution_env
     plan_id = "20260810-progress-from-db"
-    _seed_plan(plans_dir, conn, plan_id, "ready")
+    _seed_plan(plans_dir, conn, plan_id, "queued")
 
     project_dir = plans_dir / "project" / plan_id
     project_dir.mkdir(parents=True, exist_ok=True)

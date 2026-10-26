@@ -3,7 +3,7 @@
 背景
 ----
 ``plan_routing.current_phase`` 是阶段权威列，但侧栏此前按「文档存在性」**猜**
-``status``（有 ``tasks.json`` → ``ready``，有 ``review.json`` → ``reviewed``，…）。
+``status``（有 ``tasks.json`` → ``queued``，有 ``review.json`` → ``reviewed``，…）。
 猜出来的桶不认识计划书审核阶段，于是这个新阶段在列表里被标成 ``reviewed`` ——
 一个没有发生过的阶段。
 
@@ -231,7 +231,9 @@ def test_list_bucket_unchanged_for_phase_without_label(seed_plan):
 
     显式桶只给「阶段带稳定标签」的计划（``plan_state.PHASE_LABELS``）。
     其它阶段的列表词汇一个都不许变 —— 否则每一次给某个阶段补标签，
-    列表里所有既有计划的桶都会跟着换词。
+    列表里所有既有计划的桶都会跟着换词。等待桶本身是**改过名**的：
+    等待相位合并成 ``queued`` 之后，「有 ``tasks.json``」猜出来的桶跟着
+    换成 ``queued`` —— 说的是同一件事（旧词 ``ready``），但用的是现行词。
 
     阶段列仍然说阶段自己的话：``current_phase`` 取 routing 列的权威值，
     桶取启发式。两者不再共用一个词，但它们各说各的事实。
@@ -246,8 +248,9 @@ def test_list_bucket_unchanged_for_phase_without_label(seed_plan):
     assert resp.status_code == 200, resp.text
     entry = _entry(resp.json(), plan_id)
 
-    assert entry["status"] == "ready", (
-        "没有稳定标签的阶段，桶必须仍是既有启发式（有 tasks.json → ready）；"
+    assert entry["status"] == "queued", (
+        "没有稳定标签的阶段，桶必须仍是既有启发式（有 tasks.json → queued，"
+        "等待相位合并后桶跟着现行词走）；"
         f"实际是 {entry.get('status')!r}"
     )
     assert entry["current_phase"] == "verification", entry

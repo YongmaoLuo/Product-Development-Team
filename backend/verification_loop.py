@@ -3652,23 +3652,29 @@ def _count_unfinished_execution_tasks(plan_id: str) -> int:
         return 0
 
 
-def _rollback_dead_end_to_ready(
+def _rollback_dead_end_to_queued(
     plan_id: str,
     unfinished_count: int,
     stop_reason: str,
     log_tag: str = "dead_end",
 ) -> bool:
-    """Roll a dead-ended verification plan back to ``ready``.
+    """Roll a dead-ended verification plan back to ``queued``.
 
     2026-09-14 when verification terminates with
     ``no_repair_tasks`` the plan must NOT strand on the user-gated
     ``verification_repairing`` phase — that gate only makes sense when
     there are repair tasks to confirm.  If execution work remains
     (``unfinished_count > 0``) the routing phase is CAS'd back to
-    ``ready`` (the resumable-execution state ``/start`` accepts,
+    ``queued`` (the resumable-execution state ``/start`` accepts,
     server.py start_execution contract), so the operator can resume
     execution with an explicit ``POST /api/execution/{plan_id}/start``.
     We deliberately do NOT auto-start the executor — Ready != Start.
+
+    2026-10-25 (R10): the target used to be spelled ``ready``.  The
+    waiting phase is ``queued`` now and ``ready`` is only an INPUT
+    alias of it (``backend/phase_vocabulary.py``) — the write path
+    must not produce the retired word, so the function is renamed to
+    match what it actually writes.
 
     Returns True when the rollback CAS was applied; False when the row
     was already advanced by another writer (conflict) or any error
@@ -3692,7 +3698,7 @@ def _rollback_dead_end_to_ready(
                     "verification_running",
                     "verification_repairing",
                 ),
-                "ready",
+                "queued",
             )
         finally:
             conn.close()
@@ -3716,10 +3722,16 @@ def _rollback_dead_end_to_ready(
     # allowed to fail silently cannot be a copy worth keeping.  With
     # ``GET /api/plans`` reading the routing column there is nothing
     # left for it to reconcile.
+    #
+    # 2026-10-25 (R10): the phase the CAS above writes is spelled
+    # ``queued`` now (it was ``ready`` when the 2026-10-16 note was
+    # written) — the waiting phase was renamed and ``ready`` is now
+    # only an input alias.  The mirror is still gone, and for exactly
+    # the same reason.
 
     _server.logger.warning(
         f"[{log_tag}] plan=%s verification stopped (%s) with %d "
-        "unfinished task(s) — rolled back to ready; resume "
+        "unfinished task(s) — rolled back to queued; resume "
         "with POST /api/execution/{plan_id}/start",
         plan_id, stop_reason, unfinished_count,
     )
@@ -3779,10 +3791,10 @@ def _dead_end_terminal(
     fallback.
 
     ``rollback_to_ready=False`` (2026-09-17) suppresses the
-    ``ready`` rollback on that same branch. The rollback exists so
-    an OPERATOR can resume a parked plan via ``POST
+    waiting-phase (``queued``) rollback on that same branch. The
+    rollback exists so an OPERATOR can resume a parked plan via ``POST
     /api/execution/{plan_id}/start``; but that endpoint's CAS accepts
-    ``ready`` and has **no verification-liveness guard**, so
+    ``queued`` and has **no verification-liveness guard**, so
     leaving the row there while the auto-loop runs another verification
     round opens a window where an operator restart spawns an executor
     into a mid-flight verification. A plan that is still being worked on
@@ -3800,12 +3812,12 @@ def _dead_end_terminal(
     unfinished = _count_unfinished_execution_tasks(plan_id)
     if unfinished > 0:
         if rollback_to_ready:
-            _rollback_dead_end_to_ready(plan_id, unfinished, reason)
+            _rollback_dead_end_to_queued(plan_id, unfinished, reason)
         else:
             _server.logger.warning(
                 "[dead_end] plan=%s has %d unfinished execution task(s); "
-                "NOT rolling routing back to ready — the auto-loop "
-                "re-enters verification, and ready is a phase "
+                "NOT rolling routing back to queued — the auto-loop "
+                "re-enters verification, and queued is a phase "
                 "/execution/start would CAS away underneath it",
                 plan_id, unfinished,
             )
@@ -5259,7 +5271,7 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
     _server.PlanState(plan_dir)
 
     # 2026-09-11 plan v9 (Bug 2 fix): CAS ``plan_routing.current_phase``
-    # from ``executing`` (or ``ready`` for the partial-completion
+    # from ``executing`` (or ``queued`` for the partial-completion
     # edge case) into ``verification``. Without this CAS the routing
     # layer keeps reporting ``current_phase=executing`` even after the
     # verification round has begun, confusing downstream consumers
@@ -5268,6 +5280,12 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
     # ``route.current_phase == "executing"``). The CAS is best-effort:
     # ``ConflictError`` means another writer already advanced the
     # routing row, which is fine — we keep going.
+    #
+    # 2026-10-25 (R10): the source set follows the phase rename —
+    # ``queued`` replaces ``ready``.  A plan rolled back by
+    # ``_rollback_dead_end_to_queued`` now sits on ``queued``, and the
+    # verification start has to accept it or the plan would be unable
+    # to enter verification and would strand there.
     try:
         from state_machine.db.connection import open as _open_db_routing
         from state_machine.db.schema import migrate as _migrate_routing
@@ -5280,7 +5298,7 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
             _migrate_routing(_rc)
             RoutingRepository(_rc).try_mark_phase(
                 plan_id,
-                ("executing", "ready"),
+                ("executing", "queued"),
                 "verification",
             )
         except _RoutingConflictError:

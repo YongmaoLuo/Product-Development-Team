@@ -12,8 +12,8 @@ a direct call into ``routes.fast_lane.import_plan``):
    into ``SubTask`` fields itself would pass every other assertion here
    while never calling anything.
 2. **A broken answer is refused, per problem.** A 422 whose body lists
-   what to fix, and which never reaches ``ready``.
-3. **Nothing runs.** The plan stops in ``ready``. Asserted three ways,
+   what to fix, and which never reaches ``queued``.
+3. **Nothing runs.** The plan stops in ``queued``. Asserted three ways,
    because "did not start execution" is the kind of claim a single green
    assertion cannot support: the plan's phase, the absence of a
    ``plan_execution`` row, and the absence of any entry in the server's
@@ -179,7 +179,7 @@ SHAPES = [
 
 
 @pytest.mark.parametrize("label,content", SHAPES, ids=[s[0] for s in SHAPES])
-def test_material_of_any_shape_lands_as_a_ready_plan(
+def test_material_of_any_shape_lands_as_a_queued_plan(
     plans_root, checkout, monkeypatch, state_db_reader, label, content
 ):
     """The whole point of the lane, in one request per input shape.
@@ -222,7 +222,7 @@ def test_material_of_any_shape_lands_as_a_ready_plan(
     assert all(t.project_dir == str(checkout) for t in parsed)
 
     # Parked, not running.
-    assert state_db_reader.routing(plan_id)["current_phase"] == "ready"
+    assert state_db_reader.routing(plan_id)["current_phase"] == "queued"
     assert state_db_reader.execution(plan_id) is None
     assert plan_id not in server._execution_state
     assert server._execution_state == {}
@@ -378,11 +378,11 @@ def test_a_second_import_of_the_same_title_does_not_overwrite_the_first(
 # ---------------------------------------------------------------------------
 
 
-def _assert_not_ready(plan_id, state_db_reader):
-    """``ready`` is the one phase the lane may park a plan in, so its
+def _assert_not_queued(plan_id, state_db_reader):
+    """``queued`` is the one phase the lane may park a plan in, so its
     absence is the whole "nothing happened" claim, read from the store."""
     routing = state_db_reader.routing(plan_id)
-    assert routing is None or routing["current_phase"] != "ready"
+    assert routing is None or routing["current_phase"] != "queued"
     assert state_db_reader.execution(plan_id) is None
 
 
@@ -395,7 +395,7 @@ def test_a_model_that_returned_no_tasks_is_refused(
 
     assert response.status_code == 422
     assert "0 tasks" in response.json()["detail"]
-    _assert_not_ready(response.json()["plan_id"], state_db_reader)
+    _assert_not_queued(response.json()["plan_id"], state_db_reader)
 
 
 def test_a_generated_list_that_fails_the_audit_is_refused(
@@ -419,7 +419,7 @@ def test_a_generated_list_that_fails_the_audit_is_refused(
 
     assert response.status_code == 422
     assert response.json()["problems"] == ["dependency cycle between tasks: A, B"]
-    _assert_not_ready(response.json()["plan_id"], state_db_reader)
+    _assert_not_queued(response.json()["plan_id"], state_db_reader)
 
 
 def test_a_generated_task_with_no_test_command_is_refused(
@@ -437,7 +437,7 @@ def test_a_generated_task_with_no_test_command_is_refused(
         "needs a test_command" in problem
         for problem in response.json()["problems"]
     )
-    _assert_not_ready(response.json()["plan_id"], state_db_reader)
+    _assert_not_queued(response.json()["plan_id"], state_db_reader)
 
 
 def test_a_generated_task_naming_another_checkout_is_refused(
@@ -456,7 +456,7 @@ def test_a_generated_task_naming_another_checkout_is_refused(
         "differs from the request's" in problem
         for problem in response.json()["problems"]
     )
-    _assert_not_ready(response.json()["plan_id"], state_db_reader)
+    _assert_not_queued(response.json()["plan_id"], state_db_reader)
 
 
 def test_a_generated_task_pointing_nowhere_is_refused(
@@ -477,7 +477,7 @@ def test_a_generated_task_pointing_nowhere_is_refused(
     assert response.status_code == 422
     assert response.json()["error"] == "Generated tasks are not runnable"
     assert "project_dir does not exist" in str(response.json()["error_payload"])
-    _assert_not_ready(response.json()["plan_id"], state_db_reader)
+    _assert_not_queued(response.json()["plan_id"], state_db_reader)
 
 
 def test_a_list_without_a_project_dir_is_refused(plans_root, monkeypatch):
@@ -554,5 +554,5 @@ def test_the_import_path_never_reaches_the_executor_entry_point():
     for forbidden in ("start_execution", "_spawn_executor_subprocess", "subprocess"):
         assert forbidden not in source, (
             f"routes/fast_lane.py references {forbidden!r}; the import lane "
-            "must stop at ready and never reach the executor"
+            "must stop at queued and never reach the executor"
         )
