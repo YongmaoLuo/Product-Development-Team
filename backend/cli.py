@@ -7,8 +7,12 @@ CLI for autonomous coding skill.
 
 import argparse
 import json
+import logging
+import math
 import os
+import signal
 import sys
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -19,6 +23,7 @@ import credentials
 from rollback_manager import RollbackManager
 from config_registry import ConfigRegistry
 from config_loader import load_config_by_name
+from coding_tool import stop_all_live_dispatches
 from execution_logger import get_logger
 from request_guard import REQUEST_HEADER, REQUEST_HEADER_VALUE
 
@@ -279,6 +284,214 @@ Examples:
     return parser
 
 
+# ---------------------------------------------------------------------------
+# Stopping: what the executor does when the server says "stop"
+# ---------------------------------------------------------------------------
+#
+# The server stops an execution by sending SIGTERM to the executor's
+# process group.  Before this existed the executor had **no signal
+# handling at all**: the SIGTERM killed it on the spot, the ``finally``
+# blocks and ``cleanup()`` never ran, and the ``claude`` child — which
+# is spawned with ``start_new_session=True`` and therefore sits in its
+# *own* process group, out of reach of the signal the server sent —
+# stayed behind as an orphan, still burning tokens on a task nobody was
+# waiting for any more.
+#
+# So the executor has to stop its own children before it goes.  The
+# cooperative sequence that does it lives in ``coding_tool``
+# (:func:`coding_tool.stop_all_live_dispatches`): it closes the child's
+# stdout, escalates to SIGTERM and then to SIGKILL of the child's
+# process group, splitting its budget 0.35 / 0.25 / 0.10 — 0.7 of the
+# budget in total.
+#
+# The budget is the server's own grace window
+# (``PDT_STOP_GRACE_SECONDS``, default 10s), inherited through the
+# environment: the server spawns the executor with
+# ``env={**os.environ, ...}``.  The sequence has to finish *inside*
+# that window, because a sequence that runs past it gets its process
+# group SIGKILLed by the server — and that hard kill is exactly the
+# outcome (a forced stop instead of a clean one) this mechanism exists
+# to avoid.
+#
+# This is a deliberate deviation from the upstream wording ("wait the
+# grace, then SIGTERM, then wait 5 more seconds, then SIGKILL"): taken
+# literally, that sequence cannot fit inside the window it is measured
+# against.  The order is kept — the child gets a chance to leave on
+# its own terms first — and the total is what shrinks.
+#
+# The handler has a hard limit of its own (0.9 of the budget): whatever
+# the sequence does, the executor is gone by then.  A stop path that can
+# hang is a stop path that leaves the orphan behind.
+
+#: The env var carrying the server's grace window into the executor.
+_STOP_GRACE_ENV = "PDT_STOP_GRACE_SECONDS"
+
+#: The budget used when the environment says nothing usable.
+_STOP_GRACE_DEFAULT_SECONDS = 10.0
+
+#: Bounds for the budget.  The floor keeps each stage of the sequence
+#: long enough to mean something; the ceiling keeps a fat-fingered
+#: configuration from parking the stop path for a minute.
+_STOP_GRACE_MIN_SECONDS = 2.0
+_STOP_GRACE_MAX_SECONDS = 60.0
+
+#: How much of the budget the handler waits for the stop sequence.
+#: Below 1.0, so the executor is always gone before the server's own
+#: window closes — and therefore before the server's SIGKILL.
+_STOP_SEQUENCE_WAIT_FRACTION = 0.9
+
+#: The exit code of a SIGTERM-stopped executor: 128 + SIGTERM(15).
+_STOP_EXIT_CODE = 143
+
+#: Whether the handler is installed.  Installing twice must not stack a
+#: second handler on top of the first — the second would call the first,
+#: and the stop sequence would run twice over the same children.
+_stop_handler_installed = False
+
+#: Whether a stop sequence is already running.  A second SIGTERM during
+#: the sequence must not start another one.
+_stop_in_progress = False
+
+#: The logger for this module's own messages.  Named apart from the
+#: ``logger`` local in :func:`main` (which is the per-plan execution
+#: logger) so the two cannot be confused for one another.
+_stop_logger = logging.getLogger(__name__)
+
+
+def _stop_grace_seconds() -> float:
+    """Return the stop budget in seconds: how long the whole stop may take.
+
+    Read from the environment on every call rather than at import time,
+    so the executor sees the value the server was configured with and a
+    test can change it without reimporting the module.
+
+    A missing, empty, non-numeric or non-positive value falls back to
+    the default rather than to something smaller: "don't wait at all" is
+    the opposite of what the cooperative stop is for, and a zero budget
+    would skip the grace the children need to leave on their own.  Every
+    usable value is clamped into ``[2, 60]`` seconds — the same bounds
+    the sequence itself applies, so a fat-fingered configuration cannot
+    park the executor in a stop path for a minute.
+    """
+    raw = os.environ.get(_STOP_GRACE_ENV)
+    if raw is None or not raw.strip():
+        return _STOP_GRACE_DEFAULT_SECONDS
+    try:
+        budget = float(raw)
+    except (TypeError, ValueError):
+        return _STOP_GRACE_DEFAULT_SECONDS
+    # NaN fails every comparison, so it has to be excluded explicitly.
+    if not math.isfinite(budget) or budget <= 0:
+        return _STOP_GRACE_DEFAULT_SECONDS
+    return min(max(budget, _STOP_GRACE_MIN_SECONDS), _STOP_GRACE_MAX_SECONDS)
+
+
+def _exit_now(code: int) -> None:
+    """Leave the process right now, with ``code``.
+
+    ``os._exit`` and not ``sys.exit``: unwinding the stack would run
+    the ``finally`` blocks of whatever the executor was in the middle
+    of, and one of those may block on a child that is already gone.
+    The process is leaving because it was told to stop; there is
+    nothing left to unwind, and a stop that hangs is a stop that
+    leaves the orphan behind.
+    """
+    try:
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001 — a broken stream must not stop the exit
+        pass
+    try:
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 — ditto
+        pass
+    os._exit(code)
+
+
+def _stop_live_dispatches(budget: float) -> None:
+    """Run the cooperative stop sequence.  Never raises.
+
+    This runs on the stop thread, where an escaping exception would be
+    printed by the threading machinery and the executor would carry on
+    as if nothing had happened.  It has to be logged and swallowed: the
+    handler's job is to make the executor go away, and children it
+    failed to stop are the server's business to reap.
+    """
+    try:
+        stop_all_live_dispatches(budget)
+    except Exception:  # noqa: BLE001 — the exit below must still happen
+        _stop_logger.warning(
+            "[stop] the cooperative stop sequence failed; exiting anyway",
+            exc_info=True,
+        )
+
+
+def _on_sigterm(signum, frame) -> None:
+    """Stop the children, then leave.  Installed as the SIGTERM handler.
+
+    The sequence runs on its own thread and the handler waits for it
+    with a hard limit (0.9 of the budget): the sequence's own budget
+    covers the children's exit, but a handler that waited without a
+    limit would wait forever if the sequence wedged.
+
+    A second SIGTERM means "stop waiting".  The sequence is already
+    running, and running it again would only keep the executor around
+    longer — the second signal exits at once.
+    """
+    global _stop_in_progress
+
+    if _stop_in_progress:
+        _exit_now(_STOP_EXIT_CODE)
+        return
+
+    _stop_in_progress = True
+
+    try:
+        budget = _stop_grace_seconds()
+        worker = threading.Thread(
+            target=_stop_live_dispatches,
+            args=(budget,),
+            name="pdt-stop-sequence",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=budget * _STOP_SEQUENCE_WAIT_FRACTION)
+    except Exception:  # noqa: BLE001 — the executor must still leave
+        _stop_logger.warning(
+            "[stop] could not run the stop sequence; exiting anyway",
+            exc_info=True,
+        )
+
+    _exit_now(_STOP_EXIT_CODE)
+
+
+def install_stop_handler() -> None:
+    """Install the SIGTERM handler.  Idempotent.
+
+    Installing twice would stack a second handler on top of the first,
+    and the sequence would run twice over the same children.  Only the
+    executor's own run installs this: the subcommands (``rollback``,
+    ``secrets``, ``verification``, ...) return long before anything
+    could be signalled.
+    """
+    global _stop_handler_installed
+
+    if _stop_handler_installed:
+        return
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError, RuntimeError):
+        # Not the main thread, or the platform refuses.  A handler that
+        # cannot be installed is no reason to refuse to run.
+        _stop_logger.warning(
+            "[stop] could not install the SIGTERM handler; continuing",
+            exc_info=True,
+        )
+        return
+
+    _stop_handler_installed = True
+
+
 def main():
     """Main entry point for CLI."""
     from env_config import load_env
@@ -324,6 +537,13 @@ def main():
     logger = get_logger()
 
     tasks_file = Path(args.tasks_file) if args.tasks_file else None
+
+    # Install the stop handler *before* the run starts.  The executor is
+    # the process the server signals, and a handler installed after the
+    # first task had begun would miss the very signal it exists to
+    # answer — leaving the ``claude`` child running with nobody left to
+    # stop it.
+    install_stop_handler()
 
     autonomous_coding(
         requirement=args.requirement,

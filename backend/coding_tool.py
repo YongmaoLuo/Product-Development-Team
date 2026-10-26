@@ -10,6 +10,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -250,6 +251,236 @@ def _unregister_dispatch(registry, plan_id: Optional[str], handle) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Live dispatch registry + cooperative stop (2026-10-26)
+# ---------------------------------------------------------------------------
+# The ``claude`` child is spawned with ``start_new_session=True``, so it
+# sits in its **own** process group. A SIGTERM the executor receives
+# therefore never reaches it — the executor's signal handler has to stop
+# the child itself. If it does not, the server's ``_kill_process_tree``
+# waits out the whole grace window and then hard-kills the group:
+# ``hard_killed`` flips to True and a resumable stop degrades into a
+# full rerun.
+#
+# So the executor needs two things that did not exist before:
+#
+#   1. a **registry** of the tools that currently own a live dispatch
+#      (:data:`_LIVE_DISPATCH_TOOLS`), so a stop can find *every* child
+#      that is running. ``cleanup()`` only ever knew about one tool's
+#      own ``_current_process``, and nothing a signal handler could
+#      call;
+#   2. an **entry point** a signal handler can call
+#      (:func:`stop_all_live_dispatches`), which stops every registered
+#      child cooperatively.
+#
+# "Cooperatively" means: close the child's stdout first — the CLI sees
+# the broken pipe and exits on its own — and only escalate to signals if
+# it does not. The whole sequence is bounded by a budget split
+# 0.35 / 0.25 / 0.10, i.e. 0.7 of the budget in total. The caller
+# derives that budget from the server's grace window
+# (``PDT_STOP_GRACE_SECONDS``); the 0.7 factor is what keeps the
+# sequence *inside* it.
+
+#: The tools that currently own an in-flight dispatch subprocess.
+#:
+#: Keyed by ``id(tool)`` so that registering the same tool twice is
+#: idempotent (one tool → one entry) while the value keeps the tool
+#: itself — which is what the stop path needs in order to reach
+#: ``_current_process``. Removal is by identity, so a stale id can
+#: never unregister a *different* tool that happens to reuse it.
+_LIVE_DISPATCH_TOOLS: Dict[int, Any] = {}
+
+#: Guards :data:`_LIVE_DISPATCH_TOOLS`. Registration happens on the
+#: dispatch thread and the stop path runs on the signal-handling
+#: thread, so the two genuinely race.
+_LIVE_DISPATCH_LOCK = threading.Lock()
+
+#: Default budget (seconds) for one cooperative stop sequence.
+_STOP_BUDGET_DEFAULT_SECONDS = 10.0
+
+#: Bounds for the budget. The lower bound keeps every stage long enough
+#: to mean something; the upper bound keeps a fat-fingered caller from
+#: parking the stop path for minutes.
+_STOP_BUDGET_MIN_SECONDS = 2.0
+_STOP_BUDGET_MAX_SECONDS = 60.0
+
+#: How the budget is split between the three stages. They add up to
+#: 0.70 — deliberately below 1.0, because the budget itself is derived
+#: from the server's grace window (``PDT_STOP_GRACE_SECONDS``, default
+#: 10s): the sequence has to finish inside that window, or the server
+#: hard-kills the group, which is exactly the outcome this sequence
+#: exists to avoid.
+_STOP_STAGE_CLOSE_FRACTION = 0.35
+_STOP_STAGE_TERM_FRACTION = 0.25
+_STOP_STAGE_KILL_FRACTION = 0.10
+
+
+def register_live_dispatch(tool) -> None:
+    """Record ``tool`` as the owner of a live dispatch subprocess.
+
+    Registration is best-effort by construction: the registry is a
+    watchdog aid, and a dispatch that cannot be watched must still run.
+    Registering the same tool twice is idempotent — one tool owns one
+    child, so it gets one entry.
+    """
+    try:
+        with _LIVE_DISPATCH_LOCK:
+            _LIVE_DISPATCH_TOOLS[id(tool)] = tool
+    except Exception:  # noqa: BLE001 — a watchdog aid must never break a call
+        logger.warning(
+            "[live-dispatch] could not register a live dispatch; continuing",
+            exc_info=True,
+        )
+
+
+def unregister_live_dispatch(tool) -> None:
+    """Drop ``tool`` from the live-dispatch registry.
+
+    Best-effort and idempotent: unregistering a tool that is not (or no
+    longer) registered is a no-op, so the clean path, the timeout path
+    and ``cleanup()`` can all call it without coordinating.
+    """
+    try:
+        with _LIVE_DISPATCH_LOCK:
+            key = id(tool)
+            # Identity check: a recycled ``id()`` must not let a stale
+            # caller unregister the tool that owns the id now.
+            if _LIVE_DISPATCH_TOOLS.get(key) is tool:
+                _LIVE_DISPATCH_TOOLS.pop(key, None)
+    except Exception:  # noqa: BLE001 — cleanup must never break a call
+        logger.warning(
+            "[live-dispatch] could not unregister a live dispatch; continuing",
+            exc_info=True,
+        )
+
+
+def _normalize_stop_budget(total_seconds) -> float:
+    """Return a usable stop budget in seconds.
+
+    The budget arrives from the caller (the executor's CLI parses the
+    environment; this function only defends). A value that is not a
+    number, not finite, or not positive falls back to the default, and
+    every value is clamped into ``[2, 60]`` seconds. A bad budget must
+    not turn into "skip the grace period and SIGKILL immediately" — the
+    opposite of what the cooperative stop is for.
+    """
+    try:
+        budget = float(total_seconds)
+    except (TypeError, ValueError):
+        budget = _STOP_BUDGET_DEFAULT_SECONDS
+    if not math.isfinite(budget) or budget <= 0:
+        budget = _STOP_BUDGET_DEFAULT_SECONDS
+    return min(max(budget, _STOP_BUDGET_MIN_SECONDS), _STOP_BUDGET_MAX_SECONDS)
+
+
+def _wait_for_exit(process, timeout: float) -> bool:
+    """True when ``process`` is gone within ``timeout`` seconds.
+
+    Never raises. A ``TimeoutExpired`` means "still alive" — that is
+    the answer the caller needs, not an error. Any other failure is
+    swallowed and reported as "still alive" too: the process' fate is
+    exactly what is unknown here, and the escalation that follows is
+    harmless.
+    """
+    try:
+        process.wait(timeout=max(0.0, float(timeout)))
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:  # noqa: BLE001 — best-effort stop, never raises
+        return False
+    return True
+
+
+def _cooperative_stop_process(
+    process,
+    total_seconds: float = _STOP_BUDGET_DEFAULT_SECONDS,
+) -> bool:
+    """Stop one dispatch subprocess cooperatively.
+
+    The sequence is three stages inside one budget:
+
+    1. close the child's stdout and wait ``0.35 × budget`` — the CLI
+       sees the broken pipe and exits on its own;
+    2. SIGTERM the child's **process group** and wait ``0.25 × budget``
+       — it had its chance to leave on its own terms;
+    3. SIGKILL the group and wait ``0.10 × budget`` — the corpse is
+       reaped.
+
+    Returns ``False`` when the child left without needing a SIGKILL
+    (a cooperative stop) and ``True`` when it had to be killed (the
+    caller needs to know: a hard-killed child is not a clean stop).
+    """
+    budget = _normalize_stop_budget(total_seconds)
+    close_wait = budget * _STOP_STAGE_CLOSE_FRACTION
+    term_wait = budget * _STOP_STAGE_TERM_FRACTION
+    kill_wait = budget * _STOP_STAGE_KILL_FRACTION
+
+    # Stage 1 — close stdout. The child writes to it; with the read end
+    # gone it gets EPIPE and stops. This is the cheapest possible stop
+    # and it needs no signal at all.
+    try:
+        stdout = getattr(process, "stdout", None)
+        if stdout is not None:
+            stdout.close()
+    except Exception:  # noqa: BLE001 — a closed/absent stdout is fine
+        pass
+
+    if _wait_for_exit(process, close_wait):
+        return False
+
+    # Stage 2 — SIGTERM the whole group. The child leads its own group
+    # (``start_new_session=True``), so the group signal reaches its
+    # descendants too; a direct ``process.terminate()`` would leave
+    # them behind.
+    try:
+        kill_process_group(process, sig=signal.SIGTERM, wait_timeout=0)
+    except Exception:  # noqa: BLE001 — the escalation below still runs
+        pass
+    if _wait_for_exit(process, term_wait):
+        return False
+
+    # Stage 3 — SIGKILL the group. The child ignored SIGTERM, so there
+    # is nothing left to be polite about.
+    try:
+        kill_process_group(process, sig=signal.SIGKILL, wait_timeout=0)
+    except Exception:  # noqa: BLE001 — best-effort, never raises
+        pass
+    _wait_for_exit(process, kill_wait)
+    return True
+
+
+def stop_all_live_dispatches(
+    total_seconds: float = _STOP_BUDGET_DEFAULT_SECONDS,
+) -> int:
+    """Stop every live dispatch's subprocess; return how many were handled.
+
+    This is the entry point a signal handler calls: it walks the
+    registry, stops each registered tool's ``_current_process``
+    cooperatively, and reports how many processes it took on. It never
+    raises — a stop path that crashes leaves the child running, which
+    is the failure mode this whole mechanism exists to prevent.
+    """
+    budget = _normalize_stop_budget(total_seconds)
+    with _LIVE_DISPATCH_LOCK:
+        tools = list(_LIVE_DISPATCH_TOOLS.values())
+
+    stopped = 0
+    for tool in tools:
+        try:
+            with tool._process_lock:
+                process = getattr(tool, "_current_process", None)
+        except Exception:  # noqa: BLE001 — one bad tool must not stop the rest
+            continue
+        if process is None:
+            continue
+        try:
+            _cooperative_stop_process(process, budget)
+        except Exception:  # noqa: BLE001 — one bad process must not stop the rest
+            continue
+        stopped += 1
+    return stopped
+
+
+# ---------------------------------------------------------------------------
 # Reusable sessions for iteration loops
 # ---------------------------------------------------------------------------
 # An iteration loop — "that answer was unusable, ask again", "here is the
@@ -292,19 +523,39 @@ class JsonSession:
     had no way to ask for the first dispatch. With a pinned id, the
     first dispatch creates the session under it and every later
     dispatch (in this process or the next) resumes it.
+
+    ``stage`` (2026-10-26) says *where the id came from*, which the two
+    ids above cannot say on their own: a caller that finds a session id
+    on a handle cannot tell "this session already exists and is being
+    re-opened" from "this id is what the next dispatch will create the
+    session under". The CLI draws the same line (``--resume`` re-opens,
+    ``--session-id`` creates), and so does the dispatcher's
+    ``task_session_bound`` event, which wants to record which one
+    happened. So the handle carries it:
+
+    * ``"resumed"`` — the id names a session that exists and is
+      re-opened;
+    * ``"pinned"`` — the id is derived, and the first dispatch creates
+      the session under it;
+    * ``None`` — no id was bound, so there is nothing to label. This is
+      also what every existing caller gets, since ``stage`` defaults to
+      ``None`` and construction without it is unchanged.
     """
 
-    __slots__ = ("session_id", "pinned_session_id")
+    __slots__ = ("session_id", "pinned_session_id", "stage")
 
     def __init__(self, session_id: Optional[str] = None,
-                 pinned_session_id: Optional[str] = None):
+                 pinned_session_id: Optional[str] = None,
+                 stage: Optional[str] = None):
         self.session_id = session_id
         self.pinned_session_id = pinned_session_id
+        self.stage = stage
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
             f"JsonSession(session_id={self.session_id!r}, "
-            f"pinned_session_id={self.pinned_session_id!r})"
+            f"pinned_session_id={self.pinned_session_id!r}, "
+            f"stage={self.stage!r})"
         )
 
 
@@ -4573,6 +4824,16 @@ class ClaudeCodingTool(CodingTool):
             with self._process_lock:
                 self._current_process = process
 
+            # 2026-10-26 — the dispatch is live from here on: the child
+            # exists and the read loop below is about to block on it for
+            # minutes. Registering the tool is what makes that child
+            # reachable for a cooperative stop — the executor's signal
+            # handler calls ``stop_all_live_dispatches``, which walks
+            # this registry and stops each registered child itself
+            # (the child leads its own process group, so the executor's
+            # own SIGTERM never reaches it).
+            register_live_dispatch(self)
+
             # 2026-10-22 — register the dispatch so ``/stop`` can find
             # and kill it. The handle is registered AFTER the spawn
             # succeeded (there is nothing to kill before that) and
@@ -4814,6 +5075,11 @@ class ClaudeCodingTool(CodingTool):
             _unregister_dispatch(
                 _dispatch_registry, dispatch_plan_id, _dispatch_handle,
             )
+            # 2026-10-26 — same for the live-dispatch registry: the child
+            # has just been reaped, so there is nothing left for a stop
+            # to find. Leaving the tool registered would make the next
+            # stop count a child that is already dead.
+            unregister_live_dispatch(self)
             raise
         result_text = ""
         # Usage metadata captured from the stream-json ``result`` event
@@ -5022,6 +5288,14 @@ class ClaudeCodingTool(CodingTool):
             _unregister_dispatch(
                 _dispatch_registry, dispatch_plan_id, _dispatch_handle,
             )
+            # 2026-10-26 — and the same for the live-dispatch registry.
+            # This ``finally`` is the point where the child is actually
+            # reaped, so it is where the tool stops being reachable for a
+            # cooperative stop. The ``ApiError`` path matters most: it
+            # leaves the read loop through here and never reaches the
+            # ``_current_process = None`` further down, so a tool that
+            # stayed registered would keep a dead child on the roster.
+            unregister_live_dispatch(self)
 
         # Layer 3: stderr capture — do this BEFORE the total-timeout check
         # so we can include stderr context in the timeout error message.
@@ -5032,6 +5306,11 @@ class ClaudeCodingTool(CodingTool):
         finally:
             with self._process_lock:
                 self._current_process = None
+            # 2026-10-26 — the dispatch is over: the child is gone (or
+            # could not be read) and the output has been collected. The
+            # tool leaves the live-dispatch registry here, so a later
+            # stop does not try to stop a child that is already gone.
+            unregister_live_dispatch(self)
 
         # 2026-10-22 — the operator stopped this plan while the dispatch
         # was in flight. The subprocess is gone (that is exactly how the
@@ -5308,7 +5587,16 @@ class ClaudeCodingTool(CodingTool):
         )
 
     def _graceful_shutdown(self, process: subprocess.Popen) -> None:
-        """Three-phase shutdown: stdin EOF → wait → SIGTERM group → SIGKILL."""
+        """Three-phase shutdown: stdin EOF → wait → SIGTERM group → SIGKILL group.
+
+        Both escalation signals go through ``kill_process_group``, i.e.
+        they reach the *whole* process group.  The earlier version
+        escalated with ``process.kill()``, which signals only the lead
+        process: its children survived the shutdown and the group was
+        left running.  The lead process is in the group too (it is
+        spawned with ``start_new_session=True``), so the group kill
+        subsumes the direct kill.
+        """
         # Phase 1: close stdin to signal EOF
         try:
             process.stdin.close()
@@ -5320,16 +5608,32 @@ class ClaudeCodingTool(CodingTool):
             process.wait(timeout=self.GRACEFUL_STOP_TIMEOUT)
             return
         except subprocess.TimeoutExpired:
+            # Still alive after the grace period → escalate below.
+            pass
+        except Exception:
+            # Unknown wait failure. This is a best-effort cleanup called
+            # from ``finally`` blocks, so the error is swallowed rather
+            # than allowed to escape and replace the real one — but the
+            # escalation still runs, because the process' fate is
+            # exactly what is unknown here.
             pass
 
-        # Phase 2: SIGTERM the entire process group
-        if kill_process_group(process, sig=signal.SIGTERM) is not None:
+        # Phase 2: SIGTERM the entire process group. The helper waits
+        # for the process and answers its exit code; ``None`` means it is
+        # still alive, so we escalate. It also swallows
+        # ``ProcessLookupError`` for a group that is already gone — which
+        # is reported the same way, so a vanished group still gets the
+        # SIGKILL attempt below.
+        try:
+            reaped = kill_process_group(process, sig=signal.SIGTERM) is not None
+        except Exception:
+            reaped = False
+        if reaped:
             return
 
-        # Phase 3: SIGKILL (last resort)
+        # Phase 3: SIGKILL the entire process group (last resort).
         try:
-            process.kill()
-            process.wait(timeout=5)
+            kill_process_group(process, sig=signal.SIGKILL)
         except Exception:
             pass
 
@@ -5342,6 +5646,11 @@ class ClaudeCodingTool(CodingTool):
         with self._process_lock:
             proc = self._current_process
             self._current_process = None
+        # 2026-10-26 — the tool no longer owns a live dispatch: it has
+        # just taken the child away from ``_current_process`` and is
+        # about to kill it. Leaving it in the registry would make a
+        # concurrent stop try to stop the same child a second time.
+        unregister_live_dispatch(self)
         if proc is not None and proc.poll() is None:
             self._graceful_shutdown(proc)
 
