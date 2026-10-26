@@ -185,8 +185,10 @@ LOG_FILENAME = "server.log"
 
 #: The first line of every message the product formats.  It is what a
 #: reader sees first, and it is how this suite counts how many
-#: deliveries arrived.
-MESSAGE_HEADER = "[HITL] 计划"
+#: deliveries arrived.  The message is Markdown, so the title carries
+#: its markers — this is the fixed part of the title line, ahead of the
+#: plan the decision belongs to.
+MESSAGE_HEADER = "**⏳ HITL 决策待处理**"
 
 #: How long a poll waits before it gives up.  The delivery runs on a
 #: thread of its own, so the wait is a real wait — and it is bounded,
@@ -765,7 +767,7 @@ def test_session_receives_decision_message(booted):
             f"the message does not carry the option {option!r}; the "
             "answers on the table are what a person replies with"
         )
-    assert f"默认答案：{DEFAULT_OPTION}" in message, (
+    assert f"**默认答案**：{DEFAULT_OPTION}" in message, (
         f"the message does not carry the default answer "
         f"({DEFAULT_OPTION!r}); the answer that happens by default is "
         "part of the question"
