@@ -86,7 +86,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple, Union
 from urllib.parse import urlsplit, urlunsplit
 
 log = logging.getLogger("provider_order")
@@ -639,14 +639,38 @@ REASON_PERMISSION_DENIED = "permission_denied"
 REASON_JSON_INVALID = "json_invalid"
 REASON_NOT_A_DICT = "not_a_dict"
 
+#: Canonical reasons for a *degraded* reading, as reported by
+#: :func:`last_usage_read_reason` and :func:`last_quota_read_reason`.
+#:
+#: A log line says how a read broke; these say what the reader
+#: concluded, and they are the vocabulary a caller asserts against.
+#: The two are deliberately not the same strings: the log tokens above
+#: predate this API and an operator's existing grep must keep matching,
+#: so the mapping from a log token to a canonical reason lives in one
+#: place — :func:`_read_payload_with_reason`.
+#:
+#: ``REASON_FILE_MISSING`` is shared by both: a file that is not there
+#: fails the same way whether the reader logs it or reports it.
+REASON_PARSE_ERROR = "parse_error"
+REASON_INVALID_SHAPE = "invalid_shape"
+REASON_PROVIDER_ABSENT = "provider_absent"
 
-def _read_payload(file_path: Union[str, os.PathLike]) -> Optional[Dict[str, Any]]:
-    """Read the quota payload and return the parsed dict, or None on error.
 
-    Errors are *not* raised — the caller decides what a missing or
-    malformed payload means. For :func:`load_provider_5h_usage` the
-    answer is "no quota data", which its caller reads as a fully
-    available provider.
+def _read_payload_with_reason(
+    file_path: Union[str, os.PathLike],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Read the quota payload; return ``(payload, reason)``.
+
+    ``reason`` is ``None`` when the file was read and parsed into a
+    dict, and a canonical degradation reason otherwise:
+    :data:`REASON_FILE_MISSING`, :data:`REASON_PERMISSION_DENIED`,
+    :data:`REASON_PARSE_ERROR` or :data:`REASON_INVALID_SHAPE`.
+
+    The reason exists because an empty payload and an unreadable one
+    are the same answer to the caller and different facts to the
+    operator: "the producer has not written the file yet" and "the
+    file is there but malformed" need different reactions, and a log
+    line nobody reads is not a report.
     """
     path = _validate_provider_order_file_path(file_path)
     if not path.exists():
@@ -656,7 +680,7 @@ def _read_payload(file_path: Union[str, os.PathLike]) -> Optional[Dict[str, Any]
             REASON_FILE_MISSING,
             extra={"reason": REASON_FILE_MISSING},
         )
-        return None
+        return None, REASON_FILE_MISSING
     try:
         with path.open("r", encoding="utf-8") as fp:
             data = json.load(fp)
@@ -672,7 +696,7 @@ def _read_payload(file_path: Union[str, os.PathLike]) -> Optional[Dict[str, Any]
             exc,
             extra={"reason": REASON_PERMISSION_DENIED},
         )
-        return None
+        return None, REASON_PERMISSION_DENIED
     except (OSError, ValueError) as exc:
         # OSError: file disappeared between exists() check and open()
         # ValueError: json.JSONDecodeError (subclass)
@@ -682,7 +706,7 @@ def _read_payload(file_path: Union[str, os.PathLike]) -> Optional[Dict[str, Any]
             exc,
             extra={"reason": REASON_JSON_INVALID},
         )
-        return None
+        return None, REASON_PARSE_ERROR
 
     if not isinstance(data, dict):
         log.warning(
@@ -691,9 +715,24 @@ def _read_payload(file_path: Union[str, os.PathLike]) -> Optional[Dict[str, Any]
             REASON_NOT_A_DICT,
             extra={"reason": REASON_NOT_A_DICT},
         )
-        return None
+        return None, REASON_INVALID_SHAPE
 
-    return data
+    return data, None
+
+
+def _read_payload(file_path: Union[str, os.PathLike]) -> Optional[Dict[str, Any]]:
+    """Read the quota payload and return the parsed dict, or None on error.
+
+    Errors are *not* raised — the caller decides what a missing or
+    malformed payload means. For :func:`load_provider_5h_usage` the
+    answer is "no quota data", which its caller reads as a fully
+    available provider.
+
+    The reason-aware form is :func:`_read_payload_with_reason`; this
+    entry point stays for the callers that only want the payload.
+    """
+    payload, _reason = _read_payload_with_reason(file_path)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +792,84 @@ def _parse_5h_usage_payload(payload: Any) -> Dict[str, float]:
     return result
 
 
+#: Why the last 5-hour usage read degraded (``None`` = it did not), and
+#: the provider ids the table that read found held. Both are written
+#: under :data:`_cache_lock` and read by :func:`last_usage_read_reason`.
+_last_usage_read_reason: Optional[str] = None
+_last_usage_read_providers: FrozenSet[str] = frozenset()
+
+
+def _usage_table(payload: Any) -> Tuple[Optional[str], FrozenSet[str]]:
+    """Return ``(shape_reason, members)`` for a freshly read payload.
+
+    ``shape_reason`` is ``None`` when the payload is a usable provider
+    table, and :data:`REASON_INVALID_SHAPE` when it is not: a payload
+    that parsed but carries no ``providers`` dict is a file this reader
+    cannot use, which is a *failed read* and not an empty table. The
+    two must not collapse into one answer, because only the failed
+    read is worth retrying.
+
+    ``members`` is the provider ids the table holds. It is empty when
+    the shape was wrong, because then there is no table to be a member
+    of.
+    """
+    if not isinstance(payload, dict):
+        return REASON_INVALID_SHAPE, frozenset()
+    providers = payload.get("providers")
+    if not isinstance(providers, dict):
+        return REASON_INVALID_SHAPE, frozenset()
+    return None, frozenset(providers)
+
+
+def _record_usage_read(reason: Optional[str], providers: FrozenSet[str]) -> None:
+    """Record the outcome of the last 5-hour usage read.
+
+    Called with :data:`_cache_lock` held, so a reader never sees half
+    of a state: the reason and the table membership are written
+    together or not at all.
+    """
+    global _last_usage_read_reason, _last_usage_read_providers
+    _last_usage_read_reason = reason
+    _last_usage_read_providers = providers
+
+
+def last_usage_read_reason(provider: Optional[str] = None) -> Optional[str]:
+    """Why the last 5-hour usage read degraded — ``None`` if it did not.
+
+    The reader's answer to "what is the 5-hour quota?" is a map, and
+    an empty map is what both a missing file and a table without this
+    provider look like. This function is the other half of that
+    answer: it names the reason, so a caller can tell the two apart
+    instead of inferring them.
+
+    Args:
+        provider: When given, the question is about *this* provider:
+            ``REASON_PROVIDER_ABSENT`` if the table was read and does
+            not hold it. When the read itself failed, the failure's
+            reason is returned instead — an unreadable table says
+            nothing about whether the provider is in it.
+
+    Returns:
+        ``None`` when the last read did not degrade, otherwise one of
+        :data:`REASON_FILE_MISSING`, :data:`REASON_PERMISSION_DENIED`,
+        :data:`REASON_PARSE_ERROR`, :data:`REASON_INVALID_SHAPE` or
+        :data:`REASON_PROVIDER_ABSENT`.
+
+    The value is a token, not a shared object: a caller cannot mutate
+    what the next caller sees. It describes the last *read*, not the
+    last cache hit — a cached answer was read earlier and is reported
+    by the read that produced it.
+    """
+    with _cache_lock:
+        reason = _last_usage_read_reason
+        providers = _last_usage_read_providers
+    if reason is not None:
+        return reason
+    if provider is not None and provider not in providers:
+        return REASON_PROVIDER_ABSENT
+    return None
+
+
 def load_provider_5h_usage(
     file_path: Optional[Union[str, os.PathLike]] = None,
 ) -> Dict[str, float]:
@@ -771,6 +888,8 @@ def load_provider_5h_usage(
          provider via :func:`_parse_5h_usage_payload`.
       4. Cache the result keyed on the resolved absolute path; the
          next caller from the same process returns the cached map.
+         **Only a successful read is cached** — see the failure
+         semantics below.
 
     Failure semantics — every failure mode returns an empty map:
 
@@ -784,6 +903,13 @@ def load_provider_5h_usage(
     behaviour (no dynamic-cap input → legacy fixed cap), so a missing
     file degrades to the pre-feature state rather than refusing to
     dispatch.
+
+    A failed read is **not** cached, so the next call reads the file
+    again: the payload is written by a producer on its own schedule,
+    and a cache that remembered the absence would report "no quota
+    data" for the life of the process. The reason of the last read is
+    available from :func:`last_usage_read_reason`, so the empty map
+    is not the whole story.
 
     Returns:
         ``{provider_id: remaining_pct}``. ``remaining_pct`` is in
@@ -811,11 +937,23 @@ def load_provider_5h_usage(
             if cached is not None and _cache_version == version_at_entry:
                 return dict(cached)
 
-        payload = _read_payload(file_path)
+        payload, reason = _read_payload_with_reason(file_path)
+        shape_reason, members = _usage_table(payload)
+        if reason is None:
+            reason = shape_reason
         result = _parse_5h_usage_payload(payload)
         with _cache_lock:
-            if _cache_version == version_at_entry:
+            if reason is None and _cache_version == version_at_entry:
+                # Only a *successful* read is cached. A failed read is
+                # a fact about now, not about the file: the producer
+                # writes the payload on its own schedule, and a cache
+                # that remembered the absence would keep reporting "no
+                # quota data" for the life of the process — long after
+                # the file appeared. The cost of not caching a failure
+                # is one small file read per call, and only while the
+                # file is unreadable.
                 _usage_cache[key] = result
+            _record_usage_read(reason, members)
         return dict(result)
 
 
@@ -1337,6 +1475,57 @@ _quota_refreshed_at: float = 0.0
 #: Single key for the in-flight barrier: there is one CC Switch.
 _QUOTA_CACHE_KEY = "quota"
 
+#: Why the last quota fetch degraded (``None`` = it did not), and the
+#: providers that fetch returned a reading for. Written under
+#: :data:`_quota_cache_lock` and read by :func:`last_quota_read_reason`.
+_last_quota_read_reason: Optional[str] = None
+_last_quota_read_providers: FrozenSet[str] = frozenset()
+
+
+def _record_quota_read(reason: Optional[str], providers: FrozenSet[str]) -> None:
+    """Record the outcome of the last quota fetch.
+
+    Called with :data:`_quota_cache_lock` held, so a reader never sees
+    half of a state.
+    """
+    global _last_quota_read_reason, _last_quota_read_providers
+    _last_quota_read_reason = reason
+    _last_quota_read_providers = providers
+
+
+def last_quota_read_reason(provider: Optional[str] = None) -> Optional[str]:
+    """Why the last quota fetch degraded — ``None`` if it did not.
+
+    The quota map's own failure vocabulary:
+    :data:`REASON_QUOTA_UNREACHABLE` when CC Switch could not be
+    asked, and :data:`REASON_QUOTA_BAD_PAYLOAD` when it answered with
+    something this reader cannot use.
+
+    Args:
+        provider: When given, the question is about *this* provider:
+            :data:`REASON_PROVIDER_ABSENT` if the fetch succeeded and
+            returned no reading for it. When the fetch itself failed,
+            the failure's reason is returned instead — an unanswered
+            question says nothing about whether the provider is in the
+            answer.
+
+    Returns:
+        ``None`` when the last fetch did not degrade, otherwise one of
+        the quota reasons above or :data:`REASON_PROVIDER_ABSENT`.
+
+    Like its file-backed sibling, this describes the last *fetch*, not
+    the last cache hit: a cached reading was fetched earlier and is
+    reported by the fetch that produced it.
+    """
+    with _quota_cache_lock:
+        reason = _last_quota_read_reason
+        providers = _last_quota_read_providers
+    if reason is not None:
+        return reason
+    if provider is not None and provider not in providers:
+        return REASON_PROVIDER_ABSENT
+    return None
+
 
 def probe_floor_sec(quota: Optional[ProviderQuota]) -> float:
     """Seconds this reading is trusted before it is asked for again.
@@ -1463,6 +1652,7 @@ def load_provider_quota_map(*, force: bool = False) -> Dict[str, ProviderQuota]:
             # that ends must be noticed on the next dispatch, and the
             # cost of asking is one request, not a storm.
             with _quota_cache_lock:
+                _record_quota_read(exc.reason, frozenset())
                 return {}
         except Exception:  # pragma: no cover - defensive
             log.warning(
@@ -1472,6 +1662,7 @@ def load_provider_quota_map(*, force: bool = False) -> Dict[str, ProviderQuota]:
                 extra={"reason": REASON_QUOTA_BAD_PAYLOAD},
             )
             with _quota_cache_lock:
+                _record_quota_read(REASON_QUOTA_BAD_PAYLOAD, frozenset())
                 return {}
 
         # A meter-less reading is sticky for its own floor. The fetch
@@ -1498,4 +1689,5 @@ def load_provider_quota_map(*, force: bool = False) -> Dict[str, ProviderQuota]:
             _quota_cache.clear()
             _quota_cache.update(merged)
             _quota_refreshed_at = stamp
+            _record_quota_read(None, frozenset(merged))
         return {name: quota for name, (_, quota) in merged.items()}

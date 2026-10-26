@@ -404,15 +404,33 @@ def test_to_dict_round_trips_the_divergences(state_db):
 
 
 def test_the_endpoint_404s_for_an_unknown_plan(tmp_path, monkeypatch):
+    import json
+
     import server
-    from fastapi import HTTPException
 
     monkeypatch.setattr(server, "PLANS_DIR", tmp_path)
 
-    with pytest.raises(HTTPException) as exc:
-        server.get_plan_status("no-such-plan")
+    # The tree has to hold **something**: a plans tree that cannot be
+    # searched (here: one with no plan in it at all) is answered 503,
+    # not 404 — an empty tree says "not found" about every id, and a
+    # 404 for one of them would claim the plan is gone (2026-10-25,
+    # repair-r1-34).  So the unknown plan is looked up in a tree that
+    # holds another plan, which is the state a 404 is an answer about.
+    (tmp_path / "some-other-plan").mkdir()
 
-    assert exc.value.status_code == 404
+    # The route **answers** the 404 rather than raising it: the answer
+    # carries the plans root it searched and the plan directory it
+    # resolved, so a reader can tell "the plan is not in this tree" from
+    # "the plan is not there at all" (2026-10-25, repair-r1-29).  The
+    # contract is unchanged — the endpoint still 404s — but the way the
+    # answer comes back is the one every other 404 in this repo uses.
+    response = server.get_plan_status("no-such-plan")
+
+    assert response.status_code == 404
+    body = json.loads(response.body)
+    assert body["detail"] == "Plan not found"
+    assert body["plans_dir"] == str(tmp_path)
+    assert body["plan_dir"] == str(tmp_path / "no-such-plan")
 
 
 def test_the_endpoint_serves_the_snapshot(tmp_path, monkeypatch, state_db,
@@ -497,7 +515,31 @@ def test_a_failing_section_degrades_to_none_not_500(
 
     payload = server._plan_status_payload(plan_id)
 
-    assert payload["execution"] is None, "a broken section must not be invented"
+    # 2026-10-26 (merge): the degraded execution section is no longer
+    # ``None`` — it carries the **durable** verdict of the run (the
+    # ``plan_execution`` row) and says that it is degraded.  The reason
+    # is the capacity-wait one: "the execution section is unreadable"
+    # and "the plan's state is unknown" are two different answers, and
+    # for a plan parked for capacity the second one throws away the
+    # very fact the reader needs (it is parked, not failed).
+    #
+    # The section body is still never re-invented: everything but the
+    # verdict is empty, and the section says it is degraded.  A plan
+    # with no execution row still degrades to ``None`` (there is no
+    # verdict to preserve) — the branch's own HTTP-level test pins that
+    # rule (``tests/integration/test_quota_parked_plan_status_http.py``).
+    execution = payload["execution"]
+    assert execution is not None, (
+        "the durable execution verdict must survive a broken section"
+    )
+    assert execution.get("degraded") is True, (
+        "a degraded section must say so — a reader has to be able to "
+        "tell a reduced answer from a complete one"
+    )
+    assert execution.get("execution_status") == "running", (
+        "the degraded section must carry the row's verdict, not a "
+        "re-invented one"
+    )
     assert payload["phase"] == "executing", (
         "the verdict must survive a body section failing"
     )

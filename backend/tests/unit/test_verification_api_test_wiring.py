@@ -16,6 +16,7 @@ were easy to get wrong:
 
 from __future__ import annotations
 
+import errno
 import json
 import sys
 from pathlib import Path
@@ -128,17 +129,33 @@ def test_api_schema_report_survives_malformed_plans(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_run_api_test_vp_returns_a_failed_verdict_for_an_unreachable_url(
+def test_run_api_test_vp_returns_a_blocked_verdict_for_an_unreachable_url(
     tmp_path: Path,
 ):
-    """Port 1 on loopback refuses immediately — no network, deterministic."""
+    """Port 1 on loopback refuses immediately — no network, deterministic.
+
+    2026-10-25 (repair-r1-26): a request that never reached the service
+    is **BLOCKED**, not FAILED.  The production round pointed twelve
+    ``api_test`` VPs at an address nothing was serving and recorded
+    twelve contract violations; there was one event there — the
+    environment was not serving, and a verdict about the environment
+    must not be filed as a verdict about the product.
+
+    The evidence keeps the two facts that make the claim checkable: the
+    address that was called and the errno the transport reported.
+    """
     agent = _make_agent(tmp_path)
 
     verdict = agent._run_api_test_vp(_api_vp())
 
-    assert verdict["status"] == "FAILED"
+    assert verdict["status"] == "BLOCKED"
+    assert verdict["status"] != "FAILED"
     assert verdict["reasons"]
-    assert "请求未能完成" in verdict["reasons"][0]
+    assert "service_unreachable" in verdict["reasons"][0]
+    evidence = verdict["evidence"]
+    assert evidence["error_kind"] == "service_unreachable"
+    assert evidence["url"] == "http://127.0.0.1:1/x"
+    assert evidence["errno"] == errno.ECONNREFUSED
 
 
 def test_run_api_test_vp_writes_the_audit_artifact(tmp_path: Path):

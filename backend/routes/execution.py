@@ -9,11 +9,11 @@ from __future__ import annotations
 from utils.atomic_io import atomic_write_json
 from fastapi import APIRouter
 
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, NamedTuple, Optional, Tuple, Any, Literal
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import deque
 import json
 import os
@@ -36,7 +36,67 @@ import server as _server
 # directory is.
 from project_dir_guard import ProjectDirInvalidError, validate_project_dir
 
+# The park's kind is decided ONCE — in the module that owns the
+# decision — and written down by the writer that records the park.
+# Imported by value for the same reason as the guard above: the
+# disposition must not have a second opinion about what kind of park it
+# is recording, and a second opinion is exactly how a hard cap ends up
+# described as a window that reopens by itself.
+from capacity_wait import WAIT_KIND_FIELD, quota_wait_event_data
+
 router = APIRouter()
+
+
+def _restore_execution_state_from_row(
+    plan_id: str, row: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Put the row's run back into this process's in-memory registry.
+
+    The registry (``server._execution_state``) is one process's view of
+    a run; the ``plan_execution`` row is the durable record of it.  The
+    registry is empty in every process that did not start the run — a
+    fresh boot whose recovery scan has not walked this plan yet, another
+    process serving for it, a plan whose directory the scan never saw.
+
+    The registry is also what the liveness rule reads: the watchdog
+    (``verification_loop._lazy_check_execution``) judges the in-memory
+    status and probes the in-memory pid.  So a row that says
+    ``running`` while its process is gone is never probed at all when
+    the registry is empty — and the read reports a run that is still
+    going, forever.
+
+    Restoring the row here hands it to the standing rule instead of
+    inventing a verdict for it.  The shape is the one the boot-time
+    scan restores, so a plan restored here and a plan restored at boot
+    are judged by the same rule and answer identically.
+
+    The caller decides *whether* to restore: the boot scan restores
+    unconditionally (the registry is empty at boot), while a status
+    read restores only a gap — this process's own view of a run it is
+    executing is more detailed than the row (it holds the process
+    handle and the logs), and the row's *verdict* is adopted into that
+    view separately.
+    """
+    status, stop_reason = _execution_verdict(row)
+    state = {
+        "status": status,
+        "started_at": row.get("started_at"),
+        # A terminal verdict carries its end time, and the row's own
+        # stamp is that time: the row's last write IS the verdict.  So
+        # a restored plan answers with the end time the verdict was
+        # written with, not with a second derivation of it.
+        "ended_at": _verdict_stamp(row),
+        "pid": row.get("exec_pid"),
+        "stop_reason": stop_reason,
+        # Runtime-only, like ``sync_targets``: the row's stamp is the
+        # durable copy of it.
+        "verdict_persisted_at": _verdict_stamp(row),
+        "project_dir": row.get("project_dir"),
+        "logs": deque(maxlen=2000),
+        "process": None,
+    }
+    _server._execution_state[plan_id] = state
+    return state
 
 
 def _recover_execution_states(plans_dir: Path) -> None:
@@ -74,30 +134,22 @@ def _recover_execution_states(plans_dir: Path) -> None:
                 continue
             if row is None:
                 continue
-            status = row.get("exec_status") or "not_started"
-            pid = row.get("exec_pid")
-            # Restore in-memory state (handle None values gracefully)
-            from collections import deque
-            _server._execution_state[plan_id] = {
-                "status": status,
-                "started_at": row.get("started_at"),
-                "ended_at": None,
-                "pid": pid,
-                "stop_reason": row.get("stop_reason"),
-                "project_dir": row.get("project_dir"),
-                "logs": deque(maxlen=2000),
-                "process": None,
-            }
+            # Restore in-memory state (handle None values gracefully).
+            # The status and the pid are read out of the restored state,
+            # so the scan judges exactly what a reader would see.
+            state = _restore_execution_state_from_row(plan_id, row)
+            status = state.get("status")
+            pid = state.get("pid")
 
             # If still running, check if the process is alive
             if status == "running":
                 if not pid:
-                    _server._mark_failed_dead(plan_id)
+                    _judge_process_dead(plan_id, row)
                     continue
                 try:
                     os.kill(pid, 0)
                 except ProcessLookupError:
-                    _server._mark_failed_dead(plan_id)
+                    _judge_process_dead(plan_id, row)
                 except PermissionError:
                     pass
     finally:
@@ -461,6 +513,859 @@ def _consume_execution_checkpoint(plan_dir: Path) -> None:
             "execution_start: could not consume the execution checkpoint — "
             "it stays on disk and may be consumed again",
         )
+
+
+#: 2026-10-24 — the marker the executor leaves in the top level of
+#: ``tasks.json`` when a run parks because every provider had no
+#: capacity left (written by ``agent._stop_reason_for_quota_wait``).
+#:
+#: A plan carrying this marker has NOT failed: its tasks are still
+#: eligible for another dispatch, which is the whole point of the
+#: marker.  The disposition for such a run is therefore "parked", not
+#: "failed" and not "skipped".
+_QUOTA_WAIT_STOP_REASON = "waiting_for_quota"
+
+#: The verdict a process death gets.  It is written to the row, so it
+#: is the reason every later reader sees — a restart included.
+_CRASH_STOP_REASON = "process_died_unexpectedly"
+
+#: The execution statuses that mean the run is over.  A run that is
+#: over has an end time; a parked run (``waiting_for_quota``) and a
+#: live one have not ended yet.  The same set the repository uses to
+#: decide that a pid has to go back to NULL.
+_TERMINAL_EXEC_STATUSES = frozenset({"completed", "failed", "stopped"})
+
+#: The provenance of a status answer: where the answer was read from.
+#: ``state_db`` means it was assembled from the durable
+#: ``plan_execution`` row; ``default`` means the library really holds
+#: no row for this plan and the answer is the empty default.
+#:
+#: The field exists because the two answers used to look alike.  A
+#: reader that got ``status=not_started`` with every other field null
+#: could not tell "this plan never ran" from "this process knows
+#: nothing about this plan" — and the second one is what a run that
+#: was dying looked like.  The answer now certifies itself.
+STATUS_DATA_SOURCE_STATE_DB = "state_db"
+STATUS_DATA_SOURCE_DEFAULT = "default"
+
+#: The fields the provenance of a status read carries.
+#:
+#: The block answers one question — **which database answered, and which
+#: row did it find** — and it answers it in facts rather than in a word:
+#: the database by path (so a reader knows WHICH file) and by inode (so
+#: a reader knows it is not a different file wearing the same name), the
+#: moment the read opened it, the row it found (by rowid and by the
+#: row's own stamp), and the verdict of the integrity check that ran
+#: before the row was trusted.
+#:
+#: It exists because the answer's own wording cannot say it.  A reader
+#: that got ``status=not_started`` with every other field null could
+#: not tell "this plan never ran" from "this instance cannot see the
+#: plan" — and the second one is what a dying run used to look like.
+#: A round that restarts the service inside the round is exactly where
+#: the two come apart: two instances can read two different snapshots of
+#: the same file and answer the same question differently.
+STATUS_SOURCE_FIELDS = (
+    "kind",
+    "state_db_path",
+    "state_db_inode",
+    "opened_at",
+    "row_updated_at",
+    "rowid",
+    "integrity",
+)
+
+#: The three states the library this instance reads can be in.
+#:
+#: * ``absent`` — there is no state database at all.  Nothing was ever
+#:   recorded by this instance, so the empty answer is the honest one.
+#: * ``unreadable`` — there is one and it could not be read.  This
+#:   instance cannot confirm anything, so it refuses rather than
+#:   answering.
+#: * ``readable`` — it was read, and what it holds is what the answer
+#:   is made of.
+LIBRARY_ABSENT = "absent"
+LIBRARY_UNREADABLE = "unreadable"
+LIBRARY_READABLE = "readable"
+
+#: The refusal's ``detail``.  It says what happened, not what the plan
+#: is: the caller is being told that this instance cannot answer, not
+#: that the plan never ran.
+STATUS_REFUSAL_DETAIL = "the execution state of this plan could not be read"
+
+
+class _ExecutionRead(NamedTuple):
+    """What one read of the durable state found — and where it read it.
+
+    ``row`` is the plan's ``plan_execution`` row (``None`` when the
+    library holds none), ``source`` is the provenance block, ``library``
+    is the state of the database the read tried to use, ``known`` says
+    whether the library holds a row of its own for this plan, and
+    ``populated`` says whether the library holds rows of its own at all.
+    """
+
+    row: Optional[Dict[str, Any]]
+    source: Dict[str, Any]
+    library: str
+    known: bool
+    populated: bool
+
+
+def _utc_now_iso() -> str:
+    """This instant, as an ISO-8601 stamp that carries a timezone."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _quick_check(conn: sqlite3.Connection) -> Optional[str]:
+    """The integrity check of the database this read opened.
+
+    ``PRAGMA quick_check`` is the cheap half of SQLite's integrity
+    check: it reads every page and verifies the b-trees against each
+    other, without the index-consistency pass.  It runs BEFORE the row
+    is trusted, because a database whose pages do not agree cannot be
+    asked for the truth — and what this read produces is the truth
+    about a run.
+
+    ``None`` means the check could not be run at all (an old SQLite, a
+    locked file).  The read still answers; the block then says the
+    check did not run rather than claiming that it passed.
+    """
+    try:
+        row = conn.execute("PRAGMA quick_check").fetchone()
+    except Exception:  # noqa: BLE001 — a check that cannot run is not a crash
+        return None
+    if not row or row[0] is None:
+        return None
+    return str(row[0])
+
+
+def _row_identity(
+    conn: sqlite3.Connection, plan_id: str
+) -> Tuple[Optional[int], Optional[str]]:
+    """The row's own identity: its ``rowid`` and the stamp of its last write.
+
+    Two rows in two snapshots of the same file are told apart by these
+    two facts, so they are what the answer carries: "the row you are
+    hearing about is *this* row of *this* file, as of *this* write".
+    """
+    try:
+        row = conn.execute(
+            "SELECT rowid, updated_at FROM plan_execution WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001 — an unreadable row is not a crash
+        return (None, None)
+    if not row:
+        return (None, None)
+    rowid = int(row[0]) if row[0] is not None else None
+    return (rowid, row[1])
+
+
+def _library_holds_rows(conn: sqlite3.Connection) -> bool:
+    """Does this library hold any row of its own?
+
+    An empty library and a library that holds other plans' rows are two
+    different things, and the difference decides what may be claimed:
+
+      * **empty** — this instance has never recorded anything.  There is
+        nothing here that could have described a run, so there is
+        nothing here that contradicts the plan's directory;
+      * **populated** — this instance records runs, and it has never
+        heard of *this* plan, while the plan's directory is right
+        here.  The database and the tree do not describe each other,
+        and that is the shape a stale snapshot takes.
+
+    The check asks the database itself, on the same connection the row
+    was read from, so the two facts describe one snapshot.
+    """
+    try:
+        row = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM plan_routing) "
+            "OR EXISTS(SELECT 1 FROM plan_execution)"
+        ).fetchone()
+    except Exception:  # noqa: BLE001 — an unreadable library is not a crash
+        return False
+    return bool(row and row[0])
+
+
+def _execution_verdict(row: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    """The ``(status, stop_reason)`` a persisted execution row carries.
+
+    One rule, every read path.  The row is the durable record of a run,
+    so the row is what a reader must answer from — and two readers must
+    not disagree about the same row, or the answer starts to depend on
+    which process served the request (the bug this rule closes).
+
+    The row's own ``stop_reason`` wins whenever it carries one.  A row
+    that says ``waiting_for_quota`` but carries no reason of its own
+    still says *why* it stopped: a quota wait has exactly one reason,
+    the capacity wall.  That covers the rows written before the reason
+    was persisted alongside the status.
+    """
+    status = row.get("exec_status") or "not_started"
+    stop_reason = row.get("stop_reason")
+    if not stop_reason and status == _QUOTA_WAIT_STOP_REASON:
+        stop_reason = _QUOTA_WAIT_STOP_REASON
+    return status, stop_reason
+
+
+def _row_has_verdict(row: Optional[Dict[str, Any]]) -> bool:
+    """Does this row carry a verdict of its own?
+
+    A verdict is a status that is not "the run is going": a terminal
+    one (``completed`` / ``failed`` / ``stopped``) and the parked one
+    (``waiting_for_quota``).  A row that says ``running`` — or a row
+    that says nothing at all — carries no verdict, and the process
+    that owns the run is still the only one who knows what is
+    happening to it.
+    """
+    if not row:
+        return False
+    status = str(row.get("exec_status") or "").strip()
+    if not status or status == "not_started":
+        return False
+    return status != "running"
+
+
+def _verdict_stamp(row: Optional[Dict[str, Any]]) -> Optional[str]:
+    """When a persisted verdict was written — the row's own stamp.
+
+    ``plan_execution`` has no end-time column of its own.  What it has
+    is ``updated_at``: the stamp of the row's last write.  For a
+    terminal verdict that write *is* the verdict — the status, the
+    reason and the cleared pid all land in it — so the row's stamp
+    answers "when did this run end" and "when was this verdict
+    persisted" with one answer, and it answers it identically before
+    and after a restart.  That is what makes a verdict replayable
+    instead of re-derived: a reader that replays the row hands back
+    the same end time the writer recorded, rather than a second guess
+    at when the run stopped.
+
+    A parked run has not ended: ``waiting_for_quota`` is a pause, and
+    reporting the row's stamp as its end time would tell the operator
+    a paused run is over.  So only a terminal verdict gets a stamp.
+    """
+    if not row:
+        return None
+    if str(row.get("exec_status") or "") not in _TERMINAL_EXEC_STATUSES:
+        return None
+    return row.get("updated_at")
+
+
+def _row_pid(row: Dict[str, Any], status: str) -> Optional[int]:
+    """The pid the row carries — unless the verdict is over.
+
+    A pid left on a terminal verdict belongs to a process that has
+    already exited, and every "is this execution alive?" reader
+    believes a pid means alive.  So a row that says the run is over
+    reports no pid; the process handle it used to carry is a ghost.
+
+    A run that is still going (``running``) or paused
+    (``waiting_for_quota``) keeps its pid: for the parked run the pid
+    is the one the executor will be resumed under, and for the live run
+    it is the process the operator can look at.
+    """
+    if status in _TERMINAL_EXEC_STATUSES:
+        return None
+    return row.get("exec_pid")
+
+
+def _memory_verdict(plan_id: str) -> Tuple[Optional[str], Optional[str]]:
+    """The ``(status, stop_reason)`` this process's memory holds."""
+    state = _server._execution_state.get(plan_id)
+    if not state:
+        return (None, None)
+    return (state.get("status"), state.get("stop_reason"))
+
+
+def _adopt_row_verdict(plan_id: str, row: Optional[Dict[str, Any]]) -> None:
+    """Make this process's memory agree with the row's verdict.
+
+    The row is the truth about a run; the in-memory map is one
+    process's view of it.  The two can disagree — another process
+    parked the plan on capacity, another process judged a crash — and
+    the disagreement is exactly what made the answer depend on which
+    process served the request (the bug this rule closes).
+
+    The adoption is not cosmetic.  The watchdog judges liveness from
+    the in-memory status, and it must not judge a row that is not
+    ``running``: a plan parked on capacity keeps a pid whose process
+    is long gone, and judging that pid is how a quota pause gets read
+    as a crash.
+    """
+    if not _row_has_verdict(row):
+        return
+    state = _server._execution_state.get(plan_id)
+    if state is None:
+        return
+    status, stop_reason = _execution_verdict(row)
+    state["status"] = status
+    if stop_reason:
+        # A row that carries no reason of its own — the executor
+        # watcher writes the status alone — must not wipe the reason
+        # this process knows.
+        state["stop_reason"] = stop_reason
+    if status in _TERMINAL_EXEC_STATUSES:
+        state["ended_at"] = _verdict_stamp(row)
+        # A **crash** is the one terminal verdict that says the process
+        # is gone: the pid belongs to a process that no longer exists,
+        # and every "is this execution alive?" reader believes a pid
+        # means alive.  So the crash takes the pid with it.
+        #
+        # The other terminal verdicts are the executor's OWN verdict —
+        # the run finished, failed or was stopped and the process said
+        # so before it exited.  The pid is then a fact about the run
+        # ("this plan was executed by that process"), and the run's
+        # reader is entitled to it: erasing it made a settled
+        # execution answer "no pid", which reads as "no executor ever
+        # ran" — a claim about the process boundary that is false.
+        # Liveness is answered by ``execution_in_flight`` and by the
+        # row's own verdict, not by the presence of a pid.
+        if stop_reason == _CRASH_STOP_REASON:
+            state["pid"] = None
+    # Runtime-only, like ``sync_targets``: the row's stamp is the
+    # durable copy of it.
+    state["verdict_persisted_at"] = _verdict_stamp(row)
+
+
+def _write_crash_verdict(plan_id: str) -> Optional[Dict[str, Any]]:
+    """Write a process death to the row — the whole verdict, at once.
+
+    The verdict goes to the row through ``ExecutionRepository``: the
+    status, the reason and the (now meaningless) pid, in one write.  A
+    row that carries only the status comes back after a restart as a
+    failure with no reason; a row that carries nothing comes back as
+    ``running`` — a crash that reads as something else entirely.
+
+    **Only a row that says ``running`` may be judged.**  A row that
+    already carries a verdict is the run's end — terminal, or parked
+    on capacity — and a verdict is never re-judged.  That is what
+    keeps a quota pause from being read as a crash.
+
+    Returns the row as it stands after the write, or ``None`` when
+    the row was not judged (no row at all, or a row that carries a
+    verdict already).
+    """
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+        PlanNotFoundError as ExecPlanNotFoundError,
+    )
+
+    row = _persisted_execution_row(plan_id)
+    if row is None:
+        # No row: there is no run to judge, and a reader must not
+        # invent a failure for a plan that never ran.
+        return None
+    if str(row.get("exec_status") or "") != "running":
+        return None
+    try:
+        persist_conn = open_db(_server._state_db_path())
+        try:
+            migrate(persist_conn)
+            ExecutionRepository(persist_conn).update_fields(
+                plan_id,
+                exec_status="failed",
+                stop_reason=_CRASH_STOP_REASON,
+                # The executor is gone; a pid left on a row that says
+                # ``failed`` reads as a live execution to every reader.
+                exec_pid=None,
+            )
+        finally:
+            persist_conn.close()
+    except ExecPlanNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 — a verdict write must not 500 a poll
+        _server.logger.exception(
+            "[execution_status] could not persist the crash verdict plan=%s",
+            plan_id,
+        )
+        return None
+    return _persisted_execution_row(plan_id)
+
+
+def _judge_process_dead(
+    plan_id: str, row: Optional[Dict[str, Any]]
+) -> bool:
+    """Judge a dead process — once, and only on a row that says ``running``.
+
+    The decision to re-judge a run is made on the **row**, not on this
+    process's memory: the row is what outlives the process, and a row
+    that already carries a verdict — the run is over, or it is parked
+    on capacity — is never judged again.  That is what keeps a quota
+    pause from being read as a crash, and a crash from being washed
+    into a quota pause.
+
+    The verdict is written to the row in full, at the moment it is
+    reached: the status, the reason, and the (now meaningless) pid.
+    The row's own stamp then becomes the end time, so every later
+    reader — the next boot, another process, a poller that never saw
+    the run — replays the same verdict instead of re-deriving it.
+
+    Returns whether the run was judged.
+    """
+    if not row or str(row.get("exec_status") or "") != "running":
+        # No row: there is no run to judge.  A row that already carries
+        # a verdict: it is the run's end, and a verdict is never
+        # re-judged.
+        return False
+    state = _server._execution_state.get(plan_id)
+    if not state or state.get("status") != "running":
+        return False
+    # The shared helper flips this process's memory, writes the row and
+    # syncs the plan state.
+    _server._mark_failed_dead(plan_id)
+    # The row now carries the verdict; its stamp is the end time, and
+    # this process's memory adopts it so the two never disagree.
+    _adopt_row_verdict(plan_id, _persisted_execution_row(plan_id))
+    return True
+
+
+def _persisted_execution_row(plan_id: str) -> Optional[Dict[str, Any]]:
+    """Read the durable ``plan_execution`` row for ``plan_id``.
+
+    The in-memory map is not the whole truth: it lives in the process
+    that started the run, so it is empty in every process that did not
+    — a fresh boot whose recovery scan has not run yet, or a second
+    process answering for a plan the first one is running.  The row is
+    what outlives the process, so the row is what a reader falls back
+    to.
+
+    Returns ``None`` when there is no row (the plan has never been
+    configured for execution) and when the row cannot be read (the state
+    machine is not on disk yet, or the read failed).  A failed read is
+    answered as "no row" rather than as a 500: a status poll must not
+    take the interface down.
+    """
+    sm = _server._open_state_machine()
+    if sm is None:
+        # No state.db yet — nothing was ever recorded for this plan.
+        return None
+    _conn, _routing, execution_repo, _verification, _artifact = sm
+    try:
+        return execution_repo.summary(plan_id)
+    except Exception:  # noqa: BLE001 — a status poll must not 500
+        _server.logger.exception(
+            "[execution_status] could not read the execution row plan=%s",
+            plan_id,
+        )
+        return None
+    finally:
+        _server._close_state_machine(sm)
+
+
+def _read_execution_state(plan_id: str) -> _ExecutionRead:
+    """The durable row for ``plan_id`` — and the provenance of that read.
+
+    One read, one answer, and the facts about the read itself.  The row
+    is what the answer is made of (the in-memory registry is one
+    process's view of a run and goes stale the moment another process
+    touches the plan), and the block says WHICH database produced it.
+
+    The three outcomes are told apart, because they are three different
+    answers:
+
+      * **a row** — the run is there, and it is what the answer is made
+        of;
+      * **no row, but the library was read** — the library holds no run
+        for this plan, and the block says which library that was;
+      * **the library could not be read** — nothing can be confirmed,
+        and the caller refuses rather than answering a default.
+
+    The database is opened, checked and read ONCE here: the integrity
+    check and the row read share the connection, so they describe one
+    snapshot rather than two reads that might straddle a write.  That
+    matters inside a round that restarts the service — two reads of
+    the same file can land on two different snapshots.
+    """
+    db_path: Optional[Path] = None
+    try:
+        db_path = _server._state_db_path()
+    except Exception:  # noqa: BLE001 — an unresolvable path is not a crash
+        db_path = None
+    inode: Optional[int] = None
+    if db_path is not None:
+        try:
+            inode = int(db_path.stat().st_ino)
+        except OSError:
+            inode = None
+
+    source: Dict[str, Any] = {field: None for field in STATUS_SOURCE_FIELDS}
+    source["kind"] = STATUS_DATA_SOURCE_DEFAULT
+    source["state_db_path"] = str(db_path) if db_path is not None else None
+    source["state_db_inode"] = inode
+    source["opened_at"] = _utc_now_iso()
+
+    if db_path is None or not db_path.exists():
+        # No database at all: this instance has never recorded a run.
+        # The library is empty rather than broken, so the empty answer
+        # is the honest one.
+        return _ExecutionRead(None, source, LIBRARY_ABSENT, False, False)
+
+    sm = _server._open_state_machine()
+    if sm is None:
+        # There IS a database and it could not be opened: this instance
+        # cannot confirm anything about the plan, and "not started"
+        # would be a claim it is not entitled to make.
+        source["kind"] = STATUS_DATA_SOURCE_STATE_DB
+        return _ExecutionRead(None, source, LIBRARY_UNREADABLE, False, False)
+
+    conn, routing, execution_repo, _verification, _artifact = sm
+    try:
+        source["integrity"] = _quick_check(conn)
+        row = execution_repo.summary(plan_id)
+        rowid, updated_at = _row_identity(conn, plan_id)
+        source["rowid"] = rowid
+        source["row_updated_at"] = updated_at
+        if row is not None:
+            source["kind"] = STATUS_DATA_SOURCE_STATE_DB
+            if source["row_updated_at"] is None:
+                source["row_updated_at"] = row.get("updated_at")
+        # Does the library hold a row of its own for this plan?  A
+        # routing row means the library knows the plan — and a plan the
+        # library knows but has no run for genuinely never ran.
+        known = bool(routing.current(plan_id))
+        # And does the library hold rows of its own at all?  An empty
+        # library and a library that has never heard of this plan are
+        # two different situations, and only the second one is a
+        # contradiction.
+        populated = _library_holds_rows(conn)
+        return _ExecutionRead(row, source, LIBRARY_READABLE, known, populated)
+    except Exception:  # noqa: BLE001 — a status poll must not 500
+        _server.logger.exception(
+            "[execution_status] could not read the execution state plan=%s",
+            plan_id,
+        )
+        source["kind"] = STATUS_DATA_SOURCE_STATE_DB
+        return _ExecutionRead(None, source, LIBRARY_UNREADABLE, False, False)
+    finally:
+        _server._close_state_machine(sm)
+
+
+def _status_refusal_response(
+    plan_id: str,
+    read: _ExecutionRead,
+    reason: str,
+) -> JSONResponse:
+    """The refusal: ``503``, with the store that could not answer.
+
+    The body carries the same facts a successful answer carries — the
+    database by path and by inode, the moment it was opened, the
+    integrity check that ran against it — so a reader can see WHICH
+    database was asked and go and look at it.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": STATUS_REFUSAL_DETAIL,
+            "reason": reason,
+            "plan_id": plan_id,
+            "data_source": STATUS_DATA_SOURCE_STATE_DB,
+            "data_source_detail": read.source,
+            "plans_dir": str(_server.PLANS_DIR),
+            "plan_dir": str(_server._plan_dir(plan_id)),
+        },
+    )
+
+
+def _refusal_when_the_run_cannot_be_confirmed(
+    plan_id: str,
+    read: _ExecutionRead,
+) -> Optional[JSONResponse]:
+    """The refusal: this instance cannot confirm that the plan never ran.
+
+    "Not started" is a claim about a plan's history, and it is an
+    honest claim only when this instance can back it up: the library
+    was read, and it holds no run for this plan.
+
+    Four situations, and only the last one is a refusal:
+
+      * **the library holds the plan** — a routing row of its own and
+        no execution row: the plan is known to this instance and it has
+        never run, so "not started" is true and it is answered;
+      * **the plan is not in this instance's tree** — there is no
+        directory for it here, so there is nothing here to describe;
+      * **the library is empty** — this instance has never recorded
+        anything at all, so there is nothing here that could have
+        described a run and nothing that contradicts the plan's
+        directory.  The empty answer is the honest one;
+      * **the library cannot see the plan** — it was read, it is
+        intact, it holds rows of its own, and it holds no row for this
+        plan at all, while the plan's directory is right there.  The
+        database this instance reads does not describe the tree it
+        serves: the shape a snapshot takes inside a round that restarts
+        the service.  Answering "not started" here would be a claim
+        about a run this instance cannot see — and a claim is worse
+        than a refusal, because the caller believes it.
+
+    A database that could not be read at all refuses in every case:
+    nothing was confirmed, so nothing may be claimed.
+    """
+    if read.library == LIBRARY_ABSENT:
+        # Nothing was ever recorded by this instance: the library is
+        # empty, not foreign, and the empty answer is the honest one.
+        return None
+    if read.library == LIBRARY_UNREADABLE:
+        return _status_refusal_response(
+            plan_id,
+            read,
+            "the state database could not be read",
+        )
+    if read.known:
+        # The library holds a row of its own for this plan and no
+        # execution row: the plan is known here and it never ran.
+        return None
+    if not _server._plan_dir(plan_id).exists():
+        # The plan is not in this instance's tree: there is nothing
+        # here to describe.
+        return None
+    if not read.populated:
+        # The library holds no row of its own: this instance has never
+        # recorded a run, so it cannot contradict the plan's directory
+        # either.  There is nothing to refuse about.
+        return None
+    return _status_refusal_response(
+        plan_id,
+        read,
+        "the state database holds no row for a plan in this instance's "
+        "tree",
+    )
+
+
+def _quota_wait_detail(tasks_file: Path) -> Optional[Dict[str, Any]]:
+    """Read the ``waiting_for_quota`` marker out of ``tasks.json``.
+
+    ``None`` means "this plan is not parked for quota" — no file, no
+    parseable JSON, no ``stop_reason``, or a different ``stop_reason``.
+    A marker whose ``reason_detail`` is missing / not JSON / not an
+    object yields an empty dict: the marker is still a marker, there is
+    just no detail to report.
+
+    A readable detail is normalised to the four fields the marker
+    carries (``providers`` / ``needs_manual_topup`` / ``waited_sec`` /
+    ``at``) so a consumer never has to guess at a missing key.
+
+    A marker that spells its kind is handed back as it was written:
+    the read side does not get a second opinion about it.  A marker
+    that does not spell one is left without one — the kind is decided
+    when the park is recorded, and it is decided there from the
+    numbers this function returns.
+    """
+    try:
+        raw = Path(tasks_file).read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:  # noqa: BLE001 — an unreadable plan is not a marker
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("stop_reason") != _QUOTA_WAIT_STOP_REASON:
+        return None
+
+    raw_detail = data.get("reason_detail")
+    detail: Dict[str, Any] = {}
+    if isinstance(raw_detail, str) and raw_detail.strip():
+        try:
+            parsed = json.loads(raw_detail)
+        except Exception:  # noqa: BLE001 — a broken detail is no reason to lose the marker
+            parsed = None
+        if isinstance(parsed, dict):
+            detail = parsed
+    elif isinstance(raw_detail, dict):
+        detail = raw_detail
+    if not detail:
+        return {}
+
+    providers = detail.get("providers")
+    if isinstance(providers, str):
+        providers = [providers]
+    elif not isinstance(providers, (list, tuple)):
+        providers = []
+    try:
+        waited = float(detail.get("waited_sec") or 0.0)
+    except (TypeError, ValueError):
+        waited = 0.0
+
+    normalised: Dict[str, Any] = {
+        "providers": list(providers),
+        "needs_manual_topup": bool(detail.get("needs_manual_topup", False)),
+        "waited_sec": waited,
+        "at": str(detail.get("at") or ""),
+    }
+    kind = detail.get(WAIT_KIND_FIELD)
+    if kind:
+        # Verbatim: the marker named the kind, so the kind is the
+        # marker's to say.  Nothing here re-derives it.
+        normalised[WAIT_KIND_FIELD] = str(kind)
+    return normalised
+
+
+def _quota_wait_log(
+    plan_id: str,
+    event: str,
+    message: str,
+    data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Record one ``waiting_for_quota`` event in the plan's own log.
+
+    The plan's ``execution.log`` is the same file the executor wrote
+    ``task_quota_wait_exhausted`` into, so the whole "why did this run
+    stop" story ends up in one place the operator (and the watchdog)
+    already reads.  There is deliberately no second sink to reconcile.
+
+    Logging must never break the disposition it is describing, so every
+    failure here degrades to "nothing was written" — the plan stays
+    parked either way.
+    """
+    payload = dict(data or {})
+    try:
+        from execution_logger import get_logger
+
+        plan_logger = get_logger(plan_id=plan_id)
+        if plan_logger is not None:
+            plan_logger.warning(event, message, data=payload)
+    except Exception:  # noqa: BLE001 — logging must never break a disposition
+        pass
+
+
+def _enter_quota_wait(
+    plan_id: str,
+    plan_dir: Path,
+    state: Dict[str, Any],
+    tasks_file: Path,
+) -> bool:
+    """Park the plan in ``waiting_for_quota`` — the quota disposition.
+
+    Returns ``True`` when the plan carries the marker, and the caller
+    MUST return immediately: no task is failed, no task is skipped, and
+    the auto-verification loop must not run.  ``False`` means "no
+    marker" and the caller keeps its normal disposition.
+    """
+    detail = _quota_wait_detail(tasks_file)
+    if detail is None:
+        return False
+
+    # 1. The in-memory state first: it is what the status endpoint
+    #    reads, and it must be right even if every write below fails.
+    #    ``ended_at`` stays ``None`` — the run is parked, not over.
+    state["status"] = _QUOTA_WAIT_STOP_REASON
+    state["stop_reason"] = _QUOTA_WAIT_STOP_REASON
+    state["ended_at"] = None
+
+    # 2. Persist the execution status.  Best-effort: the plan is
+    #    already parked in memory, and a failed write must NOT turn it
+    #    into a failure.
+    try:
+        from state_machine.db.connection import open as open_db
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.execution_repository import (
+            ExecutionRepository,
+            PlanNotFoundError as ExecPlanNotFoundError,
+        )
+    except Exception as exc:  # noqa: BLE001 — no state-machine, no write
+        _quota_wait_log(
+            plan_id,
+            "execution_quota_wait_persist_failed",
+            "Could not persist the waiting_for_quota status — the plan "
+            "stays parked in memory.",
+            {"error": str(exc)[:300]},
+        )
+    else:
+        try:
+            persist_conn = open_db(_server._state_db_path())
+            try:
+                migrate(persist_conn)
+                ExecutionRepository(persist_conn).update_status(
+                    plan_id, _QUOTA_WAIT_STOP_REASON,
+                )
+                # The reason belongs on the row too.  The row is what
+                # outlives this process, and a reader that finds it
+                # after a restart must be able to say *why* the run
+                # stopped — not only that it is parked.  Without it the
+                # durable record carries the verdict and drops the
+                # reason, and every reader has to re-derive it.
+                ExecutionRepository(persist_conn).update_fields(
+                    plan_id, stop_reason=_QUOTA_WAIT_STOP_REASON,
+                )
+            finally:
+                persist_conn.close()
+        except ExecPlanNotFoundError as exc:
+            # No ``plan_execution`` row for this plan: there is nothing
+            # to write, which is not a failure of the plan itself.
+            _quota_wait_log(
+                plan_id,
+                "execution_quota_wait_persist_failed",
+                "Could not persist the waiting_for_quota status — the plan "
+                "stays parked in memory.",
+                {"error": str(exc)[:300]},
+            )
+        except Exception as exc:  # noqa: BLE001 — same contract as above
+            _quota_wait_log(
+                plan_id,
+                "execution_quota_wait_persist_failed",
+                "Could not persist the waiting_for_quota status — the plan "
+                "stays parked in memory.",
+                {"error": str(exc)[:300]},
+            )
+
+    # 3. Move the workflow phase.  ``executing → waiting_for_quota`` is
+    #    a legal edge; anything else is forced, and the force is said
+    #    out loud because it bypasses the transition table.
+    #
+    #    ``_server.PlanState`` on purpose — the late-bound name is what
+    #    the tests patch, and ``from plan_state import PlanState``
+    #    would bind the class at import time and defeat them.
+    try:
+        _server.PlanState(plan_dir).transition_to(_QUOTA_WAIT_STOP_REASON)
+    except ValueError:
+        try:
+            _server.PlanState(plan_dir).force_set_phase(_QUOTA_WAIT_STOP_REASON)
+        except Exception as exc:  # noqa: BLE001 — the status row is the truth
+            _quota_wait_log(
+                plan_id,
+                "execution_quota_wait_persist_failed",
+                "Could not move the plan into waiting_for_quota — the plan "
+                "stays parked in memory.",
+                {"error": str(exc)[:300]},
+            )
+        else:
+            _quota_wait_log(
+                plan_id,
+                "execution_quota_wait_phase_forced",
+                "The plan had no legal edge into waiting_for_quota — the "
+                "phase was forced.",
+                {"phase": _QUOTA_WAIT_STOP_REASON},
+            )
+    except Exception as exc:  # noqa: BLE001 — the status row is the truth
+        _quota_wait_log(
+            plan_id,
+            "execution_quota_wait_persist_failed",
+            "Could not move the plan into waiting_for_quota — the plan "
+            "stays parked in memory.",
+            {"error": str(exc)[:300]},
+        )
+
+    # 4. The event that says why the run stopped — with the kind of the
+    #    park written down.
+    #
+    #    The payload comes from the module that owns the decision, so
+    #    the kind and the numbers come from ONE place.  A reader is
+    #    never left combining them by hand, and a hard cap can never be
+    #    described as a window that reopens by itself.
+    _quota_wait_log(
+        plan_id,
+        "execution_waiting_for_quota",
+        "The run parked because every provider had no capacity — no task "
+        "was failed and no task was skipped.",
+        quota_wait_event_data(
+            providers=detail.get("providers"),
+            kind=detail.get(WAIT_KIND_FIELD),
+            waited_sec=detail.get("waited_sec", 0.0),
+            at=detail.get("at"),
+            needs_manual_topup=bool(detail.get("needs_manual_topup", False)),
+        ),
+    )
+    return True
 
 
 def _record_project_dir_rejection(
@@ -1037,6 +1942,23 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
                     # considered terminal.
                     unfinished = _server._count_unfinished_tasks(plan_id, tasks_file)
                     if unfinished["pending_or_unstarted"] > 0:
+                        # 2026-10-24: the executor parked the plan
+                        # because every provider had no capacity left.
+                        # The tasks are NOT failed — they are still
+                        # eligible for another dispatch — so the
+                        # disposition is "waiting_for_quota", not
+                        # "failed" and not "blocked → skipped".
+                        #
+                        # This check comes FIRST, before the
+                        # blocked-only branch below: that branch would
+                        # skip the downstream tasks and auto-verify the
+                        # incomplete subset, and the failed branch
+                        # after it would strand every task that is only
+                        # waiting for capacity to come back.
+                        if _enter_quota_wait(
+                            plan_id, plan_dir, state, tasks_file,
+                        ):
+                            return
                         # 2026-09-11 plan v9 (Bug 2 fix):
                         # Executor gave up with deferred/blocked tasks.
                         # Two sub-cases:
@@ -1375,7 +2297,41 @@ def _pause_fields(plan_id: str) -> Dict[str, Any]:
     }
 
 
-@router.get("/api/execution/{plan_id}/status", response_model=_server.ExecutionStatusResponse)
+class _ExecutionStatusResponse(_server.ExecutionStatusResponse):
+    """The status answer, plus the provenance of that answer.
+
+    ``data_source`` says where the answer came from: ``state_db`` when
+    it was assembled from the durable ``plan_execution`` row, and
+    ``default`` when the library really holds no row for this plan and
+    the answer is the empty default.
+
+    The field exists because the two answers used to look alike.  A
+    reader that got ``status=not_started`` with every other field null
+    could not tell "this plan never ran" from "this process knows
+    nothing about this plan" — and the second one is what a run that
+    was dying looked like.
+
+    ``data_source_detail`` is the same provenance in facts rather than
+    in a word: the database by path and by inode, the moment the read
+    opened it, the row it found (by rowid and by the row's own stamp)
+    and the verdict of the integrity check that ran before the row was
+    trusted.  The kind alone is not enough inside a round that restarts
+    the service: two instances can read two different snapshots of the
+    same file, and a reader that cannot tell the snapshots apart
+    cannot tell which run it is being told about.
+
+    Declared as a subclass of the server's own model rather than as an
+    edit to it: the server module owns the shared response models, and
+    a route-local subclass inherits every field it already had — the
+    status vocabulary, the pause fields — without a second place to
+    keep them in sync.
+    """
+
+    data_source: Literal["state_db", "default"] = STATUS_DATA_SOURCE_DEFAULT
+    data_source_detail: Optional[Dict[str, Any]] = None
+
+
+@router.get("/api/execution/{plan_id}/status", response_model=_ExecutionStatusResponse)
 def get_execution_status(plan_id: str):
     """Poll execution status and logs.
 
@@ -1386,40 +2342,198 @@ def get_execution_status(plan_id: str):
     the repository layer — there is no canonical on-disk JSON to
     read from at this point.
 
+    **The row is the source of the answer; the in-memory map is one
+    view of it.**  The map lives in the process that started the run, so
+    it is empty in every process that did not: a fresh boot whose
+    recovery scan has not run yet, a second process answering for a plan
+    the first one is running, a plan whose directory the boot-time scan
+    never walked.  Answering "not started" from an empty map turned a
+    run that was parked on capacity — or one that was dying — into a
+    plan that never ran, and the operator was told the run never
+    happened.  So the row is read first and the answer is made of it:
+    its ``exec_status``, its ``stop_reason``, its start time, its end
+    time and its pid.  Only a plan that has no execution row at all is
+    "not started".
+
+    **A row with nothing in the map is restored into it.**  The map is
+    also what the liveness rule reads — the watchdog judges the
+    in-memory status and probes the in-memory pid — so a row that says
+    ``running`` while its process is gone would never be probed at all
+    when the map is empty, and the answer would report a run that is
+    still going, forever.  Restoring the row (in the very shape the
+    boot-time scan restores it) hands it to the standing rule instead
+    of inventing a verdict for it: a process that died is ``failed`` /
+    ``process_died_unexpectedly``, and never a quota wait.
+
+    **The row is also the truth when the map holds something.**  The
+    map is one process's view of a run, and it goes stale the moment
+    another process touches the same plan — another process parks the
+    plan on capacity, another process judges a crash.  So the row's
+    verdict is read first and adopted into the map, and the answer is
+    made of the row.  That is also what keeps the watchdog honest: it
+    judges liveness from the in-memory status, and it must not judge a
+    row that is not ``running``.
+
+    **The answer says where it came from.**  ``data_source`` is
+    ``state_db`` when the answer was assembled from the row and
+    ``default`` when the library really holds no row and the answer is
+    the empty default.  Without it, "this plan never ran" and "this
+    process knows nothing about this plan" are the same answer — and
+    the second one is what a dying run used to look like.
+
+    **The answer says WHICH database produced it.**  ``data_source``
+    names the *kind*; ``data_source_detail`` names the *store*: the
+    database by path and by inode, the moment the read opened it, the
+    row it found (by rowid and by the row's own stamp) and the verdict
+    of the integrity check that ran before the row was trusted.  A
+    round that restarts the service inside the round is exactly where
+    the kind is not enough: two instances can read two different
+    snapshots of the same file, and a reader that cannot tell them
+    apart cannot tell which run it is being told about.
+
+    **"Not started" is a claim, and a claim needs a witness.**  The
+    empty answer is only made when this instance can back it up: the
+    library was read and it holds no run for this plan.  When the
+    library could not be read, or when it was read, it holds rows of
+    its own, and it holds no row at all for a plan whose directory is
+    right here in this instance's tree, the answer is a refusal (503)
+    that names the database that could not answer — never a default
+    nobody recorded.  See
+    :func:`_refusal_when_the_run_cannot_be_confirmed`.
+
+    The read itself never probes a PID on its own: a parked run keeps a
+    PID whose process is gone, and judging liveness belongs to
+    ``_recover_execution_states`` and ``_lazy_check_execution`` — the
+    two places allowed to ask it.
+
     The pause fields come from the plan directory rather than from
-    that state, and are filled in on **both** branches: after a
+    that state, and are filled in on **every** branch: after a
     restart, the branch a paused plan lands in is ``not_started``,
     which is exactly where the checkpoint has to still be reported.
     """
     _server._validated_plan_id(plan_id)   # uniform contract — see that function
+
+    # The row is the truth about the run; this process's memory is one
+    # view of it and can be stale.  Read the row first and adopt its
+    # verdict, so that anything acting on the in-memory status — the
+    # watchdog judges liveness from it — acts on the row's truth.
+    #
+    # The read brings the provenance of the read with it, so the answer
+    # can name the store it was made of.
+    read = _read_execution_state(plan_id)
+    row = read.row
+
+    # A row with nothing in this process's registry: the registry is
+    # empty after a restart, in another process, and for a plan the
+    # boot-time scan never walked (it walks the plans *tree*, so a plan
+    # without a directory is invisible to it).
+    #
+    # The registry is what the liveness rule reads — the watchdog
+    # judges the in-memory status and probes the in-memory pid — so a
+    # row that says ``running`` while its process is gone would never
+    # be probed at all, and the answer would report a run that is still
+    # going, forever.  Restoring the row hands it to the standing rule
+    # instead of inventing a verdict for it.
+    if row is not None and plan_id not in _server._execution_state:
+        _restore_execution_state_from_row(plan_id, row)
+
+    _adopt_row_verdict(plan_id, row)
+
+    before = _memory_verdict(plan_id)
     _server._lazy_check_execution(plan_id)
+    if _memory_verdict(plan_id) != before:
+        # The watchdog reached a verdict.  The row is where that
+        # verdict lives, so the row is re-read: from here on the answer
+        # is made of the row, not of a second derivation of it.
+        row = _persisted_execution_row(plan_id) or row
+        _adopt_row_verdict(plan_id, row)
+        # The verdict changed the row, so the provenance is read again:
+        # it has to describe the row the answer is made of.
+        read = _read_execution_state(plan_id)
+        row = read.row or row
+
+    if (
+        _memory_verdict(plan_id)[1] == _CRASH_STOP_REASON
+        and str((row or {}).get("exec_status") or "") == "running"
+    ):
+        # The crash was reached, but the row does not carry it: the
+        # write was lost.  A ``running`` row is the only row that may
+        # still be judged, so this is the one moment the verdict may be
+        # written — and it is written whole.
+        row = _write_crash_verdict(plan_id) or row
+        _adopt_row_verdict(plan_id, row)
+        # Same here: the row changed, so the provenance is read again.
+        read = _read_execution_state(plan_id)
+        row = read.row or row
+
+    source = read.source
     s = _server._execution_state.get(plan_id)
-    if not s:
-        # No row in the state-machine — surface an empty "not started"
-        # response rather than 500.  This matches the legacy behaviour
-        # when ``execution.json`` was absent.
+    if row is not None:
+        # The row survived the process that wrote it, so the row is
+        # what the answer is made of.  A parked run has not ended and
+        # carries no end time; a terminal run's end time is the row's
+        # own stamp of the verdict, so the replay hands back the same
+        # end time the writer recorded.
+        #
+        # The logs and the sync targets are the runtime half of the
+        # answer: they live in this process only, and they are read
+        # from the registry when it holds one.
+        status, stop_reason = _execution_verdict(row)
         return {
             "plan_id": plan_id,
-            "status": "not_started",
-            "logs": [],
-            "project_dir": "",
-            "pid": None,
-            "started_at": None,
-            "ended_at": None,
-            "stop_reason": None,
-            "sync_targets": None,
+            "status": status,
+            "logs": list(s.get("logs", [])) if s else [],
+            "project_dir": row.get("project_dir") or "",
+            "pid": _row_pid(row, status),
+            "started_at": row.get("started_at"),
+            "ended_at": _verdict_stamp(row),
+            "stop_reason": stop_reason,
+            "sync_targets": s.get("sync_targets") if s else None,
+            "data_source": STATUS_DATA_SOURCE_STATE_DB,
+            "data_source_detail": source,
             **_pause_fields(plan_id),
         }
+    if s:
+        # No row, but this process holds a view of the run: the answer
+        # is that view, and it says so — it was not read from the row.
+        return {
+            "plan_id": plan_id,
+            "status": s.get("status", "not_started"),
+            "logs": list(s.get("logs", [])),
+            "project_dir": s.get("project_dir", ""),
+            "pid": s.get("pid"),
+            "started_at": s.get("started_at"),
+            "ended_at": s.get("ended_at"),
+            "stop_reason": s.get("stop_reason"),
+            "sync_targets": s.get("sync_targets"),
+            "data_source": STATUS_DATA_SOURCE_DEFAULT,
+            "data_source_detail": source,
+            **_pause_fields(plan_id),
+        }
+    # No execution row at all — and nothing this process holds either.
+    # The empty "not started" answer is a CLAIM about the plan's
+    # history, so it may only be made when this instance can back it
+    # up.  When it cannot, the answer is a refusal that names the
+    # database that could not answer — a claim the caller would believe
+    # is worse than a refusal it can act on.
+    refusal = _refusal_when_the_run_cannot_be_confirmed(plan_id, read)
+    if refusal is not None:
+        return refusal
+    # The library was read and it holds no run for this plan: the plan
+    # has never run, and a reader must never be handed a fabricated
+    # failure instead.
     return {
         "plan_id": plan_id,
-        "status": s.get("status", "not_started"),
-        "logs": list(s.get("logs", [])),
-        "project_dir": s.get("project_dir", ""),
-        "pid": s.get("pid"),
-        "started_at": s.get("started_at"),
-        "ended_at": s.get("ended_at"),
-        "stop_reason": s.get("stop_reason"),
-        "sync_targets": s.get("sync_targets"),
+        "status": "not_started",
+        "logs": [],
+        "project_dir": "",
+        "pid": None,
+        "started_at": None,
+        "ended_at": None,
+        "stop_reason": None,
+        "sync_targets": None,
+        "data_source": STATUS_DATA_SOURCE_DEFAULT,
+        "data_source_detail": source,
         **_pause_fields(plan_id),
     }
 
@@ -2056,6 +3170,77 @@ def stop_execution(plan_id: str, discard: bool = False):
     return response
 
 
+def _serving_instance(db_path: Optional[Path]) -> Dict[str, Any]:
+    """The identity of the process that is answering, and of its database.
+
+    A reader that asks a port a question gets an answer, and the answer
+    does not say WHO gave it.  That was enough until an instance died
+    and another one took its port: the round could not say whether the
+    200 it received came from the instance it had configured or from a
+    stranger, and it could not say which ``state.db`` the counts came
+    from either.  Two answers about "the same" plan then looked alike
+    while being about different databases.
+
+    So the answer names itself: the pid, the boot id (minted once per
+    process, never changed), the start time, and the database this
+    process read — by path AND by inode, because a different file at
+    the same path is a different data plane.
+
+    The database named here is the very file the counts were read from,
+    so a reader can check the two against each other instead of
+    trusting the label.
+    """
+    try:
+        identity = _server._instance_identity(db_path)
+    except Exception:  # noqa: BLE001 - an identity block must never 500
+        identity = {}
+    return {
+        "pid": identity.get("pid"),
+        "boot_id": identity.get("boot_id"),
+        "state_db_path": identity.get("state_db_path"),
+        "state_db_inode": identity.get("state_db_inode"),
+        "started_at": identity.get("started_at"),
+    }
+
+
+def _execution_in_flight(
+    exec_row: Optional[Dict[str, Any]],
+    state: Optional[Dict[str, Any]],
+) -> bool:
+    """Is this plan's execution still running right now?
+
+    Two facts, in this order:
+
+    * **The row says whether the run is supposed to be going.**  A
+      parked plan (``waiting_for_quota``) keeps the pid the executor
+      will be resumed under, and that pid is gone for as long as the
+      park lasts — so a pid on the row is NOT evidence of a live run,
+      and a parked plan is not in flight.
+    * **The process handle says whether it actually is.**  Only the
+      process that started the run holds one; everywhere else the
+      row's own word is the last word.
+
+    The pid is deliberately NOT probed here.  Liveness is the
+    watchdog's call — ``_recover_execution_states`` at boot and
+    ``_lazy_check_execution`` at runtime are the two places allowed to
+    ask it — and a third judge would answer the same run differently
+    from the first, which is the exact shape of bug this endpoint is
+    being fixed for.
+    """
+    state = state or {}
+    row_status = str((exec_row or {}).get("exec_status") or "")
+    status = row_status or str(state.get("status") or "")
+    if status != "running":
+        return False
+    proc = state.get("process")
+    if proc is not None:
+        try:
+            return proc.poll() is None
+        except Exception:  # noqa: BLE001 - a dead handle is not a live run
+            return False
+    return state.get("ended_at") is None
+
+
 @router.get("/api/execution/{plan_id}/progress")
 def get_execution_progress(plan_id: str):
     """Real-time task progress.
@@ -2078,22 +3263,158 @@ def get_execution_progress(plan_id: str):
     ``pid`` / ``project_dir`` / ``execution_status`` fields are
     derived from the state-machine row + on-disk ``execution.json``
     mirror, NOT from ``_execution_state`` (no in-memory aggregation).
+
+    2026-10-24 — the 404 gate is "there is no execution record", not
+    "there is no project dir".  The gate used to read
+    ``_get_project_dir()`` and answer 404 when it came back empty,
+    which reported a quota-parked plan as a plan that was never
+    started: the parked row exists, but nothing forces that row to
+    carry a project directory, so the operator's question ("what is
+    still left to do?") was answered with "call /start first" — on a
+    plan that was already running and waiting for capacity.
+
+    The ``plan_execution`` row IS the evidence that the plan was
+    configured for execution.  Only its ABSENCE may produce the 404,
+    and the original wording stays for that case: an operator who
+    reads "not configured" can act on it.
+
+    2026-10-26 — **the row is the truth and the registry is a cache.**
+    The row (``plan_execution``) is the durable record of the run and
+    the per-task rows (``plan_tasks``) are the durable record of the
+    work; the in-memory registry (``_execution_state``) is one
+    process's view of the row, and it goes stale the moment another
+    process touches the plan.  A plan parked on capacity by the process
+    that owns the run leaves every OTHER process holding a registry
+    that still says "running" — with a pid that has since exited.
+
+    The watchdog (``_lazy_check_execution``) judges the registry's
+    status and probes the registry's pid, so a stale "running" made it
+    judge a parked plan's dead pid: the pause was rewritten as a crash,
+    the row was overwritten with ``failed``, and the interrupted task's
+    ``in_progress`` row was reaped back to ``pending``.  The plan then
+    reported "nothing is running and two tasks are still pending" for
+    work that was merely waiting for capacity.
+
+    So the row's verdict is adopted into the registry BEFORE the
+    watchdog runs, the counts are read from the state database this
+    process is bound to, and the answer names the instance that
+    produced it (``serving_instance``) and whether the run is still in
+    flight (``execution_in_flight``).  A reader can then tell this
+    answer from another instance's answer about the same plan, and can
+    tell a paused run from a dead one.
     """
-    _server._lazy_check_execution(plan_id)
     project_dir = _server._get_project_dir(plan_id)
-    if not project_dir:
+
+    # --- Single state-machine connection ----------------------------------
+    # ``execution_repository.summary`` (the row itself),
+    # ``plan_task_repository.load_all`` (per-task runtime overlay) and
+    # ``execution_repository.progress`` (aggregated ``task_progress``
+    # column used as a sanity-check hint) all read from the same
+    # SQLite file. We open the connection ONCE and pass the handle
+    # to every repository so:
+    #
+    #   * the WAL / busy_timeout / synchronous PRAGMAs are applied
+    #     once per request instead of twice,
+    #   * the read-modify-write view is consistent — a writer that
+    #     commits between two opens cannot show the overlay and
+    #     the aggregated column out-of-order,
+    #   * the second ``migrate()`` call (a no-op once the schema is
+    #     current but still a DDL round-trip) is gone.
+    #
+    # The row is read FIRST because the 404 gate below needs it: the
+    # gate is about the existence of the record, not about the
+    # project dir it happens to carry.
+    #
+    # The database path is resolved ONCE and used twice: for the read
+    # and for the identity block the answer carries.  The two cannot
+    # disagree that way — the file named in the answer is the file the
+    # counts came from.
+    state_db_path: Optional[Path] = None
+
+    runtime: dict = {}
+    db_progress: Optional[dict] = None
+    exec_row: Optional[dict] = None
+    try:
+        from state_machine.db.connection import open as open_db
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.plan_task_repository import (
+            PlanTaskRepository,
+        )
+        from state_machine.repositories.execution_repository import (
+            ExecutionRepository,
+        )
+
+        state_db_path = Path(_server._state_db_path())
+        sm_conn = open_db(state_db_path)
+        try:
+            migrate(sm_conn)
+            exec_repo = ExecutionRepository(sm_conn)
+            # The ``plan_execution`` row — the record that says this
+            # plan was configured for execution at all.
+            exec_row = exec_repo.summary(plan_id)
+            # Per-task runtime overlay (current schema; the fields it
+            # carries are listed at ``_RUNTIME_OVERLAY_FIELDS`` below).
+            runtime = PlanTaskRepository(sm_conn).load_all(plan_id)
+            # Aggregated ``task_progress`` column — the sanity-check
+            # hint consumed by the drift log below.
+            db_progress = exec_repo.progress(plan_id)
+
+            # The row's verdict is adopted into the registry BEFORE the
+            # watchdog runs.  The watchdog judges the registry's status
+            # and probes the registry's pid; a registry that still says
+            # "running" for a plan that has since parked would make it
+            # judge the parked plan's dead pid and read a pause as a
+            # crash.  The registry is a cache of the row, so the row
+            # overwrites it.
+            _adopt_row_verdict(plan_id, exec_row)
+
+            # The watchdog may reach a verdict of its own (a row that
+            # says "running" whose process is gone).  It writes that
+            # verdict to the row and reaps the orphaned in_progress
+            # rows, so the row and the task rows are read again on the
+            # SAME connection: the answer must describe the state as
+            # it is after the verdict, not as it was before it.
+            try:
+                before = _memory_verdict(plan_id)
+                _server._lazy_check_execution(plan_id)
+                judged = _memory_verdict(plan_id) != before
+            except Exception:  # noqa: BLE001 - a watchdog failure must not 500
+                _server.logger.exception(
+                    "[execution_progress] watchdog failed plan=%s", plan_id,
+                )
+                judged = False
+            if judged:
+                exec_row = exec_repo.summary(plan_id) or exec_row
+                runtime = PlanTaskRepository(sm_conn).load_all(plan_id)
+                _adopt_row_verdict(plan_id, exec_row)
+        finally:
+            sm_conn.close()
+    except (sqlite3.OperationalError, OSError):
+        # State-machine not on disk yet — tasks.json carries the
+        # runtime fields directly (legacy / pre-migration plan).
+        runtime = {}
+        db_progress = None
+        exec_row = None
+
+    if not project_dir and exec_row is None:
         raise HTTPException(404, "Execution not configured for this plan — call /api/execution/{plan_id}/start first")
 
     plan_dir = _server._plan_dir(plan_id)
     plan_tasks_file = plan_dir / "tasks.json"
-    legacy_tasks_file = project_dir / "tasks.json"  # 404 above guarantees project_dir is set
+    # The legacy fallback lives INSIDE the project dir, so it exists
+    # only when there is one.  A plan whose row carries no project dir
+    # still has its plan-dir task list and its ``plan_tasks`` rows —
+    # that is where the counts come from.
+    legacy_tasks_file = (project_dir / "tasks.json") if project_dir else None
 
     # Hot-path optimization B-05: short-circuit candidate files with a
     # single tuple of Path.exists() probes. The previous code did two
     # sequential .exists() calls even on the common single-source
     # layout (only plan_tasks_file present). Single tuple evaluation
     # avoids re-walking the path resolution for the legacy fallback.
-    candidates = (plan_tasks_file, legacy_tasks_file)
+    candidates = tuple(
+        c for c in (plan_tasks_file, legacy_tasks_file) if c is not None
+    )
     tasks_file = next((c for c in candidates if c.exists()), None)
 
     # 2026-09-06 — also consult the latest ``tasks_with_repair_round_*.json``
@@ -2187,49 +3508,8 @@ def get_execution_progress(plan_id: str):
         "schedule_ts",
         "failure_reason",
     )
-    # --- Single state-machine connection ----------------------------------
-    # ``plan_task_repository.load_all`` (per-task runtime overlay) and
-    # ``execution_repository.progress`` (aggregated ``task_progress``
-    # column used as a sanity-check hint) both read from the same
-    # SQLite file. We open the connection ONCE and pass the handle
-    # to both repositories so:
-    #
-    #   * the WAL / busy_timeout / synchronous PRAGMAs are applied
-    #     once per request instead of twice,
-    #   * the read-modify-write view is consistent — a writer that
-    #     commits between two opens cannot show the overlay and
-    #     the aggregated column out-of-order,
-    #   * the second ``migrate()`` call (a no-op once the schema is
-    #     current but still a DDL round-trip) is gone.
-    runtime: dict = {}
-    db_progress: Optional[dict] = None
-    try:
-        from state_machine.db.connection import open as open_db
-        from state_machine.db.schema import migrate
-        from state_machine.repositories.plan_task_repository import (
-            PlanTaskRepository,
-        )
-        from state_machine.repositories.execution_repository import (
-            ExecutionRepository,
-        )
-
-        sm_conn = open_db(_server._state_db_path())
-        try:
-            migrate(sm_conn)
-            # Per-task runtime overlay (current schema; see
-            # ``_RUNTIME_OVERLAY_FIELDS`` above).
-            runtime = PlanTaskRepository(sm_conn).load_all(plan_id)
-            # Aggregated ``task_progress`` column — the sanity-check
-            # hint consumed by the drift log below.
-            db_progress = ExecutionRepository(sm_conn).progress(plan_id)
-        finally:
-            sm_conn.close()
-    except (sqlite3.OperationalError, OSError):
-        # State-machine not on disk yet — tasks.json carries the
-        # runtime fields directly (legacy / pre-migration plan).
-        runtime = {}
-        db_progress = None
-
+    # The runtime overlay was read on the single connection opened
+    # above (the row, the overlay and the aggregated hint all share it).
     for t in tasks:
         rt = runtime.get(t.get("id")) if isinstance(t, dict) else None
         if not rt:
@@ -2404,10 +3684,32 @@ def get_execution_progress(plan_id: str):
                     api_error = {"status": m.group(1), "message": m.group(2), "task_id": t.get("id")}
                 break
 
-    # Derive execution_status from in-memory state or tasks.json (for resilience after server restart)
-    # If in-memory state is missing or shows "not_started" despite having task progress, derive from tasks.json
-    execution_status = s.get("status")
+    # Derive execution_status from the state-machine row, the in-memory
+    # state, or tasks.json (for resilience after server restart).
+    #
+    # The row is the FIRST source because it is the only one that can
+    # say ``waiting_for_quota``: the counts cannot tell a parked plan
+    # from a plan that never started — both look like "pending tasks,
+    # nothing running" — and the difference is the whole point of the
+    # quota wait.  The row is also the only source that survives a
+    # restart, which is exactly when the in-memory state is empty.
+    #
+    # And it stays the first source when the registry disagrees: the
+    # registry is one process's cache of the row, and the row is
+    # written by whoever owns the run.  A registry that still says
+    # "running" for a plan that has since parked would otherwise make
+    # the answer depend on WHICH process served the request — the
+    # answer would be "running" on the process that owns the run and
+    # "parked" on every other one.
+    #
+    row_status = (exec_row or {}).get("exec_status") or None
+    memory_status = s.get("status") or None
+    if row_status and row_status != "not_started":
+        execution_status = row_status
+    else:
+        execution_status = memory_status or row_status
     has_task_progress = counts["completed"] > 0 or counts["failed"] > 0 or counts["in_progress"] > 0
+    # If in-memory state is missing or shows "not_started" despite having task progress, derive from tasks.json
     if not execution_status or (execution_status == "not_started" and has_task_progress):
         if counts["in_progress"] > 0:
             execution_status = "running"
@@ -2434,7 +3736,11 @@ def get_execution_progress(plan_id: str):
     return {
         "plan_id": plan_id,
         "pid": s.get("pid"),
-        "project_dir": str(project_dir),
+        # A plan whose row carries no project dir reports an empty
+        # string, not "None" — the field is a path, and an empty one
+        # reads as "there is none" the same way the rest of the API
+        # reports a missing project dir.
+        "project_dir": str(project_dir) if project_dir else "",
         "execution_status": execution_status,
         "tasks": tasks,
         "current": current,
@@ -2459,6 +3765,18 @@ def get_execution_progress(plan_id: str):
         "started_at": s.get("started_at"),
         "ended_at": s.get("ended_at"),
         "execution_stop_reason": s.get("stop_reason"),
+        # Is the run still going?  A parked plan (``waiting_for_quota``)
+        # keeps the pid the executor will be resumed under, and that pid
+        # is gone for as long as the park lasts — so the answer is
+        # "no", and it says so instead of leaving the reader to read a
+        # pid as "alive".
+        "execution_in_flight": _execution_in_flight(exec_row, s),
+        # Who answered.  A reader that cannot say WHICH instance
+        # produced this answer cannot compare it with another
+        # instance's answer about the same plan — and the database the
+        # counts came from is named here, by path AND by inode, so the
+        # two can be checked against each other.
+        "serving_instance": _serving_instance(state_db_path),
     }
 
 
@@ -2528,6 +3846,33 @@ def get_execution_files(plan_id: str):
     return result
 
 
+def _plan_dir_resolves_inside(plans_dir: Path, plan_dir: Path) -> bool:
+    """True when ``plan_dir`` resolves to a path inside ``plans_dir``.
+
+    Both sides are resolved before they are compared, and the
+    *resolution* is what is compared: a plans root that is itself a
+    symlink resolves to the same real directory on both sides, and a
+    plan directory that is a symlink out of the tree resolves to where
+    it really points — which is the directory that would actually be
+    read.
+
+    The check is not about the NAME the caller sent (the plan id is
+    validated before this) but about the PLACE the name leads to.  A
+    plan id is a leaf under the configured root; a leaf that points out
+    of the tree belongs to somebody else's tree, and reading it would
+    answer about a plans root this process was never asked about.
+
+    A path that cannot even be resolved (a symlink loop, a permission
+    error) is not a path this process may read, so it is refused too.
+    """
+    try:
+        root = plans_dir.resolve()
+        candidate = plan_dir.resolve()
+    except (OSError, RuntimeError):
+        return False
+    return candidate.is_relative_to(root)
+
+
 @router.get("/api/execution/{plan_id}/logs")
 def get_execution_logs(
     plan_id: str,
@@ -2539,6 +3884,15 @@ def get_execution_logs(
 ):
     """Query structured execution logs with filters.
 
+    The answer says WHICH tree it read.  A 404 that names only "Plan
+    not found" is the same answer for a plan this process does not
+    have and for a plan that is in another instance's plans root, and
+    the two must not look alike: the first is a fact about the plan,
+    the second is a fact about the probe.  So the 404 carries the root
+    it searched and the directory it resolved, and the 200 carries the
+    file it actually read — which is what lets a reader confirm after
+    a round that the evidence came from that round's instance.
+
     Args:
         level: Minimum log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         task_id: Filter by task ID
@@ -2546,14 +3900,50 @@ def get_execution_logs(
         limit: Maximum entries to return (default 100, max 1000)
         since: ISO timestamp — return entries after this time
     """
+    plans_dir = Path(_server.PLANS_DIR)
     plan_dir = _server._plan_dir(plan_id)
+    log_path = plan_dir / "execution.log"
+
+    # The plan id is a leaf under the configured root.  A leaf that
+    # resolves OUTSIDE that root is another tree's plan, and this
+    # process must not answer for it.  Refusing it loudly is the point:
+    # a silent read would be evidence about the wrong instance.
+    if not _plan_dir_resolves_inside(plans_dir, plan_dir):
+        _server.logger.warning(
+            "execution logs: refusing a plan directory that resolves "
+            "outside the configured plans root — plan=%s plan_dir=%s "
+            "plans_dir=%s",
+            plan_id,
+            plan_dir,
+            plans_dir,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "plan_path_outside_plans_root",
+                "detail": (
+                    "Plan directory resolves outside the configured plans "
+                    "root; it belongs to another tree."
+                ),
+                "plans_dir": str(plans_dir),
+                "plan_dir": str(plan_dir),
+            },
+        )
+
     if not plan_dir.exists():
-        raise HTTPException(404, "Plan not found")
+        return JSONResponse(
+            status_code=404,
+            content={
+                "detail": "Plan not found",
+                "plans_dir": str(plans_dir),
+                "plan_dir": str(plan_dir),
+            },
+        )
 
     limit = min(limit, 1000)
     entries = _server.ExecutionLogger.read_logs(
         plan_id,
-        plans_dir=_server.PLANS_DIR,
+        plans_dir=plans_dir,
         level=level,
         task_id=task_id,
         event=event,
@@ -2566,6 +3956,12 @@ def get_execution_logs(
         "logs": entries,
         "total": len(entries),
         "filters": {"level": level, "task_id": task_id, "event": event, "since": since},
+        # Which tree answered, and which file in it was read.  Without
+        # these, a reader cannot tell this instance's answer from
+        # another instance's — the confusion this route exists to end.
+        "plans_dir": str(plans_dir),
+        "plan_dir": str(plan_dir),
+        "log_path": str(log_path),
     }
 
 

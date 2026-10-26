@@ -8,13 +8,17 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from typing import Dict, List, Optional, Tuple, Any
-from fastapi import HTTPException, Request
+from typing import Dict, List, Mapping, NamedTuple, Optional, Set, Tuple, Any
+from fastapi import HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pathlib import Path
 from datetime import datetime, timezone
 import json
+import os
 import sqlite3
 import time
+
+import capacity_wait
 
 # Late binding into the application module: ``server`` owns the shared
 # helpers, request models and module globals, and the suite monkeypatches
@@ -233,6 +237,455 @@ def _execution_record(
         return None
 
 
+# ---------------------------------------------------------------------------
+# How a degraded plans listing says so
+# ---------------------------------------------------------------------------
+#
+# The listing filters the terminal phases (``failed``, ``completed``,
+# ``stopped``, …) out of the default view, and the phase it filters on
+# lives in ``plan_routing.current_phase``.  When the state database
+# cannot be opened there is no phase to read: the listing degrades to a
+# directory scan and answers with EVERY plan it can see.
+#
+# That answer is honest about what it knows and silent about what it
+# does not, and the silence is the dangerous part.  "200 + a full list"
+# is exactly what a reader takes for "the terminal plans were filtered
+# out" — so a degraded listing has to announce itself rather than let
+# the operator draw that conclusion from the shape of the answer.
+#
+# The verdict is reported twice, because there are two kinds of reader:
+#
+#   * on every row (``list_degraded`` / ``list_degraded_reason``), for
+#     the consumer that reads the body — and, because a row travels
+#     with the data, for the one that stores it;
+#   * on the response (``X-PDT-Plans-List-Degraded``), for the consumer
+#     that reads the status of the call rather than the payload.
+#
+# The marker is ABSENT from a listing that could read the phases.  A
+# marker that is always on would say nothing, so the absence is half of
+# the contract: it is what tells the two listings apart.
+LIST_DEGRADED_KEY = "list_degraded"
+LIST_DEGRADED_REASON = "state_db_unavailable"
+LIST_DEGRADED_HEADER = "X-PDT-Plans-List-Degraded"
+
+
+# ---------------------------------------------------------------------------
+# Where the listing came from
+# ---------------------------------------------------------------------------
+#
+# A listing answers 200 with an array of plans, and an array says
+# nothing about WHERE it came from: an empty array from a process
+# pointed at another worktree's plans root is the same shape as "this
+# instance really has no plans".  A reader has to be able to tell the
+# two apart, so every listing carries its provenance — which data
+# source produced the rows, and which plans root that source read.
+#
+# The data source is deliberately coarse.  It answers the one question
+# the rows themselves cannot: were the phases read from the state
+# database (so the terminal filter was applied), or did the listing
+# degrade to a directory scan (so it was not)?
+LIST_DATA_SOURCE_STATE_DB = "state_db"
+LIST_DATA_SOURCE_DIRECTORY = "directory"
+
+#: The row-level spelling of the two provenance values.
+LIST_DATA_SOURCE_KEY = "data_source"
+LIST_PLANS_DIR_KEY = "plans_dir"
+
+#: The facts every answer about this instance's data plane carries.
+#:
+#:   * ``kind`` — where the ROWS came from: ``state_db`` (the phases
+#:     were read, so the terminal filter was applied) or ``directory``
+#:     (the listing degraded to a scan);
+#:   * ``state_db_path`` / ``state_db_inode`` — the database this
+#:     instance reads, and the inode of that file.  The inode matters:
+#:     a DIFFERENT file at the same path is a different data plane;
+#:   * ``boot_id`` / ``pid`` — the process that produced the answer.
+#:     The boot id is minted once per process and never changes, so two
+#:     answers carrying the same one came from the same process;
+#:   * ``row_count`` — how many rows the answer was built from.
+#:
+#: The reason they are on every row is the shape of the answer they
+#: travel with: an empty array cannot say any of this by itself, and
+#: an empty array is exactly what an instance serving ANOTHER tree's
+#: data plane produces.
+LIST_DATA_SOURCE_FIELDS = (
+    "kind",
+    "state_db_path",
+    "state_db_inode",
+    "boot_id",
+    "pid",
+    "row_count",
+)
+
+#: The reason a listing refuses to answer: the state database this
+#: instance reads does not describe the plans tree it serves.
+LIST_DATA_PLANE_MISMATCH_REASON = "state_db_does_not_describe_plans_dir"
+
+#: The detail every such refusal answers with.
+LIST_DATA_PLANE_MISMATCH_DETAIL = (
+    "plans listing data source does not describe the plans directory"
+)
+
+#: The response headers carrying the same two values, for the consumer
+#: that reads the status of the call rather than the payload.  The
+#: first spelling of each is the canonical one; the rest are aliases,
+#: so a consumer does not have to guess which one this route uses.
+LIST_DATA_SOURCE_HEADERS = (
+    "X-PDT-Plans-Data-Source",
+    "X-PDT-Plans-Source",
+)
+LIST_PLANS_DIR_HEADERS = (
+    "X-PDT-Plans-Dir",
+    "X-PDT-Plans-Plans-Dir",
+    "X-PDT-Plans-Root",
+)
+
+#: The phases that end a plan.  ``waiting_for_quota`` is NOT one of
+#: them: a plan parked for capacity is alive, and it resumes when the
+#: quota window opens.
+TERMINAL_PHASES = frozenset({
+    "completed", "failed", "stopped",
+    "verification_passed",
+    "verification_failed",
+})
+
+#: The execution verdicts that end a plan even when the routing phase
+#: does not say so.  A run that failed or was stopped is over, whatever
+#: the workflow phase says — and the workflow phase is exactly what
+#: stays behind when a process dies: the crash path persists the
+#: verdict on the execution row and the routing row never catches up.
+TERMINAL_EXEC_STATUSES = frozenset({"failed", "stopped"})
+
+#: The provenance of the last rendered listing, per view.  The rendered
+#: rows carry the same two values, so this is only needed for an EMPTY
+#: listing — the one answer with no row to carry the provenance, and
+#: the one answer that needs it most: "no plans here" and "another
+#: instance's plans root" look alike without it.
+_LISTING_PROVENANCE: Dict[bool, Dict[str, Any]] = {}
+
+
+def _data_source_kind(source: Any) -> str:
+    """The ``kind`` of a data-source block: ``state_db`` / ``directory``.
+
+    The block itself carries the facts; the header carries the kind,
+    because a header is a flat string and the kind is the one word a
+    consumer needs to branch on.
+    """
+    if isinstance(source, Mapping):
+        return str(source.get("kind") or "")
+    return str(source or "")
+
+
+def _data_source_block(
+    kind: str,
+    db_path: Optional[Path],
+    row_count: int,
+) -> Dict[str, Any]:
+    """The facts about the data plane a listing was produced from.
+
+    ``kind`` says where the ROWS came from; the rest says which
+    instance produced them and which database it read.  The two are
+    read off the same process — the one serving the request — so the
+    two cannot drift apart the way a label and a filename can.
+    """
+    try:
+        identity = _server._instance_identity(db_path)
+    except Exception:  # noqa: BLE001 - an identity block must never 500
+        identity = {}
+    values = {
+        "kind": kind,
+        "state_db_path": identity.get("state_db_path"),
+        "state_db_inode": identity.get("state_db_inode"),
+        "boot_id": identity.get("boot_id"),
+        "pid": identity.get("pid"),
+        "row_count": row_count,
+    }
+    # The field list is the contract: a block carries exactly these
+    # fields, in this order, and a new one is added by naming it there.
+    return {field: values.get(field) for field in LIST_DATA_SOURCE_FIELDS}
+
+
+def _resolved_state_db_path(request: Optional[Request] = None) -> Optional[Path]:
+    """The state database this instance reads, or ``None``.
+
+    ``None`` means "could not be resolved" — the live-database guard
+    under pytest refuses to name it.  A listing that cannot name its
+    database says so rather than naming the wrong one.
+    """
+    try:
+        return _server._state_db_path(request)
+    except Exception:  # noqa: BLE001 - a path that cannot be resolved
+        return None
+
+
+def _listing_provenance(data_source: Dict[str, Any]) -> Dict[str, Any]:
+    """The provenance of a listing: its data source and its plans root."""
+    return {
+        LIST_DATA_SOURCE_KEY: data_source,
+        LIST_PLANS_DIR_KEY: str(_server.PLANS_DIR),
+    }
+
+
+def _listing_provenance_from_rows(
+    plans: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """The provenance carried by the rendered rows, or ``None``.
+
+    ``None`` means "the rows carry none" — an empty listing.  The rows
+    and the remembered value are written together, so they always
+    agree; the remembered value covers the empty case, where there is
+    no row left to ask.
+    """
+    for row in plans:
+        if isinstance(row, dict) and row.get(LIST_DATA_SOURCE_KEY):
+            return {
+                LIST_DATA_SOURCE_KEY: row.get(LIST_DATA_SOURCE_KEY),
+                LIST_PLANS_DIR_KEY: str(
+                    row.get(LIST_PLANS_DIR_KEY) or _server.PLANS_DIR
+                ),
+            }
+    return None
+
+
+def _remember_listing_provenance(
+    include_terminal: bool,
+    provenance: Dict[str, str],
+) -> None:
+    """Remember a listing's provenance for the empty-listing case."""
+    _LISTING_PROVENANCE[bool(include_terminal)] = dict(provenance)
+
+
+def _persisted_exec_status(exec_row: Any) -> Optional[str]:
+    """``plan_execution.exec_status`` of one execution row, or ``None``.
+
+    ``None`` means "there is no verdict to read" — no row, an empty
+    status, or a listing that could not read the state database.  It
+    never means "the plan failed".
+    """
+    if not isinstance(exec_row, dict):
+        return None
+    status = str(exec_row.get("exec_status") or "").strip()
+    return status or None
+
+
+def _plan_is_terminal(current_phase: Any, exec_status: Any) -> bool:
+    """Is this plan in a terminal state?
+
+    Two verdicts, one rule:
+
+      * the routing phase — the workflow's own answer.  A terminal
+        phase ends the plan;
+      * the persisted execution verdict — the run's own answer.  A run
+        that failed or was stopped is over, whatever the workflow phase
+        says.
+
+    The second verdict is what the phase alone cannot give: when a
+    process dies, the crash path persists ``failed`` on the execution
+    row and the routing row stays wherever the workflow left it.  A
+    listing that reads only the routing phase keeps such a plan in the
+    list, as if it were still running.
+
+    ``waiting_for_quota`` is not terminal: a plan parked for capacity
+    is alive and resumes when the window opens, so it never enters
+    :data:`TERMINAL_PHASES`.
+    """
+    phase = str(current_phase or "").strip()
+    if phase in TERMINAL_PHASES:
+        return True
+    status = str(exec_status or "").strip()
+    return status in TERMINAL_EXEC_STATUSES
+
+
+def _mark_listing_provenance(
+    response: Response,
+    plans: List[Dict[str, Any]],
+    include_terminal: bool,
+) -> None:
+    """Say, on the response, which tree this listing came from.
+
+    The provenance is read off the rows when there are any.  An empty
+    listing has no row to carry it, so the remembered provenance of the
+    last rendering is used instead — and only when it was rendered from
+    the root in effect now, because a provenance of another root would
+    be worse than no provenance at all.
+    """
+    provenance = _listing_provenance_from_rows(plans)
+    if provenance is None:
+        remembered = _LISTING_PROVENANCE.get(bool(include_terminal))
+        if remembered is not None and (
+            remembered.get(LIST_PLANS_DIR_KEY) == str(_server.PLANS_DIR)
+        ):
+            provenance = remembered
+    if provenance is None:
+        return
+    for header in LIST_DATA_SOURCE_HEADERS:
+        response.headers[header] = _data_source_kind(
+            provenance[LIST_DATA_SOURCE_KEY]
+        )
+    for header in LIST_PLANS_DIR_HEADERS:
+        response.headers[header] = provenance[LIST_PLANS_DIR_KEY]
+
+
+def _mark_listing_degraded(
+    response: Response,
+    plans: List[Dict[str, Any]],
+) -> None:
+    """Put the degradation verdict on the response, if the listing degraded.
+
+    The verdict is read off the rows rather than recomputed: the rows
+    are the ones the degraded path marked, and they are cached together
+    with the rest of the payload, so a cache HIT reports the same
+    degradation the cache MISS did.  A listing that could read the
+    phases carries no marker, and therefore no header — that is the
+    negative half of the contract.
+    """
+    if any(
+        isinstance(row, dict) and row.get(LIST_DEGRADED_KEY)
+        for row in plans
+    ):
+        response.headers[LIST_DEGRADED_HEADER] = LIST_DEGRADED_REASON
+
+
+# ---------------------------------------------------------------------------
+# When the data plane does not describe the tree
+# ---------------------------------------------------------------------------
+#
+# A plans tree and a state database are two halves of one instance's
+# world: the tree says which plans exist on disk, the database says what
+# phase they are in.  When the tree holds plans and the database knows
+# NONE of them, the two halves belong to DIFFERENT instances — the
+# database is another worktree's, or another instance's.
+#
+# The listing built from that database is empty, and an empty array is
+# exactly what "this instance has no plans" looks like on the wire.
+# That is the shape the 2026-10-26 round kept meeting: the same URL
+# answered ``[]`` twice and three plans once, and nothing but the
+# instance behind the port had changed.
+#
+# So the listing REFUSES in that case instead of answering.  A refusal
+# is honest ("I cannot answer this, and here is the data plane I could
+# not read"); an empty array is a coincidence of shape that a reader
+# takes for a fact about the plans.
+
+
+class PlansDataPlaneMismatch(Exception):
+    """The state database does not describe the plans tree this instance serves.
+
+    Raised by the listing when the tree holds plans and the database
+    knows none of them.  It carries the data plane that could not
+    answer, so the refusal can name it.
+    """
+
+    def __init__(
+        self,
+        data_source: Dict[str, Any],
+        directory_plan_ids: List[str],
+    ) -> None:
+        super().__init__(LIST_DATA_PLANE_MISMATCH_DETAIL)
+        self.data_source = data_source
+        self.directory_plan_ids = list(directory_plan_ids)
+
+
+def _plan_dir_names(plans_dir: Path) -> List[str]:
+    """The names of the plan directories under the plans root.
+
+    A directory that cannot be read contributes nothing: an unreadable
+    tree is not evidence of a mismatch, and treating it as one would
+    turn a permissions problem into a refusal.
+    """
+    try:
+        return sorted(entry.name for entry in plans_dir.iterdir() if entry.is_dir())
+    except OSError:
+        return []
+
+
+def _plan_ids_known_to_db(conn: Any) -> Set[str]:
+    """The plan ids the state database holds a row for.
+
+    EVERY ``plan_*`` table counts, not just ``plan_routing``: a plan
+    can be in the tree with nothing but a verification row (its
+    workflow phase was never routed), and that is a real state — the
+    database describes that tree.  Only a database that knows NONE of
+    the plans in the tree belongs to somebody else.
+
+    The tables are discovered from the database itself, so a table
+    added later is counted without this function knowing its name.
+    """
+    known: Set[str] = set()
+    try:
+        tables = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name LIKE 'plan%'"
+            )
+        ]
+    except Exception:  # noqa: BLE001 - an unreadable schema is not a mismatch
+        return known
+    for table in tables:
+        quoted = table.replace('"', '""')
+        try:
+            columns = {
+                str(row[1]) for row in conn.execute(f'PRAGMA table_info("{quoted}")')
+            }
+            if "plan_id" not in columns:
+                continue
+            for row in conn.execute(
+                f'SELECT DISTINCT plan_id FROM "{quoted}"'
+            ):
+                if row and row[0]:
+                    known.add(str(row[0]))
+        except Exception:  # noqa: BLE001 - one unreadable table is not a mismatch
+            continue
+    return known
+
+
+def _refuse_when_data_source_does_not_describe_the_tree(
+    known_plan_ids: Set[str],
+    data_source: Dict[str, Any],
+) -> None:
+    """Refuse to answer when the data plane does not describe the tree.
+
+    The check is an INTERSECTION, not a count: as long as the database
+    knows ONE of the plans in the tree, the two halves belong together
+    and the listing answers normally.  Only when it knows NONE of them
+    is the database somebody else's — and only then does an empty
+    answer become a lie.
+
+    The archived plans count as known: they are read out of the tree
+    itself, so a tree of archived plans is a tree this instance can
+    describe.
+    """
+    directory_plan_ids = _plan_dir_names(_server.PLANS_DIR)
+    if not directory_plan_ids:
+        return
+    if set(directory_plan_ids) & known_plan_ids:
+        return
+    raise PlansDataPlaneMismatch(data_source, directory_plan_ids)
+
+
+def _plans_data_plane_mismatch_response(
+    mismatch: PlansDataPlaneMismatch,
+) -> JSONResponse:
+    """The refusal: ``503``, with the data plane that could not answer.
+
+    The body carries the same facts the successful answer carries — the
+    database by path and by inode, the process that answered, how many
+    rows it found — so a reader can see WHICH database was asked and go
+    and look at it.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": LIST_DATA_PLANE_MISMATCH_DETAIL,
+            LIST_DATA_SOURCE_KEY: mismatch.data_source,
+            LIST_PLANS_DIR_KEY: str(_server.PLANS_DIR),
+            "reason": LIST_DATA_PLANE_MISMATCH_REASON,
+            "directory_plan_count": len(mismatch.directory_plan_ids),
+        },
+    )
+
+
 def _read_task_rows(plan_id: str) -> Dict[str, Dict[str, Any]]:
     """``task_id -> row`` from ``plan_tasks``; ``{}`` when unreadable."""
     try:
@@ -262,6 +715,26 @@ def _read_task_rows(plan_id: str) -> Dict[str, Dict[str, Any]]:
     }
 
 
+def _read_tasks_payload(plan_id: str) -> Any:
+    """The plan's parsed ``tasks.json``; ``None`` when it cannot be read.
+
+    Only the *top level* of that file matters to the phase rule: the
+    quota marker lives there (``stop_reason`` / ``reason_detail``),
+    written by the executor when a run parks because every provider had
+    no capacity left.
+
+    ``None`` means "no readable file" — not "an empty plan".  The
+    difference is the whole point: a plan with no ``tasks.json`` is a
+    plan this rule knows nothing about, and a rule that cannot tell
+    that apart from an empty plan is a rule that guesses.
+    """
+    try:
+        raw = (_server._plan_dir(plan_id) / "tasks.json").read_text()
+        return json.loads(raw)
+    except (OSError, ValueError):
+        return None
+
+
 def _read_disk_task_ids(plan_id: str) -> Optional[set]:
     """Task ids in ``plans/<id>/tasks.json``; ``None`` when unreadable.
 
@@ -269,10 +742,7 @@ def _read_disk_task_ids(plan_id: str) -> Optional[set]:
     DAG to compare against, so do not judge orphans", ``set()`` is "the
     static DAG is empty, so every DB row is an orphan".
     """
-    try:
-        data = json.loads((_server._plan_dir(plan_id) / "tasks.json").read_text())
-    except (OSError, json.JSONDecodeError, ValueError):
-        return None
+    data = _read_tasks_payload(plan_id)
     tasks = data.get("tasks") if isinstance(data, dict) else data
     if not isinstance(tasks, list):
         return None
@@ -358,6 +828,157 @@ _RECONCILE_LOG_WINDOW_SECONDS = 300.0
 _RECONCILE_LOG_MAX_ENTRIES = 256
 
 
+# ---------------------------------------------------------------------------
+# Where the phase comes from
+# ---------------------------------------------------------------------------
+#
+# A plan's phase is a fact about THAT plan, and it is written down in
+# that plan's own durable rows: the routing row's ``current_phase`` and
+# the execution row's own verdict.  Everything else — this process's
+# memory, the plans tree this instance happens to be pointed at, a value
+# the implementation happened to be holding — is CONTEXT, and context
+# changes while the plan does not.
+#
+# On 2026-10-25 that distinction cost a verification round.  Two plans
+# with two different states — one parked for capacity, one merely waiting
+# for a human — were both answered ``404 Plan not found`` by an instance
+# whose tree held neither.  The answer was about the INSTANCE, and it
+# collapsed every plan at once; and the collapse was silent, because a
+# 404 is still an answer and looks like one.
+#
+# So the rule is a function of the rows, and the rows are its only
+# inputs.  And a plan whose rows cannot be read is ANSWERED — "I cannot
+# say", with the data source named — rather than handed a default
+# phase: a default is a claim nobody made, and the one default that
+# must never exist is the parked one, because it is global.
+
+#: The refusal the phase rule makes when the plan's rows are not there.
+#: It names the store that could not answer with
+#: :data:`LIST_DATA_SOURCE_STATE_DB` — the same constant the plans
+#: listing uses for the store its rows came from, so the two answers can
+#: be compared field by field: a listing that says ``state_db`` and a
+#: refusal that says ``state_db`` are talking about the same store.
+class PlanDataMissing(RuntimeError):
+    """The plan's durable state could not be read.
+
+    Raised when the rows that decide a plan's phase are not there — no
+    routing row, no execution row, or a state database that could not
+    be read at all.  It is a REFUSAL, not a verdict: the instance says
+    "I cannot answer this", and names the store that could not.
+
+    The alternative — answering a phase nobody recorded — is how a
+    default becomes global.  Every plan the instance cannot see would
+    then read as the same phase, and the operator would be sent after a
+    capacity wall that exactly one plan ever hit.
+    """
+
+    def __init__(
+        self,
+        data_source: str = LIST_DATA_SOURCE_STATE_DB,
+        detail: str = "plan data missing",
+    ) -> None:
+        super().__init__(detail)
+        self.data_source = data_source
+        self.detail = detail
+
+
+def _routing_phase_of(routing_rows: Any) -> str:
+    """The routing row's own ``current_phase`` — ``""`` when there is none.
+
+    ``routing_rows`` is the row (or the rows) read from ``state.db``.
+    The plural is the honest shape of the question: this function is
+    handed what was read, and it does not go looking for more.
+    """
+    if isinstance(routing_rows, Mapping):
+        rows: List[Any] = [routing_rows]
+    elif isinstance(routing_rows, (list, tuple)):
+        rows = list(routing_rows)
+    else:
+        rows = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        phase = str(row.get("current_phase") or "").strip()
+        if phase:
+            return phase
+    return ""
+
+
+def derive_phase(
+    routing_rows: Any,
+    execution_row: Optional[Mapping[str, Any]] = None,
+    marker: Any = None,
+) -> Any:
+    """The plan's phase, and the tier that answered.
+
+    Pure: the three arguments are the only facts it reads.  No clock,
+    no environment, no module-level registry — a rule that could see
+    the process would answer a question about the PROCESS, and the
+    process changes (it restarts, it serves other plans) while the plan
+    does not.
+
+    The priority is fixed here rather than in whichever route happened
+    to read the rows first:
+
+        routing row  >  durable execution row  >  resting default
+
+    * **The routing row** (``plan_routing.current_phase``) is the
+      workflow-phase authority: it is what ``/execution/start`` CASes
+      and what every card renders.  When it is there, it is the answer.
+
+    * **The durable execution row** is consulted only when the routing
+      row could not be read, and it may answer ``waiting_for_quota``
+      when **both** halves hold: the row's ``stop_reason`` says the run
+      stopped for capacity, *and* the plan's ``tasks.json`` carries a
+      capacity marker that parses.  Either half alone is not enough —
+      the row says the run stopped, the marker says it stopped for
+      capacity.
+
+    * **The resting default** (``ready`` — the manual gate) is where
+      every other shape lands.  Never on the parked phase.
+
+    ``marker`` is the plan's capacity marker *as it was found*: the
+    ``tasks.json`` payload that carries it, or the marker itself.  It is
+    read through :func:`capacity_wait.parse_capacity_marker`, the single
+    entry point for marker parsing — one reader, so that "is this a
+    capacity fact?" has one answer.
+
+    Raises:
+        PlanDataMissing: when the rows carry no phase at all — no
+            routing row and no execution row.  The rule refuses rather
+            than inventing one; the caller decides what to answer.
+    """
+    from plan_status import (
+        DEFAULT_PHASE,
+        PHASE_SOURCE_DEFAULT,
+        PHASE_SOURCE_EXECUTION,
+        PHASE_SOURCE_ROUTING,
+        QUOTA_WAIT_PHASE,
+        DerivedPhase,
+    )
+
+    routing_phase = _routing_phase_of(routing_rows)
+    row = execution_row if isinstance(execution_row, Mapping) else None
+
+    if not routing_phase and row is None:
+        raise PlanDataMissing(
+            LIST_DATA_SOURCE_STATE_DB,
+            "the plan's routing row and its execution row could not be read",
+        )
+
+    if routing_phase:
+        return DerivedPhase(routing_phase, PHASE_SOURCE_ROUTING)
+
+    if (
+        row is not None
+        and str(row.get("stop_reason") or "").strip() == QUOTA_WAIT_PHASE
+        and capacity_wait.parse_capacity_marker(marker)
+    ):
+        return DerivedPhase(QUOTA_WAIT_PHASE, PHASE_SOURCE_EXECUTION)
+
+    return DerivedPhase(DEFAULT_PHASE, PHASE_SOURCE_DEFAULT)
+
+
 def _build_plan_status(plan_id: str) -> Any:
     """Assemble the one plan-status snapshot every reader renders from.
 
@@ -366,6 +987,14 @@ def _build_plan_status(plan_id: str) -> Any:
     ``plan_verification``, ``plan_tasks``, and the two in-memory
     liveness records — are read here, together, and reconciled once.
     See :mod:`plan_status` for why that matters.
+
+    The phase is not decided here: it comes from :func:`derive_phase`,
+    which owns the priority between the three things a reader can know
+    (the routing row, the durable execution row, the plan's own
+    ``tasks.json``) and says which tier answered.  A phase that is
+    decided *here* is a phase with a default nobody can point at — and
+    the one default that must never exist is the parked one, because it
+    is global.
 
     Raises:
         HTTPException: 409 ``artifact_conflict`` —— 目录里两类产物同时存在。
@@ -376,6 +1005,8 @@ def _build_plan_status(plan_id: str) -> Any:
     from dataclasses import replace
 
     from plan_status import (
+        PHASE_SOURCE_DEFAULT,
+        DerivedPhase,
         PlanStatus,
         find_divergences,
         is_runtime_phase,
@@ -389,7 +1020,6 @@ def _build_plan_status(plan_id: str) -> Any:
             artifact_conflict_payload(plan_id, artifacts),
         )
 
-    phase = ""
     v_status = ""
     v_round = 0
     v_max = 0
@@ -398,26 +1028,24 @@ def _build_plan_status(plan_id: str) -> Any:
     # the except path leaves it unassigned. A status read must degrade,
     # not raise NameError on top of the failure it is already handling.
     route: Optional[Dict[str, Any]] = None
-    exec_row: Optional[Dict[str, Any]] = None
+    execution_row: Optional[Dict[str, Any]] = None
     try:
         conn, routing, verification = _server._open_verification_state()
         try:
             route = routing.current(plan_id)
             record = verification.current(plan_id)
-            # ``executing`` is the ONE phase an execution record can
-            # refute, so it is the only one worth a second query here:
-            # this route is polled several times a minute per plan, and
-            # a resting plan must not pay for a read it cannot use.
-            # The in-memory record is free, so it is checked first.
-            if (
-                is_runtime_phase(str((route or {}).get("current_phase") or ""))
-                and _server._execution_state.get(plan_id) is None
-            ):
-                exec_row = _execution_record(conn, plan_id)
+            # The execution row is read on this same connection — the
+            # phase rule needs it, and a second connection to the same
+            # SQLite file buys nothing.
+            #
+            # 2026-10-26 (merge): main 的读路径只在相位是运行相位时才查
+            # 这一行（少付一次查询的代价）。本分支的相位规则需要**执行行**
+            # 作为第二层事实 —— 「等配额」这个相位只能从这一行读到
+            # （routing 行读不到时），所以这里无条件读。读的是同一条连接上
+            # 的同一张表，不额外开连接，也不改变读到的内容。
+            execution_row = _execution_row_from_conn(conn, plan_id)
         finally:
             conn.close()
-        if route:
-            phase = str(route.get("current_phase") or "")
         if record:
             v_status = str(record.get("verification_status") or "")
             try:
@@ -434,36 +1062,63 @@ def _build_plan_status(plan_id: str) -> Any:
         # this plan" is exactly the wrong moment to hand them a 500.
         _server.logger.exception("[plan_status] state.db read failed plan=%s", plan_id)
 
-    # ``executing`` is the one phase in the vocabulary that does not
-    # describe a plan's ARTEFACTS — it describes a PROCESS: "the executor
-    # is running this plan right now".  So it is the one phase the
-    # execution store can refute, and a reader that repeats it without
-    # checking is what let the same plan read ``ready`` in the listing
-    # and ``executing`` here.
+    # The phase, from the one rule that owns it.  The rule reads the
+    # rows and nothing else, and it REFUSES when the rows are not
+    # there: an unreadable row and an unreadable ``tasks.json`` are
+    # missing information, and the answer to missing information is
+    # "I cannot say" — never a phase nobody recorded, and never the
+    # parked phase.
+    tasks_payload = _read_tasks_payload(plan_id)
+    try:
+        derived = derive_phase(
+            [route] if route else [],
+            execution_row,
+            tasks_payload,
+        )
+    except PlanDataMissing:
+        if tasks_payload is not None:
+            # The plan's files are here and its rows are not: this
+            # instance cannot see the plan's state.  The refusal travels
+            # up to the route, which answers 503 with the data source
+            # named.
+            raise
+        # Nothing at all: no rows and no plan file.  There is no plan
+        # here to sit at the manual gate, so the answer is the empty
+        # phase — which is what the snapshot has always said for that
+        # case.  It is not the parked phase either: a plan that does
+        # not exist cannot be waiting for capacity.
+        derived = DerivedPhase("", PHASE_SOURCE_DEFAULT)
+    phase = derived.phase
+    phase_source = derived.source
+
+    # 2026-10-26 (merge): main 的运行相位反驳规则接在相位规则**之后**。
     #
-    # The judgement itself lives in ``plan_status.resolve_phase`` — this
-    # is only its I/O half.  The listing calls the same function with
-    # the same fallback, so the two readers cannot disagree.
+    # ``executing`` 是词表里唯一一个描述**过程**而不是计划产物的相位 ——
+    # 「执行器此刻正在跑这条计划」。所以它是唯一能被执行记录反驳的相位：
+    # 一个 routing 行可以停在 ``executing`` 而身后没有任何进程在跑（导入
+    # 旧 ``plan_state.json`` 的计划、被杀死的执行器留下的行都是这个形状），
+    # 而读者不查就把这个相位复述出去，于是同一条计划在列表里读成
+    # ``ready``、在这里读成 ``executing`` —— 一条计划，两个答案。
     #
-    # "An execution record exists" means a ``plan_execution`` row OR an
-    # in-memory ``_execution_state`` entry: the executor seeds the
-    # in-memory record before it stamps the phase, and persists the row
-    # before it spawns the subprocess, so a plan that IS running always
-    # has one of the two.
+    # 判定本身在 :func:`plan_status.resolve_phase` 里；这里只是它的 I/O 一半，
+    # 列表接口调的是同一个函数、同一个兜底，所以两个读者不会给出不同的答案。
+    # 「有执行记录」= 有 ``plan_execution`` 行 **或** 有内存里的
+    # ``_execution_state`` 条目：执行器先写内存记录再盖相位，先落库再拉子
+    # 进程，所以真在跑的计划一定有一个。
     exec_recorded = (
-        exec_row is not None
+        execution_row is not None
         or _server._execution_state.get(plan_id) is not None
     )
-    fallback = ""
-    if not exec_recorded and is_runtime_phase(phase):
+    if is_runtime_phase(phase) and not exec_recorded:
         # The fallback is the status the plan's ARTEFACTS put it in —
         # the same answer the listing falls back to.  Computed only in
         # this rare case: a resting plan must not pay for it on a route
         # that is polled several times a minute per plan.
-        fallback = _artifact_status_for_plan(plan_id)
-    phase = resolve_phase(
-        phase, execution_recorded=exec_recorded, fallback=fallback,
-    )
+        phase = resolve_phase(
+            phase,
+            execution_recorded=exec_recorded,
+            fallback=_artifact_status_for_plan(plan_id),
+        )
 
     # The plan-doc review gate sits BEFORE the verification sub-machine:
     # a plan waiting for a human to accept / skip its plan-doc items has
@@ -583,6 +1238,7 @@ def _build_plan_status(plan_id: str) -> Any:
     status_snapshot = PlanStatus(
         plan_id=plan_id,
         phase=phase,
+        phase_source=phase_source,
         verification_status=v_status,
         verification_round=v_round,
         verification_max_rounds=v_max,
@@ -604,6 +1260,287 @@ def _build_plan_status(plan_id: str) -> Any:
     return status_snapshot
 
 
+# ---------------------------------------------------------------------------
+# Is the plans tree searchable at all?
+# ---------------------------------------------------------------------------
+#
+# "Plan not found" is a true answer about a plan that is not there — and
+# a false answer about a plan that IS there, in a tree this process is
+# not looking at.  The two were told apart by nothing at all, because
+# the route looked only for the plan directory and never asked whether
+# the tree around it could be searched.
+#
+# The shape it exists for: an instance pointed at an **empty** plans
+# root answers "Plan not found" for *every* plan id, and a caller that
+# reads that as "this plan does not exist" never learns that the
+# instance is looking in the wrong place (or that the tree it was told
+# to look in is not there at all).
+#
+# So the tree is checked before the plan is.  A tree that cannot be
+# searched is answered **503** — the plan may well exist; this instance
+# cannot see it — and the directory that was searched is echoed in the
+# body, so "this instance is looking in the wrong place" and "this plan
+# does not exist" are told apart by the paths they carry rather than by
+# a status code the caller has to interpret.
+
+#: The detail a route answers with when the plans tree cannot be
+#: searched.  Spelled the same way in every answer that carries it.
+PLANS_DIR_UNAVAILABLE_DETAIL = "plans dir unavailable"
+
+#: How many plan ids a diagnostic answer carries.  The list exists so a
+#: reader can compare the instance that answered with the plan it asked
+#: about; twenty is enough for that comparison and short enough to keep
+#: the body small.
+AVAILABLE_PLAN_IDS_LIMIT = 20
+
+#: The state of the serving instance's state plane.
+#:
+#:   * ``"absent"`` — there is no state database file at all.  Nothing
+#:     was ever routed through this instance, so there is no state to
+#:     be empty about: the tree it serves is what it answers from.
+#:   * ``"unreadable"`` — there is one and it could not be read.
+#:   * ``"empty"`` — there is one and it holds no plan rows.  A state
+#:     that knows none of the plans in the tree is somebody else's
+#:     state — the same mismatch the plans listing refuses to answer
+#:     through (see
+#:     :func:`_refuse_when_data_source_does_not_describe_the_tree`).
+#:   * ``"readable"`` — there is one and it holds plan rows.
+STATE_PLANE_ABSENT = "absent"
+STATE_PLANE_UNREADABLE = "unreadable"
+STATE_PLANE_EMPTY = "empty"
+STATE_PLANE_READABLE = "readable"
+
+#: The detail a route answers with when the serving instance's state
+#: plane holds no plan of its own.  Spelled the same way in every
+#: answer that carries it.
+PLAN_STATE_EMPTY_DETAIL = "plan state empty"
+
+#: The detail a route answers with when the serving instance's state
+#: plane could not be read at all.
+PLAN_STATE_UNREADABLE_DETAIL = "plan state unavailable"
+
+
+def _scan_plans_tree(plans_dir: Path) -> Tuple[Optional[str], Tuple[str, ...]]:
+    """Look in the plans tree — (why it cannot be searched, the plans in it).
+
+    The ways a search is impossible, and none of them may be answered
+    "the plan is not there":
+
+    * **missing** — the tree this process was pointed at is not there;
+    * **not a directory** — something that is not a tree is there;
+    * **unreadable** — the tree cannot be listed (permissions);
+    * **empty** — the tree lists, but there is nothing in it.
+
+    The empty case is the one that cannot be told apart from "the plan
+    does not exist" by looking at the plan alone: an instance whose data
+    plane is empty says "not found" about every id.
+
+    A stray *file* in the tree (``.DS_Store`` and friends) is not a plan
+    and must not make an empty data plane look populated — so the tree
+    counts as searchable only when it holds at least one directory.
+
+    The plan ids come out of the same scan: they are the directories in
+    the tree, and they are what the answer carries so a reader can see
+    what the answering instance can serve.
+
+    The path is used as it is configured (``str(plans_dir)``), not
+    resolved: the answer names the directory the operator pointed the
+    instance at, and resolving it would answer with a different
+    spelling of the same place.
+    """
+    if not plans_dir.exists():
+        return "missing", ()
+    if not plans_dir.is_dir():
+        return "not a directory", ()
+    try:
+        # ``os.scandir`` rather than ``Path.iterdir()``: this runs on
+        # every status read, and the status route is polled every few
+        # seconds per plan.  The scan reads the directory once and
+        # builds no Path objects for the entries it looks at.
+        with os.scandir(plans_dir) as entries:
+            plan_ids = sorted(entry.name for entry in entries if entry.is_dir())
+    except OSError:
+        return "unreadable", ()
+    if not plan_ids:
+        return "empty", ()
+    return None, tuple(plan_ids[:AVAILABLE_PLAN_IDS_LIMIT])
+
+
+def _plans_dir_unavailable_reason(plans_dir: Path) -> Optional[str]:
+    """Why the plans tree cannot be searched — ``None`` when it can."""
+    return _scan_plans_tree(plans_dir)[0]
+
+
+class _ServingPlane(NamedTuple):
+    """What the SERVING instance can see.
+
+    The facts every answer about a plan this instance cannot find
+    carries: the state database it reads (by path and by inode), the
+    plan ids that database holds, the plan directories in the tree it
+    serves, and whether the plan the caller asked about has rows of its
+    own.
+    """
+
+    state_db_path: Optional[Path]
+    state_db_inode: Optional[int]
+    state_db_plan_ids: Tuple[str, ...]
+    tree_plan_ids: Tuple[str, ...]
+    state_plane: str
+    plan_has_rows: bool
+
+    @property
+    def available_plan_ids(self) -> Tuple[str, ...]:
+        """The plan ids this instance can see — capped, in a stable order.
+
+        The state's own rows come first: they are the plans this
+        instance knows about.  The tree's directories follow: they are
+        the plans it can serve.  A reader comparing this list with the
+        plan it asked about can see at once whether it is talking to
+        the instance that holds that plan.
+        """
+        ids: List[str] = []
+        for plan_id in tuple(self.state_db_plan_ids) + tuple(self.tree_plan_ids):
+            if plan_id in ids:
+                continue
+            ids.append(plan_id)
+            if len(ids) >= AVAILABLE_PLAN_IDS_LIMIT:
+                break
+        return tuple(ids)
+
+
+def _plan_ids_in_db(conn: Any) -> Tuple[str, ...]:
+    """The plan ids the state database holds a row for — capped.
+
+    Both tables that carry a plan's own row count: a plan can be in the
+    tree with nothing but an execution row (its workflow phase was
+    never routed), and that is a real state.
+    """
+    ids: List[str] = []
+    for statement in (
+        "SELECT DISTINCT plan_id FROM plan_routing ORDER BY plan_id LIMIT ?",
+        "SELECT DISTINCT plan_id FROM plan_execution ORDER BY plan_id LIMIT ?",
+    ):
+        try:
+            rows = conn.execute(statement, (AVAILABLE_PLAN_IDS_LIMIT,)).fetchall()
+        except Exception:  # noqa: BLE001 - one unreadable table is not a crash
+            continue
+        for row in rows:
+            plan_id = str(row[0]) if row and row[0] else ""
+            if plan_id and plan_id not in ids:
+                ids.append(plan_id)
+    return tuple(ids[:AVAILABLE_PLAN_IDS_LIMIT])
+
+
+def _serving_plane(plan_id: str, tree_plan_ids: Tuple[str, ...]) -> _ServingPlane:
+    """Read the serving instance's data plane — once per answer.
+
+    The state database is opened once and read for three things at
+    once: the plan ids it holds (the ``available_plan_ids`` the answer
+    carries), whether the plan the caller asked about has rows of its
+    own, and whether the state plane holds anything at all.
+    """
+    db_path = _resolved_state_db_path()
+    inode: Optional[int] = None
+    if db_path is not None:
+        try:
+            inode = int(db_path.stat().st_ino)
+        except OSError:
+            inode = None
+
+    state_plane = STATE_PLANE_ABSENT
+    db_ids: Tuple[str, ...] = ()
+    plan_has_rows = False
+    if db_path is not None and db_path.exists():
+        # There IS a state database.  Whether it holds anything is a
+        # different question from whether there is one at all, and the
+        # two are told apart here: an instance with no state database
+        # has never routed a plan — the tree it serves is what it
+        # answers from — while an instance whose state database holds
+        # no plan rows has a state that does not describe the tree.
+        state_plane = STATE_PLANE_UNREADABLE
+        sm = None
+        try:
+            sm = _server._open_state_machine()
+            if sm is not None:
+                conn, routing, execution, _verification, _artifact = sm
+                db_ids = _plan_ids_in_db(conn)
+                plan_has_rows = (
+                    bool(routing.current(plan_id))
+                    or bool(execution.summary(plan_id))
+                )
+                state_plane = (
+                    STATE_PLANE_READABLE if db_ids else STATE_PLANE_EMPTY
+                )
+        except Exception:  # noqa: BLE001 - an unreadable state is not a 500
+            _server.logger.exception(
+                "[plan_status] state plane read failed plan=%s", plan_id,
+            )
+            db_ids = ()
+            plan_has_rows = False
+        finally:
+            _server._close_state_machine(sm)
+    return _ServingPlane(
+        state_db_path=db_path,
+        state_db_inode=inode,
+        state_db_plan_ids=db_ids,
+        tree_plan_ids=tree_plan_ids,
+        state_plane=state_plane,
+        plan_has_rows=plan_has_rows,
+    )
+
+
+def _plane_diagnostics(plans_dir: Path, plane: _ServingPlane) -> Dict[str, Any]:
+    """The facts the answer carries about the instance that gave it.
+
+    The same fields in every answer this route gives about a plan it
+    cannot find — the ``404`` and the ``503`` answers alike — so a
+    caller can compare them field by field instead of guessing from a
+    status code.
+    """
+    return {
+        "searched_dir": str(plans_dir),
+        "state_db_path": (
+            str(plane.state_db_path) if plane.state_db_path is not None else None
+        ),
+        "state_db_inode": plane.state_db_inode,
+        "available_plan_ids": list(plane.available_plan_ids),
+    }
+
+
+#: The detail a route answers with when the plan's durable rows could
+#: not be read.  Spelled the same way in every answer that carries it.
+PLAN_DATA_UNAVAILABLE_DETAIL = "plan data unavailable"
+
+
+def _plan_data_unavailable_response(
+    plan_id: str,
+    plans_dir: Path,
+    plan_dir: Path,
+    error: PlanDataMissing,
+    diagnostics: Dict[str, Any],
+) -> JSONResponse:
+    """The answer to "I cannot say what phase this plan is in".
+
+    ``503`` because the plan may well be there — this instance cannot
+    see it.  The body names the store that could not answer
+    (``data_source``) and the tree that was searched, so "the plan does
+    not exist" and "this instance is looking in the wrong place" are
+    told apart by the paths and the store they carry rather than by a
+    status code the caller has to interpret.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": PLAN_DATA_UNAVAILABLE_DETAIL,
+            LIST_DATA_SOURCE_KEY: error.data_source,
+            "plan_id": plan_id,
+            "plans_dir": str(plans_dir),
+            "plan_dir": str(plan_dir),
+            **diagnostics,
+        },
+    )
+
+
 @router.get("/api/plan/{plan_id}/status")
 def get_plan_status(plan_id: str):
     """The single, consistent view of one plan — everything a card needs.
@@ -618,10 +1555,153 @@ def get_plan_status(plan_id: str):
     ``PlanStatus`` fields.
 
     ``divergences`` is empty when the stores agree.
+
+    The two ways this route can refuse to answer are a contract of their
+    own, and they are told apart deliberately:
+
+    * a **malformed** id is a bad request — ``400``, with the same body
+      every other plan-id route answers it with;
+    * a **legal but unknown** id is a plan that does not exist —
+      ``404`` with the detail ``Plan not found``.
+
+    And there is a third answer, which is not about the id at all:
+    a plans tree this instance **cannot search** is answered ``503``,
+    because in that state "the plan does not exist" is not a fact this
+    instance is entitled to state.  An empty tree says "not found"
+    about every id, and a caller that believes it is looking for a
+    plan that was deleted never learns that the instance is looking in
+    the wrong place.  See :func:`_plans_dir_unavailable_reason`.
+
+    The same reasoning covers the state plane: an instance whose state
+    database holds no plan of its own cannot say that a plan it does
+    not hold is missing, so it answers ``503`` there too.  See
+    :func:`_serving_plane`.
+
+    Every one of those answers carries the facts of the **serving**
+    instance — the tree that was searched, the state database that was
+    read (by path and by inode), and the plan ids that instance can
+    see — because an answer that cannot be attributed to an instance
+    cannot be told apart from the answer of an instance that is
+    looking at another round's data plane.  That confusion is what
+    made two earlier rounds read "the plan is gone" out of an answer
+    that really said "you asked the wrong instance".
+
+    The validation is asked for here rather than left to happen on the
+    way to ``PLANS_DIR / plan_id``.  ``_plan_dir`` does validate, so the
+    refusal is observable either way — but a route whose contract rests
+    on a helper it happens to call has no contract at all: the day that
+    helper is relaxed (and it is a plausible relaxation, because the
+    codebase already carries ``_is_renderable_plan_id`` for stored ids
+    that predate the traversal guard), this route would answer ``200``
+    with ``plan_id: ".."`` and the repository root's contents as if they
+    were a plan.  Asking for the guard at the entry is what keeps the
+    refusal a decision of this route instead of a side effect of
+    another one.
     """
-    if not _server._plan_dir(plan_id).exists():
-        raise HTTPException(404, "Plan not found")
-    return _plan_status_payload(plan_id)
+    _server._validated_plan_id(plan_id)   # uniform contract — see that function
+    plans_dir = Path(_server.PLANS_DIR)
+    unavailable, tree_plan_ids = _scan_plans_tree(plans_dir)
+    if unavailable is not None:
+        # The tree could not be searched, so "the plan is not there" is
+        # not an answer this instance may give.  503 says "ask again
+        # once there is a tree to search", and the directory that could
+        # not be searched is named so an operator can see *which* tree
+        # was searched — the answer that tells "this instance is looking
+        # in the wrong place" apart from "this plan does not exist".
+        plane = _serving_plane(plan_id, tree_plan_ids)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": PLANS_DIR_UNAVAILABLE_DETAIL,
+                **_plane_diagnostics(plans_dir, plane),
+            },
+        )
+    plan_dir = _server._plan_dir(plan_id)
+    if not plan_dir.exists():
+        # 2026-10-25 (repair-r1-29): a 404 says **where** it looked.
+        # "Plan not found" is a true answer about a plan that is not
+        # there — and a false answer about a plan that IS there, in
+        # another instance's tree.  The two are told apart by the paths
+        # the answer carries: the plans root this process is configured
+        # with, and the plan directory it resolved inside it.
+        #
+        # The ``detail`` stays what it was (a client that keys off the
+        # message keeps working) and no stack trace is added: the point
+        # of these fields is to say which directory was searched, not to
+        # explain the search.  The execution routes answer the same way
+        # — see ``backend/routes/execution.py``.
+        #
+        # ``searched_dir`` is the spelling the 503 answer above uses as
+        # well, so the two answers can be compared field by field: a
+        # 404 means "the tree was searched and the plan is not in it",
+        # a 503 means "the tree was never searched".
+        #
+        # 2026-10-26 (repair-r1-44): the tree is not the only place a
+        # plan lives.  When the durable state holds rows for this plan
+        # and the tree does not hold its directory, "Plan not found" is
+        # FALSE — the plan is there, in the store that decides where it
+        # is, and this instance is simply pointed at a tree that does
+        # not hold it.  That is the shape that collapsed every plan at
+        # once in the failed round: one wrong directory, one answer,
+        # every plan.  So the durable state gets the last word, and the
+        # answer is a refusal with the store named.
+        plane = _serving_plane(plan_id, tree_plan_ids)
+        diagnostics = _plane_diagnostics(plans_dir, plane)
+        if plane.plan_has_rows:
+            return _plan_data_unavailable_response(
+                plan_id,
+                plans_dir,
+                plan_dir,
+                PlanDataMissing(
+                    LIST_DATA_SOURCE_STATE_DB,
+                    "the plan's rows are in the durable state, but its "
+                    "directory is not in this instance's plans tree",
+                ),
+                diagnostics,
+            )
+        if plane.state_plane in (STATE_PLANE_EMPTY, STATE_PLANE_UNREADABLE):
+            # 2026-10-26: the state plane holds no plan of this
+            # instance's own.  The plan may well be somewhere else, and
+            # this instance cannot see it — so "Plan not found" is not
+            # an answer it is entitled to give, and it would be the
+            # SAME answer for every plan id, which is exactly what the
+            # earlier rounds ran into: an instance looking at somebody
+            # else's data plane, saying "not found" about everything.
+            # 503 says "this instance cannot see whether the plan
+            # exists", and the diagnostics name the state that could
+            # not answer.
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": (
+                        PLAN_STATE_EMPTY_DETAIL
+                        if plane.state_plane == STATE_PLANE_EMPTY
+                        else PLAN_STATE_UNREADABLE_DETAIL
+                    ),
+                    **diagnostics,
+                },
+            )
+        return JSONResponse(
+            status_code=404,
+            content={
+                "detail": "Plan not found",
+                "plans_dir": str(plans_dir),
+                "plan_dir": str(plan_dir),
+                **diagnostics,
+            },
+        )
+    try:
+        return _plan_status_payload(plan_id)
+    except PlanDataMissing as error:
+        # The plan's files are here and its rows are not: the phase rule
+        # refused to invent one.  The refusal is the answer — a default
+        # phase would be a claim nobody made, and the parked one is
+        # global by construction.
+        plane = _serving_plane(plan_id, tree_plan_ids)
+        return _plan_data_unavailable_response(
+            plan_id, plans_dir, plan_dir, error,
+            _plane_diagnostics(plans_dir, plane),
+        )
 
 
 def _plan_status_payload(plan_id: str) -> Dict[str, Any]:
@@ -629,17 +1709,29 @@ def _plan_status_payload(plan_id: str) -> Dict[str, Any]:
 
     The detail sections are read through the same handler functions the
     standalone endpoints serve, so there is one implementation of each;
-    a failure in any one of them degrades that section to ``None``
-    rather than failing the whole snapshot (an operator asking "where is
-    this plan" should still get an answer).
+    a failure in any one of them degrades that section rather than
+    failing the whole snapshot (an operator asking "where is this plan"
+    should still get an answer).
+
+    The degradation is partial, not total.  A section that reads
+    ``None`` says "this section is unreadable" — but the execution
+    section used to swallow the plan's execution verdict along with
+    it, and "the execution section is unreadable" is not the same
+    answer as "the plan's state is unknown".  So the execution section
+    falls back to the durable row's verdict (see
+    :func:`_degraded_execution_section`) and the task counts are always
+    present (see :func:`_base_status_payload`).
     """
-    payload = _build_plan_status(plan_id).to_dict()
+    payload = _base_status_payload(plan_id)
     # The phase under the key the plans listing uses (``current_phase``)
     # plus its stable label. The two interfaces name the same facts the
     # same way — a consumer reading both must not have to know which key
     # holds the phase in which one — and they read the label from the
     # same table (``plan_state.PHASE_LABELS``), so the same phase can
     # never be labelled two ways.
+    #
+    # 2026-10-26 (merge): 快照本体仍走本分支的 :func:`_base_status_payload`
+    # （它多做一件事：任务计数永远在场），main 的两个键加在上面。
     payload["current_phase"] = payload.get("phase", "")
     payload["current_phase_label"] = _phase_label(payload.get("phase"))
     for key, handler in (
@@ -653,8 +1745,193 @@ def _plan_status_payload(plan_id: str) -> Dict[str, Any]:
             _server.logger.exception(
                 "[plan_status] %s section failed plan=%s", key, plan_id,
             )
-            payload[key] = None
+            payload[key] = (
+                _degraded_execution_section(plan_id)
+                if key == "execution" else None
+            )
     return payload
+
+
+def _base_status_payload(plan_id: str) -> Dict[str, Any]:
+    """The snapshot itself, with the task counts guaranteed present.
+
+    The counts are the numbers every consumer asks for ("how much is
+    left to do"), so they are never optional: even a snapshot that
+    could not be assembled at all answers with zeros rather than with a
+    missing key.  ``ensure_task_counts`` is what turns "the counts
+    section could not be read" into "the counts are zero" without
+    discarding the counts that were read fine.
+    """
+    from plan_status import ensure_task_counts
+
+    try:
+        payload = _build_plan_status(plan_id).to_dict()
+    except PlanDataMissing:
+        # A refusal is not a failure to degrade.  The phase rule said
+        # "I cannot say" because the plan's rows are not there, and
+        # degrading it into a default phase would turn that refusal into
+        # a claim — the exact thing the refusal exists to prevent.  So
+        # it travels up to the route, which answers 503 and names the
+        # store that could not answer.
+        raise
+    except HTTPException:
+        # A deliberate refusal is not a failure to degrade either.  The
+        # snapshot raises 409 ``artifact_conflict`` when the plan
+        # directory holds both products of two branches: "what this
+        # plan is for" has not been decided by a human yet, and handing
+        # back a phase — or degrading the phase to the empty default —
+        # would be deciding it for them.  The five call points share
+        # this error semantics, so the refusal travels up unchanged.
+        raise
+    except Exception:
+        # The snapshot is built from several stores and one of them may
+        # be unreadable in a way its own handler did not anticipate.
+        # The plan's phase and counts are then unknown — but "unknown"
+        # is an answer (zeros, an empty phase), not a 500 for the
+        # operator who asked.
+        _server.logger.exception(
+            "[plan_status] snapshot build failed plan=%s", plan_id,
+        )
+        payload = {
+            "plan_id": plan_id,
+            "phase": "",
+            # The snapshot could not be assembled at all, so the phase was
+            # not read from any record — it is the resting fallback, and
+            # it is empty because there is nothing to report a phase for.
+            "phase_source": "default",
+            "verification_status": "",
+            "verification_round": 0,
+            "verification_max_rounds": 0,
+            "verification_stop_reason": None,
+            "execution_in_flight": False,
+            "verification_in_flight": False,
+            "tasks": {},
+            "current_task": None,
+            "next_task": None,
+            "current_activity": None,
+            "divergences": [],
+        }
+    payload["tasks"] = ensure_task_counts(payload.get("tasks"))
+    return payload
+
+
+def _execution_row_from_conn(conn: Any, plan_id: str) -> Optional[Dict[str, Any]]:
+    """The durable ``plan_execution`` row, read on an open connection.
+
+    The row is the plan's own record of how its last run ended, and it
+    outlives the process that wrote it — which is why the phase rule
+    reads it rather than the in-memory execution map.
+
+    It is read on a connection the caller already holds: the status
+    endpoint is polled several times a minute per plan, and a second
+    connection to the same SQLite file buys nothing.
+
+    ``None`` means "no row to read" — no row, or a row that could not
+    be read.  It is not a failure of the plan, and it is not a failure
+    of the read: the caller answers "the phase was not read from here".
+    """
+    try:
+        from state_machine.repositories.execution_repository import (
+            ExecutionRepository,
+        )
+
+        row = ExecutionRepository(conn).summary(plan_id)
+    except Exception:
+        _server.logger.exception(
+            "[plan_status] execution row read failed plan=%s", plan_id,
+        )
+        return None
+    return row if isinstance(row, dict) else None
+
+
+def _persisted_execution_row(plan_id: str) -> Optional[Dict[str, Any]]:
+    """The durable ``plan_execution`` row for ``plan_id``, on its own
+    connection.
+
+    The standalone read, for the callers that have no connection open
+    (the degraded execution section).  ``None`` means "no row to read".
+    """
+    try:
+        sm = _server._open_state_machine()
+    except Exception:
+        # A state.db that cannot even be opened is a missing row, not a
+        # failed request — the caller degrades to "the phase was not
+        # read from the execution row".
+        _server.logger.exception(
+            "[plan_status] execution row read failed plan=%s", plan_id,
+        )
+        return None
+    if sm is None:
+        # No state.db yet — nothing was ever recorded for this plan.
+        return None
+    try:
+        conn, _routing, _execution, _verification, _artifact = sm
+        return _execution_row_from_conn(conn, plan_id)
+    finally:
+        _server._close_state_machine(sm)
+
+
+def _execution_row_status(plan_id: str) -> Optional[str]:
+    """``plan_execution.exec_status`` — the execution row's own verdict.
+
+    Read straight from the state-machine row, because that row is the
+    only place an execution verdict lives: ``waiting_for_quota`` is
+    written there and nowhere else.
+
+    ``None`` means "there is no verdict to read" — no row, an empty
+    ``exec_status``, or an unreadable database.  It never means "the
+    plan failed", and it is not a failure of the read: the caller uses
+    it to decide whether a degraded section has anything to preserve.
+    """
+    row = _persisted_execution_row(plan_id)
+    if row is None:
+        return None
+    status = str(row.get("exec_status") or "").strip()
+    return status or None
+
+
+def _degraded_execution_section(plan_id: str) -> Optional[Dict[str, Any]]:
+    """The execution section of a plan whose section read failed.
+
+    A section that cannot be read must not take the plan's state with
+    it.  The execution verdict is the one field a consumer cannot do
+    without — it is the difference between "parked, waiting for
+    capacity" and "failed" — and it is durable: it lives in the
+    ``plan_execution`` row, not in the handler that just failed.  So
+    the degraded section carries that verdict and blanks everything
+    else.
+
+    ``None`` when the row carries no verdict: there is nothing to
+    preserve, and inventing one would be a lie.  A plan with no
+    execution record has no execution status, and a reader is better
+    off knowing that than being handed a made-up one.
+    """
+    status = _execution_row_status(plan_id)
+    if status is None:
+        return None
+    return {
+        "plan_id": plan_id,
+        "pid": None,
+        "project_dir": "",
+        "execution_status": status,
+        "tasks": [],
+        "current": None,
+        "next": None,
+        "counts": {
+            "total": 0, "completed": 0, "failed": 0,
+            "in_progress": 0, "pending": 0,
+        },
+        "current_activity": None,
+        "stop_reason": None,
+        "stop_detail": None,
+        "api_error": None,
+        "started_at": None,
+        "ended_at": None,
+        "execution_stop_reason": None,
+        # A reader has to be able to tell a reduced answer from a
+        # complete one: everything except the verdict is missing here.
+        "degraded": True,
+    }
 
 
 def _plan_summary_section(plan_id: str) -> Optional[Dict[str, Any]]:
@@ -1282,6 +2559,7 @@ def start_all_tasks():
 @router.get("/api/plans")
 def list_plans(
     request: Request,
+    response: Response,
     include_terminal: bool = False,
 ):
     """List all plans.
@@ -1293,6 +2571,58 @@ def list_plans(
     ``?include_terminal=true`` to see the full list (e.g. for
     audit / cleanup scripts).
 
+    ``waiting_for_quota`` is NOT one of the terminal phases: a plan
+    parked for capacity is alive and will resume when the window opens,
+    so it stays in the sidebar.
+
+    The terminal decision reads TWO verdicts, not one: the routing
+    phase (the workflow's answer) and the persisted execution row (the
+    run's answer).  A run that failed or was stopped is over whatever
+    the workflow phase says — see :func:`_plan_is_terminal`.
+
+    Provenance
+    ----------
+    The answer says which tree it read: ``data_source``
+    (``state_db`` when the phases came from the state database,
+    ``directory`` when the listing degraded to a directory scan) and
+    ``plans_dir`` (the root it read).  Both appear on every row and on
+    the response headers, so an empty list from a process pointed at
+    another worktree's plans root cannot be mistaken for "this
+    instance has no plans".
+
+    The ``data_source`` of a row is a BLOCK, not a word: it carries the
+    kind (``state_db`` / ``directory``) together with the facts about
+    the data plane the rows came from — the database by path and by
+    inode, the process that answered (pid + boot id) and how many rows
+    it found.  The kind is what the response header carries; the block
+    is what a reader needs to tell this answer apart from another
+    instance's answer about the same URL.
+
+    Refusal
+    -------
+    A plans tree and a state database are two halves of one instance's
+    world.  When the tree holds plans and the database knows NONE of
+    them, the two halves belong to different instances — and the
+    listing built from that database is empty, which is exactly what
+    "this instance has no plans" looks like on the wire.
+
+    So the listing refuses in that case: ``503``, with the data plane
+    that could not answer named in the body.  An empty array is a
+    coincidence of shape that a reader takes for a fact; a refusal is
+    an answer about what this instance could and could not read.
+
+    Degradation
+    -----------
+    The terminal filter needs the phase, and the phase lives in the
+    state database.  When that database cannot be opened, the listing
+    degrades to a directory scan: it answers 200 with every plan it can
+    see and it CANNOT filter the terminal ones.  Such an answer carries
+    the degradation marker — on every row
+    (``list_degraded``) and on the response
+    (``X-PDT-Plans-List-Degraded``) — because "200 + a full list" is
+    what a reader takes for "the terminal plans were filtered out".
+    See :data:`LIST_DEGRADED_KEY`.
+
     Reads
     -----
     * RoutingRepository.list_all(data_dir=PLANS_DIR) — single
@@ -1300,12 +2630,13 @@ def list_plans(
       (directory-derived) rows. Archived rows carry
       ``archived=True`` and DO NOT carry stage / current_phase
       fields.
-    * ExecutionRepository.snapshot_for_list(plan_ids) — bulk
-      enrichment for the SQLite (new) rows; archived rows have no
-      execution rows so they get ``None``.  Used for the run-state
-      fields only (``exec_status`` / ``exec_pid`` / ``project_dir`` …);
-      the workflow phase comes from the routing row above, not from
-      here (schema v6).
+    * ExecutionRepository.snapshot_for_list(plan_ids) — the execution
+      row of every listed plan, read from the state database.  It
+      carries the run's own verdict (``exec_status``), which is part of
+      the terminal decision, plus the run-state fields
+      (``exec_pid`` / ``project_dir`` …); the workflow phase comes from
+      the routing row above, not from here (schema v6).  Archived rows
+      have no execution rows so they get ``None``.
 
     Architecture decision point 5 forbids an in-memory aggregation
     facade: this route composes the two repositories directly
@@ -1323,9 +2654,15 @@ def list_plans(
     :func:`invalidate_plans_cache` to drop the snapshot the moment
     they know it is stale; absent explicit invalidation, the TTL
     guarantees self-healing within a small bounded delay.
+
+    The degradation verdict and the provenance are read off the cached
+    rows, so a cache hit reports the same verdict and the same tree the
+    cache miss did.
     """
     cached = _server._read_plans_cache(include_terminal)
     if cached is not None:
+        _mark_listing_degraded(response, cached)
+        _mark_listing_provenance(response, cached, include_terminal)
         return cached
     # Fast-path: empty PLANS_DIR — skip the state-machine open + DB scan +
     # bulk snapshot entirely. A fresh install with no plans (or a runtime
@@ -1335,15 +2672,49 @@ def list_plans(
     # even though both return no rows.
     if not _server.PLANS_DIR.exists():
         empty: List[Dict[str, Any]] = []
+        # The state database was NOT read on this path, so the answer
+        # comes from the plans directory — the root that does not
+        # exist.  Say so: an empty list that names no tree cannot be
+        # told apart from "another instance's tree, and it has no
+        # plans".
+        _remember_listing_provenance(
+            include_terminal,
+            _listing_provenance(
+                _data_source_block(
+                    LIST_DATA_SOURCE_DIRECTORY,
+                    _resolved_state_db_path(request),
+                    0,
+                )
+            ),
+        )
         _server._write_plans_cache(include_terminal, empty)
+        _mark_listing_provenance(response, empty, include_terminal)
         return empty
-    result = _list_plans_impl(request, include_terminal)
+    try:
+        result, provenance = _list_plans_impl(request, include_terminal)
+    except PlansDataPlaneMismatch as mismatch:
+        # The state database this instance reads does not describe the
+        # tree it serves.  Refuse, and name the data plane that could
+        # not answer — an empty array here would read as "there is
+        # nothing here", which is a fact about the WRONG instance.
+        return _plans_data_plane_mismatch_response(mismatch)
+    _remember_listing_provenance(include_terminal, provenance)
     _server._write_plans_cache(include_terminal, result)
+    _mark_listing_degraded(response, result)
+    _mark_listing_provenance(response, result, include_terminal)
     return result
 
 
-def _list_plans_impl(request: Request, include_terminal: bool) -> List[Dict[str, Any]]:
+def _list_plans_impl(
+    request: Request, include_terminal: bool
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Compute the ``/api/plans`` payload from disk.
+
+    Returns the rendered rows AND the provenance of that rendering —
+    the data source and the plans root.  The rows cannot carry it on
+    their own when the listing is empty, and an empty listing is
+    exactly the answer that needs it: "no plans here" and "another
+    instance's plans root" look alike without it.
 
     This is the cache-miss path; ``list_plans`` wraps it with the
     TTL + explicit-invalidation layer above.
@@ -1353,6 +2724,10 @@ def _list_plans_impl(request: Request, include_terminal: bool) -> List[Dict[str,
     depend on which of the 200 lines below happens to return. The body
     lives in :func:`_list_plans_body` and receives the handle instead
     of opening its own.
+
+    Raises :class:`PlansDataPlaneMismatch` when the state database
+    does not describe the plans tree this instance serves — the caller
+    turns that into a refusal rather than an empty answer.
     """
     sm = _server._open_state_machine(request)
     try:
@@ -1365,13 +2740,30 @@ def _list_plans_body(
     request: Request,
     include_terminal: bool,
     sm: Optional[Tuple[Any, ...]],
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Build the plan list using an already-open state-machine handle.
 
     ``sm`` is injected rather than opened here: the caller owns its
     lifetime. It may legitimately be ``None`` (no ``state.db`` yet), in
     which case the legacy directory-listing path below still answers.
+
+    Returns the rows and their provenance — see :func:`_list_plans_impl`.
     """
+    # A listing without a state machine has no phase to filter on, so
+    # it is a DEGRADED listing: the terminal-phase filter below cannot
+    # be applied to it.  The rows it produces say so — see
+    # :data:`LIST_DEGRADED_KEY` for why the answer must not be silent
+    # about it.
+    degraded = sm is None
+
+    # -- the data plane, resolved BEFORE anything is rendered ----------
+    # The answer has to be able to say which database it read, and it
+    # has to say it even when the answer is empty: an empty array is
+    # exactly what an instance serving another tree's data plane
+    # produces, and it cannot say so by itself.
+    db_path = _resolved_state_db_path(request)
+
+    # 2026-10-26 (merge): main 的运行相位反驳与终局相位集合，两边都要。
     from plan_status import resolve_phase
 
     terminal_phases = {
@@ -1404,6 +2796,40 @@ def _list_plans_body(
     else:
         _, routing, execution, _verification, _artifact = sm
         routing_rows = routing.list_all(data_dir=_server.PLANS_DIR)
+
+    # -- where this listing comes from ---------------------------------
+    # The state database was read when there is one — the phases are
+    # authoritative and the terminal filter was applied.  Without one
+    # the listing is a directory scan, and the answer has to say so.
+    # The block carries the facts about the data plane as well as the
+    # kind: the database by path and by inode, the process that
+    # answered, and how many rows the answer was built from.
+    data_source = _data_source_block(
+        LIST_DATA_SOURCE_STATE_DB if sm is not None
+        else LIST_DATA_SOURCE_DIRECTORY,
+        db_path,
+        len(routing_rows),
+    )
+    provenance = _listing_provenance(data_source)
+
+    # -- the data plane must describe the tree this instance serves ----
+    # A database that knows NONE of the plans in the tree is somebody
+    # else's database, and the listing built from it is empty — which
+    # is exactly what "this instance has no plans" looks like.  Refuse
+    # instead of answering that.
+    if sm is not None:
+        conn = sm[0]
+        known_plan_ids = _plan_ids_known_to_db(conn)
+        # The archived plans are read out of the tree itself, so they
+        # are known to this instance even when no table holds them.
+        known_plan_ids |= {
+            str(row.get("plan_id"))
+            for row in routing_rows
+            if isinstance(row, dict) and row.get("archived") and row.get("plan_id")
+        }
+        _refuse_when_data_source_does_not_describe_the_tree(
+            known_plan_ids, data_source,
+        )
 
     # ``plan_routing`` can hold ids that predate the plan-id validator
     # (a state.db can carry a ``'..'`` row from
@@ -1493,7 +2919,6 @@ def _list_plans_body(
             # phases), so preferring it would reintroduce exactly the
             # two-vocabulary split v5 removed.
             exec_row = execution_by_plan.get(plan_id)
-
             # The execution record is read BEFORE the phase is decided,
             # because whether the recorded phase can be believed depends
             # on it (see the runtime-phase check below).
@@ -1515,7 +2940,24 @@ def _list_plans_body(
             # 化：启发式是当场算出来的，不是存量数据，不值得为它刷一条
             # 弃用日志（真正的旧数据来自上面那一行）。
             current_phase, _ = normalize_waiting_phase(current_phase)
-            if not include_terminal and current_phase in terminal_phases:
+
+            # 2026-10-26 (merge): 终局判定**两边都要**。
+            #
+            # 本分支的 :func:`_plan_is_terminal` 看的是两个裁决：路由相位
+            # （工作流的答案）与持久化的执行行（这一轮运行的答案）。第二个是
+            # 单看相位给不出来的 —— 进程死掉时工作流相位留在原地，裁决留在行
+            # 上；只读相位的列表会把一条死掉的计划继续摆在列表里，仿佛它还在
+            # 跑。它还明确把 ``waiting_for_quota`` 排除在终局之外：等配额的
+            # 计划是活的，窗口一开就继续。
+            #
+            # main 的 ``terminal_phases`` 是同一件事的另一份写法，它多认了
+            # 两个验证终局相位（``verification_passed`` / ``verification_failed``）。
+            # 两个判定取并集：谁认它终局，谁就把它滤掉。
+            persisted_exec_status = _persisted_exec_status(exec_row)
+            if not include_terminal and (
+                _plan_is_terminal(current_phase, persisted_exec_status)
+                or current_phase in terminal_phases
+            ):
                 continue
 
             # An **explicit bucket**: a phase that has a stable label
@@ -1711,6 +3153,22 @@ def _list_plans_body(
             # The same stable label the status interface returns, read
             # from the same table — one phase, one label, two endpoints.
             entry["current_phase_label"] = _phase_label(current_phase)
+        if degraded:
+            # This row's phase is NOT authoritative: it came from the
+            # directory fallback, where no phase could be read and the
+            # terminal filter could not be applied.  Say so on the row
+            # itself, so the answer cannot be read as "the terminal
+            # plans were filtered out".
+            entry[LIST_DEGRADED_KEY] = True
+            entry[f"{LIST_DEGRADED_KEY}_reason"] = LIST_DEGRADED_REASON
+            # The same verdict under the name the execution section
+            # already uses, so a consumer that reads one vocabulary
+            # finds it either way.
+            entry["degraded"] = True
+        # Every row carries the provenance of the listing it came from:
+        # which data source produced it, and which plans root that
+        # source read.
+        entry.update(provenance)
         if conflicted:
             # 列表这一层的 409：与其它四个调用点**逐字相同**的载荷，挂在条目
             # 上。集合接口不能整张列表变 409，所以这里是「桶 + 载荷」。
@@ -1718,7 +3176,7 @@ def _list_plans_body(
                 plan_id, artifacts,
             )
         plans.append(entry)
-    return plans
+    return plans, provenance
 
 
 def _seed_plan_routing_phase(plan_id: str, phase: str) -> None:

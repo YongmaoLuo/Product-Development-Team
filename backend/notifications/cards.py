@@ -208,6 +208,10 @@ _PHASE_LABEL = {
     # phase hint so the user can distinguish running vs
     # failed vs completed inside the executing window.
     "executing": "▶️ 执行中",
+    # 2026-10-24: parked because every provider is out of capacity.
+    # Not a failure — the plan still has work left, it just cannot run
+    # it right now.
+    "waiting_for_quota": "⏳ 等待配额",
     # Verification sub-machine — the user wants to see which
     # sub-phase the loop is in (initial verify, repairing,
     # rerunning).
@@ -244,6 +248,15 @@ _TERMINAL_FAILURE_PHASES = frozenset({
 # the verification family; see ``_unified_phase_section``.
 _EXECUTION_PHASE_LABEL = {
     "executing": "正在跑 tasks",
+    # 2026-10-24: parked for capacity — the sub-line says WHAT is
+    # blocked, so the operator does not read "等待配额" as "nothing is
+    # happening".
+    #
+    # 2026-10-26 (merge): ``ready`` 随 main 的词表统一退出这张表 —— 它只是
+    # 输入别名，卡片上不渲染；「等人」在卡片上只有 ``queued`` 一个说法。
+    # ``waiting_for_quota`` 留下：它是独立相位，不是「等人」的一种，卡片上
+    # 必须说得出「等的是配额」。
+    "waiting_for_quota": "等待 provider 配额恢复",
     # 2026-09-15: queued plans are auto-started by the scheduler.
     # 2026-10-25: ``ready`` is an input alias, not a card phase — the
     # waiting phase is spelled ``queued`` here too.

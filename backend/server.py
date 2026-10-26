@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import atexit
 from collections import deque
 from contextlib import asynccontextmanager
@@ -152,6 +153,32 @@ try:  # pragma: no cover - the repo always ships service_manager.py
     from service_manager import reap_services as _reap_services
 except Exception:  # noqa: BLE001
     _reap_services = None
+
+#: The one function that signals a service.  Resolved at import time for
+#: the same reason the reaps above are: the shutdown path runs from an
+#: ``atexit`` hook, after the interpreter has begun tearing down, and an
+#: import there would raise ``ModuleNotFoundError`` at the worst
+#: possible moment.  ``None`` means the module is missing: the kill
+#: becomes a no-op that says so, rather than a crash on the way out.
+try:  # pragma: no cover - the repo always ships service_manager.py
+    from service_manager import (
+        ServiceRuntime as _ServiceRuntime,
+        kill_service as _kill_service,
+    )
+except Exception:  # noqa: BLE001
+    _ServiceRuntime = None
+    _kill_service = None
+
+try:  # pragma: no cover - the repo always ships service_manager.py
+    from service_manager import (
+        new_owner_token as _new_owner_token,
+        register_service_owner as _register_owner,
+        release_service_owner as _release_owner,
+    )
+except Exception:  # noqa: BLE001
+    _new_owner_token = None
+    _register_owner = None
+    _release_owner = None
 
 # ---------------------------------------------------------------------------
 # secret_sweep (credential-residue reaping) — resolved once, at import time
@@ -1002,6 +1029,33 @@ async def _lifespan(app):
     On shutdown: stop the heartbeat monitor and kill any in-flight
     execution subprocesses.
     """
+    # The request guard's self-check, before this instance serves
+    # anything.  uvicorn runs the lifespan BEFORE it binds the socket,
+    # so a guard that does not refuse stops the boot right here: the
+    # port is never opened, and no browser page can reach an API that
+    # answers without the guard.  The second half of the check — the
+    # same question asked of the running instance on its own address —
+    # lives next to the middleware; see ``_start_request_guard_selfcheck``.
+    #
+    # The question is asked of **the app this module serves** — the one
+    # uvicorn is given in ``__main__`` — and not of the handle the
+    # lifespan was handed: that is the app whose stack an outside
+    # request has to pass, and in every real deployment the two are the
+    # same object.
+    _guard_ok, _guard_detail = await _request_guard_selfcheck_async()
+    if not _guard_ok:
+        logger.error(
+            "%s",
+            _request_guard_failure_line(
+                _SERVER_BOUND_PORT, REQUEST_GUARD_SELFCHECK_PATH,
+                _guard_detail,
+            ),
+        )
+        raise RuntimeError(
+            "the request guard is not in force on this instance; refusing "
+            f"to serve ({_guard_detail})"
+        )
+
     # 2026-10-25 (R10): startup phase migration — ``ready`` → ``queued``.
     #
     # ``queued`` is the only waiting phase now (see ``phase_vocabulary``),
@@ -1066,7 +1120,10 @@ async def _lifespan(app):
         )
     else:
         try:
-            _swept = _reap_all_plans(PLANS_DIR, reason="startup_sweep")
+            _swept = _reap_all_plans(
+                PLANS_DIR, reason="startup_sweep",
+                caller="server.startup_sweep",
+            )
             _swept_reaped = [r for r in _swept if r.reaped or not r.clean]
             if _swept_reaped:
                 logger.warning(
@@ -1328,6 +1385,406 @@ async def _request_guard_middleware(request, call_next):
     return await call_next(request)
 
 
+# ---------------------------------------------------------------------------
+# The guard's self-check — "the guard is in force", proved at runtime
+# ---------------------------------------------------------------------------
+#
+# The middleware above is the reason a page from another origin cannot
+# drive this API.  A test can prove that the middleware *refuses* a
+# request; it cannot prove that the instance an operator actually
+# reaches on a port refuses one — that instance is a separate process,
+# and it is the one a browser can reach.  The two came apart in the
+# round this code belongs to: the in-process check passed, and the
+# instance that was serving did not carry the guard.
+#
+# So the instance asks itself, at the two moments where the answer is
+# still worth something:
+#
+#   * **before it serves anything.**  The lifespan runs before uvicorn
+#     binds the socket, so a check there that finds the guard missing
+#     stops the boot: the port is never opened, and the instance never
+#     serves an API that a browser page could drive.
+#   * **on the address it listens on.**  Right after uvicorn has bound
+#     the port, the same question is asked over real HTTP, to the real
+#     port.  Nothing but the running instance can answer that one, so
+#     it is the check that cannot be satisfied by code that merely
+#     *looks* right.
+#
+# Both answers are recorded in :data:`_REQUEST_GUARD_SELFCHECK` and
+# published on ``/health/data`` as ``request_guard``, so a reader can
+# tell "this instance enforces the guard" from "somebody else answered
+# on this port".
+
+#: The path the self-check asks.  It is under the guarded prefix, it
+#: always exists, and it touches nothing: a liveness answer, so a
+#: failing check can only ever mean "the guard let a request through".
+REQUEST_GUARD_SELFCHECK_PATH = "/api/health"
+
+#: The path the self-check asks **outside** the guarded prefix.  The
+#: guard has to refuse the API and leave the UI alone, so the check asks
+#: both questions — a guard that swallowed the static assets would
+#: answer this one with a 403 too, and the record of the check would say
+#: so.
+REQUEST_GUARD_UNGUARDED_PROBE_PATH = "/health"
+
+#: What this process knows about its own guard.  ``status`` is one of:
+#:
+#:   * ``"enforced"`` — the self-check passed;
+#:   * ``"failed"`` — the self-check ran and the guard did not refuse;
+#:   * ``"unchecked"`` — no self-check has run in this process (an
+#:     application that was imported rather than started).
+#:
+#: The rest of the record is what the check **found**: when it ran
+#: (``checked_at``), what the guarded path answered without and with the
+#: header (``status_without_header`` / ``status_with_header``), and the
+#: per-path answers (``paths``).  A verdict on its own says "the guard is
+#: in force"; the numbers say *what was asked and what came back*, which
+#: is what a reader needs when the answer came from a port they did not
+#: start themselves.
+_REQUEST_GUARD_SELFCHECK: Dict[str, Any] = {
+    "status": "unchecked",
+    "detail": None,
+    "checked_at": None,
+    "status_without_header": None,
+    "status_with_header": None,
+    "paths": [],
+}
+
+#: The address this process serves on, when it is known.  ``__main__``
+#: fills it in before uvicorn is started, so a refusal can name the
+#: port the instance was about to serve on.
+_SERVER_BOUND_HOST: Optional[str] = None
+_SERVER_BOUND_PORT: Optional[int] = None
+
+
+def _judge_guard_probe(
+    bare_status: int, bare_body: str, headed_status: int,
+) -> Tuple[bool, str]:
+    """Decide whether a pair of probe answers proves the guard is in force.
+
+    ``bare_*`` is the answer to a request that carries no guard header;
+    ``headed_status`` is the answer to the same request that carries it.
+
+    The two have to be read together.  A 403 on the bare request proves
+    the request was refused — but a route that refuses *everything*
+    would look exactly the same, and the route being alive is what
+    says the refusal was the guard's doing.
+    """
+    problems: List[str] = []
+    if bare_status != 403:
+        problems.append(
+            f"a request without {request_guard.REQUEST_HEADER} answered "
+            f"{bare_status} instead of 403"
+        )
+    if "forbidden" not in (bare_body or "").lower():
+        problems.append(
+            f"the refusal body does not carry 'forbidden': "
+            f"{(bare_body or '')[:200]!r}"
+        )
+    if headed_status == 403:
+        problems.append(
+            f"a request WITH {request_guard.REQUEST_HEADER} was refused too "
+            f"(403) — the route under the guard is not being served"
+        )
+    if problems:
+        return False, "; ".join(problems)
+    return True, (
+        f"a request without {request_guard.REQUEST_HEADER} was refused with "
+        f"403 and a 'forbidden' body, and the same request with the header "
+        f"was served ({headed_status})"
+    )
+
+
+async def _asgi_probe(
+    target_app, path: str, headers: Sequence[Tuple[bytes, bytes]],
+) -> Tuple[int, str]:
+    """Call *target_app* over ASGI and return ``(status, body)``.
+
+    The application is called the way a server calls it — one ASGI
+    request, through the whole middleware stack — so what comes back is
+    the answer the middleware gives, not the answer the guard's
+    predicate gives on its own.
+    """
+    scope: Dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
+        "query_string": b"",
+        "root_path": "",
+        # The Host is loopback on purpose: the guard refuses for two
+        # independent reasons, and this check is about the header one.
+        "headers": [(b"host", b"127.0.0.1"), *headers],
+        "client": ("127.0.0.1", 0),
+        "server": ("127.0.0.1", 0),
+        "state": {},
+    }
+    status = 0
+    body_parts: List[bytes] = []
+
+    async def receive() -> Dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Dict[str, Any]) -> None:
+        nonlocal status
+        if message["type"] == "http.response.start":
+            status = int(message["status"])
+        elif message["type"] == "http.response.body":
+            body_parts.append(message.get("body", b"") or b"")
+
+    await target_app(scope, receive, send)
+    return status, b"".join(body_parts).decode("utf-8", "replace")
+
+
+async def _request_guard_selfcheck_async(
+    target_app=None,
+    path: str = REQUEST_GUARD_SELFCHECK_PATH,
+) -> Tuple[bool, str]:
+    """Ask this application, over its own stack, whether it refuses.
+
+    ``target_app`` defaults to this module's application.  The check
+    asks two questions of the same path: a request without the guard
+    header, and the same request with it.
+    """
+    app_to_ask = target_app if target_app is not None else app
+    bare_status, bare_body = await _asgi_probe(app_to_ask, path, ())
+    headed_status, _headed_body = await _asgi_probe(
+        app_to_ask,
+        path,
+        ((
+            request_guard.REQUEST_HEADER.lower().encode("ascii"),
+            request_guard.REQUEST_HEADER_VALUE.encode("ascii"),
+        ),),
+    )
+    ok, detail = _judge_guard_probe(bare_status, bare_body, headed_status)
+    paths = await _guard_probe_paths_async(app_to_ask, path)
+    _record_request_guard_selfcheck(
+        ok, detail,
+        status_without_header=bare_status,
+        status_with_header=headed_status,
+        paths=paths,
+    )
+    return ok, detail
+
+
+async def _guard_probe_paths_async(
+    target_app, guarded_path: str,
+) -> List[Dict[str, Any]]:
+    """What each probed path answered, with and without the header.
+
+    The record is what the check *found*, not what it concluded: a
+    reader who was not there can see which paths were asked and what
+    came back.  The guarded path comes first — it is the one the verdict
+    is about — and the unguarded one after it, because a guard that
+    swallowed the static assets would answer it with a 403 too.
+    """
+    records: List[Dict[str, Any]] = []
+    for path in (guarded_path, REQUEST_GUARD_UNGUARDED_PROBE_PATH):
+        if any(str(entry.get("path")) == path for entry in records):
+            continue
+        bare_status, _bare_body = await _asgi_probe(target_app, path, ())
+        headed_status, _headed_body = await _asgi_probe(
+            target_app,
+            path,
+            ((
+                request_guard.REQUEST_HEADER.lower().encode("ascii"),
+                request_guard.REQUEST_HEADER_VALUE.encode("ascii"),
+            ),),
+        )
+        records.append({
+            "path": path,
+            "status_without_header": bare_status,
+            "status_with_header": headed_status,
+        })
+    return records
+
+
+def _request_guard_selfcheck_on_port(
+    host: str,
+    port: int,
+    path: str = REQUEST_GUARD_SELFCHECK_PATH,
+    timeout: float = 5.0,
+) -> Tuple[bool, str]:
+    """Ask the instance listening on ``host:port`` whether it refuses.
+
+    This is the check that cannot be satisfied by code that merely
+    looks right: the answer comes over a real socket, from the process
+    that is serving.
+    """
+    import http.client
+
+    def _get(probe_path: str, headers: Dict[str, str]) -> Tuple[int, str]:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        try:
+            conn.request("GET", probe_path, headers=headers)
+            resp = conn.getresponse()
+            return int(resp.status), resp.read().decode("utf-8", "replace")
+        finally:
+            conn.close()
+
+    bare_status, bare_body = _get(path, {})
+    headed_status, _headed_body = _get(path, {
+        request_guard.REQUEST_HEADER: request_guard.REQUEST_HEADER_VALUE,
+    })
+    ok, detail = _judge_guard_probe(bare_status, bare_body, headed_status)
+    paths = _guard_probe_paths_on_port(host, port, path, timeout)
+    _record_request_guard_selfcheck(
+        ok, detail,
+        status_without_header=bare_status,
+        status_with_header=headed_status,
+        paths=paths,
+    )
+    return ok, detail
+
+
+def _guard_probe_paths_on_port(
+    host: str, port: int, guarded_path: str, timeout: float,
+) -> List[Dict[str, Any]]:
+    """What each probed path answered on the wire, with and without the header."""
+    import http.client
+
+    def _get(probe_path: str, headers: Dict[str, str]) -> int:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        try:
+            conn.request("GET", probe_path, headers=headers)
+            resp = conn.getresponse()
+            resp.read()
+            return int(resp.status)
+        finally:
+            conn.close()
+
+    records: List[Dict[str, Any]] = []
+    for probe_path in (guarded_path, REQUEST_GUARD_UNGUARDED_PROBE_PATH):
+        if any(str(entry.get("path")) == probe_path for entry in records):
+            continue
+        records.append({
+            "path": probe_path,
+            "status_without_header": _get(probe_path, {}),
+            "status_with_header": _get(probe_path, {
+                request_guard.REQUEST_HEADER: request_guard.REQUEST_HEADER_VALUE,
+            }),
+        })
+    return records
+
+
+def _record_request_guard_selfcheck(
+    ok: bool,
+    detail: str,
+    *,
+    status_without_header: Optional[int] = None,
+    status_with_header: Optional[int] = None,
+    paths: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Remember what the self-check found, for ``/health/data``.
+
+    The verdict (``status``) is what the round compares; the numbers are
+    what lets it check the verdict instead of taking it on trust.
+    """
+    _REQUEST_GUARD_SELFCHECK["status"] = "enforced" if ok else "failed"
+    _REQUEST_GUARD_SELFCHECK["detail"] = detail
+    _REQUEST_GUARD_SELFCHECK["checked_at"] = datetime.now(
+        timezone.utc,
+    ).isoformat()
+    _REQUEST_GUARD_SELFCHECK["status_without_header"] = status_without_header
+    _REQUEST_GUARD_SELFCHECK["status_with_header"] = status_with_header
+    _REQUEST_GUARD_SELFCHECK["paths"] = [
+        dict(entry) for entry in (paths or []) if isinstance(entry, dict)
+    ]
+
+
+def _request_guard_detail() -> Dict[str, Any]:
+    """The self-check's own record, published for whoever asks.
+
+    This is the evidence the round could not get on its own: the
+    instance checked **itself** before it began serving, and this is
+    what it found.  A round that reaches a port whose instance has since
+    died cannot ask the instance — but it can read this from the
+    service-ready event, and it does not have to re-derive the guard's
+    behaviour on an address that is already gone.
+    """
+    record = _REQUEST_GUARD_SELFCHECK
+    paths = record.get("paths") or []
+    return {
+        "status": record.get("status"),
+        "detail": record.get("detail"),
+        "checked_at": record.get("checked_at"),
+        "status_without_header": record.get("status_without_header"),
+        "status_with_header": record.get("status_with_header"),
+        "paths": [dict(entry) for entry in paths if isinstance(entry, dict)],
+    }
+
+
+def _request_guard_failure_line(
+    port: Optional[int], path: str, detail: str,
+) -> str:
+    """The one line an operator reads when the guard is not in force."""
+    where = f"port={port}" if port is not None else "port=unknown"
+    return f"request_guard_selfcheck_failed{{{where}, path={path}}} {detail}"
+
+
+def _connect_host(host: str) -> str:
+    """The address to connect to for a server bound to *host*."""
+    return host if host not in ("0.0.0.0", "::", "") else "127.0.0.1"
+
+
+def _start_request_guard_selfcheck(
+    instance,
+    host: str,
+    port: int,
+    path: str = REQUEST_GUARD_SELFCHECK_PATH,
+    timeout: float = 60.0,
+) -> threading.Thread:
+    """Ask the running instance, on its own address, whether it refuses.
+
+    The question can only be answered by something outside the serving
+    loop, so the check runs in its own thread: it waits for the socket
+    to be listening, asks the instance over real HTTP, and — if the
+    guard does not refuse — stops the instance instead of letting it
+    serve an API a browser page could drive.
+    """
+
+    def _run() -> None:
+        deadline = time.monotonic() + timeout
+        while not instance.started and time.monotonic() < deadline:
+            if instance.should_exit:
+                # The server is going down for another reason; there is
+                # nothing left to ask.
+                return
+            time.sleep(0.05)
+        if not instance.started:
+            detail = (
+                f"the server never started listening on {host}:{port} "
+                f"within {timeout:g}s"
+            )
+            _record_request_guard_selfcheck(False, detail)
+            logger.error(
+                "%s", _request_guard_failure_line(port, path, detail),
+            )
+            instance.should_exit = True
+            return
+        try:
+            ok, detail = _request_guard_selfcheck_on_port(
+                _connect_host(host), port, path,
+            )
+        except Exception as exc:  # noqa: BLE001 - a probe that cannot run is a failure
+            ok, detail = False, f"the probe raised {type(exc).__name__}: {exc}"
+            _record_request_guard_selfcheck(False, detail)
+        if not ok:
+            logger.error(
+                "%s", _request_guard_failure_line(port, path, detail),
+            )
+            instance.should_exit = True
+
+    thread = threading.Thread(
+        target=_run, name="pdt-request-guard-selfcheck", daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def _run_in_plan_ctx(plan_id: str, fn) -> None:
     """Thread entry wrapper: bind the usage-registry plan context."""
     with plan_usage_context(plan_id=plan_id):
@@ -1444,6 +1901,140 @@ def health_check():
     return {"status": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# 2026-10-25 — the instance block: WHICH process answered
+# ---------------------------------------------------------------------------
+#
+# ``/health/data`` used to answer with exactly one fact about the data
+# plane: how many ``plan_routing`` rows it could read.  That is enough
+# to tell a broken database from a working one, and NOT enough to tell
+# whose answer it is.
+#
+# The 2026-10-24 round found that difference the hard way.  A probe
+# reached a backend on a busy port; that backend answered 200 with
+# ``status: ok`` and an EMPTY routing table; and the round could not
+# say whether the answer came from its own instance or from the
+# stranger that had taken the port.  "Some instance answered" and "the
+# round's instance answered" were the same shape on the wire.
+#
+# So the probe answers the identity question too, in an ``instance``
+# block — a fact sheet about the process that produced the answer:
+#
+#   * ``boot_id`` — minted once per process, never changes.  Two
+#     answers carrying the same boot id came from the same process;
+#     two answers carrying different ones did not.
+#   * ``pid`` / ``pgid`` — the process and its process group.
+#   * ``cwd`` — the directory the process was started from.
+#   * ``started_at`` — when the process started (ISO-8601, UTC).
+#   * ``plans_dir`` — the plans root this process is serving.
+#   * ``state_db_path`` / ``state_db_inode`` — the database this
+#     process reads, and the inode of that file.  The inode matters:
+#     a DIFFERENT file at the same path is a different data plane.
+#   * ``plan_routing_rows`` / ``fixture_plan_ids`` — what the process
+#     found in that database: the row count, and the plan ids behind
+#     it (the round's fixture, when the round seeded one).
+#
+# Comparing ``plans_dir`` and ``state_db_path`` against the ones the
+# round configured is what answers "is this the round's instance?" —
+# and the ids explain an empty data plane ("this instance serves
+# another tree") instead of leaving it as a mystery count.
+#
+# Every field is a fact about THIS process; none of it is derived from
+# the request, so two answers can be compared field by field.
+
+#: The identity of THIS process, minted once when the module is
+#: imported and never changed afterwards.
+#:
+#: It is deliberately NOT the ``pdt_server_boot_id`` counter the
+#: startup path writes next to the state database: that counter is
+#: shared by every process that uses the same database directory, so
+#: two instances running side by side would report the same number.
+_INSTANCE_BOOT_ID = uuid.uuid4().hex
+
+#: When the module was imported — the fallback for ``started_at`` on a
+#: host where the real process start time cannot be read.
+_PROCESS_IMPORT_EPOCH = time.time()
+
+
+def _process_started_at() -> str:
+    """When this process started, as an ISO-8601 UTC stamp.
+
+    The process start time is a fact about the OS, not about the
+    request, and it is what a reader compares against another
+    instance's claim.  ``psutil`` is a dev dependency only, so the
+    import-time stamp is the fallback for a runtime without it.
+    """
+    started = None
+    try:
+        import psutil
+
+        started = float(psutil.Process().create_time())
+    except Exception:  # noqa: BLE001 - the fallback is good enough
+        started = None
+    if started is None:
+        started = _PROCESS_IMPORT_EPOCH
+    return datetime.fromtimestamp(started, tz=timezone.utc).isoformat()
+
+
+#: The process facts, computed once at startup.
+_PROCESS_STARTED_AT = _process_started_at()
+_PROCESS_PID = os.getpid()
+_PROCESS_PGID = os.getpgid(0) if hasattr(os, "getpgid") else None
+_PROCESS_CWD = os.getcwd()
+
+#: How many plan ids the instance block lists.  The round's fixture is
+#: a handful of plans; a production-sized routing table is not, and
+#: this probe runs before EVERY api_test VP — so the list is capped and
+#: the row count beside it stays the complete number.
+_INSTANCE_PLAN_IDS_LIMIT = 100
+
+
+def _instance_identity(
+    db_path: Optional[Path] = None,
+    *,
+    routing_rows: Optional[int] = None,
+    fixture_plan_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """The fact sheet about the process that is answering.
+
+    ``db_path`` is the database the caller is reading; when it is not
+    given the path is resolved here, and a resolution failure (the
+    live-database guard under pytest) leaves it unknown rather than
+    turning the probe into a 500.
+
+    The paths are read when the answer is written, because they are the
+    configuration this process is serving RIGHT NOW — a test, and an
+    operator, can point a running process at another tree, and the
+    answer has to name the tree in use rather than the one from
+    startup.  The process facts beside them (boot id, pid, group, cwd,
+    start time) are frozen at startup because they describe the
+    process, not its configuration.
+    """
+    if db_path is None:
+        try:
+            db_path = _state_db_path()
+        except Exception:  # noqa: BLE001 - a probe must never 500
+            db_path = None
+    inode: Optional[int] = None
+    if db_path is not None:
+        try:
+            inode = int(db_path.stat().st_ino)
+        except OSError:
+            inode = None
+    return {
+        "boot_id": _INSTANCE_BOOT_ID,
+        "pid": _PROCESS_PID,
+        "pgid": _PROCESS_PGID,
+        "cwd": _PROCESS_CWD,
+        "started_at": _PROCESS_STARTED_AT,
+        "plans_dir": str(Path(PLANS_DIR)),
+        "state_db_path": str(db_path) if db_path is not None else None,
+        "state_db_inode": inode,
+        "plan_routing_rows": routing_rows,
+        "fixture_plan_ids": fixture_plan_ids,
+    }
+
+
 @app.get("/health/data")
 def health_data_check():
     """Data-plane probe: can the server actually read its state database?
@@ -1458,18 +2049,62 @@ def health_data_check():
     Deliberately read-only and cheap: it never takes the v5 migration
     write lock (the fast path in ``migrate`` is a plain SELECT on a
     current-schema DB).
+
+    2026-10-25: the answer also carries an ``instance`` block — the
+    fact sheet about the process that answered, so a reader can tell
+    "this instance" from "somebody else's instance on the same port"
+    (see :func:`_instance_identity`).  The block is purely additive:
+    ``status``, ``plan_routing_rows`` and ``reason`` keep exactly the
+    meaning they had.
+
+    2026-10-26: the answer carries the guard's own verdict as
+    ``request_guard`` — ``"enforced"`` when this process checked
+    itself and found the guard refusing, ``"failed"`` when the check
+    ran and the guard did not refuse, ``"unchecked"`` when no check
+    has run here (an application that was imported rather than
+    started).  It is the field a reader compares when the answer came
+    from a port they did not start themselves: an instance that
+    publishes ``"enforced"`` is one that proved it; one that does not
+    publish the field at all is somebody else.
+
+    The verdict is not the whole of the record, so the answer carries
+    the record too: ``request_guard_detail`` says when the check ran
+    (``checked_at``), which paths it asked (``paths``), and what each of
+    them answered with and without the header
+    (``status_without_header`` / ``status_with_header``).  This is the
+    evidence the round could not get on its own — the instance checked
+    **itself** before it began serving, and this is what it found.  A
+    round that reaches a port whose instance has since died cannot ask
+    the instance any more, so the record has to be published while the
+    instance is still there.
     """
+    db_path: Optional[Path] = None
     try:
         from state_machine.db.connection import open as open_db
         from state_machine.db.schema import migrate as _migrate
         db_path = _state_db_path()
         if not db_path.exists():
             # Fresh install — no state.db yet is legitimate, not a fault.
-            return {"status": "ok", "plan_routing_rows": 0}
+            return {
+                "status": "ok",
+                "plan_routing_rows": 0,
+                "request_guard": _REQUEST_GUARD_SELFCHECK["status"],
+                "request_guard_detail": _request_guard_detail(),
+                "instance": _instance_identity(
+                    db_path, routing_rows=0, fixture_plan_ids=[],
+                ),
+            }
         conn = open_db(db_path)
         try:
             _migrate(conn)
             row = conn.execute("SELECT COUNT(*) FROM plan_routing").fetchone()
+            plan_ids = [
+                str(r[0])
+                for r in conn.execute(
+                    "SELECT plan_id FROM plan_routing ORDER BY plan_id LIMIT ?",
+                    (_INSTANCE_PLAN_IDS_LIMIT,),
+                ).fetchall()
+            ]
         finally:
             conn.close()
     except Exception as exc:  # noqa: BLE001 - a probe must never 500
@@ -1478,9 +2113,25 @@ def health_data_check():
             content={
                 "status": "degraded",
                 "reason": f"{type(exc).__name__}: {exc}",
+                # The data plane is broken, so the counts are unknown —
+                # but WHO is broken is exactly what a reader needs now.
+                "request_guard": _REQUEST_GUARD_SELFCHECK["status"],
+                "request_guard_detail": _request_guard_detail(),
+                "instance": _instance_identity(
+                    db_path, routing_rows=None, fixture_plan_ids=None,
+                ),
             },
         )
-    return {"status": "ok", "plan_routing_rows": row[0] if row else 0}
+    routing_rows = row[0] if row else 0
+    return {
+        "status": "ok",
+        "plan_routing_rows": routing_rows,
+        "request_guard": _REQUEST_GUARD_SELFCHECK["status"],
+        "request_guard_detail": _request_guard_detail(),
+        "instance": _instance_identity(
+            db_path, routing_rows=routing_rows, fixture_plan_ids=plan_ids,
+        ),
+    }
 
 
 @app.get("/api/health")
@@ -1726,7 +2377,20 @@ class ResetRoundsRequest(BaseModel):
 
 class ExecutionStatusResponse(BaseModel):
     plan_id: str
-    status: Literal["running", "completed", "failed", "stopped", "not_started"]
+    # 2026-10-24: ``waiting_for_quota`` joined the vocabulary — a plan
+    # parked because every provider is out of capacity. The two
+    # execution-phase Literals (``status`` here and ``execution_status``
+    # in ``ExecutionProgressResponse``) MUST grow together: this model
+    # is the ``response_model`` of
+    # ``GET /api/execution/{plan_id}/status``
+    # (backend/routes/execution.py), so a value that is not in the
+    # Literal makes the endpoint raise ``ResponseValidationError`` → 500
+    # on every poll. Same class of bug as the 2026-09-14 ``stop_reason``
+    # Literal incident.
+    status: Literal[
+        "running", "completed", "failed", "stopped", "not_started",
+        "waiting_for_quota",
+    ]
     logs: list[str]
     project_dir: str
     pid: Optional[int] = None
@@ -1759,7 +2423,10 @@ class ExecutionProgressResponse(BaseModel):
     plan_id: str
     pid: Optional[int] = None
     project_dir: str
-    execution_status: Literal["running", "completed", "failed", "stopped", "not_started"]
+    execution_status: Literal[
+        "running", "completed", "failed", "stopped", "not_started",
+        "waiting_for_quota",
+    ]
     tasks: list
     current: Optional[dict] = None
     next: Optional[dict] = None
@@ -2014,6 +2681,10 @@ _TERMINAL_PHASES = ("completed", "failed", "stopped")
 #:   them, and the pre-v5 gate accepted all four.
 #: * ``completed`` / ``verification_passed`` — likewise the single old
 #:   ``terminal_done``.
+#: * ``waiting_for_quota`` — 2026-10-24: a plan parked because every
+#:   provider was out of capacity. It still has work left, so once
+#:   capacity returns the operator (or the scheduler) has to be able to
+#:   start it again from here — including after a backend restart.
 _EXECUTION_START_SOURCE_PHASES = (
     "queued",
     "failed",
@@ -2022,6 +2693,7 @@ _EXECUTION_START_SOURCE_PHASES = (
     "verification_loop_stopped",
     "completed",
     "verification_passed",
+    "waiting_for_quota",
 )
 
 # Minimum seconds between ``POST /api/verification/{id}/start`` and the
@@ -2275,6 +2947,27 @@ def _resolve_stop_grace_seconds(grace_seconds: Optional[float]) -> float:
     return _STOP_GRACE_DEFAULT_SECONDS
 
 
+def _execution_plan_dir(proc: object) -> Optional[Path]:
+    """The plan directory of the execution that owns *proc*, if any.
+
+    The server knows which plan every running execution belongs to —
+    ``_execution_state`` is the map — but ``_kill_process_tree`` is
+    handed a bare ``Popen``.  Looking the process up here is what lets
+    the kill request land in the right plan's event stream without
+    changing the signature every call site already uses.
+    """
+    for plan_id, state in list(_execution_state.items()):
+        if not isinstance(state, dict):
+            continue
+        if state.get("process") is not proc:
+            continue
+        try:
+            return _plan_dir(str(plan_id))
+        except Exception:  # noqa: BLE001 - a bad plan id is not a verdict
+            return None
+    return None
+
+
 def _kill_process_tree(
     proc: subprocess.Popen, grace_seconds: Optional[float] = None
 ) -> bool:
@@ -2283,6 +2976,21 @@ def _kill_process_tree(
     Processes started with ``start_new_session=True`` get their own session
     (and thus process group). Killing the group ensures all descendant
     processes (shells, child commands, etc.) are terminated together.
+
+    The signal goes out through ``service_manager.kill_service``
+    (2026-10-26, repair-r1-49), like every other signal aimed at a
+    process this backend owns.  That function writes the request down
+    **before** the signal goes out — who asked, why, which round — so a
+    process that dies under the backend leaves a record on the plan's
+    own event stream instead of only a ``received SIGTERM`` on the
+    dying process's side.  The 2026-10-26 round could not answer "who
+    killed my service"; this is what makes the next one able to.
+
+    ``fallback_to_pids=False``: this path has a process **group** it
+    trusts, and a pid it cannot — the recorded pid may have been
+    recycled by the time the signal goes out, and signalling a stranger
+    is worse than signalling nobody.  The escalation below still reaps
+    the child through ``proc.kill()``, which addresses it directly.
 
     ``grace_seconds`` is how long to wait after SIGTERM before escalating
     to SIGKILL (explicit argument > ``PDT_STOP_GRACE_SECONDS`` > 10s).
@@ -2301,13 +3009,31 @@ def _kill_process_tree(
     grace = _resolve_stop_grace_seconds(grace_seconds)
     try:
         pgid = os.getpgid(proc.pid)
-        if _signallable_pgid(pgid) is not None:
-            os.killpg(pgid, signal.SIGTERM)
+        if _signallable_pgid(pgid) is None:
+            pgid = None
     except (ProcessLookupError, PermissionError, OSError):
         # The group is already gone, or we may not signal it. Either way
         # the child still gets the SIGTERM-shaped chance to exit below via
         # proc.wait(); we must not turn a signal failure into "give up".
-        pass
+        pgid = None
+    if pgid is not None and _kill_service is not None:
+        try:
+            _kill_service(
+                _ServiceRuntime(
+                    name="execution", port=0, pid=proc.pid, pgid=pgid,
+                ),
+                "server._kill_process_tree",
+                "the execution's process tree is being stopped",
+                plan_dir=_execution_plan_dir(proc),
+                sig=signal.SIGTERM,
+                pgid=pgid,
+                fallback_to_pids=False,
+            )
+        except Exception:  # noqa: BLE001 - a kill must never raise
+            logger.exception(
+                "[service_manager] kill request for pid=%s could not be "
+                "recorded", getattr(proc, "pid", "<unknown>"),
+            )
     try:
         proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
@@ -2360,9 +3086,19 @@ def _shutdown_all_executions() -> None:
     # it is bound, at the top of this module). This runs from ``atexit``,
     # i.e. after teardown has begun, so it must not resolve an import here
     # — that is exactly the failure this reference exists to avoid.
+    #
+    # ``release_own_owners=True`` (2026-10-24): this process is going
+    # away, so the rounds it registered are over and the services they
+    # started must not outlive it. Without the release, the owner
+    # tokens still name this (live) pid and the sweep would consider
+    # those entries the property of a running round — and leave the
+    # backend's own services holding their ports after it exited.
     if _reap_all_plans is not None:
         try:
-            _reap_all_plans(PLANS_DIR, reason="server_shutdown")
+            _reap_all_plans(
+                PLANS_DIR, reason="server_shutdown", release_own_owners=True,
+                caller="server.shutdown_sweep",
+            )
         except Exception:  # pragma: no cover - shutdown must never raise
             logger.exception("[service_manager] shutdown service reap failed")
 
@@ -2603,8 +3339,58 @@ _VP_TMP_ROOT = Path("/tmp")
 
 
 
+def _new_service_owner_token(prefix: str = "run") -> str:
+    """A token identifying one *round* of service ownership (2026-10-24).
+
+    The ledger used to record "which processes the backend started for
+    this plan", not "which round started them" — so an older round's
+    exit-time reap read the newer round's entries out of the one ledger
+    the plan directory has and stopped them. The token is what tells the
+    two apart.
+    """
+    if _new_owner_token is None:
+        return ""
+    try:
+        return _new_owner_token(prefix)
+    except Exception:  # noqa: BLE001 - never raise on a cleanup path
+        logger.exception("[service_manager] owner token creation failed")
+        return ""
+
+
+def _register_service_owner(
+    plan_dir: Path, owner_token: str, *, current: bool = False,
+) -> None:
+    """Register ``owner_token`` as running for this plan.
+
+    ``current=True`` is for the round that *starts* services: it is the
+    round whose ledger entries carry this token. A caller that merely
+    reaps must not claim it.
+    """
+    if _register_owner is None or not owner_token:
+        return
+    try:
+        _register_owner(plan_dir, owner_token, current=current)
+    except Exception:  # noqa: BLE001 - never raise on a cleanup path
+        logger.exception(
+            "[service_manager] owner registration failed for %s", owner_token,
+        )
+
+
+def _release_service_owner(plan_dir: Path, owner_token: str) -> None:
+    """Deregister ``owner_token``: the round it names is over."""
+    if _release_owner is None or not owner_token:
+        return
+    try:
+        _release_owner(plan_dir, owner_token)
+    except Exception:  # noqa: BLE001 - never raise on a cleanup path
+        logger.exception(
+            "[service_manager] owner release failed for %s", owner_token,
+        )
+
+
 def _reap_managed_services(
-    plan_id: str, plan_dir: Path, reason: str,
+    plan_id: str, plan_dir: Path, reason: str, owner_token: Optional[str] = None,
+    caller: str = "server._reap_managed_services",
 ) -> None:
     """Stop every service this plan's ledger says the backend started (2026-09-18 C3).
 
@@ -2619,7 +3405,27 @@ def _reap_managed_services(
     ``service_manager.reap_services``). An unidentified port holder is
     reported, never signalled. Never raises — exit-time cleanup must
     not be the thing that turns a clean shutdown into a crash.
+
+    ``owner_token`` names the round doing the reaping (2026-10-24).
+    Entries that belong to a *different, still-running* round are left
+    alone: that round reaps its own services when it exits. Without the
+    token, an older round's exit stopped the api server the newer round
+    had just started — 47 seconds before that round's first test asked
+    it for ``/health``.
+
+    A caller that passes no token owns nothing, so its reap stops the
+    entries whose owner is gone (the orphans a crashed round left) and
+    leaves the live rounds' services to their owners. That is the right
+    default for the route call sites — a stop or a reset is not the
+    owner of a round that is still running. They still get a token of
+    their own, so each exit is identifiable in the log.
+
+    ``caller`` names who is doing the reaping. It is written to the
+    plan's kill event stream before each signal goes out, so a service
+    that dies during a reap says on the record that a reap stopped it
+    (2026-10-26, repair-r1-49).
     """
+    token = owner_token if owner_token else _new_service_owner_token(reason)
     try:
         if _reap_services is None:
             logger.warning(
@@ -2627,7 +3433,10 @@ def _reap_managed_services(
                 "service_manager did not import", plan_id,
             )
             return
-        report = _reap_services(plan_dir, plan_id, reason=reason)
+        report = _reap_services(
+            plan_dir, plan_id, reason=reason, owner_token=token,
+            caller=caller,
+        )
     except Exception:  # pragma: no cover - reap never raises by design
         logger.exception(
             "[service_manager] reap failed for plan=%s (reason=%s)",
@@ -3220,6 +4029,7 @@ if __name__ == "__main__":
 
     import socket
     import uvicorn
+    from uvicorn.main import STARTUP_FAILURE
 
     # Port backoff: try PDT_PORT (or default 8000); on AddressInUse, increment until free.
     # Two independent backend servers may coexist (e.g. two independent projects); refuse to silently
@@ -3259,5 +4069,37 @@ if __name__ == "__main__":
     if bound_port is None:
         print(f"[backend server] FATAL: no free port in range {preferred_port}..{preferred_port + max_attempts - 1} ({last_error})")
         sys.exit(1)
+
+    # The address this instance serves on, recorded before the server
+    # starts so a refusal can name it.
+    _SERVER_BOUND_HOST = host
+    _SERVER_BOUND_PORT = bound_port
+
     print(f"[backend server] Starting uvicorn on {host}:{bound_port}")
-    uvicorn.run(app, host=host, port=bound_port)
+    # The server is built by hand rather than through ``uvicorn.run`` so
+    # that the request guard can be checked against the address this
+    # instance actually serves on: the check needs the server object —
+    # to know when it is listening, and to stop it if the guard is not
+    # in force.  ``uvicorn.run`` does exactly this for the single-worker
+    # case, plus its own "the process never came up" exit.
+    config = uvicorn.Config(app, host=host, port=bound_port)
+    instance = uvicorn.Server(config=config)
+    _start_request_guard_selfcheck(instance, host, bound_port)
+    try:
+        instance.run()
+    except KeyboardInterrupt:  # pragma: no cover - the signal path
+        pass
+    if not instance.started:
+        # uvicorn's own verdict: the process never came up (a failed
+        # lifespan, a port that could not be bound).
+        sys.exit(STARTUP_FAILURE)
+    if _REQUEST_GUARD_SELFCHECK["status"] == "failed":
+        print(
+            "[backend server] FATAL: "
+            + _request_guard_failure_line(
+                bound_port,
+                REQUEST_GUARD_SELFCHECK_PATH,
+                _REQUEST_GUARD_SELFCHECK["detail"] or "",
+            )
+        )
+        sys.exit(1)

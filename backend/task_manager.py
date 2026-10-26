@@ -1033,12 +1033,19 @@ class TaskManager:
                 plan_id, task_id, exc, 0, exhausted=False,
             )
 
-    def set_stop_reason(self, reason: str, detail: Optional[str] = None):
+    def set_stop_reason(self, reason: Optional[str], detail: Optional[str] = None):
         """
         Record why the run stopped, persisted as top-level fields in tasks.json.
 
         Args:
-            reason: One of 'success' or 'repeated_failure'
+            reason: One of 'success', 'repeated_failure' or
+                'waiting_for_quota' — or ``None`` to clear the marker.
+                'success' means the plan's work is done; 'repeated_failure'
+                means the same task failed the same way often enough that
+                the run stopped retrying it; 'waiting_for_quota' (2026-10-24)
+                means the run stopped because every provider had no room,
+                NOT because the work failed — the tasks stay eligible for
+                another dispatch, which is the whole point of the marker.
             detail: Human-readable description of the specific stopping cause
         """
         self.stop_reason = reason

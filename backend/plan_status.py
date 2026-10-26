@@ -54,8 +54,9 @@ That split is what makes the invariants testable without a database.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -88,8 +89,204 @@ FINISHED_PHASES = (
 RUNTIME_PHASE = "executing"
 
 
+#: The task counts every reader of a plan status asks for: how much work
+#: the plan is, how much of it is running, how much is still waiting and
+#: how much failed.  A status payload that omits one of them answers
+#: "where is this plan" with a question mark, so these four are the
+#: counts that must never be missing.
+REQUIRED_TASK_COUNTS = ("total", "in_progress", "pending", "failed")
+
+
+def ensure_task_counts(counts: Any) -> Dict[str, int]:
+    """``counts`` with the four required counts always present as ints.
+
+    Pure, like the rest of this module.  Two things are guaranteed
+    about the result:
+
+    * every key in :data:`REQUIRED_TASK_COUNTS` is present, and is an
+      ``int`` — a missing count is reported as ``0`` rather than as a
+      key a consumer has to defend against;
+    * every key that WAS present is still there, coerced to an ``int``
+      when it can be.  A count that cannot be read as a number becomes
+      ``0`` instead of raising: a status read must degrade, not fail.
+
+    The point is the difference between "this plan has no pending work"
+    and "this plan's pending count could not be read".  The first is a
+    fact; the second is a gap, and a consumer that cannot tell them
+    apart is exactly the consumer that guesses wrong.
+    """
+    source: Mapping[str, Any] = counts if isinstance(counts, Mapping) else {}
+    result: Dict[str, int] = {}
+    for key, value in source.items():
+        try:
+            result[str(key)] = int(value or 0)
+        except (TypeError, ValueError):
+            result[str(key)] = 0
+    for key in REQUIRED_TASK_COUNTS:
+        result.setdefault(key, 0)
+    return result
+
+
 def _norm(value: Optional[str]) -> str:
     return (value or "").strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# Where the phase comes from
+# ---------------------------------------------------------------------------
+#
+# The phase a reader is shown used to be whatever ``_build_plan_status``
+# happened to be holding: the routing row's ``current_phase`` when the
+# row could be read, and nothing else when it could not.  That is a
+# default living in the implementation — nobody can point at it, and
+# the one default that must never exist is the *parked* one, because it
+# is global: every plan in the system would claim to be waiting for
+# capacity, and the operator would be sent after a wall that only one
+# plan ever hit.
+#
+# So the rule is a function, here, and it says which tier answered.
+
+#: The resting phase: "tasks are generated, a human decides when to
+#: start".  It is the answer for a plan whose phase cannot be read —
+#: the one answer that is never a lie about capacity.
+DEFAULT_PHASE = "ready"
+
+#: The parked-for-capacity phase.
+QUOTA_WAIT_PHASE = "waiting_for_quota"
+
+#: The phase came from the routing row's own ``current_phase``.
+PHASE_SOURCE_ROUTING = "routing"
+
+#: The phase came from the durable execution row: the plan is parked
+#: for capacity and the routing row could not be read.
+PHASE_SOURCE_EXECUTION = "execution"
+
+#: The phase was not read from a record — it is the resting fallback.
+PHASE_SOURCE_DEFAULT = "default"
+
+#: The fields the executor's capacity marker carries
+#: (``agent._stop_reason_for_quota_wait``): which providers had no
+#: capacity, whether a human has to top up, how long the run waited and
+#: when it gave up.  A detail that parses into an object with none of
+#: these is not a capacity fact.
+_CAPACITY_MARKER_KEYS = frozenset({
+    "providers", "needs_manual_topup", "waited_sec", "at",
+})
+
+
+class DerivedPhase(NamedTuple):
+    """A phase and the tier that produced it.
+
+    ``source`` is what makes a fallback visible: a reader that cannot
+    tell a recorded phase from a resting default has to guess, and the
+    guess is where "the card says X but the plan is doing Y" comes
+    from.
+    """
+
+    phase: str
+    source: str
+
+
+def _capacity_marker(tasks_payload: Any) -> bool:
+    """Does ``tasks.json`` carry a capacity marker that parses?
+
+    The marker is written by the executor when a run parks because
+    every provider had no capacity left.  It lives in the *top level*
+    of ``tasks.json`` as ``reason_detail`` — a JSON string holding the
+    four fields of :data:`_CAPACITY_MARKER_KEYS`.
+
+    False for every shape that is not a capacity fact: no file, no
+    ``reason_detail``, a detail that is not JSON, a detail that is not
+    an object, an empty object, or an object carrying something else
+    entirely (the field is a free-form "why did this stop" slot).
+    """
+    if not isinstance(tasks_payload, Mapping):
+        return False
+    raw = tasks_payload.get("reason_detail")
+    detail: Any = raw
+    if isinstance(raw, str):
+        if not raw.strip():
+            return False
+        try:
+            detail = json.loads(raw)
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(detail, Mapping):
+        return False
+    return any(key in detail for key in _CAPACITY_MARKER_KEYS)
+
+
+def _execution_row_is_parked(execution_row: Any) -> bool:
+    """Does the durable execution row's ``stop_reason`` say "parked"?
+
+    ``stop_reason`` is the field that carries *why* the run stopped,
+    and it is the only place the parked verdict survives a restart.
+    The status column alone does not promote a plan: a row whose own
+    reason says something else is not a parked row, however its status
+    column reads.
+    """
+    if not isinstance(execution_row, Mapping):
+        return False
+    stop_reason = str(execution_row.get("stop_reason") or "").strip()
+    return stop_reason == QUOTA_WAIT_PHASE
+
+
+def derive_phase(
+    routing_phase: Optional[str],
+    execution_row: Optional[Mapping[str, Any]] = None,
+    tasks_payload: Any = None,
+) -> DerivedPhase:
+    """The plan's phase, and the tier that answered.
+
+    Pure — no I/O, no clock, no environment.  The three inputs are the
+    three things a reader can know about a plan's phase, and the
+    priority between them is fixed here rather than in whichever route
+    happened to read them first::
+
+        routing row  >  durable execution row  >  "ready"
+
+    **Tier 1 — the routing row.**  ``plan_routing.current_phase`` is
+    the workflow-phase authority: it is what ``/execution/start`` CASes
+    and what every card renders.  When it is there, it is the answer.
+
+    **Tier 2 — the durable execution row.**  Only consulted when the
+    routing row could not be read.  It may answer ``waiting_for_quota``
+    when **both** halves of the conjunction hold: the row's
+    ``stop_reason`` says the run stopped for capacity, *and* the plan's
+    ``tasks.json`` carries a capacity marker that parses.  Either half
+    alone is not enough — the row says the run stopped, the marker says
+    it stopped for capacity.
+
+    **Tier 3 — the resting default.**  Everything else is
+    :data:`DEFAULT_PHASE`, the manual gate.  This is where *every*
+    missing-information branch lands: a missing routing row, an
+    unreadable marker, a malformed marker, a row that says something
+    else.  Never on the parked phase.
+
+    The one exception is a plan with **no records at all** — no routing
+    row, no execution row, no ``tasks.json``.  There is no plan there
+    to sit at the manual gate, so the answer is the empty phase, which
+    is what the snapshot has always said for that case (and what the
+    endpoint's ``404`` is about).  It is not the parked phase either: a
+    plan that does not exist cannot be waiting for capacity.
+    """
+    routing = str(routing_phase or "").strip()
+    if routing:
+        return DerivedPhase(routing, PHASE_SOURCE_ROUTING)
+
+    row = execution_row if isinstance(execution_row, Mapping) else None
+    if (
+        row is not None
+        and _execution_row_is_parked(row)
+        and _capacity_marker(tasks_payload)
+    ):
+        return DerivedPhase(QUOTA_WAIT_PHASE, PHASE_SOURCE_EXECUTION)
+
+    if row is None and tasks_payload is None:
+        # No plan at all — see the docstring.
+        return DerivedPhase("", PHASE_SOURCE_DEFAULT)
+
+    return DerivedPhase(DEFAULT_PHASE, PHASE_SOURCE_DEFAULT)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +347,13 @@ class PlanStatus:
     #: CASes, and the only workflow-phase authority.
     phase: str = ""
 
+    #: Which tier produced :attr:`phase`: ``"routing"`` (the routing
+    #: row's own ``current_phase``), ``"execution"`` (the durable
+    #: execution row says the plan is parked for capacity) or
+    #: ``"default"`` (the phase was not read from a record — it is the
+    #: resting fallback).  See :func:`derive_phase`.
+    phase_source: str = ""
+
     #: ``plan_verification`` row.
     verification_status: str = ""
     verification_round: int = 0
@@ -202,6 +406,7 @@ class PlanStatus:
         return {
             "plan_id": self.plan_id,
             "phase": self.phase,
+            "phase_source": self.phase_source,
             "verification_status": self.verification_status,
             "verification_round": self.verification_round,
             "verification_max_rounds": self.verification_max_rounds,
@@ -248,6 +453,7 @@ def from_payload(payload: Mapping[str, Any]) -> PlanStatus:
     return PlanStatus(
         plan_id=str(payload.get("plan_id") or ""),
         phase=str(payload.get("phase") or ""),
+        phase_source=str(payload.get("phase_source") or ""),
         verification_status=str(payload.get("verification_status") or ""),
         verification_round=_int(payload.get("verification_round")),
         verification_max_rounds=_int(payload.get("verification_max_rounds")),

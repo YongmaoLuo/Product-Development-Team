@@ -24,6 +24,12 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+# 2026-10-26 (merge): 本分支删掉了这一行 —— 它原来只服务于
+# ``_quota_reset_seconds_for``，而那个函数被本分支删了。main 那边保留了它，
+# 并且新写的 ``_quota_wake_soonest_reset`` 真的要用 ``datetime``：两边合在
+# 一起时，import 跟着被删、用法跟着被合进来，于是模块一 import 就 NameError。
+# 这里把 import 补回来：它是纯增量（本分支自己不用 ``datetime``），
+# 保住 main 那段新代码的语义。
 from datetime import datetime
 from contextlib import contextmanager
 
@@ -36,8 +42,28 @@ import claude_sandbox
 # dependency-free (stdlib only), so a top-level import carries no cycle
 # risk — unlike ``provider_routing`` / ``provider_order``, which pull in
 # the SQLite consumer layer and stay lazily imported at the call site.
-from dynamic_provider_concurrency import get_shared_tracker
+from dynamic_provider_concurrency import (
+    DEFAULT_COOLDOWN_SEC,
+    DEFAULT_QUOTA_COOLDOWN_SEC,
+    get_shared_tracker,
+    looks_like_quota_exhaustion,
+)
 from quota_watchdog import get_shared_quota_watchdog as _shared_quota_watchdog
+# How long to park a provider that just refused (2026-10-24). The module
+# is stdlib-only apart from ``dynamic_provider_concurrency`` and
+# ``provider_order``, and imports nothing from here — so a top-level
+# import carries no cycle risk, unlike ``provider_order``, which stays
+# lazily imported at the call site.
+from capacity_wait import (
+    ENV_QUOTA_TOPUP_PARK_SEC,
+    WAIT_MANUAL_TOPUP,
+    WAIT_RATE_LIMITED,
+    WAIT_UNKNOWN,
+    WAIT_WINDOW,
+    QuotaWaitExhausted,
+    resolve_quota_wait,
+    topup_park_sec,
+)
 # Per-plan LLM-call attribution registry (2026-09-21). Pure logging side
 # channel — record failures must never break a dispatch, so the registry
 # swallows its own errors and we never let them propagate either.
@@ -1417,60 +1443,6 @@ def is_deterministic_local_error(exc: BaseException) -> bool:
     return isinstance(exc, _DETERMINISTIC_LOCAL_ERRORS)
 
 
-def _quota_reset_seconds_for(provider: str, fallback: float) -> float:
-    """Seconds until the window that emptied ``provider`` comes back.
-
-    A quota cooldown is only ever worth as long as the window it is
-    waiting on, and ``resets_at`` is the one field in the reading that
-    says when that is. So the parked length stops being a constant and
-    becomes a countdown: a window twelve minutes out is parked for
-    twelve minutes, rather than for the half hour the fixed number has
-    to be because it has to cover the worst window — and a provider is
-    almost never parked at the worst moment.
-
-    Every way of failing to answer falls back to ``fallback`` rather
-    than raising or returning a small number:
-
-      * no reading for this provider, or no reading at all (CC Switch
-        unreachable, provider absent from the map);
-      * the reading shows no budget but names no tier — the refusal was
-        real and the meter did not corroborate it;
-      * ``resets_at`` absent, unparseable, or **already in the past**.
-
-    That last one is the boundary worth naming. A ``resets_at`` in the
-    past is also what the reader treats as "this window has already
-    rolled", so the tier's percentage is discarded as stale — which
-    means a past stamp cannot be paired with a conviction from the same
-    tier. When it happens anyway, returning the remaining time would
-    return a non-positive number, and :meth:`ProviderCooldown.park` is
-    documented to ignore those: the provider would be neither parked
-    nor dispatched around, and the next dispatch would re-select the
-    provider that just refused. So a past stamp falls back instead.
-    """
-    if not provider:
-        return fallback
-    try:
-        from provider_order import load_provider_quota_map
-    except Exception:  # pragma: no cover - import cycle guard
-        return fallback
-    try:
-        quota = load_provider_quota_map().get(provider)
-    except Exception:
-        return fallback
-    if quota is None or not getattr(quota, "exhausted", False):
-        # The reading does not corroborate a refusal. Park for the
-        # fallback rather than for a window nobody named.
-        return fallback
-    resets_at = getattr(quota, "exhausted_resets_at", None)
-    if resets_at is None:
-        return fallback
-    now = datetime.now(resets_at.tzinfo) if resets_at.tzinfo else datetime.now()
-    seconds = (resets_at - now).total_seconds()
-    if seconds <= 0:
-        return fallback
-    return seconds
-
-
 def _quota_wake_probe_sec() -> float:
     """Seconds between two probes of a closed quota window.
 
@@ -2015,39 +1987,218 @@ def _slot_wake_step_sec(round_index: int) -> float:
     return max(SLOT_WAKE_MIN_STEP_SEC, min(scaled, SLOT_WAKE_MAX_STEP_SEC))
 
 
+#: The operator's number for a rate-limit park.
+ENV_PROVIDER_COOLDOWN_SEC = "PDT_PROVIDER_COOLDOWN_SEC"
+
+#: The operator's number for a quota park — a window, or a refusal the
+#: reading cannot corroborate. It also covers a hard cap: before the
+#: kinds existed there was one quota park, and an operator who had set
+#: it was parking their hard caps with it.
+ENV_PROVIDER_QUOTA_COOLDOWN_SEC = "PDT_PROVIDER_QUOTA_COOLDOWN_SEC"
+
+
+def _operator_seconds(name: str) -> Optional[float]:
+    """The operator's number for ``name``, or ``None``.
+
+    ``None`` means "there is no usable number here": the variable is
+    unset, blank, or not a number at all. A number that is not usable
+    is not obeyed — it falls back to what the reading says — because a
+    knob set to ``"soon"`` is a typo, and a typo that silently parks a
+    provider for the wrong length is worse than one that is ignored.
+
+    A negative number is floored at zero rather than obeyed as "wait a
+    very long time": it is a mistake either way, and zero at least says
+    "do not park this provider" out loud.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _provider_quota_for(provider: str):
+    """The live reading for ``provider``, or ``None``.
+
+    ``None`` means "there is no reading to be had", and it covers the
+    three ways that can be true: the caller named no provider, the
+    quota map could not be fetched, or the map has no row for this
+    provider. The wait resolver answers all three the same way — the
+    half hour, and no claim that a person has to act — so they are not
+    worth telling apart here.
+
+    The import is lazy because :mod:`provider_order` pulls in the
+    SQLite consumer layer, and this module is imported by everything.
+    """
+    if not provider:
+        return None
+    try:
+        from provider_order import load_provider_quota_map
+    except Exception:  # pragma: no cover - import cycle guard
+        return None
+    try:
+        quota_map = load_provider_quota_map()
+    except Exception:
+        return None
+    try:
+        return quota_map.get(provider)
+    except Exception:
+        return None
+
+
 def _cooldown_seconds_for(exc: BaseException, provider: str = "") -> float:
     """Park duration for ``exc``; env-overridable for operators/tests.
 
-    A rate-limit refusal keeps its fixed short park — a transient limit
-    is expected to clear in minutes and nothing about the exception says
-    otherwise. A quota refusal is a statement about a *window*, so it is
-    parked until that window returns
-    (:func:`_quota_reset_seconds_for`), with the half-hour default as
-    the answer whenever the reading cannot name the moment.
+    The park length follows the *kind* of refusal, and the kind is
+    settled before anything else is consulted:
+
+    * A refusal that does not read as "out of budget" is a rate limit.
+      It keeps its fixed short park (:data:`DEFAULT_COOLDOWN_SEC`) and
+      the live reading is not consulted at all. A full meter is a fact
+      about the budget; a rate limit is a fact about the traffic, and
+      neither one makes the other true. Letting the meter into this
+      branch would park a provider for the length of a window it never
+      spent.
+    * A refusal that does read as "out of budget" is handed to
+      :func:`capacity_wait.resolve_quota_wait` together with the live
+      reading, and the answer is one of three waits: the exact time
+      left on a window that names its reset time; the long park that a
+      balance a person has to top up earns (logged, because a silent
+      long park is indistinguishable from a hang); or the half hour for
+      a refusal the reading cannot corroborate.
+
+    The operator's number wins over all of it, which is the point of
+    having one: an operator who knows better than the reading does not
+    have to wait for a restart to be obeyed.
     """
-    try:
-        from dynamic_provider_concurrency import (
-            DEFAULT_COOLDOWN_SEC,
-            DEFAULT_QUOTA_COOLDOWN_SEC,
-            looks_like_quota_exhaustion,
+    if not looks_like_quota_exhaustion(str(exc)):
+        override = _operator_seconds(ENV_PROVIDER_COOLDOWN_SEC)
+        if override is not None:
+            return override
+        return float(DEFAULT_COOLDOWN_SEC)
+
+    wait = resolve_quota_wait(
+        provider,
+        str(exc),
+        str(getattr(exc, "status", "") or ""),
+        _provider_quota_for(provider),
+    )
+
+    if wait.kind == WAIT_MANUAL_TOPUP:
+        # The budget is gone because it was *paid for* and is not
+        # coming back on a timer, so no length of waiting brings it
+        # back. The top-up knob is the specific one and wins; the older
+        # quota knob still applies, so an operator who had set it keeps
+        # being obeyed.
+        override = _operator_seconds(ENV_QUOTA_TOPUP_PARK_SEC)
+        if override is None:
+            override = _operator_seconds(ENV_PROVIDER_QUOTA_COOLDOWN_SEC)
+        seconds = topup_park_sec() if override is None else override
+        logger.warning(
+            "provider_quota_manual_topup_required provider=%s park_sec=%s",
+            provider, seconds,
         )
-    except Exception:  # pragma: no cover - import cycle guard
-        return 0.0
-    if looks_like_quota_exhaustion(str(exc)):
-        default = DEFAULT_QUOTA_COOLDOWN_SEC
-        env_key = "PDT_PROVIDER_QUOTA_COOLDOWN_SEC"
-    else:
-        default = DEFAULT_COOLDOWN_SEC
-        env_key = "PDT_PROVIDER_COOLDOWN_SEC"
-    raw = os.environ.get(env_key)
-    if raw:
-        try:
-            return max(0.0, float(raw))
-        except (TypeError, ValueError):
-            pass
-    if default is not DEFAULT_QUOTA_COOLDOWN_SEC:
-        return default
-    return _quota_reset_seconds_for(provider, default)
+        return float(seconds)
+
+    if wait.kind in (WAIT_WINDOW, WAIT_UNKNOWN):
+        override = _operator_seconds(ENV_PROVIDER_QUOTA_COOLDOWN_SEC)
+        if override is not None:
+            return override
+        if wait.kind == WAIT_WINDOW:
+            # The window is a fact and a constant is a guess: park for
+            # exactly the time that is left on it.
+            return float(wait.seconds)
+        # The reading could not say what ran out, so the half hour it
+        # has always been — and no claim that a person has to act.
+        return float(DEFAULT_QUOTA_COOLDOWN_SEC)
+
+    if wait.kind == WAIT_RATE_LIMITED:
+        # A rate limit cannot reach here (the branch above only holds
+        # for a refusal that reads as an exhaustion), but the mapping is
+        # written down rather than assumed.
+        return float(DEFAULT_COOLDOWN_SEC)
+    # Any kind the resolver may grow later: the half hour it has always
+    # been, and no claim that a person has to act.
+    return float(DEFAULT_QUOTA_COOLDOWN_SEC)
+
+
+def _raise_if_all_blocked_are_manual_topup(
+    blocked,
+    quota_map,
+    *,
+    scene: str = "execution",
+    waited_sec: float = 0.0,
+) -> None:
+    """Raise when every blocked provider is a balance a person must top up.
+
+    The closed-window wait below is unbounded, and that is right for a
+    *window*: a quota window is somebody else's meter on their own
+    clock, and a plan upgrade can bring the budget back at a moment no
+    ``resets_at`` was ever going to name. Probing for that is how the
+    dispatch finds the budget again.
+
+    A hard cap is a different animal. A balance that was paid for and
+    spent is not coming back on any timer — the answer cannot change
+    until a person tops it up, so probing every five minutes for the
+    rest of the run buys nothing at all. This is the point where
+    "wait and retry" stops being a plan, and the plan has to say so:
+    :class:`capacity_wait.QuotaWaitExhausted` is what the agent turns
+    into a ``waiting_for_quota`` marker, so the task stays alive and
+    re-dispatchable instead of being failed for something a person has
+    to do.
+
+    The verdict is deliberately all-or-nothing:
+
+    * one provider on a *window* among the blocked ones is a reason to
+      keep waiting — that provider comes back by itself, and paging
+      somebody to buy credits because of a different row in the same
+      fleet is asking for the wrong thing;
+    * a provider whose reading is missing, unreadable, or names no
+      window is an *unknown*, not a hard cap. "We cannot tell" is not
+      "somebody has to act", and a verdict that claimed a top-up on a
+      missing reading would page somebody for a rate limit.
+
+    Only the execution scene escalates. PRD, architecture and refine
+    have nobody to receive a ``waiting_for_quota`` marker, so raising
+    there turns a parked plan into an unhandled exception; their hard
+    caps stay visible through the
+    ``provider_quota_manual_topup_required`` log line instead.
+
+    Args:
+        blocked: The providers the dispatch is blocked on. An empty
+            list means nothing is blocked, and nothing is raised.
+        quota_map: The live reading, provider name → quota row.
+        scene: The workflow scene the dispatch belongs to.
+        waited_sec: How long the dispatch has already waited, reported
+            on the exception.
+
+    Raises:
+        QuotaWaitExhausted: Every blocked provider is a hard cap.
+    """
+    if scene != "execution":
+        # Nobody in this scene can receive the marker; see above.
+        return
+    names = [str(name) for name in (blocked or []) if str(name).strip()]
+    if not names:
+        return
+    for name in names:
+        quota = None
+        if quota_map:
+            try:
+                quota = quota_map.get(name)
+            except Exception:
+                quota = None
+        wait = resolve_quota_wait(name, "", "", quota)
+        if wait.kind != WAIT_MANUAL_TOPUP:
+            # A window, a rate limit or an unknown: keep waiting.
+            return
+    raise QuotaWaitExhausted(
+        providers=names,
+        needs_manual_topup=True,
+        waited_sec=float(waited_sec),
+    )
 
 
 def _park_provider_after_error(provider: str, exc: BaseException) -> float:
@@ -2110,7 +2261,125 @@ def _provider_is_parked(provider: str) -> bool:
         return False
 
 
-def _classify_provider_failure(exc: BaseException, provider: str = "") -> str:
+#: The event an operator greps for when a capacity failure was
+#: classified without a live reading to stand on. It reports *how* the
+#: answer was reached and never changes it: the bucket the caller gets
+#: is the same with and without this line.
+CAPACITY_DEGRADATION_EVENT = "capacity_classified_without_live_reading"
+
+
+def _module_log() -> logging.Logger:
+    """The module-level logger, read when it is needed.
+
+    A caller — or a test — may replace ``coding_tool.logger``, so the
+    global is read at call time rather than captured at import time.
+    """
+    return logger
+
+
+def _capacity_read_degradation_reason(provider: str) -> Optional[str]:
+    """Why there is no live reading for ``provider`` — ``None`` if there is one.
+
+    Two readings exist, and either of them can be missing:
+
+      * the file-backed 5-hour usage table, whose failure vocabulary is
+        ``file_missing`` / ``permission_denied`` / ``parse_error`` /
+        ``invalid_shape`` / ``provider_absent``;
+      * the quota map CC Switch reports, whose vocabulary is
+        ``quota_unreachable`` / ``quota_bad_payload`` / ``provider_absent``.
+
+    Both are asked through the module-level accessors the readers
+    already leave behind, so this asks the disk and the network no
+    question at all: it only repeats what the last read already said.
+    A classification runs on every refused dispatch, and a second read
+    would be a second answer to a question that has one.
+
+    The table is asked first, because a table that cannot be read is
+    what most often leaves the classification resting on the prose
+    alone; the quota leg's own reason is the fallback for when the
+    table is there and holds this provider. Whichever answer comes
+    back is the *same* answer the reader gave — this does not invent a
+    vocabulary of its own.
+    """
+    try:
+        from provider_order import (
+            last_quota_read_reason,
+            last_usage_read_reason,
+        )
+    except Exception:  # pragma: no cover - import cycle guard
+        return None
+
+    for accessor in (last_usage_read_reason, last_quota_read_reason):
+        try:
+            reason = accessor(provider)
+        except Exception:
+            continue
+        if reason:
+            return reason
+    return None
+
+
+def _write_capacity_event(
+    target: Any,
+    event: str,
+    message: str,
+    data: Dict[str, Any],
+) -> None:
+    """Write one event to ``target``, whichever shape ``target`` has.
+
+    Two shapes are in use in this module: the module logger (a stdlib
+    logger, which takes a message) and the structured execution logger
+    (which takes an event name, a message and a ``data`` payload). The
+    message carries the event name and the three fields in its text as
+    well, so a plain-text grep finds the same facts the structured
+    record holds — and a sink that only understands one of the two
+    shapes still receives the whole story.
+
+    A sink that raises must not break the classification: the report
+    is a side channel, and the caller is waiting on an answer.
+    """
+    try:
+        target.warning(event, message, data=data)
+        return
+    except TypeError:
+        # Not the structured shape — fall through to the flat one.
+        pass
+    except Exception:
+        return
+    try:
+        target.warning(message)
+    except Exception:
+        pass
+
+
+def _report_capacity_degradation(
+    provider: str,
+    reason: str,
+    bucket: str,
+    sink: Optional[Any] = None,
+) -> None:
+    """Report that a capacity failure was classified without a live reading.
+
+    Two sinks, as elsewhere in this module: the module logger is always
+    there, and the structured sink is what the plan's execution log
+    reads. The line carries the event name and the three fields in its
+    text as well, so the two sinks can be joined by a grep.
+    """
+    event = CAPACITY_DEGRADATION_EVENT
+    message = f"{event} provider={provider} reason={reason} bucket={bucket}"
+    data = {"provider": provider, "reason": reason, "bucket": bucket}
+    targets = [_module_log()]
+    if sink is not None and sink is not targets[0]:
+        targets.append(sink)
+    for target in targets:
+        _write_capacity_event(target, event, message, data)
+
+
+def _classify_provider_failure(
+    exc: BaseException,
+    provider: str = "",
+    logger: Optional[Any] = None,
+) -> str:
     """Which kind of provider failure ``exc`` is.
 
     Four answers, in the order
@@ -2127,6 +2396,22 @@ def _classify_provider_failure(exc: BaseException, provider: str = "") -> str:
     fetched is not a reading that says "exhausted" — it leaves the prose
     in charge, so an unreachable CC Switch can only ever make the
     classification *less* aggressive, never more.
+
+    A classification made without a live reading is therefore a
+    classification made on the prose alone, and until now it said
+    nothing about that. This function now reports it: the event
+    :data:`CAPACITY_DEGRADATION_EVENT` is written with the provider, the
+    reason the reading was missing and the bucket that was decided.
+    The answer itself does not move — the reading is still folded in
+    first, and the order of the checks is untouched.
+
+    Args:
+        exc: The failure to classify.
+        provider: The provider the failure came from. Empty means the
+            failure cannot be attributed to one, and then nothing is
+            reported: an event about "somebody" names nobody.
+        logger: Where the report goes. ``None`` means the module
+            logger, which is always present.
     """
     from dynamic_provider_concurrency import classify_capacity_failure
 
@@ -2137,11 +2422,16 @@ def _classify_provider_failure(exc: BaseException, provider: str = "") -> str:
         exhausted = bool(getattr(quota, "exhausted", False))
     except Exception:
         exhausted = False
-    return classify_capacity_failure(
+    bucket = classify_capacity_failure(
         str(exc),
         str(getattr(exc, "status", "") or ""),
         live_exhausted=exhausted,
     )
+    if provider:
+        reason = _capacity_read_degradation_reason(provider)
+        if reason:
+            _report_capacity_degradation(provider, reason, bucket, sink=logger)
+    return bucket
 
 
 class ClaudeCodingTool(CodingTool):
@@ -3301,6 +3591,12 @@ class ClaudeCodingTool(CodingTool):
                 _wake_rounds = 0
                 _slot_rounds = 0
                 _slot_waited = 0.0
+                # How long this dispatch has spent inside the closed-window
+                # probe. It is reported on the escalation, so the marker
+                # says how long the run waited before it gave up on the
+                # fleet — and a wait of zero is the honest answer for the
+                # dispatch that recognised the cap on its first look.
+                _quota_waited = 0.0
                 # The wall clock the queue's bound is measured on, and how
                 # much of it the queue has spent inside its own steps.
                 #
@@ -3454,6 +3750,27 @@ class ClaudeCodingTool(CodingTool):
                         # cannot read.
                         _window_blocked = _quota_blocked or list(
                             _capacity.blocked
+                        )
+
+                        # A fleet that is entirely at a hard cap is not
+                        # a window: no probe can open it, and probing it
+                        # for the rest of the dispatch would buy nothing
+                        # at all. So the wait is not entered — the
+                        # escalation is raised instead, and the agent
+                        # turns it into a ``waiting_for_quota`` marker
+                        # rather than a failed task.
+                        #
+                        # The verdict is all-or-nothing, and a single
+                        # provider on a window (or on a reading we
+                        # cannot read) keeps the wait alive: only a
+                        # fleet that is *entirely* at a cap has run out
+                        # of answers. See
+                        # :func:`_raise_if_all_blocked_are_manual_topup`.
+                        _raise_if_all_blocked_are_manual_topup(
+                            _window_blocked,
+                            quota_map,
+                            scene=effective_scene,
+                            waited_sec=_quota_waited,
                         )
 
                         if not _quota_blocked and _capacity.total > 0:
@@ -3710,6 +4027,7 @@ class ClaudeCodingTool(CodingTool):
                                 },
                             )
                         _quota_wake_sleep(delay)
+                        _quota_waited += delay
 
                         # Re-read, then re-decide from scratch — same
                         # candidates, same eligibility rules, same answer
@@ -5292,6 +5610,16 @@ class ClaudeCodingTool(CodingTool):
             # a cancelled dispatch must not be retried: the stop killed
             # the subprocess on purpose, and running the same work again
             # on another provider is exactly what a stop request forbids.
+            raise
+        except QuotaWaitExhausted:
+            # 2026-10-24 — the fleet is at a hard cap and the wait is
+            # over. This is NOT a resume failure: it is the final
+            # answer, and the fallback below would swallow it — it
+            # would read the escalation as "the resume did not work"
+            # and answer with a fresh session and the whole prompt
+            # re-sent, to a provider that has already said it has no
+            # budget. So the signal is passed up untouched, the same
+            # way a hard timeout and a cancellation are.
             raise
         except Exception as exc:
             if is_deterministic_local_error(exc):

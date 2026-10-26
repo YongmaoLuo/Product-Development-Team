@@ -527,6 +527,18 @@ class ExecutionRepository:
         longer exists (schema v6), so there is nothing left for this
         method to stamp.
 
+        2026-10-24: ``waiting_for_quota`` joined the recognised set.
+        The executor can park a run because the provider has no quota
+        left.  That is neither a failure nor a cancellation, but the
+        five-value set had no word for it: a caller persisting the
+        truth had to write ``running`` (so a restart would probe the
+        PID, find it gone, and mark the plan ``failed`` — reporting a
+        quota pause as a crash) or ``stopped`` (which reads as "the
+        operator cancelled this").  ``waiting_for_quota`` says the
+        execution is alive-but-parked, and the startup recovery in
+        ``_recover_execution_states`` restores it verbatim, because
+        that function only probes the PID for ``running`` rows.
+
         Raises
         ------
         PlanNotFoundError
@@ -534,7 +546,14 @@ class ExecutionRepository:
         ValueError
             If ``status`` is not a recognised execution status.
         """
-        recognised = {"not_started", "running", "completed", "failed", "stopped"}
+        recognised = {
+            "not_started",
+            "running",
+            "completed",
+            "failed",
+            "stopped",
+            "waiting_for_quota",
+        }
         if status not in recognised:
             raise ValueError(
                 f"unknown execution status {status!r}; must be one of "

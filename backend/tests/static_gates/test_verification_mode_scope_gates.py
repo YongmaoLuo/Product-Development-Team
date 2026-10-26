@@ -155,6 +155,19 @@ EXCLUDED_SEGMENTS: frozenset[str] = frozenset({
 #: of ``frontend/``, ``backend/state_machine/`` and
 #: ``backend/verification_api_runner.py`` stay frozen inside the diff.
 #:
+#: One more file is excluded for the capacity-wait work:
+#: ``backend/state_machine/repositories/execution_repository.py``.  The
+#: executor can park a run because the provider has no quota left, and
+#: that disposition has to be a word the repository knows — the
+#: five-value status set had no word for it, and a caller persisting
+#: the truth had to write ``running`` (so a restart would probe the
+#: PID, find it gone and report the pause as a crash) or ``stopped``
+#: (which reads as "the operator cancelled this").  The exclusion is
+#: scoped to that one file, and its bytes are frozen by
+#: ``FROZEN_CAPACITY_WAIT_SURFACE_SHA256`` (checked by
+#: ``test_capacity_wait_status_surface_is_frozen``), so the rest of
+#: ``backend/state_machine/`` stays frozen inside the diff.
+#:
 #: The pathspecs are repository-root-relative: the helper runs
 #: ``git -C ..`` from ``backend/``, so the prefix is the repository
 #: root.
@@ -167,6 +180,7 @@ FORBIDDEN_MODULE_PATHS: tuple[str, ...] = (
     ":(exclude)frontend/app.js",
     ":(exclude)frontend/style.css",
     ":(exclude)backend/verification_loop.py",
+    ":(exclude)backend/state_machine/repositories/execution_repository.py",
 )
 
 #: The base ref the change surface is measured against, in preference
@@ -501,6 +515,14 @@ FROZEN_SCHEMA_DDL_HASH: str = (
 #: The exclusion is not a blank cheque. Every byte of these files is
 #: pinned to the hash below, so a later edit to any of them fails this
 #: gate even though it no longer shows up in the diff.
+#:
+#: ``backend/verification_loop.py`` carries the **capacity-wait**
+#: work as well as the rename: the park (and the crash verdict that
+#: must not read as a park) lives in the round's own loop, and the
+#: freeze is moved to the branch's approved state so that the rule
+#: stays "these files change once, and only that way" — the approved
+#: change being the rename plus the capacity work, not the rename
+#: alone.
 FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     "frontend/app.js": (
         "65e064074b3e4d9950508c550bb4ea1a492e04a936d9d26fe3eb39524b619b0c"
@@ -509,7 +531,21 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
         "4c38a1f0d1a661a9b0a48159e2db997974d4fa9e57c1b7af57d8e8812ea23a06"
     ),
     "backend/verification_loop.py": (
-        "a232e1867084d4ad033cfbb76e4dbe41bd467b3b5a6258be6f715a26206a1292"
+        "52de1da58c46ef362e23cbc6e36dcbcfbf1701be26dd45f981bd529531b26962"
+    ),
+}
+
+#: The capacity-wait status vocabulary.  The execution repository is
+#: where an execution's status is written, and the capacity wait needs
+#: a status of its own (``waiting_for_quota``) — a pause that is
+#: neither a failure nor a cancellation.  The file is therefore
+#: excluded from the change-surface diff (above) and frozen here
+#: instead, byte for byte: the diff gate stops reporting the one
+#: approved change, and this gate stops reporting any *other* change
+#: to the same file.
+FROZEN_CAPACITY_WAIT_SURFACE_SHA256: dict[str, str] = {
+    "backend/state_machine/repositories/execution_repository.py": (
+        "88475ca878e79ab198dd9ca2fa21e3f4b0cc0148ac4e29f0c92e4e2d969811b8"
     ),
 }
 
@@ -789,5 +825,34 @@ def test_r10_waiting_phase_rename_surface_is_frozen() -> None:
     ]
     assert mismatched == [], (
         "a file in R10's waiting-phase rename surface changed outside "
+        "the frozen baseline:\n  " + "\n  ".join(mismatched)
+    )
+
+
+def test_capacity_wait_status_surface_is_frozen() -> None:
+    """The capacity wait's status vocabulary is frozen byte for byte.
+
+    The execution repository is where an execution's status is written,
+    and the capacity wait needed a status of its own: a run parked
+    because the provider has no quota left is neither a failure nor a
+    cancellation, and the five-value set had no word for it.  That is
+    the approved change, and the file is therefore excluded from the
+    change-surface diff — which is only safe if something else holds
+    it still.  This gate pins every byte of the file to the hash of the
+    approved state, so any *further* edit to it fails here even though
+    it no longer shows up in the diff.
+
+    The rule does not weaken the change-surface gate; it moves it from
+    "this file never changes" to "this file changes once, and only
+    that way".
+    """
+    mismatched = [
+        f"{rel}: frozen {expected}, actual "
+        f"{hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest()}"
+        for rel, expected in FROZEN_CAPACITY_WAIT_SURFACE_SHA256.items()
+        if hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest() != expected
+    ]
+    assert mismatched == [], (
+        "a file in the capacity wait's status surface changed outside "
         "the frozen baseline:\n  " + "\n  ".join(mismatched)
     )

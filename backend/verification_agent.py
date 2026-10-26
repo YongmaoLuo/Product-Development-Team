@@ -21,10 +21,15 @@ import os
 import re
 import sys
 import tempfile
+import uuid
+from dataclasses import dataclass
+# 2026-10-26 (merge): main 的 ``_service_recovery_locks`` / ``_recover_service_port``
+# 用到 ``threading.Lock``，本分支用到 ``uuid`` / ``dataclass`` —— 两边都要。
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional, List, Dict, Any, Tuple
+from typing import Callable, Optional, List, Dict, Any, Set, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from coding_tool import (
     ClaudeCodingTool,
@@ -767,6 +772,1415 @@ def _load_service_manager(project_dir: Any = None) -> Any:
         return service_manager
 
 
+# ---------------------------------------------------------------------------
+# The round's service binding (2026-10-25, repair-r1-22)
+# ---------------------------------------------------------------------------
+#
+# "Where does a request go" is decided **once**, by the ``ensure`` that
+# produced the instance, and it is decided by an **object** — not by
+# re-reading a map every time a plan is resolved.
+#
+# The distinction matters because the map is a *record*: anything that
+# merges into it may rewrite it, and a rewritten map moves the address
+# under a VP that is talking to a perfectly healthy instance.  The
+# 2026-10-24 production round is what that looks like: the ensure
+# produced port 58396, and the address a VP was later dispatched to
+# was one the round had never verified.  Nothing in the log said how
+# the address got there.
+#
+# So the round keeps a binding per service — the runtime object the
+# ensure returned — and every VP's request is built from it.  The map
+# is still written (it is the record of what happened); it just no
+# longer decides where a request goes.
+
+
+@dataclass
+class _BoundService:
+    """The service instance a declared service is bound to this round.
+
+    ``runtime`` is the object the ``ensure`` returned — the binding is
+    to *that instance*, not to a port number that some later step may
+    re-derive.
+    """
+
+    name: str
+    #: The port the bound instance listens on.
+    port: int
+    #: The pid behind it — the same port can be a different process
+    #: after a restart, and "which process" is half of the identity.
+    pid: Optional[int] = None
+    #: The health URL of the bound instance.
+    health_url: str = ""
+    #: The **boot identity** of the instance: pid + process start
+    #: epoch.  A pid alone cannot tell two runs of the same pid apart,
+    #: and "the service was restarted" is exactly the question a log
+    #: reader has to be able to answer.
+    boot_id: str = ""
+    #: The identity of the binding record itself.
+    runtime_id: str = ""
+    #: The runtime object the ensure returned.
+    runtime: Any = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "service": self.name,
+            "port": self.port,
+            "pid": self.pid,
+            "health_url": self.health_url,
+            "boot_id": self.boot_id,
+            "runtime_id": self.runtime_id,
+        }
+
+
+#: The hosts a locally started service listens on.  Only these are
+#: retargeted: a URL that names another host is not this service's
+#: address to rewrite.
+_LOCAL_SERVICE_HOSTS = frozenset({"127.0.0.1", "localhost", "0.0.0.0", "::1"})
+
+
+def _url_port(url: str) -> Optional[int]:
+    """The port a URL names, or ``None`` when it names none."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    try:
+        return parts.port
+    except ValueError:
+        return None
+
+
+def _retarget_url_port(url: str, port: int) -> Optional[str]:
+    """The same URL, pointed at *port*.
+
+    ``None`` when the URL is not a local address — retargeting a
+    remote URL would send the request to a host the round never
+    started.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    if host not in _LOCAL_SERVICE_HOSTS:
+        return None
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    userinfo = ""
+    if "@" in parts.netloc:
+        userinfo = parts.netloc.rsplit("@", 1)[0] + "@"
+    netloc = f"{userinfo}{host}:{int(port)}"
+    return urlunsplit(
+        (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+    )
+
+
+# ---------------------------------------------------------------------------
+# The address every VP's evidence records (2026-10-25, repair-r1-31)
+# ---------------------------------------------------------------------------
+#
+# The production round pointed its ``api_test`` VPs at an address, and
+# the evidence said exactly one thing about it: ``Errno 61``.  That is
+# a transport's complaint — it is not an address, and it cannot answer
+# the two questions a reader has:
+#
+#   * **which port** did the request go to?
+#   * **which instance** was listening on that port — the one this
+#     round's ``ensure`` started, or a stranger that took the port
+#     behind the round's back?
+#
+# Without those two answers the round cannot tell a **product** defect
+# from an **environment** defect.  The same ``Errno 61`` means "the
+# service is down" when the port was the round's own instance, and
+# "the request never reached the code under test" when it was not —
+# and the report cannot tell those apart, so the repair loop repairs
+# the wrong thing.
+#
+# So every VP's recorded evidence carries the address it was sent to.
+# Two identities are recorded, and they are **not** the same question:
+#
+#   * ``boot_id`` — the boot identity of the instance the round's
+#     ``ensure`` bound.  It is the expectation.
+#   * ``answering_boot_id`` — the boot identity the *responder* says
+#     it has (``/health/data``).  It is the observation.  When the
+#     two differ, somebody else's instance answered.
+#
+# ``request_id`` is the round's own id: every VP of one round carries
+# the same one, so "were these twelve failures the same address?" is
+# a question the evidence can answer on its own.
+
+# ---------------------------------------------------------------------------
+# The instance behind the address (2026-10-26)
+# ---------------------------------------------------------------------------
+#
+# The 02:25 round asked a port for a service and was refused; the port
+# had been handed over to another instance while the round was running,
+# and the round had no way to say so — it knew the address it aimed at
+# and nothing about **who** was answering there.  The same round's
+# ``ui_validation`` point was served on that very address minutes
+# later, so the address was alive and the round's own reading of it
+# was stale.
+#
+# The fix is a snapshot on **both** sides of every dispatch: the
+# instance that was serving the address before the request, and the
+# one serving it after.  A snapshot is four facts the service publishes
+# about itself, so two snapshots can be compared field by field.
+
+#: The four facts that identify the instance serving an address.  They
+#: come from the ``instance`` block the service publishes about
+#: itself, so they are that process's own statements, not the round's
+#: guesses.
+SERVING_SNAPSHOT_FIELDS = ("pid", "boot_id", "plans_dir", "state_db_inode")
+
+#: The evidence names for the two sides of one dispatch.  They are part
+#: of the address contract, so every VP's evidence carries them — a
+#: field that is absent reads as "nobody looked".
+SERVING_BEFORE_FIELD = "serving_before"
+SERVING_AFTER_FIELD = "serving_after"
+
+#: The round-level event: which instance served the round, and which
+#: one is serving it now.  It is written to the plan's own log, so a
+#: reader can tell that the round's address belonged to somebody else
+#: by the end without reading the round's internals.
+ROUND_INSTANCE_HANDOVER_EVENT = "round_instance_handover"
+
+#: The address fields every VP's evidence carries.  Written in this
+#: order, and always written — a field that is absent reads as "nobody
+#: looked", which is not the same as "there was nothing there".
+ADDRESS_EVIDENCE_FIELDS = (
+    "requested_url",
+    "resolved_port",
+    "ensure_port",
+    "pid",
+    "boot_id",
+    "attempt_no",
+    "error_kind",
+    "errno",
+    "request_id",
+    "answering_boot_id",
+    SERVING_BEFORE_FIELD,
+    SERVING_AFTER_FIELD,
+)
+
+
+def _instance_state_db_inode(instance: Any) -> Optional[int]:
+    """The inode of the database the answering instance reads.
+
+    The instance publishes the inode of **its own** database, and that
+    is the authoritative number: the path it names may live somewhere
+    this process cannot stat (another container, another mount).  The
+    published inode is preferred; the path is only stat'ed when the
+    instance did not publish one.
+    """
+    if not isinstance(instance, dict):
+        return None
+    published = instance.get("state_db_inode")
+    if isinstance(published, int) and not isinstance(published, bool):
+        return int(published)
+    reported = str(instance.get("state_db_path") or "")
+    if not reported:
+        return None
+    try:
+        return int(Path(reported).stat().st_ino)
+    except OSError:
+        return None
+
+
+def _serving_snapshot(instance: Any) -> Optional[Dict[str, Any]]:
+    """The snapshot of the instance serving an address.
+
+    ``None`` when the service does not identify itself: there is no
+    instance to snapshot, and "nobody said" is not the same as
+    "somebody else said".
+    """
+    if not isinstance(instance, dict):
+        return None
+    values = {
+        "pid": instance.get("pid"),
+        "boot_id": str(instance.get("boot_id") or ""),
+        "plans_dir": str(instance.get("plans_dir") or ""),
+        "state_db_inode": _instance_state_db_inode(instance),
+    }
+    # The contract's field list, in the contract's order — so two
+    # snapshots can be compared field by field, and a reader that knows
+    # the list finds every field where it expects it.
+    return {field: values.get(field) for field in SERVING_SNAPSHOT_FIELDS}
+
+
+def _serving_handover(
+    before: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]],
+) -> bool:
+    """Did the instance serving this address change hands?
+
+    Three answers, and the third one is the careful one:
+
+      * **both sides identify an instance** — the handover happened
+        when the two snapshots differ;
+      * **exactly one side identifies an instance** — the handover
+        happened too: the instance either appeared or disappeared, and
+        a request that crossed that boundary cannot be attributed to
+        the instance the round started;
+      * **neither side identifies an instance** — there was no instance
+        to have changed hands.  "Not comparable" is not "wrong", and a
+        service that publishes no ``instance`` block is never gated.
+    """
+    if before is None and after is None:
+        return False
+    if before is None or after is None:
+        return True
+    return before != after
+
+
+#: The round's **instance epoch** — the identity of the instance whose
+#: answers this round accepts.
+#:
+#: A round asks **one** instance a question.  When the process behind
+#: the round's address dies and somebody else takes the port, the round
+#: is no longer asking the instance it started: it is asking a
+#: stranger, and the answer it gets is a statement about the stranger's
+#: data.  The 2026-10-26 round was graded on exactly that: it never got
+#: an HTTP answer at all, so it could not tell whether the criterion it
+#: was verifying had been looked at.
+#:
+#: The epoch is the round's answer to "which instance is that?".  It is
+#: established from the first successful read of ``/health/data`` — the
+#: same road a verification point's request travels — and it is
+#: compared before every dispatch after that.
+INSTANCE_EPOCH_EVENT = "instance_epoch"
+
+#: The conflict kind of an epoch change: the round asking a stranger.
+#:
+#: It is a contradiction of the same kind as a handover, so it is
+#: handled by the same rule — the point is not a verdict about the
+#: product, and it gets the round's one second look.
+EPOCH_CHANGED_CONFLICT_KIND = "instance_epoch_changed"
+
+#: Why a round was blocked: it could not say which instance it was
+#: asking.
+EPOCH_UNRESOLVED_ERROR_KIND = "instance_epoch_unresolved"
+
+
+def _instance_epoch_token(instance: Any) -> str:
+    """The comparable identity of an instance: its pid and its boot id.
+
+    Two instances are the same instance when this token is the same.  An
+    instance that publishes neither has **no** token: "nobody said" is
+    not the same as "somebody else said", so such an instance is never
+    treated as a different one.
+    """
+    if not isinstance(instance, dict):
+        return ""
+    pid = str(instance.get("pid") or "")
+    boot_id = str(instance.get("boot_id") or "")
+    if not pid and not boot_id:
+        return ""
+    return f"{pid}@{boot_id}"
+
+
+def _mint_request_id(plan_id: str, round_number: int) -> str:
+    """One id for a whole round — the thread every VP's evidence hangs on.
+
+    The round's number is in it, so a reader can tell the rounds
+    apart without the log; the random part is what makes two rounds of
+    the same plan distinguishable even when they ran within the same
+    second.
+    """
+    return f"{plan_id}-r{int(round_number)}-{uuid.uuid4().hex[:12]}"
+
+
+# ---------------------------------------------------------------------------
+# A runtime that names no address (2026-10-25, repair-r1-29)
+# ---------------------------------------------------------------------------
+#
+# ``service_manager._relocate_service`` gives up when it cannot place a
+# service anywhere: the declared port is held by a process that is not
+# the service, and the ports it tried are gone too.  The runtime it
+# hands back still carries the **declared** port — the stranger's — and
+# used to say so only in prose (``origin="failed"``).
+#
+# A reader that asks "is it ready?" and does not read the prose has an
+# address in its hand.  So the failure is explicit: the runtime says
+# ``unusable``, and every reader here refuses it.  The declared port is
+# **not** a fallback for it — falling back to it would aim the round's
+# VPs at the process squatting the port, which is how a round ends up
+# graded on somebody else's server.
+
+
+def _runtime_is_unusable(runtime: Any) -> bool:
+    """Does the runtime say it names **no** address at all?
+
+    Duck-typed on purpose: the runtime may come from the project's own
+    copy of ``service_manager`` (see :func:`_load_service_manager`),
+    which may predate the field — and then the runtime simply is not
+    marked unusable, which is the behaviour of every earlier round.
+    """
+    return bool(getattr(runtime, "unusable", False))
+
+
+def _runtime_is_usable(runtime: Any) -> bool:
+    """May the runtime's port be used as an address?
+
+    Only a runtime that is ready, is not a failure, is not marked
+    unusable, and carries a port qualifies.  "Not ready yet" does not
+    qualify either — but it is a different case, and the two are never
+    conflated.
+    """
+    if runtime is None:
+        return False
+    if _runtime_is_unusable(runtime):
+        return False
+    if not getattr(runtime, "ready", False):
+        return False
+    if str(getattr(runtime, "origin", "") or "") == "failed":
+        return False
+    return bool(getattr(runtime, "port", None))
+
+
+def _vp_service_names(vp: Dict[str, Any]) -> Set[str]:
+    """The service names a VP names.
+
+    Two ways, and both are honoured: ``uses_services`` (the plan's own
+    list) and a ``{{svc.<name>.<field>}}`` placeholder in the VP's text.
+    The placeholder is the one that matters for a service that could not
+    be placed: the placeholder never resolved, and the unresolved text is
+    itself the evidence that the VP needs that service.
+    """
+    names: Set[str] = set()
+    uses = vp.get("uses_services")
+    if isinstance(uses, list):
+        for name in uses:
+            names.add(str(name).lower())
+    try:
+        from service_declaration import iter_placeholders
+    except Exception:  # pragma: no cover - defensive
+        return names
+    try:
+        body = json.dumps(vp, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        body = str(vp)
+    for _raw, name, _field in iter_placeholders(body):
+        names.add(str(name).lower())
+    return names
+
+
+# ---------------------------------------------------------------------------
+# The adoption gates of a re-ensure's result (2026-10-25, repair-r1-24)
+# ---------------------------------------------------------------------------
+#
+# The production round ended with its api_test pointing at
+# 127.0.0.1:51725 — a port nothing had ever listened on, and one no log
+# had ever recorded as a service's address.  There is only one way that
+# address becomes a VP's request address: a re-ensure allocated it, wrote
+# it into the runtime map **without a liveness probe**, and the plan's
+# placeholders followed it there.
+#
+# So a re-ensure's result is adopted only after it has been *verified*:
+# the runtime has to say the service is ready and carry a port, that port
+# has to accept a TCP connection, and the service's health URL has to
+# answer 200.  A result that fails any of the three is not adopted — the
+# old map stands, the address does not move, and the VPs that need the
+# service are BLOCKED (``service_unreachable``) instead of being sent to
+# a port nobody serves.
+
+#: How long the gate waits for the TCP connect it makes to the port a
+#: re-ensure reported.
+_REENSURE_CONNECT_TIMEOUT_SECONDS = 1.0
+
+#: How long the gate waits for the health URL to answer.
+_REENSURE_HEALTH_TIMEOUT_SECONDS = 3.0
+
+#: The reason code a VP carries when the round could not reach the
+#: service a re-ensure produced.  It is a **code**, not prose: a report
+#: reader has to be able to match on it.
+SERVICE_UNREACHABLE = "service_unreachable"
+
+#: The reason code a VP carries when the round could not **place** the
+#: service the VP needs: the declared port is held by a process that is
+#: not the service, and no other port would do.  A **code**, not prose.
+SERVICE_UNUSABLE = "service_unusable"
+
+
+# ---------------------------------------------------------------------------
+# The identity of the instance a request is about to reach (2026-10-25)
+# ---------------------------------------------------------------------------
+#
+# "Something is listening on the port" and "the thing listening is the
+# instance this round started" are two different questions, and the
+# production round could not tell them apart: the address on the wire
+# (51725) belonged to an instance the round had never started, and the
+# verdict it produced said nothing about the plan it was supposed to
+# be about.
+#
+# A liveness probe cannot answer that — a stranger answers a health URL
+# just as well as the right instance does.  So the service is asked
+# **who it is**: ``/health/data`` publishes an ``instance`` block about
+# the answering process (the boot id minted when it started, the plans
+# tree it serves, the state database it reads).  Three facts are
+# compared before a request goes out:
+#
+#   * the **boot id** — the one this round's ``ensure`` recorded.  A
+#     different boot id is a different process: something restarted the
+#     service behind the round's back, or a stranger took the port;
+#   * the **plans tree** — the instance must serve the tree this
+#     round's plan lives in.  Another tree is another set of plans;
+#   * the **state database's inode** — the same path with another
+#     inode is another file, i.e. another data plane.  This is the
+#     comparison the production round needed and could not make.
+#
+# Any of them failing means the request is **not** sent: a verdict
+# about somebody else's instance is worse than no verdict at all.  The
+# VP is BLOCKED with ``error_kind = service_instance_mismatch`` — never
+# FAILED, which would say "the project answered wrong" about a project
+# that was never asked — and the round log carries an event of the same
+# name, with both sides of every comparison.
+
+#: The ``error_kind`` a VP carries when the instance that answered is
+#: **not** the instance this round started.  A **code**, not prose: a
+#: report reader has to be able to match on it.
+SERVICE_INSTANCE_MISMATCH = "service_instance_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# The classification of a failed request (2026-10-25, repair-r1-26)
+# ---------------------------------------------------------------------------
+#
+# The production round pointed twelve ``api_test`` VPs at an address
+# nothing was serving.  All twelve died inside twenty-two seconds with
+# the same ``URLError [Errno 61]`` and every one of them was written
+# down as **FAILED** — twelve independent contract violations,
+# according to the report.  There was exactly one event there: the
+# environment was not serving.
+#
+# So a request that never got an answer is not a verdict about the
+# product.  It is a verdict about the plumbing, and it says so:
+# ``BLOCKED`` with ``error_kind = service_unreachable``, and the
+# evidence keeps the two facts that make the claim checkable — the URL
+# that was actually called and the errno the transport reported.
+#
+# A request that **did** get an answer (2xx or 4xx) keeps the old
+# semantics: the assertions decide, and a violated assertion is
+# FAILED.  The classification layer never re-judges a contract — it
+# only separates "the service was not there" from "the service said
+# no".
+
+#: The ``error_kind`` a VP carries when its request never reached the
+#: service.  A **code**, not prose: a report reader has to be able to
+#: match on it.
+ENVIRONMENT_ERROR_KIND = SERVICE_UNREACHABLE
+
+#: The round-level marker for "the environment took this round out".
+#: The round is re-run by the upper layer; it is not repaired.
+ENVIRONMENT_BLOCKED = "environment_blocked"
+
+#: The event a round writes when the environment blocked it.
+ROUND_BLOCKED_EVENT = "verification_round_blocked"
+
+#: The transport failures that mean "the service was never reached".
+#: A refused connection, a name that does not resolve, a socket that
+#: died before a response — these are statements about the
+#: **environment**.  The evidence for each of them is the transport's
+#: own words, which is what the api runner leaves in
+#: ``evidence["error"]``.
+_TRANSPORT_FAILURE_MARKERS = (
+    "urlerror",
+    "connectionrefused",
+    "connection refused",
+    "gaierror",
+    "name or service not known",
+    "nodename nor servname",
+    "temporary failure in name resolution",
+    "connectionreseterror",
+    "connection reset by peer",
+    "remote end closed connection",
+    "brokenpipeerror",
+)
+
+#: A timeout is **not** one of them, on purpose.  A timeout means the
+#: request was sent and no answer came back in time: the service may
+#: be up and simply too slow, which can be a real product defect (a
+#: slow endpoint).  Hiding it behind "the environment" would silently
+#: stop the repair path from ever seeing it.  A timeout therefore keeps
+#: the verdict it has always had.
+_TIMEOUT_MARKERS = ("timed out", "timeout")
+
+
+def _errno_from_error(text: str) -> Optional[int]:
+    """The errno the transport reported, if it reported one.
+
+    ``[Errno 61]`` → ``61``; ``[Errno -2]`` → ``-2``.  ``None`` when
+    the transport named no errno — the evidence then carries the
+    message alone, which is still enough to say *what* happened.
+    """
+    match = re.search(r"Errno\s+(-?\d+)", text or "")
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:  # pragma: no cover - the regex only matches digits
+        return None
+
+
+def _is_transport_failure(error_text: str) -> bool:
+    """Is *error_text* the transport saying "the service was not there"?"""
+    if not error_text:
+        return False
+    lowered = error_text.lower()
+    if any(marker in lowered for marker in _TIMEOUT_MARKERS):
+        return False
+    return any(marker in lowered for marker in _TRANSPORT_FAILURE_MARKERS)
+
+
+#: The reason codes that mean "the environment stopped this, not the
+#: product".  ``service_unreachable`` is the per-point code the
+#: classification layer writes; ``environment_blocked`` is the round's
+#: own code, written when one refused connection takes the whole round
+#: out.
+ENVIRONMENT_REASON_CODES = frozenset({
+    SERVICE_UNREACHABLE, ENVIRONMENT_BLOCKED,
+})
+
+
+def _result_evidence(result: Any) -> Dict[str, Any]:
+    """One result's evidence as a dict.
+
+    The evidence travels as a **string** on the legacy
+    ``execution_results`` envelope (the Phase 3 judgment prompt slices
+    it), so every reader has to parse it before it can ask a question
+    of it.  Evidence that is not JSON is not evidence this module can
+    read — it comes back as an empty dict rather than raising.
+    """
+    if not isinstance(result, dict):
+        return {}
+    evidence = result.get("evidence")
+    if isinstance(evidence, dict):
+        return evidence
+    if isinstance(evidence, str):
+        text = evidence.strip()
+        if not text:
+            return {}
+        try:
+            loaded = json.loads(text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+    return {}
+
+
+def _result_serving_handover(result: Any) -> bool:
+    """Did the address change hands during the look that produced *result*?
+
+    The answer is in the result's own evidence — the two snapshots the
+    dispatch took around the request.  A result that carries no
+    snapshot at all (an older entry, a point that never reached a
+    service) has no handover to report.
+    """
+    evidence = _result_evidence(result)
+    before = evidence.get(SERVING_BEFORE_FIELD)
+    after = evidence.get(SERVING_AFTER_FIELD)
+    if not isinstance(before, dict) and not isinstance(after, dict):
+        return False
+    return _serving_handover(before, after)
+
+
+def _environment_block_reason_code(result: Any) -> str:
+    """The reason code that says the environment stopped this result.
+
+    The **per-point** code wins over the round's own.  A round that was
+    blocked as a whole rewrites every result's ``reason_code`` to
+    ``environment_blocked`` — and a point that genuinely failed (the
+    product answered and broke the contract) must not be re-read as
+    "the environment stopped it" just because it sat in that round.
+    ``original_reason_code`` is where the per-point code is kept.
+    """
+    evidence = _result_evidence(result)
+    if "original_reason_code" in evidence:
+        code = evidence.get("original_reason_code")
+    else:
+        code = evidence.get("reason_code") or evidence.get("error_kind")
+    return str(code or "")
+
+
+def _is_environment_blocked_result(result: Any) -> bool:
+    """Is this result a BLOCKED entry whose cause is the environment?
+
+    The two halves have to agree: the status says the verdict was not
+    a verdict about the product, and the reason code says **why**.
+    A BLOCKED entry with no reason code (a stale binary, a retired
+    method) is blocked for a different reason and is left alone.
+    """
+    if not isinstance(result, dict):
+        return False
+    if str(result.get("status") or "") != "BLOCKED":
+        return False
+    return _environment_block_reason_code(result) in ENVIRONMENT_REASON_CODES
+
+
+# ---------------------------------------------------------------------------
+# The round's own evidence, checked against itself (2026-10-26)
+# ---------------------------------------------------------------------------
+#
+# The 02:25 round held two facts that cannot both be true.  Twelve
+# ``api_test`` points were refused the connection on port 64469 at
+# 02:25:01 — every one of them with the transport's own ``URLError
+# [Errno 61]``.  The ``ui_validation`` point verified **the same
+# address** from 02:25:01 onwards for twelve minutes without a hitch,
+# and the round's own probe answered 200 at 02:37:49.
+#
+# A refused connection and a served one cannot both be true of one
+# address at one moment.  The framework took both at face value, so the
+# twelve refusals were written down as twelve product defects.
+#
+# So the round now checks its own evidence before the report is built.  A
+# connection-class failure whose address was **served** somewhere in the
+# same round is not a verdict about the product: it is marked
+# ``invalid_env`` and gets one more look — the service is re-ensured and
+# the point is run again by the round's own dispatcher, under the same
+# criteria.  What the second look says is what lands.
+#
+# The contradiction is written down as it is found
+# (``round_evidence_conflict``), because a contradiction nobody can find
+# afterwards is a contradiction that will be found again.
+
+#: The status a verification point carries when the round's own evidence
+#: contradicts its failure.  A **code**, not prose: a report reader has
+#: to be able to match on it.
+INVALID_ENV = "invalid_env"
+
+#: The event a round writes when it finds its own evidence contradicting
+#: itself.
+ROUND_EVIDENCE_CONFLICT_EVENT = "round_evidence_conflict"
+
+
+def _invalid_env_message(conflict: Dict[str, Any]) -> str:
+    """The sentence that says "this is not a verdict about the product".
+
+    Two kinds of contradiction say it, and they say it differently:
+
+      * the address was **refused and served** in the same round — the
+        round's own evidence disagrees with itself; and
+      * the instance serving the address **changed hands** while the
+        point was being verified — the answer cannot be attributed to
+        the instance the round started.
+
+    A third says it from the round's side: the round's **instance
+    epoch** moved, so the answer was obtained under an epoch the round
+    no longer holds.
+
+    All end the same way: the point is given one more look before
+    anything is written down about it.
+    """
+    if str(conflict.get("kind") or "") == "instance_handover":
+        before = conflict.get(SERVING_BEFORE_FIELD) or {}
+        after = conflict.get(SERVING_AFTER_FIELD) or {}
+        return (
+            f"{INVALID_ENV}: the instance serving "
+            f"{conflict.get('url') or 'the address'} changed hands while "
+            f"this point was being verified — boot "
+            f"{before.get('boot_id') or '?'} before, boot "
+            f"{after.get('boot_id') or '?'} after. The answer this point "
+            f"got cannot be attributed to the instance the round started, "
+            f"so it is not a verdict about the product; the point is "
+            f"given one more look before anything is written down about it."
+        )
+    if str(conflict.get("kind") or "") == EPOCH_CHANGED_CONFLICT_KIND:
+        before = conflict.get("epoch_before") or {}
+        after = conflict.get("epoch_after") or {}
+        return (
+            f"{INVALID_ENV}: the round's instance epoch moved while this "
+            f"point was being verified — boot "
+            f"{before.get('boot_id') or '?'} before, boot "
+            f"{after.get('boot_id') or '?'} after. The answer this point "
+            f"got was obtained under an epoch the round no longer holds, "
+            f"so it is not a verdict about the product; the point is "
+            f"given one more look before anything is written down about it."
+        )
+    return (
+        f"{INVALID_ENV}: the round's own evidence contradicts this "
+        f"failure — {conflict.get('url') or 'the address'} was refused "
+        f"here but was served for {conflict.get('succeeded_vp')} in the "
+        f"same round. This is not a verdict about the product; the "
+        f"point is given one more look before anything is written "
+        f"down about it."
+    )
+
+
+def _url_origin(url: str) -> str:
+    """The address a URL names, reduced to ``scheme://host:port``.
+
+    Two URLs that name the same address are the same address, whatever
+    path they carry: a refusal to ``/api/plans`` and a 200 from
+    ``/health`` are two facts about one place, and one place cannot
+    refuse one request and serve another at the same moment.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = f"http://{text}"
+    try:
+        parts = urlsplit(text)
+        host = parts.hostname or ""
+        port = parts.port
+    except ValueError:
+        # A URL with a port that is not a number names no address.
+        return ""
+    if not host:
+        return ""
+    scheme = (parts.scheme or "http").lower()
+    # The default port names the same address as no port at all.
+    default_port = {"http": 80, "https": 443, "ws": 80, "wss": 443}.get(scheme)
+    if port and port != default_port:
+        return f"{scheme}://{host}:{port}"
+    return f"{scheme}://{host}"
+
+
+def _evidence_url(evidence: Dict[str, Any]) -> str:
+    """The URL a piece of evidence says was called."""
+    if not isinstance(evidence, dict):
+        return ""
+    request = evidence.get("request")
+    if isinstance(request, dict):
+        url = str(request.get("url") or "")
+        if url:
+            return url
+    return str(evidence.get("url") or "")
+
+
+def _vp_url(vp: Any) -> str:
+    """The address a verification point declares it will talk to.
+
+    The ``ui_validation`` point names its address in ``target_url``;
+    the ``api_test`` point names it inside its ``request``.  Both are
+    declarations the plan made, and both are what a reader checks the
+    round's evidence against.
+    """
+    if not isinstance(vp, dict):
+        return ""
+    for key in ("target_url", "url"):
+        url = str(vp.get(key) or "")
+        if url:
+            return url
+    request = vp.get("request")
+    if isinstance(request, dict):
+        return str(request.get("url") or "")
+    return ""
+
+
+def _is_invalid_env_result(result: Any) -> bool:
+    """Is this result one the round's own evidence contradicted?
+
+    The status is the whole of the claim: ``invalid_env`` says the
+    round could not judge this point, and says nothing about the
+    product.
+    """
+    if not isinstance(result, dict):
+        return False
+    return str(result.get("status") or "") == INVALID_ENV
+
+
+def _is_passed_result(result: Any) -> bool:
+    """Did this point really pass?
+
+    A round that was blocked as a whole rewrites every one of its
+    results to BLOCKED and keeps the verdict each one really got in
+    the evidence (``original_status``).  The witness is the **verdict**,
+    not the rewrite: a point that really passed is still a point that
+    passed, and it can still say that the address was served.
+
+    This is the production shape: the round was blocked as a whole
+    because twelve points were refused, and the one point that was
+    served on the same address was rewritten to BLOCKED with it.  The
+    two facts cannot both be true, and the point that was served is
+    the one that says which of them is wrong.
+    """
+    if not isinstance(result, dict):
+        return False
+    if str(result.get("status") or "") == "PASSED":
+        return True
+    return str(_result_evidence(result).get("original_status") or "") == "PASSED"
+
+
+def _result_is_connection_failure(result: Any) -> bool:
+    """Did this result's request never reach the service?
+
+    The rule the classification layer uses: the evidence must carry the
+    transport's error and **no** ``status_code`` — a response came back
+    iff the runner recorded one, and a response that came back means
+    the transport reached the service and the assertions decided.
+    """
+    if not isinstance(result, dict):
+        return False
+    evidence = _result_evidence(result)
+    if evidence.get("status_code") is not None:
+        return False
+    error_text = str(evidence.get("error") or "")
+    if not error_text:
+        error_text = str(result.get("actual_result") or "")
+    return _is_transport_failure(error_text)
+
+
+def _tcp_reachable(
+    port: int,
+    timeout: float = _REENSURE_CONNECT_TIMEOUT_SECONDS,
+) -> bool:
+    """Can a TCP connection be opened to *port* on the loopback?
+
+    The fast answer to "is anything serving there".  It says nothing
+    about *who* is serving — that is the health URL's job.
+    """
+    import socket
+
+    try:
+        with socket.create_connection(
+            ("127.0.0.1", int(port)), timeout=timeout,
+        ):
+            return True
+    except Exception:  # noqa: BLE001 - a refused connect is the answer
+        return False
+
+
+def _health_url_answers(
+    url: str,
+    timeout: float = _REENSURE_HEALTH_TIMEOUT_SECONDS,
+) -> bool:
+    """Does *url* answer **200** when asked with the request guard's header?
+
+    The header is the one a VP's own request carries (:mod:`request_guard`),
+    so the probe travels the same road the request will travel.
+    """
+    import urllib.error
+    import urllib.request
+
+    try:
+        from request_guard import REQUEST_HEADER, REQUEST_HEADER_VALUE
+    except Exception:  # pragma: no cover - defensive
+        REQUEST_HEADER, REQUEST_HEADER_VALUE = "X-PDT-Request", "1"
+    request = urllib.request.Request(url, method="GET")
+    request.add_header(REQUEST_HEADER, REQUEST_HEADER_VALUE)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(response.status) == 200
+    except urllib.error.HTTPError as exc:
+        # A non-200 is an answer too — it just is not the answer the
+        # health URL was supposed to give.
+        return int(exc.code) == 200
+    except Exception:  # noqa: BLE001 - a probe never raises
+        return False
+
+
+def _health_data_instance(
+    port: int,
+    timeout: float = _REENSURE_HEALTH_TIMEOUT_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    """The ``instance`` block the service on *port* publishes about itself.
+
+    ``None`` when the service does not answer, does not answer with
+    JSON, or answers without an ``instance`` block — a service that
+    does not identify itself cannot be compared with anything, so it is
+    left alone rather than blocked.
+
+    The block is the answering process's own fact sheet: the boot id
+    minted when it started, the plans tree it serves, the state
+    database it reads.  Every field is a fact about **that** process,
+    so two answers can be compared field by field.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{int(port)}/health/data"
+    request = urllib.request.Request(url, method="GET")
+    try:
+        from request_guard import REQUEST_HEADER, REQUEST_HEADER_VALUE
+    except Exception:  # pragma: no cover - defensive
+        REQUEST_HEADER, REQUEST_HEADER_VALUE = "X-PDT-Request", "1"
+    request.add_header(REQUEST_HEADER, REQUEST_HEADER_VALUE)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if int(response.status) != 200:
+                return None
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError:
+        return None
+    except Exception:  # noqa: BLE001 - a probe never raises
+        return None
+    try:
+        body = json.loads(raw)
+    except Exception:  # noqa: BLE001 - a probe never raises
+        return None
+    if not isinstance(body, dict):
+        return None
+    instance = body.get("instance")
+    if not isinstance(instance, dict):
+        return None
+    return instance
+
+
+# ---------------------------------------------------------------------------
+# The ONE service precondition (2026-10-26)
+# ---------------------------------------------------------------------------
+#
+# A verification round has exactly one question before it may dispatch a
+# verification point: **is the service this point is about to talk to
+# actually serving?**  On 2026-10-26 the round answered that question
+# three different ways, and the disagreement is what cost it:
+#
+#   * the round-start ensure wrote ``services_ensured`` and said the
+#     ``api`` service was ready on port 64469;
+#   * every verification point was preceded by ``binary_freshness_pass``
+#     — a statement about the binary **on disk**, not about the port;
+#   * the twelve ``api_test`` points that followed were all refused the
+#     connection.
+#
+# The same URL was verified for twelve minutes by the ``ui_validation``
+# path and passed, so the service *was* there — and the ``api_test``
+# path's own precondition did not know it.
+#
+# So there is now **one** precondition, and every path uses it:
+#
+#   1. probe the port — is anybody serving there?;
+#   2. if nobody is, bring the service up through the round's own start
+#      path, stamped with **this round's** token, so the ledger says who
+#      owns the instance and a later reap sweep leaves it alone;
+#   3. send **the request a verification point would send** — the same
+#      client, the same headers — and require a 200.
+#
+# A round that cannot get that 200 dispatches nothing: a refused
+# connection is a statement about the plumbing, not about the product.
+
+#: How long the self-check waits for the health URL.  A local service
+#: answers in milliseconds; a slow answer is a broken service.
+SERVICE_SELF_CHECK_TIMEOUT_SECONDS = 10.0
+
+
+def _service_health_url(decl: Any, port: int) -> str:
+    """Where to ask the service whether it is alive.
+
+    The declaration's own health URL, moved to the port the service
+    really listens on — a service that was relocated answers on its
+    new address.
+
+    **Empty** when the declaration names no health URL.  That is the
+    plan's own convention, spelled out in the plan prompt: ``health_url``
+    is optional, and a service that declares none is judged by TCP
+    reachability alone.  Guessing ``/health`` for such a service would
+    ask a question the plan never asked, and a service that serves no
+    ``/health`` would be blocked for not answering one.
+    """
+    url = str(getattr(decl, "health_url", "") or "")
+    if not url:
+        return ""
+    try:
+        declared = int(getattr(decl, "port", 0) or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    if declared and int(port) != declared:
+        try:
+            from service_manager import rewrite_port
+
+            url = rewrite_port(url, declared, int(port))
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return url
+
+
+def _service_port_is_live(port: int) -> bool:
+    """Is anything serving on *port*?
+
+    Two oracles, and either one saying "yes" is enough: the direct
+    TCP connect (the fast answer) and the round's own liveness probe,
+    which names the process behind the port.  The probe is the one the
+    round already trusts everywhere else, so the shared precondition
+    asks the same question the rest of the round asks — and a project
+    that stubs the probe in a test gets the same answer here.
+    """
+    if _tcp_reachable(int(port)):
+        return True
+    try:
+        from service_freshness import probe_port
+
+        return bool(getattr(probe_port(int(port)), "listening", False))
+    except Exception as exc:  # noqa: BLE001 - a probe never raises
+        logger.warning(
+            "[service_precondition] could not probe port %s: %s", port, exc,
+        )
+        return False
+
+
+def _service_self_check(
+    url: str, timeout: float = SERVICE_SELF_CHECK_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Send **the request a verification point would send** and read it.
+
+    Same client (:mod:`urllib.request` — the one the ``api_test``
+    runner uses) and the same headers (the request guard's), so the
+    probe travels the same road the request will travel: a service
+    that would refuse that request is refused here too.
+
+    Never raises — a probe that fails is a service that is not ready,
+    not a broken round.
+    """
+    import urllib.error
+    import urllib.request
+
+    result: Dict[str, Any] = {
+        "asked": False,
+        "status_code": None,
+        "content_type": "",
+        "body_status": "",
+        "error": "",
+        # 2026-10-26: the address that answered.  The round's own
+        # probe is a **witness** — it says this address was being
+        # served — and a witness that does not say which address it
+        # was cannot contradict anything.
+        "url": "",
+    }
+    if not url:
+        result["error"] = "the service declares no health URL to ask"
+        return result
+    result["asked"] = True
+    result["url"] = url
+    try:
+        from request_guard import REQUEST_HEADER, REQUEST_HEADER_VALUE
+    except Exception:  # pragma: no cover - defensive
+        REQUEST_HEADER, REQUEST_HEADER_VALUE = "X-PDT-Request", "1"
+    request = urllib.request.Request(url, method="GET")
+    request.add_header(REQUEST_HEADER, REQUEST_HEADER_VALUE)
+    raw = ""
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result["status_code"] = int(response.status)
+            result["content_type"] = str(
+                response.headers.get("Content-Type") or ""
+            )
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        # A non-200 is an answer too — it just is not the answer the
+        # health URL was supposed to give.
+        result["status_code"] = int(exc.code)
+        try:
+            result["content_type"] = str(
+                (exc.headers or {}).get("Content-Type") or ""
+            )
+        except Exception:  # pragma: no cover - defensive
+            result["content_type"] = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - a body is a nicety
+            raw = ""
+    except Exception as exc:  # noqa: BLE001 - a probe never raises
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    try:
+        body = json.loads(raw)
+    except Exception:  # noqa: BLE001 - a non-JSON body is a fact
+        body = None
+    if isinstance(body, dict):
+        result["body_status"] = str(body.get("status") or "")
+    return result
+
+
+def _claim_round_token(
+    service_manager: Any, plan_dir: Optional[Path], round_token: str,
+) -> None:
+    """Make the round's token the plan's **current** owner, if nobody holds it.
+
+    The ledger stamps the services it records with the plan's current
+    owner token, and a service recorded without one belongs to nobody —
+    so the first reaper that comes along may stop it.  That is one of
+    the ways the 2026-10-26 round lost its api service between the
+    round's own ensure and its first verification point.
+
+    A token is only claimed when the plan has **no** current owner:
+    stealing it from a live round would make that round's services
+    reapable, which is the very damage this is here to prevent.
+    """
+    if not round_token or plan_dir is None:
+        return
+    register = getattr(service_manager, "register_service_owner", None)
+    read = getattr(service_manager, "read_owners", None)
+    if register is None or read is None:
+        return
+    try:
+        owners = read(Path(plan_dir))
+    except Exception:  # noqa: BLE001 - a damaged registry must not block
+        return
+    if not isinstance(owners, dict):
+        return
+    if owners.get("current_owner"):
+        return
+    try:
+        register(Path(plan_dir), round_token, current=True)
+    except Exception:  # noqa: BLE001 - a claim that fails is not fatal
+        logger.warning(
+            "[service_precondition] could not claim the round's token "
+            "for %s", plan_dir,
+        )
+
+
+def _default_service_starter(
+    decl: Any,
+    *,
+    plan_dir: Optional[Path],
+    round_token: str,
+    project_dir: Optional[Path],
+    round_number: int,
+    plan_id: str,
+    service_manager: Any,
+) -> Dict[str, Any]:
+    """Bring the service up through the project's own service manager.
+
+    The start happens inside the module's own address-event context, so
+    the address event carries **this round's** token: the ledger then
+    says who owns the instance, and the reap sweep leaves it alone.
+    """
+    sm = service_manager
+    if sm is None:
+        try:
+            sm = _load_service_manager(project_dir)
+        except Exception as exc:  # noqa: BLE001 - a fallback, never a failure
+            return {
+                "ok": False, "port": 0, "pid": None,
+                "detail": f"could not load the service manager: {exc}",
+            }
+    root = Path(project_dir) if project_dir else Path(".")
+    _claim_round_token(sm, plan_dir, round_token)
+    context = getattr(sm, "address_event_context", None)
+    try:
+        if context is not None and plan_dir is not None:
+            with context(
+                Path(plan_dir), run_id=plan_id, round_token=round_token,
+            ):
+                runtime_map = sm.ensure_services(
+                    root, {decl.name: decl}, round_number=round_number,
+                    plan_dir=Path(plan_dir), plan_id=plan_id,
+                )
+        else:
+            runtime_map = sm.ensure_services(
+                root, {decl.name: decl}, round_number=round_number,
+                plan_dir=Path(plan_dir) if plan_dir is not None else None,
+                plan_id=plan_id,
+            )
+    except TypeError:
+        # A project whose service manager has a narrower signature.
+        try:
+            runtime_map = sm.ensure_services(
+                root, {decl.name: decl}, round_number=round_number,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed start is a fact
+            return {
+                "ok": False, "port": 0, "pid": None,
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+    except Exception as exc:  # noqa: BLE001 - a failed start is a fact
+        return {
+            "ok": False, "port": 0, "pid": None,
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
+    runtime = (getattr(runtime_map, "runtimes", None) or {}).get(decl.name)
+    if runtime is None:
+        return {
+            "ok": False, "port": 0, "pid": None,
+            "detail": "the start attempt reported no runtime for the service",
+        }
+    port = int(getattr(runtime, "port", 0) or 0)
+    pid = getattr(runtime, "pid", None)
+    ready = bool(getattr(runtime, "ready", False))
+    detail = str(getattr(runtime, "detail", "") or "")
+    if not ready:
+        return {
+            "ok": False, "port": port, "pid": pid,
+            "detail": detail or "the service did not come up",
+        }
+    return {"ok": True, "port": port, "pid": pid, "detail": detail}
+
+
+def _default_health_check(decl: Any, port: int) -> Dict[str, Any]:
+    """Ask the service whether it is alive, over the guarded road.
+
+    The declaration's own health URL, asked with the request guard's
+    header — the same header a verification point's request carries, so
+    the probe travels the same road the request will travel.  A
+    declaration that names no health URL is asked nothing.
+    """
+    return _service_self_check(_service_health_url(decl, port))
+
+
+def ensure_service_ready(
+    decl: Any,
+    plan_dir: Optional[Path] = None,
+    round_token: str = "",
+    *,
+    project_dir: Optional[Path] = None,
+    round_number: int = 0,
+    plan_id: str = "",
+    service_manager: Any = None,
+    starter: Optional[Callable[[Any], Dict[str, Any]]] = None,
+    liveness: Optional[Callable[[int], bool]] = None,
+    health: Optional[Callable[[Any, int], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """The one precondition every verification path shares.
+
+    Three steps, in this order:
+
+      1. **Probe the port.**  Is anybody serving there?
+      2. **Bring the service up** if nobody is — through the round's
+         own start path, stamped with *round_token* so the ledger says
+         who owns the instance.
+      3. **Ask the service itself.**  The very request a verification
+         point would send — same client, same headers — and a 200 is
+         required.  A fresh binary on disk is not an answer; the
+         service answering is.
+
+    A service that declares no health URL is asked nothing: the plan's
+    convention is that such a service is judged by TCP reachability
+    alone (see :func:`_service_health_url`).
+
+    Args:
+        decl: the service declaration (``port``, ``name``, ``health_url``).
+        plan_dir: the plan's directory — where the ledger and the
+            address events live.
+        round_token: the token this round's services are recorded
+            under.
+        project_dir: the project the service belongs to.
+        round_number: the round this start belongs to.
+        plan_id: the plan's id (the ledger's ``run_id``).
+        service_manager: the project's own ``service_manager`` module.
+        starter: an optional callable that performs the start instead of
+            the default one.  It is called with the declaration and
+            returns ``{"ok": bool, "port": int, "pid": int | None,
+            "detail": str, "health_record": dict}``.
+        liveness: an optional callable answering "is anything serving
+            on this port?".  Defaults to :func:`_service_port_is_live`.
+        health: an optional callable that asks the service whether it
+            is alive and returns the self-check record.  It is called
+            with the declaration and the port.
+
+    Returns:
+        A record with ``ready`` (the verdict), ``service``, ``port``,
+        ``pid``, ``error_kind``, ``detail``, ``status_code``,
+        ``content_type`` and ``body_status`` — the last three are what
+        the service actually answered, so a reader can see the 200 (or
+        the absence of one) rather than take it on trust.
+    """
+    record: Dict[str, Any] = {
+        "ready": False,
+        "service": str(getattr(decl, "name", "") or ""),
+        "port": 0,
+        "pid": None,
+        "error_kind": "",
+        "detail": "",
+        "status_code": None,
+        "content_type": "",
+        "body_status": "",
+        "start_attempted": False,
+    }
+    try:
+        port = int(getattr(decl, "port", 0) or 0)
+    except (TypeError, ValueError):
+        port = 0
+    record["port"] = port
+    if not port:
+        record["error_kind"] = "no_address"
+        record["detail"] = "the declaration carries no port to probe"
+        return record
+
+    is_live = liveness or _service_port_is_live
+    ask_health = health or _default_health_check
+    probe: Dict[str, Any] = {}
+
+    if not is_live(port):
+        record["start_attempted"] = True
+        if starter is not None:
+            try:
+                outcome = starter(decl)
+            except Exception as exc:  # noqa: BLE001 - a failed start is a fact
+                outcome = {
+                    "ok": False, "port": 0, "pid": None,
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+            if not isinstance(outcome, dict):
+                outcome = {
+                    "ok": False, "port": 0, "pid": None,
+                    "detail": "the start attempt returned no result",
+                }
+        else:
+            outcome = _default_service_starter(
+                decl,
+                plan_dir=plan_dir,
+                round_token=round_token,
+                project_dir=project_dir,
+                round_number=round_number,
+                plan_id=plan_id,
+                service_manager=service_manager,
+            )
+        record["pid"] = outcome.get("pid")
+        started_port = int(outcome.get("port") or 0)
+        if started_port:
+            record["port"] = started_port
+            port = started_port
+        if not outcome.get("ok"):
+            record["error_kind"] = "tcp_connect_failed"
+            record["detail"] = (
+                f"nothing accepted a TCP connection on port {port}"
+                + (
+                    f"; the start attempt did not bring it back: "
+                    f"{outcome.get('detail')}"
+                    if outcome.get("detail") else ""
+                )
+            )
+            return record
+        # The service says it is up.  Ask the port, not the runtime:
+        # a runtime that says "ready" on a port nobody listens on is
+        # not a service.
+        if not is_live(port):
+            record["error_kind"] = "tcp_connect_failed"
+            record["detail"] = (
+                f"nothing accepted a TCP connection on port {port} after "
+                f"the start attempt"
+            )
+            return record
+        # The start asked the service itself already — the round's
+        # adoption gates do exactly that.  Asking a second time would
+        # be a second check, and one check is the point.
+        asked = outcome.get("health_record")
+        if isinstance(asked, dict):
+            probe = asked
+
+    if not probe:
+        try:
+            probe = ask_health(decl, port)
+        except Exception as exc:  # noqa: BLE001 - a probe never raises
+            record["error_kind"] = "health_unanswered"
+            record["detail"] = (
+                f"the health check of service {record['service']!r} raised: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return record
+    if not isinstance(probe, dict):
+        probe = {}
+    record["status_code"] = probe.get("status_code")
+    record["content_type"] = str(probe.get("content_type") or "")
+    record["body_status"] = str(probe.get("body_status") or "")
+    if probe.get("asked") and probe.get("status_code") != 200:
+        record["error_kind"] = "health_unanswered"
+        record["detail"] = (
+            f"the health URL of service {record['service']!r} did not "
+            f"answer 200"
+            + (
+                f" ({probe.get('error')})" if probe.get("error")
+                else f" (it answered {probe.get('status_code')})"
+            )
+        )
+        return record
+    record["ready"] = True
+    record["detail"] = (
+        "the service answers 200 on its health URL"
+        if probe.get("asked")
+        else "the service accepts connections and declares no health URL"
+    )
+    return record
+
+
 #
 # Refactor note (Phase C7 → Orchestrator): the historical class name
 # ``VerificationAgent`` is kept as a backward-compatibility alias of the
@@ -1204,6 +2618,157 @@ class Orchestrator:
         #: who was adopted, which ports are blocked). ``None`` for
         #: legacy plans, which use the scrape-and-restart path instead.
         self._service_runtime_map: Optional[Any] = None
+        #: 2026-10-25 (repair-r1-22) — the service instance each
+        #: declared service is **bound** to for this round.  The
+        #: binding is what a VP's request is built from: it is the
+        #: runtime object the ``ensure`` returned, so a runtime map
+        #: that is rewritten later cannot move the address under a VP
+        #: that is talking to a healthy instance.  Keyed by service
+        #: name; empty for legacy plans (no ``services`` block).
+        self._service_bindings: Dict[str, _BoundService] = {}
+        #: 2026-10-24 — per-VP service liveness recovery.  The
+        #: round-start preflight starts the declared services **once**;
+        #: a service that dies *after* that stays dead for the rest of
+        #: the round, and every VP that talks to it is graded on the
+        #: connection refusal.  These carry the recovery's state:
+        #: the lock that keeps N concurrent VPs from starting N copies
+        #: of the same service, and the services whose recovery already
+        #: failed this round (one attempt each — a service that cannot
+        #: be brought back must not be retried by every later VP).
+        self._service_reensure_lock: Optional["asyncio.Lock"] = None
+        self._service_reensure_lock_loop: Optional[Any] = None
+        self._service_reensure_failed: set = set()
+        #: 2026-10-26 — the **self-check** records: what each service
+        #: answered when it was last asked over the guarded road, keyed
+        #: by ``(service, port)``.  The record is what the round's
+        #: adoption gates produce, and the one precondition reuses it
+        #: instead of asking the same service a second time.
+        self._service_self_check_records: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        #: 2026-10-25 (repair-r1-24) — the ports whose service the round
+        #: could **not** reach after a re-ensure, and why.  The
+        #: blocked-port gate turns these into BLOCKED verdicts that carry
+        #: the ``service_unreachable`` code, so a report reader can tell
+        #: "the plumbing died" from "the project answered wrong".
+        self._service_unreachable: Dict[int, str] = {}
+        #: 2026-10-25 (repair-r1-26) — did the **environment** fail this
+        #: round?  A request that never reached its service is not a
+        #: verdict about the product, so it is BLOCKED, and the round
+        #: that produced it is blocked as a whole: every one of its
+        #: results is recorded BLOCKED and the upper layer re-runs the
+        #: round instead of repairing a product that was never asked.
+        #: The per-VP details say which address was called and what the
+        #: transport said about it.
+        self._environment_blocked: bool = False
+        self._environment_blocked_details: List[Dict[str, Any]] = []
+        #: The round event is written once per round, not once per VP.
+        self._environment_blocked_event_written: bool = False
+        #: 2026-10-25 (repair-r1-32) — has this round already spent its
+        #: one automatic re-run of the points the environment blocked?
+        #: At most one: a second look at a service that is still not
+        #: serving buys nothing but cost.
+        self._environment_rerun_attempted: bool = False
+        #: 2026-10-26 — has this round already checked its own evidence
+        #: against itself?  At most once: a second look at the same
+        #: evidence buys nothing but cost, and the point of the check is
+        #: that it happens **before** the report is built.
+        self._round_evidence_reconciled: bool = False
+        #: The round's own per-point dispatcher, kept so the re-run can
+        #: grade the points it re-runs by exactly the rules the first
+        #: attempt used.
+        self._vp_dispatch_runner: Optional[Any] = None
+        #: The plan **before** its ``{{svc.*}}`` placeholders were
+        #: resolved.  Re-resolving after a service moved needs the
+        #: unresolved source — a resolved copy cannot be resolved again.
+        self._unresolved_plan_data: Optional[dict] = None
+        #: The executor's VPs by id — where a re-resolution writes the
+        #: service's new address.
+        self._executor_vps_by_id: Dict[str, dict] = {}
+        #: 2026-10-24 — the data plane each declared service was serving
+        #: when the round started.  A live port is **not** proof that the
+        #: right instance is behind it: the production round talked to
+        #: an instance whose ``/health/data`` answered with an empty
+        #: database, and every assertion after that ran against the
+        #: wrong data.  Keyed by service name; only the services that
+        #: answered the probe are recorded — a service that does not
+        #: speak ``/health/data`` is never gated.
+        self._data_plane_fingerprints: Dict[str, Any] = {}
+        #: The services whose one re-ensure this round already spent.
+        #: The round may bring a lost instance back **once**; the VPs
+        #: after that go straight to BLOCKED instead of each paying for
+        #: another start.
+        self._data_plane_reensure_spent: set = set()
+        #: 2026-10-25 — the **identity** of the instance each declared
+        #: service was serving when the round's ``ensure`` produced it.
+        #: A live port is not proof that the round's own instance is
+        #: behind it: the production round's address belonged to an
+        #: instance it had never started, and no amount of ``200 OK``
+        #: makes the two the same.  The ``instance`` block the service
+        #: publishes about itself is what settles it — the boot id says
+        #: *which process*, the plans tree and the state database's
+        #: inode say *which data*.  Keyed by service name; a service
+        #: that publishes no block is never gated.
+        self._service_instance_identity: Dict[str, Dict[str, Any]] = {}
+        #: 2026-10-25 (repair-r1-31) — **where every VP of this round
+        #: was sent**.  The production round's evidence said only
+        #: ``Errno 61``, which cannot tell "the service is down" from
+        #: "the request never reached the code under test".  Each
+        #: record carries the URL, the port it names, the port the
+        #: round's ``ensure`` bound, the pid and boot id behind that
+        #: binding, and how many times the request was attempted.
+        #: Keyed by vp id; empty for a VP that never dispatched.
+        self._vp_address_records: Dict[str, Dict[str, Any]] = {}
+        #: How many times each VP's request was **attempted** this
+        #: round.  ``0`` means "no request was ever sent" — the
+        #: difference between a request that failed and a request that
+        #: never happened.
+        self._vp_attempts: Dict[str, int] = {}
+        #: The round's own request id — one for every VP of the round,
+        #: so their evidence can be compared horizontally.
+        self._round_request_id: str = ""
+        #: The instance blocks the round has **observed** this round,
+        #: keyed by the port they were read from.  The round reads
+        #: ``/health/data`` anyway when it gates on an instance's
+        #: identity; the answer it gets there is the answer to "who is
+        #: listening on that port", and a bookkeeping field must not
+        #: make the service answer a **new** question.
+        self._observed_instances: Dict[int, Dict[str, Any]] = {}
+        #: 2026-10-26 — **who was serving the address**, on both sides of
+        #: every dispatch.  The production round knew the address it
+        #: aimed at and nothing about the instance answering there, so a
+        #: refusal on that address could not be told apart from "the
+        #: port changed hands while the request was in flight".  Each
+        #: record carries the snapshot taken before the request and the
+        #: one taken after it.  Keyed by vp id.
+        self._vp_serving_snapshots: Dict[str, Dict[str, Any]] = {}
+        #: The instance that served the round's **first** dispatch — the
+        #: "before" of the round-level handover record.
+        self._round_serving_snapshot: Optional[Dict[str, Any]] = None
+        #: The port that snapshot was read from, so the round can ask
+        #: the same address again when the round ends.
+        self._round_serving_port: Optional[int] = None
+        #: The handovers the round saw, one per dispatch whose address
+        #: changed hands.  The round's own reconciliation reads them, so
+        #: a contradicted point gets the **one** second look every other
+        #: contradicted point gets.
+        self._instance_handover_conflicts: List[Dict[str, Any]] = []
+        #: 2026-10-26 — the round's **instance epoch**: the identity of the
+        #: instance whose answers this round accepts.  Established from the
+        #: first successful read of ``/health/data`` and compared before
+        #: every dispatch after that.  ``None`` means the round has not
+        #: named an instance yet — either it has no service to ask, or the
+        #: service does not identify itself.
+        self._instance_epoch: Optional[Dict[str, Any]] = None
+        #: The comparable form of the epoch — ``pid@boot_id``.
+        self._instance_epoch_token: str = ""
+        #: The epoch each verification point was dispatched under, keyed by
+        #: vp id.  A point whose epoch is no longer the round's was
+        #: answered by an instance the round cannot place.
+        self._vp_epoch_tokens: Dict[str, str] = {}
+        #: The epoch changes the round saw.  The round's own reconciliation
+        #: reads them, so a point answered under a stale epoch gets the
+        #: **one** second look every other contradicted point gets.
+        self._instance_epoch_conflicts: List[Dict[str, Any]] = []
+
         #: 2026-10-24 (repair-r3-16): **why** a port is blocked.  The
         #: preflight's diagnosis (exit code, first error, log tail) used
         #: to die in a ``logger.warning`` with the process; a blocked
@@ -1224,6 +2789,17 @@ class Orchestrator:
         #: 阶段归一化摘要（Phase 1/2 计数 + 被兜底提升的 VP），由
         #: :meth:`generate_verification_plan` 填充，供审计/展示读取。
         self._last_phase_summary: Dict[str, Any] = {}
+        #: 2026-10-25 (repair-r1-33) — the round's **service
+        #: preflight**: the question "may this round dispatch its
+        #: verification points at all?".  Installed by the verification
+        #: loop (which owns the question) and called by the agent
+        #: (which owns the services) right after the round-start
+        #: preflight has brought the services up, and before the first
+        #: verification point is dispatched.  ``None`` means no
+        #: preflight was installed — the round runs as it always did.
+        self._round_service_preflight: Optional[
+            Callable[[], Optional[Dict[str, Any]]]
+        ] = None
 
     def _note_vp_capacity(self, peak: Optional[int]) -> None:
         """Record the concurrency the round reached, for the report to quote.
@@ -2664,6 +4240,32 @@ class Orchestrator:
             Path to the new log file
         """
         self._current_round = round_number
+        # 2026-10-25 (repair-r1-26): the environment verdict is a
+        # **round** verdict.  Last round's blocked round says nothing
+        # about this one — the service may be up now — so the record
+        # starts empty every round, exactly like the round's other
+        # per-round state.
+        self._environment_blocked = False
+        self._environment_blocked_details = []
+        self._environment_blocked_event_written = False
+        # 2026-10-25 (repair-r1-32): the one automatic re-run is a
+        # **round's** allowance — a new round gets a new one.
+        self._environment_rerun_attempted = False
+        # 2026-10-26: the round's own evidence is checked **once** per
+        # round.  A new round gets a new check: last round's evidence
+        # says nothing about this one.
+        self._round_evidence_reconciled = False
+        # 2026-10-25 (repair-r1-31): the address record is a **round's**
+        # record.  Last round's addresses say nothing about this one —
+        # the service may be on another port now — so the table starts
+        # empty, and the round gets its own request id to hang its
+        # evidence on.
+        self._vp_address_records = {}
+        self._vp_attempts = {}
+        self._observed_instances = {}
+        self._round_request_id = _mint_request_id(
+            self.plan_dir.name, round_number,
+        )
         return self.persistence.start_round(round_number)
 
     def execute_verification_plan(self, plan_data: Optional[dict] = None) -> dict:
@@ -2833,6 +4435,12 @@ class Orchestrator:
         all_results.sort(
             key=lambda r: original_index.get(r.get("id", ""), len(original_index))
         )
+
+        # 2026-10-25 (repair-r1-26): same rule as the live round — a
+        # round that could not reach the service is blocked as a whole.
+        if self._environment_blocked:
+            self._write_environment_blocked_event()
+            all_results = self._mark_results_environment_blocked(all_results)
 
         print(f"[Verification] Completed {len(all_results)} verification points")
 
@@ -3436,7 +5044,7 @@ class Orchestrator:
         that knows where a service actually lives.
         """
         runtime_map = self._service_runtime_map
-        if runtime_map is None:
+        if runtime_map is None and not self._service_bindings:
             return self._service_declarations
         try:
             from service_manager import render_declaration
@@ -3445,13 +5053,684 @@ class Orchestrator:
 
         effective: Dict[str, Any] = {}
         for name, decl in self._service_declarations.items():
-            runtime = (runtime_map.runtimes or {}).get(name)
-            port = getattr(runtime, "port", None)
-            if runtime is not None and runtime.ready and port and port != decl.port:
-                effective[name] = render_declaration(decl, port)
+            runtime = None
+            if runtime_map is not None:
+                runtime = (runtime_map.runtimes or {}).get(name)
+            if _runtime_is_unusable(runtime):
+                # 2026-10-25 (repair-r1-29): this service has **no
+                # address**.  The port its runtime names is the
+                # declared one, and the declared one belongs to
+                # somebody else — so it is not a fallback: falling
+                # back to it would aim the round's VPs at the
+                # stranger.  The entry is left out of the table, and
+                # the VPs that need this service are blocked by name
+                # (see :meth:`_unusable_services`).
+                continue
+            # The **binding** first: it is the instance the round's
+            # ensure produced, and it is what the VPs are dispatched
+            # to.  The runtime map is only consulted for a service
+            # that was never bound (a legacy path, or a test that
+            # installs a map directly) — a map that is rewritten
+            # afterwards must not be able to move a bound service.
+            port = self._bound_service_port(name)
+            if port is None and _runtime_is_usable(runtime):
+                port = getattr(runtime, "port", None)
+            if port and int(port) != decl.port:
+                effective[name] = render_declaration(decl, int(port))
             else:
                 effective[name] = decl
         return effective
+
+    def _unusable_services(self) -> Dict[str, Dict[str, Any]]:
+        """The services the round could not place.
+
+        ``{name: {"port": int, "reason": str}}`` — the name is
+        lower-cased, the port is the **declared** one (the port the
+        stranger holds), and the reason is the runtime's own sentence.
+
+        A runtime that is explicitly unusable names no address: there is
+        nowhere to send a VP that needs it, and the VPs that name it
+        are blocked — by name, because the placeholder that named it
+        never resolved and there is no port left to match on.
+        """
+        runtime_map = self._service_runtime_map
+        if runtime_map is None:
+            return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        runtimes = getattr(runtime_map, "runtimes", None) or {}
+        for name, runtime in runtimes.items():
+            if not _runtime_is_unusable(runtime):
+                continue
+            declared = getattr(runtime, "declared_port", None)
+            port = getattr(runtime, "port", None)
+            out[str(name).lower()] = {
+                "port": int(declared or port or 0),
+                "reason": str(
+                    getattr(runtime, "failure_reason", "")
+                    or getattr(runtime, "detail", "")
+                    or "no detail"
+                ),
+            }
+        return out
+
+    # ------------------------------------------------------------------
+    # The round's service binding (2026-10-25, repair-r1-22)
+    # ------------------------------------------------------------------
+    #
+    # The address a VP is dispatched to is decided **once**, by the
+    # ``ensure`` that produced the instance, and it is carried by that
+    # instance's runtime object.  Everything below exists so that no
+    # later step can quietly re-derive the address from the runtime
+    # map — the map is a record of what happened, not an instruction
+    # about where to send a request.
+
+    def _bind_service_runtime(
+        self, name: str, runtime: Any,
+    ) -> Optional[_BoundService]:
+        """Bind *name* to the instance *runtime* describes.
+
+        Only a runtime that is **ready** and carries a port can be
+        bound: an address nobody listens on is not a service, and
+        binding one would send the round's VPs to a dead port.
+
+        Returns the binding, or ``None`` when the runtime was refused
+        (a previous binding — if any — is left alone; the caller that
+        knows the service is gone releases it explicitly).
+        """
+        if runtime is None:
+            return None
+        if _runtime_is_unusable(runtime):
+            # 2026-10-25 (repair-r1-29): a runtime that says "this
+            # names no address" is never bound — the port it carries is
+            # the declared one, and the declared one is somebody else's.
+            return None
+        if not getattr(runtime, "ready", False):
+            return None
+        port = getattr(runtime, "port", None)
+        if not port:
+            return None
+        key = str(name).lower()
+        pid = getattr(runtime, "pid", None)
+        binding = _BoundService(
+            name=key,
+            port=int(port),
+            pid=int(pid) if pid else None,
+            health_url=self._bound_health_url(key, int(port)),
+            boot_id=self._runtime_boot_id(runtime),
+            runtime_id=f"{key}:{int(port)}:{pid}",
+            runtime=runtime,
+        )
+        self._service_bindings[key] = binding
+        return binding
+
+    @staticmethod
+    def _runtime_boot_id(runtime: Any) -> str:
+        """The **boot identity** of a runtime: pid + process start epoch.
+
+        A pid alone cannot tell two runs of the same pid apart, and
+        "the service was restarted" is exactly the question a log reader
+        has to be able to answer.
+        """
+        pid = getattr(runtime, "pid", None)
+        start_epoch = getattr(runtime, "start_epoch", None)
+        if pid and start_epoch:
+            return f"{int(pid)}@{int(start_epoch)}"
+        if pid:
+            return str(int(pid))
+        return ""
+
+    def _release_service_binding(self, name: str) -> None:
+        """Unbind *name*: the round has no usable instance of it.
+
+        A released service falls back to its declared address, which
+        the blocked-port gate turns into a BLOCKED verdict — which is
+        the truth: the round has no service to talk to.
+        """
+        self._service_bindings.pop(str(name).lower(), None)
+
+    def _bound_service_port(self, name: str) -> Optional[int]:
+        """The port the bound instance of *name* listens on."""
+        binding = self._service_bindings.get(str(name).lower())
+        if binding is None:
+            return None
+        return binding.port
+
+    def _bound_health_url(self, name: str, port: int) -> str:
+        """The health URL of the bound instance (the declaration, moved
+        to the bound port)."""
+        decl = self._service_declarations.get(str(name).lower())
+        if decl is None:
+            return f"http://127.0.0.1:{int(port)}"
+        try:
+            from service_manager import render_declaration
+
+            return render_declaration(decl, int(port)).health_url
+        except Exception:  # pragma: no cover - defensive
+            return f"http://127.0.0.1:{int(port)}"
+
+    def _service_for_vp(self, vp: dict, url: str) -> Optional[str]:
+        """Which bound service does this VP's request talk to?
+
+        Two ways a VP names a service, and both are honoured:
+
+          * ``uses_services`` — the plan's explicit list of service
+            names;
+          * a **port literal** in the request URL that belongs to a
+            declared service.
+        """
+        uses = vp.get("uses_services")
+        if isinstance(uses, list):
+            for name in uses:
+                key = str(name).lower()
+                if key in self._service_bindings:
+                    return key
+        port = _url_port(url)
+        if port is None:
+            return None
+        for key, binding in self._service_bindings.items():
+            if binding.port == port:
+                return key
+        for key, decl in self._service_declarations.items():
+            if getattr(decl, "port", None) == port:
+                return key
+        return None
+
+    def _bind_vp_service_address(self, vp: dict) -> dict:
+        """Point this VP's request at the instance the round bound.
+
+        The URL a VP carries was resolved when the plan was resolved —
+        against whatever the declarations said *then*.  The bound
+        instance is the one the round's ``ensure`` produced, and it is
+        the one the VP must talk to: a rewritten runtime map must not
+        be able to move the request to an address the round never
+        verified.
+
+        Returns the VP — a copy when the URL had to be retargeted, the
+        same dict when it was already pointing at the bound instance.
+        """
+        if not self._service_bindings:
+            return vp
+        request = vp.get("request")
+        if not isinstance(request, dict):
+            return vp
+        url = request.get("url")
+        if not isinstance(url, str) or not url.strip():
+            return vp
+        vp_id = str(vp.get("id", "unknown"))
+
+        name = self._service_for_vp(vp, url)
+        if name is None:
+            return vp
+        binding = self._service_bindings.get(name)
+        if binding is None:
+            return vp
+
+        bound_url = _retarget_url_port(url, binding.port)
+        if bound_url is not None and bound_url != url:
+            new_request = dict(request)
+            new_request["url"] = bound_url
+            new_vp = dict(vp)
+            new_vp["request"] = new_request
+            self._log_service_dispatch_bound(
+                vp_id, binding, request_url=bound_url, retargeted_from=url,
+            )
+            return new_vp
+
+        self._log_service_dispatch_bound(vp_id, binding, request_url=url)
+        return vp
+
+    def _log_service_dispatch_bound(
+        self, vp_id: str, binding: _BoundService, **extra: Any,
+    ) -> None:
+        """Say which instance this VP was dispatched to.
+
+        The 2026-10-24 round could not answer "which service did this
+        VP talk to" from its log — the address was there, but nothing
+        said which instance it belonged to.  The binding says it, and
+        says it per VP.
+        """
+        data = {
+            "plan_id": self.plan_dir.name,
+            "vp_id": vp_id,
+        }
+        data.update(binding.to_dict())
+        data.update(extra)
+        self._safe_log_freshness_event(vp_id, "service_dispatch_bound", data)
+
+    # ------------------------------------------------------------------
+    # The address every VP's evidence records (2026-10-25, repair-r1-31)
+    # ------------------------------------------------------------------
+
+    def _address_records(self) -> Dict[str, Dict[str, Any]]:
+        """The address records of the round, keyed by vp id.
+
+        ``getattr`` for the same reason as :meth:`_serving_snapshots`:
+        an orchestrator built without ``__init__`` has recorded no
+        address yet, and "no address recorded" means "no address facts"
+        — not an ``AttributeError``.  The attribute is created on first
+        use so the writers and the readers always share one dict.
+        """
+        records = getattr(self, "_vp_address_records", None)
+        if records is None:
+            records = {}
+            self._vp_address_records = records
+        return records
+
+    def _record_vp_address(self, vp_id: str, vp: dict) -> Dict[str, Any]:
+        """Remember where this VP's request went (or was going to go).
+
+        The record is written **twice** per api_test VP on purpose:
+        once when the VP is about to be dispatched (the address the
+        plan asked for) and once after the request was bound (the
+        address it really went to).  The second write wins, because it
+        is the one the transport saw.
+
+        The service is looked up the way the dispatch looks it up —
+        by ``uses_services`` first, then by the port the URL names —
+        so the address and the binding can never disagree about which
+        service they are talking about.
+        """
+        request = vp.get("request") if isinstance(vp, dict) else None
+        request = request if isinstance(request, dict) else {}
+        url = str(request.get("url") or "")
+        resolved_port = _url_port(url) if url else None
+
+        name = self._service_for_vp(vp, url) if url else None
+        binding = self._service_bindings.get(name) if name else None
+        declaration = self._service_declarations.get(name) if name else None
+
+        ensure_port: Optional[int] = None
+        pid: Optional[int] = None
+        boot_id = ""
+        if binding is not None:
+            ensure_port = int(binding.port)
+            pid = binding.pid
+            boot_id = str(binding.boot_id or "")
+        elif declaration is not None:
+            # The service was never bound (it could not be placed, or
+            # the round released it).  The **declared** port is still
+            # worth recording: it is the address the plan expected.
+            try:
+                ensure_port = int(declaration.port)
+            except (TypeError, ValueError):
+                ensure_port = None
+
+        record = {
+            "requested_url": url,
+            "resolved_port": resolved_port,
+            "ensure_port": ensure_port,
+            "pid": pid,
+            "boot_id": boot_id,
+            "service": str(name or ""),
+        }
+        self._address_records()[str(vp_id)] = record
+        return record
+
+    def _attempt_counts(self) -> Dict[str, int]:
+        """How many times each VP was asked this round.
+
+        ``getattr`` for the same reason as :meth:`_address_records`:
+        an orchestrator built without ``__init__`` has asked nobody
+        anything, and "no attempt" is a fact — not an
+        ``AttributeError``.
+        """
+        counts = getattr(self, "_vp_attempts", None)
+        if counts is None:
+            counts = {}
+            self._vp_attempts = counts
+        return counts
+
+    def _note_vp_attempt(self, vp_id: str) -> int:
+        """Count this VP's request attempt in this round.
+
+        ``1`` means the request was sent once.  ``0`` — the value a
+        VP that was blocked before dispatch keeps — means **no request
+        was ever made**, which is a different fact from "the request
+        failed".
+        """
+        key = str(vp_id)
+        counts = self._attempt_counts()
+        attempt = int(counts.get(key, 0)) + 1
+        counts[key] = attempt
+        return attempt
+
+    def _answering_boot_id(self, port: Optional[int]) -> str:
+        """The boot id of the instance that answered on *port*.
+
+        The round does not ask the service a **new** question for a
+        bookkeeping field: the answer is the instance block the round
+        has already read for that address — the one its own pre-dispatch
+        identity check fetches from ``/health/data``, moments before
+        the request goes out.  A service's request pattern must not
+        change because a report wants one more field.
+
+        Empty when the round has not identified the instance at that
+        address: "not obtainable" is a real answer, and it is not the
+        same as "the answering instance is the one the round started".
+        """
+        if not port:
+            return ""
+        instance = self._observed_instances.get(int(port)) or {}
+        return str(instance.get("boot_id") or "")
+
+    def _address_evidence_block(
+        self, vp_id: str, evidence: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """The address facts one VP's evidence carries.
+
+        ``error_kind`` and ``errno`` are read **out of** the evidence
+        the verdict already produced — the classification layer owns
+        those two, and this layer only makes sure they are present
+        under a name every reader can match on.
+        """
+        record = self._address_records().get(str(vp_id)) or {}
+        requested_url = str(record.get("requested_url") or "")
+        resolved_port = record.get("resolved_port")
+        if resolved_port is None and requested_url:
+            resolved_port = _url_port(requested_url)
+
+        errno_value = evidence.get("errno")
+        if errno_value is None:
+            error_text = str(evidence.get("error") or "")
+            if error_text:
+                errno_value = _errno_from_error(error_text)
+
+        answering = record.get("answering_boot_id")
+        serving = (
+            getattr(self, "_vp_serving_snapshots", None) or {}
+        ).get(str(vp_id)) or {}
+        values: Dict[str, Any] = {
+            "requested_url": requested_url,
+            "resolved_port": resolved_port,
+            "ensure_port": record.get("ensure_port"),
+            "pid": record.get("pid"),
+            "boot_id": str(record.get("boot_id") or evidence.get("boot_id") or ""),
+            "attempt_no": int(self._attempt_counts().get(str(vp_id), 0)),
+            "error_kind": evidence.get("error_kind"),
+            "errno": errno_value,
+            "request_id": getattr(self, "_round_request_id", "") or "",
+            # ``None`` when no response came back: there was no
+            # answering instance to name.  That is a fact, not a gap.
+            "answering_boot_id": str(answering) if answering else None,
+            # The instance on **both** sides of this dispatch.  ``None``
+            # means the service did not identify itself — not "there was
+            # nothing there".
+            SERVING_BEFORE_FIELD: serving.get(SERVING_BEFORE_FIELD),
+            SERVING_AFTER_FIELD: serving.get(SERVING_AFTER_FIELD),
+        }
+        # The contract's field list, in the contract's order: a reader
+        # that knows the list finds every field where it expects it,
+        # and a field that is absent never reads as "nobody looked".
+        return {field: values.get(field) for field in ADDRESS_EVIDENCE_FIELDS}
+
+    def _enrich_evidence_with_address(
+        self, vp_id: str, evidence: Any, vp: Optional[dict] = None,
+    ) -> str:
+        """One VP's recorded evidence, with the address attached.
+
+        The evidence stays a **string** — the legacy Phase 3 judgment
+        prompt slices it — but it now carries the address facts as a
+        serialized fragment.  Evidence that was not JSON becomes
+        ``{"raw_evidence": ...}`` plus the block, so the shape is the
+        same for every VP of the round.
+        """
+        parsed: Dict[str, Any]
+        if isinstance(evidence, str):
+            text = evidence
+            try:
+                loaded = json.loads(text) if text.strip() else {}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                loaded = None
+            parsed = loaded if isinstance(loaded, dict) else {"raw_evidence": text}
+        elif isinstance(evidence, dict):
+            parsed = dict(evidence)
+        else:
+            parsed = {}
+
+        # A VP that never dispatched has no record of its own; the
+        # plan's request is still the address it was *going to* use,
+        # and saying so is what makes "never sent" readable.
+        if not parsed.get("requested_url") and isinstance(vp, dict):
+            request = vp.get("request")
+            if isinstance(request, dict):
+                planned_url = str(request.get("url") or "")
+                if planned_url:
+                    record = self._address_records().setdefault(
+                        str(vp_id), {},
+                    )
+                    if not record.get("requested_url"):
+                        record["requested_url"] = planned_url
+                        if record.get("resolved_port") is None:
+                            record["resolved_port"] = _url_port(planned_url)
+
+        parsed.update(self._address_evidence_block(vp_id, parsed))
+        try:
+            return json.dumps(parsed, ensure_ascii=False)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return str(evidence)
+
+    # ------------------------------------------------------------------
+    # The instance behind the address (2026-10-26)
+    # ------------------------------------------------------------------
+    #
+    # The production round aimed at an address and was refused, while a
+    # later point of the **same** round was served on that very
+    # address.  The only explanation the framework had was "the port
+    # was taken over by another instance", and it could not say so —
+    # because it had never asked **who** was serving the address.
+    #
+    # These four methods are that question, asked on both sides of
+    # every dispatch.  The answer is written into the VP's evidence, so
+    # a reader can place the answer they are looking at.
+
+    def _serving_snapshots(self) -> Dict[str, Dict[str, Any]]:
+        """The snapshots the round has taken, keyed by vp id.
+
+        ``getattr`` for the same reason as elsewhere in this module: an
+        orchestrator built without ``__init__`` has taken no snapshots
+        yet, and "no snapshots" means "nothing to compare".
+        """
+        snapshots = getattr(self, "_vp_serving_snapshots", None)
+        if snapshots is None:
+            snapshots = {}
+            self._vp_serving_snapshots = snapshots
+        return snapshots
+
+    def _handover_conflicts(self) -> List[Dict[str, Any]]:
+        """The handovers the round has seen, one per dispatch.
+
+        ``getattr`` for the same reason as :meth:`_serving_snapshots`.
+        """
+        conflicts = getattr(self, "_instance_handover_conflicts", None)
+        if conflicts is None:
+            conflicts = []
+            self._instance_handover_conflicts = conflicts
+        return conflicts
+
+    def _serving_port_for_vp(
+        self, vp: dict, vp_id: str,
+    ) -> Optional[int]:
+        """The port whose instance this VP's snapshot is about.
+
+        The same three sources the address record uses, in the same
+        order: what the request really went to, what the plan's URL
+        names, and what the round bound for the service the VP uses.
+        """
+        record = self._address_records().get(str(vp_id)) or {}
+        resolved = record.get("resolved_port")
+        if resolved:
+            try:
+                return int(resolved)
+            except (TypeError, ValueError):
+                pass
+
+        request = vp.get("request") if isinstance(vp, dict) else None
+        request = request if isinstance(request, dict) else {}
+        url = str(request.get("url") or "")
+        port = _url_port(url) if url else None
+        if port:
+            return int(port)
+
+        name = self._service_for_vp(vp, url) if url else None
+        if name is None:
+            uses = vp.get("uses_services") if isinstance(vp, dict) else None
+            if isinstance(uses, list):
+                for candidate in uses:
+                    key = str(candidate).lower()
+                    if key in self._service_bindings or key in self._service_declarations:
+                        name = key
+                        break
+        if name:
+            binding = self._service_bindings.get(name)
+            if binding is not None:
+                try:
+                    return int(binding.port)
+                except (TypeError, ValueError):
+                    return None
+            declaration = self._service_declarations.get(name)
+            if declaration is not None:
+                try:
+                    return int(declaration.port)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _capture_serving_snapshot(
+        self, vp: dict, vp_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Ask the address who is serving it, right now.
+
+        The question is asked over the same road the request travels
+        (``/health/data`` on the port the VP is about to use), and the
+        answer is the service's **own** statement about itself.
+
+        A fresh read is what makes this worth anything: the round's
+        cached observation of a port is a statement about the past, and
+        a handover that happened **during** the dispatch is invisible
+        to it.  The snapshot is therefore taken on both sides of the
+        request, not once at the start of the round.
+
+        Only a service the round has already seen identify itself is
+        asked again.  A service that publishes no ``instance`` block has
+        no instance to have changed hands, so it is not asked a second
+        question and it is never gated — the same rule the round's own
+        data-plane fingerprint follows.
+        """
+        port = self._serving_port_for_vp(vp, vp_id)
+        if not port:
+            return None
+        if int(port) not in (getattr(self, "_observed_instances", None) or {}):
+            # The round has never seen this address identify itself, so
+            # there is nothing to compare and nothing to gate.
+            return None
+        snapshot = _serving_snapshot(_health_data_instance(int(port)))
+        if getattr(self, "_round_serving_port", None) is None:
+            # The round's own "before": the first instance that served
+            # one of its addresses.  The round-level handover record is
+            # built from this one and a fresh read at the round's end.
+            self._round_serving_port = int(port)
+            self._round_serving_snapshot = snapshot
+        return snapshot
+
+    def _apply_serving_handover(
+        self,
+        vp_id: str,
+        before: Optional[Dict[str, Any]],
+        after: Optional[Dict[str, Any]],
+        verdict: Any,
+    ) -> Any:
+        """Say whose instance answered — and refuse to judge a handover.
+
+        The two snapshots go into the evidence under their contract
+        names, whatever the verdict says.
+
+        When the address changed hands, the round's own evidence
+        contradicts the verdict: the answer came from an instance the
+        round cannot place (or the instance could not be placed at
+        all).  So the handover is recorded as a **contradiction** — the
+        same shape as the "refused here but served there" one — and the
+        round's own reconciliation marks the point ``invalid_env`` and
+        gives it the **one** second look every other contradicted point
+        gets.  What the second look says is what lands.
+
+        The verdict's own status is not touched here.  ``invalid_env``
+        is the round's word for "this is not about the product", and it
+        is written on the round's **results** — after the executor has
+        collected the verdicts, which only accept the statuses they
+        accept.
+        """
+        key = str(vp_id)
+        self._serving_snapshots()[key] = {
+            SERVING_BEFORE_FIELD: before,
+            SERVING_AFTER_FIELD: after,
+        }
+        if not isinstance(verdict, dict):
+            return verdict
+
+        # The verdict itself is **not** rewritten: the dispatcher's
+        # verdict is what the downstream handed over, and the round's own
+        # evidence contract is where the address facts live (see
+        # ``_address_evidence_block``).  The two snapshots travel with
+        # the address block, which every VP's recorded evidence carries.
+        evidence = verdict.get("evidence")
+        evidence = dict(evidence) if isinstance(evidence, dict) else {}
+
+        if not _serving_handover(before, after):
+            return verdict
+
+        # The address the request went to — the record the dispatch
+        # wrote, because the verdict's own evidence does not carry the
+        # URL (that is the result layer's job).
+        record = self._address_records().get(key) or {}
+        url = str(
+            evidence.get("requested_url") or record.get("requested_url") or ""
+        )
+        conflict = {
+            "kind": "instance_handover",
+            "url": url,
+            "origin": _url_origin(url),
+            "failed_vps": [key],
+            "succeeded_vp": None,
+            SERVING_BEFORE_FIELD: before,
+            SERVING_AFTER_FIELD: after,
+        }
+        self._handover_conflicts().append(conflict)
+        self._safe_log_freshness_event(
+            key, "service_instance_handover",
+            {
+                "plan_id": self.plan_dir.name,
+                "vp_id": key,
+                SERVING_BEFORE_FIELD: before,
+                SERVING_AFTER_FIELD: after,
+            },
+        )
+        logger.warning(
+            "[verification] the instance serving %s changed hands while %s "
+            "was being verified (boot %s before, boot %s after); the answer "
+            "is not a verdict about the product",
+            conflict.get("url") or "the address", key,
+            (before or {}).get("boot_id") or "?", (after or {}).get("boot_id") or "?",
+        )
+        return verdict
+
+    def round_instance_handover(self) -> Dict[str, Any]:
+        """The instance that served this round, and the one serving it now.
+
+        ``before`` is the snapshot the round took when it first talked
+        to its own address; ``after`` is a fresh read of that same
+        address.  Both are ``None`` when the round never reached a
+        service that identifies itself — "nobody said" is an answer,
+        and it is not the same as "somebody else said".
+        """
+        before = getattr(self, "_round_serving_snapshot", None)
+        after: Optional[Dict[str, Any]] = None
+        port = getattr(self, "_round_serving_port", None)
+        if port:
+            after = _serving_snapshot(_health_data_instance(int(port)))
+        return {
+            "before": before,
+            "after": after,
+        }
 
     def _service_env_for_vps(self) -> Dict[str, str]:
         """``PDT_SVC_<NAME>_*`` for every ready service, for the VP prompt.
@@ -3825,6 +6104,15 @@ class Orchestrator:
         from verification_api_runner import run_api_verification
 
         vp_id = str(vp.get("id", "unknown"))
+        # 2026-10-26 (merge): main 的 api_test 前置门禁 + 本分支的绑定/记账，
+        # 两边都要，顺序有讲究：
+        #
+        # 1) **先**问 main 的门禁（``_ensure_api_test_services``）：它可能直接
+        #    判 BLOCKED —— 那时请求一次都没发出去，所以本分支的 attempt 计数
+        #    必须是 0（「0 = 从没发过请求」这条不变量不能破）。
+        # 2) **再**做本分支的绑定与记账：门禁放行之后请求确实会发出去，
+        #    这时才记录地址（这个 VP 会被发到哪儿、绑定的是哪个实例）并把
+        #    attempt 计数 +1。
 
         # The service has to be there before the question is asked.
         blocked_ports, detail = self._ensure_api_test_services(vp)
@@ -3837,6 +6125,17 @@ class Orchestrator:
                 vp_id, blocked_ports, detail,
             )
 
+        # 2026-10-25 (repair-r1-22): the request is built from the
+        # instance the round bound — the one its ensure produced.  The
+        # URL the VP carries was resolved when the plan was resolved;
+        # this is the last word on where it points.
+        vp = self._bind_vp_service_address(vp)
+        # 2026-10-25 (repair-r1-31): the address this request goes to
+        # is recorded **before** it goes there — the transport's own
+        # complaint ("Errno 61") says nothing about which port it was
+        # aimed at, and the reader needs both.
+        address = self._record_vp_address(vp_id, vp)
+        self._note_vp_attempt(vp_id)
         try:
             result = run_api_verification(
                 vp,
@@ -3854,7 +6153,28 @@ class Orchestrator:
                 "evidence": {"vp_id": vp_id},
             }
 
+        # 2026-10-25 (repair-r1-31): a response came back, so the
+        # instance that answered can be named.  Its boot id is what
+        # separates "the round's own instance answered" from "somebody
+        # else answered" — and it is the round's **own observation** of
+        # that port (the block it read from ``/health/data`` while it
+        # gated on the instance), not a new question to the service.
+        if result.evidence.get("status_code") is not None:
+            answering = self._answering_boot_id(address.get("resolved_port"))
+            if answering:
+                address["answering_boot_id"] = answering
+
         verdict = result.to_verdict_dict()
+        # 2026-10-25 (repair-r1-26): a request that never reached the
+        # service is not a verdict about the product.  The
+        # classification layer runs **before** the verdict is recorded,
+        # so what lands on disk is BLOCKED, not FAILED.
+        verdict = self._classify_transport_failure(vp_id, verdict)
+
+        # 2026-10-26 (merge): main 的分类在**之后**：它只往裁决上补两个键
+        # （``failure_class`` / ``failure_class_source``），是就地改写；而本分支
+        # 的分类会把 FAILED 换成一个**新的**裁决字典 —— 所以必须本分支先跑，
+        # 否则 main 补的键会被新字典丢掉。
         self._classify_api_test_verdict(verdict, result)
         self._safe_log_freshness_event(
             vp_id, "api_test_executed",
@@ -3866,6 +6186,1249 @@ class Orchestrator:
             },
         )
         return verdict
+
+    def _classify_transport_failure(
+        self, vp_id: str, verdict: dict,
+    ) -> dict:
+        """Turn "the service was not there" into BLOCKED.
+
+        The api runner never raises: a request that could not be sent
+        comes back as a FAILED verdict carrying the transport's own
+        words in ``evidence["error"]``.  That is a statement about the
+        **plumbing**, not about the product's behaviour, and the
+        production round paid for the difference: twelve identical
+        connection refusals were recorded as twelve contract
+        violations.
+
+        The rule is deliberately narrow:
+
+          * the verdict must be FAILED (a PASSED is never touched);
+          * the evidence must carry the transport's error and **no**
+            ``status_code`` — a response came back iff the runner
+            recorded one, and a response that came back means the
+            assertions decided, which this layer does not re-judge;
+          * the error must name a transport failure (a refused
+            connection, a name that does not resolve, a socket that
+            died).  A timeout is excluded on purpose: the service may
+            be up and too slow, and that can be a real defect.
+
+        A verdict that passes all of those is reclassified to BLOCKED
+        with ``error_kind = service_unreachable``, and the round is
+        marked environment blocked (see
+        :meth:`_mark_round_environment_blocked`).
+        """
+        if not isinstance(verdict, dict):
+            return verdict
+        if str(verdict.get("status")) != "FAILED":
+            return verdict
+        evidence = verdict.get("evidence")
+        if not isinstance(evidence, dict):
+            return verdict
+        error_text = str(evidence.get("error") or "")
+        if not error_text:
+            return verdict
+        if "status_code" in evidence:
+            # A response came back — the assertions decided, and the
+            # verdict stands as it is.
+            return verdict
+        if not _is_transport_failure(error_text):
+            return verdict
+
+        request = evidence.get("request")
+        if not isinstance(request, dict):
+            request = {}
+        url = str(request.get("url") or evidence.get("url") or "")
+        errno_value = _errno_from_error(error_text)
+
+        new_evidence = dict(evidence)
+        new_evidence["error_kind"] = ENVIRONMENT_ERROR_KIND
+        new_evidence["reason_code"] = SERVICE_UNREACHABLE
+        new_evidence["url"] = url
+        if errno_value is not None:
+            new_evidence["errno"] = errno_value
+
+        self._mark_round_environment_blocked(
+            vp_id, url=url, errno=errno_value, error=error_text,
+        )
+        return {
+            "status": "BLOCKED",
+            "reasons": [blocked_reason(
+                f"{SERVICE_UNREACHABLE} — the request never reached the "
+                f"service ({url or 'no url'}: {error_text})"
+            )],
+            "actual_result": (
+                f"{SERVICE_UNREACHABLE}: the request to {url or '(no url)'} "
+                f"never reached the service — {error_text}. The environment, "
+                f"not the product, is what failed; this verification point "
+                f"is BLOCKED and the round is re-run rather than repaired."
+            ),
+            "evidence": new_evidence,
+            "framework_checks": [],
+        }
+
+    def _mark_round_environment_blocked(
+        self,
+        vp_id: str,
+        *,
+        url: str = "",
+        errno: Optional[int] = None,
+        error: str = "",
+    ) -> None:
+        """Record that the environment — not the product — failed a VP.
+
+        The record is what turns one blocked VP into a blocked **round**:
+        the round's results are all rewritten to BLOCKED and the round
+        writes its ``verification_round_blocked`` event, so the upper
+        layer re-runs the round instead of repairing against verdicts
+        that were measured against a broken environment.
+        """
+        self._environment_blocked = True
+        self._environment_blocked_details.append({
+            "vp_id": vp_id,
+            "url": url,
+            "errno": errno,
+            "error": error,
+        })
+
+    def _environment_blocked_summary(self) -> str:
+        """One sentence naming what the environment did to this round."""
+        details = self._environment_blocked_details or []
+        if not details:
+            return (
+                "the round could not reach the service the verification "
+                "points were sent to"
+            )
+        parts = []
+        for detail in details:
+            url = detail.get("url") or "(no url)"
+            errno_value = detail.get("errno")
+            if errno_value is None:
+                parts.append(f"{url}: {detail.get('error') or 'unreachable'}")
+            else:
+                parts.append(f"{url}: errno {errno_value}")
+        return (
+            f"the round could not reach the service "
+            f"({len(details)} blocked verification point(s): "
+            + "; ".join(parts)
+            + ")"
+        )
+
+    def _write_environment_blocked_event(self) -> None:
+        """Tell the round log that the environment took this round out.
+
+        One event per round — not one per VP: the question a log reader
+        has is "was this round about the product or about the
+        plumbing", and the answer is a property of the round.
+        """
+        if self._environment_blocked_event_written:
+            return
+        self._environment_blocked_event_written = True
+        self._safe_log_freshness_event(
+            "__round__",
+            ROUND_BLOCKED_EVENT,
+            {
+                "plan_id": self.plan_dir.name,
+                "round": self._current_round,
+                "status": ENVIRONMENT_BLOCKED,
+                "error_kind": ENVIRONMENT_ERROR_KIND,
+                "reason": self._environment_blocked_summary(),
+                "blocked_vps": [
+                    detail.get("vp_id")
+                    for detail in self._environment_blocked_details
+                ],
+                "details": list(self._environment_blocked_details),
+            },
+        )
+
+    def _mark_results_environment_blocked(
+        self, results: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Every result of an environment-blocked round is BLOCKED.
+
+        The round measured itself against a service that was not
+        serving.  Whatever the other verification points concluded, they
+        concluded it against that environment — so none of it describes
+        the product, and none of it may become a repair task.  The
+        round is recorded as blocked and the upper layer re-runs it.
+
+        The verdict each result really got is kept in the evidence
+        (``original_status``): blocking a round must not erase what
+        happened, it must say what happened *and* that it does not
+        count.
+
+        One status is left alone: ``SKIPPED``.  A ``manual_check`` VP
+        was never going to be executed — a human has to look at it —
+        and the environment is not why.  Rewriting it to BLOCKED would
+        throw away the one thing the status says.
+        """
+        summary = self._environment_blocked_summary()
+        marked: List[Dict[str, Any]] = []
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            evidence = result.get("evidence")
+            if isinstance(evidence, str):
+                try:
+                    parsed = json.loads(evidence) if evidence.strip() else {}
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    parsed = {"raw_evidence": evidence}
+                if not isinstance(parsed, dict):
+                    parsed = {"raw_evidence": evidence}
+            elif isinstance(evidence, dict):
+                parsed = dict(evidence)
+            else:
+                parsed = {}
+            original_status = result.get("status")
+            # 2026-10-25 (repair-r1-32): the rewrite below replaces the
+            # per-point reason code with the round's own, and that code
+            # is the **only** thing that tells "the environment stopped
+            # this point" apart from "the product broke the contract".
+            # It is therefore kept — under its own name, so the rewrite
+            # cannot overwrite it a second time.
+            if "original_reason_code" not in parsed:
+                parsed["original_reason_code"] = parsed.get("reason_code")
+            parsed["error_kind"] = ENVIRONMENT_ERROR_KIND
+            parsed["reason_code"] = ENVIRONMENT_BLOCKED
+            parsed["environment_blocked"] = True
+            parsed["environment_blocked_reason"] = summary
+            if original_status != "BLOCKED":
+                parsed["original_status"] = original_status
+            actual = (
+                f"{ENVIRONMENT_BLOCKED}: {summary} — this result does not "
+                f"describe the product; the round is re-run, not repaired."
+            )
+            original_result = str(result.get("actual_result") or "").strip()
+            if original_result:
+                actual = f"{actual}\n(original: {original_result})"
+            marked_result = {
+                "id": result.get("id"),
+                "status": original_status,
+                "actual_result": actual,
+                "evidence": json.dumps(parsed, ensure_ascii=False),
+            }
+            reasons = result.get("reasons")
+            if reasons:
+                marked_result["reasons"] = list(reasons)
+            if original_status == "SKIPPED":
+                # It was never going to run — that stays true.
+                marked_result["status"] = "SKIPPED"
+                marked_result["actual_result"] = (
+                    f"{original_result or '需要人工验证'} "
+                    f"({ENVIRONMENT_BLOCKED}: {summary})"
+                )
+            else:
+                marked_result["status"] = "BLOCKED"
+            marked.append(marked_result)
+        return marked
+
+    # -----------------------------------------------------------------------
+    # The accounting of environment-blocked entries (2026-10-25, repair-r1-32)
+    # -----------------------------------------------------------------------
+    #
+    # One refused connection is one event.  The production round pointed
+    # twelve ``api_test`` VPs at ``127.0.0.1:51725`` — a port nothing
+    # had ever listened on — and all twelve died inside twenty-two
+    # seconds with the same ``URLError [Errno 61]``.  The report then
+    # said the product broke twelve times over.
+    #
+    # The verdict table already says the truth (BLOCKED, not FAILED), but
+    # the verdict table is not what the numbers are read from: the
+    # FAILED count is derived from the **report's**
+    # ``verification_results``, and the judgment LLM is free to write a
+    # BLOCKED point down as FAILED.  So the exclusion has to happen
+    # where the report is built — the artifact every downstream reader
+    # takes its numbers from.
+    #
+    # The rule is deliberately narrow, because the failure mode it
+    # guards against is the opposite one: a real defect must never be
+    # re-read as "the environment got in the way".  An entry is excluded
+    # only when BOTH halves agree — the status is BLOCKED *and* the
+    # reason code names the environment.
+
+    def _exclude_environment_blocked_from_failures(
+        self, report_data: dict, execution_results: dict,
+    ) -> dict:
+        """Keep the entries the round could not judge out of the statistics.
+
+        Two kinds of entry are in that class, and they are counted
+        separately because they mean different things:
+
+          * the **environment-blocked** ones — the service was not
+            there, so the round never asked the product anything;
+          * the **invalid_env** ones — the round's own evidence
+            contradicted the failure, so the round does not know what
+            happened and will not pretend it does.
+
+        The entries are **kept** — a reader has to be able to see that
+        the round could not judge them, and why — and they are
+        **annotated** with the reason they were blocked.  What they are
+        not is a failure: they leave the FAILED count, and they leave
+        the repair path (which reads the report's FAILED entries to
+        choose its targets).
+
+        The executor's verdicts are the authority here, not the
+        judgment LLM's report: the executor knows whether the request
+        ever reached the service, and the LLM only saw a summary of it.
+
+        The round's verdict is re-derived from what is left:
+
+          * a genuine failure keeps the round red — this is the whole
+            point of the exercise, and the negative control the tests
+            pin;
+          * a partial verdict stays partial;
+          * a round in which nothing was judged says ``SKIPPED`` —
+            claiming ``PASSED`` there would be a verdict about a
+            product nobody asked.
+        """
+        blocked: Dict[str, Dict[str, Any]] = {}
+        invalid_env: Dict[str, Dict[str, Any]] = {}
+        for result in execution_results.get("execution_results", []) or []:
+            if _is_environment_blocked_result(result):
+                blocked[str(result.get("id"))] = result
+            elif _is_invalid_env_result(result):
+                invalid_env[str(result.get("id"))] = result
+        if not blocked and not invalid_env:
+            return report_data
+
+        report_results = report_data.get("verification_results")
+        if not isinstance(report_results, list):
+            return report_data
+
+        for entry in report_results:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = str(entry.get("id") or "")
+            source = blocked.get(entry_id)
+            if source is not None:
+                entry["status"] = "BLOCKED"
+                entry["environment_blocked"] = True
+                entry["reason_code"] = (
+                    _environment_block_reason_code(source) or SERVICE_UNREACHABLE
+                )
+                entry["actual_result"] = self._blocked_entry_annotation(source)
+                continue
+            source = invalid_env.get(entry_id)
+            if source is None:
+                continue
+            entry["status"] = INVALID_ENV
+            entry["invalid_env"] = True
+            entry["reason_code"] = INVALID_ENV
+            entry["actual_result"] = self._invalid_env_entry_annotation(source)
+
+        # The FAILED statistics: the entries the round could not judge
+        # are not in them, and the round's verdict is derived from what
+        # is left.
+        unjudged = set(blocked) | set(invalid_env)
+        judged = [
+            entry.get("status")
+            for entry in report_results
+            if isinstance(entry, dict)
+            and str(entry.get("id") or "") not in unjudged
+        ]
+        if any(status == "FAILED" for status in judged):
+            report_data["overall_status"] = "FAILED"
+        elif any(status == "PARTIAL" for status in judged):
+            report_data["overall_status"] = "PARTIAL"
+        elif any(status == "PASSED" for status in judged):
+            report_data["overall_status"] = "PASSED"
+        else:
+            report_data["overall_status"] = "SKIPPED"
+
+        if blocked:
+            report_data["environment_blocked"] = True
+            report_data["environment_blocked_reason"] = (
+                self._environment_blocked_summary()
+                if self._environment_blocked
+                else self._environment_blocked_entries_summary(blocked)
+            )
+            report_data["environment_blocked_vps"] = sorted(blocked)
+        if invalid_env:
+            report_data["invalid_env"] = True
+            report_data["invalid_env_reason"] = (
+                self._invalid_env_entries_summary(invalid_env)
+            )
+            report_data["invalid_env_vps"] = sorted(invalid_env)
+        return report_data
+
+    @staticmethod
+    def _invalid_env_entries_summary(
+        invalid_env: Dict[str, Dict[str, Any]],
+    ) -> str:
+        """One sentence naming the points the round's own evidence refuted."""
+        if not invalid_env:
+            return "no verification point was refuted by the round's own evidence"
+        parts = []
+        for vp_id, result in sorted(invalid_env.items()):
+            conflict = _result_evidence(result).get("evidence_conflict") or {}
+            if str(conflict.get("kind") or "") == "instance_handover":
+                before = conflict.get(SERVING_BEFORE_FIELD) or {}
+                after = conflict.get(SERVING_AFTER_FIELD) or {}
+                parts.append(
+                    f"{vp_id}: the instance serving "
+                    f"{conflict.get('url') or 'the address'} changed hands "
+                    f"(boot {before.get('boot_id') or '?'} before, boot "
+                    f"{after.get('boot_id') or '?'} after)"
+                )
+                continue
+            served = conflict.get("succeeded_vp") or "another point"
+            parts.append(f"{vp_id}: {conflict.get('url') or 'the address'} "
+                         f"was served for {served}")
+        return (
+            "the round's own evidence contradicts "
+            f"{len(invalid_env)} verification point(s) "
+            f"({'; '.join(parts)})"
+        )
+
+    @staticmethod
+    def _invalid_env_entry_annotation(source: Dict[str, Any]) -> str:
+        """The text an invalid-env entry carries in the report."""
+        conflict = _result_evidence(source).get("evidence_conflict") or {}
+        url = conflict.get("url") or "the address"
+        if str(conflict.get("kind") or "") == "instance_handover":
+            before = conflict.get(SERVING_BEFORE_FIELD) or {}
+            after = conflict.get(SERVING_AFTER_FIELD) or {}
+            text = (
+                f"{INVALID_ENV}: the instance serving {url} changed hands "
+                f"while this verification point was being verified — boot "
+                f"{before.get('boot_id') or '?'} before, boot "
+                f"{after.get('boot_id') or '?'} after. The answer this point "
+                f"got cannot be attributed to the instance the round "
+                f"started, so it is kept in the report and annotated with "
+                f"the reason, and it is not counted as a failure."
+            )
+        else:
+            served = conflict.get("succeeded_vp") or "another point"
+            text = (
+                f"{INVALID_ENV}: the round's own evidence contradicts this "
+                f"verification point — {url} was refused here but was served "
+                f"for {served} in the same round. It is kept in the report and "
+                f"annotated with the reason, and it is not counted as a "
+                f"failure."
+            )
+        original = str(source.get("actual_result") or "").strip()
+        if original:
+            text = f"{text}\n(original: {original})"
+        return text
+
+    @staticmethod
+    def _environment_blocked_entries_summary(
+        blocked: Dict[str, Dict[str, Any]],
+    ) -> str:
+        """One sentence naming the points the environment stopped."""
+        if not blocked:
+            return "no verification point was blocked by the environment"
+        parts = []
+        for vp_id, result in sorted(blocked.items()):
+            code = _environment_block_reason_code(result) or SERVICE_UNREACHABLE
+            parts.append(f"{vp_id}: {code}")
+        return (
+            "the environment, not the product, stopped "
+            f"{len(blocked)} verification point(s) ({'; '.join(parts)})"
+        )
+
+    @staticmethod
+    def _blocked_entry_annotation(source: Dict[str, Any]) -> str:
+        """The text an environment-blocked entry carries in the report."""
+        code = _environment_block_reason_code(source) or SERVICE_UNREACHABLE
+        text = (
+            f"{code}: the environment, not the product, stopped this "
+            f"verification point. It is kept in the report and annotated "
+            f"with the reason, and it is not counted as a failure."
+        )
+        original = str(source.get("actual_result") or "").strip()
+        if original:
+            text = f"{text}\n(original: {original})"
+        return text
+
+    # -----------------------------------------------------------------------
+    # The round's one automatic re-run (2026-10-25, repair-r1-32)
+    # -----------------------------------------------------------------------
+    #
+    # A single environment hiccup used to end the round: the service was
+    # not serving, every point that needed it was BLOCKED, and the round
+    # was over.  The round now gets **one** more look:
+    #
+    #   1. bring the service back (``ensure``) and probe it — the same
+    #      three gates a per-point recovery uses: the runtime says it is
+    #      ready, the port accepts a connection, the health URL answers;
+    #   2. only if it is healthy, re-run the points the environment
+    #      blocked;
+    #   3. at most once per round.
+    #
+    # If the second look says the same thing, the round is marked
+    # ``environment_blocked`` and the **original evidence is kept** — the
+    # first attempt's record of what happened is the record.
+
+    def _rerun_environment_blocked_vps(
+        self, plan_data: dict, execution_results: dict,
+    ) -> dict:
+        """Re-run, once, the points the environment blocked.
+
+        Returns the execution results the report must be built from —
+        the same dict when there was nothing to re-run.
+        """
+        # ``getattr`` and not a plain attribute: an orchestrator that was
+        # built without ``__init__`` (the round tests build one that way)
+        # never ran the reset, and the flag's absence means "this round
+        # has not spent its re-run yet" — which is what it means.
+        if getattr(self, "_environment_rerun_attempted", False):
+            # One attempt per round.  A second one would buy nothing
+            # but cost: the service is either up by now or it is not.
+            return execution_results
+
+        results = execution_results.get("execution_results") or []
+        blocked = [
+            result for result in results if _is_environment_blocked_result(result)
+        ]
+        if not blocked:
+            return execution_results
+
+        self._environment_rerun_attempted = True
+        blocked_ids = sorted({str(result.get("id")) for result in blocked})
+        logger.warning(
+            "[verification] %d verification point(s) were blocked by the "
+            "environment (%s); looking at the service once more",
+            len(blocked_ids), ", ".join(blocked_ids),
+        )
+
+        healthy = self._ensure_and_probe_blocked_services(plan_data, blocked_ids)
+        if not healthy:
+            # The second look says the same thing.  The round is blocked
+            # as a whole and the original evidence stays where it is.
+            self._mark_round_environment_blocked(
+                ", ".join(blocked_ids),
+                error=(
+                    "the service was still unreachable after the round's "
+                    "one re-ensure"
+                ),
+            )
+            self._write_environment_blocked_event()
+            self._save_execution_results(execution_results)
+            return execution_results
+
+        rerun = self._dispatch_vps_again(blocked_ids)
+        if not rerun:
+            return execution_results
+
+        still_blocked = self._merge_rerun_results(
+            execution_results, rerun, blocked_ids,
+        )
+        if still_blocked:
+            self._mark_round_environment_blocked(
+                ", ".join(still_blocked),
+                error=(
+                    "the service was reachable again, but the re-run still "
+                    "could not reach it"
+                ),
+            )
+            self._write_environment_blocked_event()
+        self._save_execution_results(execution_results)
+        return execution_results
+
+    def _ensure_and_probe_blocked_services(
+        self, plan_data: dict, blocked_ids: List[str],
+    ) -> bool:
+        """Bring the blocked points' services back and probe them.
+
+        ``ensure`` first, probe second — a service that was not asked to
+        come back is not a service the round may talk to, and a service
+        that came back but does not answer is not a service either.
+
+        Returns ``True`` when every service the blocked points need is
+        healthy.  A round that declares no service has nothing to bring
+        back, so it goes straight to the re-run.
+        """
+        if not self._service_declarations:
+            return True
+
+        vps_by_id = {
+            str(vp.get("id")): vp
+            for vp in (plan_data or {}).get("verification_points", []) or []
+            if isinstance(vp, dict)
+        }
+        if not vps_by_id:
+            vps_by_id = {
+                str(vp.get("id")): vp
+                for vp in (getattr(self, "_executor_vps_by_id", None) or {}).values()
+            }
+
+        targets: Dict[str, Any] = {}
+        for vp_id in blocked_ids:
+            vp = vps_by_id.get(vp_id)
+            if vp is None:
+                continue
+            try:
+                targets.update(self._vp_service_targets(vp))
+            except Exception as exc:  # noqa: BLE001 — a probe never aborts
+                logger.warning(
+                    "[verification] could not read the services of %s: %s",
+                    vp_id, exc,
+                )
+        if not targets:
+            # Nothing declared that these points need — there is no
+            # service to bring back, and the points may be blocked for
+            # another reason entirely.
+            return True
+
+        runtime_map = None
+        try:
+            runtime_map = self._ensure_declared_services(targets)
+        except Exception as exc:  # noqa: BLE001 — a failed start is a
+            # failed start, not a reason to take the round down
+            logger.warning(
+                "[verification] the round's re-ensure errored: %s", exc,
+            )
+
+        verdicts = self._adopt_reensure_runtimes("__rerun__", runtime_map)
+        for name, verdict in (verdicts or {}).items():
+            if not verdict.get("accepted"):
+                continue
+            runtime = verdict.get("runtime")
+            port = int(getattr(runtime, "port", 0) or 0)
+            if port:
+                # The service is alive again: it is not a blocked port
+                # any more, and its one failed recovery is spent.
+                self._unblock_service_port(name, port)
+                self._service_reensure_failed.discard(name)
+        self._refresh_resolved_service_placeholders()
+
+        for name, decl in targets.items():
+            port = int(getattr(decl, "port", 0) or 0)
+            if port and not self._service_port_is_live(port):
+                logger.warning(
+                    "[verification] the service %r is still not listening on "
+                    "port %s", name, port,
+                )
+                return False
+            # The one check: the service is asked over the guarded road,
+            # with the same client and the same headers the round's own
+            # precondition uses.  A declaration that names no health URL
+            # is asked nothing — the plan's convention is that such a
+            # service is judged by TCP reachability alone.
+            record = self._service_health_check(decl, port)
+            if record.get("asked") and record.get("status_code") != 200:
+                logger.warning(
+                    "[verification] the health URL of service %r did not "
+                    "answer 200: %s", name,
+                    record.get("error") or record.get("status_code"),
+                )
+                return False
+        return True
+
+    def _dispatch_vps_again(self, vp_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Re-dispatch the given points through the round's own dispatcher.
+
+        The dispatcher is the very closure the executor used, so a
+        re-run is graded by the same rules as the first attempt — the
+        same gates, the same evidence, the same verdicts.
+        """
+        runner = getattr(self, "_vp_dispatch_runner", None)
+        if runner is None:
+            return {}
+        wanted = set(vp_ids)
+        vps = [
+            vp for vp in (getattr(self, "_executor_vps_by_id", None) or {}).values()
+            if str(vp.get("id")) in wanted
+        ]
+
+        async def _dispatch() -> Dict[str, Dict[str, Any]]:
+            verdicts: Dict[str, Dict[str, Any]] = {}
+            for vp in vps:
+                vp_id = str(vp.get("id"))
+                try:
+                    verdict = await runner(vp)
+                except Exception as exc:  # noqa: BLE001 — one point's
+                    # failure must not take the re-run down
+                    logger.warning(
+                        "[verification] the re-run of %s raised: %s",
+                        vp_id, exc,
+                    )
+                    verdict = {
+                        "status": "FAILED",
+                        "reasons": [
+                            f"the re-run raised {type(exc).__name__}: {exc}"
+                        ],
+                        "evidence": {
+                            "exception_type": type(exc).__name__,
+                            "exception_message": str(exc),
+                        },
+                    }
+                if isinstance(verdict, dict):
+                    verdicts[vp_id] = verdict
+            return verdicts
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(_dispatch())
+        import nest_asyncio  # type: ignore
+        nest_asyncio.apply()
+        return asyncio.run(_dispatch())
+
+    def _merge_rerun_results(
+        self, execution_results: dict, rerun: Dict[str, Dict[str, Any]],
+        blocked_ids: List[str],
+    ) -> List[str]:
+        """Fold the re-run's verdicts into the round's results.
+
+        A point the re-run could not reach keeps its **original**
+        entry — the first attempt's evidence is the record of what
+        happened, and a second refusal does not make it more true.
+
+        Returns the ids of the points that are still blocked.
+        """
+        results = execution_results.get("execution_results") or []
+        positions = {
+            str(result.get("id")): index
+            for index, result in enumerate(results)
+            if isinstance(result, dict)
+        }
+        vps_by_id = {
+            str(vp.get("id")): vp
+            for vp in (getattr(self, "_executor_vps_by_id", None) or {}).values()
+        }
+        still_blocked: List[str] = []
+        for vp_id, verdict in rerun.items():
+            new_result = self._project_verdict_to_result(
+                vp_id, verdict, vps_by_id.get(vp_id),
+            )
+            if _is_environment_blocked_result(new_result):
+                still_blocked.append(vp_id)
+                continue
+            index = positions.get(vp_id)
+            if index is None:
+                continue
+            results[index] = new_result
+        if still_blocked:
+            logger.warning(
+                "[verification] the re-run could still not reach the service "
+                "for %s; the original evidence is kept",
+                ", ".join(sorted(still_blocked)),
+            )
+        return sorted(still_blocked)
+
+    # -----------------------------------------------------------------------
+    # The round's own evidence, checked against itself (2026-10-26)
+    # -----------------------------------------------------------------------
+    #
+    # The rationale is at the top of the module: the 02:25 round refused
+    # twelve requests on an address it was simultaneously being served
+    # on, and the framework believed both halves.  The check below is
+    # what the round owes itself before it writes anything down.
+    #
+    # The rule is deliberately narrow, because the failure mode it
+    # guards against is the opposite one: a real defect must never be
+    # re-read as "the environment got in the way".  A point qualifies
+    # only when
+    #
+    #   * its own evidence says the transport never reached the service
+    #     (a refused connection, a name that does not resolve, a socket
+    #     that died — a timeout is excluded, as everywhere else), and
+    #   * the round has evidence of that **same address** being served
+    #     in the same round.
+    #
+    # A qualified point is not a failure and not a pass: it is
+    # ``invalid_env``, and it gets one more look before the report is
+    # built.  What the second look says is what lands.
+
+    def _vps_by_id(self, plan_data: dict) -> Dict[str, dict]:
+        """The round's verification points, by id.
+
+        The plan's own points come first — they are what the round was
+        asked to verify — and the executor's copy fills the gaps.
+        """
+        by_id: Dict[str, dict] = {}
+        for vp in (plan_data or {}).get("verification_points", []) or []:
+            if isinstance(vp, dict) and vp.get("id"):
+                by_id[str(vp["id"])] = vp
+        for vp_id, vp in (getattr(self, "_executor_vps_by_id", None) or {}).items():
+            by_id.setdefault(str(vp_id), vp)
+        return by_id
+
+    def _collect_served_addresses(
+        self, plan_data: dict, execution_results: dict,
+    ) -> Dict[str, Dict[str, Any]]:
+        """The addresses the round has evidence of being **served**.
+
+        Three kinds of witness, in the order they are trusted:
+
+          * a result carrying a ``status_code`` — a response came back,
+            whatever it said (a 500 proves the service was up just as
+            well as a 200 does);
+          * a PASSED point whose own declaration names the address it
+            drove — the ``ui_validation`` case, where the sub-agent
+            drove a browser and the evidence it leaves behind carries
+            no status code of its own.  The verdict is what counts here,
+            not the round-level rewrite that may have replaced it (see
+            :func:`_is_passed_result`);
+          * the round's own probe records — the health URL the round
+            asked, which answers on the very address that refused the
+            verification point.
+
+        Keyed by origin, because that is what a refusal and a success
+        have to agree about.
+        """
+        served: Dict[str, Dict[str, Any]] = {}
+
+        def _remember(url: str, witness: Dict[str, Any]) -> None:
+            origin = _url_origin(url)
+            if not origin:
+                return
+            served.setdefault(origin, dict(witness, url=url))
+
+        results = execution_results.get("execution_results") or []
+
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            evidence = _result_evidence(result)
+            if evidence.get("status_code") is None:
+                continue
+            url = _evidence_url(evidence)
+            if not url:
+                continue
+            _remember(url, {
+                "vp_id": str(result.get("id")),
+                "kind": "response",
+                "status_code": evidence.get("status_code"),
+            })
+
+        vps_by_id = self._vps_by_id(plan_data)
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            if not _is_passed_result(result):
+                continue
+            url = _vp_url(vps_by_id.get(str(result.get("id"))))
+            if not url:
+                continue
+            _remember(url, {
+                "vp_id": str(result.get("id")),
+                "kind": "passed_point",
+            })
+
+        for key, record in (
+            getattr(self, "_service_self_check_records", None) or {}
+        ).items():
+            if not isinstance(record, dict):
+                continue
+            if record.get("status_code") is None:
+                continue
+            url = str(record.get("url") or "")
+            if not url:
+                continue
+            name = key[0] if isinstance(key, tuple) else str(key)
+            _remember(url, {
+                "vp_id": f"service:{name}",
+                "kind": "probe",
+                "status_code": record.get("status_code"),
+            })
+        return served
+
+    def _collect_refused_addresses(
+        self, execution_results: dict,
+    ) -> Dict[str, Dict[str, Any]]:
+        """The addresses the round has evidence of being **refused**.
+
+        A result qualifies when it is a verdict about the point (not
+        ``PASSED``) and when its own evidence says the transport never
+        reached the service.
+
+        A result that carries a ``status_code`` never qualifies: a
+        response came back, which means the transport *did* reach the
+        service and the assertions decided.  That is the same rule the
+        classification layer uses, and for the same reason — the two
+        halves have to agree.
+        """
+        refused: Dict[str, Dict[str, Any]] = {}
+        for result in execution_results.get("execution_results") or []:
+            if not isinstance(result, dict):
+                continue
+            if str(result.get("status") or "") not in ("FAILED", "BLOCKED"):
+                continue
+            if not _result_is_connection_failure(result):
+                continue
+            evidence = _result_evidence(result)
+            url = _evidence_url(evidence)
+            if not url:
+                continue
+            origin = _url_origin(url)
+            if not origin:
+                continue
+            entry = refused.setdefault(origin, {"url": url, "vp_ids": []})
+            vp_id = str(result.get("id"))
+            if vp_id and vp_id not in entry["vp_ids"]:
+                entry["vp_ids"].append(vp_id)
+        return refused
+
+    def _detect_round_evidence_conflicts(
+        self, plan_data: dict, execution_results: dict,
+    ) -> List[Dict[str, Any]]:
+        """The places where the round's own evidence contradicts itself.
+
+        Two kinds, and both are the round disagreeing with itself:
+
+          * one conflict per address: the address that was refused, the
+            points that were refused on it, and the point that was
+            served on it; and
+          * the handovers the dispatch saw — the instance serving an
+            address changed hands while a point was being verified, so
+            the answer that point got belongs to nobody the round can
+            name.
+
+        A third joins them (2026-10-26): the round's **instance epoch**
+        moved — the instance behind the round's own address changed
+        hands between two dispatches — so the points answered under the
+        old epoch were answered by somebody the round cannot name.  It
+        is the same contradiction, seen from the round's side instead of
+        the point's.
+
+        All of them are contradictions of the same kind, so all of them
+        are handled by the same rule: the point is not a verdict about
+        the product, and it gets the round's one second look.
+        """
+        served = self._collect_served_addresses(plan_data, execution_results)
+        refused = self._collect_refused_addresses(execution_results)
+        conflicts: List[Dict[str, Any]] = []
+        for origin, entry in refused.items():
+            witness = served.get(origin)
+            if not witness:
+                continue
+            conflicts.append({
+                "url": entry["url"],
+                "origin": origin,
+                "failed_vps": sorted(entry["vp_ids"]),
+                "succeeded_vp": witness.get("vp_id"),
+                "witness": witness,
+            })
+        conflicts.extend(self._handover_conflicts())
+        conflicts.extend(self._epoch_conflicts())
+        return conflicts
+
+    def _reconcile_round_evidence_conflicts(
+        self, plan_data: dict, execution_results: dict,
+    ) -> dict:
+        """Check the round's evidence against itself, and act on it.
+
+        The contradicted points are marked ``invalid_env`` — a status
+        that says one thing: this is not about the product — and they
+        get **one** more look: the service is re-ensured, probed, and
+        the point is run again by the round's own dispatcher, under the
+        same criteria as the first attempt.  What the second look says
+        is what lands; a failure that survives it may be written down as
+        a failure, and a refusal that survives it is still a refusal —
+        it stays ``invalid_env`` and the round says the environment
+        blocked it.
+
+        At most once per round: a second look at the same evidence buys
+        nothing but cost.
+        """
+        if getattr(self, "_round_evidence_reconciled", False):
+            return execution_results
+
+        conflicts = self._detect_round_evidence_conflicts(
+            plan_data, execution_results,
+        )
+        if not conflicts:
+            return execution_results
+        self._round_evidence_reconciled = True
+
+        for conflict in conflicts:
+            if str(conflict.get("kind") or "") == "instance_handover":
+                before = conflict.get(SERVING_BEFORE_FIELD) or {}
+                after = conflict.get(SERVING_AFTER_FIELD) or {}
+                logger.warning(
+                    "[verification] the instance serving %s changed hands "
+                    "while %s was being verified (boot %s before, boot %s "
+                    "after); the answer is not a verdict about the product",
+                    conflict.get("origin") or conflict.get("url") or "the address",
+                    ", ".join(conflict.get("failed_vps") or []),
+                    before.get("boot_id") or "?",
+                    after.get("boot_id") or "?",
+                )
+            elif str(conflict.get("kind") or "") == EPOCH_CHANGED_CONFLICT_KIND:
+                before = conflict.get("epoch_before") or {}
+                after = conflict.get("epoch_after") or {}
+                logger.warning(
+                    "[verification] the round's instance epoch moved "
+                    "(boot %s before, boot %s after); the answers obtained "
+                    "under the old epoch are not verdicts about the product",
+                    before.get("boot_id") or "?",
+                    after.get("boot_id") or "?",
+                )
+            else:
+                logger.warning(
+                    "[verification] the round's own evidence contradicts itself "
+                    "on %s: %s was refused there while %s was served; the "
+                    "refusal is not a verdict about the product",
+                    conflict.get("origin"),
+                    ", ".join(conflict.get("failed_vps") or []),
+                    conflict.get("succeeded_vp"),
+                )
+            self._safe_log_freshness_event(
+                "__round__",
+                ROUND_EVIDENCE_CONFLICT_EVENT,
+                {
+                    "plan_id": self.plan_dir.name,
+                    "round": self._current_round,
+                    "kind": conflict.get("kind"),
+                    "url": conflict.get("url"),
+                    "origin": conflict.get("origin"),
+                    "failed_vps": conflict.get("failed_vps"),
+                    "succeeded_vp": conflict.get("succeeded_vp"),
+                    "witness": conflict.get("witness"),
+                    SERVING_BEFORE_FIELD: conflict.get(SERVING_BEFORE_FIELD),
+                    SERVING_AFTER_FIELD: conflict.get(SERVING_AFTER_FIELD),
+                },
+            )
+
+        conflicted_ids = self._mark_invalid_env_results(
+            execution_results, conflicts,
+        )
+        if not conflicted_ids:
+            return execution_results
+
+        healthy = self._ensure_and_probe_blocked_services(
+            plan_data, conflicted_ids,
+        )
+        if not healthy:
+            self._mark_round_environment_blocked(
+                ", ".join(conflicted_ids),
+                error=(
+                    "the service was still unreachable after the round's "
+                    "one re-ensure; the contradicted points stay invalid_env"
+                ),
+            )
+            self._write_environment_blocked_event()
+            self._save_execution_results(execution_results)
+            return execution_results
+
+        rerun = self._dispatch_vps_again(conflicted_ids)
+        if not rerun:
+            # There was no dispatcher to give the points a second look
+            # with.  The round therefore still does not know what
+            # happened to them, and it says so.
+            self._mark_round_environment_blocked(
+                ", ".join(conflicted_ids),
+                error=(
+                    "the round had no dispatcher to give the contradicted "
+                    "points a second look with"
+                ),
+            )
+            self._write_environment_blocked_event()
+            self._save_execution_results(execution_results)
+            return execution_results
+
+        still_invalid = self._merge_conflict_rerun_results(
+            execution_results, rerun, conflicted_ids,
+        )
+        if still_invalid:
+            self._mark_round_environment_blocked(
+                ", ".join(still_invalid),
+                error=(
+                    "the service was reachable again, but the re-run still "
+                    "could not produce an answer that belongs to the "
+                    "instance this round started"
+                ),
+            )
+            self._write_environment_blocked_event()
+        self._save_execution_results(execution_results)
+        return execution_results
+
+    def _mark_invalid_env_results(
+        self, execution_results: dict, conflicts: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Mark the contradicted points ``invalid_env``.
+
+        Returns the ids that were marked.
+        """
+        by_vp: Dict[str, Dict[str, Any]] = {}
+        for conflict in conflicts:
+            for vp_id in conflict.get("failed_vps") or []:
+                by_vp[str(vp_id)] = conflict
+
+        results = execution_results.get("execution_results") or []
+        marked: List[str] = []
+        for index, result in enumerate(results):
+            if not isinstance(result, dict):
+                continue
+            vp_id = str(result.get("id"))
+            conflict = by_vp.get(vp_id)
+            if conflict is None:
+                continue
+            if str(result.get("status") or "") == INVALID_ENV:
+                # Already marked — the round's own reconciliation wrote
+                # the marker once.  It is not written twice, but the
+                # point still counts as contradicted: it gets the
+                # round's one second look like every other.
+                marked.append(vp_id)
+                continue
+            results[index] = self._mark_invalid_env(result, conflict)
+            marked.append(vp_id)
+        return sorted(set(marked))
+
+    @staticmethod
+    def _mark_invalid_env(
+        result: Dict[str, Any], conflict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """One contradicted point → the entry that says so.
+
+        The status is the point of the marker: ``invalid_env`` is not a
+        failure and not a pass, it is "the round's own evidence
+        contradicts this one".  Everything else about the entry is kept
+        — the refusal, the address, the point that was served on it — so
+        that a reader can check the claim instead of taking it.
+        """
+        evidence = _result_evidence(result)
+        new_evidence = dict(evidence)
+        original_code = (
+            evidence.get("reason_code") or evidence.get("error_kind")
+        )
+        if original_code and "original_reason_code" not in new_evidence:
+            # The per-point code is kept under its own name — a round
+            # that was blocked as a whole already put one there, and it
+            # says more than the round's own code does.
+            new_evidence["original_reason_code"] = original_code
+        new_evidence["reason_code"] = INVALID_ENV
+        new_evidence["invalid_env"] = True
+        new_evidence["evidence_conflict"] = conflict
+        if not new_evidence.get("url"):
+            new_evidence["url"] = conflict.get("url") or ""
+
+        original_status = result.get("status")
+        if original_status != INVALID_ENV:
+            new_evidence["original_status"] = original_status
+
+        actual = _invalid_env_message(conflict)
+        original_result = str(result.get("actual_result") or "").strip()
+        if original_result:
+            actual = f"{actual}\n(original: {original_result})"
+
+        marked = {
+            "id": result.get("id"),
+            "status": INVALID_ENV,
+            "actual_result": actual,
+            "evidence": json.dumps(new_evidence, ensure_ascii=False),
+        }
+        reasons = result.get("reasons")
+        if reasons:
+            marked["reasons"] = list(reasons)
+        return marked
+
+    def _merge_conflict_rerun_results(
+        self, execution_results: dict, rerun: Dict[str, Dict[str, Any]],
+        conflicted_ids: List[str],
+    ) -> List[str]:
+        """Fold the second look's verdicts into the round's results.
+
+        A verdict that is about the **product** replaces the entry — the
+        second look is the one that counts.  A verdict that is about the
+        **plumbing** (the service was still not there) leaves the entry
+        where it is: ``invalid_env``, because a second refusal does not
+        make the first one a product defect.
+
+        A second look that found the address in **another pair of hands**
+        is the plumbing case too: the answer still cannot be attributed
+        to the instance the round started, so the point stays
+        ``invalid_env`` — it is not a verdict about the product, and it
+        is not one about the product just because the look was repeated.
+
+        Returns the ids that are still ``invalid_env``.
+        """
+        results = execution_results.get("execution_results") or []
+        positions = {
+            str(result.get("id")): index
+            for index, result in enumerate(results)
+            if isinstance(result, dict)
+        }
+        vps_by_id = {
+            str(vp.get("id")): vp
+            for vp in (getattr(self, "_executor_vps_by_id", None) or {}).values()
+        }
+        still_invalid: List[str] = []
+        still_handover: List[str] = []
+        for vp_id, verdict in rerun.items():
+            new_result = self._project_verdict_to_result(
+                vp_id, verdict, vps_by_id.get(vp_id),
+            )
+            if _result_serving_handover(new_result):
+                # The second look found the address in another pair of
+                # hands.  The answer still cannot be attributed, so the
+                # point stays ``invalid_env``.
+                still_handover.append(vp_id)
+                still_invalid.append(vp_id)
+                continue
+            if (
+                _is_environment_blocked_result(new_result)
+                or _result_is_connection_failure(new_result)
+            ):
+                # The second look found the service still not there.  A
+                # second refusal does not make the first one a product
+                # defect, so the point stays ``invalid_env``.
+                still_invalid.append(vp_id)
+                continue
+            index = positions.get(vp_id)
+            if index is None:
+                continue
+            results[index] = new_result
+        if still_handover:
+            logger.warning(
+                "[verification] the second look found the address in another "
+                "pair of hands for %s; they stay %s",
+                ", ".join(sorted(still_handover)), INVALID_ENV,
+            )
+        still_refused = sorted(set(still_invalid) - set(still_handover))
+        if still_refused:
+            logger.warning(
+                "[verification] the second look could still not reach the "
+                "service for %s; they stay %s",
+                ", ".join(still_refused), INVALID_ENV,
+            )
+        return sorted(set(still_invalid))
+
+    def _project_verdict_to_result(
+        self, vp_id: str, verdict: dict, vp: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        """One executor verdict → the legacy ``execution_results`` entry."""
+        status = verdict.get("status", "FAILED")
+        actual_result = verdict.get("actual_result")
+        if actual_result is None or actual_result == "":
+            reasons = verdict.get("reasons", []) or []
+            if isinstance(reasons, list):
+                actual_result = "\n".join(str(reason) for reason in reasons)
+            else:
+                actual_result = str(reasons)
+        evidence = verdict.get("evidence", "")
+        if not isinstance(evidence, str):
+            evidence = json.dumps(evidence, ensure_ascii=False)
+        evidence = self._enrich_evidence_with_address(str(vp_id), evidence, vp)
+        return {
+            "id": vp_id,
+            "status": status,
+            "actual_result": actual_result,
+            "evidence": evidence,
+        }
+
+    def _save_execution_results(self, execution_results: dict) -> None:
+        """Write the round's results back to SQLite — best effort.
+
+        The report is built from the dict in memory, so this is not on
+        the critical path; it is here so a reader that comes along
+        later (the next round's resume, the bridge UI) sees the same
+        results the report was built from.
+        """
+        # ``getattr`` for the same reason as elsewhere in this module: an
+        # orchestrator built without ``__init__`` has no repository, and
+        # "no repository" means "nothing to write to".
+        if getattr(self, "verif_repo", None) is None:
+            return
+        try:
+            self.verif_repo.save_execution_results(
+                self.plan_dir.name, execution_results,
+            )
+        except Exception:  # noqa: BLE001 — a write failure is not a
+            # reason to fail the round
+            pass
 
     # ------------------------------------------------------------------
     # api_test — the service guard
@@ -5384,10 +8947,32 @@ class Orchestrator:
                     else:
                         report_data["overall_status"] = "PASSED"
 
+                # 2026-10-25 (repair-r1-32): the accounting of the
+                # environment-blocked entries.  It runs **after** every
+                # verdict correction above, so it has the last word on
+                # the round's verdict: a point the environment stopped
+                # is kept in the report and annotated, but it is not a
+                # failure and it does not make the round red.  A genuine
+                # failure is not touched.
+                report_data = self._exclude_environment_blocked_from_failures(
+                    report_data, execution_results,
+                )
+
                 # Add metadata
                 report_data["generated_at"] = datetime.now().isoformat()
                 report_data["plan_id"] = self.plan_dir.name
                 report_data["project_dir"] = str(self.project_dir)
+                # 2026-10-25 (repair-r1-26): the report says out loud
+                # when the round was about the environment rather than
+                # about the product.  The upper layer reads this to
+                # decide between re-running the round and repairing the
+                # product — and the answer must not depend on reading
+                # twelve identical reasons.
+                if self._environment_blocked:
+                    report_data["environment_blocked"] = True
+                    report_data["environment_blocked_reason"] = (
+                        self._environment_blocked_summary()
+                    )
 
                 # Compute execution_profile (static budget projection
                 # consumed by the bridge UI). The profile mirrors
@@ -5747,6 +9332,29 @@ class Orchestrator:
         # BLOCKED verdicts on the affected VPs.
         self._preflight_service_freshness(plan_data)
 
+        # 2026-10-25 (repair-r1-33): the services are up — now ask
+        # whether they may be **used** at all.  The round's service
+        # preflight is asked here, before the executor dispatches
+        # anything, so a round whose services are not there spends no
+        # verification point on a connection refusal.  A round that is
+        # refused produces **no** verdict about the product: it is
+        # BLOCKED, and it says so.
+        preflight_failure = self._run_round_service_preflight()
+        if preflight_failure is not None:
+            report = self._build_preflight_blocked_report(preflight_failure)
+            try:
+                self.persistence.update_report(report)
+            except Exception as exc:  # noqa: BLE001 - a report is a nicety
+                logger.warning(
+                    "[verification_preflight] could not write the blocked "
+                    "report: %s", exc,
+                )
+            print(
+                f"[Verification] Round blocked before dispatch: "
+                f"{report['summary']}"
+            )
+            return report
+
         # 2026-09-18 C2：服务已经由 preflight 起好并登记，这里把 VP 命令里的
         # ``{{svc.<name>.<field>}}`` 展开成真实地址再交给执行器。替换只在
         # 内存里做——磁盘上的计划保留占位符，每轮重新解析，避免换端口后
@@ -5820,6 +9428,30 @@ class Orchestrator:
             execution_results = self._build_failure_execution_results(
                 plan_data, exc
             )
+
+        # 2026-10-26: the round checks its **own** evidence before it
+        # writes anything down.  A connection-class failure whose
+        # address was served in the same round is not a verdict about
+        # the product: it is marked ``invalid_env`` and given one more
+        # look — the service is re-ensured, probed, and the point is run
+        # again by the round's own dispatcher.  What the second look
+        # says is what lands.
+        #
+        # This runs **before** the environment-blocked re-run below, and
+        # that order is load-bearing: a contradicted point is taken out
+        # of the environment-blocked set by being marked ``invalid_env``,
+        # so it gets exactly one second look — this one — instead of two.
+        execution_results = self._reconcile_round_evidence_conflicts(
+            plan_data, execution_results,
+        )
+
+        # 2026-10-25 (repair-r1-32): the round's one automatic re-run.
+        # The points the environment blocked get one more look — the
+        # service is brought back and probed, and only if it is healthy
+        # are they run again.  At most once per round.
+        execution_results = self._rerun_environment_blocked_vps(
+            plan_data, execution_results,
+        )
 
         # Step 3: Phase 3 LLM.
         report = self.generate_verification_report(execution_results)
@@ -5933,13 +9565,26 @@ class Orchestrator:
         agent's other entry points are not affected.
         """
         executor_plan = self._convert_plan_to_executor_schema(plan_data)
+        # 2026-10-24: the executor's VPs are where a service's new
+        # address is written when a per-VP recovery had to move it
+        # (see ``_refresh_resolved_service_placeholders``).  These are
+        # the very dicts the executor dispatches, so writing into them
+        # is what the next VP reads.
+        self._executor_vps_by_id = {
+            str(vp.get("id")): vp for vp in executor_plan.get("vps", [])
+        }
+
         #: The plan file's own definitions — the authority on what a
         #: verification point is.  Read once per round: Phase 1 has already
         #: written the file by the time the executor is built, and the
         #: round's plan does not change under it.
         plan_definitions = self._plan_vp_definitions()
 
-        async def _sub_agent_runner(vp_node: dict) -> dict:
+        async def _dispatch_vp(vp_node: dict) -> dict:
+            # 2026-10-25 (repair-r1-32): the round keeps its own
+            # dispatcher, so the one automatic re-run of the points the
+            # environment blocked is graded by exactly the rules the
+            # first attempt used — the same gates, the same evidence.
             vp = dict(vp_node)
             vp_id = str(vp.get("id", "unknown"))
             # 2026-10-24（VP-031）：**分派前**先问"这条验证点有判据吗"。
@@ -5958,6 +9603,13 @@ class Orchestrator:
                     vp_id, VP_DEFINITION_MISSING_SIGNAL, {"gaps": _gaps},
                 )
                 return self._build_vp_definition_blocked_verdict(vp_id, _gaps)
+
+            # 2026-10-25 (repair-r1-31): the address this VP is about
+            # to use is recorded **before** anything can block it — a
+            # VP that never got a request out still has to say which
+            # address it would have used, and which instance the round
+            # had bound for it.
+            self._record_vp_address(vp_id, vp)
             # Binary freshness pre-check (runs before every VP).
             # Audit-logged via ``write_verification_point_log`` so the
             # operator can audit stale-binary detection per VP from
@@ -6086,6 +9738,97 @@ class Orchestrator:
             )
             if gate_verdict is not None:
                 return gate_verdict
+
+            # Service liveness (2026-10-24): the round-start preflight
+            # starts the declared services **once**.  A service that
+            # dies after that stays dead for the rest of the round,
+            # and every VP that talks to it is graded on the
+            # connection refusal — ``api_test`` calls that FAILED,
+            # which reads as "the project is broken" when the truth is
+            # "the plumbing died".  Probe the ports this VP is about
+            # to use and bring a dead one back before the VP runs; if
+            # it cannot be brought back, its port joins
+            # ``_blocked_service_ports`` and the gate below says
+            # BLOCKED.
+            verified_services = await self._recover_declared_services(
+                vp_id, vp_node,
+            )
+            # The recovery may have moved a service to a new address,
+            # and the plan's placeholders were re-resolved into the
+            # executor's VP — so the copy is taken *after* it.
+            vp = dict(vp_node)
+            vp_id = str(vp.get("id", "unknown"))
+            # Service-freshness gate (2026-09-16): the round-start
+            # preflight could not bring a service port back to life →
+            # any VP referencing that port is BLOCKED up front rather
+            # than spending a sub-agent on a guaranteed
+            # connection-refused. Ports are matched with the same
+            # extractor the preflight used, so the semantics agree.
+            if self._blocked_service_ports:
+                from service_freshness import extract_service_ports
+                vp_ports = set(extract_service_ports(
+                    {"verification_points": [vp]}, self.project_dir,
+                ))
+                # 2026-09-18 C1: a VP that references a declared service
+                # by name carries no literal port (the placeholder is
+                # resolved at dispatch time), so match on the
+                # declaration table as well — otherwise the one VP that
+                # uses the declaration *correctly* is the one VP the
+                # blocked-port gate cannot see.
+                uses = vp.get("uses_services")
+                if isinstance(uses, list):
+                    for name in uses:
+                        decl = self._service_declarations.get(str(name).lower())
+                        if decl is not None:
+                            vp_ports.add(decl.port)
+                blocked = sorted(vp_ports & self._blocked_service_ports)
+                if blocked:
+                    self._safe_log_freshness_event(
+                        vp_id, "service_freshness_blocked",
+                        {"ports": blocked},
+                    )
+                    return self._build_service_freshness_blocked_verdict(
+                        vp_id, blocked,
+                    )
+            # 2026-10-25 (repair-r1-29): a service the round could not
+            # place has **no address** at all — the port it declares
+            # belongs to somebody else.  The VPs that need such a
+            # service are blocked by **name**: the placeholder naming
+            # it never resolved, so there is no port left to match on
+            # and the blocked-port gate cannot see them.
+            unusable = self._unusable_services()
+            if unusable:
+                hit = sorted(set(unusable) & _vp_service_names(vp))
+                if hit:
+                    ports = sorted(
+                        unusable[name]["port"] for name in hit
+                        if unusable[name]["port"]
+                    )
+                    self._safe_log_freshness_event(
+                        vp_id, "service_unusable_blocked",
+                        {"services": hit, "ports": ports},
+                    )
+                    return self._build_unusable_service_blocked_verdict(
+                        vp_id, hit, ports,
+                    )
+            # 2026-10-26: the ONE service precondition.  It runs here —
+            # after the gates above (which answer "is this port
+            # blocked?" and "could the service be placed at all?") and
+            # before the method branch, so the ``api_test`` path and the
+            # ``ui_validation`` path are gated by the **same** check.
+            #
+            # The recovery above only asked whether the port accepted a
+            # connection; this asks the service itself, over HTTP, with
+            # the request a verification point would send.  The
+            # 2026-10-26 round dispatched twelve api_test points at a
+            # port that was refusing connections while its
+            # ui_validation point was talking to the very same URL
+            # minutes later — two paths, two checks, two answers.
+            blocked = await self.ensure_vp_services_ready(
+                vp_id, vp, verified=verified_services,
+            )
+            if blocked is not None:
+                return blocked
             if "method" in vp and "verification_method" not in vp:
                 vp["verification_method"] = vp["method"]
             # 2026-09-18（VP 判定重构）：api_test 由框架确定性地执行，
@@ -6097,6 +9840,20 @@ class Orchestrator:
             # 结果的直接原因（one run's VP-001）。现在 (请求, 响应, 断言) 决定
             # 判定，跨轮可复现。
             if str(vp.get("verification_method") or "") == "api_test":
+                # 2026-10-24（数据面身份）：端口有人在听、HTTP 回 200，并不
+                # 说明回答的就是本轮起的那个实例 —— 生产那一轮就是这样把
+                # VP 打到了一个空库上。api_test 下发前再取一次 /health/data，
+                # 与预检记录的指纹比对；取不到或对不上就是实例丢失，最多
+                # 重新 ensure 一次，还不行就 BLOCKED（绝不下发请求、绝不记
+                # 成 api_test FAILED）。
+                blocked = await self._guard_api_test_data_plane(vp_id, vp)
+                if blocked is not None:
+                    return blocked
+                # 门禁可能重新起了一个搬了地址的服务，占位符已按新端口
+                # 重新解析进执行器的 VP —— 所以副本在门禁**之后**取。
+                vp = dict(vp_node)
+                if "method" in vp and "verification_method" not in vp:
+                    vp["verification_method"] = vp["method"]
                 return self._run_api_test_vp(vp)
             # 2026-09-18（D2）：Phase 2 的整仓 CI 门禁同理由框架确定性地
             # 执行 —— 判定依据就是仓库 CI 总入口的退出码，没有任何需要
@@ -6136,6 +9893,47 @@ class Orchestrator:
                     vp, await self._run_single_vp_async(vp),
                 ),
             )
+
+        async def _sub_agent_runner(vp_node: dict) -> dict:
+            """One dispatch — with the instance on **both** sides of it.
+
+            2026-10-26: the address a request goes to can change hands
+            while the request is in flight, and the round has to be able
+            to say so.  So the instance serving the address is looked at
+            **before** the dispatch and **after** it, and the two
+            snapshots go into the point's evidence under their contract
+            names.
+
+            A handover is not a verdict about the product: the answer
+            came from an instance the round cannot place.  The verdict's
+            own status is left alone — the executor only accepts the
+            statuses it accepts — but the handover is recorded as one of
+            the round's own contradictions, and the round's reconciliation
+            marks the point ``invalid_env`` and gives it the **one**
+            second look every other contradicted point gets.  What the
+            second look says is what lands.
+            """
+            self._vp_dispatch_runner = _sub_agent_runner
+            vp_id = str(vp_node.get("id", "unknown"))
+            before = self._capture_serving_snapshot(vp_node, vp_id)
+            # 2026-10-26: the round's **instance epoch** is compared
+            # before the request goes out.  A request sent to the wrong
+            # instance measures the wrong data plane, and the verdict it
+            # produces is worse than no verdict at all — it is a
+            # confident statement about somebody else's data.  So the
+            # epoch is checked first: when it moved, the service is
+            # re-ensured and the epoch updated before the dispatch, and
+            # the points answered under the old epoch are recorded as
+            # contradicted (they get the round's one second look).
+            await self.ensure_instance_epoch(
+                vp_id, self._epoch_observation(vp_node, vp_id, before),
+            )
+            token = str(getattr(self, "_instance_epoch_token", "") or "")
+            if token:
+                self._vp_epoch_tokens[vp_id] = token
+            verdict = await _dispatch_vp(vp_node)
+            after = self._capture_serving_snapshot(vp_node, vp_id)
+            return self._apply_serving_handover(vp_id, before, after, verdict)
 
         return VerificationExecutor(
             verification_plan=executor_plan,
@@ -6330,6 +10128,21 @@ class Orchestrator:
         self._service_recovery_locks = {}
         self._service_recovery_outcomes = {}
         self._service_runtime_map = None
+        # 2026-10-25 (repair-r1-22): 本轮的绑定也清 —— 上一轮绑的实例是上一轮
+        # 的事，这一轮的 ensure 会重新绑定。留着不放，这一轮的 VP 就会去上一轮
+        # 的实例。
+        self._service_bindings = {}
+        # 2026-10-24: 本轮「服务起不回来」的账也要清 —— 上一轮起不回来的
+        # 服务，这一轮要重新试一次（服务可能已经被人修好了）。留着不放，
+        # 这一轮的 VP 就直接进 BLOCKED 门禁，连试都不会试。
+        self._service_reensure_failed = set()
+        # 2026-10-26: 同一个道理，服务「自检过」的记录也要清 —— 上一轮
+        # 问过的答案不能替这一轮作答。
+        self._service_self_check_records = {}
+        # 2026-10-25 (repair-r1-24): the round's "could not reach the
+        # service" record starts empty too — a service that was
+        # unreachable last round may be reachable now.
+        self._service_unreachable = {}
         try:
             if self._service_declarations:
                 return self._preflight_declared_services(plan_data)
@@ -6384,6 +10197,13 @@ class Orchestrator:
             round_number=self._current_round,
         )
         self._service_runtime_map = runtime_map
+        # 2026-10-25 (repair-r1-22): 本轮 ensure 产出的实例就是本轮的绑定 ——
+        # VP 的请求地址由它决定，而不是由 runtime map 每次重新推导。map 仍然
+        # 照记（它是"发生过什么"的记录），但它不再决定请求往哪儿发。
+        for name, runtime in (runtime_map.runtimes or {}).items():
+            if self._bind_service_runtime(name, runtime) is None:
+                self._release_service_binding(name)
+
         # 2026-10-24 (repair-r3-16): the reason a service is not up
         # belongs in the event, not only in a log line that dies with the
         # process.  ``to_dict`` buries it under
@@ -6399,6 +10219,14 @@ class Orchestrator:
             {
                 **runtime_map.to_dict(),
                 "unready_details": unready_details,
+            },
+        )
+        self._safe_log_freshness_event(
+            "__preflight__",
+            "service_bindings",
+            {
+                name: binding.to_dict()
+                for name, binding in sorted(self._service_bindings.items())
             },
         )
         print(
@@ -6427,7 +10255,2287 @@ class Orchestrator:
             project_dir=self.project_dir,
             round_number=self._current_round,
         )
+        # 2026-10-24: the services are up — now record **which data
+        # plane** each of them is serving.  The preflight is the only
+        # moment the round knows the instance it started; every later
+        # api_test compares against this fingerprint.
+        self._capture_data_plane_fingerprints()
+        # 2026-10-26: the round's **own** instance — the one its
+        # ``ensure`` just bound.  The round-level handover record is
+        # built from this snapshot and a fresh read at the round's end,
+        # so a reader can tell that the address the round used belonged
+        # to somebody else by the end.
+        self._capture_round_serving_snapshot()
+        # 2026-10-26: the round names the instance it is asking, before
+        # it dispatches anything.  From here on every dispatch is
+        # compared against this name, and a name that changed hands is
+        # a contradiction of the round's own evidence.
+        self.round_instance_epoch()
         return runtime_map
+
+    def _capture_round_serving_snapshot(self) -> None:
+        """Record the instance serving the round's own address.
+
+        The round's ``ensure`` has just bound its services, and the
+        preflight has just asked each of them who it is.  The answer
+        the round already holds is the one this record is built from —
+        the service is not asked a second time.
+
+        A service that does not identify itself yields no snapshot —
+        "nobody said" is an answer, and it is not the same as "somebody
+        else said".
+        """
+        observed = getattr(self, "_observed_instances", None) or {}
+        for name in sorted(self._service_bindings):
+            binding = self._service_bindings.get(name)
+            port = getattr(binding, "port", None)
+            if not port:
+                continue
+            instance = observed.get(int(port))
+            if instance is None:
+                continue
+            self._round_serving_port = int(port)
+            self._round_serving_snapshot = _serving_snapshot(instance)
+            return
+
+    # ------------------------------------------------------------------
+    # The round's instance epoch (2026-10-26)
+    # ------------------------------------------------------------------
+    #
+    # "Which instance is this round asking?" is a question the round has
+    # to answer **before** it dispatches anything, and to keep answering
+    # while it dispatches.
+    #
+    # On 2026-10-26 the round asked it too late: a verification point was
+    # refused a connection on port 64469 at 02:25:01, and the round could
+    # not say whether the refusal was about the product or about a
+    # service that had been replaced behind its back.  The criterion the
+    # round was verifying — *the waiting event must be readable* — was
+    # never looked at, because the round never learned who was answering
+    # it.
+    #
+    # So the round names the instance it is asking, once, and compares
+    # that name before every dispatch after it.  A name that changed is
+    # a contradiction of the round's own evidence: the points answered
+    # under the old name are not verdicts about the product, and they
+    # get the round's one second look under the new one.
+
+    def instance_epoch(self) -> Dict[str, Any]:
+        """The round's epoch — the instance whose answers this round accepts.
+
+        Empty when the round has not named an instance yet: either it has
+        no service to ask, or the service does not identify itself.  The
+        empty answer is what the loop's gate reads — a round that cannot
+        say which instance it is asking must not dispatch anything.
+        """
+        epoch = getattr(self, "_instance_epoch", None)
+        return dict(epoch) if isinstance(epoch, dict) else {}
+
+    def round_instance_epoch(self) -> Dict[str, Any]:
+        """The instance the round is asking — named now, or named already.
+
+        The **first** successful read of ``/health/data`` names the
+        epoch; from then on the round keeps the name it has and compares
+        every dispatch against it.  A later read never silently replaces
+        the name: replacing it would throw away the very fact the round
+        needs — that the instance behind its address changed hands.
+
+        So this method names the instance only when the round has not
+        named it yet.  :meth:`establish_instance_epoch` is the operation
+        that (re)names it, and it is called on purpose: at the round's
+        start, and after a re-ensure that brought the service back.
+        """
+        epoch = self.instance_epoch()
+        if epoch:
+            return epoch
+        return self.establish_instance_epoch()
+
+    def _epoch_port(self) -> Optional[int]:
+        """The port the round's epoch is about.
+
+        The round's own address — the one it recorded when it first talked
+        to its own service — is the port the epoch belongs to.  A round
+        that never reached a service falls back to the address it is bound
+        to, because that is the address its verification points will go
+        to.
+        """
+        port = getattr(self, "_round_serving_port", None)
+        if port:
+            return int(port)
+        for name in sorted(getattr(self, "_service_bindings", None) or {}):
+            binding = self._service_bindings.get(name)
+            bound = getattr(binding, "port", None)
+            if bound:
+                return int(bound)
+        for name in sorted(getattr(self, "_service_declarations", None) or {}):
+            decl = self._service_declarations.get(name)
+            declared = getattr(decl, "port", None)
+            if declared:
+                return int(declared)
+        return None
+
+    def _epoch_service_name(self, port: Optional[int]) -> str:
+        """The name of the service the epoch's port belongs to.
+
+        The round may talk to several services; the epoch belongs to the
+        one whose address it was read from.  The name is what the
+        round's re-ensure needs to say which service to bring back.
+        """
+        if not port:
+            return ""
+        for name in sorted(getattr(self, "_service_bindings", None) or {}):
+            binding = self._service_bindings.get(name)
+            if int(getattr(binding, "port", 0) or 0) == int(port):
+                return str(name)
+        for name in sorted(getattr(self, "_service_declarations", None) or {}):
+            decl = self._service_declarations.get(name)
+            try:
+                declared = int(getattr(decl, "port", 0) or 0)
+            except (TypeError, ValueError):
+                declared = 0
+            if declared == int(port):
+                return str(name)
+        return ""
+
+    def _epoch_serving_instance(self) -> Optional[Dict[str, Any]]:
+        """The instance block the round's own address is served by.
+
+        Read over ``/health/data`` — the same road a verification point's
+        request travels — so the round's idea of who is answering is the
+        service's own statement about itself.
+        """
+        port = self._epoch_port()
+        if not port:
+            return None
+        return _health_data_instance(int(port))
+
+    def _epoch_ensured_token(self) -> str:
+        """The instance the round's **own** ensure produced.
+
+        The round's record of the process it started (or adopted): the
+        binding it holds, or the runtime the service manager reported.
+        It names the instance the round **asked** for — which is not
+        the same as naming the instance that **answered**, and the
+        round never pretends the two are the same.
+
+        It is the second road to a name.  A service that does not speak
+        ``/health/data`` (an application of the project's own, a static
+        preview, a third-party server) cannot say who it is — and the
+        round does not gate it for that, because "not comparable" is
+        not "wrong".  But the round still knows **which** instance it
+        asked for, and that is enough to know that it is not reading an
+        address nobody can account for.
+        """
+        for name in sorted(getattr(self, "_service_bindings", None) or {}):
+            binding = self._service_bindings.get(name)
+            token = str(getattr(binding, "boot_id", "") or "")
+            if token:
+                return token
+        runtimes = getattr(
+            getattr(self, "_service_runtime_map", None), "runtimes", None,
+        ) or {}
+        for name in sorted(runtimes):
+            token = self._runtime_boot_id(runtimes.get(name))
+            if token:
+                return token
+        return ""
+
+    def establish_instance_epoch(self) -> Dict[str, Any]:
+        """Name the instance the round is asking, right now.
+
+        The epoch is read from ``/health/data`` and carries the pid and
+        the boot id — the two facts that tell two runs of the same port
+        apart.  That is the **comparable** part of the epoch: the
+        instance's own statement about itself, which the round can
+        compare with the next statement it gets.
+
+        A service that does not identify itself cannot be compared —
+        "nobody said" is not "somebody else said" — so the comparable
+        part stays empty.  The round still names the instance it asked
+        for, through its own record of the process it started, and that
+        name is what keeps the epoch from being empty: a round that
+        cannot name the instance it is asking would be reading an
+        address whose owner nobody can say.
+        """
+        instance = self._epoch_serving_instance()
+        token = _instance_epoch_token(instance)
+        ensured_token = self._epoch_ensured_token()
+        if not token and not ensured_token:
+            self._instance_epoch = None
+            self._instance_epoch_token = ""
+            self._safe_log_freshness_event(
+                "__preflight__", INSTANCE_EPOCH_EVENT,
+                {
+                    "plan_id": self.plan_dir.name,
+                    "round": self._current_round,
+                    "epoch": None,
+                    "detail": (
+                        "the service did not identify itself and the round "
+                        "has no record of an instance; the round has nobody "
+                        "to ask"
+                    ),
+                },
+            )
+            return {}
+        port = self._epoch_port()
+        epoch = {
+            "service": self._epoch_service_name(port),
+            "port": port,
+            "pid": (
+                instance.get("pid")
+                if isinstance(instance, dict) and instance.get("pid")
+                else None
+            ),
+            "boot_id": str((instance or {}).get("boot_id") or ""),
+            "plans_dir": str((instance or {}).get("plans_dir") or ""),
+            #: The comparable identity — the service's own statement.
+            #: Empty when the service does not identify itself: there is
+            #: nothing to compare, so the round compares nothing.
+            "token": token,
+            #: The instance the round's own ensure produced.  It says
+            #: which instance the round asked for; it does not say that
+            #: this instance answered, and it is never used for that.
+            "ensured_token": ensured_token,
+        }
+        self._instance_epoch = epoch
+        self._instance_epoch_token = token
+        self._safe_log_freshness_event(
+            "__preflight__", INSTANCE_EPOCH_EVENT,
+            {
+                "plan_id": self.plan_dir.name,
+                "round": self._current_round,
+                "epoch": dict(epoch),
+            },
+        )
+        return dict(epoch)
+
+    def _epoch_conflicts(self) -> List[Dict[str, Any]]:
+        """The epoch changes the round has seen.
+
+        ``getattr`` for the same reason as :meth:`_serving_snapshots`: an
+        orchestrator built without ``__init__`` has seen none.
+        """
+        conflicts = getattr(self, "_instance_epoch_conflicts", None)
+        if conflicts is None:
+            conflicts = []
+            self._instance_epoch_conflicts = conflicts
+        return conflicts
+
+    def _stale_epoch_vps(self, token: str) -> List[str]:
+        """The points that were dispatched under *token*.
+
+        They are the points whose answers belong to an instance the round
+        cannot place any more.
+        """
+        tokens = getattr(self, "_vp_epoch_tokens", None) or {}
+        return sorted(
+            str(vp_id)
+            for vp_id, seen in tokens.items()
+            if str(seen or "") == str(token or "")
+        )
+
+    async def ensure_instance_epoch(
+        self, vp_id: str, observed: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Is the instance still the round's?  And what if it is not?
+
+        Called **before** every dispatch.  When the instance behind the
+        round's address changed hands, the round is asking somebody
+        else: the answers obtained so far belong to a process the round
+        cannot place, and the request about to go out would be measured
+        against the wrong data plane.
+
+        So the round re-ensures the service, adopts the new instance and
+        updates its epoch **before** the dispatch goes out — and it
+        records the contradiction, so the points answered under the old
+        epoch are marked ``invalid_env`` and get the round's one second
+        look under the new one.
+
+        Args:
+            vp_id: the point about to be dispatched — it names the
+                contradiction in the round's own log.
+            observed: the instance block the caller has already read
+                (the "before" side of the dispatch).  ``None`` means the
+                caller has no observation, and the round reads one.
+
+        Returns:
+            ``{"changed": bool, "epoch": dict, ...}`` — ``changed`` says
+            whether the instance behind the round's address changed hands.
+        """
+        epoch = self.instance_epoch()
+        token = str(epoch.get("token") or "")
+        if not token and epoch:
+            # The round named the instance it is asking, but the service
+            # does not say who is answering: there is nothing to
+            # compare, so there is nothing to decide.  "Nobody said" is
+            # not "somebody else said".
+            return {"changed": False, "epoch": epoch}
+        if not token:
+            # The round has not named an instance yet: this is the first
+            # successful read of ``/health/data``, and it establishes
+            # the epoch the rest of the round is measured against.
+            epoch = self.establish_instance_epoch()
+            token = str(epoch.get("token") or "")
+            if not token:
+                return {"changed": False, "epoch": dict(epoch)}
+
+        instance = observed
+        if instance is None:
+            instance = self._epoch_serving_instance()
+        current = _instance_epoch_token(instance)
+        if not current or current == token:
+            # "Nobody said" is not "somebody else said": an instance
+            # that does not identify itself is never treated as a
+            # different one.
+            return {"changed": False, "epoch": epoch}
+
+        # The instance changed hands.
+        before = dict(epoch)
+        affected = self._stale_epoch_vps(token)
+        logger.warning(
+            "[verification] the instance serving the round's address "
+            "changed hands before %s was dispatched (boot %s before, boot "
+            "%s after); the answers obtained under the old epoch are not "
+            "verdicts about the product",
+            vp_id, before.get("boot_id") or "?", current,
+        )
+        restored = await self._reensure_epoch_service(before)
+        after = self.establish_instance_epoch() if restored else {}
+        conflict = {
+            "kind": EPOCH_CHANGED_CONFLICT_KIND,
+            "url": self._epoch_url(before),
+            "origin": _url_origin(self._epoch_url(before)),
+            "failed_vps": affected,
+            "succeeded_vp": None,
+            "epoch_before": before,
+            "epoch_after": dict(after),
+            SERVING_BEFORE_FIELD: self._epoch_snapshot(before),
+            SERVING_AFTER_FIELD: self._epoch_snapshot(after),
+        }
+        self._epoch_conflicts().append(conflict)
+        self._safe_log_freshness_event(
+            vp_id, INSTANCE_EPOCH_EVENT,
+            {
+                "plan_id": self.plan_dir.name,
+                "round": self._current_round,
+                "epoch_before": before,
+                "epoch_after": dict(after),
+                "restored": bool(restored),
+                "stale_vps": affected,
+            },
+        )
+        return {
+            "changed": True,
+            "epoch": dict(after),
+            "before": before,
+            "conflict": conflict,
+        }
+
+    def _epoch_observation(
+        self, vp: dict, vp_id: str, snapshot: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """The observation the epoch check may use, if it is the right one.
+
+        The snapshot the dispatch took is about **the point's** address.
+        The epoch is about the round's own address — and in a round that
+        talks to several services those are not the same question.  So
+        the snapshot is only handed over when it was read from the
+        epoch's port; otherwise the epoch check reads its own.
+        """
+        if snapshot is None:
+            return None
+        epoch_port = self._epoch_port()
+        if not epoch_port:
+            return None
+        vp_port = self._serving_port_for_vp(vp, vp_id)
+        if not vp_port or int(vp_port) != int(epoch_port):
+            return None
+        return snapshot
+
+    def _epoch_url(self, epoch: Dict[str, Any]) -> str:
+        """The address the epoch belongs to."""
+        port = epoch.get("port") if isinstance(epoch, dict) else None
+        if not port:
+            return ""
+        return f"http://127.0.0.1:{int(port)}"
+
+    @staticmethod
+    def _epoch_snapshot(epoch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The snapshot shape the round's handover records use."""
+        if not isinstance(epoch, dict) or not epoch:
+            return None
+        return {
+            "pid": epoch.get("pid"),
+            "boot_id": str(epoch.get("boot_id") or ""),
+            "plans_dir": str(epoch.get("plans_dir") or ""),
+            "state_db_inode": None,
+        }
+
+    async def _reensure_epoch_service(self, epoch: Dict[str, Any]) -> bool:
+        """Ask the round's own precondition for the service behind the epoch.
+
+        The round re-ensures through the **one** precondition every
+        verification path shares (:meth:`ensure_service_ready`): the
+        same port probe, the same start attempt, the same HTTP
+        self-check.  That is deliberate, and it is what keeps the two
+        questions apart:
+
+          * a service the round itself **restarted** is adopted — the
+            expectation follows it, exactly as it follows a service the
+            round brought back in any other way; and
+          * a service that is merely **alive** under a stranger's boot
+            id is not: the round did not start it, so it may not
+            claim it, and the identity gate still refuses to ask it.
+
+        So a port taken over by a stranger leaves the round's
+        expectation where it was — the request is not sent to the
+        stranger — while a service that died is brought back by the
+        round's own start path, and the round's address follows it.
+
+        Returns ``True`` when the service is serving again, so the
+        epoch may be re-read.
+        """
+        name = str(epoch.get("service") or "")
+        declaration = self._service_declarations.get(name)
+        if declaration is None:
+            # The bindings are keyed in lower case, the declarations keep
+            # the name the plan wrote — so the round asks for the
+            # declaration by the name it knows, whatever its case.
+            for key, decl in sorted(self._service_declarations.items()):
+                if str(key).lower() == name.lower():
+                    declaration = decl
+                    name = str(key)
+                    break
+        if declaration is None:
+            return False
+        try:
+            outcome = await asyncio.to_thread(
+                self.ensure_service_ready, declaration,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed start is a fact
+            logger.warning(
+                "[verification] the epoch's re-ensure of service %r "
+                "errored: %s", name, exc,
+            )
+            return False
+        if not outcome.get("ready"):
+            logger.warning(
+                "[verification] the epoch's re-ensure of service %r did "
+                "not bring it back: %s", name,
+                outcome.get("detail") or "no detail",
+            )
+            return False
+        # The service may have come back **somewhere else**: the round's
+        # own address follows it, and the epoch is read there.
+        binding = self._service_bindings.get(name.lower())
+        new_port = int(getattr(binding, "port", 0) or 0)
+        if new_port and new_port != int(epoch.get("port") or 0):
+            self._round_serving_port = new_port
+        return True
+
+    # ------------------------------------------------------------------
+    # Data-plane identity (2026-10-24)
+    # ------------------------------------------------------------------
+    #
+    # "Something is listening on the port" and "the thing listening is
+    # the instance this round started, reading the fixture this round
+    # seeded" are two different questions.  The 2026-10-24 production
+    # round was graded on the first one: the port was busy, the HTTP
+    # answer was 200 with ``status: ok``, and the data behind it was
+    # another database — ``/health/data`` reported 0 routing rows and
+    # every later assertion ran against an empty one.
+    #
+    # The round therefore identifies an instance by its **data plane**:
+    # the port it listens on, the pid behind it, and the number of
+    # ``plan_routing`` rows its ``/health/data`` reports — read over
+    # the very same HTTP path an ``api_test`` VP uses, because a probe
+    # that took a different road could answer a different question than
+    # the VP's request does.
+
+    def _capture_data_plane_fingerprints(self) -> Dict[str, Any]:
+        """Record which data plane each declared service is serving.
+
+        Called once, at the end of the round-start preflight — the
+        moment the round knows which instance it started.  A service
+        that does not answer ``/health/data`` (a project with no data
+        plane of its own) is **not** recorded and is therefore never
+        gated: not knowing the data plane is not the same as knowing
+        it is wrong.
+
+        Never raises — a probe that fails is a service that is not
+        recorded, not a broken preflight.
+        """
+        from service_freshness import expected_routing_rows, probe_data_plane
+
+        expected: Optional[int] = None
+        try:
+            # The fixture is the state database the round's own service
+            # reads; its row count is what "the right data plane"
+            # means.
+            expected = expected_routing_rows()
+        except Exception as exc:  # noqa: BLE001 - defensive
+            logger.warning(
+                "[data_plane] could not read the fixture's row count: %s", exc,
+            )
+        try:
+            effective = self._effective_declarations()
+        except Exception as exc:  # noqa: BLE001 - defensive
+            logger.warning(
+                "[data_plane] could not read the effective declarations: %s",
+                exc,
+            )
+            effective = self._service_declarations
+
+        fingerprints: Dict[str, Any] = {}
+        for name, decl in sorted(effective.items()):
+            try:
+                port = int(decl.port)
+            except (TypeError, ValueError):
+                continue
+            try:
+                fingerprint = probe_data_plane(port, expected_rows=expected)
+            except Exception as exc:  # noqa: BLE001 - a probe never raises
+                logger.warning(
+                    "[data_plane] could not probe service %s on port %s: %s",
+                    name, port, exc,
+                )
+                continue
+            if not fingerprint.answered:
+                # Not an error: a service that does not speak
+                # ``/health/data`` has no data plane to compare, so it
+                # is never gated.
+                logger.info(
+                    "[data_plane] service %s on port %s did not answer "
+                    "/health/data (%s); it is not data-plane gated",
+                    name, port,
+                    fingerprint.error or fingerprint.status or "no answer",
+                )
+                continue
+            fingerprints[name] = fingerprint
+            # 2026-10-25: the round now also records **which instance**
+            # that is — the ``instance`` block the service publishes
+            # about itself.  The fingerprint says "which data plane";
+            # the block says "which process".  A service that does not
+            # publish one is left alone: nothing to compare, nothing to
+            # gate.
+            self._record_service_instance_identity(name, port)
+        self._data_plane_fingerprints = fingerprints
+        if fingerprints:
+            self._safe_log_freshness_event(
+                "__preflight__", "data_plane_fingerprints",
+                {
+                    name: fingerprint.to_dict()
+                    for name, fingerprint in fingerprints.items()
+                },
+            )
+        return fingerprints
+
+    # ------------------------------------------------------------------
+    # The identity of the instance a request is about to reach
+    # ------------------------------------------------------------------
+
+    def _record_service_instance_identity(self, name: str, port: int) -> None:
+        """Remember which instance answered for *name* on *port*.
+
+        The block is fetched over the very road a VP's request travels.
+        A service that publishes none is **forgotten** rather than
+        remembered as empty: a stale expectation is worse than none,
+        because it would block a VP against an instance the round
+        itself has just started.
+        """
+        key = str(name).lower()
+        instance = _health_data_instance(port)
+        if instance is None:
+            self._service_instance_identity.pop(key, None)
+            self._observed_instances.pop(int(port), None)
+            return
+        self._service_instance_identity[key] = instance
+        # 2026-10-25 (repair-r1-31): the block is also the round's
+        # **observation** of that address — "who is listening here".
+        # The evidence of every VP that talks to the port quotes it,
+        # instead of making the service answer a second question.
+        self._observed_instances[int(port)] = instance
+
+    def _expected_plans_dirs(self) -> List[str]:
+        """The plans trees this round's service may be serving.
+
+        The service publishes the plans **root** it serves; the round
+        lives in ``<root>/<plan_id>``, so the root the round expects is
+        the plan directory's parent.  The plan directory itself is
+        accepted as well — a deployment that serves the round's plan
+        directory as its own root is serving the round's plans either
+        way.
+
+        The first entry is the *primary* expectation (the plans root);
+        the second is the tolerated alternative.
+        """
+        dirs: List[str] = []
+        for candidate in (self.plan_dir.parent, self.plan_dir):
+            try:
+                resolved = str(Path(candidate).resolve())
+            except OSError:  # pragma: no cover - defensive
+                resolved = str(candidate)
+            if resolved not in dirs:
+                dirs.append(resolved)
+        return dirs
+
+    def _expected_state_db_inode(self) -> Optional[int]:
+        """The inode of the state database **this process** has open.
+
+        The round runs inside the backend, and the backend reads the
+        state database through
+        :func:`config_paths.resolve_state_db_path`.  A service reading
+        a *different* file — the same path with another inode — is a
+        different data plane, and no amount of ``200 OK`` makes the two
+        the same.
+        """
+        try:
+            from config_paths import resolve_state_db_path
+
+            return int(resolve_state_db_path().stat().st_ino)
+        except Exception:  # noqa: BLE001 - no database, no verdict
+            return None
+
+    @staticmethod
+    def _observed_state_db_inode(instance: Dict[str, Any]) -> Optional[int]:
+        """The inode of the database the answering instance reads.
+
+        The instance publishes the inode of **its own** database, and
+        that is the authoritative number: the path it names may live
+        somewhere this process cannot stat (another container, another
+        mount).  The published inode is preferred; the path is only
+        stat'ed when the instance did not publish one.
+
+        The body is the module-level helper, so the round's own
+        comparison and the serving snapshot cannot drift apart.
+        """
+        return _instance_state_db_inode(instance)
+
+    def _service_instance_mismatch(
+        self, name: str, decl: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Is the instance answering for *name* still the round's own?
+
+        ``None`` when it is — or when there is nothing to compare.  A
+        service that publishes no ``instance`` block is not gated, and
+        neither is a field the service did not answer: "not comparable"
+        is not "wrong".
+
+        The three comparisons catch three different ways of being on
+        the wrong instance:
+
+          * **boot id** — the round's ``ensure`` recorded the instance
+            it started; a different boot id is a different process
+            (something restarted the service behind the round's back,
+            or a stranger took the port);
+          * **plans tree** — the instance serves another tree, so what
+            it answers about is not this round's plan;
+          * **state database inode** — the same path with another
+            inode is another file, i.e. another data plane.
+        """
+        try:
+            port = int(getattr(decl, "port", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if not port:
+            return None
+        actual = _health_data_instance(port)
+        if actual is None:
+            return None
+        return self._compare_service_instance(name, actual, port)
+
+    def _compare_service_instance(
+        self, name: str, actual: Dict[str, Any], port: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Compare the instance that answered with the round's own.
+
+        The body of the comparison, split out of
+        :meth:`_service_instance_mismatch` so the round's service
+        preflight asks **exactly** the question the dispatch asks and
+        gets exactly the same answer — one comparison, one meaning.
+        """
+        # 2026-10-25 (repair-r1-31): this block was read **right before
+        # the request** — it is the freshest statement about who is
+        # listening on that port, and the evidence of the VP quotes it
+        # as the answering instance.
+        self._observed_instances[int(port)] = actual
+
+        recorded = self._service_instance_identity.get(str(name).lower()) or {}
+        expected_dirs = self._expected_plans_dirs()
+        expected_plans_dir = expected_dirs[0] if expected_dirs else ""
+        actual_plans_dir = str(actual.get("plans_dir") or "")
+        expected_boot_id = str(recorded.get("boot_id") or "")
+        actual_boot_id = str(actual.get("boot_id") or "")
+
+        mismatched: List[str] = []
+        reasons: List[str] = []
+
+        if expected_boot_id and actual_boot_id and expected_boot_id != actual_boot_id:
+            mismatched.append("boot_id")
+            reasons.append(
+                f"boot id {actual_boot_id!r} instead of {expected_boot_id!r}"
+            )
+
+        if actual_plans_dir and not any(
+            self._same_path(actual_plans_dir, candidate)
+            for candidate in expected_dirs
+        ):
+            mismatched.append("plans_dir")
+            reasons.append(
+                f"plans tree {actual_plans_dir!r} instead of "
+                f"{expected_plans_dir!r}"
+            )
+
+        expected_inode = self._expected_state_db_inode()
+        observed_inode = self._observed_state_db_inode(actual)
+        if (
+            expected_inode is not None
+            and observed_inode is not None
+            and observed_inode != expected_inode
+        ):
+            mismatched.append("state_db_inode")
+            reasons.append(
+                f"state database inode {observed_inode} instead of "
+                f"{expected_inode}"
+            )
+
+        if not mismatched:
+            return None
+        return {
+            "service": str(name).lower(),
+            "port": port,
+            "mismatched_fields": mismatched,
+            "reasons": reasons,
+            "expected_boot_id": expected_boot_id,
+            "actual_boot_id": actual_boot_id,
+            "expected_plans_dir": expected_plans_dir,
+            "actual_plans_dir": actual_plans_dir,
+            "expected_state_db_inode": expected_inode,
+            "actual_state_db_inode": observed_inode,
+        }
+
+    # ------------------------------------------------------------------
+    # The round's service preflight (2026-10-25, repair-r1-33)
+    # ------------------------------------------------------------------
+    #
+    # The question "may this round dispatch its verification points at
+    # all?" belongs to the verification loop.  The facts the answer
+    # needs — the round's services, the address each one is at, and the
+    # identity each one is expected to answer with — belong to the
+    # agent.  The two meet through a hook: the loop installs it, the
+    # agent calls it right after the round-start preflight has brought
+    # the services up, and before the first verification point is
+    # dispatched.
+    #
+    # The order is load-bearing.  The services are only there — and
+    # only identified — **after** the round's own preflight has
+    # ensured them, so a preflight placed before it would compare the
+    # round against an instance it has not started yet.
+
+    def set_round_service_preflight(
+        self, hook: Optional[Callable[[], Optional[Dict[str, Any]]]],
+    ) -> None:
+        """Install the round's service preflight.
+
+        *hook* is called once per round, after the round-start
+        preflight has brought the services up and before the first
+        verification point is dispatched.  It returns ``None`` when the
+        round may run, or a failure record (``service``, ``port``,
+        ``pid``, ``error_kind``, ``detail``) when it may not.
+        """
+        self._round_service_preflight = hook
+
+    def _run_round_service_preflight(self) -> Optional[Dict[str, Any]]:
+        """Ask the round's preflight whether this round may run.
+
+        ``None`` when no preflight is installed, or when the preflight
+        says the round may run.
+
+        A preflight that **could not answer** is not a round that may
+        run: the round could not establish that its services are
+        usable, and the honest answer to "may this round dispatch its
+        verification points" is no.  Failing closed here is what keeps
+        a broken gate from turning into a round full of connection
+        refusals — which is the very thing this gate exists to stop.
+        """
+        # ``getattr`` and not a plain attribute: an orchestrator that was
+        # built without ``__init__`` (the round tests build one that way)
+        # never installed a preflight, and "no preflight" means "this
+        # round runs as it always did" — which is what it means.  The
+        # same reading this module gives ``_executor_vps_by_id``,
+        # ``_vp_dispatch_runner`` and ``verif_repo``.
+        hook = getattr(self, "_round_service_preflight", None)
+        if hook is None:
+            return None
+        try:
+            failure = hook()
+        except Exception as exc:  # noqa: BLE001 - a broken gate blocks
+            logger.warning(
+                "[verification_preflight] the round's service preflight "
+                "raised (%s: %s); the round is blocked",
+                type(exc).__name__, exc,
+            )
+            return {
+                "service": "",
+                "port": 0,
+                "pid": None,
+                "error_kind": "preflight_error",
+                "detail": (
+                    f"the round's service preflight raised: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+        if failure is None:
+            return None
+        if not isinstance(failure, dict):
+            logger.warning(
+                "[verification_preflight] the round's service preflight "
+                "returned %s instead of a failure record; the round is blocked",
+                type(failure).__name__,
+            )
+            return {
+                "service": "",
+                "port": 0,
+                "pid": None,
+                "error_kind": "preflight_error",
+                "detail": (
+                    "the round's service preflight returned no usable "
+                    "failure record"
+                ),
+            }
+        return failure
+
+    def service_preflight_targets(self) -> List[Dict[str, Any]]:
+        """The services this round is about to use, and who they must be.
+
+        One record per service the round is going to talk to:
+
+          * ``service`` — the name;
+          * ``port`` — the address the round is bound to;
+          * ``pid`` — the process behind that address, when the round
+            knows it;
+          * ``health_url`` — where to ask whether it is alive;
+          * ``expected_identity`` — the ``instance`` block the round
+            recorded when it started the service.
+
+        The identity is the *expectation*.  A service that publishes no
+        block is never gated: there is nothing to compare, and "not
+        comparable" is not "wrong".
+        """
+        targets: List[Dict[str, Any]] = []
+        try:
+            effective = self._effective_declarations()
+        except Exception:  # pragma: no cover - defensive
+            effective = self._service_declarations
+        for name, decl in sorted(effective.items()):
+            key = str(name).lower()
+            try:
+                port = int(getattr(decl, "port", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if not port:
+                continue
+            binding = self._service_bindings.get(key)
+            pid = (
+                getattr(binding, "pid", None)
+                if binding is not None
+                else None
+            )
+            if pid is None:
+                runtimes = (
+                    getattr(self._service_runtime_map, "runtimes", None) or {}
+                )
+                runtime = runtimes.get(key)
+                if runtime is not None:
+                    pid = getattr(runtime, "pid", None)
+            health_url = str(getattr(decl, "health_url", "") or "")
+            if not health_url:
+                health_url = f"http://127.0.0.1:{port}/health"
+            targets.append({
+                "service": key,
+                "port": port,
+                "pid": pid,
+                "health_url": health_url,
+                "expected_identity": dict(
+                    self._service_instance_identity.get(key) or {},
+                ),
+            })
+        return targets
+
+    def service_declaration(self, name: str) -> Optional[Any]:
+        """The declaration of the service *name*, as this round runs it.
+
+        The **effective** declaration: the plan's, with the port the
+        round's own instance really listens on.  The round-level gate
+        in the verification loop asks about a service by name, and this
+        is where the name is turned into the declaration the shared
+        precondition needs — so the loop and the per-verification-point
+        gate look at the same address.
+        """
+        key = str(name or "").lower()
+        try:
+            effective = self._effective_declarations()
+        except Exception:  # pragma: no cover - defensive
+            effective = self._service_declarations
+        return effective.get(key) or self._service_declarations.get(key)
+
+    def reensure_preflight_service(
+        self, name: str, port: int,
+    ) -> Dict[str, Any]:
+        """Bring one service back, and say whether it came.
+
+        The round's **one** attempt at a service that is not there: the
+        project is asked to start it once more, and the result goes
+        through the same adoption gates a per-VP recovery uses — a
+        runtime that says the service is ready is not enough, the port
+        has to accept a connection and the health URL has to answer.
+
+        Returns ``{"restored": bool, "port": int, "pid": int | None,
+        "detail": str}``.
+        """
+        key = str(name).lower()
+        try:
+            effective = self._effective_declarations()
+        except Exception:  # pragma: no cover - defensive
+            effective = self._service_declarations
+        decl = effective.get(key) or self._service_declarations.get(key)
+        if decl is None:
+            return {
+                "restored": False,
+                "port": int(port),
+                "pid": None,
+                "detail": f"the round has no declaration for service {key!r}",
+            }
+        try:
+            runtime_map = self._ensure_declared_services({key: decl})
+        except Exception as exc:  # noqa: BLE001 - a failed re-ensure blocks
+            return {
+                "restored": False,
+                "port": int(port),
+                "pid": None,
+                "detail": (
+                    f"the re-ensure of {key!r} raised: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+        verdicts = self._adopt_reensure_runtimes("__preflight__", runtime_map)
+        verdict = verdicts.get(key) or {}
+        runtime = verdict.get("runtime")
+        if not verdict.get("accepted"):
+            return {
+                "restored": False,
+                "port": int(port),
+                "pid": None,
+                "detail": str(
+                    verdict.get("detail") or "the service did not come back",
+                ),
+            }
+        return {
+            "restored": True,
+            "port": int(getattr(runtime, "port", port) or port),
+            "pid": getattr(runtime, "pid", None),
+            "detail": "",
+        }
+
+    def probe_service_liveness(self, port: int) -> bool:
+        """Does a TCP connection to *port* succeed?"""
+        return _tcp_reachable(int(port))
+
+    def probe_service_health(self, health_url: str) -> bool:
+        """Does *health_url* answer 200 when asked with the request header?
+
+        The header is the one a verification point's own request carries,
+        so the probe travels the same road the request will travel: a
+        service that would refuse that request is refused here too.
+        """
+        if not health_url:
+            return True
+        return _health_url_answers(health_url)
+
+    def probe_service_instance(
+        self, port: int,
+    ) -> Optional[Dict[str, Any]]:
+        """The ``instance`` block the service on *port* publishes.
+
+        ``None`` when the service does not answer, does not answer with
+        JSON, or answers without an ``instance`` block.
+        """
+        return _health_data_instance(int(port))
+
+    def service_identity_mismatch(
+        self, name: str, port: int,
+        observed: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Is the instance answering on *port* still the round's own?
+
+        ``None`` when it is — or when there is nothing to compare.
+
+        *observed* is the block the caller already read; when it is
+        ``None`` the block is read here.
+        """
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return None
+        if not port:
+            return None
+        if observed is None:
+            observed = _health_data_instance(port)
+        if observed is None:
+            return None
+        return self._compare_service_instance(name, observed, port)
+
+    # ------------------------------------------------------------------
+    # The round's service precondition (2026-10-26)
+    # ------------------------------------------------------------------
+    #
+    # The round has **one** precondition, and both the ``api_test`` path
+    # and the ``ui_validation`` path go through it (see
+    # :meth:`ensure_vp_services_ready`).  The round-level gate the
+    # verification loop installs asks the same question through the
+    # same function (see ``verification_loop._run_service_preflight``).
+    #
+    # The 2026-10-26 round had three answers to "is the service there?"
+    # — the ensure said yes, the freshness check said yes (about the
+    # binary, not the port), and the connection said no.  Twelve
+    # verification points were graded on the connection.
+
+    def _round_service_token(self) -> str:
+        """The token this round's services are recorded under.
+
+        The round's service-owner token: the same token the lease
+        carries, the same one the ledger stamps the services with.
+        ``""`` when the plan has no live owner — the ledger then
+        records the service without one, which is what let the reap
+        sweep stop a service the round was still using.
+        """
+        try:
+            service_manager = _load_service_manager(self.project_dir)
+            return str(
+                service_manager.current_service_owner(Path(self.plan_dir)) or ""
+            )
+        except Exception:  # noqa: BLE001 - a token is not worth a failure
+            return ""
+
+    def _start_service_for_round(self, decl: Any) -> Dict[str, Any]:
+        """Bring the service up through the round's own start path.
+
+        The same machinery the round-start preflight uses (the
+        **project's** ``service_manager``), narrowed to this one
+        service, and the same adoption gates a per-VP recovery uses: a
+        runtime that says "ready" is not adopted until the port accepts
+        a connection and the health URL answers.
+
+        The adoption is what moves the round's **binding** — the
+        address the verification points are dispatched to — so a
+        service that came back on another port is reached on that port
+        and not on the one that died.
+        """
+        key = str(getattr(decl, "name", "") or "").lower()
+        try:
+            runtime_map = self._ensure_declared_services({key: decl})
+        except Exception as exc:  # noqa: BLE001 - a failed start is a fact
+            return {
+                "ok": False,
+                "port": int(getattr(decl, "port", 0) or 0),
+                "pid": None,
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+        verdicts = self._adopt_reensure_runtimes("__preflight__", runtime_map)
+        self._refresh_resolved_service_placeholders()
+        verdict = verdicts.get(key) or {}
+        runtime = verdict.get("runtime")
+        if not verdict.get("accepted"):
+            return {
+                "ok": False,
+                "port": int(getattr(decl, "port", 0) or 0),
+                "pid": None,
+                "detail": str(
+                    verdict.get("detail") or "the service did not come back"
+                ),
+            }
+        port = int(getattr(runtime, "port", 0) or 0)
+        return {
+            "ok": True,
+            "port": port,
+            "pid": getattr(runtime, "pid", None),
+            "detail": "",
+            # The adoption gates already asked the service itself; the
+            # precondition reuses that answer instead of asking again.
+            "health_record": self._service_self_check_records.get(
+                (key, port), {},
+            ),
+        }
+
+    def _service_health_check(self, decl: Any, port: int) -> Dict[str, Any]:
+        """Ask the service whether it is alive, over the guarded road.
+
+        The declaration's own health URL — moved to the port the service
+        really answers on — asked with the request guard's header.  A
+        declaration that names no health URL is asked nothing: the
+        plan's convention is that such a service is judged by TCP
+        reachability alone.
+        """
+        name = str(getattr(decl, "name", "") or "").lower()
+        url = _service_health_url(decl, int(port))
+        if not url:
+            url = self._runtime_health_url(name, int(port))
+        if not url:
+            return _service_self_check("")
+        record = _service_self_check(url)
+        self._service_self_check_records[(name, int(port))] = record
+        return record
+
+    def ensure_service_ready(
+        self, decl: Any, plan_dir: Optional[Path] = None,
+        round_token: str = "",
+    ) -> Dict[str, Any]:
+        """The round's own service precondition.
+
+        The round-flavoured wrapper around
+        :func:`ensure_service_ready`: it supplies the project, the
+        round number, the plan and the **project's** service manager,
+        so the service is started by the same code the project ships —
+        and the start goes through the round's adoption gates, so the
+        round's binding follows the service when it comes back
+        somewhere else.
+
+        See :func:`ensure_service_ready` for the three steps and for
+        the shape of the returned record.
+        """
+        token = round_token or self._round_service_token()
+        if round_token:
+            # The round's own token owns the services it starts — and
+            # owns them in the ledger, so the reap sweep leaves them
+            # alone.  Claimed only when nobody else holds the plan.
+            _claim_round_token(
+                _load_service_manager(self.project_dir),
+                Path(self.plan_dir), round_token,
+            )
+        return ensure_service_ready(
+            decl,
+            Path(plan_dir) if plan_dir is not None else Path(self.plan_dir),
+            token,
+            project_dir=Path(self.project_dir),
+            round_number=self._current_round,
+            plan_id=self.plan_dir.name,
+            service_manager=_load_service_manager(self.project_dir),
+            starter=self._start_service_for_round,
+            liveness=self._service_port_is_live,
+            health=self._service_health_check,
+        )
+
+    async def ensure_vp_services_ready(
+        self, vp_id: str, vp: dict,
+        verified: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """The one precondition every verification point shares.
+
+        Both the ``api_test`` path and the ``ui_validation`` path come
+        through here, before the point is dispatched.  A path that had
+        a check of its own is a path that can disagree with the other
+        one — and that disagreement is what cost the 2026-10-26 round
+        its twelve verification points.
+
+        *verified* carries what the round's own recovery has already
+        established for this dispatch — the services it brought back
+        and asked over the guarded road.  Those answers are reused:
+        asking the same service a second time would be a second check,
+        and one check is the point.
+
+        Returns a BLOCKED verdict when the service the point is about
+        to talk to is not serving, or ``None`` when the point may be
+        dispatched.  The verdict is BLOCKED and never FAILED: a refused
+        connection is a statement about the plumbing, not about the
+        product.
+        """
+        targets = self._vp_service_targets(vp)
+        if not targets:
+            return None
+        already = verified or {}
+        blocked: List[Tuple[str, Any, Dict[str, Any]]] = []
+        for key, decl in sorted(targets.items()):
+            reused = already.get(key)
+            if isinstance(reused, dict) and reused.get("ready"):
+                self._safe_log_freshness_event(
+                    vp_id, "service_ready",
+                    {
+                        "service": key,
+                        "port": reused.get("port"),
+                        "status_code": reused.get("status_code"),
+                        "content_type": reused.get("content_type"),
+                        "body_status": reused.get("body_status"),
+                        "reused": True,
+                    },
+                )
+                continue
+            outcome = await asyncio.to_thread(self.ensure_service_ready, decl)
+            if outcome.get("ready"):
+                self._safe_log_freshness_event(
+                    vp_id, "service_ready",
+                    {
+                        "service": key,
+                        "port": outcome.get("port"),
+                        "status_code": outcome.get("status_code"),
+                        "content_type": outcome.get("content_type"),
+                        "body_status": outcome.get("body_status"),
+                    },
+                )
+                continue
+            blocked.append((key, decl, outcome))
+        if not blocked:
+            return None
+
+        ports: List[int] = []
+        for key, decl, outcome in blocked:
+            port = int(outcome.get("port") or getattr(decl, "port", 0) or 0)
+            detail = str(outcome.get("detail") or "")
+            if port:
+                self._block_service_port(key, port, vp_id, None, detail=detail)
+                ports.append(port)
+            self._safe_log_freshness_event(
+                vp_id, "service_not_ready",
+                {
+                    "service": key,
+                    "port": port,
+                    "error_kind": outcome.get("error_kind"),
+                    "detail": detail,
+                },
+            )
+        return self._build_service_freshness_blocked_verdict(
+            vp_id, sorted(set(ports)),
+        )
+
+    def _build_preflight_blocked_report(
+        self, failure: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """The report of a round that could not start.
+
+        A round that dispatched nothing has measured nothing about the
+        product, so it has no verdict to give: the report says
+        ``BLOCKED`` and carries **no** verification results — not an
+        empty ``FAILED``, not a skipped one.  A FAILED verdict would
+        send the repair chain after a product nobody ever looked at.
+        """
+        failure = failure or {}
+        service = str(failure.get("service") or "")
+        port = failure.get("port")
+        error_kind = str(failure.get("error_kind") or "")
+        detail = str(failure.get("detail") or "")
+        where = f"the service {service!r}" if service else "the round's services"
+        if port:
+            where = f"{where} on port {port}"
+        summary = (
+            f"The round dispatched no verification point: {where} was not "
+            f"usable ({error_kind or 'unknown reason'}). {detail}"
+        ).strip()
+        return {
+            "overall_status": "BLOCKED",
+            "verification_results": [],
+            "requirement_deviations": [],
+            "summary": summary,
+            "stop_reason": "service_preflight_failed",
+            "service_preflight_failed": {
+                "service": service,
+                "port": int(port) if port else 0,
+                "pid": failure.get("pid"),
+                "error_kind": error_kind,
+                "detail": detail,
+            },
+            "execution_profile": {"mode": "service_preflight_blocked"},
+        }
+
+    @staticmethod
+    def _same_path(left: str, right: str) -> bool:
+        """Do two paths name the same place?
+
+        Resolved on both sides, because one of them may reach the same
+        directory through a symlink (``/tmp`` → ``/private/tmp`` on
+        macOS) — and the round's plan directory and the service's
+        plans root have to be recognised as the same tree.
+        """
+        if not left or not right:
+            return False
+        try:
+            return Path(left).resolve() == Path(right).resolve()
+        except OSError:  # pragma: no cover - defensive
+            return str(left) == str(right)
+
+    def _build_service_instance_mismatch_verdict(
+        self, vp_id: str, mismatch: Dict[str, Any],
+    ) -> dict:
+        """The verdict for a VP whose service answered as another instance.
+
+        The request is **not** sent: a response from somebody else's
+        instance is a confident verdict about somebody else's data.
+        And the verdict is BLOCKED, never FAILED — FAILED would say
+        "the project answered wrong", and the project was never asked.
+
+        The evidence carries both sides of every comparison — the
+        identity the round expected and the identity that answered —
+        so a reader can tell "the service was restarted behind the
+        round's back" from "the service serves another tree".
+        """
+        service = str(mismatch.get("service") or "")
+        reasons = "; ".join(mismatch.get("reasons") or [])
+        evidence: Dict[str, Any] = {
+            "error_kind": SERVICE_INSTANCE_MISMATCH,
+            "reason_code": SERVICE_INSTANCE_MISMATCH,
+            "service": service,
+            "expected_boot_id": mismatch.get("expected_boot_id"),
+            "actual_boot_id": mismatch.get("actual_boot_id"),
+            "expected_plans_dir": mismatch.get("expected_plans_dir"),
+            "actual_plans_dir": mismatch.get("actual_plans_dir"),
+            "mismatched_fields": list(mismatch.get("mismatched_fields") or []),
+        }
+        return {
+            "status": "BLOCKED",
+            "reasons": [blocked_reason(
+                f"{SERVICE_INSTANCE_MISMATCH} — the instance answering for "
+                f"service {service!r} on port {mismatch.get('port')} is not "
+                f"the instance this round started ({reasons})"
+            )],
+            "actual_result": (
+                f"{SERVICE_INSTANCE_MISMATCH}: the service {service!r} on "
+                f"port {mismatch.get('port')} answered as another instance "
+                f"(boot id {mismatch.get('actual_boot_id') or 'unknown'} "
+                f"instead of {mismatch.get('expected_boot_id') or 'unknown'}; "
+                f"plans tree {mismatch.get('actual_plans_dir') or 'unknown'} "
+                f"instead of {mismatch.get('expected_plans_dir') or 'unknown'}) "
+                f"— so the request was not sent. This verification point is "
+                f"BLOCKED: the project was never asked."
+            ),
+            "evidence": evidence,
+            "framework_checks": [],
+        }
+
+    async def _probe_data_plane(self, decl: Any, recorded: Any) -> Any:
+        """Ask the service on *decl*'s port which data plane it serves.
+
+        ``None`` when the service cannot be asked at all — the same
+        thing the fingerprint records as "no answer", and equally a
+        reason to treat the instance as lost.
+        """
+        from service_freshness import probe_data_plane
+
+        try:
+            port = int(decl.port)
+        except (TypeError, ValueError):
+            return None
+        try:
+            return await asyncio.to_thread(
+                probe_data_plane, port,
+                expected_rows=getattr(recorded, "expected_rows", None),
+            )
+        except Exception as exc:  # noqa: BLE001 - a probe never raises
+            logger.warning(
+                "[data_plane] probe on port %s errored: %s", port, exc,
+            )
+            return None
+
+    async def _guard_api_test_data_plane(
+        self, vp_id: str, vp: dict,
+    ) -> Optional[dict]:
+        """Is the instance this VP is about to talk to still the round's?
+
+        Returns a BLOCKED verdict when the answer is no, ``None`` when
+        the VP may go out.  The check happens **before** the request: a
+        request sent to the wrong instance measures the wrong database,
+        and the verdict it produces is worse than no verdict at all —
+        it is a confident statement about somebody else's data.
+
+        The rule the check enforces:
+
+          * the instance must answer ``/health/data`` at all (a service
+            that stopped answering is lost, whatever its port says);
+          * the answer must be the fixture's — the same number of
+            ``plan_routing`` rows the round recorded;
+          * a service that does not speak ``/health/data`` is not
+            gated at all (there is no data plane to compare).
+        """
+        if not self._data_plane_fingerprints:
+            return None
+        try:
+            targets = self._vp_service_targets(vp)
+        except Exception as exc:  # noqa: BLE001 - defensive
+            logger.warning(
+                "[data_plane] vp=%s could not resolve the VP's services: %s; "
+                "proceeding", vp_id, exc,
+            )
+            return None
+
+        for name, decl in sorted(targets.items()):
+            recorded = self._data_plane_fingerprints.get(name)
+            if recorded is None:
+                continue
+            observed = await self._probe_data_plane(decl, recorded)
+            if recorded.matches(observed):
+                if observed is not None and observed.port != recorded.port:
+                    # The service moved (a liveness recovery relocated
+                    # it): the fingerprint follows it to its new address,
+                    # so the pid check keeps working for the rest of
+                    # the round.
+                    self._data_plane_fingerprints[name] = observed
+                # 2026-10-25: the data plane is the round's — but is the
+                # **instance**?  The data plane says "which data"; the
+                # instance block says "which process".  A service that
+                # serves the right fixture from another process (a
+                # stranger that took the port, or a restart behind the
+                # round's back) would pass the fingerprint check and
+                # still be the wrong instance to ask.
+                mismatch = self._service_instance_mismatch(name, decl)
+                if mismatch is not None:
+                    self._safe_log_freshness_event(
+                        vp_id, "service_instance_mismatch",
+                        {
+                            "service": name,
+                            "expected_boot_id": mismatch.get(
+                                "expected_boot_id",
+                            ),
+                            "actual_boot_id": mismatch.get("actual_boot_id"),
+                            "expected_plans_dir": mismatch.get(
+                                "expected_plans_dir",
+                            ),
+                            "actual_plans_dir": mismatch.get(
+                                "actual_plans_dir",
+                            ),
+                            "mismatched_fields": list(
+                                mismatch.get("mismatched_fields") or [],
+                            ),
+                        },
+                    )
+                    logger.warning(
+                        "[service_freshness] vp=%s: service %r answered as "
+                        "another instance (%s)", vp_id, name,
+                        "; ".join(mismatch.get("reasons") or []),
+                    )
+                    return self._build_service_instance_mismatch_verdict(
+                        vp_id, mismatch,
+                    )
+                continue
+            self._safe_log_freshness_event(
+                vp_id, "data_plane_mismatch",
+                {
+                    "service": name,
+                    "recorded": recorded.to_dict(),
+                    "observed": observed.to_dict() if observed else None,
+                },
+            )
+            logger.warning(
+                "[data_plane] vp=%s: service %r no longer serves the "
+                "round's fixture (recorded %s, observed %s)",
+                vp_id, name, recorded.to_dict(),
+                observed.to_dict() if observed else None,
+            )
+            recovered, restored = await self._recover_data_plane_instance(
+                vp_id, name, decl, recorded,
+            )
+            if restored and recovered is not None:
+                # The instance is back and serving the fixture: the
+                # round's fingerprint follows it to its new address.
+                self._data_plane_fingerprints[name] = recovered
+                self._safe_log_freshness_event(
+                    vp_id, "data_plane_reensure_ready",
+                    {"service": name, "fingerprint": recovered.to_dict()},
+                )
+                continue
+            return self._build_data_plane_blocked_verdict(
+                vp_id, name, recorded, observed, recovered,
+            )
+        return None
+
+    async def _recover_data_plane_instance(
+        self, vp_id: str, name: str, decl: Any, recorded: Any,
+    ) -> Tuple[Any, bool]:
+        """Bring the lost instance back — once — and re-probe it.
+
+        Returns ``(fingerprint, restored)``.  ``fingerprint`` is the
+        observation of the service after the re-ensure (``None`` when
+        it could not be asked); ``restored`` says whether that
+        observation is the round's data plane again.
+
+        The re-ensure goes through the same machinery the preflight
+        uses (the **project's** ``service_manager``), so the service
+        may end up on a **new port** — the declarations and the plan's
+        resolved placeholders are refreshed to follow it, and the
+        fingerprint is taken at the address the service really serves.
+        """
+        if name in self._data_plane_reensure_spent:
+            # The round already spent its one re-ensure on this
+            # service: the VPs after this one go straight to BLOCKED
+            # rather than each starting a copy of it.
+            return None, False
+        self._data_plane_reensure_spent.add(name)
+
+        try:
+            runtime_map = await asyncio.to_thread(
+                self._ensure_declared_services, {name: decl},
+            )
+        except Exception as exc:  # noqa: BLE001 — a failed start is a
+            # failed start, not a reason to let the VP fail
+            logger.warning(
+                "[data_plane] vp=%s: re-ensuring service %r errored: %s",
+                vp_id, name, exc,
+            )
+            runtime_map = None
+        # 2026-10-25 (repair-r1-24): the re-ensure's result is
+        # **verified** before it is adopted.  A result that names a port
+        # nobody serves is not an instance, and the round must not move
+        # its address there.
+        verdicts = self._adopt_reensure_runtimes(vp_id, runtime_map)
+        verdict = verdicts.get(name)
+        if verdict is not None and not verdict.get("accepted"):
+            detail = str(verdict.get("detail") or "")
+            runtime = verdict.get("runtime")
+            self._block_service_port(
+                name,
+                self._reensure_failed_port(name, runtime, decl),
+                vp_id, runtime, detail=detail,
+            )
+            self._safe_log_freshness_event(
+                vp_id, "data_plane_reensure_failed",
+                {
+                    "service": name,
+                    "reason_code": SERVICE_UNREACHABLE,
+                    "detail": detail,
+                },
+            )
+            return None, False
+        # The service may have moved: the declarations and the plan's
+        # resolved placeholders have to follow it.
+        self._refresh_resolved_service_placeholders()
+        effective = self._effective_declarations().get(name, decl)
+        fingerprint = await self._probe_data_plane(effective, recorded)
+        if fingerprint is None or not fingerprint.answered:
+            self._safe_log_freshness_event(
+                vp_id, "data_plane_reensure_failed",
+                {
+                    "service": name,
+                    "detail": "the service did not answer /health/data "
+                              "after the re-ensure",
+                },
+            )
+            return fingerprint, False
+
+        expected = getattr(recorded, "expected_rows", None)
+        if expected is not None:
+            restored = fingerprint.routing_rows == expected
+        else:
+            # No row count to compare: the instance the round just
+            # started is the one that answers, and it is up.
+            restored = self._service_runtime_ready(name)
+        if not restored:
+            self._safe_log_freshness_event(
+                vp_id, "data_plane_reensure_failed",
+                {
+                    "service": name,
+                    "fingerprint": fingerprint.to_dict(),
+                    "detail": "the instance came back with another data plane",
+                },
+            )
+        return fingerprint, restored
+
+    def _service_runtime_ready(self, name: str) -> bool:
+        """Is the service *name* up, as the round's runtime map says?"""
+        runtime_map = self._service_runtime_map
+        if runtime_map is None:
+            return False
+        runtime = (getattr(runtime_map, "runtimes", None) or {}).get(name)
+        return bool(getattr(runtime, "ready", False))
+
+    def _build_data_plane_blocked_verdict(
+        self, vp_id: str, service: str, recorded: Any,
+        observed: Any, recovered: Any,
+    ) -> dict:
+        """The verdict for a VP whose service stopped serving the fixture.
+
+        The request is **not** sent: a response from the wrong instance
+        would be a confident verdict about somebody else's data.  And
+        the verdict is BLOCKED, never FAILED — FAILED would say "the
+        project answered wrong", and the project was never asked.
+
+        The observed fingerprint travels with the verdict: without it
+        nobody can tell "the instance was replaced" from "the instance
+        serves another database".
+        """
+        recorded_dict = recorded.to_dict() if recorded is not None else None
+        observed_dict = observed.to_dict() if observed is not None else None
+        recovered_dict = recovered.to_dict() if recovered is not None else None
+        evidence: Dict[str, Any] = {
+            "data_plane_service": service,
+            "recorded_data_plane": recorded_dict,
+            "observed_data_plane": observed_dict,
+        }
+        if recovered_dict is not None:
+            evidence["recovered_data_plane"] = recovered_dict
+        recorded_rows = (
+            recorded_dict.get("routing_rows") if recorded_dict else None
+        )
+        observed_rows = (
+            observed_dict.get("routing_rows") if observed_dict else None
+        )
+        # 2026-10-25 (repair-r1-24): the re-ensure may have failed for a
+        # sharper reason than "the data plane did not come back" — the
+        # round could not **reach** the service at all.  The verdict has
+        # to say which one it is.
+        unreachable = {
+            port: text
+            for port, text in (
+                getattr(self, "_service_unreachable", None) or {}
+            ).items()
+            if recorded is not None and port == int(recorded.port)
+        }
+        if unreachable:
+            detail = "; ".join(
+                f"port {port}: {text}"
+                for port, text in sorted(unreachable.items())
+            )
+            evidence["reason_code"] = SERVICE_UNREACHABLE
+            return {
+                "status": "BLOCKED",
+                "reasons": [
+                    blocked_reason(
+                        f"{SERVICE_UNREACHABLE} — the round could not reach "
+                        f"service {service!r} after the re-ensure ({detail})"
+                    )
+                ],
+                "actual_result": (
+                    f"{SERVICE_UNREACHABLE}: the re-ensure of service "
+                    f"{service!r} did not produce an instance the round could "
+                    f"reach, so the api_test request was not sent. detail: "
+                    f"{detail}"
+                ),
+                "evidence": evidence,
+                "framework_checks": [],
+            }
+        return {
+            "status": "BLOCKED",
+            "reasons": [
+                blocked_reason(
+                    f"service {service!r} no longer serves the round's "
+                    f"fixture (recorded {recorded_rows} routing rows, "
+                    f"observed {observed_rows})"
+                )
+            ],
+            "actual_result": (
+                f"data-plane identity check BLOCKED this VP: the instance "
+                f"behind service {service!r} answered with a different data "
+                f"plane than the one this round recorded, and one re-ensure "
+                f"did not restore it. The api_test request was not sent."
+            ),
+            "evidence": evidence,
+            "framework_checks": [],
+        }
+
+    # ------------------------------------------------------------------
+    # Service liveness — per-VP recovery (2026-10-24)
+    # ------------------------------------------------------------------
+    #
+    # The round-start preflight brings the declared services up **once**.
+    # A service that dies after that stays dead for the rest of the
+    # round: every VP that talks to it is graded on the connection
+    # refusal, and ``api_test`` reports that refusal as FAILED — which
+    # reads as "the project is broken" when the truth is "the plumbing
+    # died".  One dead service cost a production round twelve VPs.
+    #
+    # So the per-VP runner probes the ports it is about to use and
+    # brings a dead one back before the VP runs.  What it must not do
+    # is restart a service that is alive: a restart re-seeds the
+    # fixture and clears the execution state, so a round that
+    # restarts its service per VP destroys the very state its VPs are
+    # verifying.
+
+    def _service_reensure_lock_for_round(self) -> "asyncio.Lock":
+        """The lock that keeps N concurrent VPs from starting N copies
+        of the same service.
+
+        One lock per **loop**: a round runs its VPs on one event loop
+        and a lock belongs to the loop it was first awaited on, so a
+        new round (new loop) gets a new lock rather than an error.
+        """
+        loop = asyncio.get_running_loop()
+        if (
+            self._service_reensure_lock is None
+            or self._service_reensure_lock_loop is not loop
+        ):
+            self._service_reensure_lock = asyncio.Lock()
+            self._service_reensure_lock_loop = loop
+        return self._service_reensure_lock
+
+    def _vp_service_targets(self, vp: dict) -> Dict[str, Any]:
+        """The declared services this VP depends on, keyed by name.
+
+        Two ways a VP names a service, and both are honoured:
+
+          * ``uses_services`` — the plan's explicit list of service
+            names;
+          * a **port literal** in the VP's text that belongs to a
+            declared service — the ``{{svc.*}}`` placeholder was
+            already expanded, so the address the VP will actually hit
+            is in the text.
+
+        A VP that names no declared service is not this method's
+        business: it must not drag an unrelated service back to life.
+        """
+        if not self._service_declarations:
+            return {}
+        effective = self._effective_declarations()
+        targets: Dict[str, Any] = {}
+
+        uses = vp.get("uses_services")
+        if isinstance(uses, list):
+            for name in uses:
+                key = str(name).lower()
+                decl = effective.get(key)
+                if decl is not None:
+                    targets[key] = decl
+
+        try:
+            from service_freshness import (
+                PROTECTED_PORTS,
+                extract_service_ports,
+            )
+            ports = set(extract_service_ports(
+                {"verification_points": [vp]}, self.project_dir,
+            ))
+        except Exception as exc:  # noqa: BLE001 — best effort
+            logger.debug(
+                "[service_freshness] could not read the VP's ports: %s", exc,
+            )
+            return targets
+        for key, decl in effective.items():
+            try:
+                port = int(decl.port)
+            except (TypeError, ValueError):
+                continue
+            # A backend-runtime port is never a service of the
+            # project's — it is the orchestrator itself.
+            if port in PROTECTED_PORTS:
+                continue
+            if port in ports:
+                targets[key] = decl
+        # 2026-10-25 (repair-r1-29): a service the round could not place
+        # is still worth **probing**: the process that held the declared
+        # port may be gone, and then the service can be placed there.
+        # This is a probe, not an address — the declaration becomes the
+        # effective one only if the re-ensure really produced an
+        # instance.
+        named = _vp_service_names(vp)
+        for key, info in self._unusable_services().items():
+            if key in targets:
+                continue
+            decl = self._service_declarations.get(key)
+            if decl is None:
+                continue
+            if key not in named and info["port"] not in ports:
+                continue
+            targets[key] = decl
+        return targets
+
+    async def _recover_declared_services(
+        self, vp_id: str, vp: dict,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Make the services this VP depends on alive before it runs.
+
+        The round-start preflight starts the declared services once
+        (see :meth:`_preflight_declared_services`); this is the
+        recovery for a service that dies *after* that.  A dead port is
+        brought back through ``service_manager.ensure_services`` — the
+        same machinery the preflight uses, and the **project's** copy
+        of it (see :func:`_load_service_manager`) — and the plan's
+        ``{{svc.*}}`` placeholders are re-resolved against the
+        service's new address.
+
+        Three properties this has to keep:
+
+          * **Only the dead ones are re-ensured.**  ``ensure_services``
+            is called with the dead services alone, never with the
+            whole declaration set: a healthy service must not be
+            restarted, and ``ensure_services`` is free to restart a
+            service it considers stale.
+          * **One attempt per service per round.**  A service that
+            could not be brought back is remembered, so the VPs after
+            it go straight to the BLOCKED gate instead of each paying
+            for another failed start.
+          * **One start at a time.**  The VPs of a round run
+            concurrently; without the lock, every VP that sees the
+            dead port would start its own copy of the service.
+
+        Returns what the recovery **established**: the services it
+        brought back, with the answer the adoption gates got from the
+        service itself.  The one precondition reuses those answers
+        instead of asking the same service a second time.
+
+        Never raises: a recovery that fails must not take the round
+        down — the blocked-port gate is what turns an unusable service
+        into a BLOCKED verdict.
+        """
+        if not self._service_declarations:
+            return {}
+        try:
+            return await self._recover_declared_services_inner(vp_id, vp)
+        except Exception as exc:  # noqa: BLE001 — recovery never aborts a VP
+            logger.warning(
+                "[service_freshness] vp=%s service recovery errored: %s; "
+                "proceeding", vp_id, exc,
+            )
+            return {}
+
+    async def _recover_declared_services_inner(
+        self, vp_id: str, vp: dict,
+    ) -> Dict[str, Dict[str, Any]]:
+        """The body of :meth:`_recover_declared_services`."""
+        from service_freshness import probe_port
+
+        verified: Dict[str, Dict[str, Any]] = {}
+        targets = self._vp_service_targets(vp)
+        if not targets:
+            return verified
+
+        dead: Dict[str, Any] = {}
+        for key, decl in targets.items():
+            if key in self._service_reensure_failed:
+                continue
+            probe = await asyncio.to_thread(probe_port, int(decl.port))
+            if not getattr(probe, "listening", False):
+                dead[key] = decl
+        if not dead:
+            return verified
+
+        async with self._service_reensure_lock_for_round():
+            # Re-probe under the lock: another VP may have brought the
+            # service back while this one was waiting for the lock.
+            still_dead: Dict[str, Any] = {}
+            for key, decl in dead.items():
+                if key in self._service_reensure_failed:
+                    continue
+                probe = await asyncio.to_thread(probe_port, int(decl.port))
+                if not getattr(probe, "listening", False):
+                    still_dead[key] = decl
+            if not still_dead:
+                return verified
+
+            logger.warning(
+                "[service_freshness] vp=%s: declared service(s) %s are not "
+                "listening; bringing them back up",
+                vp_id, sorted(still_dead),
+            )
+            try:
+                runtime_map = await asyncio.to_thread(
+                    self._ensure_declared_services, still_dead,
+                )
+            except Exception as exc:  # noqa: BLE001 — a failed start is
+                # a failed start, not a reason to let the VP fail
+                logger.warning(
+                    "[service_freshness] vp=%s: bringing service(s) %s back "
+                    "up errored: %s", vp_id, sorted(still_dead), exc,
+                )
+                runtime_map = None
+            # 2026-10-25 (repair-r1-24): the re-ensure's result is
+            # **verified** before it is adopted.  A runtime that says
+            # "ready" on a port nobody listens on is not a service, and
+            # adopting it would point the round's VPs at a dead address
+            # — which is exactly what the production round did.
+            verdicts = self._adopt_reensure_runtimes(vp_id, runtime_map)
+            self._refresh_resolved_service_placeholders()
+
+            for key, decl in still_dead.items():
+                verdict = verdicts.get(key, {})
+                runtime = verdict.get("runtime")
+                if verdict.get("accepted"):
+                    port = int(getattr(runtime, "port"))
+                    # It is back — and if the preflight had blocked the
+                    # port, it is not blocked any more.
+                    self._unblock_service_port(key, port)
+                    # The adoption gates asked the service itself; the
+                    # answer is the one the precondition reuses.
+                    asked = self._service_self_check_records.get(
+                        (key, port), {},
+                    )
+                    verified[key] = {
+                        "ready": True,
+                        "service": key,
+                        "port": port,
+                        "pid": getattr(runtime, "pid", None),
+                        "status_code": asked.get("status_code"),
+                        "content_type": str(asked.get("content_type") or ""),
+                        "body_status": str(asked.get("body_status") or ""),
+                    }
+                    self._safe_log_freshness_event(
+                        vp_id, "service_reensure_ready",
+                        {"service": key, "port": port},
+                    )
+                    continue
+                self._service_reensure_failed.add(key)
+                port = self._reensure_failed_port(key, runtime, decl)
+                self._block_service_port(
+                    key, port, vp_id, runtime,
+                    detail=str(verdict.get("detail") or ""),
+                )
+                self._safe_log_freshness_event(
+                    vp_id, "service_reensure_failed",
+                    {
+                        "service": key,
+                        "port": port,
+                        "reason_code": SERVICE_UNREACHABLE,
+                        "detail": str(
+                            verdict.get("detail")
+                            or getattr(runtime, "detail", "") or ""
+                        ),
+                    },
+                )
+        return verified
+
+    def _ensure_declared_services(self, declarations: Dict[str, Any]) -> Any:
+        """Bring *declarations* back up through the project's own
+        ``service_manager``.
+
+        The same call the round-start preflight makes (same module, same
+        arguments, same ownership recording), narrowed to the services
+        that are actually down — a healthy service must not be touched.
+        """
+        service_manager = _load_service_manager(self.project_dir)
+        runtime_map = service_manager.ensure_services(
+            self.project_dir,
+            declarations,
+            round_number=self._current_round,
+        )
+        record_runtimes = getattr(service_manager, "record_runtimes", None)
+        if record_runtimes is not None:
+            record_runtimes(
+                self.plan_dir,
+                self.plan_dir.name,
+                runtime_map,
+                project_dir=self.project_dir,
+                round_number=self._current_round,
+            )
+        return runtime_map
+
+    # ------------------------------------------------------------------
+    # The adoption gates of a re-ensure's result (2026-10-25, repair-r1-24)
+    # ------------------------------------------------------------------
+    #
+    # A re-ensure reports what it *thinks* it produced.  The production
+    # round's re-ensure reported a service that was **ready**, on a port
+    # (51725) nothing had ever listened on, and the round adopted the
+    # address without asking.  The VPs then pointed at it and were graded
+    # on the connection refusal.
+    #
+    # So the result has to be **verified** before it is adopted:
+    #
+    #   1. the runtime says the service is ready and carries a port;
+    #   2. that port accepts a TCP connection;
+    #   3. the service's health URL answers 200.
+    #
+    # A result that fails any of them leaves the old map alone, does not
+    # move the address, and blocks the VPs that need the service with the
+    # ``service_unreachable`` code.
+
+    def _service_reensure_gates(
+        self, name: str, runtime: Any,
+    ) -> Tuple[bool, str]:
+        """The three gates a re-ensure's result has to pass.
+
+        Returns ``(passed, detail)``; *detail* says which gate refused
+        and why — it is the text the blocked verdict carries.
+        """
+        if runtime is None:
+            return False, "the re-ensure reported no runtime for the service"
+        if _runtime_is_unusable(runtime):
+            # 2026-10-25 (repair-r1-29): the re-ensure could not place
+            # the service, and says so.  The port it names is the
+            # declared one — somebody else's — so it is not an address
+            # and the round does not move there.
+            reason = str(
+                getattr(runtime, "failure_reason", "")
+                or getattr(runtime, "detail", "")
+                or "no detail"
+            )
+            return False, (
+                "the re-ensure reported an unusable runtime: the service "
+                f"was not placed, so it names no address ({reason})"
+            )
+        port = getattr(runtime, "port", None)
+        if not getattr(runtime, "ready", False):
+            return False, (
+                "the re-ensure did not report the service as ready"
+                + (f": {getattr(runtime, 'detail', '') or 'no detail'}")
+            )
+        if not port:
+            return False, "the re-ensure reported no port for the service"
+        if str(getattr(runtime, "origin", "") or "") == "failed":
+            # ``_relocate_service`` returns exactly this when it could
+            # not place the service anywhere: the port it names is the
+            # declared one, and there is no instance behind it.
+            return False, (
+                "the re-ensure reported a failed runtime (origin=failed); "
+                "the service was not placed"
+            )
+
+        port = int(port)
+        if not self._service_port_is_live(port):
+            return False, (
+                f"nothing accepted a TCP connection on port {port}"
+            )
+
+        health_url = self._runtime_health_url(name, port)
+        if health_url:
+            # The service is asked **itself**, over the guarded road —
+            # the same request a verification point would send.  The
+            # record is kept so the one precondition does not ask a
+            # second time: one service, one question, one answer.
+            record = _service_self_check(health_url)
+            self._service_self_check_records[(str(name).lower(), port)] = record
+            if record.get("status_code") != 200:
+                return False, (
+                    f"the health URL {health_url} did not answer 200"
+                )
+        return True, ""
+
+    def _service_port_is_live(self, port: int) -> bool:
+        """Gate 2 — is a connection accepted on *port*?
+
+        Two oracles, and either one saying "yes" is enough: the direct
+        TCP connect (1 s — the fast answer) and the round's own liveness
+        probe, which names the process behind the port.
+        """
+        return _service_port_is_live(int(port))
+
+    def _runtime_health_url(self, name: str, port: int) -> str:
+        """The health URL of *name*'s instance at *port*.
+
+        The declaration's own health URL, moved to the port the runtime
+        reports — a service that was relocated answers on its new
+        address.  Empty when the declaration declares none: there is
+        then no health URL to ask, and the service is judged by the
+        other two gates.
+        """
+        decl = self._service_declarations.get(str(name).lower())
+        if decl is None:
+            return ""
+        try:
+            from service_manager import render_declaration
+
+            return render_declaration(decl, int(port)).health_url
+        except Exception:  # pragma: no cover - defensive
+            return ""
+
+    def _adopt_reensure_runtimes(
+        self, vp_id: str, runtime_map: Any,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Verify every runtime a re-ensure produced, and adopt the ones
+        that pass.
+
+        The **accepted** runtimes are the only ones folded into
+        ``_service_runtime_map``: a rejected one leaves the old entry
+        standing, so the round's address does not move to a port nobody
+        serves.  The address the VPs are pointed at follows the
+        binding, and only an accepted runtime rebinds it.
+
+        Returns ``{name: {"accepted": bool, "detail": str, "runtime": ...}}``
+        — the caller turns a refusal into a BLOCKED verdict.
+        """
+        verdicts: Dict[str, Dict[str, Any]] = {}
+        accepted: Dict[str, Any] = {}
+        runtimes = getattr(runtime_map, "runtimes", None) or {}
+        for name, runtime in runtimes.items():
+            passed, detail = self._service_reensure_gates(name, runtime)
+            verdicts[name] = {
+                "accepted": passed,
+                "detail": detail,
+                "runtime": runtime,
+            }
+            if not passed:
+                logger.warning(
+                    "[service_freshness] vp=%s: the re-ensure of service %r "
+                    "was not adopted: %s", vp_id, name, detail,
+                )
+                continue
+            accepted[name] = runtime
+            # 2026-10-25: the round's own re-ensure started a **new**
+            # instance — a new process, a new boot id.  The expectation
+            # follows it, or the next VP would compare the new instance
+            # against the old one's boot id and block a service the
+            # round itself has just brought back.  Only a service the
+            # round had recorded an identity for is re-read: there is
+            # nothing to move otherwise, and a service the round never
+            # identified is not gated in the first place.
+            if str(name).lower() in self._service_instance_identity:
+                self._record_service_instance_identity(
+                    name, int(getattr(runtime, "port")),
+                )
+            self._safe_log_freshness_event(
+                vp_id, "service_reensure_verified",
+                {
+                    "service": name,
+                    "port": int(getattr(runtime, "port")),
+                    "pid": getattr(runtime, "pid", None),
+                    "boot_id": self._runtime_boot_id(runtime),
+                },
+            )
+        if accepted:
+            self._merge_service_runtime_map(
+                self._runtime_map_subset(runtime_map, accepted),
+            )
+        return verdicts
+
+    @staticmethod
+    def _runtime_map_subset(runtime_map: Any, runtimes: Dict[str, Any]) -> Any:
+        """A runtime map carrying only *runtimes*."""
+        from service_manager import ServiceRuntimeMap
+
+        subset = ServiceRuntimeMap(runtimes=dict(runtimes))
+        try:
+            subset.duration_seconds = float(
+                getattr(runtime_map, "duration_seconds", 0.0) or 0.0,
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return subset
+
+    def _merge_service_runtime_map(self, runtime_map: Any) -> None:
+        """Fold a re-ensure's runtime map into the round's.
+
+        The re-ensure only knows about the services it was asked to
+        bring back; the healthy ones stay in the map the preflight
+        built.  The merged map is the **record** of what the re-ensure
+        found.
+
+        The address the VPs are pointed at follows the **binding**,
+        not the map: a re-ensure that really produced a live instance
+        rebinds the round (the address is allowed to move exactly once,
+        explicitly), and a re-ensure that failed releases the binding
+        (there is no instance to talk to, and the blocked-port gate
+        turns that into a BLOCKED verdict instead of a request to a
+        dead port).
+
+        Only **verified** runtimes reach this method — the adoption
+        gates live in :meth:`_adopt_reensure_runtimes`, so a runtime
+        that never came up is not merged into the map at all.
+        """
+        if runtime_map is None:
+            return
+        new_runtimes = getattr(runtime_map, "runtimes", None) or {}
+        current = self._service_runtime_map
+        if current is None:
+            self._service_runtime_map = runtime_map
+        else:
+            try:
+                current.runtimes.update(new_runtimes)
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.warning(
+                    "[service_freshness] could not merge the runtime map: %s",
+                    exc,
+                )
+        # The binding is what the VPs are dispatched to.  A re-ensure
+        # that produced a live instance rebinds the round; one that
+        # did not releases it — an address nobody listens on is not
+        # an address a request may be sent to.
+        for name, runtime in new_runtimes.items():
+            if self._bind_service_runtime(name, runtime) is None:
+                self._release_service_binding(name)
+
+    def _refresh_resolved_service_placeholders(self) -> None:
+        """Re-resolve the plan's ``{{svc.*}}`` placeholders.
+
+        A service that had to move (its port was taken by a foreign
+        process) must not leave the VPs pointing at the address it used
+        to have.  The plan on disk keeps its placeholders, so the
+        re-resolution starts from the **unresolved** plan — a resolved
+        copy cannot be resolved again.
+        """
+        source = self._unresolved_plan_data
+        if source is None or not self._executor_vps_by_id:
+            return
+        try:
+            resolved = self._resolve_service_placeholders(source)
+            fresh = self._convert_plan_to_executor_schema(resolved)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.warning(
+                "[service_freshness] placeholder refresh failed: %s", exc,
+            )
+            return
+        by_id = {str(vp.get("id")): vp for vp in fresh.get("vps", [])}
+        for vp_id, vp in self._executor_vps_by_id.items():
+            new_vp = by_id.get(vp_id)
+            if new_vp is None:
+                continue
+            vp.update(new_vp)
+
+    def _reensure_failed_port(
+        self, key: str, runtime: Any, decl: Any,
+    ) -> int:
+        """The port to block when a re-ensure of *key* did not deliver.
+
+        The port the runtime named (the address the round was about to
+        point its VPs at) — and, when the runtime named none, the
+        declared port.  The address the VPs are *currently* pointed at
+        is blocked as well: it is the one the request would have gone
+        to.
+        """
+        port = getattr(runtime, "port", None)
+        if port:
+            return int(port)
+        declared_port = getattr(decl, "port", None)
+        if declared_port:
+            return int(declared_port)
+        bound = self._bound_service_port(key)
+        return int(bound) if bound else 0
+
+    def _block_service_port(
+        self, key: str, port: int, vp_id: str, runtime: Any,
+        detail: str = "",
+    ) -> None:
+        """Record that *key*'s port is unusable, and say why.
+
+        The blocked-port gate turns this into a BLOCKED verdict; the
+        report it carries has to name the failure, not just the port.
+
+        Every address this service could be reached at is blocked — the
+        one the re-ensure named, the declared one, and the one the
+        round is currently bound to.  A request must not escape to any
+        of them.
+        """
+        detail = str(detail or getattr(runtime, "detail", "") or "")
+        ports = {int(port)}
+        declared = self._service_declarations.get(key)
+        declared_port = getattr(declared, "port", None)
+        if declared_port is not None:
+            ports.add(int(declared_port))
+        bound = self._bound_service_port(key)
+        if bound:
+            ports.add(int(bound))
+        self._blocked_service_ports.update(ports)
+        # 2026-10-25 (repair-r1-24): the round could not **reach** the
+        # service.  That is a different failure from "the service is
+        # not ready", and the verdict has to say which one it is.
+        for blocked_port in ports:
+            self._service_unreachable[blocked_port] = detail
+        try:
+            from service_freshness import ServiceFreshnessReport
+            report = ServiceFreshnessReport()
+        except Exception:  # pragma: no cover - defensive
+            return
+        report.action = "blocked"
+        report.detail = (
+            f"service {key!r} on port {port} could not be brought back up "
+            f"before VP {vp_id}"
+            + (f": {detail}" if detail else "")
+        )
+        self._last_service_freshness_report = report
+        logger.warning(
+            "[service_freshness] service %s on port %s could not be "
+            "revived: %s", key, port, detail or "no detail",
+        )
+
+    def _unblock_service_port(self, key: str, port: int) -> None:
+        """A service that is alive again is not blocked."""
+        self._blocked_service_ports.discard(port)
+        declared = self._service_declarations.get(key)
+        declared_port = getattr(declared, "port", None)
+        if declared_port is not None:
+            self._blocked_service_ports.discard(int(declared_port))
+
 
     def _maybe_rebuild_before_service_start(self) -> None:
         """Rebuild a stale build artefact before (re)starting services.
@@ -6513,6 +12621,10 @@ class Orchestrator:
                 "VPs will see the raw {{svc.*}} text", exc,
             )
             return plan_data
+        # 2026-10-24: keep the **unresolved** plan.  A service that
+        # moves has to be re-resolved, and a resolved copy cannot be
+        # resolved again — the placeholders are gone by then.
+        self._unresolved_plan_data = plan_data
         # 2026-09-18（端口让路）：解析必须按**实际**端口，不是声明端口 ——
         # 端口被外人占着时 preflight 会另起一个（``_relocate_service``），
         # 此时 {{svc.<name>.url}} 必须指向新端口，否则 VP 会去打那个别人的
@@ -6582,6 +12694,43 @@ class Orchestrator:
             )
         return report
 
+    def _build_unusable_service_blocked_verdict(
+        self, vp_id: str, services: List[str], ports: List[int],
+    ) -> dict:
+        """Synthesize a BLOCKED verdict for a VP whose service could not
+        be placed.
+
+        The service is **missing**, not broken: the round found the
+        declared port held by a process that is not the service, could
+        not place it anywhere else, and therefore has no address to
+        send this VP to.  The verdict names the service — a blocked
+        port on its own does not say which service was missing.
+        """
+        detail = "; ".join(
+            f"{name}: {self._unusable_services().get(name, {}).get('reason', '')}"
+            for name in services
+        )
+        return {
+            "status": "BLOCKED",
+            "reasons": [
+                blocked_reason(
+                    f"{SERVICE_UNUSABLE} — the round could not place the "
+                    f"service(s) {list(services)}, so it has no address to "
+                    f"send this VP to ({detail})"
+                )
+            ],
+            "actual_result": (
+                f"service(s) {', '.join(services)} could not be placed, so "
+                f"the round has no address for this VP: {detail}"
+            ),
+            "evidence": {
+                "reason_code": SERVICE_UNUSABLE,
+                "unusable_services": list(services),
+                "blocked_ports": list(ports),
+            },
+            "framework_checks": [],
+        }
+
     def _build_service_freshness_blocked_verdict(
         self, vp_id: str, ports: List[int],
     ) -> dict:
@@ -6601,6 +12750,39 @@ class Orchestrator:
         evidence: Dict[str, Any] = {"blocked_ports": list(ports)}
         if report is not None:
             evidence["service_freshness"] = report.to_dict()
+        # 2026-10-25 (repair-r1-24): the round could not **reach** the
+        # service — the re-ensure produced no instance to talk to.  That
+        # is a different failure from "the service is not ready", and a
+        # report reader has to be able to tell them apart.
+        unreachable = {
+            port: self._service_unreachable[port]
+            for port in ports
+            if port in (getattr(self, "_service_unreachable", None) or {})
+        }
+        if unreachable:
+            detail = "; ".join(
+                f"port {port}: {text}" for port, text in sorted(unreachable.items())
+            )
+            evidence["reason_code"] = SERVICE_UNREACHABLE
+            evidence["unreachable_ports"] = sorted(unreachable)
+            return {
+                "status": "BLOCKED",
+                "reasons": [
+                    blocked_reason(
+                        f"{SERVICE_UNREACHABLE} — the round could not reach "
+                        f"the service on port(s) {ports} after the re-ensure "
+                        f"({detail})"
+                    )
+                ],
+                "actual_result": (
+                    f"{SERVICE_UNREACHABLE}: the re-ensure of the service on "
+                    f"port(s) {ports} did not produce an instance the round "
+                    f"could reach, so the request was not sent. detail: "
+                    f"{detail}"
+                ),
+                "evidence": evidence,
+                "framework_checks": [],
+            }
         return {
             "status": "BLOCKED",
             "reasons": [blocked_reason(f"service not ready on port(s) {ports}")],
@@ -6744,6 +12926,14 @@ class Orchestrator:
 
         executor_verdicts = executor.collect_verdicts()
 
+        # 2026-10-25 (repair-r1-31): the plan's own VPs are the
+        # fallback for a VP that never dispatched — the address it was
+        # *going to* use is still worth recording.
+        plan_vps_by_id = {
+            str(vp.get("id")): vp for vp in verification_points
+            if isinstance(vp, dict)
+        }
+
         results: List[Dict[str, Any]] = []
         for v in executor_verdicts:
             vp_id = v.get("vp_id", "unknown")
@@ -6760,6 +12950,17 @@ class Orchestrator:
             evidence = v.get("evidence", "")
             if not isinstance(evidence, str):
                 evidence = json.dumps(evidence, ensure_ascii=False)
+            # 2026-10-25 (repair-r1-31): every VP's recorded evidence
+            # carries **where it was sent** — the URL, the port it
+            # names, the port the round's ``ensure`` bound, the pid and
+            # boot id behind that binding, the attempt count, the
+            # classification code, the errno, and the round's request
+            # id.  The production round's evidence said only
+            # ``Errno 61``, which cannot tell a product defect from a
+            # broken environment.
+            evidence = self._enrich_evidence_with_address(
+                str(vp_id), evidence, plan_vps_by_id.get(str(vp_id)),
+            )
             result = {
                 "id": vp_id,
                 "status": status,
@@ -6772,11 +12973,27 @@ class Orchestrator:
             # 在同因阈值上的待遇完全相反。不带过去的话，历史里每一条失败
             # 都记成 deliverable_defect，也就是那条会计数、会生成修复任务
             # 的类（见 verification/orchestrator.py 的 _extract_failure_records）。
+            #
+            # 2026-10-26 (merge): 本分支的地址富化与 main 的分类**都要** ——
+            # 地址回答"发到哪儿了"，分类回答"这是谁的错"，两个都是裁决
+            # 的一部分，少一个都会把一半的证据丢掉。
             for key in ("failure_class", "failure_class_source"):
                 value = v.get(key)
                 if value:
                     result[key] = str(value)
             results.append(result)
+
+        # 2026-10-25 (repair-r1-26): the environment verdict is a round
+        # verdict.  If the round could not reach the service, none of
+        # its results describes the product — they are all recorded
+        # BLOCKED, and the round says so in its log.
+        #
+        # ``getattr`` for the same reason as elsewhere in this module:
+        # an orchestrator built without ``__init__`` has judged no
+        # environment, and "not blocked" is the fact that says so.
+        if getattr(self, "_environment_blocked", False):
+            self._write_environment_blocked_event()
+            results = self._mark_results_environment_blocked(results)
 
         # Stable, plan-order output: re-sort by the plan's original
         # index so downstream consumers (the report, the bridge UI)
@@ -6823,29 +13040,41 @@ class Orchestrator:
         state machine with no report to inspect.
         """
         verification_points = plan_data.get("verification_points", [])
+        results = [
+            {
+                "id": vp.get("id", "unknown"),
+                "status": "FAILED",
+                "actual_result": (
+                    f"executor.run() raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                "reasons": [
+                    f"executor.run() raised {type(exc).__name__}: {exc}"
+                ],
+                # 2026-10-25 (repair-r1-31): a crashed round's evidence
+                # carries the address too — "the round crashed" is not
+                # an answer to "which port was it talking to".
+                "evidence": self._enrich_evidence_with_address(
+                    str(vp.get("id", "unknown")),
+                    {
+                        "exception_type": type(exc).__name__,
+                        "exception_message": str(exc),
+                    },
+                    vp,
+                ),
+            }
+            for vp in verification_points
+        ]
+        # 2026-10-25 (repair-r1-26): a round whose environment was
+        # broken is blocked, whatever the crash was.  A crash caused by
+        # the environment must not be filed as a product failure — it is
+        # the same event the blocked verdict describes.
+        if self._environment_blocked:
+            self._write_environment_blocked_event()
+            results = self._mark_results_environment_blocked(results)
         execution_results = {
             "verification_points": verification_points,
-            "execution_results": [
-                {
-                    "id": vp.get("id", "unknown"),
-                    "status": "FAILED",
-                    "actual_result": (
-                        f"executor.run() raised "
-                        f"{type(exc).__name__}: {exc}"
-                    ),
-                    "reasons": [
-                        f"executor.run() raised {type(exc).__name__}: {exc}"
-                    ],
-                    "evidence": json.dumps(
-                        {
-                            "exception_type": type(exc).__name__,
-                            "exception_message": str(exc),
-                        },
-                        ensure_ascii=False,
-                    ),
-                }
-                for vp in verification_points
-            ],
+            "execution_results": results,
             "executed_at": datetime.now().isoformat(),
         }
 

@@ -33,7 +33,22 @@ from coding_tool import (
     ApiError,
     HardTimeoutError,
     JsonSession,
+    SceneProviderUnavailable,
+    is_capacity_error,
     query_in_session,
+)
+# 2026-10-24 — the capacity wait. ``capacity_wait`` is a leaf module
+# (stdlib + ``dynamic_provider_concurrency`` + ``provider_order``), so
+# importing it here carries no cycle risk: it does not import
+# ``coding_tool`` and does not import this module.
+#
+# ``QuotaWaitExhausted`` is imported from its own home rather than
+# through ``coding_tool``'s re-exports, so the type the agent catches
+# is provably the type the wait raises.
+from capacity_wait import (
+    QuotaWaitExhausted,
+    capacity_wait_budget_sec,
+    capacity_wait_poll_sec,
 )
 from bounded_subprocess import run_bounded
 from usage_registry import plan_usage_context
@@ -92,6 +107,17 @@ from hitl import service as hitl_service
 from utils.atomic_io import atomic_write_json
 from framework.task_graph import DanglingTaskDependency, find_dangling_references
 from framework.prompts import INLINE_SPEC_CODE_REVIEW_PROMPT
+
+#: The two seams of the capacity wait, at module level on purpose.
+#:
+#: A capacity wait is wall-clock — it sleeps between two looks at a
+#: provider that has no room. A test that has to wait for real seconds
+#: to test a wait is a test nobody runs, so the sleep and the clock are
+#: named here and the tests patch these two names. Nothing else may
+#: reassign them: the whole point of the seam is that there is exactly
+#: one place where the wait touches the wall clock.
+_capacity_wait_sleep = time.sleep
+_capacity_wait_clock = time.monotonic
 
 # Re-export ``INLINE_SPEC_CODE_REVIEW_PROMPT`` so existing call sites
 # that wrote ``from agent import INLINE_SPEC_CODE_REVIEW_PROMPT`` keep
@@ -2015,6 +2041,23 @@ def _task_session_key(task_id: str) -> str:
     return f"task:{task_id}"
 
 
+def _attempt_bound_pair(attempt_bound) -> tuple:
+    """``attempt_bound`` as an ``(attempt, max_attempts)`` pair.
+
+    The capacity wait needs both numbers for its log line: which
+    attempt the call belongs to, and how many attempts that attempt is
+    one of. A caller that only knows the bound passes the integer and
+    gets attempt 1 — the first attempt is the only one a capacity
+    refusal can be blamed on in practice, and a wrong number in a log
+    line must never be the reason a run misbehaves.
+    """
+    if isinstance(attempt_bound, (tuple, list)):
+        attempt = attempt_bound[0] if attempt_bound else 1
+        max_attempts = attempt_bound[1] if len(attempt_bound) > 1 else attempt
+        return int(attempt), int(max_attempts)
+    return 1, int(attempt_bound)
+
+
 def _make_task_session(
     task_id: str, plan_dir: Optional[Path], plan_id: str
 ) -> JsonSession:
@@ -2510,6 +2553,11 @@ class AutonomousAgent:
 
         # Initialize managers
         self.task_manager = TaskManager(project_dir, tasks_file=tasks_file)
+        #: 2026-10-24 — set when a provider capacity wait ran out of
+        #: budget. The task was NOT failed: it is still eligible for
+        #: another dispatch, and this flag is how the run tells that
+        #: apart from a task that ran out of attempts.
+        self._quota_wait_requested = False
         #: Where this run's lock files go — beside the plan's own artifacts
         #: (``plans/<plan_id>/locks/``), never inside ``project_dir``.
         #: Resolved once, here, because both the broker and the no-broker
@@ -4213,6 +4261,55 @@ class AutonomousAgent:
         if not self._all_tasks and self.task_manager.tasks:
             self._load_tasks()
 
+        # 2026-10-24 — a ``waiting_for_quota`` marker left by an EARLIER
+        # run must not lock this run out.
+        #
+        # The marker says "the provider had no room THEN", not "the plan
+        # is finished". It lives on ``tasks.json`` and ``TaskManager``
+        # reads it back when the agent is constructed, so without this
+        # clear every later run would see it, stop before doing
+        # anything, and one unlucky afternoon with a full provider would
+        # freeze the plan for good.
+        #
+        # The clear happens BEFORE ``execution_started`` so the log
+        # reads in the order things happened: the run started, and it
+        # started with a clean marker. Only a quota marker is cleared —
+        # ``success`` is a real answer about the plan and is left alone,
+        # and it is NEVER rewritten to "success" here: that would put a
+        # completion claim into a tasks.json that is about to keep
+        # running.
+        if getattr(self.task_manager, "stop_reason", None) == "waiting_for_quota":
+            try:
+                self.task_manager.set_stop_reason(None, None)
+            except Exception as exc:  # noqa: BLE001
+                # ``set_stop_reason`` assigns the new value BEFORE it
+                # saves, so the in-memory marker is already cleared and
+                # this run is not locked out even when the file could
+                # not be rewritten. The stale marker on disk is picked
+                # up — and cleared again — by the next run.
+                if self.logger:
+                    self.logger.warning(
+                        "quota_wait_marker_clear_failed",
+                        (
+                            "Could not rewrite tasks.json to clear the "
+                            "stale waiting_for_quota marker — the run "
+                            "continues, and the next run clears it again"
+                        ),
+                        data={"error": str(exc)[:300]},
+                    )
+            else:
+                if self.logger:
+                    self.logger.info(
+                        "quota_wait_marker_cleared",
+                        (
+                            "Cleared the stale waiting_for_quota marker "
+                            "left by an earlier run — this run starts "
+                            "with a clean slate"
+                        ),
+                        data={"stop_reason": "waiting_for_quota"},
+                    )
+            self._quota_wait_requested = False
+
         if self.logger:
             self.logger.info("execution_started", "Starting task execution",
                              data={"total_tasks": total_tasks, "completed_tasks": completed_tasks,
@@ -4235,6 +4332,33 @@ class AutonomousAgent:
         _SAME_ID_LOOP_THRESHOLD = 2
 
         while True:
+            # 2026-10-24 — a quota wait ran out of budget somewhere in
+            # this run (or a marker was written by another process).
+            # Stop dispatching: the provider has no room, and
+            # re-dispatching the task that just ran out of room only
+            # burns another wait budget on the same full provider.
+            #
+            # The stop changes NO task's status. Nothing is failed,
+            # nothing is skipped: a provider with no room says nothing
+            # about the work, and the tasks stay eligible for the next
+            # run (or the next dispatch of this plan).
+            #
+            # This check comes FIRST, before the max-tasks check: the
+            # quota marker is the more informative answer, and it is the
+            # one an operator has to act on.
+            if self._stop_requested_for_quota_wait():
+                if self.logger:
+                    self.logger.info(
+                        "execution_stopped",
+                        (
+                            "Stopped dispatching: every provider ran out "
+                            "of room — the tasks stay eligible for "
+                            "another run"
+                        ),
+                        data={"reason": "waiting_for_quota"},
+                    )
+                break
+
             if max_tasks is not None and task_count >= max_tasks:
                 print(f"\nReached maximum task limit: {max_tasks}")
                 if self.logger:
@@ -4282,13 +4406,44 @@ class AutonomousAgent:
                         )
                     break
                 if total_tasks > 0:
-                    self.task_manager.set_stop_reason("success")
-                    final_completed = sum(1 for t in self.task_manager.tasks if t.status == "completed")
-                    print("\nAll tasks completed!")
-                    if self.logger:
-                        self.logger.info("execution_completed", "All tasks completed",
-                                         data={"total": len(self.task_manager.tasks),
-                                               "completed": final_completed})
+                    # 2026-10-26 (B10) — a FAILED task is not a completed
+                    # task. The dispatcher reached this branch because
+                    # nothing is schedulable any more, which happens both
+                    # when everything finished and when what is left is
+                    # broken. Answering "All tasks completed!" in the
+                    # second case told the operator the plan was done
+                    # while part of it was red on the card — and wrote a
+                    # ``success`` marker onto ``tasks.json`` that every
+                    # later reader took as "the work is finished".
+                    #
+                    # The failed tasks keep the status they were given
+                    # elsewhere (``record_task_failure``); this branch
+                    # only decides what the RUN says about itself.
+                    final_failed = sum(
+                        1 for t in self.task_manager.tasks if t.status == "failed"
+                    )
+                    if final_failed > 0:
+                        self.task_manager.set_stop_reason("failed")
+                        final_completed = sum(
+                            1 for t in self.task_manager.tasks if t.status == "completed"
+                        )
+                        print(f"\nCompleted with {final_failed} failed task(s)")
+                        if self.logger:
+                            self.logger.info(
+                                "execution_completed",
+                                f"Completed with {final_failed} failed task(s)",
+                                data={"total": len(self.task_manager.tasks),
+                                      "completed": final_completed,
+                                      "failed": final_failed},
+                            )
+                    else:
+                        self.task_manager.set_stop_reason("success")
+                        final_completed = sum(1 for t in self.task_manager.tasks if t.status == "completed")
+                        print("\nAll tasks completed!")
+                        if self.logger:
+                            self.logger.info("execution_completed", "All tasks completed",
+                                             data={"total": len(self.task_manager.tasks),
+                                                   "completed": final_completed})
                 break
 
             # Build layers from the FULL task list (including completed
@@ -5398,6 +5553,244 @@ class AutonomousAgent:
             "why — do not claim success to get past it.\n"
         )
 
+    #: The ``SceneProviderUnavailable`` reasons that mean "the provider
+    #: side has no room right now" rather than "the routing
+    #: configuration is wrong".
+    #:
+    #: ``all_candidates_skipped`` is deliberately treated as a wait even
+    #: though it can also mean "the rules excluded every candidate": a
+    #: wait that ends in a recoverable ``waiting_for_quota`` is safer
+    #: than an immediate failure that strands everything downstream of
+    #: the task, and the reason travels in the log so an operator can
+    #: tell the two apart.
+    _CAPACITY_WAIT_REASONS = frozenset({
+        "all_candidates_skipped",
+        "no_capacity",
+    })
+
+    def _capacity_wait_providers(self) -> List[str]:
+        """The provider the last refused call went to, if we know it.
+
+        The name comes from the coding tool's own bookkeeping
+        (``current_call_provider``), so it is never invented here: a
+        call that never reached a provider has no name to report, and
+        an empty list says exactly that.
+        """
+        name = getattr(
+            getattr(self, "coding_tool", None), "current_call_provider", "",
+        )
+        return [name] if name else []
+
+    def _query_with_capacity_wait(self, call, task, attempt_bound):
+        """``call()`` with a provider-capacity wait in front of it.
+
+        A provider that refuses because it is out of budget says
+        nothing about the task, so that refusal must not spend the
+        task's retry budget: the attempt stays the same attempt and the
+        call is made again after a wait. What the wait may spend is
+        wall-clock, up to
+        :func:`capacity_wait.capacity_wait_budget_sec`. When that
+        budget is gone, "wait and retry" has stopped being a plan and
+        the answer is :class:`capacity_wait.QuotaWaitExhausted`, which
+        the caller turns into a ``waiting_for_quota`` marker instead of
+        a failure.
+
+        Three refusals are capacity refusals and one is not:
+
+        * :class:`coding_tool.ApiError` that
+          :func:`coding_tool.is_capacity_error` recognises — the
+          provider answered and said it had no room.
+        * :class:`coding_tool.SceneProviderUnavailable` with reason
+          ``all_candidates_skipped`` or ``no_capacity`` — every
+          provider the scene approves is parked or out of width. This
+          one is a ``RuntimeError``, not an ``ApiError``: under the old
+          code it fell through to the generic ``except Exception`` arm,
+          which recorded an attempt and retried — the same accident
+          wearing a different exception type.
+        * ``no_tier_match`` / ``chain_unresolved`` are *configuration*
+          errors. Waiting cannot fix a tier table that approves nobody,
+          so they travel up untouched.
+
+        Args:
+            call: A zero-argument callable that performs the call.
+            task: The task being executed — used for the log line.
+            attempt_bound: The attempt this call belongs to, as
+                ``(attempt, max_attempts)``. A plain integer is read
+                as ``max_attempts``.
+
+        Returns:
+            Whatever ``call()`` returns.
+
+        Raises:
+            QuotaWaitExhausted: The wait budget ran out before the
+                call succeeded.
+            ApiError: A refusal that is not about capacity — unchanged.
+            SceneProviderUnavailable: A routing failure that waiting
+                cannot fix — unchanged.
+        """
+        attempt, max_attempts = _attempt_bound_pair(attempt_bound)
+        clock = getattr(self, "_capacity_wait_clock", None) or _capacity_wait_clock
+        sleep = getattr(self, "_capacity_wait_sleep", None) or _capacity_wait_sleep
+        started = clock()
+        while True:
+            refusal: Optional[BaseException] = None
+            try:
+                return call()
+            except QuotaWaitExhausted:
+                # The hard cap. It is the caller's answer to write, not
+                # ours to keep waiting past.
+                raise
+            except SceneProviderUnavailable as exc:
+                if exc.reason not in self._CAPACITY_WAIT_REASONS:
+                    raise
+                refusal = exc
+            except ApiError as exc:
+                if not is_capacity_error(exc):
+                    raise
+                refusal = exc
+
+            waited = clock() - started
+            budget = capacity_wait_budget_sec()
+            if budget <= 0 or waited >= budget:
+                raise QuotaWaitExhausted(
+                    providers=self._capacity_wait_providers(),
+                    needs_manual_topup=False,
+                    waited_sec=waited,
+                ) from refusal
+
+            sleep_for = min(capacity_wait_poll_sec(), budget - waited)
+            if self.logger:
+                data = {
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "api_status": getattr(refusal, "status", None),
+                    "error": str(refusal)[:300],
+                    "waited_sec": waited,
+                }
+                if isinstance(refusal, SceneProviderUnavailable):
+                    # The reason and the candidates are what tell an
+                    # operator whether this is "every provider is
+                    # parked" (a wait) or "the rules excluded them all"
+                    # (a configuration problem wearing a wait's coat).
+                    data["reason"] = refusal.reason
+                    data["candidates"] = list(refusal.candidates or [])
+                self.logger.warning(
+                    "task_api_error_provider_retry",
+                    (
+                        f"Task [{task.id}] hit a provider capacity "
+                        f"error — waiting {sleep_for:g}s and retrying "
+                        f"attempt {attempt}/{max_attempts} instead of "
+                        f"spending the attempt"
+                    ),
+                    task_id=task.id,
+                    data=data,
+                )
+            sleep(sleep_for)
+
+    def _stop_reason_for_quota_wait(
+        self,
+        exc: QuotaWaitExhausted,
+        task: Optional[SubTask] = None,
+        attempt: int = 1,
+        max_attempts: int = 1,
+    ) -> str:
+        """Write the "waiting for quota" marker for an exhausted wait.
+
+        The marker is what the next reader of the plan sees: the run
+        stopped because the provider had no room, not because the work
+        failed. It goes to ``tasks.json``'s top level (``stop_reason``
+        / ``reason_detail``) because that is where the dispatcher and
+        the operator look for "why did this stop", and it goes to the
+        execution log because that is where the run's own history is.
+
+        The task is NOT failed here. A provider with no room says
+        nothing about the work, and failing the task is what strands
+        everything downstream of it.
+
+        Args:
+            exc: The exhausted wait.
+            task: The task it happened on, for the log line.
+            attempt: The attempt it happened on.
+            max_attempts: The bound of that attempt.
+
+        Returns:
+            The ``reason_detail`` string that was written.
+        """
+        marker = {
+            "providers": list(getattr(exc, "providers", None) or []),
+            "needs_manual_topup": bool(
+                getattr(exc, "needs_manual_topup", False)
+            ),
+            "waited_sec": float(getattr(exc, "waited_sec", 0.0) or 0.0),
+            "at": datetime.now().isoformat(),
+        }
+        reason_detail = json.dumps(marker)
+        self._quota_wait_requested = True
+        try:
+            self.task_manager.set_stop_reason(
+                "waiting_for_quota", reason_detail,
+            )
+        except Exception as write_exc:  # noqa: BLE001
+            # An unwritable plan file must not turn a wait into a
+            # crash: the run still stops, and the log still says why.
+            if self.logger:
+                self.logger.warning(
+                    "task_quota_wait_marker_unwritten",
+                    (
+                        f"Task [{getattr(task, 'id', '?')}] could not "
+                        f"write its waiting_for_quota marker"
+                    ),
+                    task_id=getattr(task, "id", None),
+                    data={"error": str(write_exc)[:300]},
+                )
+        if self.logger:
+            self.logger.warning(
+                "task_quota_wait_exhausted",
+                (
+                    f"Task [{getattr(task, 'id', '?')}] stopped waiting for "
+                    f"provider capacity after "
+                    f"{marker['waited_sec']:g}s — the task is NOT failed "
+                    f"and stays eligible for another dispatch"
+                ),
+                task_id=getattr(task, "id", None),
+                data={
+                    **marker,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "reason_detail": reason_detail,
+                },
+            )
+        return reason_detail
+
+    def _stop_requested_for_quota_wait(self) -> bool:
+        """Has this run been asked to stop because a provider had no room?
+
+        Two signals, either one is enough:
+
+          * ``self._quota_wait_requested`` — the in-memory flag written by
+            :meth:`_stop_reason_for_quota_wait` when a capacity wait ran
+            out of budget. It lives on the agent, so it covers exactly
+            the run that hit the wall.
+          * ``task_manager.stop_reason == "waiting_for_quota"`` — the
+            marker persisted on ``tasks.json``. It outlives the process,
+            which is why the start of a run clears it (see
+            :meth:`_run_async`): a marker left by an EARLIER run must
+            not lock every later run out.
+
+        Both are read with ``getattr``. This is called on the
+        dispatcher's hot path, and an agent built by ``__new__`` in a
+        test — or one restored from a checkpoint written before the
+        flag existed — must not raise ``AttributeError`` just because
+        the attribute is missing.
+
+        Returns:
+            True when the dispatcher must stop dispatching.
+        """
+        if bool(getattr(self, "_quota_wait_requested", False)):
+            return True
+        task_manager = getattr(self, "task_manager", None)
+        return getattr(task_manager, "stop_reason", None) == "waiting_for_quota"
+
     def _execute_task_with_retry(self, task: SubTask, max_retries: int = 5, timeout: Optional[int] = None) -> bool:
         """
         Execute a task with retry mechanism.
@@ -5746,27 +6139,41 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                         if self.logger:
                             self.logger.info("task_background_mode", "Using background execution due to previous timeout",
                                              task_id=task.id)
-                        coder_response = query_in_session(
-                            self.coding_tool, task_session,
-                            context,
-                            system_instruction=coder_prompt,
-                            # 2026-09-15: the execution-phase
-                            # LLM call uses the SAME unified budget as every
-                            # other call — 900s of stdout silence / 1800s idle
-                            # pipe / the layer's 1-hour ceiling — so no
-                            # per-call ``timeout`` is passed on either branch.
-                            # ``EXECUTOR_TASK_TIMEOUT`` no longer caps the LLM
-                            # call (see the note at its definition).
-                            model_type=task.model_type,
-                            scene="execution",
+                        # 2026-10-24 — the capacity wait wraps BOTH
+                        # dispatch branches. A provider that has no room
+                        # is not a statement about the task, so the
+                        # refusal is waited out and the SAME attempt
+                        # makes the call again; the task's retry budget
+                        # is not spent on the provider's behalf.
+                        coder_response = self._query_with_capacity_wait(
+                            lambda: query_in_session(
+                                self.coding_tool, task_session,
+                                context,
+                                system_instruction=coder_prompt,
+                                # 2026-09-15: the execution-phase
+                                # LLM call uses the SAME unified budget as every
+                                # other call — 900s of stdout silence / 1800s idle
+                                # pipe / the layer's 1-hour ceiling — so no
+                                # per-call ``timeout`` is passed on either branch.
+                                # ``EXECUTOR_TASK_TIMEOUT`` no longer caps the LLM
+                                # call (see the note at its definition).
+                                model_type=task.model_type,
+                                scene="execution",
+                            ),
+                            task,
+                            (attempt + 1, attempt_bound),
                         )
                     else:
-                        coder_response = query_in_session(
-                            self.coding_tool, task_session,
-                            context,
-                            system_instruction=coder_prompt,
-                            model_type=task.model_type,
-                            scene="execution",
+                        coder_response = self._query_with_capacity_wait(
+                            lambda: query_in_session(
+                                self.coding_tool, task_session,
+                                context,
+                                system_instruction=coder_prompt,
+                                model_type=task.model_type,
+                                scene="execution",
+                            ),
+                            task,
+                            (attempt + 1, attempt_bound),
                         )
                     if task_session.session_id and self.logger:
                         # Observable proof that the retry re-opened the same
@@ -6909,6 +7316,35 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                                                 "attempts": max_retries})
                     return False
 
+            except QuotaWaitExhausted as exc:
+                # 2026-10-24 — the provider had no room and the wait
+                # budget went with it.
+                #
+                # This is NOT a task failure. A provider that is out of
+                # budget says nothing about the work: failing the task
+                # here is what stranded every downstream task of
+                # Vendor A Pro's 2026-09-22 Token Plan cap. So the run
+                # writes a marker that says "we stopped because the
+                # provider ran out of room", leaves the task alive (and
+                # therefore re-dispatchable), and returns.
+                #
+                # It MUST come before ``except Exception`` — otherwise
+                # the generic arm records an attempt, retries, and the
+                # accident happens again with a different exception
+                # type, which is exactly how
+                # ``SceneProviderUnavailable`` used to slip through.
+                print(
+                    "\nPROVIDER CAPACITY WAIT EXHAUSTED — the task is "
+                    "NOT failed; it stays eligible for another dispatch\n"
+                )
+                self._stop_reason_for_quota_wait(
+                    exc,
+                    task=task,
+                    attempt=attempt + 1,
+                    max_attempts=attempt_bound,
+                )
+                return False
+
             except ApiError as e:
                 # LLM API error. Distinguish two very different cases
                 # (2026-09-22):
@@ -6930,32 +7366,32 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 #
                 #   * EVERYTHING ELSE — auth failure, malformed
                 #     request. Retrying cannot help; fail immediately.
-                from coding_tool import is_capacity_error
-
-                if is_capacity_error(e) and attempt < max_retries - 1:
+                #
+                # 2026-10-24: the capacity case is a DEFENSIVE fallback
+                # now. Both dispatch call sites go through
+                # ``_query_with_capacity_wait``, which waits a capacity
+                # refusal out and turns an exhausted wait into a
+                # ``waiting_for_quota`` marker. So a capacity error
+                # should never reach this arm — but if one does, it came
+                # from a path the helper does not cover, and the answer
+                # is the same as the helper's: mark the wait, do not
+                # spend the attempt, do not fail the task.
+                if is_capacity_error(e):
                     print(
-                        "\nPROVIDER CAPACITY ERROR — rotating and "
-                        "retrying this task\n"
+                        "\nPROVIDER CAPACITY ERROR — marking the task as "
+                        "waiting for quota instead of failing it\n"
                     )
-                    self.retry_manager.record_attempt(task.id, str(e), False)
-                    if self.logger:
-                        self.logger.warning(
-                            "task_api_error_provider_retry",
-                            (
-                                f"Task [{task.id}] hit a provider capacity "
-                                f"error ([{e.status}]) — retrying attempt "
-                                f"{attempt + 2}/{max_retries} on another "
-                                f"provider instead of failing the task"
-                            ),
-                            task_id=task.id,
-                            data={
-                                "attempt": attempt + 1,
-                                "max_attempts": max_retries,
-                                "api_status": e.status,
-                                "error": str(e)[:300],
-                            },
-                        )
-                    continue
+                    self._stop_reason_for_quota_wait(
+                        QuotaWaitExhausted(
+                            providers=self._capacity_wait_providers(),
+                            needs_manual_topup=False,
+                            waited_sec=0.0,
+                        ),
+                        task=task,
+                        attempt=attempt + 1,
+                        max_attempts=attempt_bound,
+                    )
+                    return False
 
                 print(f"\n{'=' * 60}")
                 print("LLM API ERROR — RETRYING WILL NOT HELP")
