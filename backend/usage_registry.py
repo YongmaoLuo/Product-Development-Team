@@ -18,7 +18,17 @@ Design notes
   back to it automatically.
 * **Never break a dispatch.** :func:`record_llm_call` swallows all I/O
   errors and returns ``False`` when no plan can be resolved. Registry
-  failures must never surface as workflow failures.
+  failures must never surface as workflow failures. A sink that fails
+  is *counted* (:func:`sink_failure_count`), because a registry that
+  silently stopped writing would look exactly like a plan that made
+  fewer calls.
+* **Two attribution coordinates** (2026-10-26): ``vp_id`` (which
+  verification point) and ``round`` (which round of it). They answer
+  the question the plan-level split cannot — a plan's ``by_scene``
+  says verification is expensive, but only these say WHICH
+  verification point and WHICH round. A scope that does not name them
+  inherits them from the scope it runs inside, so a per-task scope
+  inside a verification round cannot erase the round it belongs to.
 * **Both CC Switch data sources.** The registry only records session
   ids; the aggregator (Step 2) is expected to match them against CC
   Switch rows with *either* ``data_source`` — ``proxy`` rows for calls
@@ -42,7 +52,8 @@ from typing import Any, Dict, Iterator, Optional
 
 #: ``{"plan_id": Optional[str], "task_id": Optional[str],
 #: "task_read_only": Optional[bool], "task_allowed_files": Optional[list],
-#: "task_report_path": Optional[str]}``
+#: "task_report_path": Optional[str], "vp_id": Optional[str],
+#: "round": Optional[int]}``
 #: — per-thread / per-async-task attribution context set by server
 #: middleware, background thread entries, and per-task scopes in the
 #: executor.
@@ -63,6 +74,12 @@ from typing import Any, Dict, Iterator, Optional
 #: at the moment the sub-agent's ``--settings`` payload is assembled, by
 #: the same call that reads ``task_read_only``, and a global would let the
 #: last report task to start re-scope every other running task.
+#:
+#: ``vp_id`` / ``round`` (2026-10-26) are the cost-attribution
+#: coordinates — which verification point, which round of it. Unlike the
+#: task family they are INHERITED by a nested scope that does not name
+#: them: a round is a property of the enclosing verification round, and a
+#: per-task scope inside it says nothing about which round it is in.
 _plan_ctx: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
     "pdt_plan_usage_ctx", default=None
 )
@@ -74,6 +91,13 @@ _plan_ctx: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
 #: lock guards the open/close pair so a crash mid-append cannot leave a
 #: torn line that a later reader chokes on.
 _registry_lock = threading.Lock()
+
+#: How many registry writes were swallowed since the process started.
+#: A registry that cannot write is invisible in the DATA (the plan's
+#: report simply shows fewer calls), so the count is kept where it can
+#: be seen: :func:`sink_failure_count`.
+_sink_failures = 0
+_sink_failures_lock = threading.Lock()
 
 
 def repo_plans_dir() -> Path:
@@ -172,6 +196,73 @@ def current_task_report_path() -> Optional[str]:
     return str(rp)
 
 
+def current_vp_id() -> Optional[str]:
+    """The verification point this call belongs to, or ``None``.
+
+    ``None`` outside any scope that names one — which is what makes an
+    entry unattributable rather than misattributed: a call with no
+    verification point behind it must not borrow somebody else's.
+    """
+    ctx = _plan_ctx.get()
+    return (ctx or {}).get("vp_id")
+
+
+def current_round() -> Optional[int]:
+    """The round this call belongs to, or ``None``.
+
+    A round is a NUMBER, so the value is normalised: an ``int`` is
+    taken as it is, a numeric string is read as the number it spells,
+    and anything else is "no round" rather than a round nobody could
+    order or compare.
+    """
+    ctx = _plan_ctx.get()
+    value = (ctx or {}).get("round")
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def sink_failure_count() -> int:
+    """How many registry writes have been swallowed since process start.
+
+    The registry is a side channel: a sink that fails (a full disk, a
+    read-only tree, a resolver that raises) must never break the
+    dispatch it was recording. But a silently-blind registry is worse
+    than a loud one — every token it failed to record looks exactly
+    like a token nobody spent — so the failures are counted, and this
+    counter is how they stay visible.
+    """
+    with _sink_failures_lock:
+        return _sink_failures
+
+
+def _count_sink_failure() -> None:
+    global _sink_failures
+    with _sink_failures_lock:
+        _sink_failures += 1
+
+
+def _sink_append(path: Path, line: str) -> None:
+    """The registry's write sink: append one JSON line to ``path``.
+
+    Split out of :func:`record_llm_call` so the failure path has ONE
+    name (and so a test can make the sink fail without touching the
+    filesystem). Everything it does is best-effort by contract: the
+    caller swallows the failure and counts it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _registry_lock:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+
 @contextmanager
 def plan_usage_context(
     plan_id: Optional[str] = None,
@@ -179,6 +270,8 @@ def plan_usage_context(
     task_read_only: Optional[bool] = None,
     task_allowed_files: Optional[list[str]] = None,
     task_report_path: Optional[str] = None,
+    vp_id: Optional[str] = None,
+    round: Optional[int] = None,
 ) -> Iterator[None]:
     """Bind LLM calls in this scope to ``plan_id`` / ``task_id``.
 
@@ -205,13 +298,24 @@ def plan_usage_context(
     moment, and ``None`` (a code task, or no task at all) means "no
     carve-out issued", which :func:`current_task_report_path`
     propagates unchanged.
+
+    ``vp_id`` / ``round`` (2026-10-26) are the cost-attribution
+    coordinates: which verification point the call belongs to, and
+    which round of it. They are INHERITED — a scope that names neither
+    keeps the ones it runs inside, so the per-task scopes of a
+    verification round cannot erase the round they belong to. Naming
+    them in the inner scope overrides the outer value for the inner
+    scope only; leaving the inner scope restores the outer value.
     """
+    outer = _plan_ctx.get() or {}
     token = _plan_ctx.set({
         "plan_id": plan_id,
         "task_id": task_id,
         "task_read_only": task_read_only,
         "task_allowed_files": task_allowed_files,
         "task_report_path": task_report_path,
+        "vp_id": vp_id if vp_id is not None else outer.get("vp_id"),
+        "round": round if round is not None else outer.get("round"),
     })
     try:
         yield
@@ -236,7 +340,13 @@ def record_llm_call(
 
     Returns ``True`` when a line was written. ``False`` (silent no-op)
     when no plan can be resolved or the write fails — the registry must
-    never break a dispatch.
+    never break a dispatch. A failed write is counted
+    (:func:`sink_failure_count`) rather than dropped: the dispatch
+    survives, and the blind spot stays visible.
+
+    The line carries the two attribution coordinates (``vp_id`` /
+    ``round``) next to the fields that were already there; both are
+    ``null`` when nothing named them.
     """
     plan_id = current_plan_id()
     if not plan_id or not session_id:
@@ -245,6 +355,8 @@ def record_llm_call(
         "ts": datetime.now(timezone.utc).isoformat(),
         "plan_id": plan_id,
         "task_id": current_task_id(),
+        "vp_id": current_vp_id(),
+        "round": current_round(),
         "session_id": session_id,
         "scene": scene,
         "provider": provider,
@@ -258,13 +370,14 @@ def record_llm_call(
     }
     try:
         path = repo_plans_dir() / plan_id / "llm_sessions.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(entry, ensure_ascii=False, default=str)
-        with _registry_lock:
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
+        _sink_append(path, line)
         return True
-    except OSError:
+    except Exception:
+        # The registry is a side channel: a sink that fails (a full
+        # disk, a read-only tree, a resolver that raises) must not
+        # break the dispatch it was recording. Counted, not hidden.
+        _count_sink_failure()
         return False
 
 

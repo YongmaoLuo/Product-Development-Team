@@ -56,13 +56,24 @@ import inspect
 import json
 import logging
 import os
+import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 from base_executor import BaseExecutor, _build_layers, _now_iso, stable_fingerprint
 from utils.atomic_io import atomic_write_json
+# 2026-10-27（归因绑定点 · 轮次侧）：台账认 ``vp_id`` / ``round`` 两个
+# 归因坐标（``usage_registry``），执行器是**轮次**的持有者 —— 验证点号由
+# 子 agent 在发起会话时绑（``verification_subagent``），轮次号由这里在
+# 分派点绑。
+from usage_registry import (
+    current_plan_id,
+    current_task_id,
+    plan_usage_context,
+)
 # 2026-09-15: verdict 的出处 —— 结论只对产生它的那条
 # 命令有效。见 ``verification_verdict_provenance`` 的模块 docstring。
 import verification_verdict_provenance as verdict_provenance
@@ -252,6 +263,66 @@ _TERMINAL_BUCKET_MIRROR_ATTR: Dict[str, str] = {
     BUCKET_SKIPPED: "_skipped_items",
 }
 
+# Topic-relevance plumbing -----------------------------------------------------
+#
+# 2026-10-27：判定内核（``verification.topic_relevance``）与归档审计
+# （``verification.vp_removal_audit``）都就绪了，但执行器没有调用点 ——
+# 主题外的验证点每轮照样被全量验证。这组常量与工具函数是**执行器这一侧**
+# 需要的两样东西：判据引用的形状（用来认「这条验证点引用了一条计划里没有
+# 的判据」），以及判据表的来源。
+
+#: 判据**引用**的形状：``AC-001`` / ``C1`` / ``AC-NOT-IN-PRD``。
+#:
+#: 「引用」与「散文」必须分开：一条验证点声明 ``["AC-NOT-IN-PRD"]`` 是在指
+#: 着一个具体的判据编号 —— 计划里没有这个编号，是一条**可以核对**的矛盾；
+#: 一条验证点声明 ``["导出 CSV"]`` 只是写法不同，对不上不构成矛盾，拿散文
+#: 去和判据表对账是拿散文对散文。
+_CRITERION_REFERENCE_RE = re.compile(
+    r"^(?:[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+|[A-Za-z]{1,10}\d+)$"
+)
+
+#: 声明切词的分隔符：空白 + 中英文标点（与判定内核同一套切法）。
+_REFERENCE_SPLIT_RE = re.compile(
+    r"[\s,;:、，。；：！？！（）()\[\]【】「」《》〈〉…·/\\|]+"
+)
+
+#: 计划文件的名字（判据表的第二个来源）。
+_PLAN_FILENAME = "verification_plan.json"
+
+
+def _reference_key(text: Any) -> str:
+    """判据编号的比较键（全角折叠 + 大小写不敏感）。
+
+    与判定内核的 ``_id_key`` 同一套：编号是标识符，不能把连字符也删掉
+    （``AC-2`` 删掉连字符就成了 ``AC2``，那是另一个编号），但全角与大小写
+    是噪声。
+    """
+    return unicodedata.normalize("NFKC", str(text or "")).casefold()
+
+
+def _criterion_references(vp: Any) -> List[str]:
+    """这条验证点声明里**编号式**的判据引用。
+
+    只收编号式的（``AC-001``）—— 散文式的声明（``"导出 CSV"``）不是引用，
+    见 :data:`_CRITERION_REFERENCE_RE` 的说明。
+    """
+    if not isinstance(vp, Mapping):
+        return []
+    raw = vp.get("related_prd_criteria")
+    if isinstance(raw, str):
+        candidates = [raw]
+    elif isinstance(raw, (list, tuple)):
+        candidates = [str(item) for item in raw if item is not None]
+    else:
+        candidates = []
+    references: List[str] = []
+    for candidate in candidates:
+        for token in _REFERENCE_SPLIT_RE.split(candidate):
+            token = token.strip()
+            if token and _CRITERION_REFERENCE_RE.match(token):
+                references.append(token)
+    return references
+
 #: Default filename for the on-disk state file. The state file lives
 #: next to the other verification artifacts under ``plan_dir`` so the
 #: entire VP-execution state is colocated with the report / plan JSON.
@@ -325,7 +396,15 @@ class VerificationExecutor(BaseExecutor):
         (see :meth:`run`) — a fixed-width semaphore when the caller
         passes a positive ``max_parallel`` and no ``gate``, and no gate
         at all when the caller passes ``max_parallel=0``, which is what
-        the production verification path does.
+        the production verification path does;
+      * ``round_no`` — optional keyword.  **Which round this run is.**
+        It is the round half of the cost attribution the registry
+        records (2026-10-27): the executor binds it at the dispatch
+        point so every session it hands out carries it, and the
+        verification point half (``vp_id``) is bound one layer down, by
+        the sub-agent that opens the session (see
+        :mod:`verification_subagent`).  ``None`` means "ask the state
+        store" (see :meth:`_round_number`).
 
     The class is intentionally stateless across instances: every
     mutation goes through :meth:`_save_state`, so two processes
@@ -356,11 +435,41 @@ class VerificationExecutor(BaseExecutor):
         plan_dir: Path,
         sub_agent_runner: Callable[[Dict[str, Any]], Any],
         verif_repo: Optional[Any] = None,
+        *,
+        topic_relevance_llm_batch: Optional[Callable[..., Any]] = None,
+        round_no: Optional[int] = None,
     ) -> None:
         self.verification_plan = verification_plan
         self.plan_id = plan_id
         self.plan_dir = Path(plan_dir)
         self.sub_agent_runner = sub_agent_runner
+
+        # 2026-10-27（归因）：本轮的轮次号。调用方知道自己是第几轮时
+        # 直接给；不给就问状态库（``_current_round``）。
+        self._round_no = round_no
+
+        # 2026-10-27（主题相关性判定）：本轮可用的**批量判定器**。
+        #
+        # ``None`` = 没有模型可问 → 判定内核按「相关」兜底（一条验证点不能
+        # 因为模型抽风而消失）。判定内核自己会按签名适配调用方式，契约是
+        # ``llm_batch(vps, criteria)``。
+        self._topic_relevance_llm_batch = topic_relevance_llm_batch
+
+        # 移除集：**每轮重建**（从审计文件），**绝不**写进 executor_state ——
+        # 审计文件是移除的唯一持久化真相，两处真相必然漂移。
+        #
+        # 这里先放一个空集：``super().__init__`` → ``_load_or_init_state`` →
+        # ``_backfill_index_lists_from_verdicts`` 会读它，那条路径上还没有
+        # 「本轮的移除集」可言（真正重建在 ``run()`` 的第三步）。
+        self._removed_vp_ids: Set[str] = set()
+
+        # 2026-10-27：``reset_state()`` 之后的**那一轮**不许装载裁决。
+        #
+        # 「装载裁决」（``run()`` 的第一步）把持久化存储里的旧结论读回内存 ——
+        # 刚被 ``reset_state()`` 清掉的结论若在这一步回来，那条验证点会被
+        # 当成「上一轮已经验过」而跳过：清空等于没做。标志是**一次性的**：
+        # 跳过这一轮之后恢复，否则执行器就再也看不见别人写的结论了。
+        self._skip_next_hydration: bool = False
 
         # Optional state-machine routing for the verdict callback
         # chain. When provided, ``record_verdict`` /
@@ -534,6 +643,12 @@ class VerificationExecutor(BaseExecutor):
             # 拼写（见 :meth:`_orphaned_vp_ids`）。
             if str(vp_id).strip() in orphaned:
                 continue
+            # 2026-10-27：**被移除的验证点不进报告**。移除是「这条验证点
+            # 不属于本计划的主题」—— 它的旧裁决（上一轮留下的）不该继续
+            # 生产报告，正如计划作废的验证点一样。判据与执行侧共用
+            # :meth:`_removed_vp_ids`。
+            if str(vp_id).strip() in self._removed_vp_ids:
+                continue
             entry = dict(verdict)  # defensive copy
             entry["vp_id"] = vp_id
             out.append(entry)
@@ -571,6 +686,12 @@ class VerificationExecutor(BaseExecutor):
         self._deferred_vps = []
         self._current_vp = None
         self._completed_vps = []
+        # 2026-10-27：**下一轮不许装载裁决**。持久化存储（SQLite 仓库 /
+        # 旧的 state 文件）里那份旧结论还在 —— 只清内存等于清了一半，下一轮
+        # 的「装载裁决」会把它们读回来，那条验证点就被当成「上一轮已经验过」
+        # 而跳过：清空等于没做。标志是一次性的 —— 跳过这一轮之后恢复，
+        # 否则执行器就再也看不见别人写的结论了。
+        self._skip_next_hydration = True
 
     # ------------------------------------------------------------------
     # Public read-only progress state API
@@ -661,6 +782,27 @@ class VerificationExecutor(BaseExecutor):
         mode.  Progress is derived from the verdict map; no separate
         progress state-file is written.
 
+        管线顺序（2026-10-27，承重）
+        --------------------------
+        这一轮的执行之前先做**主题相关性判定**：主题外的验证点不该被跑一遍
+        ——跑一遍的结论没有价值，钱却是真花了。顺序是::
+
+            装载裁决 → 隔离孤儿 → 扣除移除集 → 判定 → 先归档后移除 → 派生索引
+
+        每一步为什么在这个位置：
+
+        * **装载裁决** 在最前 —— 判定与移除都要看这一轮真正的裁决表。
+        * **隔离孤儿** 紧随其后 —— 计划没有定义的裁决先离开投影，它**不是**
+          「主题外」，不许混进移除集。
+        * **扣除移除集** 在判定之前 —— 上一轮移除掉的验证点不再参与判定，
+          也不会被归档第二次。
+        * **先归档后移除** —— 归档写成功才允许移除（写不进去就留着）。
+        * **派生索引** 在最后 —— 索引是从裁决表派生的，被移除的验证点不进
+          任何桶。派生在执行**之前**完成：执行过程中的桶由
+          ``_record_result`` 维护，而派生函数会把「出处过期」的结论摘掉 ——
+          刚写下的结论还没有出处指纹，执行之后再派生会把自己这一轮的结论
+          摘掉。
+
         Args:
             max_parallel: Fixed width for the gather, used only when no
                 ``gate`` is supplied. **The production caller passes
@@ -682,6 +824,51 @@ class VerificationExecutor(BaseExecutor):
         the executor, and the only honest width report now that no width
         is declared.
         """
+        # 2026-10-27（归因绑定点 · 轮次侧）：轮次号在**分派点**绑定。
+        #
+        # 执行器是轮次的持有者 —— 它知道自己是第几轮，分派出去的每一次
+        # 验证会话都得带着这个号，否则台账里的行只有「哪条验证点」，没有
+        # 「哪一轮」，而「哪一轮」正是「第一轮就没过」和「第三轮才过」的
+        # 分界。
+        #
+        # 这里绑的是**轮次**，不是验证点：验证点号由发起会话的那一层绑
+        # （``verification_subagent``）—— 只有它知道自己是谁。绑在轮次这
+        # 一层，内层的验证点号由 ``plan_usage_context`` 的继承规则接住。
+        #
+        # ``plan_id`` / ``task_id`` 原样带过来：这次绑定不许顺手改掉别的
+        # 归因（台账里既有字段的值必须与绑定之前一模一样）。
+        round_no = self._round_number()
+        with plan_usage_context(
+            plan_id=current_plan_id(),
+            task_id=current_task_id(),
+            round=round_no,
+        ):
+            await self._run_round(max_parallel=max_parallel, gate=gate)
+
+    async def _run_round(self, max_parallel: int = 1, *, gate: Any = None) -> None:
+        """这一轮自己的身子 —— 见 :meth:`run`。
+
+        单独一个方法只为让 :meth:`run` 的归因绑定包住整轮：轮次号是**这一
+        轮**的属性，不是某一次分派的属性。
+        """
+        # 1. 装载裁决 —— 这一轮看到的是「构造之后才落库」的结论。
+        self._hydrate_verdicts()
+        # 2. 隔离孤儿 —— 行为不变：计划没有定义的裁决不进报告投影。
+        self._quarantine_orphan_verdicts()
+        # 3. 扣除移除集 + 主题判定 + 先归档后移除。
+        self._apply_topic_relevance()
+        # 4. 派生索引 —— 在移除**之后**派生，所以被移除的验证点不进任何桶。
+        #
+        #    派生放在执行**之前**是有原因的：``_backfill_index_lists_from_verdicts``
+        #    会把「出处过期」的结论摘掉，而刚写下的结论还没有出处指纹
+        #    （指纹由 ``record_verdict`` 盖，生产路径 ``_record_result`` 不盖）
+        #    —— 执行之后再派生，这一轮自己的结论会被当成过期的摘掉。执行
+        #    过程中的桶由 ``_record_result`` 维护。
+        self._backfill_index_lists_from_verdicts()
+        self._completed_items = list(self._completed_vps)
+        self._failed_items = list(self._failed_vps)
+        self._skipped_items = list(self._skipped_vps)
+
         await super().run(max_parallel=max_parallel, gate=gate)
         # After super().run() returns, BaseExecutor has set
         # ``_current_item = None`` and saved the final progress
@@ -1329,6 +1516,10 @@ class VerificationExecutor(BaseExecutor):
                 vp_id: verdict
                 for vp_id, verdict in self._verdicts.items()
                 if str(vp_id).strip() not in orphaned
+                # 2026-10-27：**被移除的验证点不进任何桶**。它既不是失败
+                # （没人要它了），也不是验证通过（没验过就报通过是撒谎）。
+                # 与 :meth:`collect_verdicts` 共用同一道闸。
+                and str(vp_id).strip() not in self._removed_vp_ids
             },
             retired=retired,
         )
@@ -1899,9 +2090,15 @@ class VerificationExecutor(BaseExecutor):
         # filtering here stays keyed on the **marker**, not on the id —
         # the historical comprehension filtered on the marker alone, so a
         # marker-carrying VP without an ``id`` was dropped and still is.
+        #
+        # 2026-10-27: **被移除的验证点也不跑**。移除集每轮从审计文件重建
+        # （见 :meth:`_apply_topic_relevance`），它与「计划自己作废」是两种
+        # 不同的「不要它了」：作废是计划改主意了，移除是这条验证点不属于本
+        # 计划的主题。两种都不跑，但只有后者有审计行。
         return [
             vp for vp in self._plan_vps()
             if not self._vp_retired_marker(vp)
+            and not self._is_removed_vp(vp)
         ]
 
     def _plan_retired_vps(self) -> Dict[str, str]:
@@ -1944,6 +2141,17 @@ class VerificationExecutor(BaseExecutor):
         if vp.get("superseded_by"):
             return "superseded_by"
         return None
+
+    def _is_removed_vp(self, vp: Any) -> bool:
+        """这个验证点已经被移除了吗（主题外移除）。
+
+        移除集每轮从审计文件重建（见 :meth:`_apply_topic_relevance`），它是
+        移除的**唯一**持久化真相 —— 不写进 ``executor_state``，两处真相必然
+        漂移。
+        """
+        if not isinstance(vp, Mapping):
+            return False
+        return str(vp.get("id") or "").strip() in self._removed_vp_ids
 
     def _plan_vps(self) -> List[Any]:
         """The plan's VP list, in whichever schema the caller supplied."""
@@ -2177,6 +2385,316 @@ class VerificationExecutor(BaseExecutor):
                     "defined by the plan — dropped from the report projection",
                     self.plan_id, key, self._orphaned_vps[key],
                 )
+
+    # ------------------------------------------------------------------
+    # Topic relevance — judge, archive, remove
+    # ------------------------------------------------------------------
+    #
+    # 2026-10-27：判定内核（``verification.topic_relevance``）与归档审计
+    # （``verification.vp_removal_audit``）都就绪了，但执行器没有调用点 ——
+    # 主题外的验证点每轮照样被全量验证：跑一遍、产出一条裁决、报告里再出现
+    # 一次。跑一遍的结论没有价值，钱却是真花了。
+    #
+    # 这一段把三件事接起来，顺序是承重的：
+    #
+    #   1. **判定** —— 判定内核给出三态结果（相关 / 无关 / 兜底）；
+    #   2. **先归档** —— 归档写成功，移除才有据；
+    #   3. **后移除** —— 归档写不进去就**留着**（写不进去就不得移除）。
+
+    def _hydrate_verdicts(self) -> None:
+        """把持久化的裁决重新读回内存（``run()`` 的第一步）。
+
+        ``__init__`` 已经水合过一次；``run()`` 再水合一次是为了让这一轮看到
+        「构造之后才落库」的结论 —— 执行器可以被复用多轮，而落库是别人写的。
+
+        这里**只**动 ``_verdicts``：孤儿隔离与索引派生各有各的步骤（见
+        :meth:`run`），不在这里重复做。
+
+        2026-10-27：``reset_state()`` 之后的那一轮**跳过**装载 —— 刚清空的
+        结论在这一步回来就等于没清（详见 :meth:`reset_state`）。
+        """
+        if self._skip_next_hydration:
+            self._skip_next_hydration = False
+            logger.info(
+                "[Verification] plan_id=%s: hydration skipped — the state was "
+                "explicitly reset, the next round starts from scratch",
+                self.plan_id,
+            )
+            return
+        for vp_id, verdict in self._stored_verdicts().items():
+            key = str(vp_id)
+            if not key.strip():
+                continue
+            self._verdicts[key] = (
+                dict(verdict) if isinstance(verdict, dict) else verdict
+            )
+
+    def _stored_verdicts(self) -> Dict[str, Any]:
+        """持久化存储里的裁决表（SQLite 优先，否则旧的 state 文件）。
+
+        与 :meth:`_load_or_init_state` 的两个分支读的是同一份东西 —— 形状
+        也一样：SQLite 那边可能是 list（每条带 ``vp_id``），旧 state 文件
+        那边是 ``{vp_id: verdict}``。
+        """
+        if self.verif_repo is not None:
+            try:
+                row = self.verif_repo.summary(self.plan_id)
+            except Exception:  # noqa: BLE001 - 存储读不到不是致命的
+                return {}
+            if not isinstance(row, dict):
+                return {}
+            raw = row.get("verdicts") or {}
+            if isinstance(raw, list):
+                return {
+                    str(v.get("vp_id")): v
+                    for v in raw
+                    if isinstance(v, dict) and v.get("vp_id")
+                }
+            if isinstance(raw, dict):
+                return dict(raw)
+            return {}
+        try:
+            data = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        verdicts = data.get("verdicts") if isinstance(data, dict) else None
+        return dict(verdicts) if isinstance(verdicts, dict) else {}
+
+    def _topic_relevance_criteria(self) -> List[Dict[str, str]]:
+        """本计划的判据表 —— 主题判定拿它当「这个计划到底要什么」的权威。
+
+        两个来源，先字典后文件：
+
+        1. 执行器拿到的计划字典（``plan["criteria"]`` /
+           ``plan["acceptance_criteria"]``）；
+        2. 计划文件本身（``plan_dir/verification_plan.json``）—— 执行器拿到
+           的是**转换后**的计划（``verification_agent`` 的转换会丢掉判据段），
+           文件里那份才是原样。
+
+        只收**编号式**的判据（``id`` + 正文）：没有编号的判据没法被引用，
+        收了也只会在判定内核里被丢掉。
+        """
+        raw: Any = None
+        for source in (self.plan, self._plan_file_payload()):
+            if not isinstance(source, Mapping):
+                continue
+            for key in ("criteria", "acceptance_criteria"):
+                candidate = source.get(key)
+                if isinstance(candidate, (list, tuple)) and candidate:
+                    raw = candidate
+                    break
+            if raw:
+                break
+        if not isinstance(raw, (list, tuple)):
+            return []
+        criteria: List[Dict[str, str]] = []
+        for entry in raw:
+            if not isinstance(entry, Mapping):
+                continue
+            criterion_id = str(
+                entry.get("id") or entry.get("criterion_id") or ""
+            ).strip()
+            if not criterion_id:
+                continue
+            text = str(
+                entry.get("text")
+                or entry.get("description")
+                or entry.get("content")
+                or ""
+            ).strip()
+            criteria.append({"id": criterion_id, "text": text})
+        return criteria
+
+    def _plan_file_payload(self) -> Optional[Dict[str, Any]]:
+        """计划文件本身（``plan_dir/verification_plan.json``）的内容。
+
+        读不到就返回 ``None`` —— 判据表少一个来源不影响判定（判定内核在
+        没有判据时按「相关」兜底）。
+        """
+        path = self.plan_dir / _PLAN_FILENAME
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _apply_topic_relevance(self) -> Set[str]:
+        """判定活动验证点是否还在计划主题内；主题外的**先归档、后移除**。
+
+        顺序是承重的：
+
+        1. **扣除移除集** —— 移除集每轮从审计文件重建（它是移除的唯一持久化
+           真相，**不**写进 ``executor_state``）；上一轮移除掉的验证点不再
+           参与判定，也不会被归档第二次。
+        2. **判定** —— 判定内核先走确定性层（判据编号 / 正文命中），剩下
+           的交给模型；模型不可用就按「相关」兜底。
+        3. **先归档、后移除** —— 归档写成功才允许移除。写不进去（磁盘满 /
+           只读 / 记录不可序列化）就**留着**那条验证点：一次没有证据的移除
+           是一次静悄悄的严格度损失。
+
+        Returns:
+            本轮的移除集（之前移除过的 + 这一次移除的）。
+        """
+        from verification.topic_relevance import (
+            TIER_FAIL_OPEN,
+            RelevanceDecision,
+            judge_topic_relevance,
+        )
+        from verification.vp_removal_audit import (
+            archive_removal,
+            load_removed_vp_ids,
+        )
+
+        # 1. 移除集每轮重建 —— 审计文件是唯一的持久化真相。
+        removed: Set[str] = set(load_removed_vp_ids(self.plan_dir))
+        self._removed_vp_ids = removed
+
+        # 活动集合 = 计划里的 − 计划自己作废的 − 已经移除的。
+        active: List[Dict[str, Any]] = []
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for vp in self._plan_vps():
+            if not isinstance(vp, Mapping):
+                continue
+            if self._vp_retired_marker(vp):
+                continue
+            vp_id = str(vp.get("id") or "").strip()
+            if not vp_id or vp_id in removed:
+                continue
+            active.append(dict(vp))
+            by_id[vp_id] = dict(vp)
+        if not active:
+            return removed
+
+        # 2. 判定。
+        criteria = self._topic_relevance_criteria()
+        results = judge_topic_relevance(
+            vps=active,
+            criteria=criteria,
+            llm_batch=self._topic_relevance_llm_batch,
+        )
+
+        # 3. 移除候选。
+        candidates: List[Tuple[str, Any]] = []
+        for vp_id, result in results.items():
+            if result.decision == RelevanceDecision.LLM_IRRELEVANT:
+                candidates.append((vp_id, result))
+                continue
+            # 判定内核没能给出结论（模型不可用 / 回答不可解析）时，只认一条
+            # **确定性**的矛盾：这条验证点声明的判据编号在计划里一条都对不上。
+            # 模型还能说话的时候由模型说话 —— 模型的明确判断优先。
+            if result.tier == TIER_FAIL_OPEN and self._has_broken_reference(
+                by_id.get(vp_id, {}), criteria,
+            ):
+                candidates.append((vp_id, result))
+
+        # 4. 先归档、后移除。
+        for vp_id, result in candidates:
+            try:
+                archive_removal(self._removal_record(vp_id, result), self.plan_dir)
+            except Exception as exc:  # noqa: BLE001 - 写不进去就不得移除
+                logger.warning(
+                    "[Verification] plan_id=%s: could not archive the removal "
+                    "of %s (%s) — keeping it: a removal without an audit trail "
+                    "is a silent loss of strictness",
+                    self.plan_id, vp_id, exc,
+                )
+                continue
+            removed.add(vp_id)
+
+        self._removed_vp_ids = removed
+        return removed
+
+    def _has_broken_reference(
+        self,
+        vp: Mapping[str, Any],
+        criteria: List[Dict[str, str]],
+    ) -> bool:
+        """这条验证点声明的判据编号在计划里一条都对不上吗（确定性矛盾）。
+
+        只有**编号式**的声明才算数：``["AC-NOT-IN-PRD"]`` 是在指着一个具体
+        的判据，而计划里没有这个编号 —— 那是事实层面的矛盾。散文式的声明
+        （``["导出 CSV"]``）对不上只是写法不同，不能据此判死一条验证点。
+
+        判据表里只要有一条**不是**编号式的，整条规则就停用：那种判据表没有
+        「编号」可言，验证点的声明对不上它是常态而不是矛盾。
+        """
+        if not criteria:
+            return False
+        known: Set[str] = set()
+        for criterion in criteria:
+            criterion_id = str(criterion.get("id") or "")
+            if not criterion_id or not _CRITERION_REFERENCE_RE.match(criterion_id):
+                return False
+            known.add(_reference_key(criterion_id))
+        references = _criterion_references(vp)
+        if not references:
+            return False
+        return not any(_reference_key(ref) in known for ref in references)
+
+    def _removal_record(self, vp_id: str, result: Any) -> Dict[str, Any]:
+        """一条移除记录 —— 归档文件里的形状。
+
+        与 :mod:`verification.vp_removal_audit` 的契约一致：读路径从
+        ``vp_id``（或 ``vp.id``）取 id，其余字段是给人看的判定依据 —— 什么
+        判的、依据是什么、这条验证点当时是什么状态。
+        """
+        verdict = self._verdicts.get(vp_id)
+        status = verdict.get("status") if isinstance(verdict, dict) else None
+        return {
+            "schema_version": 1,
+            "ts": _now_iso(),
+            "plan_id": self.plan_id,
+            "round": self._current_round(),
+            "component": "verification_executor",
+            "vp_id": vp_id,
+            "decision": str(result.decision),
+            "tier": str(result.tier),
+            "reason": str(result.reason),
+            "evidence": {
+                "matched_criterion_ids": list(result.matched_criterion_ids),
+            },
+            "vp": {"id": vp_id},
+            "verdict": {"status": str(status) if status else "pending"},
+            # 移除不动 id 台账（``allocated_vp_ids``）—— 那个号已经被发出去过，
+            # 移除一条验证点不等于把号收回来。
+            "allocated_vp_ids_preserved": True,
+        }
+
+    def _current_round(self) -> int:
+        """这一轮是第几轮（归档记录里的 ``round``）。
+
+        执行器自己不知道轮次 —— 轮次住在状态库的 ``plan_verification.round``
+        列上。没有绑定状态库时是 0（「轮次未知」，不是「第一轮」）。
+        """
+        if self.verif_repo is None:
+            return 0
+        try:
+            row = self.verif_repo.summary(self.plan_id)
+        except Exception:  # noqa: BLE001 - 读不到轮次不是致命的
+            return 0
+        if not isinstance(row, dict):
+            return 0
+        try:
+            return int(row.get("round") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _round_number(self) -> Optional[int]:
+        """这一轮是第几轮 —— **交给分派**的归因坐标。
+
+        显式给的轮次优先（调用方知道自己是第几轮），否则问状态库
+        （:meth:`_current_round`）。状态库说「不知道」（0）时是 ``None``：
+        0 是「轮次未知」，不是「第一轮」—— 把它写进台账会造出一个不存在
+        的第 0 轮，而「第 0 轮」在报表里和「第一轮」长得一样。
+        """
+        if self._round_no is not None:
+            try:
+                explicit = int(self._round_no)
+            except (TypeError, ValueError):
+                explicit = 0
+            return explicit if explicit > 0 else None
+        current = self._current_round()
+        return current if current > 0 else None
 
     def _load_orphan_ledger(self, raw: Any) -> None:
         """Read the persisted orphan ledger (``orphaned_vp_ids``).

@@ -14,6 +14,7 @@ import inspect
 import json
 import logging
 import os
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set, Tuple
@@ -41,6 +42,24 @@ from verification.failure_triage import (
     disposition_for,
     is_not_looser,
 )
+# 2026-10-27: the fingerprint of a failure, and the decision it feeds.
+# The fingerprint says *whether* the root cause moved; the decision says
+# what the round does about it. Both are pure functions — the loop's
+# bookkeeping must be reproducible from the record alone.
+from verification.failure_fingerprint import (
+    failure_fingerprint,
+    needs_root_cause_task,
+)
+# 2026-10-27: the two task shapes the root-cause chain dispatches — the
+# read-only diagnosis and the single implementation task that follows it.
+# The builders own the shape (the id, the ``kind``, the fields each kind
+# must and must not carry); the orchestrator owns *when* they are
+# dispatched.
+from root_cause_task import (
+    build_implementation_task,
+    build_root_cause_task,
+    root_cause_report_path,
+)
 from verification.triage_agent import VPTriageJudge
 from verification_plan_delta import (
     OBSOLETE_FIELD,
@@ -67,6 +86,52 @@ _LOOP_TRACKING_VERSION = 2
 #: uses, so a key reads the same in a log line as it does on disk.
 _DECISION_KEY_SEPARATOR = "|"
 
+#: The marker a repair row carries when the failure's root cause
+#: evolved. 2026-10-27: the repair decision forks on the fingerprint —
+#: a point that failed again *for a different reason* is not the failure
+#: the last repair attempt was aimed at, so its row says so.
+_ROOT_CAUSE_MARK = "【根因演进】"
+
+#: The file the root-cause chain's record is written to.
+#:
+#: The chain outlives a single round: the diagnosis is dispatched in one
+#: round and answered in the next, and every round runs in a **fresh**
+#: orchestrator. So the stage the chain stands at cannot live in memory —
+#: it is the plan's own history, and it goes next to the round payload
+#: that already is (``verification_loop_tracking.json``).
+_ROOT_CAUSE_CHAIN_FILENAME = "verification_root_cause_chain.json"
+
+#: The chain's stages, per point:
+#:
+#: ``root_cause``
+#:     The point's root cause moved. What it owes now is a **diagnosis**:
+#:     a read-only task that delivers a root-cause report.
+#: ``implementation``
+#:     The diagnosis came back with a scope. What the point owes now is
+#:     **exactly one** implementation task — the blind repairs are over.
+#: ``BLOCKED_ON_USER``
+#:     The machine's road on this point is walked out: one diagnosis, one
+#:     implementation, and the point still fails. A human takes it from
+#:     here.
+_CHAIN_STAGE_ROOT_CAUSE = "root_cause"
+_CHAIN_STAGE_IMPLEMENTATION = "implementation"
+CHAIN_STAGE_BLOCKED_ON_USER = "BLOCKED_ON_USER"
+
+#: The headings a root-cause report may put its scope under.
+#:
+#: The report is written by the executor, so its shape is not ours to
+#: dictate — but the *scope* it delivers is not optional: the
+#: implementation task's ``files_to_modify`` is exactly these paths, and
+#: a task without a blast radius is a task that guesses.
+_ROOT_CAUSE_SCOPE_HEADINGS = (
+    "改动范围",
+    "修改范围",
+    "涉及文件",
+    "受影响文件",
+    "files_to_modify",
+    "files to modify",
+)
+
 
 def _decision_key_str(key: Tuple[str, str]) -> str:
     """The on-disk spelling of one ``(point, failure class)`` pair."""
@@ -87,6 +152,174 @@ def _parse_decision_key(text: Any) -> Optional[Tuple[str, str]]:
     if not separator or not vp_id:
         return None
     return (vp_id, failure_class)
+
+
+def _parse_failure_fingerprints(raw: Any) -> Dict[str, List[Optional[str]]]:
+    """The fingerprint pairs a payload carries, as ``{vp_id: [prev, curr]}``.
+
+    The payload's ``failure_fingerprints`` key is **optional** — a
+    payload written before the fingerprints existed simply does not have
+    it, and that is not an error: the reader returns an empty map and
+    the loop keeps its old behaviour.
+
+    A pair is ``[fp_prev, fp_curr]``: the fingerprint of the point's
+    failure in the previous round and in the current one. The previous
+    slot may be ``None`` — a point that failed for the first time has no
+    previous fingerprint, and "we do not know" must not be spelled as
+    "it was the same" (nor as a KeyError further down).
+
+    A malformed pair is dropped rather than repaired: a half-written
+    fingerprint is not evidence about anything.
+    """
+    out: Dict[str, List[Optional[str]]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for vp_id, pair in raw.items():
+        if not isinstance(vp_id, str) or not vp_id:
+            continue
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        fp_prev, fp_curr = pair
+        if fp_prev is not None and not isinstance(fp_prev, str):
+            continue
+        if not isinstance(fp_curr, str) or not fp_curr:
+            continue
+        out[vp_id] = [fp_prev, fp_curr]
+    return out
+
+
+def _looks_like_path(token: str) -> bool:
+    """Whether a token is a relative path a report names.
+
+    A path is a path because it says where it is: it carries a ``/`` and
+    nothing else that would make it prose. A URL is not a path in this
+    repository, and a bare word is a sentence, not a file.
+    """
+    if not token or " " in token or "\t" in token:
+        return False
+    if "/" not in token:
+        return False
+    if token.startswith(("#", ">", "|")):
+        return False
+    if "://" in token:
+        return False
+    return True
+
+
+def _scope_tokens(line: str) -> List[str]:
+    """The paths one line of a report's scope section names.
+
+    A scope line is written by a person (or a model) writing prose: it
+    may be a bullet, a numbered item, a ``改动范围：a.py、b.py`` line, or
+    a sentence with the paths in backticks. Every shape is read the same
+    way — strip the marker, split on the separators, keep what looks like
+    a path.
+    """
+    text = line.strip()
+    # The bullet marker and the numbering.
+    text = re.sub(r"^(?:[-*+•]|\d+[.)])\s*", "", text)
+    # A "改动范围：a.py、b.py" line carries the paths after the colon.
+    text = re.split(r"[：:]", text, maxsplit=1)[-1]
+    out: List[str] = []
+    for raw in re.split(r"[\s,，、;；]+", text):
+        token = raw.strip().strip("`").strip()
+        token = token.rstrip("。．.，,、；;")
+        if _looks_like_path(token):
+            out.append(token)
+    return out
+
+
+def _json_body(text: str) -> Optional[Any]:
+    """The JSON a report carries, if it carries any.
+
+    Two shapes: the whole file is JSON, or a fenced ```json block inside
+    a markdown report. Anything else is not JSON — a report that is not
+    JSON is read as markdown, not as broken JSON.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    candidates = [stripped]
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", stripped, re.DOTALL)
+    if fenced:
+        candidates.append(fenced.group(1).strip())
+    for candidate in candidates:
+        if not candidate.startswith(("{", "[")):
+            continue
+        try:
+            return json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _paths_from_report(body: Any) -> List[str]:
+    """The paths a JSON report body names."""
+    if isinstance(body, list):
+        return [
+            str(item).strip()
+            for item in body
+            if isinstance(item, str) and item.strip()
+        ]
+    if not isinstance(body, Mapping):
+        return []
+    for key in ("paths", "files_to_modify"):
+        value = body.get(key)
+        if isinstance(value, (list, tuple)):
+            return [
+                str(item).strip()
+                for item in value
+                if isinstance(item, str) and item.strip()
+            ]
+        if isinstance(value, str) and value.strip():
+            return [value.strip()]
+    fix_plan = body.get("fix_plan")
+    if isinstance(fix_plan, Mapping):
+        return _paths_from_report(fix_plan)
+    return []
+
+
+def _root_cause_scope_from_text(text: str) -> List[str]:
+    """The relative paths a root-cause report names.
+
+    The report is the diagnosis's deliverable, and the scope it delivers
+    is what the implementation task is allowed to change. So the scope is
+    read out of the report — never guessed from the failure.
+
+    Two shapes are read: a JSON body (the whole file, or a fenced
+    ``json`` block) and a markdown section under a scope heading. A
+    report that names no path yields no scope, and the caller then
+    refuses to build an implementation task rather than invent one.
+    """
+    if not text:
+        return []
+    body = _json_body(text)
+    if body is not None:
+        paths = _paths_from_report(body)
+        if paths:
+            return paths
+    paths: List[str] = []
+    in_scope = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            heading = stripped.lstrip("#").strip().lower()
+            in_scope = any(
+                heading.startswith(candidate.lower())
+                for candidate in _ROOT_CAUSE_SCOPE_HEADINGS
+            )
+            continue
+        if not in_scope:
+            continue
+        paths.extend(_scope_tokens(stripped))
+    seen: Set[str] = set()
+    unique: List[str] = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
 
 
 def _is_counted_failure(key: Tuple[str, str]) -> bool:
@@ -632,11 +865,29 @@ class VerificationOrchestrator:
         # 2026-10-22 (v2): the persisted state is per
         # ``(verification point, failure class)`` pair, so a point that
         # changed its failure class is not counted as the same cause.
+        #
+        # 2026-10-27: the payload is read **once** and handed to both
+        # parsers — the counts and the fingerprints come from the same
+        # read, so a round can never see the count of one write and the
+        # fingerprint of another. A payload without the fingerprint key
+        # is a legacy payload: it loads, and the fingerprints are simply
+        # unknown.
+        tracking_payload = self._read_loop_tracking_payload()
         (
             self._previous_failed_keys,
             self._same_failure_counts,
             self._last_round,
-        ) = self._load_loop_tracking()
+        ) = self._parse_loop_tracking(tracking_payload)
+        # ``{vp_id: [fp_prev, fp_curr]}`` — the fingerprint of each
+        # point's failure in the last two rounds. The pair is what tells
+        # "the same failure again" (the count) apart from "a different
+        # failure under the same name" (the count plus a changed
+        # fingerprint).
+        self._failure_fingerprints: Dict[str, List[Optional[str]]] = (
+            _parse_failure_fingerprints(
+                tracking_payload.get("failure_fingerprints")
+            )
+        )
         self._current_repair_tasks: List[Dict] = []
         self._waiting_for_user = False
         # 2026-10-22 (triage): the semantic judge that names the nature of
@@ -721,6 +972,46 @@ class VerificationOrchestrator:
             for key in self._previous_failed_keys
         }
 
+    @property
+    def _failure_fingerprints(self) -> Dict[str, List[Optional[str]]]:
+        """The fingerprint pairs of the last two rounds, per point.
+
+        Stored in the instance dictionary and read through this
+        property, so an orchestrator built **without** ``__init__``
+        reads an empty map instead of raising ``AttributeError``. The
+        stub helpers in the test suite build their orchestrator that
+        way (they set the attributes they need by hand), and a round
+        must not die on a missing bookkeeping attribute — a missing
+        fingerprint map means "no fingerprints known", which is exactly
+        what a legacy payload says too.
+
+        The map is **replaced**, never mutated in place: the round
+        writes a fresh pair map every time it records a round.
+        """
+        fingerprints = self.__dict__.get("_failure_fingerprints")
+        if fingerprints is None:
+            fingerprints = {}
+            self.__dict__["_failure_fingerprints"] = fingerprints
+        return fingerprints
+
+    @_failure_fingerprints.setter
+    def _failure_fingerprints(self, value: Any) -> None:
+        self.__dict__["_failure_fingerprints"] = dict(value or {})
+
+    def _read_loop_tracking_payload(self) -> Dict[str, Any]:
+        """The tracking file's raw payload — ``{}`` when it is not there.
+
+        One read, one payload: the counts and the fingerprints live in
+        the same file and are read together, so a round cannot see the
+        count of one write and the fingerprint of another.
+        """
+        try:
+            with self._loop_tracking_path().open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
     def _load_loop_tracking(self) -> Tuple[set, Dict[str, int], int]:
         """Return ``(failed_keys, same_failure_counts, last_round)``.
 
@@ -739,6 +1030,13 @@ class VerificationOrchestrator:
         failed. Failures that do not count (``infra``,
         ``out_of_scope``) have no entry at all.
 
+        2026-10-27: the same payload also carries
+        ``failure_fingerprints`` — ``{vp_id: [fp_prev, fp_curr]}`` — the
+        fingerprint of each point's failure in the last two rounds. It
+        is read by :meth:`_parse_failure_fingerprints`, from the same
+        read, and it is **optional**: a payload without it is a legacy
+        payload and reads as "no fingerprints known", never as an error.
+
         A v1 file is read as an empty state. It names the points that
         failed but not *why*, and inventing a class for them would
         fabricate the very distinction v2 exists to make — a v1 file
@@ -755,11 +1053,17 @@ class VerificationOrchestrator:
         starts the counting from scratch rather than inheriting a
         verdict set from the run that was just discarded.
         """
-        try:
-            with self._loop_tracking_path().open("r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except (OSError, ValueError):
-            return set(), {}, 0
+        return self._parse_loop_tracking(self._read_loop_tracking_payload())
+
+    def _parse_loop_tracking(
+        self, payload: Dict[str, Any]
+    ) -> Tuple[set, Dict[str, int], int]:
+        """The counts a tracking payload carries.
+
+        Split out of :meth:`_load_loop_tracking` so the constructor can
+        read the payload **once** and hand the same read to the count
+        parser and to the fingerprint parser.
+        """
         if not isinstance(payload, dict):
             return set(), {}, 0
 
@@ -818,6 +1122,22 @@ class VerificationOrchestrator:
             },
             "last_round": int(self._last_round),
         }
+        # 2026-10-27: the fingerprints ride along with the counts — the
+        # same file, the same write, the same read. They are what tells
+        # "the same failure again" (the count) apart from "a different
+        # failure under the same name" (the count plus a changed
+        # fingerprint).
+        #
+        # The key is written only when there is a fingerprint to record.
+        # An empty map carries no information, and a payload without the
+        # key is exactly the legacy shape — which the reader already
+        # tolerates. So a run that has not seen a failure yet writes the
+        # file it has always written.
+        if self._failure_fingerprints:
+            payload["failure_fingerprints"] = {
+                vp_id: list(pair)
+                for vp_id, pair in sorted(self._failure_fingerprints.items())
+            }
         path = self._loop_tracking_path()
         tmp = path.with_name(path.name + ".tmp")
         try:
@@ -831,6 +1151,490 @@ class VerificationOrchestrator:
                 tmp.unlink()
             except OSError:
                 pass
+
+    # ------------------------------------------------------------------
+    # The failure fingerprints
+    # ------------------------------------------------------------------
+    #
+    # 2026-10-27. The same-cause counter answers "did this failure happen
+    # again?". It cannot answer "is it the SAME failure?" — two failures
+    # can share a classification and differ in everything that matters.
+    # So the loop keeps generating repair tasks for a failure whose root
+    # cause has moved on.
+    #
+    # The fingerprint is that missing key: two failures of the same point
+    # with the same fingerprint are the same failure; different
+    # fingerprints mean the root cause evolved. The pair
+    # ``[fp_prev, fp_curr]`` rides in the round payload next to the
+    # counts, so the next round's fresh orchestrator can compare.
+
+    def _failure_class_of_entry(
+        self, vp_id: str, entry: Dict[str, Any]
+    ) -> str:
+        """The failure class a report entry carries.
+
+        The same rule :meth:`_extract_failed_keys` reads: a report that
+        names no class reads as ``deliverable_defect``, because that is
+        the only class whose verdict is safe to act on when nobody has
+        said otherwise. The fingerprint has to be built from the same
+        class the decision key uses — otherwise the fingerprint would
+        say "the class changed" about a class that did not.
+        """
+        from verification import failure_triage
+
+        key = failure_triage.decision_key(vp_id, entry.get("failure_class"))
+        if not key:
+            return ""
+        _, _, failure_class = key.partition(_DECISION_KEY_SEPARATOR)
+        return failure_class
+
+    def _first_error_line(self, entry: Dict[str, Any]) -> Optional[str]:
+        """The failure's first line of output — the fingerprint's text field.
+
+        The report does not always name it, so it is derived: an explicit
+        ``first_error_line`` wins; otherwise the first line of the
+        evidence (the recorded output); otherwise the LAST line of
+        ``actual_result`` — the reasons are ordered "satisfied criteria
+        first, the failing one last", so the last line is the one that
+        says what went wrong.
+        """
+        explicit = entry.get("first_error_line")
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit
+        for line in str(entry.get("evidence") or "").splitlines():
+            if line.strip():
+                return line
+        reasons = [
+            line for line in str(entry.get("actual_result") or "").splitlines()
+            if line.strip()
+        ]
+        if reasons:
+            return reasons[-1]
+        return None
+
+    def _round_fingerprints(self, report: Dict[str, Any]) -> Dict[str, str]:
+        """The fingerprint of every point that failed in this round.
+
+        One fingerprint per point — the point is the unit the payload
+        stores, and the fingerprint itself carries the failure class, so
+        two failures of one point under different classes do not share
+        a fingerprint.
+        """
+        out: Dict[str, str] = {}
+        for entry in self._report_failure_entries(report):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("status") not in (
+                "FAILED", "timeout", "SPLIT", "hard_timeout",
+            ):
+                continue
+            vp_id = str(entry.get("id") or "").strip()
+            if not vp_id or vp_id in out:
+                # The first occurrence wins — the top-level list is the
+                # freshest, exactly as in ``_extract_failed_keys``.
+                continue
+            out[vp_id] = failure_fingerprint(
+                vp_id=vp_id,
+                failure_class=self._failure_class_of_entry(vp_id, entry),
+                failed_assertions=entry.get("failed_assertions"),
+                command=entry.get("test_command") or entry.get("command"),
+                first_error_line=self._first_error_line(entry),
+            )
+        return out
+
+    def _record_round_fingerprints(
+        self, report: Dict[str, Any], void_vp_ids: Set[str],
+    ) -> Dict[str, List[Optional[str]]]:
+        """Pair this round's fingerprints with the previous round's.
+
+        The pair is ``[fp_prev, fp_curr]``: the fingerprint of the
+        point's failure in the round before this one, and in this one.
+        A point that failed for the first time has no previous
+        fingerprint — ``None`` says "we do not know", which is not the
+        same as "it was the same".
+
+        The map is replaced, not merged: a point that is not failing any
+        more has no fingerprint to carry, and a stale one would make the
+        next round compare against a failure that has already been
+        fixed.
+        """
+        previous = self._failure_fingerprints
+        current = self._round_fingerprints(report)
+        pairs: Dict[str, List[Optional[str]]] = {}
+        for vp_id, fp_curr in current.items():
+            if vp_id in void_vp_ids:
+                # A voided point is not a failure of the deliverable —
+                # its criterion is gone, so it has no root cause to
+                # evolve.
+                continue
+            prior = previous.get(vp_id) or []
+            fp_prev = prior[1] if len(prior) == 2 else None
+            pairs[vp_id] = [fp_prev, fp_curr]
+        self._failure_fingerprints = pairs
+        return pairs
+
+    def _root_cause_vp_ids(
+        self, current_failed_keys: Set[Tuple[str, str]],
+    ) -> List[str]:
+        """The points whose failure needs a root-cause task, not a repair.
+
+        The decision is :func:`verification.failure_fingerprint.needs_root_cause_task`
+        — a pure function of the failure's history: how many consecutive
+        rounds it has repeated, and what its fingerprint was before and
+        is now. The count comes from the same tally the old key uses, so
+        the two branches read one state and cannot disagree about it.
+
+        The count is read **before** the triage runs, because the triage
+        may reset it (a diverting verdict gives the failure a fresh
+        budget). The transition — "it failed again, and for a different
+        reason" — is the one the triage is asked about, so it has to be
+        read while it is still there.
+        """
+        out: List[str] = []
+        for vp_id, failure_class in sorted(current_failed_keys):
+            pair = self._failure_fingerprints.get(vp_id)
+            if not pair:
+                continue
+            history = {
+                "vp_id": vp_id,
+                "consecutive_failures": self._same_failure_counts.get(
+                    _decision_key_str((vp_id, failure_class)), 0,
+                ),
+                "fp_prev": pair[0],
+                "fp_curr": pair[1],
+            }
+            if needs_root_cause_task(history):
+                out.append(vp_id)
+        return out
+
+    def _root_cause_note(self, vp_id: str) -> str:
+        """The note a root-cause row carries in place of a blind repair."""
+        pair = self._failure_fingerprints.get(vp_id) or [None, None]
+        fp_prev, fp_curr = pair[0], pair[1]
+        return (
+            f"【根因演进】{vp_id} 又失败了，但已经不是同一个根因"
+            f"（失败指纹 {fp_prev or '(无)'} → {fp_curr or '(无)'}）。"
+            "先根据本轮证据定位当前根因，再给出修复方案；"
+            "不要重复上一轮针对旧根因的方案。"
+        )
+
+    def _mark_root_cause_task(
+        self, task: Dict[str, Any], vp_id: str,
+    ) -> Dict[str, Any]:
+        """Mark a task as the root-cause task of a point.
+
+        The mark is the same one a re-scoped repair row has always
+        carried: the title says the root cause moved, and the description
+        leads with the fingerprint change and the instruction to find the
+        current root cause first. The executor has to be able to tell
+        this task apart from the blind repairs it has been fed all
+        along — otherwise a diagnosis reads as "fix it again, the same
+        way".
+
+        The task is copied, not mutated: the caller's dict is its own.
+        """
+        row = dict(task)
+        title = str(row.get("title") or "").strip()
+        if not title.startswith(_ROOT_CAUSE_MARK):
+            row["title"] = (
+                f"{_ROOT_CAUSE_MARK}{title}"
+                if title
+                else f"{_ROOT_CAUSE_MARK}[{vp_id}] 根因分析"
+            )
+        note = self._root_cause_note(vp_id)
+        description = str(row.get("description") or "").strip()
+        row["description"] = f"{note}\n\n{description}" if description else note
+        return row
+
+    # ------------------------------------------------------------------
+    # The root-cause chain
+    # ------------------------------------------------------------------
+    #
+    # A point whose root cause moved does not get another blind repair.
+    # It gets a **chain**: one read-only diagnosis, then — if the
+    # diagnosis says what to change — exactly one implementation task,
+    # and if that fails too, a human.
+    #
+    # The stages land on different rounds (the diagnosis is dispatched in
+    # one round and answered in the next), and every round runs in a
+    # fresh orchestrator, so the stage the chain stands at is kept on
+    # disk, next to the round payload that already is.
+
+    def _root_cause_chain_path(self) -> Path:
+        """Where the chain's record lives."""
+        return Path(self.plan_dir) / _ROOT_CAUSE_CHAIN_FILENAME
+
+    def _load_root_cause_chain(self) -> Dict[str, Any]:
+        """The chain's record: ``{"version", "stage", "vps"}``.
+
+        A record that cannot be read is an **empty** chain, not an error:
+        the worst a lost record can do is send the plan back to the
+        repair path it came from, and a round must never die because a
+        file is unreadable.
+        """
+        empty = {
+            "version": 1,
+            "stage": "",
+            "vps": {},
+        }
+        try:
+            raw = json.loads(
+                self._root_cause_chain_path().read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return empty
+        if not isinstance(raw, dict):
+            return empty
+        vps = raw.get("vps")
+        clean: Dict[str, Dict[str, Any]] = {}
+        if isinstance(vps, dict):
+            for vp_id, entry in vps.items():
+                if not isinstance(vp_id, str) or not vp_id:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                clean[vp_id] = dict(entry)
+        return {
+            "version": 1,
+            "stage": str(raw.get("stage") or ""),
+            "vps": clean,
+        }
+
+    def _save_root_cause_chain(self, payload: Mapping[str, Any]) -> None:
+        """Write the chain's record.
+
+        Best-effort and atomic, like every other record the orchestrator
+        keeps: a write failure must never abort a round that has already
+        reached its verdict, and a reader must never see half a file.
+        """
+        path = self._root_cause_chain_path()
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            with tmp.open("w", encoding="utf-8") as handle:
+                json.dump(dict(payload), handle, ensure_ascii=False)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    def _clear_root_cause_chain(self) -> None:
+        """Forget the chain — the point passed, or the plan moved on."""
+        try:
+            self._root_cause_chain_path().unlink()
+        except OSError:
+            pass
+
+    def _root_cause_report_file(self, vp_id: str) -> Path:
+        """Where the root-cause report of a point lives.
+
+        The path is the one the diagnosis task was handed
+        (:func:`root_cause_task.root_cause_report_path`), so the task
+        and the reader cannot disagree about where the report is.
+        """
+        name = Path(root_cause_report_path(self.plan_dir.name, vp_id)).name
+        return Path(self.plan_dir) / "reports" / name
+
+    def _root_cause_scope(self, vp_id: str) -> Tuple[bool, List[str]]:
+        """The scope the root-cause report delivers, and whether it is there.
+
+        Two answers, because they mean different things: a report that
+        is **not there** means the diagnosis has not been delivered yet
+        (the point still owes a diagnosis), while a report that is there
+        but names no path means the diagnosis came back without saying
+        what to change (nobody can act on that — a human has to).
+
+        The paths go through the same normalisation the repair tasks
+        have always used (:func:`repair_generator.normalise_declared_files`),
+        so the scope this reads is exactly the scope the implementation
+        task will carry — an absolute path or a ``..`` walk is not a
+        blast radius, and a report that only names those has not
+        delivered one.
+        """
+        from repair_generator import normalise_declared_files
+
+        try:
+            text = self._root_cause_report_file(vp_id).read_text(
+                encoding="utf-8",
+            )
+        except OSError:
+            return False, []
+        scope = normalise_declared_files(
+            _root_cause_scope_from_text(text),
+        )
+        return True, list(scope)
+
+    def _root_cause_chain_decision(
+        self, escalated_vp_ids: List[str], round_number: int,
+    ) -> Dict[str, Any]:
+        """Where the chain stands, and what this round owes it.
+
+        The decision is per point, because two points can be at two
+        different stages of their own chain:
+
+        * a point whose root cause just moved **joins** the chain at the
+          diagnosis stage;
+        * a point at the diagnosis stage owes a **diagnosis** — unless its
+          report has already been delivered, in which case it owes the
+          **implementation** the report asks for;
+        * a point at the implementation stage has had its implementation
+          run and still fails: the machine's road on it is walked out, so
+          it goes to a **human**.
+
+        Nothing is written here — the caller writes the record once the
+        round has decided what to do with it. A round that stops early
+        must not leave the chain advanced.
+        """
+        chain = self._load_root_cause_chain()
+        vps: Dict[str, Dict[str, Any]] = dict(chain.get("vps") or {})
+
+        # A point whose root cause moved joins the chain.
+        for vp_id in escalated_vp_ids:
+            if vp_id in vps:
+                continue
+            vps[vp_id] = {
+                "stage": _CHAIN_STAGE_ROOT_CAUSE,
+                "round": int(round_number),
+                "report_path": root_cause_report_path(
+                    self.plan_dir.name, vp_id,
+                ),
+            }
+
+        actions: List[Dict[str, Any]] = []
+        blocked: List[str] = []
+        for vp_id in sorted(vps):
+            entry = vps[vp_id]
+            stage = str(entry.get("stage") or _CHAIN_STAGE_ROOT_CAUSE)
+            if stage == CHAIN_STAGE_BLOCKED_ON_USER:
+                # Already with a human — this round owes it nothing.
+                blocked.append(vp_id)
+                continue
+            if stage == _CHAIN_STAGE_IMPLEMENTATION:
+                # The implementation task ran; the point still fails.
+                # One diagnosis and one implementation, both spent: the
+                # machine has nothing left to try on this point.
+                entry["stage"] = CHAIN_STAGE_BLOCKED_ON_USER
+                entry["blocked_round"] = int(round_number)
+                entry["blocked_reason"] = "implementation_still_fails"
+                blocked.append(vp_id)
+                continue
+            # The diagnosis stage: what does this point owe right now?
+            report_exists, scope = self._root_cause_scope(vp_id)
+            if report_exists and not scope:
+                # The report came back without saying what to change.
+                # Guessing the scope is how a repair task ends up
+                # touching the wrong files, so this goes to a human too.
+                entry["stage"] = CHAIN_STAGE_BLOCKED_ON_USER
+                entry["blocked_round"] = int(round_number)
+                entry["blocked_reason"] = "root_cause_report_without_scope"
+                blocked.append(vp_id)
+                continue
+            if scope:
+                entry["stage"] = _CHAIN_STAGE_IMPLEMENTATION
+                entry["implementation_round"] = int(round_number)
+                actions.append({
+                    "vp_id": vp_id,
+                    "action": _CHAIN_STAGE_IMPLEMENTATION,
+                    "scope": list(scope),
+                })
+                continue
+            actions.append({
+                "vp_id": vp_id,
+                "action": _CHAIN_STAGE_ROOT_CAUSE,
+                "scope": [],
+            })
+
+        if not vps:
+            # No chain, no record — the round is an ordinary repair round.
+            return {
+                "payload": {
+                    "version": 1,
+                    "stage": "",
+                    "vps": {},
+                    "updated_round": int(round_number),
+                },
+                "actions": [],
+                "blocked": [],
+                "vp_ids": [],
+                "terminal": False,
+                "active": False,
+            }
+
+        if blocked and len(blocked) == len(vps):
+            stage = CHAIN_STAGE_BLOCKED_ON_USER
+        elif any(
+            action["action"] == _CHAIN_STAGE_IMPLEMENTATION
+            for action in actions
+        ):
+            stage = _CHAIN_STAGE_IMPLEMENTATION
+        else:
+            stage = _CHAIN_STAGE_ROOT_CAUSE
+
+        return {
+            "payload": {
+                "version": 1,
+                "stage": stage,
+                "vps": vps,
+                "updated_round": int(round_number),
+            },
+            "actions": actions,
+            "blocked": blocked,
+            "vp_ids": sorted(vps),
+            # The round ends here when every point the chain owns is with
+            # a human: there is nothing left to dispatch, and nothing
+            # left the machine can try.
+            "terminal": bool(blocked) and len(blocked) == len(vps),
+            "active": True,
+        }
+
+    def _root_cause_chain_tasks(
+        self,
+        actions: List[Dict[str, Any]],
+        round_number: int,
+        seq_base: int,
+        evidence_by_vp: Mapping[str, Mapping[str, Any]],
+        vp_test_commands: Mapping[str, str],
+    ) -> List[Dict[str, Any]]:
+        """The tasks the chain owes this round.
+
+        The ids come from the same repair sequence the plain rows use
+        (``repair-r<round>-<seq>``), and they are allocated **before**
+        the plain rows' — so the two never collide. The chain's tasks
+        carry their own ``kind`` and their own fields (a diagnosis has no
+        blast radius; an implementation has exactly one), so they do not
+        go through the repair assembler — that one drops the rows without
+        files to change, and a diagnosis is precisely such a row.
+        """
+        tasks: List[Dict[str, Any]] = []
+        for index, action in enumerate(actions):
+            vp_id = str(action["vp_id"])
+            task_id = f"repair-r{int(round_number)}-{seq_base + index:02d}"
+            evidence = dict(evidence_by_vp.get(vp_id) or {})
+            if action["action"] == _CHAIN_STAGE_IMPLEMENTATION:
+                report = {
+                    "plan_id": self.plan_dir.name,
+                    "vp_id": vp_id,
+                    "round": int(round_number),
+                    "paths": list(action.get("scope") or []),
+                    "test_command": str(vp_test_commands.get(vp_id) or ""),
+                }
+                task = build_implementation_task(
+                    report,
+                    plan_id=self.plan_dir.name,
+                    vp_id=vp_id,
+                    round_no=round_number,
+                    evidence=evidence,
+                    task_id=task_id,
+                )
+            else:
+                task = build_root_cause_task(
+                    self.plan_dir.name, vp_id, round_number, evidence,
+                    task_id=task_id,
+                )
+            tasks.append(self._mark_root_cause_task(task, vp_id))
+        return tasks
 
     # ------------------------------------------------------------------
     # The same-failure triage
@@ -883,7 +1687,9 @@ class VerificationOrchestrator:
             except OSError:
                 pass
 
-    def _stuck_failure_keys(self) -> List[Tuple[str, str]]:
+    def _stuck_failure_keys(
+        self, exclude_vp_ids: Optional[Set[str]] = None,
+    ) -> List[Tuple[str, str]]:
         """The decision keys whose same-cause count has reached the cap.
 
         A key is a ``(verification point, failure class)`` pair, and its
@@ -898,12 +1704,19 @@ class VerificationOrchestrator:
         again. And a failure that does not count (``infra``,
         ``out_of_scope``) has no count at all, so it can never be here —
         two rounds of an environment blip buy no triage call.
+
+        ``exclude_vp_ids`` takes the points the root-cause chain owns out
+        of it: a point whose root cause **moved** is not the same failure
+        repeating — the counter is counting repeats of a name, and the
+        chain is the loop control for that point now.
         """
         cap = self._MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS
+        excluded = set(exclude_vp_ids or ())
         return sorted(
             key
             for key in self._previous_failed_keys
-            if self._same_failure_counts.get(_decision_key_str(key), 0) >= cap
+            if key[0] not in excluded
+            and self._same_failure_counts.get(_decision_key_str(key), 0) >= cap
         )
 
     def _triage_judge_for(self) -> Any:
@@ -2154,6 +2967,11 @@ class VerificationOrchestrator:
         - needs_operator_decision: bool   # 2026-10-23: True when
           ``intent_conflicts`` is non-empty — only an operator can say
           whether the constraint or the requirement gives way
+        - root_cause_vp_ids: List[str]   # 2026-10-27: the points whose
+          failure repeated under a *changed* fingerprint — the ones
+          whose repair row was re-scoped to a root-cause task
+        - failure_fingerprints: Dict[str, List[Optional[str]]]   2026-10-27:
+          the round's fingerprint pairs, as they were persisted
         """
         overall_status = report.get("overall_status", "FAILED")
 
@@ -2200,13 +3018,26 @@ class VerificationOrchestrator:
             and str(r.get("id") or "").strip() not in void_vp_ids
         )
         deviation_count = len(report.get("requirement_deviations", []))
+        # 2026-10-27: the points whose failure repeated under a changed
+        # fingerprint. Empty until the failure path computes it — the
+        # pass path has no failure to evolve.
+        root_cause_vp_ids: List[str] = []
 
         # PASSED or PARTIAL with no real failures → treat as passed
         if overall_status == "PASSED" or (overall_status == "PARTIAL" and failed_count == 0 and deviation_count == 0):
             self._previous_failed_ids = None
             self._consecutive_same_failure_rounds = 0
             self._last_round = round_number
+            # The failures are over: no fingerprint to carry forward.
+            # A stale one would make the next round compare against a
+            # failure that has already been fixed.
+            self._failure_fingerprints = {}
             self._save_loop_tracking()
+            # 2026-10-27: the point passed, so the escalation it was on
+            # is over. A chain left on disk would keep owning the point
+            # and would block the *next* failure of it from ever getting
+            # a repair.
+            self._clear_root_cause_chain()
             # All failures resolved — drop the per-VP feedback history
             # so the next plan (if this orchestrator is reused) starts
             # with a clean slate. Persist the empty state too: a later
@@ -2240,6 +3071,12 @@ class VerificationOrchestrator:
                 "void_vp_ids": sorted(void_vp_ids),
                 "undefined_vp_ids": sorted(undefined_vp_ids),
                 "operator_action": operator_action,
+                # 2026-10-27 — a passing round has no root cause to
+                # evolve and no fingerprint to carry. The fields are
+                # present on every return path so a consumer can read
+                # them without guarding for their absence.
+                "root_cause_vp_ids": [],
+                "failure_fingerprints": {},
             }
 
         # --- Failure path ---
@@ -2318,6 +3155,46 @@ class VerificationOrchestrator:
         # current round's view of what repeated.
         self._previous_failed_keys = current_failed_keys
 
+        # 2026-10-27 (root-cause branch): the fingerprint of each
+        # failure, paired with the previous round's. The count says
+        # "it failed again"; the fingerprint says whether it is the SAME
+        # failure — and that is the question the old key cannot answer.
+        #
+        # The pair is recorded here, before the triage runs, because the
+        # triage may reset the count (a diverting verdict gives the
+        # failure a fresh budget) — and the transition this branch owns
+        # is exactly the one the triage is asked about.
+        self._record_round_fingerprints(report, void_vp_ids)
+        root_cause_vp_ids = self._root_cause_vp_ids(current_failed_keys)
+        if root_cause_vp_ids:
+            print(
+                f"[Verification] round {round_number}: "
+                f"{len(root_cause_vp_ids)} failed VP(s) failed again for a "
+                f"DIFFERENT reason (fingerprint changed) — "
+                f"{', '.join(root_cause_vp_ids)}: root-cause task, not "
+                f"another blind repair"
+            )
+
+        # 2026-10-27 (root-cause chain): the chain's stage decides what
+        # this round owes the points it owns — one diagnosis, then one
+        # implementation, then a human. It is read **before** the triage,
+        # because a point the chain owns is not the same failure
+        # repeating: its fingerprint moved, so the same-cause counter is
+        # counting repeats of a *name*, and the chain is that point's
+        # loop control from here on.
+        chain_decision = self._root_cause_chain_decision(
+            root_cause_vp_ids, round_number,
+        )
+        chain_vp_ids: Set[str] = set(chain_decision["vp_ids"])
+        if chain_decision["active"]:
+            print(
+                f"[Verification] round {round_number}: root-cause chain at "
+                f"stage {chain_decision['payload']['stage']} for "
+                f"{', '.join(chain_vp_ids)} — this round owes "
+                f"{len(chain_decision['actions'])} chain task(s), "
+                f"{len(chain_decision['blocked'])} point(s) with a human"
+            )
+
         # 2026-10-22 (triage): reaching the cap no longer terminates the
         # chain on its own. It buys ONE semantic triage call, and the
         # triage's verdict decides between stopping (a human has to
@@ -2337,7 +3214,7 @@ class VerificationOrchestrator:
         # criterion was not replaced instead of finding no replacement
         # and no explanation.
         replacement_rejected_reason: Optional[str] = None
-        stuck_keys = self._stuck_failure_keys()
+        stuck_keys = self._stuck_failure_keys(exclude_vp_ids=chain_vp_ids)
         if stuck_keys:
             decision = self.classify_cycle(
                 stuck_keys[0], report, round_number,
@@ -2388,6 +3265,18 @@ class VerificationOrchestrator:
                     "void_vp_ids": sorted(void_vp_ids),
                     "undefined_vp_ids": sorted(undefined_vp_ids),
                     "operator_action": operator_action,
+                    # 2026-10-27 — the same two fields every return path
+                    # carries. On this path the round stopped instead of
+                    # repairing, so the list says which points had a
+                    # root cause that moved — the record an operator
+                    # reads when they look at why the chain ended.
+                    "root_cause_vp_ids": sorted(root_cause_vp_ids),
+                    "failure_fingerprints": {
+                        vp_id: list(pair)
+                        for vp_id, pair in sorted(
+                            self._failure_fingerprints.items()
+                        )
+                    },
                 }
                 # The reason is the code *and* the verdict: a string to
                 # every consumer that compares a stop reason against the
@@ -2411,6 +3300,66 @@ class VerificationOrchestrator:
                 self._same_failure_counts[
                     _decision_key_str(stuck_keys[0])
                 ] = 0
+        # 2026-10-27 (root-cause chain): every point the chain owns is
+        # with a human.
+        #
+        # The point had its diagnosis, it had its one implementation
+        # task, and it still fails. The machine's road on it is walked
+        # out — another task would only ask the same question again.
+        # So the round ends here, and the verdict says what a human has
+        # to look at.
+        if chain_decision["terminal"]:
+            self._save_root_cause_chain(chain_decision["payload"])
+            self._safe_phase_call(
+                "verification_failed", "verification_failed",
+            )
+            try:
+                self.plan_state.stop_verification_loop(
+                    "repair_execution_failed",
+                )
+            except Exception as stop_exc:  # noqa: BLE001
+                # The plan's state machine may refuse the transition
+                # (the phase it stands at may not allow it). The verdict
+                # below is the round's answer either way — losing it
+                # would leave the plan running with nobody looking.
+                print(
+                    f"[Verification] round {round_number}: the plan state "
+                    f"refused the terminal transition ({stop_exc}) — the "
+                    f"verdict still says what happened"
+                )
+            return {
+                "should_continue": False,
+                "should_stop": True,
+                # The machine's road on this point is walked out: one
+                # diagnosis, one implementation, and the point still
+                # fails. The reason is spelled out of the state
+                # machine's closed vocabulary on purpose — the guard in
+                # ``tests/unit/test_verification_terminal_state_machine.py``
+                # reads this function's return literals to prove that
+                # every reason it can return ends the chain.
+                "stop_reason": "repair_execution_failed",
+                "repair_tasks": [],
+                "intent_conflicts": [],
+                # 2026-10-27: the round ends with a person, not with a
+                # task. The two flags say so: the chain's own stage
+                # (``BLOCKED_ON_USER``) says where the point stands, and
+                # these say that the round is waiting for a human.
+                "needs_operator_decision": True,
+                "waiting_for_user": True,
+                "blocked_on_user": True,
+                "status": "loop_stopped",
+                "void_vp_ids": sorted(void_vp_ids),
+                "undefined_vp_ids": sorted(undefined_vp_ids),
+                "operator_action": operator_action,
+                "root_cause_vp_ids": sorted(root_cause_vp_ids),
+                "failure_fingerprints": {
+                    vp_id: list(pair)
+                    for vp_id, pair in sorted(
+                        self._failure_fingerprints.items()
+                    )
+                },
+                "root_cause_chain": chain_decision["payload"],
+            }
         # Not yet at the cap — log and continue, generating
         # repair tasks again so the executor can try once more.
         _logger = getattr(self, "logger", None)
@@ -2621,6 +3570,15 @@ class VerificationOrchestrator:
         repair_candidates, vp_splits = self._apply_vp_split_decisions(
             repair_candidates, round_number,
         )
+        # 2026-10-27 (root-cause chain): a point the chain owns gets the
+        # chain's task — a diagnosis, then one implementation — and not a
+        # blind repair. Asking the repair model for a fix on top of that
+        # is asking for the very blind repair this chain exists to stop.
+        if chain_vp_ids:
+            repair_candidates = [
+                candidate for candidate in repair_candidates
+                if str(candidate.get("id") or "") not in chain_vp_ids
+            ]
 
         # 2026-09-14 — a FAILED generation must not masquerade as "no
         # repair tasks needed". ``generate_repair_contents`` now raises
@@ -2724,6 +3682,20 @@ class VerificationOrchestrator:
                     f"{len(failed_vps)} failed VP(s) routed to split — no "
                     f"repair tasks generated"
                 )
+        # 2026-10-27 (root-cause chain): the points the chain owns are
+        # the chain's business now — they get a diagnosis, then one
+        # implementation, then a human. A blind repair row on top of that
+        # is the third repair this chain exists to prevent, so the rows
+        # are dropped here.
+        #
+        # The candidates were already taken out above, so this only
+        # catches a model that named a point it was not offered.
+        if chain_vp_ids and repair_contents:
+            repair_contents = [
+                content for content in repair_contents
+                if not isinstance(content, dict)
+                or str(content.get("failed_vp_id") or "") not in chain_vp_ids
+            ]
         # 2026-10-23 — the intent gate (R4). The model was *asked* whether
         # its fix crosses the plan's own constraint, and the answer is
         # only as good as the model's reading of it; the gate re-checks
@@ -2867,13 +3839,33 @@ class VerificationOrchestrator:
                 f"check skipped ({id_exc})"
             )
             seq_base = 1
+        vp_test_commands = extract_vp_test_commands(_plan_file)
+        # 2026-10-27 (root-cause chain): the chain's tasks are allocated
+        # from the repair sequence **before** the plain rows', so the two
+        # can never land on the same id. The chain's tasks do not go
+        # through the repair assembler: a diagnosis has no files to
+        # change (the assembler drops such rows), and an implementation
+        # task carries a ``kind`` the assembler does not know.
+        chain_tasks = self._root_cause_chain_tasks(
+            chain_decision["actions"],
+            round_number,
+            seq_base,
+            round_failed_vps,
+            vp_test_commands,
+        )
         repair_tasks = RepairTaskAssembler(
             round_number=round_number,
             failed_vps=failed_vps,
-            vp_test_commands=extract_vp_test_commands(_plan_file),
+            vp_test_commands=vp_test_commands,
             plan_path=str(_plan_file),
-            seq_base=seq_base,
+            seq_base=seq_base + len(chain_tasks),
         ).assemble(repair_contents)
+        repair_tasks = chain_tasks + repair_tasks
+        if chain_decision["active"]:
+            # The record is written once the round has decided what to
+            # do: a chain that says "implementation" while the round
+            # dispatched a diagnosis would send the next round back.
+            self._save_root_cause_chain(chain_decision["payload"])
         self._current_repair_tasks = repair_tasks
 
         # 2026-10-11 (W5): retire earlier rounds' duplicate repair rows
@@ -2940,6 +3932,7 @@ class VerificationOrchestrator:
                 from state_machine.db.connection import open as _open_db
                 from state_machine.db.schema import migrate as _migrate
                 from state_machine.repositories.plan_task_repository import (
+                    ALLOWED_STATIC_TASK_FIELDS,
                     PlanTaskRepository,
                 )
                 plan_id = self.plan_dir.name
@@ -2953,13 +3946,15 @@ class VerificationOrchestrator:
                             continue
                         if not rt.get("id"):
                             continue
-                        # ``add_task`` filters keys through
-                        # ``ALLOWED_STATIC_TASK_FIELDS``. The repair
-                        # fields (task_group / execution_group /
-                        # priority / acceptance_criteria / failed_vp_id
+                        # ``add_task`` **rejects** a payload that carries a
+                        # field it does not know (``TaskProgressValidationError``)
+                        # — it does not filter it out. So the payload is
+                        # narrowed to the table's own allow-list here.
+                        #
+                        # The repair fields (task_group / execution_group
+                        # / priority / acceptance_criteria / failed_vp_id
                         # / round) are all on the allow-list as of
                         # 2026-09-08, so they pass through verbatim.
-                        #
                         # ``status`` is NOT on the allow-list — it
                         # belongs to ``update_task``'s runtime mirror.
                         # :class:`RepairTaskAssembler.assemble` stamps
@@ -2969,8 +3964,22 @@ class VerificationOrchestrator:
                         # key here so ``add_task`` can apply its own
                         # default (also ``status='pending'`` — same
                         # outcome, single source of truth).
+                        #
+                        # 2026-10-27 (root-cause chain): the chain's
+                        # tasks carry fields the repair rows never had
+                        # (``kind`` / ``read_only`` / ``report_path`` /
+                        # ``deliverable`` / ``evidence``). They are taken
+                        # out by the same narrowing — a task that cannot
+                        # be written is a task the executor never runs,
+                        # and one of them aborting the write would take
+                        # the round's plain repair rows down with it.
+                        # What the table cannot hold stays in the fields
+                        # it can: the path a diagnosis must write is in
+                        # the task's description.
                         static_payload = {
-                            k: v for k, v in rt.items() if k != "status"
+                            k: v
+                            for k, v in rt.items()
+                            if k in ALLOWED_STATIC_TASK_FIELDS
                         }
                         repo.add_task(plan_id, static_payload)
                         written += 1
@@ -3086,6 +4095,25 @@ class VerificationOrchestrator:
             "void_vp_ids": sorted(void_vp_ids),
             "undefined_vp_ids": sorted(undefined_vp_ids),
             "operator_action": operator_action,
+            # 2026-10-27: the points whose failure repeated under a
+            # changed fingerprint. Their repair rows were re-scoped to a
+            # root-cause task — the round says which ones, so an
+            # operator can see where the loop changed its mind.
+            "root_cause_vp_ids": sorted(root_cause_vp_ids),
+            # 2026-10-27: where the root-cause chain stands, and what it
+            # owes. The chain's own stage says how far the escalation
+            # got (``root_cause`` → ``implementation`` →
+            # ``BLOCKED_ON_USER``); the round says whether it ended with
+            # a person in the loop.
+            "root_cause_chain": chain_decision["payload"],
+            "blocked_on_user": bool(chain_decision["terminal"]),
+            # 2026-10-27: the round's fingerprint pairs, exactly as they
+            # were persisted. The payload on disk is the record; this is
+            # the same record, handed to the caller.
+            "failure_fingerprints": {
+                vp_id: list(pair)
+                for vp_id, pair in sorted(self._failure_fingerprints.items())
+            },
         }
 
     def _load_disk_task_titles(self) -> Dict[str, str]:
@@ -3414,17 +4442,16 @@ class VerificationOrchestrator:
         walks — the top-level results plus the last round's snapshot —
         and the first occurrence of a point wins, because the top-level
         list is the freshest.
-        """
-        from verification import failure_triage
 
+        2026-10-27: the class is read through
+        :meth:`_failure_class_of_entry` — the same helper the
+        fingerprint is built from, so the counter and the fingerprint
+        can never disagree about which class a failure had.
+        """
         classes: Dict[str, str] = {}
 
         def _class_of(vp_id: str, entry: Dict[str, Any]) -> str:
-            key = failure_triage.decision_key(vp_id, entry.get("failure_class"))
-            if not key:
-                return ""
-            _, _, failure_class = key.partition(_DECISION_KEY_SEPARATOR)
-            return failure_class
+            return self._failure_class_of_entry(vp_id, entry)
 
         results_lists: List[List[Dict[str, Any]]] = []
         top_level = report.get("verification_results") or []

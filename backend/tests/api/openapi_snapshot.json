@@ -1,0 +1,4160 @@
+{
+  "components": {
+    "schemas": {
+      "AddDecisionPointRequest": {
+        "properties": {
+          "count": {
+            "default": 1,
+            "title": "Count",
+            "type": "integer"
+          },
+          "requirement": {
+            "title": "Requirement",
+            "type": "string"
+          }
+        },
+        "required": [
+          "requirement"
+        ],
+        "title": "AddDecisionPointRequest",
+        "type": "object"
+      },
+      "AnswerDecisionRequest": {
+        "description": "Body of ``POST /api/hitl/{plan_id}/decisions/{decision_id}/answer``.\n\n``option`` is the answer, ``answered_by`` who gave it and ``note``\nthe free-form remark that travels with it into the audit mirror.\nThe option is stored as given: which of the offered options it is\nis not this route's business to decide.",
+        "properties": {
+          "answered_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answered By"
+          },
+          "note": {
+            "default": "",
+            "title": "Note",
+            "type": "string"
+          },
+          "option": {
+            "minLength": 1,
+            "title": "Option",
+            "type": "string"
+          }
+        },
+        "required": [
+          "option"
+        ],
+        "title": "AnswerDecisionRequest",
+        "type": "object"
+      },
+      "AnswerInterviewRequest": {
+        "properties": {
+          "answer": {
+            "title": "Answer",
+            "type": "string"
+          },
+          "dimension": {
+            "title": "Dimension",
+            "type": "string"
+          }
+        },
+        "required": [
+          "dimension",
+          "answer"
+        ],
+        "title": "AnswerInterviewRequest",
+        "type": "object"
+      },
+      "ContinueInterviewRequest": {
+        "properties": {
+          "reply": {
+            "title": "Reply",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reply"
+        ],
+        "title": "ContinueInterviewRequest",
+        "type": "object"
+      },
+      "CreateDecisionRequest": {
+        "description": "Body of ``POST /api/hitl/{plan_id}/decisions``.\n\n``question`` and ``options`` are the two things a decision cannot\nbe made of: what is being asked, and what the answers on the table\nare.  ``default_option`` is the answer to use when nobody replies\nin time, and it has to be one of the offered options.\n\n``mode`` and ``timeout_sec`` are the *request's* own defaults.  The\nplan's ``hitl_config.json`` decides what is actually stored \u2014 a\ndecision keeps the meaning it was created with even when the plan's\nconfiguration is rewritten afterwards (see\n:func:`hitl.service.create_decision`).  They are accepted here\nbecause the service's own rules read them: a request whose own\ntimeout is not a positive number of seconds is refused rather than\nstored.\n\n``vp_id`` / ``failure_class`` / ``round`` say *what the question is\nabout* \u2014 the verification point, the class of the failure that\nraised it, and the round of the verification loop it was raised in.\nThey are what makes a decision findable by the failure it is\nabout, rather than only by the plan it belongs to.\n\n``answer_note`` is a remark recorded with the question.  A note\nthat comes with an answer replaces it.",
+        "properties": {
+          "answer_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer Note"
+          },
+          "default_option": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Option"
+          },
+          "failure_class": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Class"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          },
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Options",
+            "type": "array"
+          },
+          "question": {
+            "title": "Question",
+            "type": "string"
+          },
+          "round": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Round"
+          },
+          "source": {
+            "default": "api",
+            "title": "Source",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "timeout_sec": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout Sec"
+          },
+          "vp_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vp Id"
+          }
+        },
+        "required": [
+          "question",
+          "options"
+        ],
+        "title": "CreateDecisionRequest",
+        "type": "object"
+      },
+      "GeneratePRDRequest": {
+        "properties": {
+          "project_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Dir"
+          }
+        },
+        "title": "GeneratePRDRequest",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ImportPlanRequest": {
+        "description": "Body of ``POST /api/plan/import``.\n\n``project_dir`` is required and ``content`` is declared as ``Any`` on\npurpose. The imported material is an upstream input the caller owns, so\nnothing about its shape is this route's business: a string, a bare\narray, an object with keys nobody here has heard of \u2014 all three are\naccepted and all three are stored verbatim. The three aliases are the\nsame slot under different names, because which one a caller reaches for\nis a habit, not a requirement; exactly one of them must be present.",
+        "properties": {
+          "content": {
+            "title": "Content"
+          },
+          "hook_destination": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook Destination"
+          },
+          "hook_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook Session Id"
+          },
+          "project_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Dir"
+          },
+          "raw": {
+            "title": "Raw"
+          },
+          "requirement": {
+            "title": "Requirement"
+          },
+          "tasks": {
+            "title": "Tasks"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "title": "ImportPlanRequest",
+        "type": "object"
+      },
+      "PlanPhaseTransitionRequest": {
+        "properties": {
+          "target_phase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Phase"
+          }
+        },
+        "title": "PlanPhaseTransitionRequest",
+        "type": "object"
+      },
+      "PlanStateUpdateRequest": {
+        "properties": {
+          "arch_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Arch Enabled"
+          },
+          "current_phase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Phase"
+          },
+          "test_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Test Enabled"
+          }
+        },
+        "title": "PlanStateUpdateRequest",
+        "type": "object"
+      },
+      "RefineRequest": {
+        "properties": {
+          "feedback": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Feedback"
+          }
+        },
+        "title": "RefineRequest",
+        "type": "object"
+      },
+      "ResetRoundsRequest": {
+        "description": "Operator payload for ``POST /api/verification/{plan_id}/reset_rounds``.\n\n2026-09-16 \u2014 the endpoint was renamed from\n``reset_max_rounds`` because that name described the *original*\nbehaviour, not the current one: a name that says \"max rounds\" tells\nthe reader this rewrites the budget when it resets the counter.\n\nThe rename follows the 2026-09-14 semantic inversion. The decision\nbehind it: the cap is not what this endpoint is for. The budget is\nset when the plan is created and is not meant to move afterwards;\nthe counter is the part that legitimately needs to be rewound, and\nonly with the operator's authorization.\n\nSo: ``max_rounds`` is the plan's budget and is immutable (raising it\nmakes rounds unbounded \u2014 the 2026-08-25 incident; lowering it\nsilently rewrites the plan's setup contract). What the operator\nactually needs is another *batch*: reset the round counter and the\nauto-loop may iterate up to ``max_rounds`` again. \"reset_rounds\"\nsays exactly that.",
+        "properties": {
+          "new_max_rounds": {
+            "anyOf": [
+              {
+                "maximum": 1000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "New Max Rounds"
+          },
+          "reset_round_to": {
+            "anyOf": [
+              {
+                "maximum": 1000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reset Round To"
+          }
+        },
+        "title": "ResetRoundsRequest",
+        "type": "object"
+      },
+      "ResetVerificationRequest": {
+        "description": "Operator payload for ``POST /api/verification/{plan_id}/reset``.\n\n2026-09-17: a manual restart must set the verification state\ndirectly rather than walk the state machine from one point to the\nnext. Routing it through the transition table is what lets the\nmachine drift into states nobody asked for, and it makes every\nrestart depend on the transitions the current stage happens to\nallow. A reset is a fixed procedure \u2014 \"clear what should be\ncleared\" \u2014 so writing the post-reset state outright is both safer\nand simpler.\n\nThis makes it a HARD RESET, in contrast with\n:class:`ResetRoundsRequest`, which is explicitly a *budget* reset \u2014\n\"verdicts / runtime state survive\".\n\nAttributes:\n    force: proceed even when a verification thread is live. The\n        hard reset is not safe against a running round (that thread\n        holds the orchestrator and keeps writing), so it refuses by\n        default; ``force`` first signals the round to cancel, then\n        resets. Without it a live round answers 409.\n    clear_artifacts: delete the per-round disk outputs\n        (``verification_report.json``,\n        ``verification_execution_results.json``,\n        ``verification_repair_tasks.json``,\n        ``verification_loop_tracking.json``,\n        ``logs/verification_*``, ``screenshots/verification_*``).\n\n        ``verification_plan.json`` is deliberately **not** in this\n        list any more \u2014 see ``clear_verification_plan``.\n    clear_verification_plan: also delete ``verification_plan.json``,\n        so the next round re-runs Phase-1 and regenerates the VP list\n        from scratch. Off by default.\n\n        2026-09-19: a reset clears the round counter without\n        touching the VP list.\n\n        The VP list is the only thing in this reset that the *next*\n        generation of the plan is keyed against, and its ids are\n        positional (``VP-0NN``). Regenerating recycles those ids onto\n        different verification points, so every cross-batch artefact\n        keyed by VP id \u2014 ``verification_failure_history.json`` above\n        all, which is what the repair prompt renders as \"\u4e0a\u6b21\u4fee\u590d\u5c1d\u8bd5\n        \u672a\u751f\u6548\" \u2014 silently re-attributes the previous batch's verdicts\n        to the current batch's same-numbered VPs \u2014 a VP list that\n        grows from one batch to the next keeps its ``VP-0NN`` ids\n        while their meaning changes underneath.\n\n        The reason the file used to be deleted \u2014 \"leaving a stale\n        plan behind is how a reset silently keeps the old verdict\n        set\" \u2014 no longer holds: the verdict set lives in\n        ``plan_verification`` (``results`` / ``verdicts`` /\n        ``runtime_state`` / ``executor_state`` / ``progress_state``\n        / ``execution_results``) and this same reset clears those,\n        plus the executor sidecars go on the next round's\n        ``_clear_verification_state_files``. Nothing in\n        ``verification_plan.json`` is per-round state \u2014 its top level\n        is ``services`` + ``verification_points``, and every VP field\n        is definitional.\n\n        Turn it on when the plan itself was regenerated (PRD revised,\n        tasks re-cut) and a fresh VP list is actually what you want.\n    supersede_repair_tasks: mark pending ``RP-*`` tasks\n        ``superseded``. They were generated from the verdicts this\n        reset is discarding, so leaving them pending would have the\n        executor run repairs for failures that no longer exist.\n        Nothing is ever deleted \u2014 see the task-data rule.\n    restart_at_round: the 1-based round the next ``/start`` begins\n        at (same numbering the card shows). Default 1 = the full\n        batch. May not exceed the plan's immutable ``max_rounds``.",
+        "properties": {
+          "clear_artifacts": {
+            "default": true,
+            "title": "Clear Artifacts",
+            "type": "boolean"
+          },
+          "clear_verification_plan": {
+            "default": false,
+            "title": "Clear Verification Plan",
+            "type": "boolean"
+          },
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "restart_at_round": {
+            "default": 1,
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Restart At Round",
+            "type": "integer"
+          },
+          "supersede_repair_tasks": {
+            "default": true,
+            "title": "Supersede Repair Tasks",
+            "type": "boolean"
+          }
+        },
+        "title": "ResetVerificationRequest",
+        "type": "object"
+      },
+      "ReviewActionRequest": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "note": {
+            "default": "",
+            "title": "Note",
+            "type": "string"
+          },
+          "question": {
+            "default": "",
+            "title": "Question",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "ReviewActionRequest",
+        "type": "object"
+      },
+      "RevisePlanRequest": {
+        "description": "Body of ``POST /api/plan/{plan_id}/revise``.\n\n``feedback`` is the caller's note about the task list as a whole \u2014\nthe reason this door exists. It is required and must not be empty:\na revision with nothing to say is not a revision, and treating it as\none would ask the model to redo the list for no reason and charge\nthe caller for the answer.\n\n``content`` optionally replaces the imported material, so a caller\nwho also has new upstream material hands it over in the same round\ntrip. It is stored verbatim, exactly as the import stores its own.",
+        "properties": {
+          "content": {
+            "title": "Content"
+          },
+          "feedback": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Feedback"
+          }
+        },
+        "title": "RevisePlanRequest",
+        "type": "object"
+      },
+      "StartExecutionRequest": {
+        "properties": {
+          "project_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Dir"
+          },
+          "sync_targets": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "feishu",
+                    "telegram"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sync Targets"
+          },
+          "tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool"
+          }
+        },
+        "title": "StartExecutionRequest",
+        "type": "object"
+      },
+      "StartInterviewRequest": {
+        "description": "``POST /api/interview/start``'s body, plus the plan's hook binding.\n\nThe two extra fields say which session created the plan and where a\nhuman-in-the-loop question about it should be delivered.  Both are\noptional and mean exactly what they mean on ``POST /api/plan/import``:\na plan started without them asks nobody, which is the right answer\nfor a plan started by a bare ``curl`` rather than a failure.\n\n``hook_destination`` is the cc-connect project the question is\ndelivered to and ``hook_session_id`` is the cc-connect session key\ninside it.  They are the two arguments of the delivery command: the\nhook this origin implies is a ``cmd`` hook whose command runs\n``backend.hooks.session_send`` with those two values, and that\nmodule is what actually delivers the message.  The protocol is the\nsame as the fast lane's \u2014 same field names, same types, same\ndefaults.",
+        "properties": {
+          "hook_destination": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook Destination"
+          },
+          "hook_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook Session Id"
+          },
+          "plan_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Id"
+          },
+          "requirement": {
+            "title": "Requirement",
+            "type": "string"
+          }
+        },
+        "required": [
+          "requirement"
+        ],
+        "title": "StartInterviewRequest",
+        "type": "object"
+      },
+      "StartPlanRequest": {
+        "description": "``POST /api/plan/{plan_id}/lifecycle/start`` \u7684\u8bf7\u6c42\u4f53\u3002\n\n\u4e94\u4e2a\u5b57\u6bb5**\u5168\u90e8\u53ef\u9009**\uff0c\u7f3a\u4ec0\u4e48\u7531\u88ab\u6d3e\u53d1\u7684\u90a3\u4e00\u4fa7\u6309\u5b83\u81ea\u5df1\u7684\u89c4\u77e9\u8865\uff1a\n\n* ``project_dir`` \u2014\u2014 \u6267\u884c\u4fa7\u7684\u5de5\u4f5c\u76ee\u5f55\u3002**\u5168\u65b0\u6267\u884c\u5fc5\u987b\u5e26**\uff08\u6ca1\u6709\u68c0\u67e5\u70b9\n  \u65f6\u5b83\u6ca1\u6709\u522b\u5904\u53ef\u53d6\uff09\u3002\n* ``tool`` \u2014\u2014 \u7f16\u7801\u5de5\u5177\u3002\n* ``max_rounds`` \u2014\u2014 \u9a8c\u8bc1\u8f6e\u6b21\u9884\u7b97\uff08\u53ea\u5bf9\u9a8c\u8bc1\u4fa7\u6709\u610f\u4e49\uff09\u3002\n* ``sync_targets`` \u2014\u2014 \u4e0b\u6e38\u901a\u77e5\u843d\u70b9\uff08\u53ea\u5bf9\u6267\u884c\u4fa7\u6709\u610f\u4e49\uff09\u3002\u53d6\u503c\u662f\u95ed\u96c6\uff0c\n  \u5199\u9519\u7684\u90a3\u4e2a\u5728**\u8fd9\u91cc**\u5c31\u88ab\u62d2\uff08422\uff09\uff0c\u4e0d\u4f1a\u7b49\u5230\u6d3e\u53d1\u51fa\u53bb\u624d\u70b8\u3002\n* ``force`` \u2014\u2014 \u9a8c\u8bc1\u4fa7\u300c\u5df2\u6709\u62a5\u544a\u4e5f\u91cd\u8dd1\u300d\uff08\u53ea\u5bf9\u9a8c\u8bc1\u4fa7\u6709\u610f\u4e49\uff09\u3002",
+        "properties": {
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "max_rounds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Rounds"
+          },
+          "project_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Dir"
+          },
+          "sync_targets": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "feishu",
+                    "telegram"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sync Targets"
+          },
+          "tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool"
+          }
+        },
+        "title": "StartPlanRequest",
+        "type": "object"
+      },
+      "StartVerificationRequest": {
+        "properties": {
+          "auto_fix": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": true,
+            "title": "Auto Fix"
+          },
+          "force": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": false,
+            "title": "Force"
+          },
+          "max_parallel": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": 1,
+            "title": "Max Parallel"
+          },
+          "max_rounds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Rounds"
+          },
+          "tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool"
+          }
+        },
+        "title": "StartVerificationRequest",
+        "type": "object"
+      },
+      "StopPlanRequest": {
+        "description": "``POST /api/plan/{plan_id}/lifecycle/stop`` \u7684\u8bf7\u6c42\u4f53\u3002\n\n``requeue`` \u2014\u2014 \u505c\u5b8c\u4e4b\u540e\u662f\u5426\u628a\u8ba1\u5212\u8fc1\u56de\u7b49\u5f85\u76f8\u4f4d ``queued``\u3002\u9ed8\u8ba4 ``False``\n\uff08\u505c\u4e0b\u5c31\u505c\u7740\uff0c\u4e0d\u585e\u56de\u961f\u5217\uff09\u3002",
+        "properties": {
+          "requeue": {
+            "default": false,
+            "title": "Requeue",
+            "type": "boolean"
+          }
+        },
+        "title": "StopPlanRequest",
+        "type": "object"
+      },
+      "TaskDeltaRequest": {
+        "description": "Operator payload for ``POST /api/execution/{plan_id}/task_delta``.\n\nTwo actions, matching the verification side's\n``verification_plan_delta`` contract (see ``backend/task_plan_delta.py``):\n\n  * ``add``     \u2014 new task; must carry ``title``, ``reason`` and\n                   ``test_command``.\n  * ``obsolete`` \u2014 mark an existing task void (``id`` + ``reason``).\n                   Marked, never deleted, and the task's own fields\n                   are not touched.\n\nAttempting to *modify* an existing task (reusing its id in ``add``)\nis rejected and recorded in ``rejected_modifications`` rather than\napplied.",
+        "properties": {
+          "actor": {
+            "default": "operator",
+            "title": "Actor",
+            "type": "string"
+          },
+          "add": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Add",
+            "type": "array"
+          },
+          "obsolete": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Obsolete",
+            "type": "array"
+          },
+          "round": {
+            "default": 0,
+            "title": "Round",
+            "type": "integer"
+          }
+        },
+        "title": "TaskDeltaRequest",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "_ExecutionStatusResponse": {
+        "description": "The status answer, plus the provenance of that answer.\n\n``data_source`` says where the answer came from: ``state_db`` when\nit was assembled from the durable ``plan_execution`` row, and\n``default`` when the library really holds no row for this plan and\nthe answer is the empty default.\n\nThe field exists because the two answers used to look alike.  A\nreader that got ``status=not_started`` with every other field null\ncould not tell \"this plan never ran\" from \"this process knows\nnothing about this plan\" \u2014 and the second one is what a run that\nwas dying looked like.\n\n``data_source_detail`` is the same provenance in facts rather than\nin a word: the database by path and by inode, the moment the read\nopened it, the row it found (by rowid and by the row's own stamp)\nand the verdict of the integrity check that ran before the row was\ntrusted.  The kind alone is not enough inside a round that restarts\nthe service: two instances can read two different snapshots of the\nsame file, and a reader that cannot tell the snapshots apart\ncannot tell which run it is being told about.\n\nDeclared as a subclass of the server's own model rather than as an\nedit to it: the server module owns the shared response models, and\na route-local subclass inherits every field it already had \u2014 the\nstatus vocabulary, the pause fields \u2014 without a second place to\nkeep them in sync.",
+        "properties": {
+          "data_source": {
+            "default": "default",
+            "enum": [
+              "state_db",
+              "default"
+            ],
+            "title": "Data Source",
+            "type": "string"
+          },
+          "data_source_detail": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Source Detail"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "interrupted_task_count": {
+            "default": 0,
+            "title": "Interrupted Task Count",
+            "type": "integer"
+          },
+          "logs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Logs",
+            "type": "array"
+          },
+          "paused": {
+            "default": false,
+            "title": "Paused",
+            "type": "boolean"
+          },
+          "paused_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Paused At"
+          },
+          "pid": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pid"
+          },
+          "plan_id": {
+            "title": "Plan Id",
+            "type": "string"
+          },
+          "project_dir": {
+            "title": "Project Dir",
+            "type": "string"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "enum": [
+              "running",
+              "completed",
+              "failed",
+              "stopped",
+              "not_started",
+              "waiting_for_quota"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "stop_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop Reason"
+          },
+          "sync_targets": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sync Targets"
+          }
+        },
+        "required": [
+          "plan_id",
+          "status",
+          "logs",
+          "project_dir"
+        ],
+        "title": "_ExecutionStatusResponse",
+        "type": "object"
+      },
+      "_VerificationPlanReviewActionRequest": {
+        "description": "\u8ba1\u5212\u4e66\u5ba1\u6838\u52a8\u4f5c\u7684\u8bf7\u6c42\u4f53\u3002\n\nAttributes:\n    action: ``accept`` / ``skip`` / ``reset`` / ``revise``\u3002\n    note: \u539f\u56e0\u3002``skip`` \u5fc5\u987b\u7ed9\u975e\u7a7a\u539f\u56e0\uff1b``revise`` \u7684 note \u662f refine \u53cd\u9988\u3002\n    doc_sha256: **\u53ef\u9009**\uff1a\u5ba1\u6838\u8005\u8bfb\u5230\u7684\u90a3\u4e00\u7248\u6587\u6863\u7684\u5b57\u8282\u54c8\u5e0c\u3002\u4e0d\u5e26\u5b83\u65f6\uff0c\n        \u7aef\u70b9\u53ea\u80fd\u62ff\u5df2\u843d\u76d8\u7684\u5ba1\u6838\u72b6\u6001\u53bb\u6bd4\u300c\u6587\u6863\u662f\u4e0d\u662f\u88ab\u6539\u8fc7\u300d\u3002",
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "doc_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Sha256"
+          },
+          "note": {
+            "default": "",
+            "title": "Note",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "_VerificationPlanReviewActionRequest",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "Spec-Driven Dev System",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/": {
+      "get": {
+        "operationId": "serve_index__get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Serve Index"
+      }
+    },
+    "/api/arch/{plan_id}": {
+      "get": {
+        "description": "Get architecture design.",
+        "operationId": "get_arch_api_arch__plan_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Arch"
+      }
+    },
+    "/api/arch/{plan_id}/decision_point/add": {
+      "post": {
+        "description": "Append a new CPEA decision point to arch-design.md.",
+        "operationId": "add_arch_decision_point_api_arch__plan_id__decision_point_add_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddDecisionPointRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Arch Decision Point"
+      }
+    },
+    "/api/arch/{plan_id}/generate": {
+      "post": {
+        "description": "Generate architecture design from approved PRD.",
+        "operationId": "generate_arch_api_arch__plan_id__generate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Arch"
+      }
+    },
+    "/api/arch/{plan_id}/refine": {
+      "post": {
+        "description": "Refine architecture based on rejected review items or direct feedback.",
+        "operationId": "refine_arch_api_arch__plan_id__refine_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefineRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refine Arch"
+      }
+    },
+    "/api/arch/{plan_id}/regenerate": {
+      "post": {
+        "description": "Regenerate architecture design \u2014 clears existing arch and review data.",
+        "operationId": "regenerate_arch_api_arch__plan_id__regenerate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Regenerate Arch"
+      }
+    },
+    "/api/arch/{plan_id}/review/item/{item_index}": {
+      "post": {
+        "description": "Submit architecture review action.",
+        "operationId": "review_arch_item_api_arch__plan_id__review_item__item_index__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "item_index",
+            "required": true,
+            "schema": {
+              "title": "Item Index",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewActionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review Arch Item"
+      }
+    },
+    "/api/arch/{plan_id}/review/items": {
+      "get": {
+        "description": "Get architecture review items.",
+        "operationId": "get_arch_review_items_api_arch__plan_id__review_items_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Arch Review Items"
+      }
+    },
+    "/api/execution/{plan_id}/diagnose": {
+      "get": {
+        "description": "AI-friendly diagnostic summary for stuck or failed executions.\n\nAnalyzes execution logs to detect patterns: repeated failures, timeouts,\nrefinement loops, stuck duration, etc. Returns actionable suggestions.",
+        "operationId": "diagnose_execution_api_execution__plan_id__diagnose_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Diagnose Execution"
+      }
+    },
+    "/api/execution/{plan_id}/files": {
+      "get": {
+        "description": "List files currently in the project directory (excludes vcs/build dirs).\n\nUseful for AI agents to understand the realized system architecture.\n\nThe recursive scan is cached per ``project_dir`` for\n``_FILES_CACHE_TTL_SECONDS`` (see :data:`_FILES_CACHE`) so repeated\npolls within the TTL do not re-walk the tree. The 404 path is\nchecked before the cache read, so a missing project directory is\nnever served from a stale entry.",
+        "operationId": "get_execution_files_api_execution__plan_id__files_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Execution Files"
+      }
+    },
+    "/api/execution/{plan_id}/logs": {
+      "get": {
+        "description": "Query structured execution logs with filters.\n\nThe answer says WHICH tree it read.  A 404 that names only \"Plan\nnot found\" is the same answer for a plan this process does not\nhave and for a plan that is in another instance's plans root, and\nthe two must not look alike: the first is a fact about the plan,\nthe second is a fact about the probe.  So the 404 carries the root\nit searched and the directory it resolved, and the 200 carries the\nfile it actually read \u2014 which is what lets a reader confirm after\na round that the evidence came from that round's instance.\n\nArgs:\n    level: Minimum log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)\n    task_id: Filter by task ID\n    event: Filter by event type (e.g., task_failed, refine_completed)\n    limit: Maximum entries to return (default 100, max 1000)\n    since: ISO timestamp \u2014 return entries after this time",
+        "operationId": "get_execution_logs_api_execution__plan_id__logs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "level",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Level"
+            }
+          },
+          {
+            "in": "query",
+            "name": "task_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Task Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "event",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Event"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Execution Logs"
+      }
+    },
+    "/api/execution/{plan_id}/progress": {
+      "get": {
+        "description": "Real-time task progress.\n\nResolution order (architecture decision point 3):\n\n  1. ``plan_execution.task_progress`` (SQLite) \u2014 the\n     ``ExecutionRepository.progress()`` snapshot is the\n     authoritative counts when present.\n  2. ``<PLANS_DIR>/<plan_id>/tasks.json`` \u2014 legacy fallback for\n     plans that haven't yet been migrated to the state-machine\n     task_progress write path.  ``cli.py --recover`` writes here\n     (via ``--tasks-file``), so we still consult it to derive\n     counts when the SQLite column is empty.\n  3. ``<project_dir>/tasks.json`` \u2014 pre-refactor fallback.\n\nThe ``current`` / ``next`` / ``api_error`` fields are still\nderived from the on-disk tasks.json (the per-task rich\nmetadata that ``task_progress`` does not carry).  The\n``pid`` / ``project_dir`` / ``execution_status`` fields are\nderived from the state-machine row + on-disk ``execution.json``\nmirror, NOT from ``_execution_state`` (no in-memory aggregation).\n\n2026-10-24 \u2014 the 404 gate is \"there is no execution record\", not\n\"there is no project dir\".  The gate used to read\n``_get_project_dir()`` and answer 404 when it came back empty,\nwhich reported a quota-parked plan as a plan that was never\nstarted: the parked row exists, but nothing forces that row to\ncarry a project directory, so the operator's question (\"what is\nstill left to do?\") was answered with \"call /start first\" \u2014 on a\nplan that was already running and waiting for capacity.\n\nThe ``plan_execution`` row IS the evidence that the plan was\nconfigured for execution.  Only its ABSENCE may produce the 404,\nand the original wording stays for that case: an operator who\nreads \"not configured\" can act on it.\n\n2026-10-26 \u2014 **the row is the truth and the registry is a cache.**\nThe row (``plan_execution``) is the durable record of the run and\nthe per-task rows (``plan_tasks``) are the durable record of the\nwork; the in-memory registry (``_execution_state``) is one\nprocess's view of the row, and it goes stale the moment another\nprocess touches the plan.  A plan parked on capacity by the process\nthat owns the run leaves every OTHER process holding a registry\nthat still says \"running\" \u2014 with a pid that has since exited.\n\nThe watchdog (``_lazy_check_execution``) judges the registry's\nstatus and probes the registry's pid, so a stale \"running\" made it\njudge a parked plan's dead pid: the pause was rewritten as a crash,\nthe row was overwritten with ``failed``, and the interrupted task's\n``in_progress`` row was reaped back to ``pending``.  The plan then\nreported \"nothing is running and two tasks are still pending\" for\nwork that was merely waiting for capacity.\n\nSo the row's verdict is adopted into the registry BEFORE the\nwatchdog runs, the counts are read from the state database this\nprocess is bound to, and the answer names the instance that\nproduced it (``serving_instance``) and whether the run is still in\nflight (``execution_in_flight``).  A reader can then tell this\nanswer from another instance's answer about the same plan, and can\ntell a paused run from a dead one.",
+        "operationId": "get_execution_progress_api_execution__plan_id__progress_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Execution Progress"
+      }
+    },
+    "/api/execution/{plan_id}/start": {
+      "post": {
+        "description": "Start autonomous task execution as a background subprocess.\n\nState-machine contract (architecture decision point 3):\n\n  1. Reject archived plans with HTTP 410.\n  2. CAS ``RoutingRepository.try_mark_phase(pid,\n     _EXECUTION_START_SOURCE_PHASES, 'executing')`` \u2014 the\n     only legitimate states from which ``start`` may succeed.\n     A concurrent second ``start`` (or a state we don't expect\n     to start from) raises :class:`ConflictError` which we\n     surface as HTTP 409.\n  3. Persist ``project_dir`` and ``exec_pid`` via\n     :meth:`ExecutionRepository.update_fields`.  The workflow\n     phase is *not* written here \u2014 step 2's routing CAS owns it\n     (schema v6: one phase column, one owner).  The transition is\n     wrapped in the repository's own\n     ``BEGIN IMMEDIATE`` transaction so partial writes are\n     impossible.\n\nResume contract (architecture decision point 4):\n\n  4. A plan that was *stopped* has a pause checkpoint on disk. The\n     start continues it: the checkpoint carries the project\n     directory the work was happening in (so the operator does not\n     have to repeat it, and the request body cannot redirect it),\n     and it says per task whether that task continues in its own\n     session or is re-run whole. Only the tasks that continue in a\n     session are handed to the executor, through\n     ``PDT_RESUME_SESSIONS``. A resumed start answers with\n     ``resumed`` / ``resume_strategy`` / ``resume_plan`` on top of\n     the four fields every start answers with; a fresh start keeps\n     the response it has always published. The checkpoint is\n     retired only once the executor has been spawned.",
+        "operationId": "start_execution_api_execution__plan_id__start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartExecutionRequest",
+                "default": {}
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Execution"
+      }
+    },
+    "/api/execution/{plan_id}/status": {
+      "get": {
+        "description": "Poll execution status and logs.\n\nReads flow through the in-memory ``_execution_state`` dict (which\nis restored on startup by :func:`_recover_execution_states` from\nthe ExecutionRepository SQLite row).  The legacy direct read of\n``execution.json`` was removed because writes already flow through\nthe repository layer \u2014 there is no canonical on-disk JSON to\nread from at this point.\n\n**The row is the source of the answer; the in-memory map is one\nview of it.**  The map lives in the process that started the run, so\nit is empty in every process that did not: a fresh boot whose\nrecovery scan has not run yet, a second process answering for a plan\nthe first one is running, a plan whose directory the boot-time scan\nnever walked.  Answering \"not started\" from an empty map turned a\nrun that was parked on capacity \u2014 or one that was dying \u2014 into a\nplan that never ran, and the operator was told the run never\nhappened.  So the row is read first and the answer is made of it:\nits ``exec_status``, its ``stop_reason``, its start time, its end\ntime and its pid.  Only a plan that has no execution row at all is\n\"not started\".\n\n**A row with nothing in the map is restored into it.**  The map is\nalso what the liveness rule reads \u2014 the watchdog judges the\nin-memory status and probes the in-memory pid \u2014 so a row that says\n``running`` while its process is gone would never be probed at all\nwhen the map is empty, and the answer would report a run that is\nstill going, forever.  Restoring the row (in the very shape the\nboot-time scan restores it) hands it to the standing rule instead\nof inventing a verdict for it: a process that died is ``failed`` /\n``process_died_unexpectedly``, and never a quota wait.\n\n**The row is also the truth when the map holds something.**  The\nmap is one process's view of a run, and it goes stale the moment\nanother process touches the same plan \u2014 another process parks the\nplan on capacity, another process judges a crash.  So the row's\nverdict is read first and adopted into the map, and the answer is\nmade of the row.  That is also what keeps the watchdog honest: it\njudges liveness from the in-memory status, and it must not judge a\nrow that is not ``running``.\n\n**The answer says where it came from.**  ``data_source`` is\n``state_db`` when the answer was assembled from the row and\n``default`` when the library really holds no row and the answer is\nthe empty default.  Without it, \"this plan never ran\" and \"this\nprocess knows nothing about this plan\" are the same answer \u2014 and\nthe second one is what a dying run used to look like.\n\n**The answer says WHICH database produced it.**  ``data_source``\nnames the *kind*; ``data_source_detail`` names the *store*: the\ndatabase by path and by inode, the moment the read opened it, the\nrow it found (by rowid and by the row's own stamp) and the verdict\nof the integrity check that ran before the row was trusted.  A\nround that restarts the service inside the round is exactly where\nthe kind is not enough: two instances can read two different\nsnapshots of the same file, and a reader that cannot tell them\napart cannot tell which run it is being told about.\n\n**\"Not started\" is a claim, and a claim needs a witness.**  The\nempty answer is only made when this instance can back it up: the\nlibrary was read and it holds no run for this plan.  When the\nlibrary could not be read, or when it was read, it holds rows of\nits own, and it holds no row at all for a plan whose directory is\nright here in this instance's tree, the answer is a refusal (503)\nthat names the database that could not answer \u2014 never a default\nnobody recorded.  See\n:func:`_refusal_when_the_run_cannot_be_confirmed`.\n\nThe read itself never probes a PID on its own: a parked run keeps a\nPID whose process is gone, and judging liveness belongs to\n``_recover_execution_states`` and ``_lazy_check_execution`` \u2014 the\ntwo places allowed to ask it.\n\nThe pause fields come from the plan directory rather than from\nthat state, and are filled in on **every** branch: after a\nrestart, the branch a paused plan lands in is ``not_started``,\nwhich is exactly where the checkpoint has to still be reported.",
+        "operationId": "get_execution_status_api_execution__plan_id__status_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/_ExecutionStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Execution Status"
+      }
+    },
+    "/api/execution/{plan_id}/stop": {
+      "post": {
+        "description": "Stop a running execution \u2014 and leave a resume point behind.\n\nA stop is a pause (core contract 1 / 2 / 6): the plan keeps\nwhatever it had achieved, and the next start picks it up instead\nof re-running the whole round.\n\nThe order of the four steps is the contract, not an implementation\ndetail:\n\n  1. **Mark** \u2014 the in-memory state says ``stopped`` /\n     ``pausing`` and ``exec_status`` is persisted, *before*\n     anything is killed. The executor's watcher thread and the\n     heartbeat watchdog both act on ``status == \"running\"``, so a\n     kill that landed first could let the executor stamp the\n     plan ``failed`` \u2014 the one outcome a pause must never\n     produce.\n  2. **Terminate** \u2014 only this plan's own process group is\n     signalled; another plan's executor is never touched.\n  3. **Checkpoint** \u2014 the resume point is written *after* the\n     termination completed, so it describes the interruption as\n     it actually ended.\n  4. **Transition** \u2014 the plan state moves to ``stopped``.\n\n``?discard=true`` is the escape hatch: the work is thrown away\ninstead of paused, the checkpoint is removed, and the answer says\n``paused: false``.",
+        "operationId": "stop_execution_api_execution__plan_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "discard",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Discard",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Execution"
+      }
+    },
+    "/api/execution/{plan_id}/task_delta": {
+      "post": {
+        "description": "Apply an operator task-list delta (``add`` / ``obsolete``).\n\nWhy this exists: a failed execution task previously had only two\noutcomes \u2014 get repaired, or sit on the progress card as a permanent\nred entry. Clearing them would hide the problem; this endpoint adds\nthe ability to **void** a task with a recorded reason and **add** a\nreplacement, without editing the original.\n\nSemantics live in ``backend/task_plan_delta.py``; this handler owns\nthe I/O (load current tasks, open the state-machine connection).\n\n``obsolete`` writes ``status=\"superseded\"`` (already terminal for the\ndispatcher) plus an ``[obsolete] \u2026`` marker in ``failure_reason`` \u2014\n``plan_tasks`` has no dedicated ``obsolete_reason`` column. The\nauthoritative audit record (actor, round, reasons for both actions,\nand everything that was rejected) goes to\n``plans/{plan_id}/task_delta_log.json``.",
+        "operationId": "apply_execution_task_delta_api_execution__plan_id__task_delta_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskDeltaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Apply Execution Task Delta"
+      }
+    },
+    "/api/health": {
+      "get": {
+        "description": "API-namespaced liveness probe (alias of /health).",
+        "operationId": "api_health_check_api_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Api Health Check"
+      }
+    },
+    "/api/hitl/{plan_id}/decisions": {
+      "get": {
+        "description": "The plan's decisions, oldest first, optionally narrowed to one state.\n\n``status`` is the closed set of five decision states; a value\noutside it is a 400 rather than an empty list, because a filter\nnobody can interpret would silently return the wrong set.\n\nAn unknown plan is not an error but an empty list: the question\nthis answers is \"what is outstanding\", not \"does the plan exist\".",
+        "operationId": "list_hitl_decisions_api_hitl__plan_id__decisions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response List Hitl Decisions Api Hitl  Plan Id  Decisions Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Hitl Decisions"
+      },
+      "post": {
+        "description": "Ask a human, on behalf of ``plan_id``, and store the question.\n\nThe plan's own configuration is read from its directory and the two\nfields it owns \u2014 the mode and the timeout \u2014 are frozen into the\nstored decision, so a question that is already open keeps the\nmeaning it was created with.\n\nA question that could not become a decision that works \u2014 an\n``auto`` decision with no default answer, a non-positive timeout,\nan empty option set \u2014 is refused with a 400 and leaves no row\nbehind.",
+        "operationId": "create_hitl_decision_api_hitl__plan_id__decisions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Hitl Decision Api Hitl  Plan Id  Decisions Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Hitl Decision"
+      }
+    },
+    "/api/hitl/{plan_id}/decisions/{decision_id}/answer": {
+      "post": {
+        "description": "Record a human's answer to one of the plan's decisions.\n\nThe answer is scoped to the plan in the path: a decision of another\nplan is reported as not found, so a stale card cannot answer\nsomebody else's question.\n\nThe first answer wins.  A decision that is already settled answers\nwith a 409 and keeps what it had \u2014 a second answer is a conflict,\nnever an overwrite.",
+        "operationId": "answer_hitl_decision_api_hitl__plan_id__decisions__decision_id__answer_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "decision_id",
+            "required": true,
+            "schema": {
+              "title": "Decision Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnswerDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Answer Hitl Decision Api Hitl  Plan Id  Decisions  Decision Id  Answer Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Answer Hitl Decision"
+      }
+    },
+    "/api/interview/start": {
+      "post": {
+        "description": "Start a new interview.",
+        "operationId": "start_interview_api_interview_start_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartInterviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Interview"
+      }
+    },
+    "/api/interview/{plan_id}": {
+      "get": {
+        "description": "Get interview state.",
+        "operationId": "get_interview_api_interview__plan_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Interview"
+      }
+    },
+    "/api/interview/{plan_id}/answer": {
+      "post": {
+        "description": "Submit a direct answer for a specific interview dimension.\n\nThis endpoint bypasses the LLM-driven dialogue and stores the\nuser's answer directly into interview.json.  When all five\nrequired dimensions (background, goals, scope, constraints,\nacceptance) have non-empty answers, the interview is marked\ncomplete and the plan state is advanced to ``interview_complete``.",
+        "operationId": "answer_interview_api_interview__plan_id__answer_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnswerInterviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Answer Interview"
+      }
+    },
+    "/api/interview/{plan_id}/continue": {
+      "post": {
+        "description": "Continue an interview.",
+        "operationId": "continue_interview_api_interview__plan_id__continue_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContinueInterviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Continue Interview"
+      }
+    },
+    "/api/plan/import": {
+      "post": {
+        "description": "Import external upstream material as a new plan, parked in ``queued``.\n\nSkips interview / PRD / architecture / test-design generation \u2014 the\ncaller's material stands in for all four. It does not skip validation:\nthe generated list is audited, and one that would break at dispatch\ntime is refused with one sentence per problem, without the plan ever\nreaching ``queued``.",
+        "operationId": "import_plan_api_plan_import_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportPlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Plan"
+      }
+    },
+    "/api/plan/{plan_id}/lifecycle/start": {
+      "post": {
+        "description": "\u6309\u68c0\u67e5\u70b9\u7684 kind \u542f\u52a8\u8fd9\u4e2a\u8ba1\u5212\uff08\u6062\u590d\u6267\u884c\u6216\u6062\u590d\u9a8c\u8bc1\uff09\u3002\n\n:raises fastapi.HTTPException: \u672a\u77e5\u8ba1\u5212 404\uff1b\u5904\u7406\u5668\u629b\u51fa\u7684\u5f02\u5e38\u539f\u6837\u900f\u4f20\n    \uff08\u7f3a ``project_dir`` \u90a3\u4e2a 400 \u7531\u6267\u884c\u4fa7\u8bf4\uff0c\u95e8\u9762\u4e0d\u81ea\u5df1\u7f16\uff09\u3002",
+        "operationId": "start_plan_api_plan__plan_id__lifecycle_start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/StartPlanRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Req"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Plan Api Plan  Plan Id  Lifecycle Start Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Plan"
+      }
+    },
+    "/api/plan/{plan_id}/lifecycle/stop": {
+      "post": {
+        "description": "\u6309\u5b9e\u65f6\u72b6\u6001\u505c\u8fd9\u4e2a\u8ba1\u5212\uff08\u6267\u884c\u5728\u8dd1\u5c31\u505c\u6267\u884c\uff0c\u9a8c\u8bc1\u5728\u8dd1\u5c31\u505c\u9a8c\u8bc1\uff09\u3002\n\n``requeue=True`` \u65f6\u505c\u5b8c\u4e4b\u540e\u628a\u8ba1\u5212\u8fc1\u56de\u7b49\u5f85\u76f8\u4f4d ``queued``\u3002\n\n:raises fastapi.HTTPException: \u672a\u77e5\u8ba1\u5212 404\uff1b\u5904\u7406\u5668\u629b\u51fa\u7684\u5f02\u5e38\u539f\u6837\u900f\u4f20\u3002",
+        "operationId": "stop_plan_api_plan__plan_id__lifecycle_stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/StopPlanRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Req"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Stop Plan Api Plan  Plan Id  Lifecycle Stop Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Plan"
+      }
+    },
+    "/api/plan/{plan_id}/phase": {
+      "post": {
+        "description": "Transition plan to a target phase with input completeness checks.\n\nVP-005: When transitioning to ``prd_generation`` and ``interview.json``\nis empty (or missing required dimensions), the transition is refused:\nthe response carries ``status=\"failed\"`` (alias ``\"blocked\"``) plus\n``error_code=\"PRD_INPUT_INCOMPLETE\"``, and ``current_phase`` is rolled\nback to ``interview``.",
+        "operationId": "transition_plan_phase_api_plan__plan_id__phase_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanPhaseTransitionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Transition Plan Phase"
+      }
+    },
+    "/api/plan/{plan_id}/revise": {
+      "post": {
+        "description": "Revise an imported plan's whole task list, in place.\n\nThe lane's second door. ``POST /api/plan/import`` is the way in;\nthis is the way to say \"not quite\" about what came out. The plan\nkeeps its directory, its phase and its execution state \u2014 only the\ntask list is replaced, and only after the replacement passes the\nsame audit the import applied. A rejected revision leaves the plan\nexactly as it was: the generator's writes are deferred until the\nresult has been audited and accepted.",
+        "operationId": "revise_plan_api_plan__plan_id__revise_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevisePlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revise Plan"
+      }
+    },
+    "/api/plan/{plan_id}/state": {
+      "get": {
+        "description": "Get plan workflow state.",
+        "operationId": "get_plan_state_api_plan__plan_id__state_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Plan State"
+      },
+      "post": {
+        "description": "Update plan workflow state.",
+        "operationId": "update_plan_state_api_plan__plan_id__state_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanStateUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Plan State"
+      }
+    },
+    "/api/plan/{plan_id}/state-from-db": {
+      "get": {
+        "description": "Return the routing row straight from the state-machine SQLite.\n\nThis endpoint is the integration-test seam the task brief\npins: it MUST read ``plan_routing`` directly from\n``state.db`` and MUST NOT consult the on-disk plan\ndirectory or the ``plan_state.py`` JSON fallback that\n``/api/plan/{plan_id}/state`` uses.\n\nStatus codes:\n\n  * **200** \u2014 a row exists for ``plan_id``; the body carries\n    ``plan_id``, ``current_phase`` (may be ``null``) and\n    ``completed_phases`` (decoded list, default ``[]``).\n  * **404** \u2014 no row in ``plan_routing``; body is\n    ``{\"error\": \"plan not found in routing table\",\n    \"error_code\": \"PLAN_NOT_FOUND\"}``.\n  * **503** \u2014 the state-db file does not exist on disk; body\n    is ``{\"error\": \"state db unavailable\", \"error_code\":\n    \"STATE_DB_MISSING\"}``.\n  * **500** \u2014 sqlite3 raised while reading; body is\n    ``{\"error\": \"state db read failed\", \"error_code\":\n    \"SQLITE_ERROR\"}``.",
+        "operationId": "state_from_db_api_plan__plan_id__state_from_db_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "State From Db"
+      }
+    },
+    "/api/plan/{plan_id}/status": {
+      "get": {
+        "description": "The single, consistent view of one plan \u2014 everything a card needs.\n\nPrefer this over reassembling a verdict from\n``/summary`` + ``/execution/{id}/progress`` + ``/verification/{id}/progress``:\nthose are three reads at three instants, and re-deriving an answer\nfrom them is how the card and the database came to disagree\n(2026-09-23). The three sub-payloads are still here, for the card\n*body* \u2014 but they are gathered in one server-side pass, so they\ndescribe one moment. The verdict itself is the top-level\n``PlanStatus`` fields.\n\n``divergences`` is empty when the stores agree.\n\nThe two ways this route can refuse to answer are a contract of their\nown, and they are told apart deliberately:\n\n* a **malformed** id is a bad request \u2014 ``400``, with the same body\n  every other plan-id route answers it with;\n* a **legal but unknown** id is a plan that does not exist \u2014\n  ``404`` with the detail ``Plan not found``.\n\nAnd there is a third answer, which is not about the id at all:\na plans tree this instance **cannot search** is answered ``503``,\nbecause in that state \"the plan does not exist\" is not a fact this\ninstance is entitled to state.  An empty tree says \"not found\"\nabout every id, and a caller that believes it is looking for a\nplan that was deleted never learns that the instance is looking in\nthe wrong place.  See :func:`_plans_dir_unavailable_reason`.\n\nThe same reasoning covers the state plane: an instance whose state\ndatabase holds no plan of its own cannot say that a plan it does\nnot hold is missing, so it answers ``503`` there too.  See\n:func:`_serving_plane`.\n\nEvery one of those answers carries the facts of the **serving**\ninstance \u2014 the tree that was searched, the state database that was\nread (by path and by inode), and the plan ids that instance can\nsee \u2014 because an answer that cannot be attributed to an instance\ncannot be told apart from the answer of an instance that is\nlooking at another round's data plane.  That confusion is what\nmade two earlier rounds read \"the plan is gone\" out of an answer\nthat really said \"you asked the wrong instance\".\n\nThe validation is asked for here rather than left to happen on the\nway to ``PLANS_DIR / plan_id``.  ``_plan_dir`` does validate, so the\nrefusal is observable either way \u2014 but a route whose contract rests\non a helper it happens to call has no contract at all: the day that\nhelper is relaxed (and it is a plausible relaxation, because the\ncodebase already carries ``_is_renderable_plan_id`` for stored ids\nthat predate the traversal guard), this route would answer ``200``\nwith ``plan_id: \"..\"`` and the repository root's contents as if they\nwere a plan.  Asking for the guard at the entry is what keeps the\nrefusal a decision of this route instead of a side effect of\nanother one.",
+        "operationId": "get_plan_status_api_plan__plan_id__status_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Plan Status"
+      }
+    },
+    "/api/plan/{plan_id}/summary": {
+      "get": {
+        "description": "Aggregated plan summary \u2014 route wrapper owning the DB handle.\n\nThe payload is built by :func:`_get_plan_summary_body`, which\nreceives an already-open state-machine handle. Splitting them lets\nthe connection be released in a ``finally`` even though the body\nhas a single terminal ``return`` deep inside its own branches.",
+        "operationId": "get_plan_summary_api_plan__plan_id__summary_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Plan Summary"
+      }
+    },
+    "/api/plan/{plan_id}/tasks": {
+      "get": {
+        "description": "Return a summary of the plan's tasks with lifecycle counts.",
+        "operationId": "get_plan_tasks_api_plan__plan_id__tasks_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Plan Tasks"
+      }
+    },
+    "/api/plan/{plan_id}/usage": {
+      "get": {
+        "description": "Per-plan LLM usage, aggregated from CC Switch's own ledger.\n\nAnswers \"what did this plan actually cost\" \u2014 new input / output /\ncache-read / cache-creation tokens plus the billed USD, broken down\nby ledger source, provider, model, scene, task and day, with a\ncross-check against the backend's own first-hand accounting.\n\nQuery params\n------------\n``refresh=true``\n    Re-aggregate before answering. Otherwise the persisted\n    ``plans/<id>/usage_report.json`` is returned when present, and\n    the report is computed on demand when it is not (so the endpoint\n    is useful before the first execution finishes).",
+        "operationId": "get_plan_usage_api_plan__plan_id__usage_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Plan Usage"
+      }
+    },
+    "/api/plans": {
+      "get": {
+        "description": "List all plans.\n\nBy default, plans in terminal states (``stopped``, ``completed``,\n``failed``, ``verification_loop_stopped``, ``verification_passed``,\n``verification_failed``) are filtered out \u2014 they are historical\nartifacts that no longer need a sidebar entry. Pass\n``?include_terminal=true`` to see the full list (e.g. for\naudit / cleanup scripts).\n\n``waiting_for_quota`` is NOT one of the terminal phases: a plan\nparked for capacity is alive and will resume when the window opens,\nso it stays in the sidebar.\n\nThe terminal decision reads TWO verdicts, not one: the routing\nphase (the workflow's answer) and the persisted execution row (the\nrun's answer).  A run that failed or was stopped is over whatever\nthe workflow phase says \u2014 see :func:`_plan_is_terminal`.\n\nProvenance\n----------\nThe answer says which tree it read: ``data_source``\n(``state_db`` when the phases came from the state database,\n``directory`` when the listing degraded to a directory scan) and\n``plans_dir`` (the root it read).  Both appear on every row and on\nthe response headers, so an empty list from a process pointed at\nanother worktree's plans root cannot be mistaken for \"this\ninstance has no plans\".\n\nThe ``data_source`` of a row is a BLOCK, not a word: it carries the\nkind (``state_db`` / ``directory``) together with the facts about\nthe data plane the rows came from \u2014 the database by path and by\ninode, the process that answered (pid + boot id) and how many rows\nit found.  The kind is what the response header carries; the block\nis what a reader needs to tell this answer apart from another\ninstance's answer about the same URL.\n\nRefusal\n-------\nA plans tree and a state database are two halves of one instance's\nworld.  When the tree holds plans and the database knows NONE of\nthem, the two halves belong to different instances \u2014 and the\nlisting built from that database is empty, which is exactly what\n\"this instance has no plans\" looks like on the wire.\n\nSo the listing refuses in that case: ``503``, with the data plane\nthat could not answer named in the body.  An empty array is a\ncoincidence of shape that a reader takes for a fact; a refusal is\nan answer about what this instance could and could not read.\n\nDegradation\n-----------\nThe terminal filter needs the phase, and the phase lives in the\nstate database.  When that database cannot be opened, the listing\ndegrades to a directory scan: it answers 200 with every plan it can\nsee and it CANNOT filter the terminal ones.  Such an answer carries\nthe degradation marker \u2014 on every row\n(``list_degraded``) and on the response\n(``X-PDT-Plans-List-Degraded``) \u2014 because \"200 + a full list\" is\nwhat a reader takes for \"the terminal plans were filtered out\".\nSee :data:`LIST_DEGRADED_KEY`.\n\nReads\n-----\n* RoutingRepository.list_all(data_dir=PLANS_DIR) \u2014 single\n  aggregate call returning BOTH new (SQLite) and archived\n  (directory-derived) rows. Archived rows carry\n  ``archived=True`` and DO NOT carry stage / current_phase\n  fields.\n* ExecutionRepository.snapshot_for_list(plan_ids) \u2014 the execution\n  row of every listed plan, read from the state database.  It\n  carries the run's own verdict (``exec_status``), which is part of\n  the terminal decision, plus the run-state fields\n  (``exec_pid`` / ``project_dir`` \u2026); the workflow phase comes from\n  the routing row above, not from here (schema v6).  Archived rows\n  have no execution rows so they get ``None``.\n\nArchitecture decision point 5 forbids an in-memory aggregation\nfacade: this route composes the two repositories directly\n(no intermediate facade object).  Human-readable fields\n(``requirement``, ``created_at``, ``steps``) are still derived\nfrom the on-disk JSON files because those fields are slated\nfor a separate \"interview_repository\" / \"artifact metadata\"\ntask and are out of scope for this refactor.\n\nCaching\n-------\nThe rendered list is cached in :data:`_PLANS_CACHE` for\n:data:`_PLANS_CACHE_TTL_SECONDS` seconds, keyed on the\n``include_terminal`` query parameter. Mutation endpoints call\n:func:`invalidate_plans_cache` to drop the snapshot the moment\nthey know it is stale; absent explicit invalidation, the TTL\nguarantees self-healing within a small bounded delay.\n\nThe degradation verdict and the provenance are read off the cached\nrows, so a cache hit reports the same verdict and the same tree the\ncache miss did.",
+        "operationId": "list_plans_api_plans_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_terminal",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Terminal",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Plans"
+      }
+    },
+    "/api/prd/{plan_id}": {
+      "get": {
+        "description": "Get PRD content.",
+        "operationId": "get_prd_api_prd__plan_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Prd"
+      }
+    },
+    "/api/prd/{plan_id}/decision_point/add": {
+      "post": {
+        "description": "Append a new CPEA decision point to prd.json.",
+        "operationId": "add_prd_decision_point_api_prd__plan_id__decision_point_add_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddDecisionPointRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Prd Decision Point"
+      }
+    },
+    "/api/prd/{plan_id}/generate": {
+      "post": {
+        "description": "Generate PRD from interview.\n\nOptionally accepts project_dir to scan existing codebase for context.\nFalls back to execution.json project_dir if not provided.",
+        "operationId": "generate_prd_api_prd__plan_id__generate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GeneratePRDRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Prd"
+      }
+    },
+    "/api/prd/{plan_id}/refine": {
+      "post": {
+        "description": "Refine PRD based on rejected review items.",
+        "operationId": "refine_prd_api_prd__plan_id__refine_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refine Prd"
+      }
+    },
+    "/api/prd/{plan_id}/regenerate": {
+      "post": {
+        "description": "Regenerate PRD \u2014 clears existing PRD and review data, re-generates from interview.",
+        "operationId": "regenerate_prd_api_prd__plan_id__regenerate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GeneratePRDRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Regenerate Prd"
+      }
+    },
+    "/api/preflight/{plan_id}/report": {
+      "get": {
+        "description": "Return the persisted preflight report for ``plan_id``.\n\nReturns 404 when no ``preflight_report.json`` exists for the plan.\nThe body shape matches the POST response so callers can read both\nendpoints interchangeably.",
+        "operationId": "get_preflight_report_api_preflight__plan_id__report_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Preflight Report"
+      }
+    },
+    "/api/preflight/{plan_id}/run": {
+      "post": {
+        "description": "Run the preflight cross-document reviewer on demand.\n\nReturns the report dict (``findings`` / ``high_count`` /\n``report_path``) synchronously. Side effect: writes\n``plans/<plan_id>/preflight_report.json`` (overwriting any prior\nartifact, per the DP2 contract).",
+        "operationId": "run_preflight_api_preflight__plan_id__run_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Preflight"
+      }
+    },
+    "/api/review/{plan_id}/review/item/{item_index}": {
+      "post": {
+        "description": "Submit review action for a single item.",
+        "operationId": "review_item_api_review__plan_id__review_item__item_index__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "item_index",
+            "required": true,
+            "schema": {
+              "title": "Item Index",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewActionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review Item"
+      }
+    },
+    "/api/review/{plan_id}/review/items": {
+      "get": {
+        "description": "Extract and return review items from PRD.",
+        "operationId": "get_review_items_api_review__plan_id__review_items_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Review Items"
+      }
+    },
+    "/api/system/active": {
+      "get": {
+        "description": "Quick snapshot of how many the workflow tasks are currently running.\n\nInspects:\n  - _execution_state: per-plan execution subprocess status\n  - _verification_state: per-plan verification cycle status\n  - Heartbeat check on subprocess poll() to detect \"running\" state\n  - pause checkpoints on disk: plans interrupted but not resumed\n\nReturns:\n  {\n    \"execution_running\": <int>,\n    \"verification_running\": <int>,\n    \"total_active\": <int>,\n    \"details\": [\n      {\"plan_id\": ..., \"type\": \"execution\"|\"verification\", \"status\": ..., ...},\n      ...\n    ],\n    \"paused_executions\": [\n      {\"plan_id\": ..., \"kind\": ..., \"paused_at\": ..., \"interrupted_task_count\": ...},\n      ...\n    ]\n  }\n\n``paused_executions`` is computed BEFORE the empty-state\nshort-circuit below and returned from every path. The short-circuit\nis exactly the state of a freshly-restarted server \u2014 which is the\none moment the pause list matters most, since a plan that was\npaused before the restart has no in-memory state left to report.\nA response that carried the list only on the non-empty path would\nanswer \"nothing is paused\" at precisely the moment a resume is\nwaiting to be found.",
+        "operationId": "get_active_tasks_api_system_active_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Active Tasks"
+      }
+    },
+    "/api/system/start_all": {
+      "post": {
+        "description": "Resume the batch this stop stopped, in one call.\n\nThe second half of a backend restart, and the counterpart of\n:func:`stop_all_tasks`.\n\nThe targets are the plans named by the batch the global stop\nrecorded \u2014 and only those. A checkpoint left on disk by an earlier,\nunrelated stop is not resumed: the restart belongs to the batch,\nnot to every pause that ever happened.\n\nWithin the batch, a plan is resumed from its pause checkpoint on\ndisk, or \u2014 for a verification whose thread a hard kill took away \u2014\nfrom its recovered state. Each is started by the route that owns\nits kind.\n\nThe execution start is handed an explicitly empty request: the\ncheckpoint carries the project directory the work was happening in,\nand a request that named one would redirect the resumed work to a\ndirectory it was never written for.\n\nOne plan's failure is one row. The others are still started.\n\nThe batch is consumed: the record is deleted once the resume has\nbeen attempted, whatever the per-plan outcome, so a second\n``start_all`` is a no-op instead of a second resume.\n\nThe answer carries the batch it acted on (``\"batch\"``), and\n``\"detail\"`` when there was none to act on.",
+        "operationId": "start_all_tasks_api_system_start_all_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Start All Tasks"
+      }
+    },
+    "/api/system/stop_all": {
+      "post": {
+        "description": "Stop every plan that is running, in one call.\n\nThe first half of a backend restart, and the counterpart of\n:func:`start_all_tasks`. The operator asks for one stop instead of\none stop per plan, and the answer says what happened to each of\nthem.\n\nThe list of plans comes from :func:`get_active_tasks` \u2014 the same\nread the supervisor polls \u2014 so \"what is running\" has one answer in\nthis codebase and not two that can disagree.\n\nEach plan is stopped by the route that owns its kind: an execution\nthrough ``stop_execution``, a verification through\n``stop_verification``. Both are imported *inside* the function: the\nroute modules import ``server``, which imports this one, so a\nmodule-level import here would be circular.\n\nOne plan's failure is one row. The others are still stopped.\n\nThe plans this call actually stopped are recorded as a *batch* (see\n:func:`_write_stop_all_batch`), and the batch is the only thing\nthe global start will resume. Without it, a restart would pick up\nevery checkpoint left on disk \u2014 including the ones a previous,\nunrelated stop left days ago.",
+        "operationId": "stop_all_tasks_api_system_stop_all_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Stop All Tasks"
+      }
+    },
+    "/api/tasks/{plan_id}": {
+      "get": {
+        "description": "Get generated tasks with runtime status overlay + counts.\n\nReturns ``{plan_id, tasks, counts}`` where ``tasks`` is the flat\narray of task dicts (id/title/description/test_command/...) with\nruntime fields overlaid from the state-machine SQLite row\n(``status``, ``end_ts``, ``commit_sha``, ``attempt``,\n``failure_reason``), and ``counts`` is ``{total, completed,\nfailed, skipped, in_progress, pending}``.\n\nTwo bugs in the previous contract are fixed:\n\n1. **Nested-bug.** The previous implementation returned\n   ``{\"plan_id\": ..., \"tasks\": <whole tasks.json>}`` \u2014 the\n   whole file (which has shape ``{\"tasks\": [...]}``) was nested\n   one level too deep, so the frontend's ``data.tasks.map(...)``\n   saw a dict and crashed. The handler now extracts the array\n   first (matching ``/api/execution/{plan_id}/progress``).\n2. **No runtime overlay.** Without it the frontend cannot tell\n   a passed task from a failed one \u2014 all tasks carried\n   ``status=None`` and the task panel showed no state. We now\n   overlay runtime fields from ``plan_task_repository`` (the\n   same seam ``/api/execution/{plan_id}/progress`` uses).\n\nBackward compatibility: the response still includes a ``tasks``\narray \u2014 every existing field stays. Only nested-shape callers\n(none in this repo) would break.",
+        "operationId": "get_tasks_api_tasks__plan_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Tasks"
+      }
+    },
+    "/api/tasks/{plan_id}/generate": {
+      "post": {
+        "description": "Generate tasks.json from reviewed PRD and auto-validate workspace.",
+        "operationId": "generate_tasks_api_tasks__plan_id__generate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Tasks"
+      }
+    },
+    "/api/tasks/{plan_id}/validate_workspace": {
+      "post": {
+        "description": "Post-generation: validate and fix each task's project_dir + test commands.\n\nScans the local filesystem for plausible workspace candidates and asks\nthe LLM to assign each generated task to the correct one. Use after\nPOST /api/tasks/{plan_id}/generate to fix hallucinated project_dir\nvalues (e.g. one checkout of the project when the declared\n``project_dir`` points at a different one).",
+        "operationId": "validate_task_workspace_api_tasks__plan_id__validate_workspace_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Req"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Validate Task Workspace"
+      }
+    },
+    "/api/test/{plan_id}": {
+      "get": {
+        "description": "Get test design document.",
+        "operationId": "get_test_design_api_test__plan_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Test Design"
+      }
+    },
+    "/api/test/{plan_id}/decision_point/add": {
+      "post": {
+        "description": "Append a new CPEA decision point to test-design.md.",
+        "operationId": "add_test_decision_point_api_test__plan_id__decision_point_add_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddDecisionPointRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Test Decision Point"
+      }
+    },
+    "/api/test/{plan_id}/generate": {
+      "post": {
+        "description": "Generate test design from approved architecture.",
+        "operationId": "generate_test_design_api_test__plan_id__generate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Test Design"
+      }
+    },
+    "/api/test/{plan_id}/refine": {
+      "post": {
+        "description": "Refine test design based on rejected review items or direct feedback.",
+        "operationId": "refine_test_design_api_test__plan_id__refine_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefineRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refine Test Design"
+      }
+    },
+    "/api/test/{plan_id}/regenerate": {
+      "post": {
+        "description": "Regenerate test design \u2014 clears existing test design and review data.",
+        "operationId": "regenerate_test_design_api_test__plan_id__regenerate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Regenerate Test Design"
+      }
+    },
+    "/api/test/{plan_id}/review/item/{item_index}": {
+      "post": {
+        "description": "Submit test design review action.",
+        "operationId": "review_test_item_api_test__plan_id__review_item__item_index__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "item_index",
+            "required": true,
+            "schema": {
+              "title": "Item Index",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewActionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review Test Item"
+      }
+    },
+    "/api/test/{plan_id}/review/items": {
+      "get": {
+        "description": "Get test design review items.",
+        "operationId": "get_test_review_items_api_test__plan_id__review_items_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Test Review Items"
+      }
+    },
+    "/api/verification-plan/{plan_id}": {
+      "get": {
+        "description": "\u8bfb\u53d6\u9a8c\u8bc1\u8ba1\u5212\u4e66\uff1a\u539f\u6587 + \u7ed3\u6784\u6821\u9a8c\u7ed3\u679c + \u57fa\u7ebf\u3002\n\nArgs:\n    plan_id: \u8ba1\u5212 id\u3002\n\nReturns:\n    200 ``{\"content\", \"structure_errors\", \"baseline\"}``\u3002``content`` \u662f\n    \u78c1\u76d8\u4e0a\u7684\u539f\u6587\uff08\u9010\u5b57\uff09\uff1b``structure_errors`` \u662f\u5168\u90e8\u7ed3\u6784\u8fdd\u89c4\uff08\u5408\u6cd5\u65f6\u662f\n    \u7a7a\u5217\u8868\uff0c\u6bcf\u6761\u662f ``{section, line, code, message}``\uff09\uff1b``baseline`` \u662f\n    \u6587\u6863\u91cc\u90a3\u4e00\u884c\u57fa\u7ebf\uff08``repo_dir`` / ``ref`` / ``pr_number``\uff09\uff0c\u53d6\u4e0d\u51fa\u6765\n    \u65f6\u662f ``None``\u3002\n\n    \u7ed3\u6784\u975e\u6cd5**\u4e0d\u662f**\u63a5\u53e3\u9519\u8bef\uff1a200 + \u975e\u7a7a ``structure_errors``\u3002\u5ba1\u6838\u8005\u8981\n    \u770b\u5230\u7684\u662f\u300c\u8fd9\u4efd\u6587\u6863\u54ea\u91cc\u4e0d\u5bf9\u300d\uff0c\u4e0d\u662f\u4e00\u53e5 500\u3002\n\nRaises:\n    HTTPException: 404 ``plan_not_found``\uff08\u8ba1\u5212\u76ee\u5f55\u4e0d\u5b58\u5728\uff09\uff1b404\n        ``document_not_found``\uff08\u76ee\u5f55\u5728\uff0c\u8ba1\u5212\u4e66\u4e0d\u5728\uff09\u3002",
+        "operationId": "get_verification_plan_api_verification_plan__plan_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Verification Plan"
+      }
+    },
+    "/api/verification-plan/{plan_id}/generate": {
+      "post": {
+        "description": "\u751f\u6210\u9a8c\u8bc1\u8ba1\u5212\u4e66\uff08\u9a8c\u8bc1\u5206\u652f\u7684\u4ea7\u7269\uff09\u3002\n\nArgs:\n    plan_id: \u8ba1\u5212 id\u3002\n    req: \u8bf7\u6c42\u4f53\u3002\u76ee\u524d\u53ea\u6709 ``feedback`` \u4e00\u4e2a\u5b57\u6bb5\uff0c\u800c**\u751f\u6210**\u8fd9\u4e00\u6b65\u7528\u4e0d\u4e0a\n        \u5b83\uff08\u63d0\u793a\u8bcd\u53ea\u5403 plan_id \u4e0e\u57fa\u7ebf\uff09\u2014\u2014 \u6539\u6587\u6863\u662f refine \u7aef\u70b9\u7684\u4e8b\u3002\u8fd9\u91cc\n        \u4ecd\u7136\u63a5\u53d7\u5b83\uff0c\u662f\u4e3a\u4e86\u8ba9\u8bf7\u6c42\u4f53\u5f62\u72b6\u4e0e\u5176\u5b83\u751f\u6210\u7aef\u70b9\u4e00\u81f4\u3002\n\nReturns:\n    200 ``{\"plan_id\", \"document_path\", \"current_phase\"}``\u3002\n    ``document_path`` \u662f**\u76f8\u5bf9\u8def\u5f84**\uff08``verification-plan.md``\uff09\uff0c\u4e0d\u6cc4\u9732\n    \u672c\u673a\u7edd\u5bf9\u8def\u5f84\u3002\n\nRaises:\n    HTTPException: 404 ``plan_not_found``\uff08\u8ba1\u5212\u76ee\u5f55\u4e0d\u5b58\u5728\uff09\uff1b409\n        ``artifact_conflict``\uff08\u76ee\u5f55\u91cc\u5df2\u6709 ``tasks.json``\uff09\uff1b409\n        ``prd_review_incomplete``\uff08PRD \u5ba1\u6838\u8fd8\u6709\u6ca1\u89e3\u51b3\u7684\u51b3\u7b56\u70b9\uff09\uff1b409\n        ``stage_mismatch``\uff08\u5f53\u524d\u9636\u6bb5\u4e0d\u80fd\u8fdb\u8ba1\u5212\u4e66\u751f\u6210\uff09\uff1b422\n        ``baseline_missing``\uff08\u8ba1\u5212\u72b6\u6001\u91cc\u6ca1\u6709\u8bb0\u5f55\u57fa\u7ebf\uff09\uff1b422\n        ``verification_plan_invalid``\uff08\u751f\u6210\u7684\u6587\u6863\u4e0d\u6ee1\u8db3\u5341\u7ae0\u8282\u5951\u7ea6\uff0c\u4e14\n        \u6ca1\u6709\u843d\u76d8\uff09\uff1b504\uff08\u751f\u6210\u8d85\u65f6\uff09\u3002",
+        "operationId": "generate_verification_plan_api_verification_plan__plan_id__generate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefineRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Verification Plan"
+      }
+    },
+    "/api/verification-plan/{plan_id}/refine": {
+      "post": {
+        "description": "\u6309\u53cd\u9988\u6539\u5199\u9a8c\u8bc1\u8ba1\u5212\u4e66\u3002\n\nArgs:\n    plan_id: \u8ba1\u5212 id\u3002\n    req: ``{feedback}``\u3002\u53cd\u9988\u4e0d\u80fd\u4e3a\u7a7a \u2014\u2014 \u6ca1\u6709\u53cd\u9988\u5c31\u6ca1\u6709\u8981\u6539\u7684\u4e1c\u897f\u3002\n\nReturns:\n    200 ``{\"document_path\", \"doc_sha256\", \"items\"}``\u3002``document_path`` \u662f\n    **\u76f8\u5bf9\u8def\u5f84**\uff08``verification-plan.md``\uff09\uff0c\u4e0d\u6cc4\u9732\u672c\u673a\u7edd\u5bf9\u8def\u5f84\uff1b\n    ``doc_sha256`` \u662f\u6539\u5199\u540e\u90a3\u4efd\u6587\u6863\u7684\u5b57\u8282\u54c8\u5e0c\uff1b``items`` \u662f\u5ba1\u6838\u6761\u76ee \u2014\u2014 \u6539\u5199\n    \u4e4b\u540e**\u5168\u90e8**\u56de\u5230 ``pending``\u3002\n\nRaises:\n    HTTPException: 400 ``feedback_required``\uff08\u53cd\u9988\u4e3a\u7a7a\uff09\uff1b404\n        ``plan_not_found``\uff08\u8ba1\u5212\u76ee\u5f55\u4e0d\u5b58\u5728\uff09\uff1b404 ``document_not_found``\n        \uff08\u76ee\u5f55\u5728\uff0c\u8ba1\u5212\u4e66\u4e0d\u5728\uff09\uff1b422 ``verification_plan_invalid``\uff08\u6539\u5199\u7ed3\u679c\n        \u4e0d\u6ee1\u8db3\u5341\u7ae0\u8282\u5951\u7ea6\uff0c\u65e7\u6587\u6863\u539f\u6837\u4fdd\u7559\uff09\uff1b504\uff08\u6539\u5199\u8d85\u65f6\uff09\u3002",
+        "operationId": "refine_verification_plan_api_verification_plan__plan_id__refine_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefineRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refine Verification Plan"
+      }
+    },
+    "/api/verification-plan/{plan_id}/review/item/{item_index}": {
+      "post": {
+        "description": "\u8bb0\u5f55\u4e00\u6b21\u8ba1\u5212\u4e66\u5ba1\u6838\u52a8\u4f5c\uff08\u9010\u6761\uff09\u3002\n\n\u4e00\u6b21\u52a8\u4f5c\u53ea\u52a8**\u4e00\u6761**\uff1a``accept`` / ``skip`` / ``reset`` / ``revise``\u3002\u52a8\u4f5c\n\u843d\u76d8\u8d70 :func:`verification_plan_review.record_action` \u2014\u2014 \u4e0e\u751f\u4ea7\u8def\u5f84\u540c\u4e00\u6761\u3002\n\nArgs:\n    plan_id: \u8ba1\u5212 id\u3002\n    item_index: \u6761\u76ee\u5e8f\u53f7\uff080 \u8d77\uff0c\u8ba1\u5212\u7ea7\u6761\u76ee\u5728\u524d\u3001\u9a8c\u8bc1\u70b9\u6761\u76ee\u6309\u6587\u6863\u987a\u5e8f\u5728\u540e\uff09\u3002\n    req: ``{action, note, doc_sha256}``\u3002``doc_sha256`` \u662f\u5ba1\u6838\u8005\u8bfb\u5230\u7684\u90a3\u4e00\u7248\n        \u6587\u6863\u7684\u54c8\u5e0c\uff0c\u53ef\u9009\u3002\n\nReturns:\n    200 ``{\"items\": [...], \"doc_sha256\": \"...\", \"resolved\": false}``\u3002\n    ``items`` \u662f\u5168\u91cf\u6761\u76ee\uff08\u5f62\u72b6\u4e0e ``GET .../review/items`` \u4e00\u81f4\uff09\uff1b``doc_sha256``\n    \u662f\u5f53\u524d\u6587\u6863\u7684\u5b57\u8282\u54c8\u5e0c\uff1b``resolved`` \u662f\u8fd9\u4efd\u5ba1\u6838\u662f\u5426\u5df2\u7ecf\u5b8c\u5907\uff08\u5168\u90e8\u6761\u76ee\n    accepted / skipped\uff09\u3002\n\nRaises:\n    HTTPException: 404 ``plan_not_found``\uff08\u8ba1\u5212\u76ee\u5f55\u4e0d\u5b58\u5728\uff09\uff1b404\n        ``document_not_found``\uff08\u76ee\u5f55\u5728\uff0c\u8ba1\u5212\u4e66\u4e0d\u5728\uff09\uff1b404 ``item_not_found``\n        \uff08\u6761\u76ee\u5e8f\u53f7\u4e0d\u5b58\u5728\uff09\uff1b400 ``unknown_action``\uff08\u52a8\u4f5c\u4e0d\u8ba4\u8bc6\uff09\uff1b400\n        ``skip_note_required``\uff08skip \u7f3a\u975e\u7a7a\u539f\u56e0\uff09\uff1b409\n        ``document_changed``\uff08\u8bf7\u6c42\u5e26\u7684\u54c8\u5e0c\u5bf9\u4e0d\u4e0a\u5f53\u524d\u6587\u6863\uff0c\u8981\u6c42\u91cd\u8bfb\u6761\u76ee\uff09\uff1b\n        422 ``verification_plan_invalid``\uff08\u8ba1\u5212\u4e66\u7ed3\u6784\u975e\u6cd5\uff0c\u6761\u76ee\u65e0\u4ece\u63d0\u53d6\uff09\u3002",
+        "operationId": "review_verification_plan_item_api_verification_plan__plan_id__review_item__item_index__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "item_index",
+            "required": true,
+            "schema": {
+              "title": "Item Index",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/_VerificationPlanReviewActionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review Verification Plan Item"
+      }
+    },
+    "/api/verification-plan/{plan_id}/review/items": {
+      "get": {
+        "description": "\u8bfb\u53d6\u8ba1\u5212\u4e66\u7684\u5ba1\u6838\u6761\u76ee\u5217\u8868\u3002\n\n\u6761\u76ee\u662f\u6587\u6863\u7684**\u6d3e\u751f\u89c6\u56fe**\uff1a5 \u4e2a\u8ba1\u5212\u7ea7\u6761\u76ee\uff08id \u4e0e\u987a\u5e8f\u662f\u5951\u7ea6\uff09+ \u6587\u6863\u91cc\u6bcf\u4e2a\n\u9a8c\u8bc1\u70b9\u4e00\u4e2a\u6761\u76ee\u3002\u6761\u76ee\u5f62\u72b6\u56fa\u5b9a ``{index, id, title, status, note}``\uff1b\n``PLAN-OBJECT`` \u591a\u5e26\u4e00\u4efd ``baseline`` \u2014\u2014 \u5b83\u8986\u76d6\u7684\u6b63\u662f\u6587\u6863\u91cc\u90a3\u884c\n``baseline:``\uff0caccept \u4e4b\u524d\u5fc5\u987b\u8ba9\u5ba1\u6838\u8005\u770b\u89c1\u5c06\u88ab\u51bb\u7ed3\u7684\u57fa\u7ebf\u3002\n\n``status`` / ``note`` \u53d6\u81ea\u5df2\u843d\u76d8\u7684\u5ba1\u6838\u72b6\u6001\uff08``verification-plan-review.\njson``\uff09\u3002\u6587\u6863\u5b57\u8282\u53d8\u4e86\uff0c\u90a3\u4e9b\u72b6\u6001\u4e00\u5f8b\u4f5c\u5e9f\uff08\u5168\u90e8\u56de\u5230 pending\uff09\u2014\u2014 \u65e7\u5ba1\u6838\n\u4e0d\u518d\u8986\u76d6\u5f53\u524d\u6587\u6863\u3002\n\nArgs:\n    plan_id: \u8ba1\u5212 id\u3002\n\nReturns:\n    200 ``{\"items\": [...], \"doc_sha256\": \"...\"}``\u3002\u6587\u6863\u7ed3\u6784\u975e\u6cd5\u65f6\u6761\u76ee\u662f\u7a7a\n    \u5217\u8868\uff08\u4ecd\u662f 200\uff09\uff1a\u6761\u76ee\u662f\u4ece\u5408\u6cd5\u6587\u6863\u91cc\u63d0\u53d6\u7684\uff0c\u975e\u6cd5\u6587\u6863\u6ca1\u6709\u6761\u76ee\u53ef\u63d0\u53d6 \u2014\u2014\n    \u7ed3\u6784\u9519\u8bef\u7531\u6587\u6863\u7aef\u70b9\u9010\u6761\u7ed9\u51fa\u3002\n\n    ``doc_sha256`` \u662f\u5f53\u524d\u8ba1\u5212\u4e66\u7684\u5b57\u8282\u54c8\u5e0c\u3002\u5ba1\u6838\u8005\u8981\u628a\u8fd9\u4e00\u7248**\u8bb0\u4e0b\u6765**\u518d\n    \u53bb\u63d0\u4ea4\u52a8\u4f5c\uff1a\u6587\u6863\u5728\u8fd9\u671f\u95f4\u88ab\u6539\u8fc7\uff0c\u52a8\u4f5c\u7aef\u70b9\u4f1a 409 ``document_changed``\n    \u8981\u6c42\u91cd\u8bfb\u6761\u76ee\uff08\u5ba1\u6838\u4e0d\u80fd\u8986\u76d6\u4e00\u4efd\u5df2\u7ecf\u53d8\u8fc7\u7684\u6587\u6863\uff09\u3002\n\nRaises:\n    HTTPException: 404 ``plan_not_found``\uff08\u8ba1\u5212\u76ee\u5f55\u4e0d\u5b58\u5728\uff09\uff1b404\n        ``document_not_found``\uff08\u76ee\u5f55\u5728\uff0c\u8ba1\u5212\u4e66\u4e0d\u5728\uff09\u3002",
+        "operationId": "get_verification_plan_review_items_api_verification_plan__plan_id__review_items_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Verification Plan Review Items"
+      }
+    },
+    "/api/verification/{plan_id}/force_terminal": {
+      "post": {
+        "description": "Operator escape hatch \u2014 synchronously CAS a plan out of any\n``verification_*`` stage (running / rerunning / repairing) into\n``failed`` and persist the verification_status update.\n\n2026-09-06:\nUse this for plans that the new watchdog hasn't yet recovered\n(e.g. the 12-hour-stuck ``2026-09-04 plan``\nbefore the backend picks up the new code). Returns 200 on success\nwith the new stage in the response body so callers can verify the\ntransition before issuing follow-up requests; returns 409 if the\nplan is already in an incompatible stage (already terminal, or in a\nnon-verification stage like ``executing``); returns 404 if the plan\ndoes not exist in ``plan_routing``.\n\nSide effects:\n  1. ``RoutingRepository.try_mark_phase`` SQL CAS \u2014 fires\n     ``KIND_PLAN_PHASE_CHANGED`` on the state bus.\n  2. ``_persist_verification_terminal`` \u2014 fires ``KIND_PLAN_CLOSED``\n     via ``VerificationRepository.complete_round``.\n  3. Feishu notifier (already subscribed to both events) rebuilds\n     the card within seconds: status flips from \"still verifying\"\n     to \"failed\".\n\nThe endpoint is synchronous on purpose \u2014 operators who manually\ncall this for a stuck plan want to see the change in\n``GET /api/plan/{id}/summary`` immediately, not after a background\ntask completes. The CAS itself is one SQL UPDATE so latency is\ndominated by SQLite write time (sub-millisecond on local disk).",
+        "operationId": "force_verification_terminal_api_verification__plan_id__force_terminal_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Force Verification Terminal"
+      }
+    },
+    "/api/verification/{plan_id}/progress": {
+      "get": {
+        "description": "Get VP-granularity + layer-granularity verification progress.\n\nReturns 404 if the executor hasn't written a progress state\nfile yet (``verification_progress_state.json`` absent under\n``plan_dir``) \u2014 the dashboard falls back to ``/status`` in that\ncase. Otherwise the response is the same shape whether the\nin-memory ``_verification_state`` is populated or the server\nwas just restarted: the live state lives on disk in\n``verification_progress_state.json`` (one write per\n``vp_status_changed`` event), so cross-process recovery is\nautomatic.\n\nSchema::\n\n    {\n      \"plan_id\": str,\n      \"verification_status\": str,           # \"running\" | \"passed\" | ...\n      \"verification_round\": int,\n      \"stop_reason\": Optional[str],         # why the loop ended, e.g.\n                                            # \"max_rounds_reached\" /\n                                            # \"same_failure_repeated_after_max_attempts\"\n                                            # (2026-09-19)\n      \"current_vp\": {                       # None when no VP in flight\n        \"id\": str,\n        \"title\": str,\n        \"started_at\": Optional[str]\n      },\n      \"completed_vps\": [str, ...],\n      \"failed_vps\": [str, ...],\n      \"skipped_vps\": [str, ...],\n      \"pending_vps\": [str, ...],\n      \"current_layer\": None,                # legacy field, always None\n      \"layer_summaries\": {},                # legacy field, always empty\n      \"counts\": {\n        \"total\": int, \"completed\": int, \"failed\": int,\n        \"skipped\": int, \"in_progress\": int, \"pending\": int\n      },\n      \"last_updated_at\": Optional[str]\n    }",
+        "operationId": "get_verification_progress_api_verification__plan_id__progress_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Verification Progress"
+      }
+    },
+    "/api/verification/{plan_id}/repair_tasks": {
+      "get": {
+        "description": "Get repair tasks generated by the verification cycle.\n\n2026-09-11 plan v12 (cards.py repair_tasks): reads the on-disk\n``plans/{id}/verification_repair_tasks.json`` snapshot first\n(survives server restart), then falls back to the in-memory\n``_verification_state[plan_id][\"repair_tasks\"]`` for the live\nround's freshly generated list.",
+        "operationId": "get_verification_repair_tasks_api_verification__plan_id__repair_tasks_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Verification Repair Tasks"
+      }
+    },
+    "/api/verification/{plan_id}/reset": {
+      "post": {
+        "description": "Hard-reset a plan's verification state \u2014 direct writes, no transitions.\n\n2026-09-17::\n\n    \"\u624b\u52a8\u91cd\u542f\u7684\u65f6\u5019\uff0c\u4e0d\u662f\u8ba9\u72b6\u6001\u673a\u81ea\u52a8\u7684\u4ece\u4e00\u4e2a\u70b9\u53d8\u5230\u53e6\u5916\u4e00\u4e2a\u70b9\uff0c\u800c\u662f\n     \u76f4\u63a5\u53bb\u91cd\u7f6e\u8fd9\u4e2a\u72b6\u6001\u2026\u2026\u53ea\u8981\u628a\u72b6\u6001\u641e\u5b9a\u4e86\uff0c\u628a\u5e94\u8be5\u8981\u6e05\u9664\u6389\u7684\u4e1c\u897f\u6e05\u9664\n     \u6389\uff0c\u5b83\u5e94\u8be5\u662f\u4e00\u4e2a\u6bd4\u8f83\u56fa\u5b9a\u7684\u6d41\u7a0b\u3002\"\n\nWhy \"direct\" and not the state machine: a restart is not a workflow\nstep, and routing it through ``transition_to`` means every restart\nhas to satisfy whatever transition table the current stage happens\nto allow \u2014 which is where the drift the user is describing comes\nfrom. A reset knows exactly what the state should be afterwards, so\nit writes that state.\n\nWhat a reset leaves behind (the \"fixed procedure\"):\n\n===========================  ===============================================\n``_verification_state``      in-memory entry dropped (status, results,\n                             stop_reason, orchestrator, thread \u2014 all gone)\n``plan_verification``        ``pending``, round \u2190 ``restart_at_round-1``,\n                             ``results``/``verdicts``/``runtime_state``/\n                             ``executor_state``/``progress_state``/\n                             ``execution_results`` cleared,\n                             ``verification_stop_reason`` cleared\n``plan_routing``             ``current_phase='verification'`` (a phase\n                             ``/start`` accepts), ``current_phase``\n                             mirrored, ``version`` bumped\n``plan_tasks``               pending ``RP-*`` \u2192 ``voided`` (never\n                             deleted: task data may only be voided or\n                             created, never rewritten)\n\n2026-10-16: the status written here was ``superseded`` and is now\n``voided``. These repair rows had no work handed to breakdown\nchildren \u2014 their *premise* (the round's verdicts) was thrown away \u2014\nso ``voided`` is the status whose resolver behaviour matches\n(\"this will never run\"), and ``superseded`` is now reserved for\n\"go look at my children\". The request field\n(``supersede_repair_tasks``) and the response key\n(``cleared.superseded_repair_tasks``) deliberately keep their old\nnames: they are an external API contract with a test pinning them,\nand renaming a response key to match an internal status word is a\nbreaking change for no functional gain.\n``plans/<id>/`` on disk      per-round verification artifacts, when\n                             ``clear_artifacts``; ``verification_plan.json``\n                             only when ``clear_verification_plan``\n===========================  ===============================================\n\n``max_rounds`` is NOT touched \u2014 it is the plan's immutable budget\n(see :class:`ResetRoundsRequest`).\n\nRefuses with 409 while a verification thread is live: that thread\nowns the orchestrator and keeps writing state, so a reset under it\nwould be immediately overwritten. ``force=true`` cancels the round\nfirst and then resets.",
+        "operationId": "reset_verification_api_verification__plan_id__reset_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ResetVerificationRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Req"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Verification"
+      }
+    },
+    "/api/verification/{plan_id}/reset_rounds": {
+      "post": {
+        "description": "Operator escape hatch \u2014 give the plan another batch of rounds.\n\nName (2026-09-16)\n-----------------\nRenamed from ``reset_max_rounds`` because it never touched\n``max_rounds``: it resets the round **counter**. See\n:class:`ResetRoundsRequest`.\n\nSemantics (2026-09-14 \u2014 inverted from the original)\n-----------------------------------------------------------------\n* The plan's ``max_rounds`` is **immutable**: it is the budget the\n  plan was set up with. Raising it makes rounds unbounded (the\n  2026-08-25 incident: an operator lifted the cap and the counter\n  together and round 6 ran for 47 minutes); lowering it silently\n  rewrites the plan's setup contract. Any ``new_max_rounds`` that\n  differs from the current cap is refused.\n* What this endpoint DOES is reset the round **counter** \u2014 the thing\n  the ``/start`` ceiling check compares against the cap. With user\n  authorization the operator can hand the plan a fresh batch so the\n  auto-loop iterates up to ``max_rounds`` more times.\n\nBody::\n\n    {}                       # restart at round 1 (default; full batch)\n    {\"reset_round_to\": 1}    # next /start iterates rounds 1, 2, 3\n    {\"reset_round_to\": 3}    # next /start runs round 3 only (1 left)\n\n``reset_round_to`` is the round number the iteration **restarts at**\n(1-based, the same numbering the card shows): after the cap is hit,\nthe counter resets to 1 and the next ``/start`` iterates from there.\nIt is stored internally as completed-rounds =\n``value - 1`` so ``/start`` begins exactly at that round, and it may\nnot exceed the immutable cap (there is no round 4 of a 3-round\nbudget).\n\nSide effects: the counter is written to ``plan_verification.round``\n(verdicts / runtime state survive \u2014 a reset is about budget, not\nabout wiping progress), the row is left ``pending`` with no stop\nreason, and the in-memory state is re-synced so the next ``/start``\nis admitted instead of 409-ing on a stale \"already running\" flag.\n\nOperator-only by convention (matches ``/start`` and ``/stop`` \u2014 no\nextra auth gate). Returns\n``{\"plan_id\", \"round\" (stored counter), \"restart_at_round\",\n\"rounds_remaining\", \"max_rounds\", \"new_max_rounds\"}``.",
+        "operationId": "reset_rounds_api_verification__plan_id__reset_rounds_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetRoundsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Rounds"
+      }
+    },
+    "/api/verification/{plan_id}/start": {
+      "post": {
+        "description": "Start verification via the routing/verification repositories.",
+        "operationId": "start_verification_api_verification__plan_id__start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartVerificationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Verification"
+      }
+    },
+    "/api/verification/{plan_id}/status": {
+      "get": {
+        "description": "Return verification status sourced from the SQLite state machine.",
+        "operationId": "get_verification_status_api_verification__plan_id__status_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Verification Status"
+      }
+    },
+    "/api/verification/{plan_id}/stop": {
+      "post": {
+        "description": "Stop the running verification round and leave a resumable pause behind.\n\nThe order is load-bearing:\n\n1. mark the routing row (verification_running -> verification) and the\n   plan_verification row (loop_stopped / user_stopped);\n2. read the round's verdicts before the connection is released -- they\n   live only in that row;\n3. snapshot the interrupted round (_persist_round_snapshot);\n4. write the pause checkpoint: _write_verification_checkpoint records\n   the round, its verdicts and the interrupted VPs in pause_state.json;\n5. cancel and kill the in-flight VP sub-agents, then reap their services.\n\nThe response is a pause, not a discard: it reports paused, round and\ninterrupted_vp_count, and a later /start reads that checkpoint through\n_resolve_start_round and resumes this round. The plan is left stopped.",
+        "operationId": "stop_verification_api_verification__plan_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Verification"
+      }
+    },
+    "/health": {
+      "get": {
+        "description": "Liveness probe used by startup latency tests and load balancers.\n\n2026-09-23: this answers ONLY \"is the process serving HTTP\".  During\nthe SQLite-connection outage the process was perfectly healthy by\nthis probe while every data endpoint returned 500, which is how the\nsupervisor kept reporting it \"running\" and the scheduler's card said\n\"\u672a\u8fd0\u884c\" for 40 minutes.  Whether the *data plane* works is a separate\nquestion \u2014 see :func:`health_data_check`.",
+        "operationId": "health_check_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health Check"
+      }
+    },
+    "/health/data": {
+      "get": {
+        "description": "Data-plane probe: can the server actually read its state database?\n\nUnlike :func:`health_check`, this exercises the SQLite path a real\nrequest depends on (open + version read).  It exists because a\nserver can be process-healthy and data-plane-dead at the same time \u2014\nthe 2026-09-23 outage had ``/health`` returning 200 while\n``/api/plans`` returned 500 ``database disk image is malformed`` for\nthe rest of the server's life.\n\nDeliberately read-only and cheap: it never takes the v5 migration\nwrite lock (the fast path in ``migrate`` is a plain SELECT on a\ncurrent-schema DB).\n\n2026-10-25: the answer also carries an ``instance`` block \u2014 the\nfact sheet about the process that answered, so a reader can tell\n\"this instance\" from \"somebody else's instance on the same port\"\n(see :func:`_instance_identity`).  The block is purely additive:\n``status``, ``plan_routing_rows`` and ``reason`` keep exactly the\nmeaning they had.\n\n2026-10-26: the answer carries the guard's own verdict as\n``request_guard`` \u2014 ``\"enforced\"`` when this process checked\nitself and found the guard refusing, ``\"failed\"`` when the check\nran and the guard did not refuse, ``\"unchecked\"`` when no check\nhas run here (an application that was imported rather than\nstarted).  It is the field a reader compares when the answer came\nfrom a port they did not start themselves: an instance that\npublishes ``\"enforced\"`` is one that proved it; one that does not\npublish the field at all is somebody else.\n\nThe verdict is not the whole of the record, so the answer carries\nthe record too: ``request_guard_detail`` says when the check ran\n(``checked_at``), which paths it asked (``paths``), and what each of\nthem answered with and without the header\n(``status_without_header`` / ``status_with_header``).  This is the\nevidence the round could not get on its own \u2014 the instance checked\n**itself** before it began serving, and this is what it found.  A\nround that reaches a port whose instance has since died cannot ask\nthe instance any more, so the record has to be published while the\ninstance is still there.",
+        "operationId": "health_data_check_health_data_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health Data Check"
+      }
+    },
+    "/start": {
+      "post": {
+        "description": "Generic start endpoint that returns a fresh run identifier.",
+        "operationId": "start_run_start_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Start Run"
+      }
+    },
+    "/{path}": {
+      "get": {
+        "description": "Serve one file from the frontend bundle \u2014 and nothing else.\n\nThe route exists to serve the UI's static assets (``index.html``,\n``app.js``, ``style.css`` today). It is deliberately a catch-all\nrather than one route per file so that adding an asset does not mean\nediting the server \u2014 which is exactly why it needs an explicit\ncontainment check rather than relying on the URL shape.",
+        "operationId": "serve_static__path__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Serve Static"
+      }
+    }
+  }
+}

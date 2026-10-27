@@ -1,0 +1,26 @@
+{
+  "round": 1,
+  "snapshot_at": "2026-01-01T00:00:00+00:00",
+  "results": [
+    {
+      "id": "VP-001",
+      "status": "FAILED",
+      "actual_result": "状态码断言失败：期望 200，实际 500",
+      "evidence": "HTTP 500，响应体 {\"error\": \"internal\"}",
+      "failure_class": "deliverable_defect",
+      "failure_class_source": "deterministic"
+    },
+    {
+      "id": "VP-002",
+      "status": "FAILED",
+      "actual_result": "状态码断言失败：期望 201，实际 200",
+      "evidence": "HTTP 200，响应体里没有 items 字段"
+    },
+    {
+      "id": "VP-003",
+      "status": "PASSED",
+      "actual_result": "状态码断言通过：期望 200，实际 200",
+      "evidence": "HTTP 200，响应体里有 id 字段"
+    }
+  ]
+}

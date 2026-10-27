@@ -1,0 +1,2203 @@
+{
+  "schema_version": 1,
+  "frozen_at": "2026-10-26T16:02:00+00:00",
+  "period": {
+    "from": "2026-10-20",
+    "to": "2026-10-26"
+  },
+  "ledger": {
+    "2026-10-20": {
+      "requests": 14037,
+      "total_tokens": 1161842366,
+      "cost_usd": 28.841181
+    },
+    "2026-10-21": {
+      "requests": 7075,
+      "total_tokens": 575643602,
+      "cost_usd": 16.076836
+    },
+    "2026-10-22": {
+      "requests": 16593,
+      "total_tokens": 1461394133,
+      "cost_usd": 34.862876
+    },
+    "2026-10-23": {
+      "requests": 17330,
+      "total_tokens": 1459198974,
+      "cost_usd": 38.309212
+    },
+    "2026-10-24": {
+      "requests": 22150,
+      "total_tokens": 1902020053,
+      "cost_usd": 46.895252
+    },
+    "2026-10-25": {
+      "requests": 13973,
+      "total_tokens": 1301370661,
+      "cost_usd": 30.101677
+    },
+    "2026-10-26": {
+      "requests": 14455,
+      "total_tokens": 1274388021,
+      "cost_usd": 31.701378
+    }
+  },
+  "metric_names": [
+    "pdt_plan_tokens",
+    "per_plan_tokens",
+    "repair_ratio",
+    "exec_vs_verify",
+    "round_median",
+    "round_p90",
+    "unattributed_ratio"
+  ],
+  "escape_signals": [
+    "later_plan_failures",
+    "post_merge_reverts",
+    "targeted_fix_commits"
+  ],
+  "targets": {
+    "pdt_plan_tokens": {
+      "direction": "down",
+      "baseline": 9841106516
+    },
+    "per_plan_tokens": {
+      "direction": "down",
+      "baseline": 93691241.0
+    },
+    "repair_ratio": {
+      "direction": "down",
+      "baseline": 0.0
+    },
+    "exec_vs_verify": {
+      "direction": "band",
+      "low": 1.350271,
+      "high": 5.401083
+    },
+    "round_median": {
+      "direction": "down",
+      "baseline": 0.0
+    },
+    "round_p90": {
+      "direction": "down",
+      "baseline": 0.0
+    },
+    "unattributed_ratio": {
+      "direction": "down",
+      "baseline": 1.0
+    }
+  },
+  "plans": [
+    {
+      "plan_id": "sample-plan-001",
+      "size": "large",
+      "task_count": 35,
+      "completed_at": "2026-09-27T03:58:23.889718+00:00",
+      "outcome": "failed",
+      "totals": {
+        "requests": 1216,
+        "total_tokens": 82058113,
+        "cost_usd": 4.487433
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 767,
+          "total_tokens": 54447459,
+          "cost_usd": 3.890525
+        },
+        "verification": {
+          "requests": 408,
+          "total_tokens": 22470954,
+          "cost_usd": 0.409205
+        },
+        "refiner": {
+          "requests": 38,
+          "total_tokens": 5029124,
+          "cost_usd": 0.156688
+        },
+        "audit_second_pass": {
+          "requests": 3,
+          "total_tokens": 110576,
+          "cost_usd": 0.031015
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1216,
+          "total_tokens": 82058113,
+          "cost_usd": 4.487433
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1216,
+          "total_tokens": 82058113,
+          "cost_usd": 4.487433
+        }
+      },
+      "by_day": {
+        "2026-09-26": {
+          "requests": 610,
+          "total_tokens": 39906061,
+          "cost_usd": 1.573353
+        },
+        "2026-09-27": {
+          "requests": 606,
+          "total_tokens": 42152052,
+          "cost_usd": 2.91408
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-002",
+      "size": "large",
+      "task_count": 88,
+      "completed_at": "2026-10-06T01:30:49.217461+00:00",
+      "outcome": "passed",
+      "totals": {
+        "requests": 8309,
+        "total_tokens": 581468014,
+        "cost_usd": 17.289265
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 6234,
+          "total_tokens": 439089057,
+          "cost_usd": 11.257662
+        },
+        "verification": {
+          "requests": 1323,
+          "total_tokens": 76784624,
+          "cost_usd": 2.341976
+        },
+        "refiner": {
+          "requests": 434,
+          "total_tokens": 49052910,
+          "cost_usd": 2.773823
+        },
+        "audit_second_pass": {
+          "requests": 206,
+          "total_tokens": 8997140,
+          "cost_usd": 0.36911
+        },
+        "tasks_generation": {
+          "requests": 38,
+          "total_tokens": 2892924,
+          "cost_usd": 0.216789
+        },
+        "prd": {
+          "requests": 37,
+          "total_tokens": 2313791,
+          "cost_usd": 0.144738
+        },
+        "test_design": {
+          "requests": 19,
+          "total_tokens": 1431601,
+          "cost_usd": 0.095299
+        },
+        "verification_plan_delta": {
+          "requests": 8,
+          "total_tokens": 381555,
+          "cost_usd": 0.025428
+        },
+        "arch": {
+          "requests": 7,
+          "total_tokens": 372621,
+          "cost_usd": 0.051611
+        },
+        "interview": {
+          "requests": 3,
+          "total_tokens": 151791,
+          "cost_usd": 0.012829
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 8309,
+          "total_tokens": 581468014,
+          "cost_usd": 17.289265
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 8309,
+          "total_tokens": 581468014,
+          "cost_usd": 17.289265
+        }
+      },
+      "by_day": {
+        "2026-10-04": {
+          "requests": 1913,
+          "total_tokens": 150324200,
+          "cost_usd": 4.047517
+        },
+        "2026-10-05": {
+          "requests": 5958,
+          "total_tokens": 405524534,
+          "cost_usd": 12.49879
+        },
+        "2026-10-06": {
+          "requests": 438,
+          "total_tokens": 25619280,
+          "cost_usd": 0.742958
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-003",
+      "size": "large",
+      "task_count": 171,
+      "completed_at": "2026-10-14T07:41:20.268724+00:00",
+      "outcome": "passed",
+      "totals": {
+        "requests": 17190,
+        "total_tokens": 1037296184,
+        "cost_usd": 35.676914
+      },
+      "by_scene": {
+        "verification": {
+          "requests": 12432,
+          "total_tokens": 676488798,
+          "cost_usd": 23.826873
+        },
+        "execution": {
+          "requests": 4234,
+          "total_tokens": 330594918,
+          "cost_usd": 7.75091
+        },
+        "audit_second_pass": {
+          "requests": 199,
+          "total_tokens": 7847212,
+          "cost_usd": 0.381683
+        },
+        "refiner": {
+          "requests": 59,
+          "total_tokens": 7312093,
+          "cost_usd": 1.95672
+        },
+        "verification_plan_delta": {
+          "requests": 129,
+          "total_tokens": 6214432,
+          "cost_usd": 0.684738
+        },
+        "tasks_generation": {
+          "requests": 37,
+          "total_tokens": 3764181,
+          "cost_usd": 0.353904
+        },
+        "arch_refine": {
+          "requests": 43,
+          "total_tokens": 2177936,
+          "cost_usd": 0.221175
+        },
+        "test_refine": {
+          "requests": 26,
+          "total_tokens": 1187994,
+          "cost_usd": 0.110007
+        },
+        "test_design": {
+          "requests": 11,
+          "total_tokens": 801617,
+          "cost_usd": 0.147125
+        },
+        "prd": {
+          "requests": 15,
+          "total_tokens": 647624,
+          "cost_usd": 0.126943
+        },
+        "arch": {
+          "requests": 2,
+          "total_tokens": 124496,
+          "cost_usd": 0.066381
+        },
+        "interview": {
+          "requests": 2,
+          "total_tokens": 95721,
+          "cost_usd": 0.037257
+        },
+        "prd_refine": {
+          "requests": 1,
+          "total_tokens": 39162,
+          "cost_usd": 0.013199
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 17190,
+          "total_tokens": 1037296184,
+          "cost_usd": 35.676914
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 17190,
+          "total_tokens": 1037296184,
+          "cost_usd": 35.676914
+        }
+      },
+      "by_day": {
+        "2026-10-10": {
+          "requests": 1026,
+          "total_tokens": 60958181,
+          "cost_usd": 3.76106
+        },
+        "2026-10-11": {
+          "requests": 7467,
+          "total_tokens": 437895508,
+          "cost_usd": 13.422806
+        },
+        "2026-10-12": {
+          "requests": 3573,
+          "total_tokens": 187665964,
+          "cost_usd": 6.506052
+        },
+        "2026-10-13": {
+          "requests": 3393,
+          "total_tokens": 223699584,
+          "cost_usd": 7.892814
+        },
+        "2026-10-14": {
+          "requests": 1731,
+          "total_tokens": 127076947,
+          "cost_usd": 4.094183
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-004",
+      "size": "large",
+      "task_count": 89,
+      "completed_at": "2026-10-15T20:52:38.776299+00:00",
+      "outcome": "passed",
+      "totals": {
+        "requests": 20578,
+        "total_tokens": 1704122483,
+        "cost_usd": 50.910273
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 9135,
+          "total_tokens": 890508183,
+          "cost_usd": 20.146409
+        },
+        "verification": {
+          "requests": 10837,
+          "total_tokens": 770628284,
+          "cost_usd": 27.021065
+        },
+        "audit_second_pass": {
+          "requests": 398,
+          "total_tokens": 24500078,
+          "cost_usd": 1.076525
+        },
+        "refiner": {
+          "requests": 98,
+          "total_tokens": 9823094,
+          "cost_usd": 1.418217
+        },
+        "tasks_generation": {
+          "requests": 34,
+          "total_tokens": 3587853,
+          "cost_usd": 0.306226
+        },
+        "verification_plan_delta": {
+          "requests": 46,
+          "total_tokens": 3528559,
+          "cost_usd": 0.366313
+        },
+        "arch_refine": {
+          "requests": 12,
+          "total_tokens": 490056,
+          "cost_usd": 0.067013
+        },
+        "test_refine": {
+          "requests": 9,
+          "total_tokens": 471421,
+          "cost_usd": 0.206333
+        },
+        "interview": {
+          "requests": 3,
+          "total_tokens": 160400,
+          "cost_usd": 0.062297
+        },
+        "test_design": {
+          "requests": 2,
+          "total_tokens": 157408,
+          "cost_usd": 0.087476
+        },
+        "arch": {
+          "requests": 2,
+          "total_tokens": 138735,
+          "cost_usd": 0.076572
+        },
+        "prd": {
+          "requests": 2,
+          "total_tokens": 128412,
+          "cost_usd": 0.075829
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 20578,
+          "total_tokens": 1704122483,
+          "cost_usd": 50.910273
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 20578,
+          "total_tokens": 1704122483,
+          "cost_usd": 50.910273
+        }
+      },
+      "by_day": {
+        "2026-10-12": {
+          "requests": 3335,
+          "total_tokens": 255315192,
+          "cost_usd": 7.445905
+        },
+        "2026-10-13": {
+          "requests": 6432,
+          "total_tokens": 515062492,
+          "cost_usd": 15.87494
+        },
+        "2026-10-14": {
+          "requests": 5770,
+          "total_tokens": 504060276,
+          "cost_usd": 14.295245
+        },
+        "2026-10-15": {
+          "requests": 5041,
+          "total_tokens": 429684523,
+          "cost_usd": 13.294184
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-005",
+      "size": "large",
+      "task_count": 84,
+      "completed_at": "2026-10-21T07:13:42.927903+00:00",
+      "outcome": "failed",
+      "totals": {
+        "requests": 13795,
+        "total_tokens": 1261479418,
+        "cost_usd": 33.403593
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 9680,
+          "total_tokens": 939001237,
+          "cost_usd": 22.315876
+        },
+        "verification": {
+          "requests": 3483,
+          "total_tokens": 281930122,
+          "cost_usd": 8.380185
+        },
+        "audit_second_pass": {
+          "requests": 496,
+          "total_tokens": 29406156,
+          "cost_usd": 1.295848
+        },
+        "refiner": {
+          "requests": 86,
+          "total_tokens": 6987926,
+          "cost_usd": 0.712062
+        },
+        "tasks_generation": {
+          "requests": 26,
+          "total_tokens": 2761346,
+          "cost_usd": 0.326525
+        },
+        "verification_plan_delta": {
+          "requests": 16,
+          "total_tokens": 761433,
+          "cost_usd": 0.083418
+        },
+        "arch": {
+          "requests": 3,
+          "total_tokens": 233336,
+          "cost_usd": 0.094657
+        },
+        "test_design": {
+          "requests": 2,
+          "total_tokens": 195078,
+          "cost_usd": 0.095511
+        },
+        "prd": {
+          "requests": 2,
+          "total_tokens": 143880,
+          "cost_usd": 0.078551
+        },
+        "interview": {
+          "requests": 1,
+          "total_tokens": 58904,
+          "cost_usd": 0.02096
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 13795,
+          "total_tokens": 1261479418,
+          "cost_usd": 33.403593
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 13795,
+          "total_tokens": 1261479418,
+          "cost_usd": 33.403593
+        }
+      },
+      "by_day": {
+        "2026-10-15": {
+          "requests": 3359,
+          "total_tokens": 336140053,
+          "cost_usd": 8.676455
+        },
+        "2026-10-16": {
+          "requests": 1863,
+          "total_tokens": 175465206,
+          "cost_usd": 4.655957
+        },
+        "2026-10-17": {
+          "requests": 849,
+          "total_tokens": 84806683,
+          "cost_usd": 1.879796
+        },
+        "2026-10-18": {
+          "requests": 1027,
+          "total_tokens": 85238944,
+          "cost_usd": 2.266242
+        },
+        "2026-10-19": {
+          "requests": 303,
+          "total_tokens": 23597820,
+          "cost_usd": 0.652441
+        },
+        "2026-10-20": {
+          "requests": 4067,
+          "total_tokens": 347565501,
+          "cost_usd": 9.297205
+        },
+        "2026-10-21": {
+          "requests": 2327,
+          "total_tokens": 208665211,
+          "cost_usd": 5.975498
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-006",
+      "size": "large",
+      "task_count": 12,
+      "completed_at": "2026-10-20T12:33:35.478599+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 1621,
+        "total_tokens": 121285159,
+        "cost_usd": 2.791628
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 1436,
+          "total_tokens": 113290106,
+          "cost_usd": 2.559883
+        },
+        "audit_second_pass": {
+          "requests": 185,
+          "total_tokens": 7995053,
+          "cost_usd": 0.231745
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1621,
+          "total_tokens": 121285159,
+          "cost_usd": 2.791628
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1621,
+          "total_tokens": 121285159,
+          "cost_usd": 2.791628
+        }
+      },
+      "by_day": {
+        "2026-10-20": {
+          "requests": 1621,
+          "total_tokens": 121285159,
+          "cost_usd": 2.791628
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-007",
+      "size": "large",
+      "task_count": 23,
+      "completed_at": "2026-10-20T16:43:43.517073+00:00",
+      "outcome": "passed",
+      "totals": {
+        "requests": 6102,
+        "total_tokens": 533882954,
+        "cost_usd": 12.907455
+      },
+      "by_scene": {
+        "verification": {
+          "requests": 3223,
+          "total_tokens": 270855160,
+          "cost_usd": 7.074735
+        },
+        "execution": {
+          "requests": 2817,
+          "total_tokens": 260300855,
+          "cost_usd": 5.723661
+        },
+        "audit_second_pass": {
+          "requests": 57,
+          "total_tokens": 2479072,
+          "cost_usd": 0.083083
+        },
+        "verification_plan_delta": {
+          "requests": 5,
+          "total_tokens": 247867,
+          "cost_usd": 0.025976
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 6102,
+          "total_tokens": 533882954,
+          "cost_usd": 12.907455
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 6102,
+          "total_tokens": 533882954,
+          "cost_usd": 12.907455
+        }
+      },
+      "by_day": {
+        "2026-10-20": {
+          "requests": 6102,
+          "total_tokens": 533882954,
+          "cost_usd": 12.907455
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-008",
+      "size": "large",
+      "task_count": 15,
+      "completed_at": "2026-10-20T14:54:38.206915+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 1038,
+        "total_tokens": 65006460,
+        "cost_usd": 1.592755
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 1013,
+          "total_tokens": 64013141,
+          "cost_usd": 1.55977
+        },
+        "audit_second_pass": {
+          "requests": 25,
+          "total_tokens": 993319,
+          "cost_usd": 0.032985
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1038,
+          "total_tokens": 65006460,
+          "cost_usd": 1.592755
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1038,
+          "total_tokens": 65006460,
+          "cost_usd": 1.592755
+        }
+      },
+      "by_day": {
+        "2026-10-20": {
+          "requests": 1038,
+          "total_tokens": 65006460,
+          "cost_usd": 1.592755
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-009",
+      "size": "medium",
+      "task_count": 7,
+      "completed_at": "2026-10-20T08:54:44.026311+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 618,
+        "total_tokens": 48516666,
+        "cost_usd": 1.046114
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 587,
+          "total_tokens": 47218043,
+          "cost_usd": 1.003768
+        },
+        "audit_second_pass": {
+          "requests": 31,
+          "total_tokens": 1298623,
+          "cost_usd": 0.042346
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 618,
+          "total_tokens": 48516666,
+          "cost_usd": 1.046114
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 618,
+          "total_tokens": 48516666,
+          "cost_usd": 1.046114
+        }
+      },
+      "by_day": {
+        "2026-10-20": {
+          "requests": 618,
+          "total_tokens": 48516666,
+          "cost_usd": 1.046114
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-010",
+      "size": "medium",
+      "task_count": 7,
+      "completed_at": "2026-10-20T09:12:24.229955+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 591,
+        "total_tokens": 45585626,
+        "cost_usd": 1.206024
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 577,
+          "total_tokens": 45131943,
+          "cost_usd": 1.191513
+        },
+        "audit_second_pass": {
+          "requests": 14,
+          "total_tokens": 453683,
+          "cost_usd": 0.014511
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 591,
+          "total_tokens": 45585626,
+          "cost_usd": 1.206024
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 591,
+          "total_tokens": 45585626,
+          "cost_usd": 1.206024
+        }
+      },
+      "by_day": {
+        "2026-10-20": {
+          "requests": 591,
+          "total_tokens": 45585626,
+          "cost_usd": 1.206024
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-011",
+      "size": "large",
+      "task_count": 100,
+      "completed_at": "2026-10-25T05:43:13.097818+00:00",
+      "outcome": "failed",
+      "totals": {
+        "requests": 18132,
+        "total_tokens": 1604386848,
+        "cost_usd": 38.851283
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 13367,
+          "total_tokens": 1222904230,
+          "cost_usd": 27.564706
+        },
+        "verification": {
+          "requests": 4003,
+          "total_tokens": 336979281,
+          "cost_usd": 9.195644
+        },
+        "audit_second_pass": {
+          "requests": 579,
+          "total_tokens": 30108988,
+          "cost_usd": 0.945503
+        },
+        "tasks_generation": {
+          "requests": 77,
+          "total_tokens": 8130475,
+          "cost_usd": 0.504479
+        },
+        "verification_plan_delta": {
+          "requests": 57,
+          "total_tokens": 3044790,
+          "cost_usd": 0.201921
+        },
+        "arch": {
+          "requests": 28,
+          "total_tokens": 2054817,
+          "cost_usd": 0.124775
+        },
+        "arch_refine": {
+          "requests": 9,
+          "total_tokens": 401444,
+          "cost_usd": 0.055291
+        },
+        "prd": {
+          "requests": 5,
+          "total_tokens": 292028,
+          "cost_usd": 0.090043
+        },
+        "test_design": {
+          "requests": 2,
+          "total_tokens": 243692,
+          "cost_usd": 0.111722
+        },
+        "interview": {
+          "requests": 4,
+          "total_tokens": 187643,
+          "cost_usd": 0.041149
+        },
+        "test_refine": {
+          "requests": 1,
+          "total_tokens": 39460,
+          "cost_usd": 0.01605
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 18132,
+          "total_tokens": 1604386848,
+          "cost_usd": 38.851283
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 18132,
+          "total_tokens": 1604386848,
+          "cost_usd": 38.851283
+        }
+      },
+      "by_day": {
+        "2026-10-21": {
+          "requests": 1185,
+          "total_tokens": 98912460,
+          "cost_usd": 3.088155
+        },
+        "2026-10-22": {
+          "requests": 8666,
+          "total_tokens": 760614315,
+          "cost_usd": 17.706854
+        },
+        "2026-10-23": {
+          "requests": 2118,
+          "total_tokens": 191822836,
+          "cost_usd": 4.54631
+        },
+        "2026-10-24": {
+          "requests": 5172,
+          "total_tokens": 452436779,
+          "cost_usd": 11.281294
+        },
+        "2026-10-25": {
+          "requests": 991,
+          "total_tokens": 100600458,
+          "cost_usd": 2.22867
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-012",
+      "size": "large",
+      "task_count": 11,
+      "completed_at": "2026-10-21T12:26:30.471009+00:00",
+      "outcome": "failed",
+      "totals": {
+        "requests": 1823,
+        "total_tokens": 145594153,
+        "cost_usd": 3.512399
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 1186,
+          "total_tokens": 101403901,
+          "cost_usd": 2.354464
+        },
+        "verification": {
+          "requests": 554,
+          "total_tokens": 40085557,
+          "cost_usd": 1.038394
+        },
+        "audit_second_pass": {
+          "requests": 79,
+          "total_tokens": 3980548,
+          "cost_usd": 0.106733
+        },
+        "verification_plan_delta": {
+          "requests": 4,
+          "total_tokens": 124147,
+          "cost_usd": 0.012808
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1823,
+          "total_tokens": 145594153,
+          "cost_usd": 3.512399
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1823,
+          "total_tokens": 145594153,
+          "cost_usd": 3.512399
+        }
+      },
+      "by_day": {
+        "2026-10-21": {
+          "requests": 1823,
+          "total_tokens": 145594153,
+          "cost_usd": 3.512399
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-013",
+      "size": "medium",
+      "task_count": 7,
+      "completed_at": "2026-10-22T06:49:08.078290+00:00",
+      "outcome": "passed",
+      "totals": {
+        "requests": 1774,
+        "total_tokens": 124207670,
+        "cost_usd": 3.690309
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 919,
+          "total_tokens": 70993874,
+          "cost_usd": 1.976434
+        },
+        "verification": {
+          "requests": 722,
+          "total_tokens": 46504698,
+          "cost_usd": 1.429911
+        },
+        "audit_second_pass": {
+          "requests": 99,
+          "total_tokens": 4118902,
+          "cost_usd": 0.115124
+        },
+        "tasks_generation": {
+          "requests": 32,
+          "total_tokens": 2526363,
+          "cost_usd": 0.156461
+        },
+        "verification_plan_delta": {
+          "requests": 2,
+          "total_tokens": 63833,
+          "cost_usd": 0.012379
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1774,
+          "total_tokens": 124207670,
+          "cost_usd": 3.690309
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1774,
+          "total_tokens": 124207670,
+          "cost_usd": 3.690309
+        }
+      },
+      "by_day": {
+        "2026-10-21": {
+          "requests": 1740,
+          "total_tokens": 122471778,
+          "cost_usd": 3.500784
+        },
+        "2026-10-22": {
+          "requests": 34,
+          "total_tokens": 1735892,
+          "cost_usd": 0.189525
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-014",
+      "size": "large",
+      "task_count": 19,
+      "completed_at": "2026-10-22T23:40:54.328927+00:00",
+      "outcome": "failed",
+      "totals": {
+        "requests": 4597,
+        "total_tokens": 427050866,
+        "cost_usd": 10.42547
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 3922,
+          "total_tokens": 373108797,
+          "cost_usd": 8.600325
+        },
+        "verification": {
+          "requests": 567,
+          "total_tokens": 44143460,
+          "cost_usd": 1.458829
+        },
+        "refiner": {
+          "requests": 83,
+          "total_tokens": 7469231,
+          "cost_usd": 0.192256
+        },
+        "tasks_generation": {
+          "requests": 13,
+          "total_tokens": 1758636,
+          "cost_usd": 0.108425
+        },
+        "audit_second_pass": {
+          "requests": 8,
+          "total_tokens": 386983,
+          "cost_usd": 0.01917
+        },
+        "verification_plan_delta": {
+          "requests": 4,
+          "total_tokens": 183759,
+          "cost_usd": 0.046464
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 4597,
+          "total_tokens": 427050866,
+          "cost_usd": 10.42547
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 4597,
+          "total_tokens": 427050866,
+          "cost_usd": 10.42547
+        }
+      },
+      "by_day": {
+        "2026-10-22": {
+          "requests": 4597,
+          "total_tokens": 427050866,
+          "cost_usd": 10.42547
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-015",
+      "size": "medium",
+      "task_count": 6,
+      "completed_at": "2026-10-22T19:56:56.675861+00:00",
+      "outcome": "passed",
+      "totals": {
+        "requests": 1391,
+        "total_tokens": 111774053,
+        "cost_usd": 2.682622
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 798,
+          "total_tokens": 73016224,
+          "cost_usd": 1.578011
+        },
+        "verification": {
+          "requests": 593,
+          "total_tokens": 38757829,
+          "cost_usd": 1.104611
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1391,
+          "total_tokens": 111774053,
+          "cost_usd": 2.682622
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1391,
+          "total_tokens": 111774053,
+          "cost_usd": 2.682622
+        }
+      },
+      "by_day": {
+        "2026-10-22": {
+          "requests": 1391,
+          "total_tokens": 111774053,
+          "cost_usd": 2.682622
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-016",
+      "size": "medium",
+      "task_count": 5,
+      "completed_at": "2026-10-22T16:20:53.199808+00:00",
+      "outcome": "partial",
+      "totals": {
+        "requests": 1183,
+        "total_tokens": 93691241,
+        "cost_usd": 2.294076
+      },
+      "by_scene": {
+        "verification": {
+          "requests": 721,
+          "total_tokens": 55529864,
+          "cost_usd": 1.405718
+        },
+        "execution": {
+          "requests": 462,
+          "total_tokens": 38161377,
+          "cost_usd": 0.888358
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1183,
+          "total_tokens": 93691241,
+          "cost_usd": 2.294076
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1183,
+          "total_tokens": 93691241,
+          "cost_usd": 2.294076
+        }
+      },
+      "by_day": {
+        "2026-10-22": {
+          "requests": 1183,
+          "total_tokens": 93691241,
+          "cost_usd": 2.294076
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-017",
+      "size": "medium",
+      "task_count": 6,
+      "completed_at": "2026-10-22T11:14:47.086506+00:00",
+      "outcome": "passed",
+      "totals": {
+        "requests": 722,
+        "total_tokens": 66527766,
+        "cost_usd": 1.564329
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 621,
+          "total_tokens": 58046166,
+          "cost_usd": 1.311538
+        },
+        "verification": {
+          "requests": 101,
+          "total_tokens": 8481600,
+          "cost_usd": 0.252791
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 722,
+          "total_tokens": 66527766,
+          "cost_usd": 1.564329
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 722,
+          "total_tokens": 66527766,
+          "cost_usd": 1.564329
+        }
+      },
+      "by_day": {
+        "2026-10-22": {
+          "requests": 722,
+          "total_tokens": 66527766,
+          "cost_usd": 1.564329
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-018",
+      "size": "large",
+      "task_count": 97,
+      "completed_at": "2026-10-26T18:06:52.613061+00:00",
+      "outcome": "failed",
+      "totals": {
+        "requests": 21110,
+        "total_tokens": 1833727822,
+        "cost_usd": 45.365747
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 13018,
+          "total_tokens": 1220845303,
+          "cost_usd": 27.901318
+        },
+        "verification": {
+          "requests": 7707,
+          "total_tokens": 590080719,
+          "cost_usd": 16.074784
+        },
+        "audit_second_pass": {
+          "requests": 215,
+          "total_tokens": 11208376,
+          "cost_usd": 0.305312
+        },
+        "tasks_generation": {
+          "requests": 73,
+          "total_tokens": 6683392,
+          "cost_usd": 0.457014
+        },
+        "verification_plan_delta": {
+          "requests": 57,
+          "total_tokens": 2797690,
+          "cost_usd": 0.223822
+        },
+        "prd": {
+          "requests": 18,
+          "total_tokens": 1069764,
+          "cost_usd": 0.16163
+        },
+        "(unattributed)": {
+          "requests": 13,
+          "total_tokens": 506466,
+          "cost_usd": 0.025656
+        },
+        "test_design": {
+          "requests": 2,
+          "total_tokens": 196638,
+          "cost_usd": 0.095223
+        },
+        "arch": {
+          "requests": 2,
+          "total_tokens": 134826,
+          "cost_usd": 0.060568
+        },
+        "arch_refine": {
+          "requests": 3,
+          "total_tokens": 121478,
+          "cost_usd": 0.03982
+        },
+        "interview": {
+          "requests": 2,
+          "total_tokens": 83170,
+          "cost_usd": 0.0206
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 21110,
+          "total_tokens": 1833727822,
+          "cost_usd": 45.365747
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 21110,
+          "total_tokens": 1833727822,
+          "cost_usd": 45.365747
+        }
+      },
+      "by_day": {
+        "2026-10-23": {
+          "requests": 2642,
+          "total_tokens": 231408072,
+          "cost_usd": 6.131669
+        },
+        "2026-10-24": {
+          "requests": 9592,
+          "total_tokens": 813032040,
+          "cost_usd": 19.892651
+        },
+        "2026-10-25": {
+          "requests": 5141,
+          "total_tokens": 480962817,
+          "cost_usd": 11.376054
+        },
+        "2026-10-26": {
+          "requests": 3735,
+          "total_tokens": 308324893,
+          "cost_usd": 7.965372
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-019",
+      "size": "large",
+      "task_count": 10,
+      "completed_at": "2026-10-23T07:33:36.353196+00:00",
+      "outcome": "passed",
+      "totals": {
+        "requests": 1471,
+        "total_tokens": 134659589,
+        "cost_usd": 3.856223
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 759,
+          "total_tokens": 73149560,
+          "cost_usd": 1.809991
+        },
+        "verification": {
+          "requests": 596,
+          "total_tokens": 52235949,
+          "cost_usd": 1.6786
+        },
+        "refiner": {
+          "requests": 46,
+          "total_tokens": 3947287,
+          "cost_usd": 0.118565
+        },
+        "tasks_generation": {
+          "requests": 45,
+          "total_tokens": 3715449,
+          "cost_usd": 0.206108
+        },
+        "audit_second_pass": {
+          "requests": 25,
+          "total_tokens": 1611344,
+          "cost_usd": 0.042958
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1471,
+          "total_tokens": 134659589,
+          "cost_usd": 3.856223
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1471,
+          "total_tokens": 134659589,
+          "cost_usd": 3.856223
+        }
+      },
+      "by_day": {
+        "2026-10-23": {
+          "requests": 1471,
+          "total_tokens": 134659589,
+          "cost_usd": 3.856223
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-020",
+      "size": "large",
+      "task_count": 11,
+      "completed_at": "2026-10-23T12:35:41.117852+00:00",
+      "outcome": "failed",
+      "totals": {
+        "requests": 1977,
+        "total_tokens": 149661074,
+        "cost_usd": 3.766382
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 1062,
+          "total_tokens": 82329438,
+          "cost_usd": 2.016897
+        },
+        "verification": {
+          "requests": 915,
+          "total_tokens": 67331636,
+          "cost_usd": 1.749485
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1977,
+          "total_tokens": 149661074,
+          "cost_usd": 3.766382
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1977,
+          "total_tokens": 149661074,
+          "cost_usd": 3.766382
+        }
+      },
+      "by_day": {
+        "2026-10-23": {
+          "requests": 1977,
+          "total_tokens": 149661074,
+          "cost_usd": 3.766382
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-021",
+      "size": "large",
+      "task_count": 15,
+      "completed_at": "2026-10-23T21:08:43.471871+00:00",
+      "outcome": "failed",
+      "totals": {
+        "requests": 3036,
+        "total_tokens": 234982548,
+        "cost_usd": 6.095574
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 1815,
+          "total_tokens": 145565876,
+          "cost_usd": 3.368864
+        },
+        "verification": {
+          "requests": 1105,
+          "total_tokens": 77781792,
+          "cost_usd": 2.267183
+        },
+        "tasks_generation": {
+          "requests": 106,
+          "total_tokens": 11245439,
+          "cost_usd": 0.408467
+        },
+        "verification_plan_delta": {
+          "requests": 10,
+          "total_tokens": 389441,
+          "cost_usd": 0.05106
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 3036,
+          "total_tokens": 234982548,
+          "cost_usd": 6.095574
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 3036,
+          "total_tokens": 234982548,
+          "cost_usd": 6.095574
+        }
+      },
+      "by_day": {
+        "2026-10-23": {
+          "requests": 3036,
+          "total_tokens": 234982548,
+          "cost_usd": 6.095574
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-022",
+      "size": "medium",
+      "task_count": 6,
+      "completed_at": "2026-10-23T09:32:19.038954+00:00",
+      "outcome": "passed",
+      "totals": {
+        "requests": 1002,
+        "total_tokens": 69298527,
+        "cost_usd": 1.71698
+      },
+      "by_scene": {
+        "verification": {
+          "requests": 485,
+          "total_tokens": 37944178,
+          "cost_usd": 0.865277
+        },
+        "execution": {
+          "requests": 423,
+          "total_tokens": 27186800,
+          "cost_usd": 0.660275
+        },
+        "audit_second_pass": {
+          "requests": 84,
+          "total_tokens": 3342505,
+          "cost_usd": 0.123333
+        },
+        "tasks_generation": {
+          "requests": 10,
+          "total_tokens": 825044,
+          "cost_usd": 0.068095
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1002,
+          "total_tokens": 69298527,
+          "cost_usd": 1.71698
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1002,
+          "total_tokens": 69298527,
+          "cost_usd": 1.71698
+        }
+      },
+      "by_day": {
+        "2026-10-23": {
+          "requests": 1002,
+          "total_tokens": 69298527,
+          "cost_usd": 1.71698
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-023",
+      "size": "large",
+      "task_count": 22,
+      "completed_at": "2026-10-24T01:14:20.123244+00:00",
+      "outcome": "failed",
+      "totals": {
+        "requests": 3025,
+        "total_tokens": 262030098,
+        "cost_usd": 7.269152
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 1818,
+          "total_tokens": 170951560,
+          "cost_usd": 4.039151
+        },
+        "verification": {
+          "requests": 1025,
+          "total_tokens": 80339571,
+          "cost_usd": 2.671183
+        },
+        "tasks_generation": {
+          "requests": 60,
+          "total_tokens": 5022076,
+          "cost_usd": 0.31222
+        },
+        "audit_second_pass": {
+          "requests": 87,
+          "total_tokens": 4266180,
+          "cost_usd": 0.141504
+        },
+        "verification_plan_delta": {
+          "requests": 35,
+          "total_tokens": 1450711,
+          "cost_usd": 0.105094
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 3025,
+          "total_tokens": 262030098,
+          "cost_usd": 7.269152
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 3025,
+          "total_tokens": 262030098,
+          "cost_usd": 7.269152
+        }
+      },
+      "by_day": {
+        "2026-10-23": {
+          "requests": 2733,
+          "total_tokens": 236220059,
+          "cost_usd": 6.420232
+        },
+        "2026-10-24": {
+          "requests": 292,
+          "total_tokens": 25810039,
+          "cost_usd": 0.848921
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-024",
+      "size": "large",
+      "task_count": 10,
+      "completed_at": "2026-10-23T10:36:41.473436+00:00",
+      "outcome": "failed",
+      "totals": {
+        "requests": 1359,
+        "total_tokens": 121630617,
+        "cost_usd": 3.739315
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 642,
+          "total_tokens": 60577552,
+          "cost_usd": 1.663356
+        },
+        "verification": {
+          "requests": 639,
+          "total_tokens": 54329329,
+          "cost_usd": 1.614575
+        },
+        "tasks_generation": {
+          "requests": 76,
+          "total_tokens": 6623592,
+          "cost_usd": 0.443563
+        },
+        "verification_plan_delta": {
+          "requests": 2,
+          "total_tokens": 100144,
+          "cost_usd": 0.01782
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1359,
+          "total_tokens": 121630617,
+          "cost_usd": 3.739315
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1359,
+          "total_tokens": 121630617,
+          "cost_usd": 3.739315
+        }
+      },
+      "by_day": {
+        "2026-10-23": {
+          "requests": 1359,
+          "total_tokens": 121630617,
+          "cost_usd": 3.739315
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-025",
+      "size": "medium",
+      "task_count": 6,
+      "completed_at": "2026-10-23T06:20:15.890017+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 992,
+        "total_tokens": 89515652,
+        "cost_usd": 2.036527
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 753,
+          "total_tokens": 67439603,
+          "cost_usd": 1.50421
+        },
+        "verification": {
+          "requests": 144,
+          "total_tokens": 13498023,
+          "cost_usd": 0.300654
+        },
+        "tasks_generation": {
+          "requests": 95,
+          "total_tokens": 8578026,
+          "cost_usd": 0.231663
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 992,
+          "total_tokens": 89515652,
+          "cost_usd": 2.036527
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 992,
+          "total_tokens": 89515652,
+          "cost_usd": 2.036527
+        }
+      },
+      "by_day": {
+        "2026-10-23": {
+          "requests": 992,
+          "total_tokens": 89515652,
+          "cost_usd": 2.036527
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-026",
+      "size": "large",
+      "task_count": 89,
+      "completed_at": "2026-10-26T16:00:42.335267+00:00",
+      "outcome": "blocked",
+      "totals": {
+        "requests": 12823,
+        "total_tokens": 1160057284,
+        "cost_usd": 27.85117
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 9514,
+          "total_tokens": 907270519,
+          "cost_usd": 20.511353
+        },
+        "verification": {
+          "requests": 2985,
+          "total_tokens": 225626364,
+          "cost_usd": 6.516684
+        },
+        "refiner": {
+          "requests": 231,
+          "total_tokens": 22831587,
+          "cost_usd": 0.597213
+        },
+        "audit_second_pass": {
+          "requests": 60,
+          "total_tokens": 2626974,
+          "cost_usd": 0.087823
+        },
+        "verification_plan_delta": {
+          "requests": 33,
+          "total_tokens": 1701840,
+          "cost_usd": 0.138097
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 12823,
+          "total_tokens": 1160057284,
+          "cost_usd": 27.85117
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 12823,
+          "total_tokens": 1160057284,
+          "cost_usd": 27.85117
+        }
+      },
+      "by_day": {
+        "2026-10-24": {
+          "requests": 7094,
+          "total_tokens": 610741195,
+          "cost_usd": 14.872386
+        },
+        "2026-10-25": {
+          "requests": 4105,
+          "total_tokens": 403248442,
+          "cost_usd": 9.267365
+        },
+        "2026-10-26": {
+          "requests": 1624,
+          "total_tokens": 146067647,
+          "cost_usd": 3.711419
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-027",
+      "size": "large",
+      "task_count": 27,
+      "completed_at": "2026-10-25T22:07:30.384050+00:00",
+      "outcome": "passed",
+      "totals": {
+        "requests": 3709,
+        "total_tokens": 315253067,
+        "cost_usd": 7.196927
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 2918,
+          "total_tokens": 246607484,
+          "cost_usd": 5.570283
+        },
+        "verification": {
+          "requests": 594,
+          "total_tokens": 58759054,
+          "cost_usd": 1.346092
+        },
+        "audit_second_pass": {
+          "requests": 197,
+          "total_tokens": 9886529,
+          "cost_usd": 0.280552
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 3709,
+          "total_tokens": 315253067,
+          "cost_usd": 7.196927
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 3709,
+          "total_tokens": 315253067,
+          "cost_usd": 7.196927
+        }
+      },
+      "by_day": {
+        "2026-10-25": {
+          "requests": 3709,
+          "total_tokens": 315253067,
+          "cost_usd": 7.196927
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-028",
+      "size": "large",
+      "task_count": 48,
+      "completed_at": "2026-10-26T18:27:31.978418+00:00",
+      "outcome": "failed",
+      "totals": {
+        "requests": 6024,
+        "total_tokens": 593523532,
+        "cost_usd": 13.97124
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 4562,
+          "total_tokens": 463385904,
+          "cost_usd": 10.831489
+        },
+        "verification": {
+          "requests": 1399,
+          "total_tokens": 126114750,
+          "cost_usd": 3.039513
+        },
+        "audit_second_pass": {
+          "requests": 63,
+          "total_tokens": 4022878,
+          "cost_usd": 0.100238
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 6024,
+          "total_tokens": 593523532,
+          "cost_usd": 13.97124
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 6024,
+          "total_tokens": 593523532,
+          "cost_usd": 13.97124
+        }
+      },
+      "by_day": {
+        "2026-10-26": {
+          "requests": 6024,
+          "total_tokens": 593523532,
+          "cost_usd": 13.97124
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-029",
+      "size": "large",
+      "task_count": 11,
+      "completed_at": "2026-10-26T10:59:30.109058+00:00",
+      "outcome": "passed",
+      "totals": {
+        "requests": 1920,
+        "total_tokens": 148922287,
+        "cost_usd": 3.821193
+      },
+      "by_scene": {
+        "execution": {
+          "requests": 1259,
+          "total_tokens": 104931685,
+          "cost_usd": 2.503756
+        },
+        "verification": {
+          "requests": 625,
+          "total_tokens": 42416307,
+          "cost_usd": 1.247325
+        },
+        "audit_second_pass": {
+          "requests": 34,
+          "total_tokens": 1498022,
+          "cost_usd": 0.050949
+        },
+        "verification_plan_delta": {
+          "requests": 2,
+          "total_tokens": 76273,
+          "cost_usd": 0.019163
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1920,
+          "total_tokens": 148922287,
+          "cost_usd": 3.821193
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1920,
+          "total_tokens": 148922287,
+          "cost_usd": 3.821193
+        }
+      },
+      "by_day": {
+        "2026-10-26": {
+          "requests": 1920,
+          "total_tokens": 148922287,
+          "cost_usd": 3.821193
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-030",
+      "size": "large",
+      "task_count": 11,
+      "completed_at": "2026-10-26T06:14:15.634849+00:00",
+      "outcome": "failed",
+      "totals": {
+        "requests": 1179,
+        "total_tokens": 78855539,
+        "cost_usd": 2.264815
+      },
+      "by_scene": {
+        "verification": {
+          "requests": 511,
+          "total_tokens": 45352813,
+          "cost_usd": 1.359231
+        },
+        "execution": {
+          "requests": 611,
+          "total_tokens": 31285257,
+          "cost_usd": 0.829753
+        },
+        "audit_second_pass": {
+          "requests": 57,
+          "total_tokens": 2217469,
+          "cost_usd": 0.075831
+        }
+      },
+      "by_vp": {
+        "(unattributed)": {
+          "requests": 1179,
+          "total_tokens": 78855539,
+          "cost_usd": 2.264815
+        }
+      },
+      "by_round": {
+        "(unattributed)": {
+          "requests": 1179,
+          "total_tokens": 78855539,
+          "cost_usd": 2.264815
+        }
+      },
+      "by_day": {
+        "2026-10-25": {
+          "requests": 27,
+          "total_tokens": 1305877,
+          "cost_usd": 0.032661
+        },
+        "2026-10-26": {
+          "requests": 1152,
+          "total_tokens": 77549662,
+          "cost_usd": 2.232154
+        }
+      }
+    },
+    {
+      "plan_id": "sample-plan-031",
+      "size": "unknown",
+      "task_count": 0,
+      "completed_at": "2026-10-21T06:09:02.513714+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0
+      },
+      "by_scene": {},
+      "by_vp": {},
+      "by_round": {},
+      "by_day": {}
+    },
+    {
+      "plan_id": "sample-plan-032",
+      "size": "unknown",
+      "task_count": 0,
+      "completed_at": "2026-10-21T08:16:38.278628+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0
+      },
+      "by_scene": {},
+      "by_vp": {},
+      "by_round": {},
+      "by_day": {}
+    },
+    {
+      "plan_id": "sample-plan-033",
+      "size": "unknown",
+      "task_count": 0,
+      "completed_at": "2026-10-21T07:41:57.998954+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0
+      },
+      "by_scene": {},
+      "by_vp": {},
+      "by_round": {},
+      "by_day": {}
+    },
+    {
+      "plan_id": "sample-plan-034",
+      "size": "unknown",
+      "task_count": 0,
+      "completed_at": "2026-10-21T08:54:17.955680+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0
+      },
+      "by_scene": {},
+      "by_vp": {},
+      "by_round": {},
+      "by_day": {}
+    },
+    {
+      "plan_id": "sample-plan-035",
+      "size": "unknown",
+      "task_count": 0,
+      "completed_at": "2026-10-23T15:05:40.640315+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0
+      },
+      "by_scene": {},
+      "by_vp": {},
+      "by_round": {},
+      "by_day": {}
+    },
+    {
+      "plan_id": "sample-plan-036",
+      "size": "unknown",
+      "task_count": 0,
+      "completed_at": "2026-10-23T15:05:40.645087+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0
+      },
+      "by_scene": {},
+      "by_vp": {},
+      "by_round": {},
+      "by_day": {}
+    },
+    {
+      "plan_id": "sample-plan-037",
+      "size": "unknown",
+      "task_count": 0,
+      "completed_at": "2026-10-23T15:05:40.648091+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0
+      },
+      "by_scene": {},
+      "by_vp": {},
+      "by_round": {},
+      "by_day": {}
+    },
+    {
+      "plan_id": "sample-plan-038",
+      "size": "unknown",
+      "task_count": 0,
+      "completed_at": "2026-10-23T18:54:04.782540+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0
+      },
+      "by_scene": {},
+      "by_vp": {},
+      "by_round": {},
+      "by_day": {}
+    },
+    {
+      "plan_id": "sample-plan-039",
+      "size": "unknown",
+      "task_count": 0,
+      "completed_at": "2026-10-23T18:54:13.023282+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0
+      },
+      "by_scene": {},
+      "by_vp": {},
+      "by_round": {},
+      "by_day": {}
+    },
+    {
+      "plan_id": "sample-plan-040",
+      "size": "unknown",
+      "task_count": 0,
+      "completed_at": "2026-10-23T18:54:13.028946+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0
+      },
+      "by_scene": {},
+      "by_vp": {},
+      "by_round": {},
+      "by_day": {}
+    },
+    {
+      "plan_id": "sample-plan-041",
+      "size": "unknown",
+      "task_count": 0,
+      "completed_at": "2026-10-23T18:54:04.786989+00:00",
+      "outcome": "unknown",
+      "totals": {
+        "requests": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0
+      },
+      "by_scene": {},
+      "by_vp": {},
+      "by_round": {},
+      "by_day": {}
+    }
+  ]
+}

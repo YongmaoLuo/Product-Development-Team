@@ -1,0 +1,37 @@
+[
+  {
+    "input": {
+      "vp_id": "VP-3",
+      "failure_class": "deliverable_defect",
+      "failed_assertions": [
+        "assert json_path",
+        "assert status"
+      ],
+      "command": "pytest tests/x.py",
+      "first_error_line": "AssertionError at /tmp/a.py:12"
+    },
+    "fingerprint": "e7adb050a217d77f"
+  },
+  {
+    "input": {
+      "vp_id": null,
+      "failure_class": null,
+      "failed_assertions": null,
+      "command": null,
+      "first_error_line": null
+    },
+    "fingerprint": "57a46339af0551df"
+  },
+  {
+    "input": {
+      "vp_id": "VP-9",
+      "failure_class": "criterion_defect",
+      "failed_assertions": [
+        "assert status"
+      ],
+      "command": "pytest tests/unit/test_y.py",
+      "first_error_line": "ValueError at 0x7f3c9a21 in backend/app.py"
+    },
+    "fingerprint": "12793c67936085a2"
+  }
+]

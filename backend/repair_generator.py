@@ -46,7 +46,7 @@ import re
 import os
 import sys
 from pathlib import Path
-from typing import Iterator, Optional, List, Dict, Any, Sequence, Tuple
+from typing import Iterator, Optional, List, Dict, Any, Sequence, Set, Tuple
 
 from coding_tool import CodingTool, JsonSession, query_json_in_session
 # ``stable_session_id`` is re-exported from ``plan_sessions`` rather than
@@ -1074,12 +1074,75 @@ class RepairTaskGenerator:
         """Determine the next repair task ID prefix for a verification round."""
         return f"R{round_number}"
 
+    def _stamp_shared_sequence_id(
+        self,
+        task: Dict[str, Any],
+        round_number: int,
+        used_ids: Set[str],
+        root_cause_kind: str,
+        implementation_kind: str,
+    ) -> Dict[str, Any]:
+        """给根因/实现任务分配 repair 序列里的 id。
+
+        这两类任务与普通 repair 共用一个编号空间
+        （:func:`next_repair_seq_base` / :func:`parse_repair_task_id`）：
+        ``plan_tasks`` 按 ``(plan_id, task_id)`` 定位，第二套编号空间会让
+        同一个 plan 里出现两个「第 3 号」的任务并互相覆盖。靠 ``kind``
+        区分，不靠 id 的形状。
+
+        Args:
+            task: 任务 dict（会被就地改写 id）。
+            round_number: 当前验证轮次。
+            used_ids: 已被占用的 id 集合（就地更新）。
+            root_cause_kind: 根因任务的 kind。
+            implementation_kind: 实现任务的 kind。
+
+        Returns:
+            同一个 task dict。
+
+        Raises:
+            ValueError: 根因任务带 ``files_to_modify`` 或 ``read_only``
+                不是真；实现任务没有改动范围；或者 id 已经被占用。
+        """
+        kind = str(task.get("kind") or "")
+        if kind == root_cause_kind:
+            if task.get("read_only") is not True:
+                raise ValueError(
+                    f"根因任务必须是只读任务（read_only=True）：{task.get('id')}"
+                )
+            if task.get("files_to_modify"):
+                raise ValueError(
+                    "根因任务不得声明 files_to_modify —— "
+                    f"它的产出是根因报告，不是改动：{task.get('id')}"
+                )
+        elif kind == implementation_kind and not task.get("files_to_modify"):
+            raise ValueError(
+                "实现任务必须声明 files_to_modify —— "
+                f"它的改动范围来自根因报告：{task.get('id')}"
+            )
+
+        task_id = str(task.get("id") or "").strip()
+        if not task_id:
+            seq = next_repair_seq_base(list(used_ids), round_number)
+            task_id = f"repair-r{round_number}-{seq:02d}"
+        elif task_id in used_ids:
+            raise ValueError(f"任务 id 冲突：{task_id}")
+
+        task["id"] = task_id
+        used_ids.add(task_id)
+        return task
+
     def append_to_tasks(self, repair_tasks: List[Dict[str, Any]], round_number: int) -> Path:
         """Append repair tasks to the existing project tasks.json without overwriting.
 
         Preserves the existing task list and appends the new repair tasks with
         R{round}- prefixed IDs. If project_dir/tasks.json does not exist, it
         is created with just the repair tasks.
+
+        两类新任务（根因 / 实现）也走这个入口：它们的 ``kind`` 不是
+        repair，id 由 :func:`next_repair_seq_base` 在**既有 repair 序列**
+        里分配（普通 repair 的 ``R{round}-{i}`` 形状不变）。理由见
+        :meth:`_stamp_shared_sequence_id`。
 
         Args:
             repair_tasks: List of repair task dicts to append.
@@ -1102,11 +1165,30 @@ class RepairTaskGenerator:
             except Exception:
                 existing_tasks = []
 
+        # ``root_cause_task`` 依赖本模块的序列分配器，所以这里不能顶层
+        # import 回去 —— 两个模块顶层互相 import 会在初始化时炸。函数内
+        # import 是本仓库已有的做法（见 ``verification/orchestrator.py``
+        # 对 ``repair_generator`` 的延迟 import）。
+        from root_cause_task import IMPLEMENTATION_KIND, ROOT_CAUSE_KIND
+
+        used_ids: Set[str] = {
+            str(t.get("id"))
+            for t in existing_tasks
+            if isinstance(t, dict) and t.get("id")
+        }
+
         prefixed: List[Dict[str, Any]] = []
         prefix = self._get_next_repair_task_id(round_number)
         for i, task in enumerate(repair_tasks, 1):
             task_copy = dict(task)
-            task_copy.setdefault("id", f"{prefix}-{i}")
+            kind = str(task_copy.get("kind") or "")
+            if kind in (ROOT_CAUSE_KIND, IMPLEMENTATION_KIND):
+                task_copy = self._stamp_shared_sequence_id(
+                    task_copy, round_number, used_ids,
+                    ROOT_CAUSE_KIND, IMPLEMENTATION_KIND,
+                )
+            else:
+                task_copy.setdefault("id", f"{prefix}-{i}")
             prefixed.append(task_copy)
 
         combined = list(existing_tasks) + prefixed

@@ -436,6 +436,43 @@ def _tasks_json(tasks_file: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
+#: The read-only probes the per-round context pack runs to gather the
+#: round's environment facts once, in one place, so the sub-agent does not
+#: have to explore them again (see ``backend/context_pack.py``).  They belong
+#: to building the brief — every round, parked or not — and they are finished
+#: before the run returns, so a parked or recovering path does not spawn
+#: them: it inherits them from the round that asked for the brief.
+#:
+#: They are the one exemption from the count below, and it is a named one.
+#: Every other spawn — a provider, a mutation, an unrelated program — is
+#: still counted, and still fails the assertion.
+_CONTEXT_PROBE_PREFIXES = (
+    ("git", "branch", "--show-current"),
+    ("git", "rev-parse", "--verify", "--quiet"),
+    ("git", "merge-base", "HEAD"),
+    ("git", "diff", "--stat"),
+    ("git", "diff", "--name-only"),
+    ("git", "ls-files", "--others", "--exclude-standard"),
+    ("lsof", "-a", "-n", "-P", "-iTCP", "-sTCP:LISTEN", "-F", "cn"),
+)
+
+
+def _is_context_probe(argv: Any) -> bool:
+    """Is this spawn one of the context pack's read-only probes?"""
+    if not argv:
+        return False
+    if isinstance(argv, str):
+        argv = argv.split()
+    parts = [str(part) for part in argv]
+    if parts[0].rsplit("/", 1)[-1] == "git" and len(parts) > 3 and parts[1] == "-C":
+        # ``git -C <repo> <args>``: the repository is the worktree the
+        # pack read, not part of the command.
+        parts = [parts[0], *parts[3:]]
+    return any(
+        tuple(parts[: len(prefix)]) == prefix for prefix in _CONTEXT_PROBE_PREFIXES
+    )
+
+
 @pytest.fixture
 def child_processes(monkeypatch):
     """The child processes the code under test starts, counted.
@@ -443,16 +480,53 @@ def child_processes(monkeypatch):
     A quota park is a wait, not a spawn: the run must not leave a
     subprocess behind.  The count is asserted rather than assumed, so
     "nothing was left running" is a fact of this run.
+
+
+    The read-only probes the per-round context pack runs are the one
+    exemption: they belong to building the brief, not to this path.
     """
     started: List[Any] = []
     real_popen = subprocess.Popen
 
     def _counting_popen(*args, **kwargs):
-        started.append(args[0] if args else kwargs.get("args"))
+        argv = args[0] if args else kwargs.get("args")
+        if not _is_context_probe(argv):
+            started.append(argv)
         return real_popen(*args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", _counting_popen)
     return started
+
+
+def test_the_context_probe_exemption_is_named_and_narrow() -> None:
+    """The exemption the count makes is exactly the context pack's probes.
+
+    The count is the evidence that this path starts no work.  Were the
+    exemption wider than the probes, a provider or a mutation would slip
+    through it and the count would stop being evidence.
+    """
+    assert _is_context_probe(
+        ["git", "-C", "/tmp/worktree", "branch", "--show-current"]
+    )
+    assert _is_context_probe(
+        [
+            "git",
+            "-C",
+            "/tmp/worktree",
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "origin/main^{commit}",
+        ]
+    )
+    assert _is_context_probe(
+        ["lsof", "-a", "-n", "-P", "-iTCP", "-sTCP:LISTEN", "-F", "cn"]
+    )
+    # Not a probe: a mutation, a provider, and an unrelated program.
+    assert not _is_context_probe(["git", "-C", "/tmp/worktree", "commit", "-m", "x"])
+    assert not _is_context_probe(["claude", "-p", "do the work"])
+    assert not _is_context_probe(["python3", "-c", "print(1)"])
+    assert not _is_context_probe([])
 
 
 # ---------------------------------------------------------------------------

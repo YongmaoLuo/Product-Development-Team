@@ -107,6 +107,25 @@ from hitl import service as hitl_service
 from utils.atomic_io import atomic_write_json
 from framework.task_graph import DanglingTaskDependency, find_dangling_references
 from framework.prompts import INLINE_SPEC_CODE_REVIEW_PROMPT
+# 2026-10-27（A5）: the round's environment facts live in ONE file —
+# ``<plan_dir>/context/round-<n>.json`` — written by ``context_pack``.
+# The briefs hand out that file's path instead of the facts, so a
+# sub-agent reads one JSON file rather than re-deriving the same eight
+# answers with ``ls`` / ``find`` / ``git log`` (69% of the tool calls
+# in the largest execution sessions).
+#
+# The reference CONTRACT (the fixed sentence, the pack path shape, the
+# "newest pack" rule) lives in :mod:`verification_subagent` — the leaf —
+# and is imported here, because a leaf must not import the orchestrator
+# (that is how the historical ``verification_agent -> agent`` cycle was
+# born) and because the execution brief and the verification brief have
+# to say exactly the same thing.
+from context_pack import build_context_pack
+from verification_subagent import (
+    absolute_path,
+    context_pack_reference_line,
+    existing_context_pack_rounds,
+)
 
 #: The two seams of the capacity wait, at module level on purpose.
 #:
@@ -118,6 +137,19 @@ from framework.prompts import INLINE_SPEC_CODE_REVIEW_PROMPT
 #: one place where the wait touches the wall clock.
 _capacity_wait_sleep = time.sleep
 _capacity_wait_clock = time.monotonic
+
+#: Guards the round's context-pack write.
+#:
+#: The tasks of one layer are dispatched CONCURRENTLY
+#: (``asyncio.gather`` over the layer's tasks), and each of them builds
+#: its brief.  Without this lock two of them can both read "this plan
+#: has no pack yet", both decide the round number is the same, and one
+#: of them can — one instruction later — decide the round number is one
+#: higher because the other's file has landed.  Two packs for one round
+#: is exactly what the "one file per round" contract forbids: the
+#: execution brief and the verification brief would then name different
+#: files and work from different versions of the same facts.
+_context_pack_lock = threading.Lock()
 
 # Re-export ``INLINE_SPEC_CODE_REVIEW_PROMPT`` so existing call sites
 # that wrote ``from agent import INLINE_SPEC_CODE_REVIEW_PROMPT`` keep
@@ -2735,6 +2767,18 @@ class AutonomousAgent:
         # real SQLite, so production pollution is still prevented at
         # the persistence boundary.
         self.plan_id = self.task_manager.tasks_file.parent.name
+
+        # 2026-10-27（A5）: the round's context pack — the one file the
+        # environment facts live in, and the file every brief of this run
+        # points at.  It is written ONCE per run (the facts are the
+        # ROUND's, not the task's) and reused by every task, so a
+        # sub-agent reading the path cannot watch it change under its
+        # feet.  ``_context_pack_resolved`` says "the question has been
+        # asked", because ``None`` is itself an answer: the pack could
+        # not be produced, and the briefs fall back to what they said
+        # before this contract existed.
+        self._context_pack_path: Optional[Path] = None
+        self._context_pack_resolved = False
 
         # Session-local count of how many times each task_id has been
         # marked completed in this execution run. ``_run_async`` resets
@@ -5543,6 +5587,122 @@ class AutonomousAgent:
         bullets = "\n".join(f"  - {f}" for f in files)
         return f"\nFiles likely in scope:\n{bullets}\n"
 
+    def _build_task_brief(self, task: SubTask) -> str:
+        """The brief a coder sub-agent opens with.
+
+        No-bulk-context contract (a 2026-08-19 production plan):
+        the subagent does NOT receive a repository-wide code snapshot.  It
+        discovers the CODEBASE on demand, through its own Read/Grep/Glob
+        tools.
+
+        What it does NOT do any more is discover the ENVIRONMENT.  The
+        eight environment facts a round runs on (worktree path, branch,
+        base commit, diff stat, changed files, plan directory, service
+        ports, focused test command) live in ONE file for the round —
+        ``<plan_dir>/context/round-<n>.json`` — and this brief names that
+        file instead of repeating the facts.  Every sub-agent that
+        re-derived them with ``ls`` / ``find`` / ``git log`` spent 69% of
+        the tool calls of the largest execution sessions on answers that
+        were already written down.
+
+        The failure context (the persisted reason of a previous attempt,
+        the in-run retry hint) is appended by the caller — it belongs to
+        the ATTEMPT, not to the task, and it must not appear in the first
+        attempt's brief twice.
+        """
+        brief = f"Subtask: {task.description}\n"
+        brief += self._build_files_to_modify_hint(task)
+        brief += self._build_report_hint(task)
+        brief += self._build_context_pack_reference(task)
+        brief += "\nUse Read/Grep/Glob tools to discover the codebase as needed.\n"
+        return brief
+
+    def _build_context_pack_reference(self, task: SubTask) -> str:
+        """Point the brief at the round's context pack — or say nothing.
+
+        2026-10-27 (A5).  The pack is written once per round by
+        :meth:`_context_pack_for_round`; this line is the hand-out.  The
+        verification brief in ``verification_subagent._build_prompt``
+        hands out the SAME file — one round, one pack, one version of the
+        facts.
+
+        Empty when there is no pack to point at.  A brief that names a
+        file which is not there sends the sub-agent looking for a file
+        that does not exist, and a missing pack must never interrupt a
+        round.
+        """
+        pack_path = self._context_pack_for_round(task)
+        if pack_path is None:
+            return ""
+        return f"\n{context_pack_reference_line(pack_path)}\n"
+
+    def _context_pack_for_round(self, task: SubTask) -> Optional[Path]:
+        """The context pack this round's briefs point at — or ``None``.
+
+        The pack is written ONCE per run and then reused by every task in
+        the run: the facts are the round's, not the task's, and a pack
+        that changed under a sub-agent that is reading it would make
+        "which facts did this round run on" unanswerable.
+
+        ``None`` means the pack could not be produced — an unsafe plan
+        directory, a git query that failed, a read-only plans tree.  That
+        is not an error the round should die of: the brief falls back to
+        what it said before this contract existed.
+
+        The two attributes are read defensively: a test double built
+        with ``AutonomousAgent.__new__`` never ran ``__init__``, and it
+        must not be the reason a task fails.
+
+        The write happens under a module-level lock, because the tasks of
+        one layer are dispatched concurrently and two of them must not
+        each decide that the round has no pack yet.
+        """
+        if getattr(self, "_context_pack_resolved", False):
+            return getattr(self, "_context_pack_path", None)
+        with _context_pack_lock:
+            if getattr(self, "_context_pack_resolved", False):
+                return getattr(self, "_context_pack_path", None)
+            pack_path = self._write_context_pack(task)
+            # The path is stored BEFORE the flag: a thread that reads the
+            # flag must never be able to read a path that is not there
+            # yet.  The other way round, a task of the same layer — the
+            # layer is dispatched concurrently — would read the flag,
+            # find no path, and build a brief with no reference to the
+            # pack while its sibling was still writing it.
+            self._context_pack_path = pack_path
+            self._context_pack_resolved = True
+            return pack_path
+
+    def _write_context_pack(self, task: SubTask) -> Optional[Path]:
+        """Write this round's context pack, or give up quietly.
+
+        The pack lands at ``<plan_dir>/context/round-<n>.json``.  The
+        round number is the one after the newest pack the plan already
+        has, so a re-run of the same plan writes the facts of THAT run
+        rather than overwriting the record of the previous one.
+
+        Every failure here is swallowed on purpose: the pack is an
+        optimisation for the sub-agent's first minute, and a plan whose
+        pack cannot be written still has to run.
+        """
+        try:
+            tasks_file = getattr(self.task_manager, "tasks_file", None)
+            if not isinstance(tasks_file, (str, Path)) or not str(tasks_file):
+                return None
+            plan_dir = absolute_path(Path(tasks_file).parent)
+            rounds = existing_context_pack_rounds(plan_dir)
+            round_no = (rounds[-1] + 1) if rounds else 1
+            test_command = getattr(task, "test_command", "") or ""
+            return build_context_pack(
+                plan_id=plan_dir.name,
+                round_no=round_no,
+                plan_dir=plan_dir,
+                project_dir=absolute_path(self.project_dir),
+                focused_test_command=self._clean_test_command(test_command),
+            )
+        except Exception:  # noqa: BLE001 - a missing pack is not a failure
+            return None
+
     def _build_report_hint(self, task: SubTask) -> str:
         """Name the report task's deliverable, its address, and its stakes.
 
@@ -6046,18 +6206,18 @@ class AutonomousAgent:
                 # No-bulk-context contract (a 2026-08-19 production plan):
                 # do NOT inject ``get_file_context()`` (a repository-wide
                 # snapshot of up to 300K chars) here. The subagent
-                # discovers context on demand via its own Read/Grep/Glob
-                # tools. We only emit a *concise* hint listing the
-                # files the task's ``files_to_modify`` declares as
-                # in-scope; the unknown-modification sentinel is
-                # rendered as a human-readable phrase, not the raw
+                # discovers the CODEBASE on demand via its own
+                # Read/Grep/Glob tools. We only emit a *concise* hint
+                # listing the files the task's ``files_to_modify``
+                # declares as in-scope; the unknown-modification sentinel
+                # is rendered as a human-readable phrase, not the raw
                 # literal; an explicit empty list emits no hint.
-                context = f"Subtask: {task.description}\n"
-                context += self._build_files_to_modify_hint(task)
-                # The report deliverable's address, on the FIRST attempt
-                # rather than the retry hint — see _build_report_hint.
-                context += self._build_report_hint(task)
-                context += "\nUse Read/Grep/Glob tools to discover the codebase as needed.\n"
+                #
+                # The ENVIRONMENT is a different thing: since 2026-10-27
+                # (A5) the brief names the round's context pack instead
+                # of letting every sub-agent re-derive the same eight
+                # facts with ``ls`` / ``find`` / ``git log``.
+                context = self._build_task_brief(task)
 
                 # Failure context, from two different carriers covering
                 # two different gaps:
