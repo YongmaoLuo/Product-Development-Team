@@ -299,6 +299,13 @@ class PortProbe:
     listening: bool = False
     pids: List[int] = field(default_factory=list)
     cmdlines: List[str] = field(default_factory=list)
+    # One entry per listener pid: the command line, the working
+    # directory and the start time of that very process.  The working
+    # directory is the **tree** the process runs in, and it is the only
+    # place a read-only ``git rev-parse HEAD`` can be asked about — the
+    # executor's own HEAD says which code graded the round, this one
+    # says which code the answering service is running.
+    processes: List[Dict[str, Any]] = field(default_factory=list)
     # Earliest process-start epoch among the listeners — the comparison
     # baseline against the newest source mtime. None when unknown
     # (ps failed or the platform rejected the query).
@@ -311,6 +318,7 @@ class PortProbe:
             "listening": self.listening,
             "pids": list(self.pids),
             "cmdlines": list(self.cmdlines),
+            "processes": [dict(entry) for entry in self.processes],
             "process_start_epoch": self.process_start_epoch,
             "error": self.error,
         }
@@ -441,12 +449,69 @@ def probe_port(port: int) -> PortProbe:
         if cmdline:
             probe.cmdlines.append(cmdline)
         lstart = _run_probe_cmd(["ps", "-p", str(pid), "-o", "lstart="])
-        if lstart:
-            epoch = _parse_ps_lstart(lstart)
-            if epoch is not None:
-                starts.append(epoch)
+        epoch = _parse_ps_lstart(lstart) if lstart else None
+        if epoch is not None:
+            starts.append(epoch)
+        probe.processes.append({
+            "pid": int(pid),
+            "cmdline": cmdline or "",
+            # The tree the process runs in.  Empty when it could not be
+            # read — a blank, never a guess.
+            "cwd": process_cwd(int(pid)) or "",
+            "start_epoch": epoch,
+        })
     probe.process_start_epoch = min(starts) if starts else None
     return probe
+
+
+def process_cwd(pid: int) -> Optional[str]:
+    """The working directory of *pid*, or ``None``.
+
+    The directory is the **tree** the process runs in, and it is what a
+    read-only ``git rev-parse HEAD`` has to be asked about: the commit
+    a service is running is the commit *that tree* is checked out at,
+    and the executor's own HEAD is a different tree entirely.
+
+    Linux has ``/proc/<pid>/cwd`` — a symlink to the directory, exact
+    and free.  macOS/BSD has no such file: ``lsof`` knows the
+    directory and asks for it by name (``-d cwd``).
+
+    Never raises.  A process that died between the probe and the read
+    is a fact the caller has to handle, not an exception — and "could
+    not read it" is an answer the caller must be able to act on
+    (a blank is never read as "the project directory").
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+
+    link = Path("/proc") / str(pid) / "cwd"
+    try:
+        if link.is_symlink():
+            target = os.readlink(str(link))
+            return os.path.realpath(target) if target else None
+    except OSError as exc:
+        logger.debug(
+            "[service_freshness] could not read %s: %s", link, exc,
+        )
+
+    listing = _run_probe_cmd([
+        "lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn",
+    ])
+    if not listing:
+        return None
+    # ``-F n`` prints one name field per file description; the ``p`` and
+    # ``f`` lines are always there and are not names.
+    for line in listing.splitlines():
+        if not line.startswith("n"):
+            continue
+        path = line[1:].strip()
+        if path:
+            return path
+    return None
 
 
 def _parse_ps_lstart(raw: str) -> Optional[float]:

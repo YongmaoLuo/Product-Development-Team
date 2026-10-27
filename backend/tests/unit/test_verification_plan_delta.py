@@ -187,6 +187,7 @@ def test_applied_vps_land_in_phase_one_with_audit_fields() -> None:
         "add": [{
             "title": "新行为验收", "reason": "repair-r1-02 引入",
             "verification_method": "code_review",
+            "expected_result": "新行为被验到",
             "test_command": "pytest tests/test_x.py -k test_y",
         }],
     }, plan)
@@ -206,9 +207,11 @@ def test_multiple_additions_get_distinct_ids() -> None:
     delta = parse_delta_payload({
         "add": [
             {"title": "a", "reason": "r1", "verification_method": "code_review",
-             "test_command": "pytest a"},
+             "test_command": "pytest a",
+             "expected_result": "a 被验到"},
             {"title": "b", "reason": "r2", "verification_method": "code_review",
-             "test_command": "pytest b"},
+             "test_command": "pytest b",
+             "expected_result": "b 被验到"},
         ],
     }, plan)
     apply_delta(plan, delta, round_number=2)
@@ -309,6 +312,13 @@ def test_added_vp_without_a_method_does_not_default_to_the_retired_one() -> None
     的形态存在 —— 但 id 已经发出去��了。发出去的号没有定义，就是分配账本上
     的一个占位，而执行器对"有 id、无定义"的条目没有分派前校验。现在发号
     之前先看这条新增能不能产出完整定义：不能，就**不发号**。
+
+    已不在 ``SUPPORTED_METHODS`` 里，只能被 retired / SKIPPED。空串会让
+    ``_maybe_evaluate_plan_delta`` 的护栏把它整条丢掉。
+
+    2026-10-26：更进一步 —— 缺 method 的条目**连号都不占**。占了号却没有
+    定义，比不占号更糟：那个 id 在计划里查不到，执行器无定义可分派，它
+    此前挣到的失败又会被沿用（VP-031）。
     """
     from verification_plan_delta import apply_delta, parse_delta_payload
 
@@ -330,6 +340,16 @@ def test_added_vp_without_a_method_does_not_default_to_the_retired_one() -> None
         "dropped silently otherwise"
     )
 
+    # 特性分支的同一件事的另一种口径：定义不完整的条目**连号都不占**，
+    # 而且拒绝要落进 ``rejected_incomplete``。
+    assert [vp["id"] for vp in plan["verification_points"]] == ["VP-001"], (
+        "a definition-less item must not occupy a VP id: "
+        f"{[vp['id'] for vp in plan['verification_points']]!r}"
+    )
+    assert summary["added"] == []
+    assert summary["allocated_vp_ids"] == []
+    assert summary["rejected_incomplete"], summary
+
 
 def test_allocator_never_emits_definitionless_id() -> None:
     """分配器不给"产不出完整定义"的条目发号。
@@ -350,8 +370,13 @@ def test_allocator_never_emits_definitionless_id() -> None:
             {"title": "没有写方法的条目", "reason": "依据"},
             {"title": "方法已退休的条目", "reason": "依据",
              "verification_method": "automated_test"},
+            # 合并后的"完整定义"判据（特性分支 2026-10-26 的口径）要求标题、
+            # 方法、预期结果三样齐全 —— 这一条要真的**完整**，就得带上预期
+            # 结果，否则它会和前两条一起被拒（那就测不到"完整的新增能占号"
+            # 这一半了）。
             {"title": "完整的新增", "reason": "依据",
-             "verification_method": "code_review"},
+             "verification_method": "code_review",
+             "expected_result": "新增被验到"},
         ],
         "obsolete": [],
     }, plan)
@@ -370,6 +395,15 @@ def test_allocator_never_emits_definitionless_id() -> None:
     )
     for entry in summary["rejected_definitionless"]:
         assert entry["gaps"], "a rejection must say what was missing"
+    # 2026-10-26（合并后的口径）：同一个拒绝也落进 ``rejected_incomplete``
+    # —— 两条路说的是同一件事（"这条产不出完整定义"），两边都写，按哪边的
+    # 口径读摘要都读得到这次拒绝。
+    assert len(summary["rejected_incomplete"]) == 2, (
+        f"both incomplete additions must be recorded; "
+        f"got {summary['rejected_incomplete']!r}"
+    )
+    # 被拒的条目**不占号**：账本上不会有谁也分派不了的占位 id。
+    assert summary["allocated_vp_ids"] == ["VP-002"], summary
 
 
 def test_added_vp_has_no_test_command_field() -> None:
@@ -382,6 +416,7 @@ def test_added_vp_has_no_test_command_field() -> None:
             "add": [{
                 "title": "新行为验收", "reason": "依据",
                 "verification_method": "api_test",
+                "expected_result": "服务按契约应答",
                 "test_command": "pytest tests/test_x.py",
             }],
         },
@@ -408,6 +443,7 @@ def test_added_vp_honours_a_declared_phase_two() -> None:
                 "title": "Nightly CI 全过", "reason": "本轮新增门禁要求",
                 "verification_method": "full_ci",
                 "verification_phase": 2,
+                "expected_result": "整仓门禁退出码为 0",
                 "ci_entry": "python scripts/ci_local.py",
             }],
         },
@@ -433,6 +469,7 @@ def test_added_vp_with_an_illegal_phase_falls_back_to_phase_one() -> None:
             "add": [{
                 "title": "x", "reason": "r",
                 "verification_method": "api_test",
+                "expected_result": "x 被验到",
                 "verification_phase": "two",
             }],
         },
@@ -536,6 +573,7 @@ def test_added_vp_without_the_optional_execution_fields_stays_clean() -> None:
             "title": "代码审查",
             "reason": "本轮新增了批处理路径",
             "verification_method": "code_review",
+            "expected_result": "批处理路径的改动有对应审查结论",
         }],
         "obsolete": [],
     }, plan), 5)
@@ -810,14 +848,20 @@ def test_round_two_delta_allocates_fresh_ids() -> None:
     # 两条都带一个受支持的方法：发号之前先看这条新增能不能产出**完整**
     # 定义（见 ``vp_definition_gaps``）—— 产不出来的条目连号都拿不到，
     # 所以"只写标题"的新增在这里根本走不到发号那一步。
+    #
+    # 2026-10-26（合并后的口径）：完整定义要**三样**齐全 —— 标题、方法、
+    # 预期结果（``REQUIRED_DEFINITION_FIELDS``）：缺预期结果时框架没法核对
+    # 跑出来的结论算不算数，所以那一条**不占号**。
     round3 = json.loads(json.dumps(base))
     summary3 = apply_delta(
         round3,
         parse_delta_payload({"add": [
             {"title": "第一轮新增 A", "reason": "依据",
-             "verification_method": "code_review"},
+             "verification_method": "code_review",
+             "expected_result": "A 被验到"},
             {"title": "第一轮新增 B", "reason": "依据",
-             "verification_method": "code_review"},
+             "verification_method": "code_review",
+             "expected_result": "B 被验到"},
         ]}, round3),
         round_number=3,
     )
@@ -830,7 +874,8 @@ def test_round_two_delta_allocates_fresh_ids() -> None:
         round4,
         parse_delta_payload({"add": [
             {"title": "第二轮新增 C", "reason": "依据",
-             "verification_method": "code_review"},
+             "verification_method": "code_review",
+             "expected_result": "C 被验到"},
         ]}, round4, reserved_ids=reserved),
         round_number=4,
         reserved_ids=reserved,
@@ -859,7 +904,8 @@ def test_delta_state_persists_allocated_vp_ids(tmp_path: Path) -> None:
         plan,
         parse_delta_payload(
             {"add": [{"title": "x", "reason": "依据",
-                      "verification_method": "code_review"}]},
+                      "verification_method": "code_review",
+                      "expected_result": "x 被验到"}]},
             plan,
         ),
         round_number=3,
@@ -878,7 +924,8 @@ def test_delta_state_persists_allocated_vp_ids(tmp_path: Path) -> None:
         plan2,
         parse_delta_payload(
             {"add": [{"title": "y", "reason": "依据",
-                      "verification_method": "code_review"}]}, plan2,
+                      "verification_method": "code_review",
+                      "expected_result": "y 被验到"}]}, plan2,
             reserved_ids=reserved,
         ),
         round_number=4,
@@ -937,6 +984,9 @@ def test_agent_delta_allocates_fresh_ids_across_rounds(tmp_path: Path) -> None:
                     "title": "新增行为的验收",
                     "reason": "本轮新增了任务，当前没有 VP 覆盖它",
                     "verification_method": "code_review",
+                    # 2026-10-26（合并后的口径）：完整定义要三样齐全，
+                    # 预期结果缺一条这条新增就**不占号**。
+                    "expected_result": "新增行为被验到",
                 }],
                 "obsolete": [],
             }
@@ -999,3 +1049,465 @@ def test_agent_delta_allocates_fresh_ids_across_rounds(tmp_path: Path) -> None:
         "the ledger of issued ids must outlive the round and must never "
         "lose an id that was already handed out"
     )
+
+
+# 2026-10-26：发出去的号必须带着定义落地，裁决必须钉住"判它的那次提交"
+# ---------------------------------------------------------------------------
+#
+# 事故（VP-031）：增量评估发过 VP-031 / 032 / 033 这三个号，但它们的定义
+# 从未落进 ``verification_plan.json``（那份文件至今仍是 30 条）。于是
+#
+#   * 执行器**无定义可分派** —— 那三条 VP 这一轮一次都没跑；
+#   * 它们此前挣到的失败被原样沿用，报告里 VP-031 的 title /
+#     expected_result 是空的，失败却是"真的"；
+#   * 而结果里不记"判它的是哪次提交"，跨提交沿用这件事根本无从发现。
+#
+# 修的不是机制（写前备份 + 多入口重放那条路 r3-11 已经落地），修的是
+# **凭什么沿用一条旧裁决**：号与定义必须一起落地，裁决必须带着出处。
+
+
+def test_delta_added_vp_is_materialized_into_plan_file(tmp_path: Path) -> None:
+    """增量发出去的 id 必须**带着定义**落进 ``verification_plan.json``。
+
+    只在内存里发号是不够的：下一轮（以及任何别的进程）读到的仍然是那份
+    没有这条定义的计划，于是执行器无定义可分派。落盘必须是**原子**的 ——
+    写一半的计划文件比没有更坏。
+    """
+    from verification_plan_delta import apply_delta, parse_delta_payload
+
+    plan_file = tmp_path / "verification_plan.json"
+    plan = _plan(_vp("VP-001"))
+    plan_file.write_text(
+        json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+    delta = parse_delta_payload({
+        "add": [{
+            "title": "注入不得静默失效",
+            "reason": "repair-r4-11 引入了恢复日志重放路径",
+            "verification_method": "code_review",
+            "expected_result": (
+                "SIGKILL / 崩溃后 .mcp.json 由恢复日志在下次启动时重放还原"
+            ),
+        }],
+    }, plan)
+
+    summary = apply_delta(
+        plan, delta, round_number=7, plan_file=plan_file, head="abc1234",
+    )
+
+    on_disk = json.loads(plan_file.read_text(encoding="utf-8"))
+    ids = [vp["id"] for vp in on_disk["verification_points"]]
+    assert "VP-002" in ids, (
+        "the delta's new VP never reached the plan file: "
+        f"{ids!r} — the executor has no definition to dispatch"
+    )
+    added = next(
+        vp for vp in on_disk["verification_points"] if vp["id"] == "VP-002"
+    )
+    assert added["title"] == "注入不得静默失效"
+    assert added["verification_method"] == "code_review"
+    assert added["expected_result"].startswith("SIGKILL")
+    assert added["defined_at_head"] == "abc1234", (
+        "the definition must record the commit it was written at, otherwise "
+        "nobody can tell which tree judged it"
+    )
+    assert summary["written_head"] == "abc1234"
+    assert summary["allocated_vp_ids"] == ["VP-002"]
+
+
+def test_definitionless_item_never_gets_an_id() -> None:
+    """定义不完整的条目**不许占号**。
+
+    占了号却没有定义，比不占号更糟：多出来的那个 id 在计划里查不到，
+    执行器无定义可分派，它的失败又会被沿用（VP-031）。
+    """
+    from verification_plan_delta import apply_delta, parse_delta_payload
+
+    plan = _plan(_vp("VP-001"))
+    delta = parse_delta_payload({
+        "add": [{"title": "只有标题没有方法", "reason": "依据"}],
+    }, plan)
+
+    summary = apply_delta(plan, delta, round_number=7)
+
+    assert [vp["id"] for vp in plan["verification_points"]] == ["VP-001"], (
+        "an item without a complete definition must not occupy a VP id"
+    )
+    assert summary["added"] == []
+    assert summary["allocated_vp_ids"] == []
+    assert summary["rejected_incomplete"], (
+        "the rejection must leave an audit trail: "
+        f"{summary!r}"
+    )
+    assert any(
+        "verification_method" in str(entry.get("why"))
+        for entry in delta.rejected_additions
+    ), delta.rejected_additions
+
+
+def test_allocated_id_without_definition_is_blocked_not_carried(tmp_path: Path) -> None:
+    """发过号但没定义的 VP：不分派、不沿用旧结论，记 ``BLOCKED_DEFINITION_MISSING``。
+
+    2026-10-26（VP-031）：增量评估发过号，定义从未落盘。执行器无定义可
+    分派，于是把上一轮那条失败原样沿用 —— 报告里 VP-031 的 title /
+    expected_result 是空的，失败却是"真的"。框架必须把这件事显式记成
+    "没有定义"，而不是让一条旧失败冒充今天的结论。
+    """
+    import asyncio
+    from unittest.mock import Mock
+
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.verification_repository import (
+        VerificationRepository,
+    )
+    from verification_agent import (
+        BLOCKED_DEFINITION_MISSING,
+        VerificationAgent,
+    )
+    from verification_executor import VerificationExecutor
+
+    plan_id = "plan-vp031-20261026"
+    plan_dir = tmp_path / plan_id
+    plan_dir.mkdir(parents=True)
+
+    # 计划里只有 VP-001 —— VP-031 的定义从未落盘。
+    plan_data = {
+        "verification_points": [{
+            "id": "VP-001",
+            "title": "健康检查",
+            "verification_method": "code_review",
+            "priority": "high",
+            "expected_result": "服务按契约应答",
+        }],
+    }
+
+    conn = open_db(tmp_path / "state.db")
+    migrate(conn)
+    repo = VerificationRepository(conn)
+    repo.insert(plan_id, verification_status="running")
+    # 上一轮 VP-031 的失败（它没有定义，因此这一轮分派不了它）。
+    repo.append_verdict(plan_id, {
+        "vp_id": "VP-031",
+        "status": "FAILED",
+        "reasons": ["上一轮在旧代码上的失败"],
+        "evidence": {},
+    })
+    conn.commit()
+
+    ran = []
+
+    async def _runner(vp_node):
+        ran.append(vp_node["id"])
+        return {"status": "PASSED", "reasons": ["ok"], "evidence": {}}
+
+    executor = VerificationExecutor(
+        verification_plan={"vps": plan_data["verification_points"]},
+        plan_id=plan_id,
+        plan_dir=plan_dir,
+        sub_agent_runner=_runner,
+        verif_repo=repo,
+    )
+    agent = VerificationAgent(
+        plan_dir=plan_dir,
+        project_dir=tmp_path,
+        coding_tool=Mock(),
+        verif_repo=repo,
+    )
+
+    asyncio.run(executor.run(max_parallel=1))
+    assert "VP-031" not in ran, (
+        "a VP without a definition must not be dispatched"
+    )
+
+    envelope = agent._build_execution_results_from_executor(plan_data, executor)
+    rows = {r["id"]: r for r in envelope["execution_results"]}
+    assert "VP-031" in rows, (
+        "the verdict must not silently disappear either — it has to be "
+        "visible as 'there is a VP id nobody can run'"
+    )
+    row = rows["VP-031"]
+    assert row["status"] == "BLOCKED", (
+        "the historical FAILED of a definition-less VP was carried over as "
+        f"this round's conclusion: {row!r}"
+    )
+    assert BLOCKED_DEFINITION_MISSING in row["actual_result"], row
+    assert "上一轮在旧代码上的失败" not in row["actual_result"], (
+        "the old conclusion's text must not be carried over: " f"{row!r}"
+    )
+
+
+def test_failed_result_from_another_head_is_reexecuted(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """在别的提交上判出来的失败必须重跑 —— 而且这件事必须看得见。
+
+    2026-10-26（VP-031）：那条失败结论绑在 dfd1c27 上，而当前 HEAD 已经是
+    876fb19 —— 那是**旧代码上的**失败，当前这份代码还没被它验过。两件事
+    必须同时成立：
+
+    1. 每条结果都记着"判它的那次提交"（``judged_head``），否则跨提交沿用
+       这件事根本无从发现；
+    2. 与当前 HEAD 不一致的失败必须**重跑**，不能被当成这一轮的结论沿用。
+    """
+    import asyncio
+    from unittest.mock import Mock
+
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.verification_repository import (
+        VerificationRepository,
+    )
+    from verification_agent import (
+        JUDGED_HEAD_FIELD,
+        VerificationAgent,
+        requires_reexecution,
+        stamp_judged_head,
+    )
+    from verification_executor import VerificationExecutor
+
+    plan_id = "plan-head-20261026"
+    plan_dir = tmp_path / plan_id
+    plan_dir.mkdir(parents=True)
+
+    plan_data = {
+        "verification_points": [{
+            "id": "VP-001",
+            "title": "注入不得静默失效",
+            "verification_method": "code_review",
+            "priority": "high",
+            "expected_result": (
+                "SIGKILL / 崩溃后 .mcp.json 由恢复日志在下次启动时重放还原"
+            ),
+        }],
+    }
+
+    conn = open_db(tmp_path / "state.db")
+    migrate(conn)
+    repo = VerificationRepository(conn)
+    repo.insert(plan_id, verification_status="running")
+    # 上一轮在旧提交上判出来的失败。
+    repo.append_verdict(plan_id, {
+        "vp_id": "VP-001",
+        "status": "FAILED",
+        "reasons": ["旧代码上的失败"],
+        "evidence": {JUDGED_HEAD_FIELD: "old-head-sha"},
+    })
+    conn.commit()
+
+    agent = VerificationAgent(
+        plan_dir=plan_dir,
+        project_dir=tmp_path,
+        coding_tool=Mock(),
+        verif_repo=repo,
+    )
+    monkeypatch.setattr(
+        agent, "_current_project_head", lambda: "new-head-sha",
+    )
+
+    # (1) 那条旧失败被认出来：判它的提交不是当前 HEAD → 必须重跑。
+    executor = VerificationExecutor(
+        verification_plan={"vps": plan_data["verification_points"]},
+        plan_id=plan_id,
+        plan_dir=plan_dir,
+        sub_agent_runner=Mock(return_value={
+            "status": "PASSED", "reasons": ["ok"], "evidence": {},
+        }),
+        verif_repo=repo,
+    )
+    envelope = agent._build_execution_results_from_executor(plan_data, executor)
+    row = next(
+        r for r in envelope["execution_results"] if r["id"] == "VP-001"
+    )
+    assert row[JUDGED_HEAD_FIELD] == "old-head-sha", (
+        "every result must record the commit that judged it: " f"{row!r}"
+    )
+    assert row.get("reexecute_required") is True, (
+        "a failure judged on another commit must be re-executed, not carried "
+        f"over as this round's conclusion: {row!r}"
+    )
+    assert requires_reexecution(
+        {"status": "FAILED", JUDGED_HEAD_FIELD: "old"}, "new",
+    ) is True
+    assert requires_reexecution(
+        {"status": "FAILED", JUDGED_HEAD_FIELD: "new"}, "new",
+    ) is False
+
+    # (2) 重跑：这条 VP 这一轮真的被重新分派了。
+    ran = []
+
+    async def _runner(vp_node):
+        ran.append(vp_node["id"])
+        return stamp_judged_head(
+            {"status": "PASSED", "reasons": ["ok"], "evidence": {}},
+            "new-head-sha",
+        )
+
+    executor2 = VerificationExecutor(
+        verification_plan={"vps": plan_data["verification_points"]},
+        plan_id=plan_id,
+        plan_dir=plan_dir,
+        sub_agent_runner=_runner,
+        verif_repo=repo,
+    )
+    asyncio.run(executor2.run(max_parallel=1))
+    assert ran == ["VP-001"], (
+        "the stale failure must be re-executed on the current tree: "
+        f"{ran!r}"
+    )
+
+    # (3) 重跑之后的结果记着**当前** HEAD —— 下一轮据此判断它是不是过期。
+    envelope2 = agent._build_execution_results_from_executor(
+        plan_data, executor2,
+    )
+    row2 = next(
+        r for r in envelope2["execution_results"] if r["id"] == "VP-001"
+    )
+    assert row2[JUDGED_HEAD_FIELD] == "new-head-sha", row2
+    assert not row2.get("reexecute_required"), row2
+
+
+def test_dispatch_without_a_definition_is_blocked(tmp_path: Path) -> None:
+    """分派前按 id 查定义：查不到就**不分派**，记 ``BLOCKED_DEFINITION_MISSING``。
+
+    2026-10-26（VP-031）：执行器无定义可分派时，那条 VP 这一轮一次都没跑，
+    它此前挣到的失败却被原样沿用。分派这一层必须自己守住 —— 派一条没有
+    定义的 VP 出去，子 agent 只能去猜"这条要验什么"，猜出来的结论与这条
+    VP 无关，却占着它的名字进了报告。
+    """
+    import asyncio
+    from unittest.mock import Mock
+
+    from verification_agent import (
+        BLOCKED_DEFINITION_MISSING,
+        VerificationAgent,
+    )
+
+    plan_dir = tmp_path / "plan-dispatch-guard-20261026"
+    plan_dir.mkdir(parents=True)
+    plan_data = {
+        "verification_points": [{
+            "id": "VP-001",
+            "title": "注入不得静默失效",
+            "verification_method": "code_review",
+            "expected_result": "SIGKILL 之后 .mcp.json 被重放还原",
+        }],
+    }
+    agent = VerificationAgent(
+        plan_dir=plan_dir,
+        project_dir=tmp_path,
+        coding_tool=Mock(),
+    )
+    executor = agent._build_verification_executor(plan_data)
+
+    # VP-031 在计划里查不到定义 —— 不许分派。
+    verdict = asyncio.run(
+        executor.sub_agent_runner({"id": "VP-031", "method": "code_review"})
+    )
+    assert verdict["status"] == "BLOCKED", verdict
+    assert BLOCKED_DEFINITION_MISSING in verdict["actual_result"], verdict
+    assert verdict["evidence"]["blocked_reason"] == BLOCKED_DEFINITION_MISSING
+
+
+def test_delta_state_records_allocated_ids_and_the_written_head() -> None:
+    """delta state 必须记下"发出去过哪些号"与"写在哪次提交上"。
+
+    2026-10-26（VP-031）：``allocated_vp_ids`` 是"哪些号是增量评估发的"的
+    唯一记录；而"写在哪次提交上"让跨提交沿用这件事**看得见** —— 没有它，
+    一条旧裁决从哪棵树来、现在该信几分，无从判断。
+    """
+    from verification_plan_delta import build_delta_state
+
+    state = build_delta_state(
+        {"allocated_vp_ids": ["VP-030"], "written_head": "old-head"},
+        seen_task_ids=["t1"],
+        round_number=2,
+        summary={"allocated_vp_ids": ["VP-031"], "written_head": "new-head"},
+        head="new-head",
+    )
+    assert state["allocated_vp_ids"] == ["VP-030", "VP-031"], state
+    assert state["written_head"] == "new-head", state
+    assert state["seen_task_ids"] == ["t1"], state
+    assert state["round"] == 2, state
+
+    # 下一轮没有新增时，这两个字段**不许被清空** —— 它们是累计的。
+    kept = build_delta_state(
+        state, seen_task_ids=["t1", "t2"], round_number=3,
+    )
+    assert kept["allocated_vp_ids"] == ["VP-030", "VP-031"], kept
+    assert kept["written_head"] == "new-head", kept
+
+
+def test_a_lost_lease_stops_the_vp_before_the_definition_guard(
+    tmp_path: Path,
+) -> None:
+    """租约丢失的轮次**先**停下来 —— 定义缺失的门禁不许把它改写成 BLOCKED。
+
+    2026-10-26：这条是回归见证。租约丢失是**轮次级**事故：服务被别的进程
+    收走以后，本轮什么都不该再跑，被停下来的验证点"没有裁决"（SKIPPED）。
+    定义缺失的门禁是**每条**验证点的事，它排在租约检查前面，就会把一次
+    轮次级事故写成一条"判据缺陷"，把"没跑"这件事的原因改得面目全非 ——
+    读报告的人会以为这条验证点没写清楚，而真相是服务没了。
+
+    门禁的顺序因此是：租约（轮次级，先停）→ 定义（每条，后判）。
+    """
+    import asyncio
+    from unittest.mock import Mock
+
+    from verification_agent import (
+        BLOCKED_DEFINITION_MISSING,
+        VerificationAgent,
+    )
+
+    plan_dir = tmp_path / "plan-lease-guard-20261026"
+    plan_dir.mkdir(parents=True)
+    plan_data = {
+        "verification_points": [{
+            "id": "VP-001",
+            "title": "健康检查",
+            "verification_method": "code_review",
+            "expected_result": "服务按契约应答",
+        }],
+    }
+    agent = VerificationAgent(
+        plan_dir=plan_dir, project_dir=tmp_path, coding_tool=Mock(),
+    )
+    # 本轮丢失了对声明服务的租约。
+    agent._round_lease_lost = {"reason": "服务被别的进程收走"}
+
+    executor = agent._build_verification_executor(plan_data)
+    # VP-009 在计划里查不到定义 —— 但这一轮先轮到的不是这件事。
+    verdict = asyncio.run(
+        executor.sub_agent_runner({"id": "VP-009", "method": "code_review"})
+    )
+
+    assert verdict["status"] == "SKIPPED", verdict
+    assert BLOCKED_DEFINITION_MISSING not in str(verdict), (
+        "the definition guard must not overwrite a round-level stop: "
+        f"{verdict!r}"
+    )
+
+
+def test_the_definition_guard_needs_a_plan_to_judge_against() -> None:
+    """计划一条 VP 都没有时，不下"没有定义"的判断。
+
+    没有计划可比对，"查不到"就分不清是"定义没落盘"（VP-031）还是"压根
+    没有计划"（退化输入）。这种时候下判断只会凭空造出一条
+    ``BLOCKED_DEFINITION_MISSING`` —— 那不是任何人的结论。
+
+    这条规则**只写一处**：分派前与投影前用的是同一个判据。
+    """
+    import verification_agent
+
+    assert hasattr(
+        verification_agent, "definition_missing",
+    ), "the 'is this id defined?' rule must exist as one shared function"
+    rule = verification_agent.definition_missing
+
+    assert rule({}, "VP-009") is False, (
+        "an empty plan has no definitions to compare against — the guard "
+        "must not judge"
+    )
+    assert rule({"VP-001": {"id": "VP-001"}}, "VP-009") is True
+    assert rule({"VP-001": {"id": "VP-001"}}, "VP-001") is False

@@ -60,6 +60,24 @@ Schema
 ``ci_entry`` 退出 0 → PASSED；非 0 / 超时 / 入口不可执行 → FAILED，并把
 stdout/stderr 尾部附在 verdict 的 evidence 里、原始输出落盘
 ``plans/<id>/vp_artifacts/<vp_id>/ci_output.json``。**只有这一条判据。**
+
+结论绑在哪棵树上（2026-10-27）
+--------------------------------
+**整仓门禁的结论只对产生它的那份代码有效。** 而"整仓门禁通过"正是 PRD
+验收④与测试设计决策点 12 的合入判据 —— 一份不自带出处的结论没法当合入
+依据：上一棵树的 ``exit_code 0`` 会被当成本轮的门禁通过。
+
+于是工件与裁决都必须**自证出处**：
+
+* 工件（``ci_output.json``）记下 ``head_sha`` / ``tree_sha`` /
+  ``started_at`` / ``ci_entry`` / ``project_dir``；
+* 裁决带 ``judged_head``（开跑前取定的那次提交）；
+* 判定前先读已有工件：它的 ``head_sha`` 缺失或与当前 HEAD 不一致 →
+  **旧结论不许沿用**，这一轮必须重跑，并把"旧结论已忽略
+  （``old=<sha>``, ``current=<sha>``）"写进结果。
+
+与 :mod:`verification_verdict_provenance` 的命令指纹同源同向：**没有出处
+= 失效**。
 """
 from __future__ import annotations
 
@@ -72,6 +90,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -85,6 +104,24 @@ STATUS_FAILED = "FAILED"
 
 #: The one field a ``full_ci`` VP must declare.
 CI_ENTRY_FIELD = "ci_entry"
+
+#: 工件 / 裁决里"这是在哪棵树上跑出来的"的字段名。
+#:
+#: 2026-10-27：工件不带这几个字段就无法自证出处，于是上一轮的
+#: ``exit_code`` 可以直接被当成本轮的结论（VP-029）。**结论只对产生它的
+#: 那份代码有效** —— 出处必须写在结论旁边。
+HEAD_SHA_FIELD = "head_sha"
+TREE_SHA_FIELD = "tree_sha"
+STARTED_AT_FIELD = "started_at"
+PROJECT_DIR_FIELD = "project_dir"
+
+#: 裁决里"判它的是哪次提交"的字段名。
+#:
+#: 与 :data:`verification_agent.JUDGED_HEAD_FIELD` 是同一个字符串。那个
+#: 模块 import 本模块，反向 import 会成环，所以这里各写一份 —— 由一条
+#: 测试（``test_judged_head_field_name_is_shared_by_agent_and_executor``）
+#: 钉住两者相同，不靠人记。
+JUDGED_HEAD_FIELD = "judged_head"
 
 #: Ceiling for a full CI gate. A whole-repo nightly run is measured in
 #: tens of minutes (a whole workspace build plus the full test suite), so
@@ -154,13 +191,18 @@ class CiRunResult:
     status: str = STATUS_FAILED
     reasons: List[str] = field(default_factory=list)
     evidence: Dict[str, Any] = field(default_factory=dict)
+    #: 判它的那次提交（开跑前取定的 HEAD）。空串 = 不知道判在哪棵树上。
+    judged_head: str = ""
 
     def to_verdict_dict(self) -> Dict[str, Any]:
-        return {
+        out: Dict[str, Any] = {
             "status": self.status,
             "reasons": list(self.reasons),
             "evidence": dict(self.evidence),
         }
+        if self.judged_head:
+            out[JUDGED_HEAD_FIELD] = self.judged_head
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +408,74 @@ def ci_subprocess_env() -> Dict[str, str]:
     }
 
 
+def _git_rev_parse(project_dir: Path, ref: str) -> str:
+    """``git rev-parse <ref>`` 在 ``project_dir`` 里 —— 取不到就返回空串。
+
+    空串意味着"不知道它是在哪棵树上跑的"：调用方据此走"无法证明出处"
+    那一条路（与 :mod:`verification_verdict_provenance` 的"没有指纹 =
+    失效"同一个方向）。只读 git，不写任何东西；git 不可用（不是仓库 /
+    没有 git）时安静地返回空串 —— 记不出 HEAD 不该拦住一轮门禁。
+
+    **不 shell out**：git 走 :class:`git_manager.GitManager`（GitPython 本来
+    就是依赖），与 :func:`verification_agent._git_head` 同一个口径 —— 进程
+    起点只有一处（``tests/static_gates/test_single_spawn_point.py`` 把这条
+    规则钉死了：harness 层之外每多一个进程起点都要写明理由）。
+    """
+    try:
+        from git_manager import GitManager
+
+        return str(GitManager(str(project_dir)).rev_parse(ref) or "").strip()
+    except Exception:  # noqa: BLE001 — 不是仓库 / 没有 git / 没有这个 ref
+        return ""
+
+
+def _read_artifact(
+    artifact_dir: Optional[Path], vp_id: str,
+) -> Optional[Dict[str, Any]]:
+    """读上一轮落盘的工件；读不到 / 坏掉都当"没有旧工件"。"""
+    if artifact_dir is None:
+        return None
+    path = Path(artifact_dir) / vp_id / "ci_output.json"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _superseded_artifact(
+    artifact_dir: Optional[Path], vp_id: str, current_head: str,
+) -> Optional[Dict[str, Any]]:
+    """上一轮的工件能不能代表**当前这棵树**？不能就说明它被忽略了。
+
+    返回 ``None`` = 没有旧工件（或旧工件就是当前这棵树上的，不必报作废）；
+    返回 dict = 旧工件**被忽略**，dict 里带着 ``old_head_sha`` /
+    ``current_head_sha`` 与一句人话（``old=<sha>``, ``current=<sha>``）。
+
+    判据只有一条：**``head_sha`` 缺失或与当前 HEAD 不一致**。前者是
+    "无法证明出处"，后者是"那是别的提交上的结论" —— 两者都不许沿用，
+    这一轮必须真跑一遍门禁。
+    """
+    previous = _read_artifact(artifact_dir, vp_id)
+    if previous is None:
+        return None
+    old_head = str(previous.get(HEAD_SHA_FIELD) or "").strip()
+    if old_head and current_head and old_head == current_head:
+        return None
+    return {
+        "ignored": True,
+        "old_head_sha": old_head,
+        "current_head_sha": current_head,
+        "reason": (
+            f"上一轮的门禁工件判在 {old_head or '(没有 head_sha)'} 上，"
+            f"当前 HEAD 是 {current_head or '(未知)'} —— 旧结论已忽略"
+            f"（old={old_head or 'unknown'}, current={current_head or 'unknown'}），"
+            f"本轮必须重跑。"
+        ),
+    }
+
+
 def run_ci_verification(
     vp: Dict[str, Any],
     *,
@@ -377,9 +487,20 @@ def run_ci_verification(
     Deterministic end to end — same tree, same entry, same verdict, every
     round. Never raises: a broken entry is a FAILED verdict carrying the
     reason, not an exception the round has to survive.
+
+    2026-10-27：结论绑在树上。``head_sha`` / ``tree_sha`` 在**开跑前**取定
+    （门禁跑的是哪棵树，必须是它开跑时的那棵），随工件与裁决一起落盘；
+    已有工件若来自别的提交，旧结论一律作废并留下痕迹。
     """
     vp_id = str(vp.get("id", "unknown"))
     result = CiRunResult()
+    project_dir = Path(project_dir)
+
+    # 开跑前取定"判它的是哪次提交"。空串 = 不是 git 仓库 / git 不可用 ——
+    # 那就承认不知道，而不是猜一个。
+    head_sha = _git_rev_parse(project_dir, "HEAD")
+    tree_sha = _git_rev_parse(project_dir, "HEAD^{tree}")
+    result.judged_head = head_sha
 
     issues = validate_vp(vp, project_dir=project_dir)
     if issues:
@@ -387,13 +508,21 @@ def run_ci_verification(
         result.evidence = {
             "vp_id": vp_id,
             "schema_issues": [i.to_dict() for i in issues],
+            HEAD_SHA_FIELD: head_sha,
+            TREE_SHA_FIELD: tree_sha,
+            JUDGED_HEAD_FIELD: head_sha,
         }
         return result
 
     entry = str(vp[CI_ENTRY_FIELD]).strip()
     timeout = ci_timeout(vp)
-    project_dir = Path(project_dir)
 
+    # 判定前先看上一轮的工件：它的结论**只对产生它的那棵树有效**。旧工件
+    # 没有 head_sha（无法证明出处）或 head_sha 不是当前 HEAD（那是别的提交
+    # 上的结论）→ 旧结论作废，这一轮真跑，并把作废写进结果。
+    superseded = _superseded_artifact(artifact_dir, vp_id, head_sha)
+
+    started_at = datetime.now(timezone.utc).isoformat()
     started = time.monotonic()
     exit_code: Optional[int] = None
     stdout = stderr = ""
@@ -431,9 +560,16 @@ def run_ci_verification(
         "duration_seconds": round(duration, 2),
         "stdout_tail": stdout_tail,
         "stderr_tail": stderr_tail,
+        HEAD_SHA_FIELD: head_sha,
+        TREE_SHA_FIELD: tree_sha,
+        STARTED_AT_FIELD: started_at,
+        PROJECT_DIR_FIELD: str(project_dir),
+        JUDGED_HEAD_FIELD: head_sha,
     }
     if error:
         evidence["error"] = error
+    if superseded:
+        evidence["superseded_artifact"] = superseded
 
     if not timed_out and not error and exit_code == 0:
         result.status = STATUS_PASSED
@@ -454,6 +590,9 @@ def run_ci_verification(
         tail = stderr_tail.strip() or stdout_tail.strip()
         if tail:
             result.reasons.append(f"输出尾部：{tail[-600:]}")
+
+    if superseded:
+        result.reasons.append(superseded["reason"])
 
     result.evidence = evidence
     _write_artifact(artifact_dir, vp_id, evidence)

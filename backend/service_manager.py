@@ -84,7 +84,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from credentials import _FD_ENV_PREFIX as _SECRET_FD_ENV_PREFIX
 from service_declaration import SERVICE_HOST, ServiceDeclaration
@@ -193,6 +193,141 @@ KILL_EVENT_REQUESTED = "service_kill_requested"
 #: dead service long before a VP runs into the dead port, slow enough
 #: that the watcher costs nothing while the service is healthy.
 _PROCESS_WATCH_INTERVAL = 0.5
+#: Where the "this plan's verification round is running" heartbeat lives,
+#: relative to the plan directory. See :func:`round_is_live`.
+ROUND_LIVENESS_FILENAME = "round_liveness.json"
+
+#: How long a heartbeat keeps a plan's round "live" (seconds).
+#:
+#: Long enough to cover the gap between two VPs of a slow round (the
+#: round refreshes it before every VP and during the judgment phase),
+#: short enough that a crashed round's services are still collected by a
+#: later sweep instead of lingering for the life of the machine.
+ROUND_LIVENESS_TTL_SECONDS = 1800
+
+#: Where a ledger entry keeps the lease of the round that owns the
+#: service. The lease is the evidence a reaper needs to tell "this
+#: service belongs to a round that is still running" from "this
+#: service is an orphan" — see :class:`ServiceLease`.
+LEASE_KEY = "lease"
+
+#: The event a reaper writes when it leaves a service alone because its
+#: lease names a different round than the one being torn down.
+#:
+#: A round-exit reap may only stop what its own round owns. The event
+#: is what makes that decision readable: "the sweep saw it and did not
+#: touch it" and "the sweep never saw it" look the same from the
+#: outside.
+LEASE_OWNER_MISMATCH_EVENT = "lease_owner_mismatch"
+
+#: The event a round writes when it takes over a residual lease whose
+#: heartbeat has expired.
+#:
+#: The round that held the lease is gone, but the ledger entry still
+#: says "a round owns this". The new round claims the service and says
+#: whose claim it took over — so the ledger never carries an owner that
+#: nobody is speaking for.
+LEASE_TAKEN_OVER_EVENT = "lease_taken_over"
+
+#: How long a lease keeps its service owned (seconds). The same window
+#: as the round heartbeat: a lease that outlives its round would keep
+#: an orphan alive for good, and a lease that expires before the round
+#: ends would expose a live round's service to the next sweep.
+LEASE_TTL_SECONDS = ROUND_LIVENESS_TTL_SECONDS
+
+#: The token an event carries when nothing is known about the round that
+#: owned the service. Never the empty string: "we cannot tell who owns
+#: it" and "there was no round" are different facts, and only the first
+#: one is allowed to be silent about the round.
+UNKNOWN_ROUND_TOKEN = "unknown"
+
+#: The reap reasons that mean "this reaper is not the round that owns
+#: the services".
+#:
+#: Two backend processes can share one ``plans/`` directory — the
+#: 2026-10-25 incident had the mcode harness running its round from a
+#: worktree while the main checkout's backend kept serving :8000. A
+#: sweep with one of these reasons may therefore run in a process that
+#: has nothing to do with the round whose services it finds in the
+#: ledger, and stopping those services takes down a live round's
+#: api_test ("connection refused", minutes later, with nothing in
+#: between that says why).
+#:
+#: The rule these reasons trigger is decided **per ledger entry** and it
+#: is written down: a service leased by a round whose heartbeat is
+#: still fresh is left alone, and the deferral is recorded with the
+#: reaper's pid, the lease's owner and the heartbeat's age. Everything
+#: else — an expired lease, a lease this process owns, a service with
+#: no lease at all — is collected as usual. A sweep that never reaped
+#: anything would be a different silent failure: the services would
+#: leak.
+CROSS_ROUND_REAP_REASONS = frozenset({"server_shutdown", "startup_sweep"})
+
+#: The decision a reap made about one ledger entry.
+#:
+#: Every decision is written down with one of these, so a reader of the
+#: service event log can tell *which* of the possible decisions was
+#: taken — not only whether an event is there. The 2026-10-25 log could
+#: say that a service *was* stopped, but not which process decided to
+#: stop it; and the deferral could be read, but only because it had an
+#: event of its own. A decision nobody can classify is a decision nobody
+#: can act on.
+REAP_DECISION_REAPED = "reaped"
+REAP_DECISION_DEFERRED = "deferred_live_round"
+REAP_DECISION_OWNER_MISMATCH = "left_alone_owner_mismatch"
+
+#: Where the "which round owns this address" event log lives, relative
+#: to the plan directory. One JSON object per line, appended.
+SERVICE_EVENTS_FILENAME = "service_address_events.jsonl"
+
+#: The round that is starting services right now, as ambient context.
+#:
+#: A context variable rather than a parameter on
+#: :func:`ensure_services`: the round's identity has to travel from the
+#: verification round down to the code that starts the services, and
+#: that code is reached from several places whose signatures other code
+#: (and the tests) rely on. The context is also per-thread, so two
+#: rounds of one plan cannot write into each other's leases.
+_ROUND_LEASE_CONTEXT: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "pdt_round_lease_context", default=None,
+)
+
+
+@contextmanager
+def round_lease_context(
+    plan_dir: Optional[Path],
+    *,
+    round_id: str,
+) -> Iterator[Dict[str, Any]]:
+    """Name the round that is starting services right now.
+
+    Everything :func:`ensure_services` does inside this block is
+    attributed to ``round_id``: the services it starts are leased to
+    that round, and the plan-level liveness marker names it as the
+    owner.
+
+    Yields the context it installed. Never raises.
+    """
+    ctx: Dict[str, Any] = {
+        "plan_dir": Path(plan_dir) if plan_dir is not None else None,
+        "round_id": str(round_id or ""),
+    }
+    token = _ROUND_LEASE_CONTEXT.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _ROUND_LEASE_CONTEXT.reset(token)
+
+
+def current_round_lease_context() -> Dict[str, Any]:
+    """The round context in force right now, or ``{}``.
+
+    A round that is not inside :func:`round_lease_context` starts its
+    services without a lease: the services are real, but nobody has
+    claimed them, and a sweep cannot tell that they are in use.
+    """
+    return dict(_ROUND_LEASE_CONTEXT.get() or {})
+
 
 #: Shell noise that carries no identity: operators, redirections,
 #: separators. Dropped before matching so ``a && b`` and ``a; b`` and
@@ -731,6 +866,10 @@ class ServiceRuntime:
     #: service the round cleans up after itself would be reported as a
     #: service that died.
     stopped: bool = False
+    #: The lease of the round that owns this service, when the round
+    #: started it. ``None`` for an adopted service (not ours) and for a
+    #: service that never came up.
+    lease: Optional[Dict[str, Any]] = None
 
     @property
     def spawned_by_ac(self) -> bool:
@@ -814,6 +953,7 @@ class ServiceRuntime:
             # has to be in it.
             "dead": self.dead,
             "exit": self.exit.to_dict() if self.exit is not None else None,
+            LEASE_KEY: self.lease,
         }
 
 
@@ -823,6 +963,10 @@ class ServiceRuntimeMap:
 
     runtimes: Dict[str, ServiceRuntime] = field(default_factory=dict)
     duration_seconds: float = 0.0
+    #: The token of the round that owns the services of this map
+    #: (``<round_id>@<backend_pid>``). Empty when the map was built
+    #: without a round — the services are then nobody's.
+    lease_owner: str = ""
 
     @property
     def ready_names(self) -> List[str]:
@@ -856,12 +1000,284 @@ class ServiceRuntimeMap:
                 n: (r.data_plane.to_dict() if r.data_plane is not None else None)
                 for n, r in sorted(self.runtimes.items())
             },
+            # The round that owns these services. The ``services_ensured``
+            # event carries it, so a reader can tell whose services these
+            # are without having to reconstruct it from the ledger.
+            "lease_owner": self.lease_owner,
         }
+
+
+@dataclass
+class ServiceLease:
+    """The round's claim on one service.
+
+    Written into the ledger entry of a service when the round starts it,
+    and read back by every reaper. The 2026-10-25 reap could not answer
+    the only question that mattered — "is a round still using this
+    service?" — because the ledger entry named the process but carried
+    no owner. This is that owner: ``owner`` names the round and the
+    process that holds it (``<round_id>@<backend_pid>``), and the two
+    pids let a reader check that the round is still alive.
+
+    A lease is a claim, not a lock: it says "a round started this and
+    says it is still here", and it expires on its own so a crashed
+    round's services are still collected.
+
+    ``service`` names the service the lease is **on**.  A round that
+    declares two services holds two leases: they share the owner (the
+    round) and differ in the service, the port and the listener.  A
+    lease that does not say which service it is on cannot answer "is
+    the process answering the mcode port the one I leased *for
+    api-mcode*?" — and that is the question the mcode criterion turns
+    on, because the other side of the round (the default claude
+    backend) answers ports too.
+    """
+
+    owner: str = ""
+    service: str = ""
+    round_pid: int = 0
+    backend_pid: int = 0
+    port: int = 0
+    listener_pid: Optional[int] = None
+    heartbeat_at: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "owner": self.owner,
+            "service": self.service,
+            "round_pid": self.round_pid,
+            "backend_pid": self.backend_pid,
+            "port": self.port,
+            "listener_pid": self.listener_pid,
+            "heartbeat_at": self.heartbeat_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Optional["ServiceLease"]:
+        """A lease from a ledger entry, or ``None`` when there is none.
+
+        A damaged lease reads as "no lease" rather than raising: the
+        question it answers is "whose service is this", and an
+        unreadable answer is an unknown answer, not a live one.
+        """
+        if not isinstance(data, dict):
+            return None
+        owner = str(data.get("owner") or "")
+        if not owner:
+            return None
+        listener = data.get("listener_pid")
+        try:
+            return cls(
+                owner=owner,
+                service=str(data.get("service") or ""),
+                round_pid=int(data.get("round_pid") or 0),
+                backend_pid=int(data.get("backend_pid") or 0),
+                port=int(data.get("port") or 0),
+                listener_pid=int(listener) if listener else None,
+                heartbeat_at=float(data.get("heartbeat_at") or 0.0),
+            )
+        except (TypeError, ValueError):
+            return None
+
+
+def make_lease(
+    *,
+    round_id: str,
+    backend_pid: int,
+    port: int,
+    listener_pid: Optional[int] = None,
+    round_pid: Optional[int] = None,
+    service: str = "",
+) -> ServiceLease:
+    """The lease a round takes on a service it just started.
+
+    ``round_id`` names the round; ``backend_pid`` is the process that
+    runs it. The owner string carries both, so a reader that only has
+    the ledger can still say which round a service belongs to.
+
+    ``service`` names the service the lease is on.  It is what tells
+    two leases of the same round apart.
+    """
+    owner = f"{round_id}@{int(backend_pid)}"
+    return ServiceLease(
+        owner=owner,
+        service=str(service or ""),
+        round_pid=int(round_pid or backend_pid),
+        backend_pid=int(backend_pid),
+        port=int(port),
+        listener_pid=listener_pid,
+        heartbeat_at=time.time(),
+    )
+
+
+def lease_state(
+    lease: Optional[ServiceLease],
+    *,
+    ttl_seconds: float = LEASE_TTL_SECONDS,
+    now: Optional[float] = None,
+) -> str:
+    """Is the service leased by a round that is still running?
+
+    Three answers, and the middle one is the point:
+
+    * ``"live"`` — the lease is fresh and its owner is alive. The
+      service is in use by a running round, and a reaper must leave it
+      alone.
+    * ``"dead"`` — the lease is stale, or the round that took it is
+      gone. The round is over and the service is an orphan.
+    * ``"unknown"`` — there is no lease, or it cannot be read. Nobody
+      can say who owns the service. It is **not** ``"live"``: the
+      absence of a lease is not evidence of a running round, and a
+      verdict that cannot tell those apart is a verdict that is always
+      true.
+    """
+    if lease is None:
+        return "unknown"
+    current = time.time() if now is None else float(now)
+    beat = float(lease.heartbeat_at or 0.0)
+    if beat <= 0.0:
+        return "dead"
+    if beat > current:
+        # A heartbeat from the future is a clock problem, not a dead
+        # round — treat it as live rather than expose a running round's
+        # service over a timestamp.
+        return "live"
+    if current - beat > float(ttl_seconds):
+        return "dead"
+    owner_pid = lease.backend_pid or lease.round_pid
+    if owner_pid and not _pid_alive(int(owner_pid)):
+        return "dead"
+    return "live"
+
+
+def lease_owner_pid(lease: Optional[ServiceLease]) -> int:
+    """The process a lease names as its owner (``0`` when it names none).
+
+    The owner token is ``<round_id>@<backend_pid>``, so the pid is
+    readable from the token itself when the structured field is missing.
+    """
+    if lease is None:
+        return 0
+    try:
+        pid = int(lease.backend_pid or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if pid:
+        return pid
+    tail = str(lease.owner or "").rsplit("@", 1)[-1]
+    try:
+        return int(tail)
+    except (TypeError, ValueError):
+        return 0
+
+
+def lease_is_owned_by(
+    lease: Optional[ServiceLease], pid: int,
+) -> bool:
+    """Is this lease held by the process ``pid``?"""
+    if lease is None or not pid:
+        return False
+    return lease_owner_pid(lease) == int(pid)
+
+
+def lease_heartbeat_age(
+    lease: Optional[ServiceLease], *, now: Optional[float] = None,
+) -> Optional[float]:
+    """How long ago the lease said "still here", in seconds.
+
+    ``None`` when the lease says nothing: a lease without a heartbeat
+    has no age, and "no age" is not "fresh".
+    """
+    if lease is None:
+        return None
+    try:
+        beat = float(lease.heartbeat_at or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if beat <= 0.0:
+        return None
+    current = time.time() if now is None else float(now)
+    return max(0.0, current - beat)
+
+
+def lease_heartbeat_is_fresh(
+    lease: Optional[ServiceLease],
+    *,
+    ttl_seconds: float = LEASE_TTL_SECONDS,
+    now: Optional[float] = None,
+) -> bool:
+    """Is the lease's heartbeat still inside its window?
+
+    A heartbeat from the future is a clock problem, not a dead round:
+    it counts as fresh.
+    """
+    age = lease_heartbeat_age(lease, now=now)
+    if age is None:
+        return False
+    return age <= float(ttl_seconds)
+
+
+def lease_owner_is_alive(lease: Optional[ServiceLease]) -> bool:
+    """Is the process the lease names still running?
+
+    A lease whose owner is **provably gone** belongs to a round that is
+    over: the heartbeat it left behind is stale news, and the service
+    is an orphan a sweep is supposed to collect. A lease that names no
+    process at all cannot be checked, so it is not held against it.
+    """
+    pid = lease_owner_pid(lease)
+    if not pid:
+        return True
+    return _pid_alive(pid)
+
+
+def lease_is_held_by_a_live_round(lease: Optional[ServiceLease]) -> bool:
+    """Is this lease held by a round that is still speaking?
+
+    **The** judgment every reaper makes about a service it does not own,
+    in one place. The two cross-round sweeps — ``startup_sweep`` (a
+    backend booting) and ``server_shutdown`` (a backend going down) —
+    see the same plans directory, so they have to reach the same verdict
+    on the same ledger entry; and the round-exit path has to agree with
+    them about what "a live round" means. Two copies of the rule drift,
+    and a drifted copy is a sweep that eventually takes a live round's
+    service down.
+
+    Both halves have to hold. The heartbeat says the round is still
+    speaking; the owner being alive says it is still there to be spoken
+    for. A lease whose owner is provably gone names a round that ended:
+    the service is an orphan then, and collecting it is what stops the
+    leak.
+
+    A lease that is not there at all is not a live round — nobody
+    claimed the service, so it is an orphan.
+    """
+    if lease is None:
+        return False
+    return lease_heartbeat_is_fresh(lease) and lease_owner_is_alive(lease)
 
 
 # ---------------------------------------------------------------------------
 # Process helpers
 # ---------------------------------------------------------------------------
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether *pid* names a live process.
+
+    Signal 0 does the existence check without delivering anything. A
+    ``PermissionError`` means the process is there and we are simply not
+    allowed to signal it — that is still alive.
+    """
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _process_group_of(pid: int) -> Optional[int]:
@@ -1300,6 +1716,137 @@ def _ambient_round_token() -> str:
     """The round token of the round that is running right now, if any."""
     context = _ADDRESS_EVENT_CONTEXT.get() or {}
     return str(context.get("round_token") or "")
+# Declared harness + process environment
+# ---------------------------------------------------------------------------
+
+#: The environment variable that selects which CLI backend a process
+#: runs.  The same name as :data:`harness.registry.HARNESS_ENV_VAR`;
+#: spelled out here because this module must not import the harness
+#: layer — the service manager runs before any backend is selected, and
+#: a plan's declaration is what names the backend, not the registry.
+HARNESS_ENV_VAR = "PDT_HARNESS"
+
+#: Any assignment of the harness variable in a declaration's command,
+#: whatever the value looks like.  Used to answer "does this
+#: declaration say anything about the backend at all", which is a
+#: different question from "which backend does it pin".
+_HARNESS_ASSIGNMENT_RE = re.compile(
+    r"(?:^|[\s;&|])(?:export\s+)?"
+    + re.escape(HARNESS_ENV_VAR)
+    + r"=(?P<value>[^\s;&|'\"]*)"
+)
+
+#: A backend name: what :mod:`harness.registry` accepts.
+_HARNESS_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def harness_assignment(decl: ServiceDeclaration) -> Optional[str]:
+    """The value the declaration's command assigns to the harness variable.
+
+    ``None`` when the command says nothing about the harness at all —
+    the default claude path, which pins none.  The raw text is returned
+    rather than a validated name, because "assigned a value this module
+    cannot check" and "assigned no value" are different facts and the
+    caller has to treat them differently.
+    """
+    command = str(getattr(decl, "start_cmd", "") or "")
+    if not command:
+        return None
+    value = None
+    for match in _HARNESS_ASSIGNMENT_RE.finditer(command):
+        value = match.group("value")
+    return value
+
+
+def declared_harness(decl: ServiceDeclaration) -> Optional[str]:
+    """The CLI backend the declaration's ``start_cmd`` pins, or ``None``.
+
+    A declaration whose command says ``export PDT_HARNESS=mcode`` is a
+    declaration about the **mcode** backend: the service it starts is
+    the mcode side of the round, and the process that answers for it has
+    to actually run under that harness.  A restart that quietly loses
+    the export leaves a process that still answers the service's port —
+    a "configured but not actually in effect" service, which has to fail
+    loudly rather than pass.
+
+    ``None`` when the command pins no harness, or pins one this module
+    cannot read statically (a value that is itself a shell expansion).
+    The second case is *not* the same as the first, and
+    :func:`harness_assignment` is what tells them apart.
+    """
+    value = harness_assignment(decl)
+    if value is None or not _HARNESS_NAME_RE.match(value):
+        return None
+    return value
+
+
+def process_environment(pid: int) -> Optional[Dict[str, str]]:
+    """The environment of *pid*, or ``None`` when it cannot be read.
+
+    Linux has ``/proc/<pid>/environ`` — exact, and NUL-separated.  On
+    macOS/BSD the environment is not a file: ``ps -E`` appends it to the
+    command line, so the command is stripped off first and what is left
+    is the environment.  A ``KEY=value`` that belongs to the *command
+    line* is therefore not mistaken for an environment entry.
+
+    Never raises.  A process that died between the spawn and the read is
+    a fact the caller has to handle, not an exception — and "could not
+    read it" is an answer the caller must be able to act on.
+    """
+    if not pid:
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+
+    environ_path = Path("/proc") / str(pid) / "environ"
+    try:
+        if environ_path.exists():
+            raw = environ_path.read_bytes()
+            env: Dict[str, str] = {}
+            for chunk in raw.split(b"\0"):
+                text = chunk.decode("utf-8", errors="replace")
+                key, sep, value = text.partition("=")
+                if sep and key:
+                    env[key] = value
+            return env or None
+    except OSError as exc:
+        logger.debug(
+            "[service_manager] could not read /proc/%s/environ: %s",
+            pid, exc,
+        )
+        return None
+
+    # macOS/BSD: the environment is appended to the command line.
+    listing = _run(["ps", "-ww", "-E", "-p", str(pid)])
+    if not listing:
+        return None
+    line = None
+    for candidate in listing.splitlines():
+        tokens = candidate.split()
+        if tokens and tokens[0] == str(pid):
+            line = candidate
+            break
+    if line is None:
+        return None
+
+    command = _run(["ps", "-ww", "-p", str(pid), "-o", "command="])
+    env_part = line
+    if command and command in line:
+        env_part = line.split(command, 1)[1]
+
+    env = {}
+    for token in env_part.split():
+        key, sep, value = token.partition("=")
+        if not sep or not key:
+            continue
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+            continue
+        env[key] = value
+    return env or None
 
 
 def stop_service(
@@ -1328,6 +1875,12 @@ def stop_service(
     it was the startup sweep.
 
     Refuses to touch protected ports. Never raises.
+
+    When a ``plan_dir`` is given the stop is written down in the plan's
+    service event log, naming the round the service belonged to. The
+    2026-10-25 log recorded the stops that broke the round without
+    saying whose services they were; the token is never the empty
+    string.
     """
     result: Dict[str, Any] = {
         "name": runtime.name, "port": runtime.port, "killed": [],
@@ -1372,6 +1925,20 @@ def stop_service(
         result["detail"] = "no process to stop"
         return result
 
+    def _note_stopped(detail: str) -> None:
+        """Write the stop down, naming the round it belonged to."""
+        if plan_dir is None:
+            return
+        record_service_event(
+            plan_dir, "stopped",
+            round_token=round_token,
+            name=runtime.name,
+            port=runtime.port,
+            declared_port=getattr(runtime, "declared_port", None),
+            pid=runtime.pid,
+            reason=reason or detail,
+        )
+
     pgid = runtime.pgid or _process_group_of(targets[0])
     # Never our own group: that is the caller, and everything it owns.
     # Signalling it would take down the backend — or, under pytest, the
@@ -1406,6 +1973,7 @@ def stop_service(
         if not probe_port(runtime.port).listening:
             result["port_free"] = True
             result["detail"] = "stopped after SIGTERM"
+            _note_stopped(result["detail"])
             return result
         time.sleep(0.5)
 
@@ -1444,6 +2012,7 @@ def stop_service(
         "stopped after SIGKILL" if result["port_free"]
         else f"port {runtime.port} still held after SIGKILL"
     )
+    _note_stopped(result["detail"])
     return result
 
 
@@ -3374,6 +3943,23 @@ def ensure_services(
     probe and the start happen under the port's lock, so a second
     caller re-probes instead of racing the first one onto the same
     port.  See :func:`_port_lock` for why that matters.
+    Every service **this round started** is leased: the lease names the
+    round (``<round_id>@<backend_pid>``) and is written into the plan's
+    ledger, so a reaper in another process can tell "a round is using
+    this" from "this is an orphan". On 2026-10-25 that distinction was
+    missing and a foreign sweep stopped the round's api service two
+    minutes after the round had started it.
+
+    A ledger entry left behind by an earlier round carries that round's
+    lease. When that lease has expired, this round takes the service
+    over — the leftover must not keep claiming an owner that nobody is
+    speaking for — and records the take-over
+    (``lease_taken_over``: whose claim it took, whose claim it is now).
+
+    The round's identity comes from :func:`round_lease_context` — the
+    context the caller wraps this call in. A call made outside such a
+    context starts the services without a lease: they are real, but
+    nobody has claimed them.
 
     Never raises; a failure is a per-service ``ready=False``.
     """
@@ -3416,6 +4002,16 @@ def _ensure_services(
     round_token = str(
         (_ADDRESS_EVENT_CONTEXT.get() or {}).get("round_token") or ""
     )
+    # 2026-10-25 — the round that is starting these services, as
+    # ambient context.  The lease context names the round; the plan
+    # directory it carries is a fallback for the caller's own
+    # ``plan_dir``, which stays the caller's to decide.
+    ctx = current_round_lease_context()
+    if plan_dir is None:
+        plan_dir = ctx.get("plan_dir")
+    round_id = str(ctx.get("round_id") or "")
+    if round_id:
+        result.lease_owner = f"{round_id}@{os.getpid()}"
 
     newest_source = newest_project_source_mtime(project_dir)
 
@@ -3585,6 +4181,30 @@ def _ensure_services(
         if runtime.data_plane is None:
             _record_data_plane(runtime)
         _apply_data_plane_gate(runtime, expected_rows)
+
+    # Every service this round started is leased to the round. The lease
+    # is written into the ledger, so a reaper in another process can
+    # tell "a round is using this" from "this is an orphan".
+    for runtime in result.runtimes.values():
+        _lease_service(
+            runtime,
+            plan_dir=plan_dir,
+            round_id=round_id,
+            project_dir=project_dir,
+            round_number=round_number,
+        )
+
+    if plan_dir is not None and round_id:
+        # The plan-level marker carries the same lease as the ledger, so
+        # the two records of "this round owns these services" cannot
+        # disagree. A reader that only has the marker still learns whose
+        # services they are.
+        write_round_liveness(
+            plan_dir, round_number=round_number,
+            owner=result.lease_owner,
+            backend_pid=os.getpid(),
+            leases=[r.lease for r in result.runtimes.values() if r.lease],
+        )
 
     result.duration_seconds = time.monotonic() - start
     return result
@@ -4879,6 +5499,122 @@ def _start_process_watcher(
         return None
     return thread
 
+def _lease_service(
+    runtime: ServiceRuntime,
+    *,
+    plan_dir: Optional[Path],
+    round_id: str,
+    project_dir: Path,
+    round_number: int = 0,
+) -> None:
+    """Lease one service to the round that just started it.
+
+    Only a service this backend **started** is leased: an adopted
+    listener belongs to somebody else, and a service that never came up
+    has nothing to protect.
+
+    The lease lands in the plan's ledger, next to the service it
+    belongs to, so a reaper in another process can read it without
+    having to reconstruct the round from anything else.
+
+    A residual entry from an earlier round may already be there, with
+    that round's lease on it. When that lease has expired, this round
+    takes the service over — and says so, so the ledger never carries
+    an owner that nobody is speaking for.
+    """
+    if not round_id or plan_dir is None:
+        return
+    if not runtime.spawned_by_ac or not runtime.pid:
+        return
+    lease = make_lease(
+        round_id=round_id,
+        backend_pid=os.getpid(),
+        port=runtime.port,
+        listener_pid=runtime.pid,
+        round_pid=os.getpid(),
+        # The lease names the service it is on.  A round that declares
+        # two services holds two leases, and only the name says which
+        # one is which.
+        service=runtime.name,
+    )
+    runtime.lease = lease.to_dict()
+    _record_lease_takeover(plan_dir, runtime, lease)
+    record_runtime(
+        plan_dir, Path(plan_dir).name, runtime,
+        project_dir=project_dir, round_number=round_number,
+    )
+
+
+def _record_lease_takeover(
+    plan_dir: Path,
+    runtime: ServiceRuntime,
+    lease: ServiceLease,
+) -> None:
+    """Write down that this round took over a residual lease.
+
+    A ledger entry left behind by an earlier round carries that round's
+    lease. Once the round that took it is gone — its heartbeat has aged
+    out of the window — the entry is a leftover: it says "a round is
+    using this" while nobody is using it, and every reader has to
+    guess whether it is a live owner or an orphan.
+
+    This round makes the answer explicit: it becomes the owner, and it
+    says whose claim it took over and why. A lease whose heartbeat is
+    still fresh belongs to a round that is still speaking, so it is not
+    this round's to take.
+    """
+    ledger = read_ledger(plan_dir)
+    services = ledger.get("services")
+    if not isinstance(services, list):
+        return
+    for entry in services:
+        if not isinstance(entry, dict):
+            continue
+        if (str(entry.get("name")) != runtime.name
+                or entry.get("port") != runtime.port):
+            continue
+        residual = ServiceLease.from_dict(entry.get(LEASE_KEY))
+        if residual is None:
+            # No lease on the leftover: there is no claim to take over.
+            return
+        if residual.owner == lease.owner:
+            # Our own claim, left by an earlier round of this process.
+            return
+        if lease_heartbeat_is_fresh(residual):
+            # A round that is still speaking owns that entry. It is not
+            # a leftover, and taking it over would steal a live claim.
+            logger.info(
+                "[service_manager] service %r on port %s is still claimed "
+                "by another round (%s); its lease was not taken over",
+                runtime.name, runtime.port, residual.owner,
+            )
+            return
+        message = (
+            f"service {runtime.name!r} on port {runtime.port} was taken "
+            f"over from {residual.owner}: that lease's heartbeat has expired"
+        )
+        try:
+            record_service_event(
+                plan_dir, LEASE_TAKEN_OVER_EVENT,
+                round_token=lease.owner,
+                run_id=Path(plan_dir).name,
+                name=runtime.name,
+                port=runtime.port,
+                declared_port=runtime.declared_port,
+                pid=runtime.pid,
+                reason="stale",
+                details={
+                    "from_owner": residual.owner,
+                    "to_owner": lease.owner,
+                    "detail": message,
+                },
+            )
+        except Exception:  # noqa: BLE001 - an event write never raises
+            logger.debug(
+                "[service_manager] could not write the take-over event "
+                "for %s", runtime.name,
+            )
+        return
 
 # ---------------------------------------------------------------------------
 # Ledger (written here, acted upon by C3)
@@ -4994,6 +5730,69 @@ def record_runtimes(
     return path
 
 
+def record_runtime(
+    plan_dir: Path,
+    plan_id: str,
+    runtime: ServiceRuntime,
+    *,
+    project_dir: Path,
+    round_number: int = 0,
+) -> Optional[Path]:
+    """Add (or replace) ONE runtime in the plan's ledger.
+
+    :func:`record_runtimes` replaces the ledger wholesale, which is
+    right for the round-start preflight — one shot, every service — and
+    wrong for a mid-round relaunch: that one would drop every other
+    service the round owns, and they would never be reaped. This merges
+    instead: the entry for the same (name, port) is replaced, the rest
+    are kept.
+
+    Never raises, for the same reason :func:`record_runtimes` never
+    raises — a ledger write failure costs the exit-time reap of one
+    service.
+    """
+    if not runtime.pid:
+        return None
+    path = ledger_path(plan_dir)
+    existing = read_ledger(plan_dir)
+    kept: List[Dict[str, Any]] = []
+    services = existing.get("services")
+    if isinstance(services, list):
+        for entry in services:
+            if not isinstance(entry, dict):
+                continue
+            same_service = (
+                str(entry.get("name")) == runtime.name
+                and entry.get("port") == runtime.port
+            )
+            if same_service:
+                continue
+            kept.append(entry)
+    kept.append(runtime.to_dict())
+    payload = {
+        "plan_id": plan_id,
+        "project_dir": str(project_dir),
+        "round": round_number,
+        "updated_at": datetime.now().isoformat(),
+        "services": kept,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+        return path
+    except OSError as exc:
+        logger.warning(
+            "[service_manager] could not write service ledger %s: %s",
+            path, exc,
+        )
+        return None
+
+
 def read_ledger(plan_dir: Path) -> Dict[str, Any]:
     """Read a plan's service ledger. Returns ``{}`` when absent or
     corrupt — a damaged ledger must not block a reap sweep."""
@@ -5003,6 +5802,496 @@ def read_ledger(plan_dir: Path) -> Dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def read_service_lease(
+    plan_dir: Path, *, name: str = "", port: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """The lease this plan holds on one service, or ``None``.
+
+    Two records of the same claim: the plan's **ledger** (one entry per
+    service) and the plan-level **liveness marker** (the same leases).
+    The ledger is read first — it is the record a reaper reads — and
+    the marker is the fallback for a round whose ledger was finalised
+    while the marker still says what it was leasing.
+
+    ``name`` selects the service and ``port`` selects the address.  Both
+    have to agree: a lease is a claim about **one service at one
+    address**, and a lease of the same service at another port is a
+    different claim (a service that was relocated leaves its old lease
+    behind).  A name that matches at another port is therefore **not**
+    the lease being asked for — reading it as one would accuse a round
+    of losing a service it never held.
+
+    The answer carries the facts a caller needs to check the claim
+    against the operating system: the service, the port, the owner,
+    the process the round ensured (``listener_pid``), the process group
+    that process was started in (``pgid``) and the heartbeat.
+    """
+    plan_dir = Path(plan_dir)
+    wanted = str(name or "").strip().lower()
+    try:
+        wanted_port = int(port) if port is not None else None
+    except (TypeError, ValueError):
+        wanted_port = None
+
+    def _found(
+        lease: ServiceLease, service: str, pgid: Any, source: str,
+    ) -> Dict[str, Any]:
+        return {
+            "service": service,
+            "port": int(lease.port or 0),
+            "owner": str(lease.owner or ""),
+            "listener_pid": lease.listener_pid,
+            "pgid": pgid,
+            "heartbeat_at": float(lease.heartbeat_at or 0.0),
+            "source": source,
+        }
+
+    def _rank(service: str, entry_port: int) -> int:
+        """How well a candidate answers the question. Higher is better.
+
+        A lease is a claim about one service **at one address**.  When
+        the caller names the address, a candidate at another address is
+        not a weaker answer — it is a different claim, and it must not
+        be returned: reading it as one would accuse a round of losing
+        a service it never held at that address.
+        """
+        name_ok = (not wanted) or service.strip().lower() == wanted
+        if wanted_port is not None:
+            if entry_port != wanted_port:
+                return 0
+            return 2 if name_ok else 1
+        return 2 if name_ok else 0
+
+    best: Optional[Dict[str, Any]] = None
+    best_rank = 0
+    for entry in read_ledger(plan_dir).get("services") or []:
+        if not isinstance(entry, dict):
+            continue
+        lease = ServiceLease.from_dict(entry.get(LEASE_KEY))
+        if lease is None:
+            continue
+        service = str(entry.get("name") or lease.service or "")
+        found = _found(lease, service, entry.get("pgid"), "ledger")
+        try:
+            found["port"] = int(entry.get("port") or found["port"])
+        except (TypeError, ValueError):
+            pass
+        rank = _rank(service, found["port"])
+        if rank > best_rank:
+            best, best_rank = found, rank
+    if best is not None:
+        return best
+
+    # The marker keeps its own copy of the leases: the round's last word
+    # on what it was using.
+    for raw in read_round_liveness(plan_dir).get("leases") or []:
+        lease = ServiceLease.from_dict(raw)
+        if lease is None:
+            continue
+        found = _found(lease, str(lease.service or ""), None, "marker")
+        rank = _rank(found["service"], found["port"])
+        if rank > best_rank:
+            best, best_rank = found, rank
+    return best
+
+
+def refresh_round_leases(plan_dir: Path, *, round_id: str = "") -> int:
+    """Refresh the heartbeat of the leases a round holds.
+
+    A lease is a heartbeat, not a timestamp. A round that runs longer
+    than :data:`LEASE_TTL_SECONDS` must not have its services read as
+    orphans half-way through, so every refresh stamps the leases
+    again: the ledger always says how recently the round spoke.
+
+    Only the leases of ``round_id`` are refreshed; an empty
+    ``round_id`` refreshes every lease in the ledger.
+
+    Returns the number of leases refreshed. Never raises.
+    """
+    plan_dir = Path(plan_dir)
+    ledger = read_ledger(plan_dir)
+    services = ledger.get("services")
+    if not isinstance(services, list) or not services:
+        return 0
+    now = time.time()
+    refreshed = 0
+    for entry in services:
+        if not isinstance(entry, dict):
+            continue
+        lease = ServiceLease.from_dict(entry.get(LEASE_KEY))
+        if lease is None:
+            continue
+        if round_id and not lease.owner.startswith(f"{round_id}@"):
+            # Somebody else's lease — not this round's to stamp.
+            continue
+        lease.heartbeat_at = now
+        entry[LEASE_KEY] = lease.to_dict()
+        refreshed += 1
+    if not refreshed:
+        return 0
+    payload = dict(ledger)
+    payload["updated_at"] = datetime.now().isoformat()
+    path = ledger_path(plan_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except OSError as exc:
+        logger.warning(
+            "[service_manager] could not refresh the leases in %s: %s",
+            path, exc,
+        )
+        return 0
+    return refreshed
+
+
+def refresh_round_liveness(
+    plan_dir: Path, *, round_number: int = 0, owner: str = "",
+    round_id: str = "",
+) -> int:
+    """Refresh the round's heartbeat in **every** place it is recorded.
+
+    The round's claim on its services lives in two files, and they are
+    two records of the same fact:
+
+      * the ledger (``managed_services.json``) carries one **lease** per
+        service — that is the record a reaper in another process reads
+        to decide "is this service still in use?";
+      * the plan-level marker (``round_liveness.json``) carries the same
+        leases plus the round's own heartbeat.
+
+    A refresh that stamps only one of them leaves the other reading as
+    stale, and whichever reader consults the stale one concludes the
+    round is gone. So both are stamped here, together, with the same
+    timestamp.
+
+    Only the leases of ``round_id`` are stamped; an empty ``round_id``
+    stamps every lease in the ledger and in the marker.
+
+    Returns the number of **ledger** leases refreshed. Never raises:
+    a heartbeat that cannot be written costs the round its protection
+    from foreign sweeps, which is strictly better than aborting it.
+    """
+    plan_dir = Path(plan_dir)
+    refreshed = refresh_round_leases(plan_dir, round_id=round_id)
+    marker = read_round_liveness(plan_dir)
+    leases = marker.get("leases")
+    stamped: List[Dict[str, Any]] = []
+    if isinstance(leases, list):
+        now = time.time()
+        for item in leases:
+            if not isinstance(item, dict):
+                continue
+            owner_token = str(item.get("owner") or "")
+            if round_id and not owner_token.startswith(f"{round_id}@"):
+                # Somebody else's lease — not this round's to stamp.
+                stamped.append(dict(item))
+                continue
+            entry = dict(item)
+            entry["heartbeat_at"] = now
+            stamped.append(entry)
+    write_round_liveness(
+        plan_dir,
+        round_number=round_number,
+        owner=owner or None,
+        leases=stamped or None,
+    )
+    return refreshed
+
+
+# ---------------------------------------------------------------------------
+# Round liveness — "is this plan's verification round still running?"
+# ---------------------------------------------------------------------------
+#
+# 2026-10-25, observed on a private plan: two backend
+# processes share one ``plans/`` directory, and the second one's startup
+# (or shutdown) sweep reaped the services the first one's *running*
+# verification round was using — the api service got SIGTERM 14 seconds
+# after the round had started it, and the round's api_test VP failed
+# seven minutes later with a bare "connection refused".
+#
+# Every safety check in :func:`reap_services` passed, and had to: the
+# ledger's pid was not recycled, the listener WAS the recorded pid, the
+# port was not protected. None of them asks the only question that
+# matters here — "is the plan's round still running?" — so the reaper
+# had no way to tell "this plan's round is over, clean up" from "this
+# plan's round is mid-flight, leave it alone".
+#
+# The round answers that question by leaving a heartbeat behind. A sweep
+# that finds a fresh heartbeat leaves the plan alone; the plan's own
+# round-end reap deletes the marker first, so the teardown the round
+# asked for still happens; and a crashed round's marker simply expires,
+# so the next sweep collects the orphan as before.
+
+
+def round_liveness_path(plan_dir: Path) -> Path:
+    """Where a plan's round-liveness heartbeat lives."""
+    return Path(plan_dir) / ROUND_LIVENESS_FILENAME
+
+
+def write_round_liveness(
+    plan_dir: Path, *, round_number: int = 0,
+    ttl_seconds: float = ROUND_LIVENESS_TTL_SECONDS,
+    owner: Optional[str] = None,
+    round_pid: Optional[int] = None,
+    backend_pid: Optional[int] = None,
+    leases: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Path]:
+    """Record that this plan's verification round is running.
+
+    Called by the round's preflight **before** the services start — the
+    window between "service is up" and "the round owns it" is exactly
+    the window a foreign sweep would use — and again as a heartbeat
+    while the round runs. Writing it again is how the round says "still
+    here": the file carries the timestamp, so a rewrite is a refresh.
+
+    The marker also carries the round's **lease** — the owner token and
+    the leases of the services it owns. A heartbeat refresh does not
+    erase them: the refresh says "still here", and a round that
+    forgot who it was would leave the marker saying nothing about the
+    services it is using.
+
+    Never raises: a marker that cannot be written costs the round its
+    protection from foreign sweeps, which is strictly better than
+    aborting the round.
+    """
+    existing = read_round_liveness(plan_dir)
+    payload = {
+        "plan_id": Path(plan_dir).name,
+        "round": int(round_number),
+        "heartbeat_at": time.time(),
+        "heartbeat_at_iso": datetime.now().isoformat(),
+        "pid": os.getpid(),
+        "ttl_seconds": float(ttl_seconds),
+        # The identity of the round. Kept from the previous write when
+        # the caller does not name one — a heartbeat must not make the
+        # round anonymous.
+        "owner": (
+            owner if owner is not None else str(existing.get("owner") or "")
+        ),
+        "round_pid": (
+            int(round_pid) if round_pid is not None
+            else int(existing.get("round_pid") or os.getpid())
+        ),
+        "backend_pid": (
+            int(backend_pid) if backend_pid is not None
+            else int(existing.get("backend_pid") or os.getpid())
+        ),
+        "leases": (
+            list(leases) if leases is not None
+            else list(existing.get("leases") or [])
+        ),
+    }
+    path = round_liveness_path(plan_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+        return path
+    except OSError as exc:
+        logger.warning(
+            "[service_manager] could not write round liveness %s: %s",
+            path, exc,
+        )
+        return None
+
+
+def read_round_liveness(plan_dir: Path) -> Dict[str, Any]:
+    """A plan's round-liveness marker, or ``{}`` when absent/corrupt."""
+    try:
+        data = json.loads(
+            round_liveness_path(plan_dir).read_text(encoding="utf-8"),
+        )
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def clear_round_liveness(plan_dir: Path) -> bool:
+    """Drop a plan's round-liveness marker. True when one was there."""
+    path = round_liveness_path(plan_dir)
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.warning(
+            "[service_manager] could not clear round liveness %s: %s",
+            path, exc,
+        )
+        return False
+
+
+def round_is_live(
+    plan_dir: Path, *, ttl_seconds: float = ROUND_LIVENESS_TTL_SECONDS,
+    now: Optional[float] = None,
+) -> bool:
+    """True when this plan's verification round is running.
+
+    A missing, corrupt or expired marker means "not live" — that is the
+    orphan case, and the orphan case is the one a sweep has to act on.
+    """
+    marker = read_round_liveness(plan_dir)
+    try:
+        beat = float(marker["heartbeat_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    try:
+        ttl = float(marker.get("ttl_seconds") or ttl_seconds)
+    except (TypeError, ValueError):
+        ttl = float(ttl_seconds)
+    current = time.time() if now is None else float(now)
+    age = current - beat
+    if age < 0:
+        # A heartbeat from the future is a clock problem, not a dead
+        # round — treat it as live rather than kill a running round's
+        # services over a timestamp.
+        return True
+    return age <= ttl
+
+
+# ---------------------------------------------------------------------------
+# Service events — "who owned this address, and who stopped it?"
+# ---------------------------------------------------------------------------
+#
+# The 2026-10-25 round's services were stopped by a sweep that could not
+# tell whose they were: the log said ``event=reaped`` and
+# ``round_token=""``, so the two facts a reader needs — whose service it
+# was, and which round was still using it — were both missing.
+#
+# So every stop and every reap is written down, one JSON object per line,
+# in one file per plan: ``logs/service_address_events.jsonl``. Every line
+# names the round it belongs to. The token is never the empty string: a
+# service nobody can attribute is recorded as ``"unknown"``, which says
+# "we could not tell" instead of "there was no round".
+
+
+def service_events_path(plan_dir: Path) -> Path:
+    """Where a plan's service events live."""
+    return Path(plan_dir) / "logs" / SERVICE_EVENTS_FILENAME
+
+
+def record_service_event(
+    plan_dir: Path,
+    event: str,
+    *,
+    round_token: str = "",
+    run_id: str = "",
+    name: str = "",
+    port: Optional[int] = None,
+    old_port: Optional[int] = None,
+    new_port: Optional[int] = None,
+    declared_port: Optional[int] = None,
+    pid: Optional[int] = None,
+    reason: str = "",
+    details: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    """Append one line to the plan's service event log.
+
+    ``round_token`` names the round the service belonged to. It is never
+    the empty string — an unattributable service is recorded as
+    ``"unknown"``, because "we could not tell" and "there was no round"
+    are different facts and the difference is what the 2026-10-25 log
+    lost.
+
+    ``details`` carries the event-specific facts (which reaper deferred
+    a service, whose lease it was, how old that lease's heartbeat was).
+    They are extra keys on the same line, so a reader can grep for
+    them; the keys above stay authoritative — a detail never overwrites
+    one of them.
+
+    Never raises: an event that cannot be written costs the evidence,
+    not the round.
+    """
+    payload: Dict[str, Any] = {
+        "ts": datetime.now().isoformat(),
+        "run_id": str(run_id or Path(plan_dir).name),
+        "round_token": str(round_token or UNKNOWN_ROUND_TOKEN),
+        "event": str(event),
+        "name": str(name or ""),
+        "old_port": old_port,
+        "new_port": new_port,
+        "port": port,
+        "declared_port": declared_port,
+        "pid": pid,
+        "reason": str(reason or ""),
+    }
+    if isinstance(details, dict):
+        for key, value in details.items():
+            payload.setdefault(str(key), value)
+    path = service_events_path(plan_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        return path
+    except OSError as exc:
+        logger.warning(
+            "[service_manager] could not write service event %s: %s",
+            path, exc,
+        )
+        return None
+
+
+def read_service_events(plan_dir: Path) -> List[Dict[str, Any]]:
+    """Every service event of a plan, oldest first.
+
+    A damaged line is skipped rather than raised: a broken log must not
+    hide the events around it.
+    """
+    events: List[Dict[str, Any]] = []
+    try:
+        with service_events_path(plan_dir).open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(data, dict):
+                    events.append(data)
+    except OSError:
+        return []
+    return events
+
+
+def last_reap_reason(
+    plan_dir: Path, *, name: str = "", port: Optional[int] = None,
+) -> str:
+    """Why a service was last stopped, as the event log records it.
+
+    The round that lost its service needs to say **why** it went away:
+    "the service was taken by another process" and "the service crashed"
+    are different faults, and the event log is where the first one is
+    written down. The newest ``reaped`` event for that service wins.
+
+    Returns the empty string when the log says nothing — "we do not
+    know" is not "nothing happened", so the caller has to be able to
+    tell the two apart.
+    """
+    reason = ""
+    for event in read_service_events(plan_dir):
+        if str(event.get("event") or "") != "reaped":
+            continue
+        if name and str(event.get("name") or "") != str(name):
+            continue
+        if port is not None and event.get("port") != int(port):
+            continue
+        reason = str(event.get("reason") or "")
+    return reason
 
 
 # ---------------------------------------------------------------------------
@@ -5031,6 +6320,34 @@ class ReapReport:
     @property
     def clean(self) -> bool:
         return not self.failed and not self.foreign_ports
+
+    @property
+    def deferred(self) -> List[Dict[str, Any]]:
+        """The entries this reap left alone for a live round.
+
+        A deferral is a decision, not an absence: it belongs in the
+        log, because "the sweep saw it and did not touch it" and "the
+        sweep never saw it" look the same from the outside.
+        """
+        return [
+            entry for entry in self.skipped
+            if entry.get("reason") == "reap_deferred_live_round"
+        ]
+
+    @property
+    def mismatched(self) -> List[Dict[str, Any]]:
+        """The entries this reap left alone because another round owns
+        them.
+
+        Same argument as :attr:`deferred`, one step further: a
+        round-exit reap stops what its own round owns, and the services
+        it did not own are named here rather than left to be inferred
+        from the absence of a ``reaped`` entry.
+        """
+        return [
+            entry for entry in self.skipped
+            if entry.get("reason") == "lease_owner_mismatch"
+        ]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -5083,6 +6400,196 @@ def _pid_reused(entry: Dict[str, Any]) -> bool:
     return abs(float(live) - float(recorded)) > 2.0
 
 
+def _record_reaped(
+    plan_dir: Path,
+    report: "ReapReport",
+    entry: Dict[str, Any],
+    lease_owner: str,
+    *,
+    reason: str = "",
+    detail: str = "",
+) -> None:
+    """Write down that a service was reaped, and whose it was.
+
+    The 2026-10-25 log recorded ``event=reaped`` with an empty
+    ``round_token``, so a reader could not tell which round's service
+    had been stopped — the two facts the investigation needed were both
+    missing. The token is the lease's owner (the round that took the
+    lease) and it is never empty: a service with no lease is recorded
+    as ``"unknown"``.
+
+    The **decision** is recorded too, with the pid of the process that
+    made it. The deferral event has carried both since 2026-10-25, and
+    this one did not — so the log could say that a service was stopped,
+    but not which process decided to stop it. That is the half of the
+    record an investigation actually needs: "the sweep saw that service
+    and left it alone" and "the sweep never saw it" look the same from
+    the outside, and "somebody stopped it" is no better.
+    """
+    name = str(entry.get("name") or "")
+    port = entry.get("port")
+    message = f"service {name!r} on port {port} was stopped"
+    if reason:
+        message = f"{message} (reason={reason})"
+    if detail:
+        message = f"{message}: {detail}"
+    try:
+        record_service_event(
+            plan_dir, "reaped",
+            round_token=lease_owner,
+            run_id=report.plan_id,
+            name=name,
+            port=port if isinstance(port, int) else None,
+            # 2026-10-26（合并后的口径）：**一条**事件，两边的事实 ——
+            # 地址链（``old_port`` / ``new_port`` / ``boot_id``：地址的生命
+            # 周期是条链，"给了回去"必须在那条链上留痕）与这次决定
+            # （``reaper_pid`` / ``decision``：谁决定停它、那是哪一种决定）
+            # 说的是同一件事（这个地址被收回了）。写成两条会让
+            # ``event="reaped"`` 在事件流里出现两次，读者得自己猜哪条是真的。
+            old_port=port if isinstance(port, int) else None,
+            new_port=None,
+            declared_port=entry.get("declared_port"),
+            pid=entry.get("pid"),
+            reason=message,
+            details={
+                "reaper_pid": os.getpid(),
+                "decision": REAP_DECISION_REAPED,
+                "boot_id": _pin_boot_id(
+                    entry.get("pid"), entry.get("start_epoch"),
+                ),
+            },
+        )
+    except Exception:  # noqa: BLE001 - an event write never raises
+        logger.debug(
+            "[service_manager] could not write the reap event for %s", name,
+        )
+
+
+def _record_reap_deferred(
+    plan_dir: Path,
+    report: "ReapReport",
+    entry: Dict[str, Any],
+    lease: ServiceLease,
+    *,
+    reason: str = "",
+) -> None:
+    """Write down that a reap was deferred because another round owns
+    the service.
+
+    The 2026-10-25 log could say that a service *was* stopped, but not
+    that a sweep *chose not to* stop one — so a reader who saw the
+    service die minutes later could not tell whether the sweep had
+    decided it was an orphan or had simply never noticed it. This is
+    that record: which process deferred it, whose lease it was, how old
+    that lease's heartbeat was, and which port was left alone.
+    """
+    name = str(entry.get("name") or "")
+    port = entry.get("port")
+    age = lease_heartbeat_age(lease)
+    reaper_pid = os.getpid()
+    details: Dict[str, Any] = {
+        "reaper_pid": reaper_pid,
+        "lease_owner": lease.owner,
+        "heartbeat_age": round(age, 3) if age is not None else None,
+        "port": port if isinstance(port, int) else None,
+        "decision": REAP_DECISION_DEFERRED,
+    }
+    report.skipped.append({
+        "name": name,
+        "reason": "reap_deferred_live_round",
+        **details,
+    })
+    message = (
+        f"service {name!r} on port {port} was left alone: it is leased by "
+        f"another round whose heartbeat is "
+        f"{details['heartbeat_age']}s old (reaper pid {reaper_pid})"
+    )
+    if reason:
+        message = f"{message} (reason={reason})"
+    try:
+        record_service_event(
+            plan_dir, "reap_deferred_live_round",
+            round_token=lease.owner,
+            run_id=report.plan_id,
+            name=name,
+            port=port if isinstance(port, int) else None,
+            declared_port=entry.get("declared_port"),
+            pid=entry.get("pid"),
+            reason=message,
+            details=details,
+        )
+    except Exception:  # noqa: BLE001 - an event write never raises
+        logger.debug(
+            "[service_manager] could not write the deferral event for %s",
+            name,
+        )
+
+
+def _record_lease_owner_mismatch(
+    plan_dir: Path,
+    report: "ReapReport",
+    entry: Dict[str, Any],
+    lease: ServiceLease,
+    *,
+    reason: str = "",
+    expected_owner: str = "",
+) -> None:
+    """Write down that a service was left alone because another round
+    owns it.
+
+    The round-exit reap may only stop what its own round owns. A
+    service whose lease names a different round is that round's, and
+    stopping it is what took the api service down on 2026-10-25 — the
+    round's own ``api_test`` then failed minutes later with a bare
+    "connection refused", with nothing in between that said why.
+
+    So the decision is written down: the reaper's pid, whose lease it
+    was, and whose round the reaper was ending.
+    """
+    name = str(entry.get("name") or "")
+    port = entry.get("port")
+    age = lease_heartbeat_age(lease)
+    reaper_pid = os.getpid()
+    details: Dict[str, Any] = {
+        "reaper_pid": reaper_pid,
+        "lease_owner": lease.owner,
+        "expected_owner": expected_owner,
+        "heartbeat_age": round(age, 3) if age is not None else None,
+        "port": port if isinstance(port, int) else None,
+        "decision": REAP_DECISION_OWNER_MISMATCH,
+    }
+    report.skipped.append({
+        "name": name,
+        "reason": "lease_owner_mismatch",
+        **details,
+    })
+    message = (
+        f"service {name!r} on port {port} was left alone: its lease names "
+        f"another round ({lease.owner}), not the round being ended"
+    )
+    if expected_owner:
+        message = f"{message} (ending {expected_owner})"
+    if reason:
+        message = f"{message} (reason={reason})"
+    try:
+        record_service_event(
+            plan_dir, LEASE_OWNER_MISMATCH_EVENT,
+            round_token=lease.owner,
+            run_id=report.plan_id,
+            name=name,
+            port=port if isinstance(port, int) else None,
+            declared_port=entry.get("declared_port"),
+            pid=entry.get("pid"),
+            reason=message,
+            details=details,
+        )
+    except Exception:  # noqa: BLE001 - an event write never raises
+        logger.debug(
+            "[service_manager] could not write the owner-mismatch event "
+            "for %s", name,
+        )
+
+
 def reap_services(
     plan_dir: Path,
     plan_id: str = "",
@@ -5091,11 +6598,27 @@ def reap_services(
     grace_seconds: float = 10.0,
     owner_token: Optional[str] = None,
     caller: str = "service_manager.reap_services",
+    own_round_end: Optional[bool] = None,
+    owner: str = "",
 ) -> ReapReport:
     """Stop every service this plan's ledger says the backend started.
 
     Safety, in order — each check can only *prevent* a kill:
 
+      0. The plan's verification round is still running (a fresh
+         ``round_liveness.json``) → skip. This is the check that keeps
+         one backend process's startup/shutdown sweep from taking the
+         services of *another* backend process's running round; see
+         :func:`round_is_live`. It does not apply to the plan's own
+         round-end reap, which deletes the marker first (see
+         ``own_round_end``).
+      0b. The service's **lease** names a round that is still running
+         → skip. This is the per-service version of the check above:
+         the ledger entry says which round started it and whether that
+         round is still here. It is what the 2026-10-25 sweep was
+         missing — the ledger named the process but carried no owner,
+         so the entry read as an orphan and the sweep stopped a live
+         round's service. See :func:`lease_state`.
       1. A **live** round has pinned the process → skip, and keep it
          in the ledger (2026-10-25, repair-r1-23). The pin names the
          process itself and does not need an owner token, so it covers
@@ -5131,6 +6654,55 @@ def reap_services(
     :func:`verification_agent._load_service_manager`). While a round is
     running, such an entry may belong to that round, so it is left
     alone; once no round is running it is an orphan and gets reaped.
+    Every reap is written to the plan's service event log, naming the
+    round the service belonged to — a reader must never have to guess
+    whose service was stopped.
+
+    ``own_round_end`` says "this is the plan's own round being torn
+    down", which is true of a reap that names the plan explicitly (the
+    workflow's exit hook is the only caller that does) and false of a
+    sweep over every plan's ledger (``reap_all_plans`` names no plan —
+    it does not know whose round it is ending). A round-end reap clears
+    the round-liveness marker before the checks above, so the teardown
+    the round asked for is never blocked by the round's own heartbeat.
+
+    A **cross-round** reap — one whose reason is in
+    :data:`CROSS_ROUND_REAP_REASONS` (``server_shutdown``,
+    ``startup_sweep``) — is a different animal: the process doing the
+    reaping is not the round that owns the services, and it may be
+    sharing the plans directory with that round's backend. So it decides
+    **per ledger entry**, from the entry's lease:
+
+      * the lease names another round whose heartbeat is still fresh →
+        leave the service alone and record the deferral
+        (``reap_deferred_live_round``: which process deferred it, whose
+        lease it was, how old that lease's heartbeat was);
+      * the lease names **this** process, or its heartbeat has expired →
+        collect the service as usual.
+
+    A cross-round reap never clears another round's liveness marker:
+    it is not ending that round, and clearing the marker would strip a
+    running round of the protection it has from the *next* sweep.
+
+    A **round-end** reap — one that names the plan, so it is ending
+    *this* plan's round — may only stop what its own round owns. The
+    ledger entry's lease says whose the service is:
+
+      * the lease names this round (its owner token names this
+        process, or it is the ``owner`` the caller passed in) → the
+        service is this round's to stop;
+      * the lease names **another** round whose heartbeat is still
+        fresh and whose owner is still running → that round is using
+        the service right now: leave it alone, keep its lease, and
+        record the decision (``lease_owner_mismatch``);
+      * the lease names another round whose heartbeat has expired (or
+        whose process is gone) → the other round is over, the service
+        is an orphan, and collecting it is what stops the leak.
+
+    ``owner`` is the owner token of the round being torn down
+    (``<round_id>@<backend_pid>``), when the caller knows it. It only
+    ever *adds* ownership: a lease that names this process is this
+    process's whatever the caller passed in.
 
     The ledger is cleared only when nothing failed and no foreign
     holder remains; otherwise the un-reaped entries are written back so
@@ -5147,6 +6719,24 @@ def reap_services(
     """
     plan_dir = Path(plan_dir)
     report = ReapReport(plan_id=plan_id or plan_dir.name, reason=reason)
+    cross_round = reason in CROSS_ROUND_REAP_REASONS
+    if own_round_end is None:
+        own_round_end = bool(plan_id)
+    if own_round_end and not cross_round:
+        # The round is over by definition — its marker goes first, so
+        # the guard below cannot block the teardown it asked for.
+        #
+        # A cross-round reap is NOT ending that round: it is a
+        # different backend process sweeping a directory it shares with
+        # a round that is still running. The marker stays.
+        clear_round_liveness(plan_dir)
+    # A cross-round reap reads the marker (it is somebody else's
+    # heartbeat), it never clears it and never treats it as "my round
+    # is over".
+    round_live = (
+        False if (own_round_end and not cross_round)
+        else round_is_live(plan_dir)
+    )
     ledger = read_ledger(plan_dir)
     entries = ledger.get("services")
     if not isinstance(entries, list) or not entries:
@@ -5160,19 +6750,28 @@ def reap_services(
     pins = live_round_pins(plan_dir)
     released_pins: set = set()
 
-    def _record_reaped(
+    def _record_address_reaped(
         entry: Dict[str, Any], name: str, port: int,
+        round_token: str = "",
     ) -> None:
         """Write down that an address was given back (2026-10-25).
 
         The reap is the end of an address's life, and the chain has to
         say so — otherwise a reader sees an address appear and never
         sees it go.
+
+        2026-10-26（合并后的口径）：``round_token`` **不许是空的** ——
+        读者要能从这一行知道这个地址是谁的。租约的持有者就是它；租约
+        不在时退回这次清扫自己的 token；连那个都没有就写 ``unknown``
+        （"查不出来"与"没有这一轮"是两件事）。
         """
         _emit_address_event(
             None, plan_dir, "reaped",
             run_id=plan_id or plan_dir.name,
-            round_token=str(entry.get("owner_token") or caller_token or ""),
+            round_token=str(
+                round_token or entry.get("owner_token") or caller_token
+                or UNKNOWN_ROUND_TOKEN
+            ),
             old_port=port, new_port=None,
             declared_port=entry.get("declared_port") or port,
             pid=entry.get("pid"),
@@ -5221,6 +6820,89 @@ def reap_services(
             )
             survivors.append(entry)
             continue
+        lease = ServiceLease.from_dict(entry.get(LEASE_KEY))
+        lease_owner = lease.owner if lease else ""
+        owned_by_me = lease_is_owned_by(lease, os.getpid())
+        # The round being torn down may name itself; a lease that names
+        # it is this round's even when the caller could not derive the
+        # owner from the process.
+        mine = owned_by_me or (
+            bool(owner) and lease is not None and lease.owner == owner
+        )
+        if own_round_end and not cross_round and lease is not None and not mine:
+            # This teardown ends *this* plan's round. The lease names a
+            # different round, so the service is not this round's to
+            # stop — and on 2026-10-25 stopping it is what left the
+            # round's own api_test with a bare "connection refused".
+            #
+            # A live lease (fresh heartbeat, owner still running) is
+            # somebody else's service in use right now: leave it alone,
+            # keep its lease, and write the decision down.
+            #
+            # A lease that has aged out of its window is not a live
+            # round — it is an orphan, and collecting it is what stops
+            # the leak. The same rule the cross-round sweep applies —
+            # literally the same judgment, so the two cannot drift.
+            if lease_is_held_by_a_live_round(lease):
+                _record_lease_owner_mismatch(
+                    plan_dir, report, entry, lease,
+                    reason=reason, expected_owner=owner,
+                )
+                survivors.append(entry)
+                continue
+            # The other round's lease has expired, or the round that
+            # took it is gone: the service is an orphan. Fall through
+            # and collect it.
+        if cross_round and lease is not None and not owned_by_me:
+            # This reaper is not the round. The lease says whose the
+            # service is, and the heartbeat says whether that round is
+            # still speaking.
+            #
+            # Both have to hold: the heartbeat says the round is
+            # speaking, and the owner being alive says it is still
+            # there to be spoken for. A lease whose owner is provably
+            # gone is a round that ended — the service is an orphan
+            # then, and collecting it is what stops the leak.
+            #
+            # The judgment is the one the round-exit path above makes
+            # (``lease_is_held_by_a_live_round``): a backend booting
+            # (``startup_sweep``) and a backend going down
+            # (``server_shutdown``) see the same plans directory, so
+            # they must reach the same verdict on the same entry.
+            if lease_is_held_by_a_live_round(lease):
+                # Another round is using it: leave it alone, and write
+                # the deferral down — a deferral nobody can read is a
+                # silent failure.
+                _record_reap_deferred(
+                    plan_dir, report, entry, lease, reason=reason,
+                )
+                survivors.append(entry)
+                continue
+            # The lease has expired, or the round that took it is gone:
+            # the service is an orphan. Fall through and collect it.
+        if round_live and not (cross_round and owned_by_me):
+            # The round that owns these services is still running. The
+            # entries stay in the ledger so a later sweep can still
+            # find them — this is a deferral, not a release.
+            #
+            # A cross-round reap of a service this process owns is
+            # exempt: the marker is about a round, and this reaper is
+            # the one ending it.
+            report.skipped.append(
+                {"name": name, "reason": "plan-round-live"}
+            )
+            survivors.append(entry)
+            continue
+        if not own_round_end and not cross_round and lease_state(lease) == "live":
+            # The service is leased by a round that is still running —
+            # this is the per-service evidence the 2026-10-25 sweep was
+            # missing. The entries stay in the ledger: this is a
+            # deferral, not a release.
+            report.skipped.append(
+                {"name": name, "reason": "lease-live"}
+            )
+            survivors.append(entry)
+            continue
         if not isinstance(port, int):
             report.skipped.append(
                 {"name": name, "reason": "ledger entry has no usable port"}
@@ -5247,7 +6929,11 @@ def reap_services(
 
         if not probe.listening:
             report.reaped.append(name)  # already gone; nothing to do
-            _record_reaped(entry, name, port)
+            # The address chain still has to close: a reader sees the
+            # address appear and must see it go.  No decision is written
+            # here -- nothing was stopped, so there is no decision to
+            # record (and "reaped" would claim one).
+            _record_address_reaped(entry, name, port, lease_owner)
             continue
 
         # The process is still there.  Is it **in use**?  A live round
@@ -5258,7 +6944,25 @@ def reap_services(
         pin_index = _pin_covers_entry(entry, pins)
         if pin_index is not None:
             pin = pins[pin_index]
-            if _pin_is_in_use(pin, plan_dir, caller_token):
+            # 2026-10-26（合并后的口径）：**别人的租约说了算，不是 pin**。
+            #
+            # 这一条讲的是**别的**那一轮：租约说它还在不在说话（心跳新鲜
+            # ＋ 持有者活着）。租约说它已经不在了 —— 写下这个 pin 的那一轮
+            # 早就结束了 —— 那这个 pin 就不能再挡住任何东西：否则一个已经
+            # 结束的轮次留下的服务永远收不掉，端口一直占着（这正是负控要
+            # 钉住的那件事）。租约说它还在 → 上面那一段早就把它**推迟**
+            # 了，根本走不到这里。
+            #
+            # 自己的轮次不看租约：pin 才是那件事的证据 —— 2026-10-24 那
+            # 次事故的形状就是服务没有 owner token，只有 pin。
+            foreign_lease_is_over = (
+                lease is not None
+                and not owned_by_me
+                and not lease_is_held_by_a_live_round(lease)
+            )
+            if foreign_lease_is_over:
+                released_pins.add(pin_index)
+            elif _pin_is_in_use(pin, plan_dir, caller_token):
                 report.skipped.append({
                     "name": name,
                     "reason": "reap_skipped_pinned",
@@ -5332,7 +7036,10 @@ def reap_services(
         )
         if stop_info.get("port_free"):
             report.reaped.append(name)
-            _record_reaped(entry, name, port)
+            _record_reaped(
+                plan_dir, report, entry, lease_owner, reason=reason,
+                detail=str(stop_info.get("detail") or ""),
+            )
             continue
 
         # Still held. If the holder still matches the declaration it is
@@ -5360,7 +7067,10 @@ def reap_services(
             )
             if second.get("port_free"):
                 report.reaped.append(name)
-                _record_reaped(entry, name, port)
+                _record_reaped(
+                    plan_dir, report, entry, lease_owner, reason=reason,
+                    detail=str(second.get("detail") or ""),
+                )
                 continue
             report.failed.append({
                 "name": name,

@@ -1,5 +1,0 @@
-# The captures this directory is for: page snapshots and console logs.
-# They are per-run debugging artefacts, they carry the identifiers of
-# whatever was on screen, and nothing reads them afterwards.
-*.yml
-*.log

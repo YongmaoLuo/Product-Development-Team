@@ -1869,6 +1869,24 @@ class VerificationOrchestrator:
                 added_item[key] = replacement[key]
             elif original.get(key) is not None:
                 added_item[key] = original[key]
+        # 2026-10-27 (merge): the replacement carries the **expected
+        # result** as well.  The delta module refuses to issue an id for
+        # a point that does not say what it verifies (2026-10-26,
+        # VP-031), and the replacement is not exempt from that rule: a
+        # criterion replaced by a point that states no expectation is a
+        # criterion replaced by silence, and the whole replacement — the
+        # obsolete mark on the old criterion included — would then be
+        # refused with the plan left untouched.  The proposal states the
+        # expectation if it can; otherwise it is inherited from the
+        # criterion it replaces, for the same reason the PRD criterion
+        # and the phase are.
+        expected_result = str(
+            replacement.get("expected_result")
+            or original.get("expected_result")
+            or ""
+        )
+        if expected_result.strip():
+            added_item["expected_result"] = expected_result
         for key in (
             "request", "assertions", "target_url", "timeout_seconds",
             "execution_group",

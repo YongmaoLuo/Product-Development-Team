@@ -52,11 +52,13 @@ import copy
 import hashlib
 import json
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from utils import atomic_io
+from utils.atomic_io import atomic_write_json
 from verification_phases import PHASE_CORE, PHASE_FINAL_GATE
 
 #: 已废弃 VP 的标记字段（执行器据此跳过，不进任何统计桶）。
@@ -86,6 +88,27 @@ REPLACEMENT_FOR_FIELD = "replacement_for"
 #: 占位必须落在 delta state 里：**基础计划不能被改写** —— 它是「这一轮判据
 #: 是什么」的唯一权威，注入占位条目会让判据与实际执行的东西对不上。
 ALLOCATED_IDS_KEY = "allocated_vp_ids"
+
+
+#: 计划里记录"这条定义是在哪次提交上写下的"。
+DEFINED_AT_HEAD_FIELD = "defined_at_head"
+
+#: 一条 VP **定义**必须自带的字段 —— 缺任何一条都不许占号。
+#:
+#: 2026-10-26（VP-031）：增量评估发过 VP-031 / 032 / 033 这三个号，但
+#: 它们的定义从未落进 ``verification_plan.json``（那份文件至今仍是 30 条）。
+#: 于是执行器**无定义可分派** —— 那三条 VP 这一轮一次都没跑；它们此前
+#: 挣到的失败被原样沿用，报告里 VP-031 的 title / expected_result 是空的，
+#: 失败却是"真的"。占了号却没有定义，比不占号更糟：多出来的那个 id 在
+#: 计划里查不到，谁也说不清它要验什么。
+#:
+#: 所以发号之前先验定义：三个字段缺一不可，方法还必须是**受支持**的
+#: （``verification_subagent.SUPPORTED_METHODS`` —— 唯一那一份清单）。
+REQUIRED_DEFINITION_FIELDS: Tuple[str, ...] = (
+    "title",
+    "verification_method",
+    "expected_result",
+)
 
 _ID_RE = re.compile(r"^VP-(\d+)$")
 
@@ -272,6 +295,125 @@ def vp_definition_gaps(vp: Dict[str, Any]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# 定义完整性（2026-10-26）
+# ---------------------------------------------------------------------------
+#
+# 「这条 VP 到底要验什么」由定义说了算。定义不完整（没标题、没方法、没
+# 预期结果）时，框架**没有办法核对**跑出来的结论 —— 它既不知道该跑什么，
+# 也不知道跑出来的算不算数。于是这种条目不许占号。
+
+
+def supported_methods() -> Tuple[str, ...]:
+    """当前受支持的验证方法。
+
+    唯一那一份清单在 :mod:`verification_subagent`（``SUPPORTED_METHODS``）。
+    这里**不复制**它：两份清单必然漂移，而漂移的产物是"一条用着已退役
+    方法的 VP 被写进计划"，它跑不出结论也删不掉。
+    """
+    from verification_subagent import SUPPORTED_METHODS
+
+    return SUPPORTED_METHODS
+
+
+def missing_definition_fields(item: Any) -> List[str]:
+    """这条条目**缺**哪些定义字段（空列表 = 定义完整）。
+
+    Args:
+        item: 一条增量条目，或计划里的一条 VP（两种 schema 的字段名一致：
+            ``title`` / ``verification_method`` / ``expected_result``）。
+
+    Returns:
+        缺失字段的列表。方法不受支持时也列在这里（值里带上那个方法名，
+        便于日志直接看出是"方法过时"而不是"方法没写"）。
+    """
+    if not isinstance(item, dict):
+        return list(REQUIRED_DEFINITION_FIELDS)
+
+    missing: List[str] = []
+    if not str(item.get("title") or "").strip():
+        missing.append("title")
+
+    method = str(item.get("verification_method") or "").strip()
+    if not method:
+        missing.append("verification_method")
+    elif method not in supported_methods():
+        missing.append(f"verification_method={method!r}(不受支持)")
+
+    if not str(item.get("expected_result") or "").strip():
+        missing.append("expected_result")
+
+    return missing
+
+
+def definition_is_complete(item: Any) -> bool:
+    """这条条目构成一份**完整**的定义吗？"""
+    return not missing_definition_fields(item)
+
+
+def current_git_head(project_dir: Optional[Path]) -> str:
+    """``project_dir`` 当前的 git HEAD（取不到就返回空串）。
+
+    空串意味着"不知道判它的是哪次提交" —— 调用方据此走"无法证明出处"
+    那一条路（与 :mod:`verification_verdict_provenance` 的"没有指纹 =
+    失效"同一个方向）。
+
+    只读一次 git，不写任何东西；git 不可用（不是仓库、没有 git）时
+    安静地返回空串 —— 记不出 HEAD 不该拦住一轮验证。
+    """
+    if not project_dir:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def materialize_plan(
+    plan_data: Dict[str, Any],
+    plan_file: Path,
+    *,
+    head: str = "",
+) -> Dict[str, Any]:
+    """把计划**原子**写回 ``verification_plan.json``。
+
+    为什么必须落盘：增量评估发出去的 id 只有带着定义落进计划文件，下
+    一轮（以及任何别的进程）才知道"VP-031 到底要验什么"。只在内存里发号
+    的话，执行器看到的是一份没有这条定义的计划 —— 它无定义可分派，那条
+    VP 既没跑、也没被记成"跑不了"，只剩一条历史失败被沿用（VP-031）。
+
+    写失败**不抛**：这一轮照常继续（内存里的计划仍然完整），但摘要里
+    会记下失败原因 —— 静默的写失败正是"定义没落盘"这类事故的成因。
+
+    Returns:
+        ``{"written": bool, "path": str, "head": str, "error": str}``
+    """
+    result: Dict[str, Any] = {
+        "written": False,
+        "path": str(plan_file),
+        "head": head,
+        "error": "",
+    }
+    try:
+        atomic_write_json(
+            plan_file, plan_data, indent=2, ensure_ascii=False, reraise=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — 写不下去不能毁掉这一轮
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    result["written"] = True
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 结果契约
 # ---------------------------------------------------------------------------
 
@@ -365,6 +507,11 @@ DELTA_SYSTEM_PROMPT = f"""你是资深测试架构师，负责维护一份**已�
    请求头，它的断言因此永远无法满足。这时在 `obsolete` 里写明原因把它标记
    掉，同时在 `add` 里给出表达正确的那一条（`request` 与 `assertions` 写全）。
    作废是标记不是删除，审计痕迹要留着。
+
+10. **每条新增必须自带完整定义**：标题、方法、预期结果三样缺一不可（方法
+   只能是上表里的五个）。缺任何一样，这条新增**不会占号** —— 2026-10-26：
+   占了号却没有定义的验证点谁也分派不了，它此前挣到的失败还会被沿用成
+   别的轮次的结论。
 
 输出必须是**纯 JSON**（不要 markdown 代码块）：
 
@@ -578,6 +725,9 @@ def apply_delta(
     reserved_ids: Optional[Iterable[str]] = None,
     *,
     avoid_ids: Iterable[str] = (),
+    plan_file: Optional[Path] = None,
+    project_dir: Optional[Path] = None,
+    head: Optional[str] = None,
 ) -> Dict[str, Any]:
     """就地应用增量，返回可写日志的摘要。
 
@@ -599,6 +749,16 @@ def apply_delta(
     不落进计划，也不占掉一个 id。理由见 :func:`vp_definition_gaps`：号已经
     发出去了、条目却被整条丢掉，会在分配账本上留下一个"有 id、无定义"的
     占位，而执行器对这种条目没有分派前校验，会按缺省方法把它派出去。
+
+    2026-10-26（VP-031）：**发号之前先验定义**。标题 / 受支持的方法 /
+    预期结果缺任何一条，这条条目就**不占号**（``rejected_incomplete`` 里
+    留痕）。占了号却没有定义的条目，执行器无定义可分派 —— 它既没跑，也
+    没被记成"跑不了"，只剩一条历史失败被沿用。
+
+    给了 ``plan_file`` 就把计划**原子**写回那份文件：发出去的号必须带着
+    定义一起落地，否则下一轮读到的仍是一份没有这条定义的计划。写入时
+    的 git HEAD 一并记在摘要（``written_head``）与每条新 VP 上
+    （``defined_at_head``）—— 裁决要钉住"判它的是哪次提交"。
     """
     points = plan_data.setdefault("verification_points", [])
     summary: Dict[str, Any] = {
@@ -611,6 +771,11 @@ def apply_delta(
         # 是因为它们是被**丢掉的** —— 静默丢弃的话，审计里看不出"这一轮
         # 评估新增了几条、丢了几条、丢在哪儿"。
         "rejected_definitionless": [],
+        # 2026-10-26（VP-031）：同一个拒绝的**另一种口径** —— 特性分支
+        # 把"定义不完整"的条目记在这里（字段名不同，说的是同一件事：
+        # 这条产不出完整定义）。两个键都留着：谁按哪边的口径读摘要都
+        # 读得到"这条被丢了、丢在哪儿"。
+        "rejected_incomplete": [],
         # 2026-10-25（VP-031）：本次**发出去过**的号。
         #
         # 它与 ``added`` 不是一回事：``added`` 是"落进计划"的条目，而这里
@@ -618,6 +783,10 @@ def apply_delta(
         # 去了，只是没落进计划）。发号账本记的是后者：这个号已经被用过，
         # 重新发出去会让新验证点继承旧号的裁决。
         "allocated_vp_ids": [],
+        # 2026-10-26（VP-031）：发出去的号有没有带着定义**落进计划文件**。
+        "materialized": False,
+        "materialize_error": "",
+        "written_head": "",
     }
     reserved = {
         str(rid).strip().upper()
@@ -625,25 +794,63 @@ def apply_delta(
         if str(rid or "").strip()
     }
 
+    resolved_head = head if head is not None else current_git_head(project_dir)
+    summary["written_head"] = resolved_head
+
     for item in delta.added:
+        missing = missing_definition_fields(item)
+        if missing:
+            # 定义不完整 → **不发号**。见模块里 REQUIRED_DEFINITION_FIELDS
+            # 的注释：占了号却没有定义，比不占号更糟。
+            delta.rejected_additions.append(
+                {
+                    "item": item,
+                    "why": (
+                        "定义不完整，缺少："
+                        + "、".join(missing)
+                        + "（不占号：占了号却没有定义的 VP 谁也分派不了）"
+                    ),
+                }
+            )
+            summary["rejected_incomplete"].append(
+                {
+                    "title": str(item.get("title", "")),
+                    "missing": list(missing),
+                }
+            )
+            # 同一个拒绝也要落进 main 的 ``rejected_definitionless``：
+            # 两边的键名不同，说的是同一件事（"这条产不出完整定义"）。
+            # 两边都写，按哪边的口径读摘要都读得到这条被丢了。
+            summary["rejected_definitionless"].append(
+                {
+                    "title": str(item.get("title", "")),
+                    "gaps": list(missing),
+                }
+            )
+            continue
         vp = {
             # id 在下面发 —— 只在定义完整时才发（见本函数末尾的注释）。
             "id": "",
             "title": str(item.get("title", "")).strip(),
             "related_prd_criteria": str(item.get("related_prd_criteria", "")),
             # 2026-09-19: 默认值不再是退休的 ``automated_test``。空串会被
-            # ``_maybe_evaluate_plan_delta`` 的护栏整条丢掉 —— "宁可少一条
+            # ``_maybe_evaluate_plan_delta`` 的护栏整条丢弃 —— "宁可少一条
             # VP，也不要一条永远跑不出结论的验收点"，而不是凭空造一个已经
             # 不存在的 method 塞进计划。
+            # 2026-10-26: 方法与预期结果在发号前已经验过非空，这里不再
+            # 兜默认值 —— 兜底等于把"没写"变成"写了默认"，那份默认没人
+            # 核对过。
             "verification_method": str(item.get("verification_method", "")),
             "priority": str(item.get("priority", "medium")),
-            "expected_result": str(item.get("expected_result", "验证通过")),
+            "expected_result": str(item.get("expected_result", "")),
             # 2026-09-19: VP 早已没有 ``test_command``（C8 删掉了它）。这里
             # 曾经把 delta 里的 ``test_command`` 透传进来，等于给新 VP 重新
             # 塞一个已经退休的字段，让下游按"有命令可跑"去理解它。
             "verification_phase": _declared_phase(item),
             ADDED_REASON_FIELD: str(item.get("reason", "")),
             ADDED_ROUND_FIELD: round_number,
+            # 2026-10-26: 这条定义是在哪次提交上写下的。
+            DEFINED_AT_HEAD_FIELD: resolved_head,
         }
         # 2026-10-14: 判据载荷原样透传。见 ADD_THROUGH_FIELDS。
         for key in ADD_THROUGH_FIELDS:
@@ -687,6 +894,21 @@ def apply_delta(
         summary["obsoleted"].append(
             {"id": item["id"], "reason": item["reason"]}
         )
+
+    # 拒绝计数在最后统一算 —— apply_delta 自己也会往
+    # ``rejected_additions`` 里追加（定义不完整的条目）。
+    summary["rejected_additions"] = len(delta.rejected_additions)
+    summary["rejected_obsoletes"] = len(delta.rejected_obsoletes)
+    summary["rejected_modifications"] = len(delta.rejected_modifications)
+
+    # 2026-10-26: 发出去的号必须带着定义**落进计划文件**。只在内存里发号
+    # 的话，下一轮读到的仍是一份没有这条定义的计划（VP-031）。
+    if plan_file is not None and (summary["added"] or summary["obsoleted"]):
+        materialized = materialize_plan(
+            plan_data, plan_file, head=resolved_head,
+        )
+        summary["materialized"] = bool(materialized.get("written"))
+        summary["materialize_error"] = str(materialized.get("error", ""))
 
     return summary
 
@@ -800,6 +1022,7 @@ def apply_delta_persisted(
     expected_digest: Optional[str] = None,
     avoid_ids: Iterable[str] = (),
     reserved_ids: Optional[Iterable[str]] = None,
+    head: Optional[str] = None,
 ) -> Dict[str, Any]:
     """把一次增量**原子地**落到 ``plan_file``；失败时内存不领先磁盘。
 
@@ -847,6 +1070,10 @@ def apply_delta_persisted(
         reserved_ids: 历轮分配出去、但不在计划里的 id（占位集合）。与
             ``avoid_ids`` 取并集 —— 两者说的是同一件事的两种读法：占位用来
             拒绝"复用旧号"，账本用来避开"发过的号"。
+        head: 写盘时这一轮判在**哪次提交**上（``git rev-parse HEAD``）。它会
+            盖在每条新的定义上（``defined_at_head``），并进摘要的
+            ``written_head`` —— 结论只对产生它的那份代码有效。没给的时候
+            ``apply_delta`` 自己去问 git。
 
     Returns:
         可写日志的摘要（与 :func:`apply_delta` 同一个形状）：``added`` /
@@ -873,7 +1100,7 @@ def apply_delta_persisted(
     try:
         summary = apply_delta(
             candidate, delta, round_number, avoid_ids=avoid,
-            reserved_ids=reserved_ids,
+            reserved_ids=reserved_ids, head=head,
         )
     except Exception as exc:
         raise PlanDeltaPersistError(f"应用增量失败：{exc}") from exc
@@ -1088,3 +1315,53 @@ def record_allocated_vp_ids(
         state["allocated_vp_ids"] = allocated
         save_delta_state(plan_dir, state)
     return allocated
+
+
+def build_delta_state(
+    previous: Optional[Dict[str, Any]],
+    *,
+    seen_task_ids: List[str],
+    round_number: int,
+    summary: Optional[Dict[str, Any]] = None,
+    head: str = "",
+) -> Dict[str, Any]:
+    """把本轮的增量评估结果落进 delta state。
+
+    state 记三样东西：
+
+    * ``seen_task_ids`` —— 哪些任务已经看过（决定下一轮要不要评估）；
+    * ``allocated_vp_ids`` —— **发出去过**的号（累计，不随轮次清零）。
+      这是"哪些 VP 是增量评估发的"的唯一记录；2026-10-26 的 VP-031 就是
+      一个发出去过、却没人说得清它要验什么的号；
+    * ``written_head`` —— 写入这些定义时的 git HEAD。裁决要钉住"判它的是
+      哪次提交"，发出去的号也一样 —— 否则跨提交沿用无从发现。
+
+    Args:
+        previous: 上一轮的 state（``load_delta_state`` 的结果）。``None``
+            或空 dict 都可以。
+        seen_task_ids: 本轮已看过的任务 id。
+        round_number: 本轮轮次。
+        summary: 本轮的增量摘要（``apply_delta`` 的返回值）。
+        head: 写入这些定义时的 git HEAD。缺省时取 ``summary`` 里的
+            ``written_head``。
+    """
+    prev = previous if isinstance(previous, dict) else {}
+    allocated: List[str] = [
+        str(vp_id) for vp_id in (prev.get("allocated_vp_ids") or [])
+    ]
+    for vp_id in (summary or {}).get("allocated_vp_ids") or []:
+        vp_id = str(vp_id)
+        if vp_id not in allocated:
+            allocated.append(vp_id)
+
+    written_head = head or str((summary or {}).get("written_head") or "")
+    if not written_head:
+        written_head = str(prev.get("written_head") or "")
+
+    return {
+        "seen_task_ids": list(seen_task_ids),
+        "round": round_number,
+        "last_delta": summary or {},
+        "allocated_vp_ids": allocated,
+        "written_head": written_head,
+    }

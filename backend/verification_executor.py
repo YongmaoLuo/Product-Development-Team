@@ -121,6 +121,13 @@ logger = logging.getLogger(__name__)
 #: what the orchestrator reports to the judgment phase).
 ALLOWED_STATUSES = ("PASSED", "FAILED", "SKIPPED", "BLOCKED", "DEFERRED")
 
+#: 裁决里"判它的是哪次提交"的字段名。
+#:
+#: 2026-10-27：与 :data:`verification_agent.JUDGED_HEAD_FIELD` 是同一个
+#: 字符串。那个模块 import 本模块，反向 import 会成环，所以这里各写一份
+#: —— 由一条测试钉住两者相同，不靠人记。
+JUDGED_HEAD_FIELD = "judged_head"
+
 #: Required keys for a valid verdict payload. The contract is
 #: position-free: any extra keys are ignored.
 REQUIRED_VERDICT_KEYS = ("status", "reasons", "evidence")
@@ -356,11 +363,24 @@ class VerificationExecutor(BaseExecutor):
         plan_dir: Path,
         sub_agent_runner: Callable[[Dict[str, Any]], Any],
         verif_repo: Optional[Any] = None,
+        current_head: str = "",
     ) -> None:
         self.verification_plan = verification_plan
         self.plan_id = plan_id
         self.plan_dir = Path(plan_dir)
         self.sub_agent_runner = sub_agent_runner
+
+        # 2026-10-27：这一轮跑的是哪次提交。Phase 2 全量关卡的结论**只对
+        # 产生它的那份代码有效** —— 上一轮的门禁结论不能算本轮的"终态
+        # 成功"（那会让这一轮直接跳过它，报告里那份结论冒充本轮的结论）。
+        # 这个值不参与"要不要重跑"的判断（那条判据是"本轮跑没跑"），它只
+        # 用来在审计痕迹里说清"旧结论判在哪棵树上"。空串 = 不知道当前
+        # HEAD，无从比较时不猜（与 ``requires_reexecution`` 同一个方向）。
+        self._current_head = str(current_head or "")
+        # 本轮**真的产出过**结论的 VP id。库里水合回来的历史结论不在其中
+        # —— 报告层据此把"本轮没跑"的 Phase 2 关卡记成 ``DEFERRED``，
+        # 而不是把上一轮的结论原样端上来。
+        self._executed_this_round: Set[str] = set()
 
         # Optional state-machine routing for the verdict callback
         # chain. When provided, ``record_verdict`` /
@@ -512,6 +532,10 @@ class VerificationExecutor(BaseExecutor):
         ``actual_result`` 还是上一轮的原文）：它是上一轮的一条孤儿裁决，
         每轮原样流进报告，再被修复生成器读成"本轮失败"，修复环因此
         永远收敛不了。判据与分桶侧共用 :meth:`_orphaned_vp_ids`。
+        2026-10-27：每条裁决都带 ``executed_this_round`` —— 这条结论是
+        **本轮**跑出来的，还是从库里水合回来的历史结论。报告层据此把
+        "本轮没跑"的 Phase 2 全量关卡记成 ``DEFERRED``（而不是把上一轮
+        的结论原样端上来冒充本轮的结论）。
 
         Returns:
             A list of ``{"vp_id": str, "status": str, "reasons": list,
@@ -536,6 +560,9 @@ class VerificationExecutor(BaseExecutor):
                 continue
             entry = dict(verdict)  # defensive copy
             entry["vp_id"] = vp_id
+            entry["executed_this_round"] = (
+                str(vp_id) in self._executed_this_round
+            )
             out.append(entry)
         return out
 
@@ -823,6 +850,9 @@ class VerificationExecutor(BaseExecutor):
         # 没有这份指纹，resume 路径会按 id 把上一轮的结论继承过来。
         verdict = self._stamp_definition_fingerprint(vp_id, verdict)
         self._verdicts[vp_id] = dict(verdict)  # defensive copy
+        # 2026-10-27：这条结论是**本轮**写下的 —— 报告层据此区分"本轮的
+        # 结论"与"从库里水合回来的历史结论"。
+        self._executed_this_round.add(str(vp_id))
         # Idempotent removal: ``list.remove`` would raise if the vp
         # is not in the pending list, which would mask a benign
         # double-record. Use a filter to keep behaviour predictable.
@@ -1217,6 +1247,62 @@ class VerificationExecutor(BaseExecutor):
                 return vp.get("test_command")
         return None
 
+    @staticmethod
+    def _judged_head_of(verdict: Any) -> str:
+        """一条裁决里"判它的那次提交"（顶层或 ``evidence`` 里）。
+
+        两处都读，与 :meth:`verification_agent.Orchestrator._judged_head_of`
+        同一个口径：顶层是内存路径，``evidence`` 是落库路径 ——
+        ``VerificationRepository.append_verdict`` 只保留固定几个字段，
+        ``evidence`` 是唯一能原样落库的地方。
+        """
+        if not isinstance(verdict, dict):
+            return ""
+        head = str(verdict.get(JUDGED_HEAD_FIELD) or "")
+        if head:
+            return head
+        evidence = verdict.get("evidence")
+        if isinstance(evidence, dict):
+            return str(evidence.get(JUDGED_HEAD_FIELD) or "")
+        return ""
+
+    def _is_final_gate_vp(self, vp_id: str) -> bool:
+        """这个 id 是不是 Phase 2 的全量关卡。"""
+        for vp in self._plan_points():
+            if isinstance(vp, dict) and str(vp.get("id")) == str(vp_id):
+                return is_final_gate(vp)
+        return False
+
+    def _unexecuted_gate_verdict_ids(self) -> List[str]:
+        """Phase 2 关卡里"**本轮没跑**"的历史结论。
+
+        整仓门禁的结论只对产生它的那份代码有效，而且只对**产出它的那一
+        轮**有效 —— 判在别的提交上（或者压根没记判在哪次提交上）的那份
+        同样不算数。
+
+        **判据不看树，只看"本轮跑没跑"。** 同一棵树上上一轮跑出来的门禁
+        结论也一样不算数：它说的确实是当前这份代码，但它不是**这一轮**
+        挣来的 —— 报告里若把它原样写成 PASSED，"整仓门禁通过"这个合入
+        判据就成了上一轮的结论，而这一轮根本没验过。让它重跑一遍，判据
+        才在这一轮成立（代价是整仓门禁每轮都要真跑一次）。
+
+        只对 Phase 2 全量关卡生效：Phase 1 的结论另有出处判据（命令指
+        纹）与重跑契约（``FAILED`` 每轮重跑），不在这里动。
+
+        与 :func:`verification_verdict_provenance.is_stale` 同向：**没有出
+        处 = 失效** —— 只是这里问的是"有没有出处"，问的其实是"这一轮
+        有没有真的跑"。
+        """
+        unexecuted: List[str] = []
+        for vp_id in self._verdicts:
+            key = str(vp_id)
+            if key in self._executed_this_round:
+                continue  # 本轮真跑出来的
+            if not self._is_final_gate_vp(key):
+                continue
+            unexecuted.append(key)
+        return unexecuted
+
     def _backfill_index_lists_from_verdicts(self) -> None:
         """Recompute the index lists from ``_verdicts``.
 
@@ -1336,6 +1422,28 @@ class VerificationExecutor(BaseExecutor):
         self._failed_vps = buckets[BUCKET_FAILED]
         self._skipped_vps = buckets[BUCKET_SKIPPED]
         self._deferred_vps = buckets[BUCKET_DEFERRED]
+
+        # 2026-10-27：Phase 2 全量关卡的历史结论若**本轮没跑**，它就不算
+        # "终态成功"。摘出完成/跳过桶 → ``BaseExecutor.run`` 的
+        # ``completed_set``（completed ∪ skipped）不再包含它 → 这一轮它
+        # 会真的再跑一遍，而不是把上一轮的结论端上来当本轮的结论。
+        unexecuted_gate_ids = set(self._unexecuted_gate_verdict_ids())
+        if unexecuted_gate_ids:
+            self._completed_vps = [
+                vp_id for vp_id in self._completed_vps
+                if vp_id not in unexecuted_gate_ids
+            ]
+            self._skipped_vps = [
+                vp_id for vp_id in self._skipped_vps
+                if vp_id not in unexecuted_gate_ids
+            ]
+        # Keep BaseExecutor's view of the same buckets in sync: the resume
+        # path's ``completed_set`` is built from those three fields, and
+        # this method is called from more than one place (load, crash
+        # recovery) — a mirror that only some of them refresh would let
+        # the two views drift.
+        for name, attr in _TERMINAL_BUCKET_MIRROR_ATTR.items():
+            setattr(self, attr, list(getattr(self, _BUCKET_MEMBER_ATTR[name])))
 
     # ------------------------------------------------------------------
     # Crash-recovery pass
@@ -1492,6 +1600,9 @@ class VerificationExecutor(BaseExecutor):
         # properties observe the recovered state.
         self._verdicts[vp_id] = dict(verdict)
         self._pending_vps = [v for v in self._pending_vps if v != vp_id]
+        # 2026-10-27：崩溃恢复合成的失败是**这一轮**的结论（框架此刻才
+        # 写下它），不是从库里水合回来的历史结论。
+        self._executed_this_round.add(str(vp_id))
         self._backfill_index_lists_from_verdicts()
 
         # Reset the in-flight signal BEFORE persisting so the
@@ -1788,6 +1899,9 @@ class VerificationExecutor(BaseExecutor):
         # 的结论永远没有指纹，每一轮都会全量重跑。
         result = self._stamp_definition_fingerprint(item_id, result)
         self._verdicts[item_id] = result
+        # 2026-10-27：这条结论是**本轮**跑出来的（见 ``record_verdict``
+        # 的同一条记号）。
+        self._executed_this_round.add(str(item_id))
         status = result.get("status", "FAILED")
         # 2026-08-25: contract change — ``completed_vps`` is now
         # PASSED-only. Failed VPs live in ``failed_vps``,
@@ -2421,10 +2535,22 @@ class VerificationExecutor(BaseExecutor):
         layer: List[Dict[str, Any]],
         reason: str,
     ) -> None:
-        """把整层 Phase 2 VP 标为 ``DEFERRED``（本轮延后，下轮重跑）。"""
+        """把整层 Phase 2 VP 标为 ``DEFERRED``（本轮延后，下轮重跑）。
+
+        2026-10-27：这条关卡**本轮没跑**，所以它不能带着上一轮的结论
+        （``PASSED`` 或 ``FAILED``）进报告。那份历史结论在这里直接作废，
+        替换成 ``DEFERRED``；旧结论留在 ``evidence`` 里作审计痕迹（"被
+        丢掉的是哪条旧结论、它判在哪次提交上"）。
+
+        作废的理由分两种，报告里要能看出是哪一种：判在**别的提交**上
+        （那份结论说的不是当前这份代码），或者判在**同一棵树**上但本轮
+        压根没跑（它不是这一轮挣来的结论）。
+        """
+        unexecuted_gate_ids = set(self._unexecuted_gate_verdict_ids())
         for item in layer:
             item_id = self._derive_item_id(item)
-            if item_id in self._verdicts:
+            superseded = item_id in unexecuted_gate_ids
+            if item_id in self._verdicts and not superseded:
                 continue
             verdict = {
                 "status": "DEFERRED",
@@ -2432,6 +2558,31 @@ class VerificationExecutor(BaseExecutor):
                 "evidence": {"gate": "verification_phase_2"},
                 "actual_result": reason,
             }
+            if superseded:
+                old = self._verdicts.get(item_id) or {}
+                old_head = self._judged_head_of(old)
+                if old_head and self._current_head and old_head == self._current_head:
+                    why = (
+                        f"上一轮那份结论判在 {old_head} 上（同一棵树），"
+                        f"但本轮没有真的执行，已作废"
+                    )
+                else:
+                    why = (
+                        f"上一轮那份结论判在 {old_head or '(未知提交)'} 上，"
+                        f"与当前 HEAD {self._current_head or '(未知)'} "
+                        f"不是同一棵树，已作废"
+                    )
+                detail = f"{reason}（{why}）"
+                verdict["reasons"] = [detail]
+                verdict["actual_result"] = detail
+                verdict["evidence"] = {
+                    "gate": "verification_phase_2",
+                    "superseded_verdict": {
+                        "status": str(old.get("status") or ""),
+                        "reasons": list(old.get("reasons") or []),
+                        "judged_head": old_head,
+                    },
+                }
             try:
                 self.record_verdict(item_id, verdict)
             except Exception:  # noqa: BLE001 — 记录失败也不能让整轮崩掉

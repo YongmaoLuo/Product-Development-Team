@@ -28,6 +28,8 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+from service_freshness import PortProbe  # noqa: E402
+
 
 def _make_agent(tmp_path: Path):
     from verification_agent import VerificationAgent
@@ -527,3 +529,252 @@ def test_violation_guidance_advertises_every_subject_the_runner_accepts(tmp_path
             f"{subject!r}; the runner accepts it, so a plan rejected for "
             f"using it cannot be regenerated into a valid one."
         )
+
+
+# ---------------------------------------------------------------------------
+# Self-healing relaunch before an api_test request (2026-10-25)
+# ---------------------------------------------------------------------------
+#
+# 2026-10-25, plan 20261023-PDT-MiniMax-CLI: the round resolved the
+# service URL once, at preflight, and never looked at the port again. A
+# service that died in between — a foreign sweep taking it, a crash —
+# turned into a bare "connection refused" minutes later, with nothing in
+# the round's log saying the service had been killed. The relaunch puts
+# the service back **on the port the URL already names**, so the
+# acceptance criterion does not move.
+
+
+def _service_agent(tmp_path: Path, port: int):
+    """An agent that declared one service, listening on ``port``."""
+    from service_declaration import ServiceDeclaration
+    from service_manager import ServiceRuntime, ServiceRuntimeMap
+
+    agent = _make_agent(tmp_path)
+    decl = ServiceDeclaration(
+        name="api", port=port,
+        start_cmd=f"python -m api.server --port {port}",
+    )
+    agent._service_declarations = {"api": decl}
+    runtime = ServiceRuntime(
+        name="api", port=port, pid=111, start_cmd=decl.start_cmd,
+        origin="spawned", ready=True,
+    )
+    agent._service_runtime_map = ServiceRuntimeMap(runtimes={"api": runtime})
+    return agent, decl
+
+
+def _api_vp_on(port: int, **over) -> dict:
+    return _api_vp(
+        request={"method": "GET", "url": f"http://127.0.0.1:{port}/health"},
+        **over,
+    )
+
+
+class _StubApiResult:
+    """What ``run_api_verification`` returns, without the network."""
+
+    def __init__(self) -> None:
+        self.status = "PASSED"
+        self.reasons: list = []
+        self.evidence = {"status_code": 200}
+
+    def to_verdict_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "reasons": list(self.reasons),
+            "evidence": dict(self.evidence),
+        }
+
+
+def test_api_test_relaunches_a_dead_service_on_the_same_port(
+    tmp_path: Path, monkeypatch
+):
+    import service_freshness
+    import service_manager
+    from service_manager import ServiceRuntime, ServiceRuntimeMap
+
+    port = 18999
+    agent, decl = _service_agent(tmp_path, port)
+    monkeypatch.setattr(
+        service_freshness, "probe_port",
+        lambda p: PortProbe(port=p, listening=False),
+    )
+    restarted = {}
+
+    def _fake_ensure(project_dir, declarations, **kwargs):
+        restarted["declarations"] = dict(declarations)
+        runtime = ServiceRuntime(
+            name="api", port=port, pid=222,
+            start_cmd=declarations["api"].start_cmd,
+            origin="spawned", ready=True, detail="started (pid 222)",
+        )
+        return ServiceRuntimeMap(runtimes={"api": runtime})
+
+    monkeypatch.setattr(service_manager, "ensure_services", _fake_ensure)
+
+    events = []
+    monkeypatch.setattr(
+        agent, "_safe_log_freshness_event",
+        lambda vp_id, event_type, data: events.append(
+            (vp_id, event_type, data)
+        ),
+    )
+
+    import verification_api_runner as runner
+
+    requests = []
+
+    def _fake_run(vp, *, artifact_dir=None):
+        requests.append(vp)
+        return _StubApiResult()
+
+    monkeypatch.setattr(runner, "run_api_verification", _fake_run)
+
+    verdict = agent._run_api_test_vp(_api_vp_on(port))
+
+    assert verdict["status"] == "PASSED"
+    assert requests, "the request still runs — after the relaunch"
+    # The service that was restarted is the one on the VP's port.
+    assert restarted["declarations"]["api"].port == port
+    # The event names who died, who replaced it, on which port, and why.
+    relaunched = [e for e in events if e[1] == "service_relaunched_before_vp"]
+    assert len(relaunched) == 1, events
+    vp_id, event_type, data = relaunched[0]
+    assert vp_id == "VP-001"
+    assert event_type == "service_relaunched_before_vp"
+    assert data["old_pid"] == 111
+    assert data["new_pid"] == 222
+    assert data["port"] == port
+    assert data["reason"]
+
+
+def test_api_test_blocks_when_the_service_cannot_be_relaunched(
+    tmp_path: Path, monkeypatch
+):
+    """A service that will not come back blocks the point; it does not fail it.
+
+    The criterion was never observed: the request was not sent, because the
+    service was not there, and not even a restart could bring it back.
+    Only a criterion that evidence falsified is a FAILED one — an
+    environment that is not ready is a BLOCKED one (infra: worth another
+    try, not counted against the same-cause threshold).
+
+    The restart attempt stays in front of the verdict: the service is
+    brought back first, and only a service that will not come back is
+    judged BLOCKED.
+    """
+    import service_freshness
+    import service_manager
+    from service_manager import ServiceRuntime, ServiceRuntimeMap
+
+    port = 18998
+    agent, decl = _service_agent(tmp_path, port)
+    monkeypatch.setattr(
+        service_freshness, "probe_port",
+        lambda p: PortProbe(port=p, listening=False),
+    )
+
+    def _fake_ensure(project_dir, declarations, **kwargs):
+        runtime = ServiceRuntime(
+            name="api", port=port, pid=None, origin="failed", ready=False,
+            detail="started but not ready after 60s",
+        )
+        return ServiceRuntimeMap(runtimes={"api": runtime})
+
+    monkeypatch.setattr(service_manager, "ensure_services", _fake_ensure)
+
+    import verification_api_runner as runner
+
+    requests = []
+
+    def _fake_run(vp, *, artifact_dir=None):
+        requests.append(vp)
+        return _StubApiResult()
+
+    monkeypatch.setattr(runner, "run_api_verification", _fake_run)
+
+    verdict = agent._run_api_test_vp(_api_vp_on(port))
+
+    assert verdict["status"] == "BLOCKED", verdict
+    evidence = verdict.get("evidence") or {}
+    assert evidence.get("blocked_ports") == [port], evidence
+    assert evidence.get("signal"), (
+        "a blocked verdict must carry the machine-readable marker the "
+        "failure triage reads, or nothing downstream can tell this "
+        "apart from a delivery failure"
+    )
+    assert not requests, "no request against a service that is not there"
+    # The criterion is not softened into a skip, and an environment that
+    # was not ready is not counted as a broken deliverable either.
+    assert verdict["status"] != "SKIPPED"
+    assert verdict["status"] != "FAILED"
+
+
+def test_api_test_does_not_restart_a_live_service(tmp_path: Path, monkeypatch):
+    import service_freshness
+    import service_manager
+
+    port = 18997
+    agent, decl = _service_agent(tmp_path, port)
+    monkeypatch.setattr(
+        service_freshness, "probe_port",
+        lambda p: PortProbe(
+            port=p, listening=True, pids=[111],
+            cmdlines=["python -m api.server --port 18997"],
+        ),
+    )
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("a live service must not be restarted")
+
+    monkeypatch.setattr(service_manager, "ensure_services", _must_not_run)
+
+    import verification_api_runner as runner
+
+    requests = []
+
+    def _fake_run(vp, *, artifact_dir=None):
+        requests.append(vp)
+        return _StubApiResult()
+
+    monkeypatch.setattr(runner, "run_api_verification", _fake_run)
+
+    verdict = agent._run_api_test_vp(_api_vp_on(port))
+
+    assert verdict["status"] == "PASSED"
+    assert len(requests) == 1
+
+
+def test_api_test_does_not_restart_a_service_the_plan_never_declared(
+    tmp_path: Path, monkeypatch
+):
+    """A third-party endpoint is not ours to restart."""
+    import service_freshness
+    import service_manager
+
+    port = 18996
+    agent, decl = _service_agent(tmp_path, 18995)
+    monkeypatch.setattr(
+        service_freshness, "probe_port",
+        lambda p: PortProbe(port=p, listening=False),
+    )
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("an undeclared service must not be restarted")
+
+    monkeypatch.setattr(service_manager, "ensure_services", _must_not_run)
+
+    import verification_api_runner as runner
+
+    requests = []
+
+    def _fake_run(vp, *, artifact_dir=None):
+        requests.append(vp)
+        return _StubApiResult()
+
+    monkeypatch.setattr(runner, "run_api_verification", _fake_run)
+
+    verdict = agent._run_api_test_vp(_api_vp_on(port))
+
+    assert verdict["status"] == "PASSED"
+    assert len(requests) == 1
