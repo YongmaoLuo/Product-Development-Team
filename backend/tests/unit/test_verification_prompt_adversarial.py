@@ -93,3 +93,24 @@ def test_prompt_omits_prd_line_when_criterion_absent(
     # The adversarial section is unconditional — it does not depend on
     # whether the plan recorded a PRD criterion.
     assert "ADVERSARIAL SELF-CHECK" in prompt
+
+
+def test_prompt_carries_process_safety_hard_rule(
+    code_review_subagent: VerificationSubAgent, vp_node: dict
+) -> None:
+    """The prompt must forbid pattern-based process killing.
+
+    2026-10-27: a verification sub-agent ran ``pkill -f "backend/cli.py"``
+    and SIGTERMed the repair executors of three unrelated plans — every
+    PDT executor on the host has that path in its argv. The prompt is one
+    of the two defenses; the other is the ``pkill_killall_block``
+    PreToolUse hook (see ``test_verification_process_safety_guard.py``).
+
+    If this assertion ever fails, the sub-agent is being handed no
+    instruction about how to stop a process — and the default it falls
+    back on is the one that killed three plans.
+    """
+    prompt = code_review_subagent._build_prompt(vp_node, 0)
+    assert "PROCESS SAFETY" in prompt
+    assert "killall" in prompt
+    assert "pkill" in prompt

@@ -777,7 +777,7 @@ class VerificationSubAgent:
     # The run() method implements the self-heal retry loop pinned by
     # PRD Decision Point 2, AMENDED 2026-09-15:
     #
-    #   1. Build a temp settings.json with 8 PreToolUse security hooks
+    #   1. Build a temp settings.json with 9 PreToolUse security hooks
     #      (delegated to SettingsJsonBuilder).
     #   2. Invoke the coding tool to attempt the verification. The
     #      ``max_retries + 1`` total attempts cover the initial try
@@ -841,7 +841,7 @@ class VerificationSubAgent:
         last_blocked: Optional[BlockedPathError] = None
 
         try:
-            # Step 1 — build temp settings.json with the 8 security hooks
+            # Step 1 — build temp settings.json with the 9 security hooks
             settings_path = builder.build()
 
             # Per-VP retry-attempt logs use the ``vp_attempt_`` prefix so
@@ -1744,6 +1744,20 @@ class VerificationSubAgent:
                 parts.append(f"  {key}={service_env[key]}")
         parts.extend([
             "",
+            "PROCESS SAFETY (HARD RULE — no exceptions):",
+            "1. Never run `killall`, and never run `pkill` (with or without -f). Both select",
+            "   processes by name or by a substring of their command line, so they reach every",
+            "   process on the host that matches — not just the ones you started. On 2026-10-27",
+            "   a `pkill -f \"backend/cli.py\"` issued by a verification sub-agent killed the",
+            "   repair executors of three unrelated plans.",
+            "2. To stop a process, kill the exact PID you recorded when you started it:",
+            "   `kill <pid>` (add `-- -<pgid>` only if you created that process group yourself).",
+            "3. If you did not record the PID, discover it first: `lsof -ti tcp:<port>` returns",
+            "   the listening PIDs; kill those PIDs explicitly, one per line.",
+            "4. Never kill a PID you did not start, and never touch a process outside your own",
+            "   fixture. Stopping other people's workloads is out of scope for a verification",
+            "   point — report it as an observation instead.",
+            "",
             "STRICT SCOPE: Your verdict MUST rest on evidence you actually "
             "gathered for THIS verification point. Do NOT run project-wide "
             "test suites, do NOT compute project-wide coverage, and do NOT "
@@ -2113,22 +2127,22 @@ class BlockedPathError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# SettingsJsonBuilder — temporary settings.json with 8 hard PreToolUse hooks
+# SettingsJsonBuilder — temporary settings.json with 9 hard PreToolUse hooks
 # ---------------------------------------------------------------------------
 #
-# PRD Decision Point 2 pins 8 hard PreToolUse hooks for the verification
+# PRD Decision Point 2 pins 9 hard PreToolUse hooks for the verification
 # sub-agent. The hooks are split into two groups:
 #
-#   * Basic 5 (Bash): rm -rf /, fork bomb, mkfs, dd if=/dev/zero, force
-#     push to main. These are system-level safety nets that protect
-#     against irreversible damage from any sub-agent.
+#   * Basic 6 (Bash): rm -rf /, fork bomb, mkfs, dd if=/dev/zero, force
+#     push to main, pkill/killall. These are system-level safety nets that
+#     protect against irreversible damage from any sub-agent.
 #
 #   * Extended 3 (Bash ×2, Edit|Write ×1): plans/ deletion interception,
 #     server-restart interception, and Edit/Write outside the
 #     sub-agent's own workspace. These guard the project a sub-agent
 #     was pointed at against accidental destruction.
 #
-# The order of the 8 rules is stable: basic 5 in front, extended 3 last.
+# The order of the 9 rules is stable: basic 6 in front, extended 3 last.
 # Tests pin the order so the SDLC audit trail is reproducible.
 #
 # Each rule's command is a one-liner that reads a JSON payload from
@@ -2173,6 +2187,13 @@ _BASIC_FORCE_PUSH_MAIN_BLOCK = (
     "and re.search(r'\\bmain\\b',c) else 0)\""
 )
 
+_BASIC_PKILL_KILLALL_BLOCK = (
+    "python3 -c "
+    "\"import json,sys,re;d=json.load(sys.stdin);"
+    "c=d.get('tool_input',{}).get('command','');"
+    "sys.exit(2 if re.search(r'\\bpkill\\b|\\bkillall\\b',c) else 0)\""
+)
+
 _EXT_PLANS_DELETE_BLOCK = (
     "python3 -c "
     "\"import json,sys,re;d=json.load(sys.stdin);"
@@ -2206,7 +2227,7 @@ _EXT_EXEC_PATH_BLOCK = (
 
 
 _HOOK_RULES: Tuple[Dict[str, str], ...] = (
-    # Basic 5 — system-level safety nets
+    # Basic 6 — system-level safety nets
     {
         "matcher": "Bash",
         "name": "rm_root_block",
@@ -2232,6 +2253,11 @@ _HOOK_RULES: Tuple[Dict[str, str], ...] = (
         "name": "force_push_main_block",
         "command": _BASIC_FORCE_PUSH_MAIN_BLOCK,
     },
+    {
+        "matcher": "Bash",
+        "name": "pkill_killall_block",
+        "command": _BASIC_PKILL_KILLALL_BLOCK,
+    },
     # Extended 3 — this project's own guards
     {
         "matcher": "Bash",
@@ -2253,9 +2279,9 @@ _HOOK_RULES: Tuple[Dict[str, str], ...] = (
 
 @dataclass
 class SettingsJsonBuilder:
-    """Build a temporary ``settings.json`` with 8 PreToolUse security hooks.
+    """Build a temporary ``settings.json`` with 9 PreToolUse security hooks.
 
-    The 8 hooks are pinned by PRD Decision Point 2 of the verification
+    The 9 hooks are pinned by PRD Decision Point 2 of the verification
     sub-agent work-package. Each rule is identified by a short ``name``
     (≤ 30 Chinese characters) and the ``command`` is a one-liner shell
     that blocks (exit 2) or allows (exit 0) a given tool invocation.
