@@ -496,7 +496,24 @@ def main():
     """Main entry point for CLI."""
     from env_config import load_env
 
+    # Imported here rather than at the top of the module: the harness
+    # layer is not needed to parse an argument list, and a CLI that
+    # only ever prints a table of secrets should not have to load it.
+    from harness.runner import HarnessInterrupted
+
     load_env()
+
+    # A workspace a run that was killed left holding the adapter's MCP
+    # configuration is put back before this process starts anything of
+    # its own. The run that wrote the file is gone, and nothing else
+    # would ever give the user their file back.
+    try:
+        from harness.mcode import recover_pending_mcp_restores
+        recover_pending_mcp_restores()
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "the pending MCP restores could not be replayed; continuing"
+        )
 
     parser = build_parser()
     args = parser.parse_args()
@@ -545,22 +562,48 @@ def main():
     # stop it.
     install_stop_handler()
 
-    autonomous_coding(
-        requirement=args.requirement,
-        project_dir=workspace_dir,
-        recover=args.recover,
-        max_tasks=args.max_tasks,
-        config_name=args.config,
-        tool=args.tool,
-        logger=logger,
-        tasks_file=tasks_file,
-        # ``args.verification_tasks`` is intentionally NOT forwarded
-        # to ``autonomous_coding``: server.py's ``_run_repair_execution``
-        # already merges the verification round's repair tasks into the
-        # canonical tasks.json before spawning this subprocess (audit
-        # 2026-08-26). The flag is accepted on the CLI for backwards
-        # compatibility with operators that pass it manually.
-    )
+    try:
+        autonomous_coding(
+            requirement=args.requirement,
+            project_dir=workspace_dir,
+            recover=args.recover,
+            max_tasks=args.max_tasks,
+            config_name=args.config,
+            tool=args.tool,
+            logger=logger,
+            tasks_file=tasks_file,
+            # ``args.verification_tasks`` is intentionally NOT forwarded
+            # to ``autonomous_coding``: server.py's ``_run_repair_execution``
+            # already merges the verification round's repair tasks into the
+            # canonical tasks.json before spawning this subprocess (audit
+            # 2026-08-26). The flag is accepted on the CLI for backwards
+            # compatibility with operators that pass it manually.
+        )
+    except HarnessInterrupted as exc:
+        # A run that a signal cut short is not a crash: it is the run
+        # being stopped. The runner turned the signal into an
+        # exception so that everything the run prepared — the file the
+        # adapter wrote, the settings file with the credential in it,
+        # the child itself — was given back before the exception got
+        # here. The exit code is the one the shell reports for a
+        # process that was killed by that signal, so a caller can tell
+        # "the run was stopped" from "the run failed".
+        if logger is not None:
+            logger.warning(
+                "harness_interrupted",
+                f"the run was interrupted by signal {exc.signum}; "
+                "the workspace was put back before leaving",
+                data={"signum": exc.signum},
+            )
+        else:
+            # No plan, so no log to write to. The operator still gets
+            # told: a stop is not a crash, and it is not a silence.
+            print(
+                f"the run was interrupted by signal {exc.signum}; "
+                "the workspace was put back before leaving",
+                file=sys.stderr,
+            )
+        sys.exit(128 + exc.signum)
 
 
 def handle_rollback_command(args):

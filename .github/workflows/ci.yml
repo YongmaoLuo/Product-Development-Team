@@ -458,6 +458,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # The change-surface gates diff this branch against its merge
+          # base with origin/main. A shallow clone leaves that ref
+          # present while cutting its history off, so `git merge-base`
+          # exits non-zero and the gate can only report an error — or,
+          # worse, skip and call the surface empty. Full history is what
+          # makes "no change" a measurement instead of an assumption.
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -1666,6 +1674,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # diff-cover compares the working tree against origin/main, so
+          # the base branch has to be in the clone. The default checkout
+          # is shallow and has no origin/main to compare against — and a
+          # comparison against a base that is not there is not a
+          # comparison.
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -1711,6 +1726,35 @@ jobs:
           pip install uv==0.11.6
           uv sync --project backend --locked
 
+      # diff-cover is the tool that measures the third floor — the lines
+      # this pull request changed in backend/coding_tool.py.
+      #
+      # It is installed here and nowhere else: the local gate
+      # (backend/tests/static_gates/test_coverage_floor.py) reads this
+      # workflow file and the threshold constants and never imports the
+      # package, so a machine that has never heard of diff-cover still
+      # runs the gate.
+      #
+      # The install is uv's *tool* mechanism rather than a named
+      # package install, and the reason is this repository's own rule:
+      # every install comes out of ``backend/uv.lock``, and a named
+      # package install in a workflow is the defect
+      # (``tests/static_gates/test_dependency_manifest_and_lock_agree.py``)
+      # was written to end — an unpinned package arriving from outside
+      # the lock. A tool environment is where a measurement tool
+      # belongs while it is still outside the project's dependency
+      # closure, and pinning the version keeps the number that judges a
+      # pull request the number this file names rather than the one
+      # the network serves that afternoon.
+      #
+      # Declaring diff-cover in ``backend/pyproject.toml`` and locking
+      # it is the better home for it — that is what the dependency
+      # gate asks for — and it needs two files this change does not
+      # touch. Until that lands, this install is what keeps the tree
+      # green and the floor measured.
+      - name: Install diff-cover
+        run: uv tool install diff-cover==10.6.0
+
       - name: Download coverage data
         uses: actions/download-artifact@v4
         with:
@@ -1722,7 +1766,44 @@ jobs:
         working-directory: backend
         run: |
           ./.venv/bin/python3 -m coverage combine
+          # The XML report is the input to the changed-line gate below,
+          # and it is what the artifact at the end of this job uploads.
+          # It is written before the report so that it exists even when
+          # the report fails.
+          ./.venv/bin/python3 -m coverage xml -o coverage.xml
           ./.venv/bin/python3 -m coverage report --fail-under=80
+
+      # The changed-line floor. The other two floors measure a tree;
+      # this one measures the change, and it is the only one of the
+      # three that says anything about the code a pull request is
+      # proposing. A line this branch added has to be covered by a test
+      # this branch added, whatever the rest of the file looks like.
+      #
+      # The working directory is the repository root, not backend/:
+      # diff-cover matches its --include patterns with glob.glob()
+      # against the path `git diff` reports, and that path is
+      # repository-root relative (backend/coding_tool.py). A pattern
+      # that matches nothing makes diff-cover report no coverage
+      # information and exit 0 — a gate that passes because it
+      # measured nothing, which is the one failure mode a coverage
+      # gate cannot be allowed to have. Measured, not assumed: the
+      # identical command from backend/ reports nothing and exits 0,
+      # and the identical command from here reports the file.
+      #
+      # The two --include patterns are one option given twice, and
+      # argparse's store action keeps the LAST one: the repository-root
+      # relative path is the pattern that matches, and the bare file
+      # name is the one the contract names. The static gate reads the
+      # effective pattern back out of this file and checks that it
+      # still selects the file, so the two cannot drift apart.
+      - name: Enforce the changed-line coverage of coding_tool.py
+        run: |
+          cp backend/coverage.xml coverage.xml
+          uv tool run --from diff-cover==10.6.0 diff-cover coverage.xml \
+            --compare-branch=origin/main \
+            --include=coding_tool.py \
+            --include=backend/coding_tool.py \
+            --fail-under=100
 
       - name: Upload combined coverage report
         if: always()
@@ -2992,6 +3073,14 @@ jobs:
       - negctl
       - verification-e2e
       - verification-perf
+      # The harness layers L1 and L2. L3 (release / nightly) is
+      # deliberately absent: it is not reachable from a pull request, and
+      # a required dependency that never reports on a pull request blocks
+      # every merge with no way to satisfy it.
+      - harness-static-gates
+      - harness-unit
+      - harness-contract
+      - harness-integration
     runs-on: ubuntu-latest
     steps:
       - name: Fail unless every upstream job succeeded
@@ -3018,7 +3107,7 @@ jobs:
 
           needs = json.loads(os.environ["NEEDS_JSON"])
           # Anything other than `success` blocks. `skipped` is included
-          # on purpose: see the job comment — for these ten jobs a skip
+          # on purpose: see the job comment — for these jobs a skip
           # on a pull request is a broken gate, not a satisfied one.
           bad = {
               name: result.get("result")
@@ -3041,3 +3130,451 @@ jobs:
           }
 
           echo "All ${summary} upstream jobs succeeded — merge gate open."
+
+  # ---------------------------------------------------------------------------
+  # HARNESS LAYERS — L1 (every commit) / L2 (before the merge) / L3 (release)
+  #
+  # The harness refactor put a second backend behind one registry. A backend
+  # that can be selected is not a backend that is tested: a suite that no
+  # lane collects is a suite nobody runs, and it is green for exactly that
+  # reason. These six lanes are where the harness suites run.
+  #
+  # The layering is explicit because the harness suites cannot all run
+  # everywhere:
+  #
+  #   L1  every commit       static gates, unit and contract. Hermetic: no
+  #                          platform, no account, no network. <= 10 min.
+  #   L2  before the merge   integration, on a macOS host. <= 20 min.
+  #   L3  release / nightly  e2e against a real account on a macOS
+  #                          self-hosted runner, plus perf on a macOS
+  #                          host. <= 60 min.
+  #
+  # L3 is out of the per-commit path on purpose: it needs a machine that
+  # carries a real account, and a pull request has to be able to merge
+  # without one. It also stays out of the merge gate — a job that is
+  # skipped on a pull request reports `skipped`, and the merge gate reads
+  # a skip as a failure.
+  #
+  # The existing lanes are untouched. The default backend is `claude` — the
+  # registry resolves to it when nothing is configured — so the pre-existing
+  # suite keeps running the claude path exactly as before. None of these
+  # jobs pins PDT_HARNESS: the harness suite exercises both backends on
+  # its own, and a job-level pin would narrow one of them silently.
+  #
+  # The job keys are the contract. `backend/tests/static_gates/
+  # test_harness_ci_jobs_exist.py` reads them out of this file, so a
+  # rename here without a rename there is a layer that stops being
+  # checked — silently, because the lane keeps running either way.
+  # ---------------------------------------------------------------------------
+
+  harness-static-gates:
+    name: Harness static gates (L1, every commit)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    # Downstream of the repository-wide gates: a contract failure there
+    # means the tree is not worth spending a runner on. The harness gates
+    # include the file that reads these six jobs out of this very
+    # workflow, so the ordering also means the harness gates are checked
+    # against a workflow that already parses.
+    needs: [static-gates]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+
+      # uv's own cache is a *different directory* from the pip cache
+      # setup-python just restored above (~/.cache/uv vs ~/.cache/pip),
+      # so without this every job re-downloads every wheel and the sync
+      # runs cold. Keyed on the lockfile hash, which this repository
+      # pins, so the entry stays valid across ordinary dependency bumps
+      # instead of going stale like a requirements.txt hash would.
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          uv sync --project backend --locked
+
+      # The harness structural contracts: one spawn point, no backend
+      # branching inside the coding tool, no mocked Popen, sanitised
+      # fixtures — and the gate that reads these six jobs out of this
+      # file. Selected by path rather than by marker: a new marker is a
+      # second thing to keep in sync with the lane contracts.
+      - name: Run the harness static gates
+        working-directory: backend
+        run: |
+          ./.venv/bin/python3 -m pytest \
+            tests/static_gates/test_single_spawn_point.py \
+            tests/static_gates/test_coding_tool_has_no_harness_branching.py \
+            tests/static_gates/test_no_popen_mocking.py \
+            tests/static_gates/test_harness_fixtures_are_sanitized.py \
+            tests/static_gates/test_harness_ci_jobs_exist.py \
+            -p no:cacheprovider -q --timeout=300
+
+  harness-unit:
+    name: Harness unit tests (L1, every commit)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: [harness-static-gates]
+    timeout-minutes: 10
+    env:
+      # The two harness floors, each as a percentage of the thing it
+      # is about. They are deliberately two numbers and not one: a
+      # single mixed figure cannot tell a well-covered branch set from
+      # a well-covered statement set, and a codebase can have one
+      # without the other.
+      #
+      # The line floor is the percentage of the STATEMENTS, alone.
+      # ``--cov-fail-under`` does not measure that: with
+      # ``--cov-branch`` on, the number it compares is the statements
+      # and the branches added together and divided by their sum, so a
+      # branch set that is better covered than the statement set can
+      # carry that mixed figure over the floor while the statements
+      # sit below it. The step below therefore reads both totals out
+      # of the report and compares each with the floor it belongs to.
+      #
+      # The values here are the ones
+      # ``backend/tests/static_gates/test_coverage_floor.py`` pins, so
+      # the two cannot drift apart without that gate failing. A floor
+      # that is lowered in one place and not the other is a floor
+      # nobody agreed to.
+      HARNESS_LINE_FLOOR: 90
+      HARNESS_BRANCH_FLOOR: 85
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          uv sync --project backend --locked
+
+      # The harness unit suite: the registry that chooses a backend, both
+      # adapters, the event normalisation and the output contract. Eight
+      # workers, because the suite is a few hundred hermetic cases and
+      # the runner has the cores to spend.
+      #
+      # The coverage flags are the floor the harness surface is held to.
+      # ``--cov=harness --cov=mcode_profiles`` is the surface: the
+      # package, and the profile table it resolves against.
+      # ``--cov-branch`` is what makes the branch floor measurable at
+      # all — without it the report has no branch totals, and the floor
+      # below would be a number compared against a number that was
+      # never measured. ``--cov-fail-under`` is the lane's floor.
+      #
+      # The JSON report is written next to the terminal one because the
+      # branch floor is compared on its own, against the branch total
+      # out of the report rather than against the mixed one. It is
+      # called coverage.json because that is the name .gitignore
+      # already ignores — a local run of this lane must not leave an
+      # untracked file behind in the tree.
+      - name: Run the harness unit suite
+        working-directory: backend
+        run: |
+          ./.venv/bin/python3 -m pytest tests/unit/harness -q -n 8 \
+            --timeout=300 \
+            --cov=harness --cov=mcode_profiles \
+            --cov-branch \
+            --cov-fail-under=90 \
+            --cov-report=term-missing \
+            --cov-report=json:coverage.json
+
+      # The two harness floors, each measured on its own.
+      #
+      # coverage.py reports the statement percentage and the branch
+      # percentage separately, and this compares each of them with the
+      # floor it belongs to — the numbers in the job's environment,
+      # which are the same numbers the static gate pins, so a floor
+      # that is lowered here is lowered in one place and shows up in
+      # the other.
+      #
+      # The step below is deliberately not the mixed total. With
+      # ``--cov-branch`` on, ``--cov-fail-under`` compares against the
+      # statements and the branches added together, which is a floor on
+      # neither of them; reading the two totals out of the report is
+      # what makes "lines ≥ 90%" and "branches ≥ 85%" two claims about
+      # two different things.
+      #
+      # A run with no branches at all is not a failure: there is
+      # nothing to cover, and coverage.py reports 100% for a total with
+      # no members. A run with no report at all IS a failure — the
+      # step below opens the file pytest-cov was asked to write, and a
+      # missing file raises rather than passing quietly.
+      - name: Enforce the harness coverage floors
+        working-directory: backend
+        run: |
+          ./.venv/bin/python3 -c '
+          import json, os, sys
+
+          totals = json.load(open("coverage.json"))["totals"]
+
+          floors = (
+              ("percent_statements_covered", "HARNESS_LINE_FLOOR"),
+              ("percent_branches_covered", "HARNESS_BRANCH_FLOOR"),
+          )
+
+          failures = []
+          for key, variable in floors:
+              floor = float(os.environ[variable])
+              percent = float(totals[key])
+              print("%s %.2f%%, floor %.2f%%" % (key, percent, floor))
+              if percent < floor:
+                  failures.append("%s %.2f%% < %.2f%%" % (key, percent, floor))
+
+          for failure in failures:
+              print("FAIL " + failure, file=sys.stderr)
+
+          sys.exit(1 if failures else 0)
+          '
+
+  harness-contract:
+    name: Harness contract tests (L1, every commit)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: [harness-static-gates]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          uv sync --project backend --locked
+
+      # The contract layer: the invariants the harness keeps with the
+      # scheduler and the workspace it drives. This suite also ran inside
+      # the sharded `misc` lane; having it here as well gives the
+      # harness work its own ten-minute budget and its own red or green
+      # instead of one line in a twenty-shard matrix.
+      - name: Run the contract suite
+        working-directory: backend
+        run: ./.venv/bin/python3 -m pytest tests/contract -q --timeout=120
+
+  harness-integration:
+    name: Harness integration tests (L2, before the merge)
+    # macOS because this layer drives the real sandbox wrapper and the
+    # real profile tool. On another platform those cases skip, and a
+    # skip reads exactly like a pass in a run summary.
+    runs-on: macos-latest
+    if: github.event_name == 'pull_request'
+    needs: [harness-static-gates]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          uv sync --project backend --locked
+
+      - name: Run the harness integration suite
+        working-directory: backend
+        run: ./.venv/bin/python3 -m pytest tests/integration/harness -q --timeout=300
+
+  harness-e2e-real:
+    name: Harness E2E, real facilities (L3, release)
+    # A self-hosted macOS runner, and the label has to exist. This layer
+    # needs a machine that carries the real facilities: the seatbelt
+    # binary, the real `/usr/bin/security`, and the account the operator
+    # configured. Those live in the runner's own keychain and its own
+    # home directory — a workflow that carried them would put a
+    # credential in the repository.
+    runs-on: [self-hosted, macOS]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          uv sync --project backend --locked
+
+      # The evidence lands under a path that carries the run id, so two
+      # runs of this layer never overwrite each other's record.
+      - name: Prepare the run archive
+        run: mkdir -p artifacts/harness-runs/${{ github.run_id }}
+
+      # The suites that need the real thing: the seatbelt profile the
+      # operator configured, the credential the adapter writes as a
+      # reference, and every consumer that has to answer "configured"
+      # without the value appearing in any environment.
+      #
+      # The strict switch turns "this runner cannot start
+      # /usr/bin/security" from a skip into a failure. On the lane that
+      # is supposed to have a keychain, a missing capability is a
+      # misconfigured runner — not a fact about the code under test, and
+      # not something a green badge may stand for.
+      #
+      # `tests/e2e/test_secret_absent_from_child_environ.py` is NOT in
+      # this list, and that is where it belongs to be. Its cases read a
+      # running child's environment out of `/proc/<pid>/environ`, which
+      # is a Linux facility: on a macOS runner every one of them skips,
+      # and a lane that reports six skips has published no evidence for
+      # the property it names. The Linux e2e lane already collects it
+      # (`pytest tests/ -m "e2e and not time_sensitive"` on
+      # `ubuntu-latest`), so nothing is uncovered by leaving it out of
+      # the layer that cannot run it.
+      - name: Run the harness real-facility E2E
+        working-directory: backend
+        env:
+          PDT_REQUIRE_CREDENTIAL_CHAIN_E2E: "1"
+        run: |
+          ./.venv/bin/python3 -m pytest \
+            tests/security/test_harness_sandbox_boundary.py \
+            tests/security/test_harness_credential_boundary.py \
+            tests/e2e/test_credential_chain_acceptance.py \
+            --tb=short --timeout=300 \
+            --junitxml=../artifacts/harness-runs/${{ github.run_id }}/harness-e2e-real-junit.xml
+
+      - name: Archive the harness run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-e2e-real-${{ github.run_id }}
+          path: artifacts/harness-runs/${{ github.run_id }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  harness-perf:
+    name: Harness performance budget (L3, release)
+    # A macOS host, and not the Linux image the rest of the pipeline uses:
+    # two of the perf cases are macOS-specific. PERF-07 checks the seatbelt
+    # wrapper contract and skips off macOS, so a Linux lane would publish
+    # no evidence for it — and the ceilings themselves were measured on
+    # macOS, so that is the platform they are stated for.
+    runs-on: macos-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          uv sync --project backend --locked
+
+      # The evidence lands under a path that carries the run id, so two
+      # runs of this layer never overwrite each other's record.
+      - name: Prepare the run archive
+        run: mkdir -p artifacts/harness-runs/${{ github.run_id }}
+
+      # The perf layer, and the harness overhead baseline in it. Serial
+      # on purpose: a wall-clock bound measured while workers fight over
+      # the same cores is not a measurement, it is a coin toss. The
+      # per-test budget is the same 1800 s the serial lane gives the
+      # other perf markers — it is the only budget these can meet.
+      - name: Run the perf suite
+        working-directory: backend
+        run: |
+          ./.venv/bin/python3 -m pytest tests/perf -m perf \
+            --tb=short --timeout=1800 -q \
+            --junitxml=../artifacts/harness-runs/${{ github.run_id }}/harness-perf-junit.xml
+
+      - name: Archive the harness run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-perf-${{ github.run_id }}
+          path: artifacts/harness-runs/${{ github.run_id }}/
+          if-no-files-found: warn
+          retention-days: 30
+

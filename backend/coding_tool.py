@@ -80,8 +80,696 @@ from file_lock_protocol import socket_path
 # 2026-10-22: the type a cancelled dispatch raises. Dependency-free
 # (stdlib only), so a top-level import carries no cycle risk.
 from verification_cancel import VerificationCancelled
+# 2026-10-23: the harness layer. Which backend this process drives is
+# decided once, at start-up, by ``harness.registry`` — this module asks
+# the registry for the answer and never decides for itself. Both
+# imports are dependency-free (stdlib only), so a top-level import
+# carries no cycle risk.
+from harness.contract import (
+    Harness,
+    HarnessConfigError,
+    HarnessInvocation,
+    SessionMode,
+    SessionRef,
+    TaskInvocation,
+)
+from harness.registry import get_runtime_config
+from harness.runner import (
+    SANDBOX_APPLIED,
+    STDERR_EVENT,
+    Runner,
+    carried_the_conversation,
+)
+# 2026-10-25 — the pinned key → real session id mapping. The module
+# knows no adapter: the claude path must be able to reach the mapping
+# without the mcode adapter being imported, so the mapping lives in a
+# module that imports neither. ``SessionIdNotResumable`` is the answer
+# a backend gives when the id it was handed names no conversation it
+# can re-open — the signal that the two ids are different things and
+# that the mapping is what says which conversation the key stands for.
+from harness.session_map import (
+    SessionIdNotResumable,
+    plan_session_map,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# The one backend this process drives (2026-10-23)
+# ---------------------------------------------------------------------------
+# Five kinds of dispatch happen in this module — the plain text query,
+# the JSON query, the sub-agent query, the retry that follows an
+# unusable answer, and the recovery that re-opens a session. Each of
+# them used to build its own command line, and each of them decided for
+# itself which backend it was talking to. Five decisions, five places to
+# forget one, five ways for a run to answer as one backend while
+# another part of the process believed it was talking to the other.
+#
+# There is one decision now, and it is made once, when the process
+# starts: ``harness.registry`` reads the backend variable, refuses
+# anything it does not recognise, and hands back the adapter. This
+# module keeps that adapter in ``_HARNESS`` and gives it out through
+# :func:`current_harness` — the only way to reach the backend from
+# above this layer.
+#
+# Two properties make one decision enough:
+#
+#   * **the answer does not move.** The adapter is resolved when this
+#     module is imported, so a process cannot change backend halfway
+#     through a run because the environment moved under it — and an
+#     operator who named a backend this process cannot honour finds out
+#     at start-up, not after the first dispatch has been paid for;
+#   * **there is one object.** Every dispatch reads the same adapter
+#     through the same accessor, so "which backend is this process
+#     driving" has exactly one answer in the codebase, and the answer
+#     is an object rather than a name somebody has to compare.
+
+#: The harness this process drives. Resolved once, when this module is
+#: imported, and never re-resolved.
+_HARNESS: Harness = get_runtime_config().harness
+
+
+def current_harness() -> Harness:
+    """The harness every dispatch in this process uses.
+
+    This is the only way to reach the backend from above this layer: a
+    caller that wants to know which backend it is driving asks here,
+    rather than reading the environment or comparing backend names
+    (arch decision point 2 — no business logic branches on *which*
+    backend it is; the backend answers what it can do).
+
+    Returns:
+        The one harness this process drives.
+    """
+    return _HARNESS
+
+
+def _environment_delta(env: Dict[str, str]) -> Dict[str, str]:
+    """The difference between ``env`` and the inherited environment.
+
+    The runner merges a delta on top of its own copy of the inherited
+    environment, so the delta is exactly this difference: the keys this
+    dispatch added, and the keys whose value it changed. Nothing else
+    travels -- the inherited environment is the runner's business, not
+    the dispatch's.
+
+    A key the dispatch *removed* cannot be expressed by an add-only
+    delta: there is no value that says "not set". The closest honest
+    answer is the empty value -- the key is still there, but it says
+    nothing -- which is what the removal was for in the first place.
+
+    Args:
+        env: The environment this dispatch wants the child to run with.
+
+    Returns:
+        The keys that differ from the inherited environment, and their
+        values.
+    """
+    delta: Dict[str, str] = {}
+    for key, value in env.items():
+        if os.environ.get(key) != value:
+            delta[key] = value
+    for key in os.environ:
+        if key not in env:
+            delta[key] = ""
+    return delta
+
+
+def _takes_settings_file(harness: Harness) -> bool:
+    """Whether this backend's command line can carry a settings file.
+
+    The settings file is the claude CLI's own convention: a JSON file
+    of environment overrides it reads at start-up. The other CLI has no
+    such flag and refuses a command line that carries one — so a
+    dispatch that drives it must neither write the file nor put the
+    flag on its command line.
+
+    The question belongs to the adapter, and the adapter that owns the
+    convention is the one that answers "yes". The contract carries no
+    capability for it yet, so the question is asked of the adapter's
+    *type*: a check that names no backend, compares no backend name and
+    reads no environment variable. When the contract grows a
+    ``settings_file`` capability, this becomes a capability read and the
+    import below goes away with it.
+
+    Args:
+        harness: The adapter this dispatch runs against.
+
+    Returns:
+        Whether a settings file may be written and named on the command
+        line.
+    """
+    # The import is deferred on purpose. ``harness.registry`` keeps the
+    # adapters out of the import graph so that a process which only asks
+    # a question about its configuration does not pay for one, and this
+    # module reaches for the registry's answer the same way.
+    from harness.claude import ClaudeHarness
+
+    return isinstance(harness, ClaudeHarness)
+
+
+def _session_run_must_stream(harness: Harness) -> bool:
+    """Whether a run that continues a conversation must produce the stream.
+
+    What a run has to produce is a fact about the call, and the call
+    comes in two kinds:
+
+    * a **one-shot query** — one question, one answer. The terminal
+      envelope *is* that answer, on every backend, and the dispatch
+      above has always read it from there. A promise such a run cannot
+      keep would turn every one-shot call into a failure.
+    * a **session-style run** — the call continues a conversation. On
+      the MiniMax Code backend the work of a continued conversation
+      travels in the event stream: the items the agent completed are
+      the conversation's turns, and a run that ends with only its
+      terminal envelope has thrown that work away. The architecture's
+      decision point 3 says such a run is a ``stream_events``
+      capability failure — refused explicitly, never answered with a
+      summary. The promise is therefore made for that backend, and
+      :meth:`harness.runner.Runner.run` enforces it.
+
+    The question belongs to the adapter, and the contract carries no
+    capability for it yet, so it is asked of the adapter's *type*: a
+    check that names no backend, compares no backend name and reads no
+    environment variable — the same shape as
+    :func:`_takes_settings_file`. When the contract grows a
+    ``session_stream`` capability, this becomes a capability read and
+    the import below goes away with it.
+
+    Args:
+        harness: The adapter this dispatch runs against.
+
+    Returns:
+        Whether a run that continues a conversation under this adapter
+        has to produce the stream.
+    """
+    # The import is deferred on purpose, for the reason given in
+    # ``_takes_settings_file`` above.
+    from harness.mcode import McodeHarness
+
+    return isinstance(harness, McodeHarness)
+
+
+# ---------------------------------------------------------------------------
+# The dispatch's watch on the child (2026-10-23)
+# ---------------------------------------------------------------------------
+# The dispatch used to read the child's stream itself, in a loop that
+# also decided what a line meant, stamped a clock on it, forwarded the
+# tool activity to the main log and stopped at the end of the turn.
+# Reading the stream is the runner's job now, so the loop moved down
+# there -- and the three things the loop did *besides* reading had to
+# come back up, because a dispatch that cannot see its own child is a
+# dispatch that cannot be stopped, timed or diagnosed.
+#
+# The two classes below are that: a stream that is watched while it is
+# read, and a runner that watches it.
+
+
+class _WatchedStream:
+    """The child's standard output, watched while it is read.
+
+    The runner reads the child's stream through this object instead of
+    the pipe itself. Three things happen per line, and all three used
+    to happen in the read loop this class stands in for:
+
+    * **The clock is stamped.** The two watchers measure *silence*,
+      and silence is only knowable if something notices every line.
+    * **The activity is forwarded.** A sub-agent that spends half an
+      hour in ``pytest`` says so on its stream; forwarding it to the
+      main log is what makes the wait legible. Without it a 30-minute
+      run is invisible until the dispatch returns.
+    * **The line is handed on unchanged.** The adapter above this
+      class decides what a line meant; this class only watches.
+
+    The line is parsed twice — once here, for the log, and once by the
+    adapter, for the run's events. That is the price of the split: the
+    runner's parser is the adapter's business and returns the whole
+    stream at once, so a line-by-line answer is not available from it.
+    A line that cannot be parsed is not an error here: the adapter
+    reports it as an event of its own, and this class stays quiet.
+    """
+
+    def __init__(self, stream: Any, owner: "_DispatchRunner") -> None:
+        """Wrap a stream.
+
+        Args:
+            stream: The child's standard output.
+            owner: The runner that watches the stream.
+        """
+        self._stream = stream
+        self._owner = owner
+        self._iterator: Optional[Any] = None
+
+    def __iter__(self) -> "_WatchedStream":
+        return self
+
+    def __next__(self) -> str:
+        if self._iterator is None:
+            # The pipe is asked for its iterator on the first line, not
+            # in the constructor: the read loop this class stands in for
+            # asked the pipe for it at the start of the loop, so a pipe
+            # that refuses to be iterated -- a stand-in in a test, for
+            # instance -- fails where it failed before.
+            self._iterator = iter(self._stream)
+        raw = next(self._iterator)
+        self._owner.note_line(raw)
+        return raw
+
+    def close(self) -> None:
+        """Close the pipe underneath.
+
+        The runner closes every pipe of the child once it has been
+        reaped. A stream that has no ``close`` of its own -- a stand-in
+        in a test, for instance -- is simply left alone: closing it is
+        tidiness, and tidiness is not worth an exception.
+        """
+        close = getattr(self._stream, "close", None)
+        if close is None:
+            return
+        try:
+            close()
+        except Exception:  # pragma: no cover - already closed
+            pass
+
+
+class _DispatchRunner(Runner):
+    """The runner, with one dispatch's watch on the child.
+
+    What this adds to the runner
+    ============================
+
+    The runner spawns a harness, reads its stream and reaps it. A
+    dispatch needs three more things from that window, and all three
+    are about *this* run rather than about harnesses in general:
+
+    * **the child itself**, so that ``/stop`` can reach it while it is
+      in flight;
+    * **the two watchers** that measure silence -- the idle watcher
+      closes the stream, the total watcher kills the group -- and the
+      clock they share;
+    * **the reap**, which has to happen before the credential on disk
+      is replaced.
+
+    The runner's own read step is where the child is visible, so this
+    subclass overrides that step and does the watching around it. The
+    rest of the runner -- the sandbox decision, the environment merge,
+    the spawn, the summary -- is inherited unchanged.
+
+    Why the watchers live here
+    =========================
+
+    They measure the child's silence, and the child's silence is only
+    knowable while its stream is being read. The read happens in the
+    runner, so the watchers have to be there too: a watcher in the
+    dispatch could only look at a clock, and would have to guess
+    whether the last line arrived before or after the child was
+    spawned.
+
+    The clock is stamped twice, in this order: ``last_line_time``
+    first (the idle watcher needs it early) and ``total_started_at``
+    second. The order is not cosmetic -- see the note in
+    :meth:`_collect_events`.
+    """
+
+    def __init__(
+        self,
+        tool: "ClaudeCodingTool",
+        harness: Harness,
+        idle_sec: int,
+        total_sec: int,
+        plan_id: Optional[str],
+    ) -> None:
+        """Prepare the watch.
+
+        Args:
+            tool: The tool the dispatch belongs to. It owns the
+                process handle, the activity log and the shutdown.
+            harness: The adapter whose parser reads the stream.
+            idle_sec: Seconds of silence before the stream is closed.
+            total_sec: Seconds of silence before the child is killed.
+            plan_id: The plan this dispatch belongs to, if any.
+        """
+        super().__init__()
+        self.tool = tool
+        self.harness = harness
+        self.idle_sec = idle_sec
+        self.total_sec = total_sec
+        self.plan_id = plan_id
+        #: The shared silence clock. A list because the two watchers
+        #: and the reader all share it, exactly as they did when they
+        #: were closures over one list.
+        self.last_line_time: List[float] = [0.0]
+        #: When the total watcher started. The silence it measures is
+        #: counted from here, never from before it.
+        self.total_started_at: List[float] = [0.0]
+        #: Set by the idle watcher when it closed the stream.
+        self.idle_fired = threading.Event()
+        #: Set by the total watcher when it fired.
+        self.total_fired = threading.Event()
+        #: Whether the total watcher killed the child.
+        self.total_triggered = False
+        #: Why the read ended, when it ended badly.
+        self.read_error: Optional[BaseException] = None
+        #: The child, while it is in flight.
+        self.process: Optional[Any] = None
+
+    # -- the watch ---------------------------------------------------------
+
+    def note_line(self, raw: str) -> None:
+        """One line of the child's output arrived.
+
+        The clock is stamped, the line is remembered for the watchdog,
+        and the activity it reports is forwarded to the main log.
+
+        Args:
+            raw: The line, as the child wrote it.
+        """
+        self.last_line_time[0] = time.monotonic()
+        # Mirror to the tool, so the sub-agent watchdog can tell an
+        # active sub-agent (still streaming tool calls / text) apart
+        # from a wedged one (no stdout output for the threshold
+        # window). The tool owns the mirror -- it is the tool the
+        # watchdog reads -- so it records the line itself.
+        self.tool._note_output_line(raw, self.last_line_time[0])
+
+        text = raw.strip()
+        if not text:
+            return
+        try:
+            events = self.harness.parse_stream([text])
+        except Exception:  # pragma: no cover - a parser that raises
+            return
+        for event in events:
+            self._forward(event)
+
+    def _forward(self, event: Any) -> None:
+        """Forward the activity one event reports to the main log.
+
+        The events are the adapter's own, so what is read out of them
+        is what the adapter understood them to mean: a tool the agent
+        called, and the answer that tool gave.
+
+        Args:
+            event: One event of the child's stream.
+        """
+        payload = event.raw if isinstance(event.raw, dict) else {}
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "tool_use":
+                self._log_tool_use(block)
+            elif block_type == "tool_result":
+                self._log_tool_result(block)
+
+    def _log_tool_use(self, block: Dict[str, Any]) -> None:
+        """Log the tool the agent is about to call.
+
+        Args:
+            block: The tool-use block of the event.
+        """
+        tool_name = block.get("name", "?")
+        tool_input = block.get("input", {}) or {}
+        # Compact form: tool name + first 200 chars of input JSON. We
+        # deliberately omit full input to avoid logging sensitive data
+        # (the input can contain arbitrary user-provided content in
+        # some tools).
+        try:
+            input_summary = json.dumps(tool_input, ensure_ascii=False)[:200]
+        except Exception:
+            input_summary = "<unserialisable>"
+        logger.info(
+            "[CLAUDE STREAM] tool_use name=%s input=%s",
+            tool_name,
+            input_summary,
+        )
+
+    def _log_tool_result(self, block: Dict[str, Any]) -> None:
+        """Log what a tool answered.
+
+        Args:
+            block: The tool-result block of the event.
+        """
+        tool_use_id = block.get("tool_use_id", "?")
+        result_body = block.get("content", "")
+        # ``content`` is either a string or a list of content blocks.
+        # Normalise.
+        if isinstance(result_body, list):
+            result_body = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b)
+                for b in result_body
+            )
+        # Truncate to 300 chars -- pytest emits thousands of ``PASSED``
+        # lines and we don't want each one in the main log.
+        summary = str(result_body)[:300]
+        logger.info(
+            "[CLAUDE STREAM] tool_result tool_use_id=%s content=%r",
+            tool_use_id,
+            summary,
+        )
+
+    # -- the runner's read step --------------------------------------------
+
+    def _collect_events(self, harness: Harness, process: Any) -> List[Any]:
+        """Read the child's stream, watched.
+
+        The runner's read step is where the child is visible, so this
+        is where the dispatch's watch is put on it: the process handle
+        is published (so ``/stop`` can reach it), the dispatch is
+        registered, the two watchers are started, and the child is
+        reaped when the read is over.
+
+        The two clock stamps happen here, in this order, and both
+        before any watcher thread starts:
+
+        * ``last_line_time`` first -- the idle watcher needs it, and
+          it is the clock every silence measurement is counted from;
+        * ``total_started_at`` second -- the total watcher measures
+          silence from *its own* start, so a child that was quiet
+          before the watcher existed cannot be counted as quiet now.
+
+        The order is not cosmetic. A stamp taken after a thread has
+        started races with that thread's own first stamp, and a watcher
+        whose baseline was taken from a stale clock fires
+        immediately -- with an elapsed time that is impossible. Both
+        stamps are taken here, before a single thread exists, so the
+        race cannot happen.
+
+        Args:
+            harness: The adapter whose parser reads the stream.
+            process: The child.
+
+        Returns:
+            The events of the run.
+        """
+        self.process = process
+        with self.tool._process_lock:
+            self.tool._current_process = process
+
+        # 2026-10-22 — register the dispatch so ``/stop`` can find and
+        # kill it. The handle is registered AFTER the spawn succeeded
+        # (there is nothing to kill before that) and BEFORE the output
+        # is read (the read is what blocks for minutes, and it is
+        # exactly the window the operator's stop has to be able to
+        # interrupt).
+        #
+        # Every failure here is swallowed: the registry is a watchdog
+        # aid, and a dispatch that cannot be watched must still run.
+        # The same is true of the unregister below.
+        registry, handle = _register_dispatch(self.tool, self.plan_id)
+
+        # 2026-10-26 — the dispatch is live from here on: the child
+        # exists and the read below is about to block on it for
+        # minutes. Registering the tool is what makes that child
+        # reachable for a cooperative stop — the executor's signal
+        # handler calls ``stop_all_live_dispatches``, which walks
+        # this registry and stops each registered child itself
+        # (the child leads its own process group, so the executor's
+        # own SIGTERM never reaches it).
+        #
+        # The spawn is the runner's, so this is the first place the
+        # child is visible: the registration has to happen here, not
+        # in the dispatch, or the stop could not reach the child.
+        register_live_dispatch(self.tool)
+
+        try:
+            self.last_line_time = [time.monotonic()]
+            self.total_started_at = [time.monotonic()]
+
+            process.stdout = _WatchedStream(process.stdout, self)
+            self._start_watchers(process)
+            try:
+                return super()._collect_events(harness, process)
+            except ValueError as exc:
+                # A closed pipe surfaces as a ValueError. The read loop
+                # this replaces caught it and turned it into a timeout
+                # rather than letting it escape as a crash.
+                self.read_error = exc
+                return []
+        finally:
+            # Cancel BOTH watchers no matter how the read ended.
+            # Otherwise the watcher thread stays alive for the life of
+            # the process, holding a reference to a dead child and
+            # eventually signalling a (possibly recycled) pid.
+            self.idle_fired.set()
+            self.total_fired.set()
+            # Reap the child, then let the dispatch drop the
+            # credential. The order is fixed by
+            # ``utils.secret_files``: the guard hook reads the settings
+            # file on every tool call, so the credential may only be
+            # replaced once the child is gone.
+            try:
+                self.tool._graceful_shutdown(process)
+            finally:
+                with self.tool._process_lock:
+                    self.tool._current_process = None
+                _unregister_dispatch(registry, self.plan_id, handle)
+                # 2026-10-26 — and the same for the live-dispatch
+                # registry. This ``finally`` is the point where the
+                # child is actually reaped, so it is where the tool
+                # stops being reachable for a cooperative stop. A tool
+                # that stayed registered would keep a dead child on the
+                # roster, and the next stop would count a child that is
+                # already gone.
+                unregister_live_dispatch(self.tool)
+
+    # -- the watchers ------------------------------------------------------
+
+    def _start_watchers(self, process: Any) -> None:
+        """Start the two watchers that measure silence.
+
+        Args:
+            process: The child they watch.
+        """
+        if self.idle_sec > 0:
+            threading.Thread(
+                target=self._idle_timer, args=(process,), daemon=True
+            ).start()
+        if self.total_sec > 0:
+            threading.Thread(
+                target=self._total_timer, args=(process,), daemon=True
+            ).start()
+
+    def _idle_timer(self, process: Any) -> None:
+        """Close the stream after ``idle_sec`` seconds of silence.
+
+        2026-09-14 — this watcher stamps its own start and clamps the
+        silence baseline to it. ``last_line_time`` is shared with the
+        total watcher and is stamped before this thread exists, so any
+        delay in between (a process freeze, a slow ``Thread.start()``,
+        a clock discontinuity) used to make this watcher see more
+        "silence" than had actually occurred. With ``idle_sec=1800``
+        that read as "idle for the whole window" and closed stdout
+        immediately, which the read loop then reported as an idle
+        timeout.
+
+        Args:
+            process: The child to stop reading.
+        """
+        started_at = time.monotonic()
+        while not self.idle_fired.is_set():
+            baseline = max(self.last_line_time[0], started_at)
+            elapsed = time.monotonic() - baseline
+            remaining = self.idle_sec - elapsed
+            if remaining <= 0:
+                break
+            self.idle_fired.wait(timeout=max(0.1, remaining))
+        if not self.idle_fired.is_set():
+            try:
+                process.stdout.close()
+            except Exception:
+                pass
+
+    def _total_timer(self, process: Any) -> None:
+        """Kill the child after ``total_sec`` seconds of silence.
+
+        2026-09-08 plan — the legacy implementation waited a fixed
+        ``total_sec`` regardless of subprocess activity. That hard
+        wall-clock cap was the right call for "wedged provider emits
+        thinking-deltas forever", but it broke legitimate long-running
+        subprocesses (e.g. ``pytest backend/tests/`` with 1,482 tests
+        -- runs 30+ min, well past the 15-min default cap).
+
+        New behaviour: the timer fires only when there's been NO
+        stdout for ``total_sec`` seconds. Every line the reader pulls
+        from the stream updates ``last_line_time``, which the timer
+        consults. Effect:
+
+          * Active subprocess (pytest emitting progress): the idle
+            window never elapses -> timer never fires.
+          * Hung subprocess (no output for 15 min): timer fires
+            exactly like the legacy hard cap.
+          * Wedged provider that emits only thinking-deltas (text
+            events without tool calls): each text event also resets
+            the timer.
+
+        The cap value itself (``total_sec``) is unchanged -- 15 min by
+        default. It is a hard bound, not a per-task tuning knob.
+
+        2026-09-14 (bogus-HardTimeout fix) — the watcher's own start
+        is stamped as the first statement of its body, and the silence
+        baseline is clamped to it: the watcher may only account for
+        silence that began while it was already running.
+
+        Args:
+            process: The child to kill.
+        """
+        started_at = time.monotonic()
+        try:
+            while not self.total_fired.is_set():
+                silence_baseline = max(self.last_line_time[0], started_at)
+                time_since_progress = time.monotonic() - silence_baseline
+                if time_since_progress > self.total_sec:
+                    # No progress for the full cap -> fire.
+                    break
+                # Otherwise wait until the cap would elapse *from the
+                # last progress point*, then re-check.
+                remaining = self.total_sec - time_since_progress
+                # Cap each wake-up at 1s so we react quickly to
+                # ``total_fired.set()`` from the read loop on clean EOF.
+                self.total_fired.wait(timeout=min(remaining, 1.0))
+        except Exception:
+            return
+        # The loop also exits when ``total_fired`` is set by the reader
+        # (clean EOF, the idle watcher closing stdout, an escaped
+        # error). Without this guard the watcher flagged every such
+        # exit as "the cap fired", and a subprocess that died before
+        # producing any text was reported as a bogus
+        # ``HardTimeoutError``.
+        if self.total_fired.is_set():
+            return
+        # The cap was exceeded. Two-step unblock:
+        # 1. Force-kill the entire process group so the subprocess
+        #    stops writing to the pipe. Without this, an actively
+        #    streaming LLM would keep filling the kernel pipe buffer
+        #    and the reader would block on read() of buffered data for
+        #    the full buffer-drain window (~seconds).
+        # 2. Close stdout from the parent's side so the reader sees
+        #    the closed pipe immediately after draining whatever's left
+        #    in the buffer.
+        # We deliberately do NOT use ``_graceful_shutdown`` here
+        # because it calls ``process.wait(timeout=120)`` which would
+        # block the watcher thread for up to 120s. The watcher is only
+        # useful if it returns quickly so the reader can detect the
+        # closed pipe and raise TimeoutError.
+        self.total_triggered = True
+        try:
+            kill_process_group(process, sig=signal.SIGKILL)
+        except Exception:
+            # Fallback to direct kill if group kill fails
+            try:
+                process.kill()
+            except Exception:
+                pass
+        try:
+            process.stdout.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -2916,7 +3604,12 @@ class ClaudeCodingTool(CodingTool):
         # a run is in flight, and probing per dispatch would put a sqlite
         # open in front of every LLM call.
         self.inherit_providers: bool = self._detect_inherit_mode()
-        self._current_process: Optional[subprocess.Popen] = None
+        # The child this dispatch is running, while it is running. The
+        # runner owns the child; the tool keeps the handle so that
+        # ``/stop`` can reach it. It is typed loosely on purpose: the
+        # spawn itself belongs to the runner now, so this module never
+        # constructs the object, it only carries it.
+        self._current_process: Optional[Any] = None
         self._process_lock = threading.Lock()
         # Concurrency slot bookkeeping for capacity-gated scene routing
         # (2026-09-17). Defaults to the process-wide tracker the FastAPI
@@ -3249,6 +3942,8 @@ class ClaudeCodingTool(CodingTool):
         excluded_providers: Optional[list] = None,
         allowed_tools: Optional[list] = None,
         scene: Optional[str] = None,
+        harness: Optional[Harness] = None,
+        conversation: Optional[bool] = None,
     ) -> tuple:
         """Run Claude Code in interactive mode with stream-json output.
 
@@ -3289,6 +3984,24 @@ class ClaudeCodingTool(CodingTool):
                 the provider chain is re-resolved for this scene (hot-
                 reload friendly) and preferred over the legacy walk.
                 ``None`` uses the instance ``scene``.
+            conversation: Whether this call reads its answer out of
+                the run's CONVERSATION — the assistant's own turns —
+                rather than out of the terminal envelope.
+
+                The two are different contracts. A call that reads the
+                turns needs the run to have streamed them: the
+                envelope is only the fallback, and answering a run that
+                never streamed with the envelope's summary is
+                answering with something the caller did not ask for.
+                The answer API (``query`` / ``query_json``) reads the
+                envelope instead — it asks one question and wants one
+                answer, and the envelope is that answer on every
+                backend — so it says so, and a run that carried only
+                its envelope is a run that worked.
+
+                ``None`` means "the caller did not say", and the tool
+                itself answers it: see
+                :meth:`_reads_the_conversation`.
 
         Returns:
             ``(result_text, session_id, result_meta)`` where session_id
@@ -3300,6 +4013,13 @@ class ClaudeCodingTool(CodingTool):
         """
         subagent_uuid = uuid.uuid4().hex
         subagent_log_file = f"/tmp/subagent_{subagent_uuid}_activity.log"
+
+        # 2026-10-23 — the backend this dispatch drives. The path that
+        # led here handed one down, so every dispatch kind reaches the
+        # spawn with the same object; a dispatch that reaches the spawn
+        # on its own asks the process for it. Either way there is one
+        # harness and one answer.
+        harness = harness if harness is not None else current_harness()
 
         # 2026-10-22 — the plan this dispatch belongs to, resolved once.
         # ``None`` means "not a plan dispatch": nothing below changes for
@@ -3344,30 +4064,64 @@ class ClaudeCodingTool(CodingTool):
         # so the parent can read the event stream; input is plain text
         # via stdin (interactive mode default). The LLM terminates by
         # emitting a ``result`` event when stdin closes.
-        cmd = [
-            "claude",
-            "--verbose",
-            "--output-format", "stream-json",
-            "--permission-mode", "bypassPermissions",
-        ]
-        if system_instruction:
-            cmd += ["--append-system-prompt", system_instruction]
-        if self.model:
-            cmd += ["--model", self.model]
-        if self.mcp_config:
-            cmd += ["--mcp-config", self.mcp_config]
-        if session_id:
-            if resume:
-                cmd += ["--resume", session_id]
-            else:
-                cmd += ["--session-id", session_id]
-        # Per-call tool restriction (2026-09-07 BinaryRebuildAgent plan).
-        # When set, the spawned Claude CLI is hard-limited to the given
-        # tool list (e.g. Bash,Read,Grep,Glob) so the sub-agent cannot
-        # use Edit/Write. ``None`` keeps the default unrestricted set so
-        # every existing caller is unaffected.
-        if allowed_tools:
-            cmd += ["--allowedTools", ",".join(allowed_tools)]
+        #
+        # 2026-10-23 — the command line is the harness's to write. The
+        # dispatch says what it wants in harness-neutral terms (the
+        # prompt, the conversation, the tools this run may use) and the
+        # adapter spells it as flags, in the order that backend
+        # expects. The argv below is therefore the adapter's answer,
+        # not a list of flags assembled here: a second copy of "what a
+        # command line looks like" is exactly what this layer is for.
+        #
+        # The per-call tool restriction stays a decision of the
+        # dispatch, because it is a decision about *this* call: whether
+        # the restriction can be honoured at all is the harness's
+        # answer, and a backend that cannot narrow the tool set says so
+        # here rather than running the dispatch unrestricted. The check
+        # stays ABOVE the provider walk on purpose -- a refusal raised
+        # after the walk would leave the provider slot it took
+        # unreleased.
+        if allowed_tools and not harness.capabilities().tool_whitelist:
+            raise HarnessConfigError(
+                "this backend cannot restrict the tools a dispatch may "
+                f"use, so the restriction {list(allowed_tools)!r} cannot "
+                "be honoured; refusing to run the dispatch unrestricted"
+            )
+
+        request = TaskInvocation(
+            prompt=prompt,
+            system_instruction=system_instruction,
+            # The MCP configuration travels as the value the caller
+            # named. The adapter reads a path and an inline
+            # configuration out of the same field and forwards it
+            # verbatim either way, and the value here is the one the
+            # caller passed.
+            mcp_config=self.mcp_config,
+            allowed_tools=tuple(allowed_tools or ()),
+            model=self.model,
+            cwd=self.cwd,
+            session=(
+                SessionRef(pinned_session_id=session_id)
+                if session_id
+                else None
+            ),
+            mode=SessionMode.RESUME if resume else SessionMode.CREATE,
+            # What THIS call needs from its run — not what this layer
+            # is. A one-shot query wants one answer, and the terminal
+            # envelope is that answer, so it promises no stream: the
+            # runner refuses a run that promised one and produced only
+            # its envelope, and a promise every one-shot call cannot
+            # keep is a promise that fails every one-shot call.
+            #
+            # A call that continues a conversation is a session-style
+            # run, and it promises the stream on the backend whose
+            # conversation lives in the event stream — where an
+            # envelope-only run is a capability failure and is refused
+            # explicitly rather than answered with a summary.
+            multi_turn=bool(resume) and _session_run_must_stream(harness),
+        )
+        invocation = harness.build_invocation(request)
+        cmd = list(invocation.argv)
 
         # Env setup: identical to _run_claude_interactive (provider selection,
         # settings file, hook, etc). Kept inline here as the single source
@@ -3383,7 +4137,14 @@ class ClaudeCodingTool(CodingTool):
         # routing / ``self.*`` override has mutated ``env`` — see the
         # write block just before the ``--settings`` flag is appended.
         settings_data: Optional[dict] = None
-        if self.settings is not None:
+        # The settings file is a claude-path input. The other backend is
+        # configured through its own profile, which its adapter
+        # contributes as the run's environment, and its command line
+        # refuses the flag that names the file. A dispatch that drives it
+        # therefore never reads a template, never writes a file and never
+        # puts that flag on the command line — the whole block below is
+        # skipped, together with the template it would have read.
+        if _takes_settings_file(harness) and self.settings is not None:
             original_settings = Path(self.settings)
             if original_settings.exists():
                 with open(original_settings, "r", encoding="utf-8") as f:
@@ -4692,28 +5453,38 @@ class ClaudeCodingTool(CodingTool):
         # selected. Symptom: server logs report a Vendor A dispatch while CC
         # Switch's usage table shows zero Vendor A requests (2026-09-13
         # investigation).
-        # 2026-09-17 — everything from the settings write through the watcher startup sits
-        # inside a try that returns the pool slot on ANY exit. The read loop below has
-        # its own finally (which also releases); this arm covers the narrow window
-        # before it — a failed settings write or a Popen that raises would otherwise
-        # leak the slot permanently, and a leaked slot never comes back: the provider
-        # would report itself full for the life of the process.
+        # 2026-09-17 — everything from the settings write through the run sits
+        # inside a try that returns the pool slot on ANY exit. The runner's own
+        # read step has its own finally (which also releases); this arm covers the
+        # narrow window before it — a failed settings write or a spawn that
+        # refuses would otherwise leak the slot permanently, and a leaked slot
+        # never comes back: the provider would report itself full for the life of
+        # the process.
         #
         # The same arm is also where the credential has to be dropped: the
         # settings file is written below, so an exception anywhere between
-        # that write and the read loop's own ``finally`` leaves a live key
-        # on disk that nothing else will ever revisit. ``process`` starts
-        # as ``None`` because the ``Popen`` below may be exactly what
-        # raised.
-        process: Optional[subprocess.Popen] = None
-        # 2026-10-22 — the watchdog handle for this dispatch. Bound
-        # before the ``try`` so the ``except BaseException`` arm can
-        # always reach it: an exception raised BEFORE the registration
-        # (a failed settings write, a Popen that refuses) must not
-        # turn into an ``UnboundLocalError`` on the way out.
-        _dispatch_registry = None
-        _dispatch_handle = None
+        # that write and the run's own end leaves a live key on disk that
+        # nothing else will ever revisit.
+        #
+        # 2026-10-23 — the child is the runner's now. This module hands it an
+        # invocation; the runner owns the process from the spawn to the reap,
+        # and the watchdog handle is registered and released down there,
+        # because it can only exist once the child does.
         try:
+            # 2026-10-23 — the ``--settings`` file is the claude CLI's
+            # own convention: a JSON file of environment overrides that
+            # the CLI reads at start-up, and the only channel that can
+            # outrank the process environment (which is where the
+            # routed provider's credentials would otherwise live).
+            #
+            # It is written when the dispatch was given a settings
+            # TEMPLATE to write, and a template is a claude-path
+            # input: the other backend is configured through its own
+            # profile, which its adapter contributes as the run's
+            # environment. A dispatch that drives the other backend
+            # therefore never has a template, never enters this branch,
+            # and never puts a flag that CLI refuses on its command
+            # line.
             if settings_data is not None:
                 # Copy every ANTHROPIC_* key the routing layer / ``self.*``
                 # overrides put into ``env``. The list is deliberately an
@@ -4778,25 +5549,92 @@ class ClaudeCodingTool(CodingTool):
             #
             # The invariant is asserted at the read site rather than here
             # because a raise from inside the ``try`` above would be masked:
-            # its ``finally`` calls ``_graceful_shutdown(process)`` with
-            # ``process`` still ``None``, and the resulting ``AttributeError``
-            # would replace the real message with a shutdown failure.
+            # its ``finally`` would reach for a child that was never
+            # started, and the resulting ``AttributeError`` would replace
+            # the real message with a shutdown failure.
+            #
+            # 2026-10-23 — the ``--settings`` flag is appended HERE, after
+            # the adapter's own flags and after the fallback ``--model``,
+            # because the file it names is written just above and its path
+            # only exists from that moment on. The order is the order the
+            # command line had before the move: the adapter's flags, then
+            # the fallback model, then the settings file.
+            #
+            # 2026-10-06 — the sandbox is the runner's decision now (it
+            # wraps the command line before it spawns anything, and
+            # raises for a profile it cannot apply), so this module does
+            # not wrap it a second time. What the run was confined to is
+            # reported from the run's own result, below.
 
-            # 2026-10-06: confine the sub-agent when the operator
-            # configured a sandbox. `bypassPermissions` removes the
-            # confirmation prompts, so without this the agent has
-            # unrestricted filesystem access with no gate anywhere in
-            # the path. Fails loudly rather than falling back — see
-            # backend/claude_sandbox.py for why a sandbox that quietly
-            # disables itself is the worse outcome.
-            _sandbox = claude_sandbox.wrap_command(cmd, env)
-            cmd = _sandbox.command
+            # The run itself (2026-10-23). The runner owns the spawn:
+            # it decides the sandbox, merges the environment, starts
+            # the child and reads its stream. What this module hands it
+            # is an invocation -- the command line, the environment
+            # this dispatch adds to the inherited one, and the directory
+            # the child runs in -- and the prompt, which the runner
+            # writes to the child's standard input.
+            #
+            # The environment travels as a DELTA: the values this
+            # dispatch adds to (or changes in) the inherited
+            # environment, and nothing else. The runner merges it on
+            # top of its own copy of the inherited environment, and
+            # the order the child used to get -- inherited first, this
+            # dispatch's values last -- is the order it gets now.
+            #
+            # The adapter's own delta rides along: a harness that
+            # contributes environment of its own (the mcode profile's
+            # credentials, for instance) put it there, and dropping it
+            # here would run the child without it.
+            self.current_call_model = env.get("ANTHROPIC_MODEL")
+            idle_sec = (
+                idle_timeout
+                if idle_timeout is not None
+                else self.DEFAULT_IDLE_TIMEOUT
+            )
+            total_sec = (
+                total_timeout
+                if total_timeout is not None
+                else self.DEFAULT_TOTAL_TIMEOUT
+            )
+            run_invocation = HarnessInvocation(
+                argv=tuple(cmd),
+                env_delta={
+                    **invocation.env_delta,
+                    **_environment_delta(env),
+                },
+                cwd=invocation.cwd,
+                prepare=invocation.prepare,
+                # The adapter said whether this run has to produce a
+                # stream; rebuilding the invocation here must not drop
+                # that, or the runner would never see the promise.
+                multi_turn=invocation.multi_turn,
+            )
+            runner = _DispatchRunner(
+                tool=self,
+                harness=harness,
+                idle_sec=idle_sec,
+                total_sec=total_sec,
+                plan_id=dispatch_plan_id,
+            )
+            result = runner.run(harness, run_invocation, stdin_text=prompt)
+
+            # What the run was confined to, as the runner decided it.
+            # 2026-10-06: `bypassPermissions` removes the confirmation
+            # prompts, so without a gate the agent has unrestricted
+            # filesystem access. The runner is the one that applies the
+            # gate (and the one that raises for a profile it cannot
+            # apply), so the answer comes from its result.
             if self.logger:
-                if _sandbox.reason == "applied":
+                if result.sandbox_state == SANDBOX_APPLIED:
+                    profile = None
+                    try:
+                        profile = claude_sandbox.resolve_sandbox_profile_file()
+                    except Exception:
+                        profile = None
                     self.logger.info(
                         "subagent_sandboxed",
-                        f"Sub-agent running under {_sandbox.profile}",
-                        data={"profile": str(_sandbox.profile)},
+                        f"Sub-agent running under {profile}",
+                        data={"profile": str(profile) if profile else None},
                     )
                 else:
                     self.logger.info(
@@ -4805,282 +5643,68 @@ class ClaudeCodingTool(CodingTool):
                         data={"profile": None},
                     )
 
-            # Launch subprocess. Interactive mode: stdin is plain text,
-            # write the prompt then close stdin (which signals the LLM
-            # to terminate with a result event).
-            self.current_call_model = env.get("ANTHROPIC_MODEL")
-            process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd=self.cwd,
-                env=env,
-                start_new_session=True,
-            )
-
-            with self._process_lock:
-                self._current_process = process
-
-            # 2026-10-26 — the dispatch is live from here on: the child
-            # exists and the read loop below is about to block on it for
-            # minutes. Registering the tool is what makes that child
-            # reachable for a cooperative stop — the executor's signal
-            # handler calls ``stop_all_live_dispatches``, which walks
-            # this registry and stops each registered child itself
-            # (the child leads its own process group, so the executor's
-            # own SIGTERM never reaches it).
-            register_live_dispatch(self)
-
-            # 2026-10-22 — register the dispatch so ``/stop`` can find
-            # and kill it. The handle is registered AFTER the spawn
-            # succeeded (there is nothing to kill before that) and
-            # BEFORE the output is read (the read is what blocks for
-            # minutes, and it is exactly the window the operator's
-            # stop has to be able to interrupt).
+            # 2026-10-23 — the child is the runner's, and so is its
+            # output. The run is over when the runner returns; what
+            # follows reads the answer out of the events it produced.
             #
-            # ``scoped_tool=self`` is what makes the kill path work:
-            # ``_kill_sub_agent_process`` reaches the ``Popen`` through
-            # ``handle.scoped_tool._current_process``, under the tool's
-            # own ``_process_lock``.
+            # The credential is dropped on every path out of the run:
+            # the settings file was written before the child started,
+            # and the guard hook reads it on every tool call, so it may
+            # only be replaced once the child is gone -- which the
+            # runner guarantees, because it reaps the child before it
+            # returns.
             #
-            # Every failure here is swallowed: the registry is a
-            # watchdog aid, and a dispatch that cannot be watched must
-            # still run. The same is true of the unregister below.
-            _dispatch_registry, _dispatch_handle = _register_dispatch(
-                self, dispatch_plan_id,
-            )
-
-            # Feed the user prompt via stdin, then close.
-            try:
-                process.stdin.write(prompt)
-                if not prompt.endswith("\n"):
-                    process.stdin.write("\n")
-                process.stdin.flush()
-            except BrokenPipeError:
-                pass
-            finally:
-                try:
-                    process.stdin.close()
-                except Exception:
-                    pass
-
-            # Idle timer — Layer-1 protection (close stdout pipe on inactivity).
-            idle_sec = idle_timeout if idle_timeout is not None else self.DEFAULT_IDLE_TIMEOUT
-            idle_fired = threading.Event()
-            last_line_time = [time.monotonic()]
-
-            def _idle_timer():
-                # 2026-09-14 — stamp this watcher's own start and clamp the
-                # silence baseline to it. ``last_line_time`` is shared with
-                # the total timer and is stamped ~16 statements earlier, so
-                # any delay in between (a process freeze, a slow
-                # ``Thread.start()``, a clock discontinuity) used to make the
-                # idle watcher see more "silence" than had actually occurred.
-                # With ``idle_sec=1800`` that read as "idle for the whole
-                # window" and closed stdout immediately, which the read loop
-                # then reported as an idle timeout.
-                started_at = time.monotonic()
-                while not idle_fired.is_set():
-                    baseline = max(last_line_time[0], started_at)
-                    elapsed = time.monotonic() - baseline
-                    remaining = idle_sec - elapsed
-                    if remaining <= 0:
-                        break
-                    idle_fired.wait(timeout=max(0.1, remaining))
-                if not idle_fired.is_set():
-                    try:
-                        process.stdout.close()
-                    except Exception:
-                        pass
-
-            if idle_sec > 0:
-                timer_thread = threading.Thread(target=_idle_timer, daemon=True)
-                timer_thread.start()
-
-            # 2026-09-06 — Layer-1b total-timeout watcher. Idle timer only fires
-            # when stdout goes silent; a wedged provider can keep emitting
-            # "thinking" deltas forever, holding the GIL on the read loop and
-            # blocking the verification iteration loop's Phase 2. The watcher
-            # force-closes stdout + SIGTERMs the process so the read loop's
-            # BlockingError bubbles up to query() as a normal TimeoutError →
-            # provider fallback re-routes instead of hanging the auto-loop.
-            #
-            # 2026-09-15 CORRECTION — the original wording here claimed this was
-            # a "hard wall-clock cap: even if the LLM is actively streaming".
-            # That has NOT been true since the 2026-09-08 change: the timer now
-            # measures SILENCE against ``last_line_time`` (clamped to its own
-            # start), so a call that keeps emitting stdout — pytest progress,
-            # thinking deltas, tool events — never trips it. That is the
-            # intended behaviour: "alive and printing" must not be killed. The
-            # absolute ceiling is the layer above (VerificationSubAgent's
-            # 1-hour cap; see HARD_WALL_CLOCK_TIMEOUT_SECONDS).
-            total_sec = total_timeout if total_timeout is not None else self.DEFAULT_TOTAL_TIMEOUT
-            total_fired = threading.Event()
-            total_started_at = [time.monotonic()]
-            # Active marker for the read loop — signals "we already SIGTERM'd
-            # due to wall-clock cap, don't try to read past EOF, just surface
-            # the timeout error."
-            total_triggered = [False]
-
-            def _total_timer():
-                """Adaptive total-timeout watcher.
-
-                2026-09-08 plan — the legacy implementation waited a fixed
-                ``total_sec`` regardless of subprocess activity. That hard
-                wall-clock cap was the right call for "wedged provider
-                emits thinking-deltas forever", but it broke legitimate
-                long-running subprocesses (e.g. ``pytest backend/tests/``
-                with 1,482 tests — runs 30+ min, well past the 15-min
-                default cap).
-
-                New behaviour: the timer fires only when there's been NO
-                stdout for ``total_sec`` seconds. Every line the read loop
-                pulls from ``process.stdout`` updates ``last_line_time``,
-                which the timer consults via the closure-captured list.
-                Effect:
-                  * Active subprocess (pytest emitting progress): the
-                    idle window never elapses → timer never fires.
-                  * Hung subprocess (no output for 15 min): timer fires
-                    exactly like the legacy hard cap.
-                  * Wedged provider that emits only thinking-deltas
-                    (text events without tool calls): each text event
-                    also resets the timer. The previous "wedged
-                    provider" concern is now mitigated by the *idle*
-                    timer on line 1075 (separate from this one), which
-                    closes stdout on inactivity — once stdout closes,
-                    the read loop sees EOF, the query returns, and
-                    ``_total_timer`` exits via ``total_fired.set()``.
-
-                The cap value itself (``total_sec``) is unchanged —
-                15 min by default. It is a hard bound, not a per-task
-                tuning knob.
-                """
-                # 2026-09-14 (bogus-HardTimeout fix) — stamp this watcher's
-                # own start as the first statement of the thread body, and
-                # clamp the silence baseline to it.
-                #
-                # ``last_line_time`` is stamped ~30 statements *before*
-                # ``total_started_at`` (it is shared with the idle timer,
-                # which needs it earlier), and the read loop only re-stamps
-                # it once the subprocess emits its first line.  Any delay
-                # between the two stamps — a process freeze, a slow
-                # ``Thread.start()``, a clock discontinuity — therefore
-                # showed up as *silence that predates the timer*, and the
-                # watcher fired immediately with an internally impossible
-                # ``elapsed`` (``total_sec`` non-zero, ``elapsed`` near
-                # zero), killing the report-generation and
-                # repair-generation LLM calls in flight.
-                #
-                # ``max(...)`` states the real invariant: the watcher may
-                # only account for silence that began while it was already
-                # running.  In the healthy case the stamps are microseconds
-                # apart, so behaviour is unchanged.
-                started_at = time.monotonic()
-                try:
-                    while not total_fired.is_set():
-                        silence_baseline = max(last_line_time[0], started_at)
-                        time_since_progress = time.monotonic() - silence_baseline
-                        if time_since_progress > total_sec:
-                            # No progress for the full cap → fire.
-                            break
-                        # Otherwise wait until the cap would elapse
-                        # *from the last progress point*, then re-check.
-                        remaining = total_sec - time_since_progress
-                        # Cap each wake-up at 1s so we react quickly to
-                        # ``total_fired.set()`` from the read loop on
-                        # clean EOF.
-                        total_fired.wait(timeout=min(remaining, 1.0))
-                except Exception:
-                    return
-                # 2026-09-14 — the loop also exits when ``total_fired`` is
-                # set by the read loop (clean EOF, a ``result`` event, the
-                # idle watcher closing stdout, an escaped ``ApiError``, …).
-                # Without this guard the watcher flagged every such exit as
-                # "the cap fired", and a subprocess that died before
-                # producing any text was reported as a bogus
-                # ``HardTimeoutError``.  The contract is the one the
-                # in-tree replica always had — the production body had
-                # simply diverged from it.
-                if total_fired.is_set():
-                    return
-                # Wall-clock cap exceeded. Two-step unblock:
-                # 1. Force-kill the entire process group so the subprocess
-                #    stops writing to the pipe. Without this, an actively
-                #    streaming LLM would keep filling the kernel pipe buffer
-                #    and the read loop would block on read() of buffered data
-                #    for the full buffer-drain window (~seconds).
-                # 2. Close stdout from the parent's side so the read loop's
-                #    ``for line in process.stdout:`` raises ValueError
-                #    immediately after draining whatever's left in the buffer.
-                # We deliberately do NOT use ``_graceful_shutdown`` here
-                # because it calls ``process.wait(timeout=120)`` which would
-                # block the watcher thread for up to 120s. The watcher is
-                # only useful if it returns quickly so the main thread's
-                # read loop can detect the closed pipe and raise TimeoutError.
-                total_triggered[0] = True
-                try:
-                    kill_process_group(process, sig=signal.SIGKILL)
-                except Exception:
-                    # Fallback to direct kill if group kill fails
-                    try:
-                        process.kill()
-                    except Exception:
-                        pass
-                try:
-                    process.stdout.close()
-                except Exception:
-                    pass
-
-            if total_sec > 0:
-                total_thread = threading.Thread(target=_total_timer, daemon=True)
-                total_thread.start()
-            else:
-                total_thread = None
-
-            # Read the stream-json event stream. Interactive mode emits:
-            #   system init       — session_id, available tools, model, etc
-            #   system thinking_tokens — incremental thinking metrics
-            #   assistant         — assistant turn content (text + tool_use)
-            #   user              — synthetic tool_result messages
-            #   result            — final turn summary, success or error
-            # We capture session_id from system init, accumulate assistant
-            # text, and break on result.
+            # ONLY ``effective_settings_path`` -- the file written above
+            # for this one child. ``self.settings`` is deliberately
+            # excluded: it is a caller-owned *input* that a later
+            # ``query()`` re-reads (``agent.py`` reassigns it once per
+            # task, but a task can make more than one call). Redacting
+            # it would hand the next dispatch ``<redacted>`` as its API
+            # key and silently break routing -- caught by
+            # ``test_coding_tool_settings_write_order``.
         except BaseException:
+            # The slot this dispatch took from the provider pool has to
+            # go back, whichever way the dispatch ends. The runner
+            # releases it as well, but the runner only exists once the
+            # run started -- a failed settings write leaks the slot
+            # otherwise, and a leaked slot never comes back.
             _release_scene_slot()
-            # The settings file may already be on disk (the write above
-            # precedes the ``Popen``), and whatever raised here is about
-            # to leave this function, so nothing further down will get a
-            # chance to revisit it. Reap a child if one exists — a
-            # successful ``Popen`` followed by a raised watcher setup
-            # reaches this arm too — and drop the credential either way.
-            # ``redact_all`` never raises, so it cannot displace the
-            # exception being propagated.
-            try:
-                if process is not None:
-                    self._graceful_shutdown(process)
-            finally:
-                redact_all(
-                    [effective_settings_path],
-                    logger=logger,
-                )
-            # 2026-10-22 — the dispatch is over on this path (a raised
-            # watcher setup, a failed Popen, a KeyboardInterrupt), so
-            # the watchdog handle has to go with it. The read loop's own
-            # ``finally`` does the same for the paths that get that far;
-            # ``unregister`` removes by identity and tolerates a handle
-            # that is already gone, so the two never fight.
-            _unregister_dispatch(
-                _dispatch_registry, dispatch_plan_id, _dispatch_handle,
-            )
-            # 2026-10-26 — same for the live-dispatch registry: the child
-            # has just been reaped, so there is nothing left for a stop
-            # to find. Leaving the tool registered would make the next
-            # stop count a child that is already dead.
-            unregister_live_dispatch(self)
             raise
+        finally:
+            # The credential on disk is dropped here, on every path out
+            # of the run. The settings file was written before the child
+            # started, and the guard hook reads it on every tool call,
+            # so it may only be replaced once the child is gone -- which
+            # the runner guarantees, because it reaps the child before
+            # it returns.
+            #
+            # ONLY ``effective_settings_path`` -- the file written above
+            # for this one child. ``self.settings`` is deliberately
+            # excluded: it is a caller-owned *input* that a later
+            # ``query()`` re-reads (``agent.py`` reassigns it once per
+            # task, but a task can make more than one call). Redacting
+            # it would hand the next dispatch ``<redacted>`` as its API
+            # key and silently break routing -- caught by
+            # ``test_coding_tool_settings_write_order``.
+            #
+            # ``redact_all`` never raises, so it cannot displace an
+            # exception that is on its way out.
+            _release_scene_slot()
+            redact_all(
+                [effective_settings_path],
+                logger=logger,
+            )
+
+        # The answer, read out of the run's events.
+        #
+        # The events are the adapter's own: the assistant's text, the
+        # session the run opened, and the result event that ends the
+        # turn. The text is the ASSISTANT's text, not the result
+        # event's summary -- the old read loop accumulated the
+        # assistant's text blocks and only fell back to the result
+        # field when there was none, and a dispatch that answered with
+        # the summary instead would be answering with something the old
+        # one never did.
         result_text = ""
         # Usage metadata captured from the stream-json ``result`` event
         # (usage / total_cost_usd / num_turns / durations). Surfaced to
@@ -5088,229 +5712,93 @@ class ClaudeCodingTool(CodingTool):
         # the per-plan usage registry (2026-09-21).
         result_meta: Dict[str, Any] = {}
         resolved_session_id: Optional[str] = session_id
-        read_error = None
-        try:
-            for line in process.stdout:
-                last_line_time[0] = time.monotonic()
-                # Mirror to self._last_output_ts so the sub-agent watchdog
-                # (server.py::_handle_stuck_sub_agent) can tell an active
-                # sub-agent (still streaming tool calls / text) apart from
-                # a wedged one (no stdout output for the threshold window).
-                # Without this mirror, the watchdog only saw
-                # SubAgentHandle.last_progress_ts — which the sub-agent
-                # only touches on stage transitions, so a 12-minute pytest
-                # re-run inside one attempt looked "stale" and got killed.
-                self._last_output_ts = last_line_time[0]
-                self._last_output_line = line[:400]
-                line = line.strip()
-                if not line:
+        api_error: Optional[ApiError] = None
+        turn_ended = False
+        for event in result.events:
+            payload = event.raw if isinstance(event.raw, dict) else {}
+            if event.type == "system":
+                # 2026-10-25 — any system event may name the
+                # conversation: claude's ``init`` does, mcode's
+                # ``session.started`` does. The rule is the same for
+                # both — an event that names a session names the
+                # session this run is in — so the reader does not ask
+                # which backend produced it.
+                #
+                # It used to read the id out of the ``init`` event
+                # alone, which meant an mcode run handed the caller
+                # back the very id it had asked with: a pinned key
+                # that names no conversation the CLI could re-open.
+                if event.session_id:
+                    resolved_session_id = event.session_id
+                continue
+            if event.type == "assistant":
+                if not turn_ended:
+                    result_text += event.text
+                continue
+            if event.type == "result":
+                if turn_ended:
+                    # The old read loop stopped at the result event, so
+                    # a second one was never part of the answer.
                     continue
-                try:
-                    event = json.loads(line)
-                    event_type = event.get("type", "")
+                turn_ended = True
+                # The usage metadata is captured BEFORE the error branch
+                # -- an error result can still carry the usage/cost
+                # fields, and the registry records both outcomes for the
+                # cross-check against CC Switch's own ledger.
+                result_meta = {
+                    "usage": payload.get("usage"),
+                    "total_cost_usd": payload.get("total_cost_usd"),
+                    "num_turns": payload.get("num_turns"),
+                    "duration_ms": payload.get("duration_ms"),
+                    "duration_api_ms": payload.get("duration_api_ms"),
+                    "is_error": bool(payload.get("is_error")),
+                }
+                if payload.get("is_error"):
+                    api_status = payload.get("api_error_status", "unknown")
+                    error_text = payload.get("result", "")
+                    api_error = ApiError(
+                        message=(
+                            error_text
+                            or f"Claude API returned error status: {api_status}"
+                        ),
+                        status=api_status,
+                        retry_after=None,
+                    )
+                # The result field is the final fallback if there is no
+                # assistant text (rare -- the model answered with a
+                # tool call only).
+                if not result_text:
+                    result_text = event.text
+                continue
 
-                    if event_type == "system":
-                        # The init subtype carries the session_id and
-                        # the tools list. Subsequent system events
-                        # are thinking_tokens / permission_denied.
-                        if event.get("subtype") == "init":
-                            resolved_session_id = event.get("session_id") or resolved_session_id
-                        continue
+        # The run reported a failure of its own: the model answered
+        # with an error. The old read loop raised it the moment the
+        # result event arrived; here the whole run has been read first,
+        # which is the same answer with the child already reaped.
+        if api_error is not None:
+            raise api_error
 
-                    if event_type == "assistant":
-                        content = event.get("message", {}).get("content", [])
-                        for block in content:
-                            if block.get("type") == "text":
-                                result_text += block.get("text", "")
-                            elif block.get("type") == "tool_use":
-                                # 2026-09-08: forward tool_use to the
-                                # main log so the operator can see what
-                                # subprocess the Claude sub-agent is
-                                # launching. Without this, a 30-min
-                                # ``pytest backend/tests/`` run is
-                                # invisible until query() returns.
-                                tool_name = block.get("name", "?")
-                                tool_input = block.get("input", {}) or {}
-                                # Compact form: tool name + first 200
-                                # chars of input JSON. We deliberately
-                                # omit full input to avoid logging
-                                # sensitive data (the input can
-                                # contain arbitrary user-provided
-                                # content in some tools).
-                                try:
-                                    input_summary = json.dumps(
-                                        tool_input, ensure_ascii=False,
-                                    )[:200]
-                                except Exception:
-                                    input_summary = "<unserialisable>"
-                                logger.info(
-                                    "[CLAUDE STREAM] tool_use name=%s "
-                                    "input=%s",
-                                    tool_name,
-                                    input_summary,
-                                )
-                        continue
-
-                    if event_type == "user":
-                        # Synthetic tool_result messages: Claude just
-                        # got the output of a tool it called (e.g.
-                        # ``pytest backend/tests/`` stdout/stderr).
-                        # 2026-09-08: forward the tool_result
-                        # content to the main log so the operator
-                        # sees pytest progress in real-time — without
-                        # this, a 30-min ``pytest`` run inside Claude
-                        # is invisible until ``query()`` returns.
-                        content = event.get("message", {}).get("content", [])
-                        for block in content:
-                            if not isinstance(block, dict):
-                                continue
-                            if block.get("type") == "tool_result":
-                                tool_use_id = block.get("tool_use_id", "?")
-                                result_body = block.get("content", "")
-                                # ``content`` is either a string or a
-                                # list of content blocks. Normalise.
-                                if isinstance(result_body, list):
-                                    result_body = "".join(
-                                        b.get("text", "") if isinstance(b, dict) else str(b)
-                                        for b in result_body
-                                    )
-                                # Truncate to 300 chars — pytest emits
-                                # thousands of ``PASSED`` lines and we
-                                # don't want each one in the main log.
-                                summary = str(result_body)[:300]
-                                logger.info(
-                                    "[CLAUDE STREAM] tool_result "
-                                    "tool_use_id=%s content=%r",
-                                    tool_use_id,
-                                    summary,
-                                )
-                                # Track non-empty results so we
-                                # don't double-log the same content.
-                                # (No-op for now — placeholder for
-                                # future dedup if needed.)
-                                _ = bool(summary.strip())
-                        continue
-
-                    if event_type == "result":
-                        # Capture usage metadata BEFORE the is_error
-                        # branch — an error result can still carry the
-                        # usage/cost fields, and the registry records
-                        # both outcomes for the cross-check against CC
-                        # Switch's own ledger.
-                        result_meta = {
-                            "usage": event.get("usage"),
-                            "total_cost_usd": event.get("total_cost_usd"),
-                            "num_turns": event.get("num_turns"),
-                            "duration_ms": event.get("duration_ms"),
-                            "duration_api_ms": event.get("duration_api_ms"),
-                            "is_error": bool(event.get("is_error")),
-                        }
-                        if event.get("is_error"):
-                            api_status = event.get("api_error_status", "unknown")
-                            error_text = event.get("result", "")
-                            idle_fired.set()
-                            self._graceful_shutdown(process)
-                            raise ApiError(
-                                message=error_text or f"Claude API returned error status: {api_status}",
-                                status=api_status,
-                                retry_after=None,
-                            )
-                        # Use result field as final fallback if no
-                        # assistant text accumulated (rare — LLM
-                        # responded via tool only).
-                        if not result_text:
-                            result_text = event.get("result", "")
-                        break
-
-                except json.JSONDecodeError:
-                    pass
-        except ValueError as e:
-            read_error = e
-        finally:
-            # 2026-09-14 — cancel BOTH watchers no matter how the read
-            # loop exited. Previously the two ``set()`` calls sat after
-            # the ``except ValueError`` handler only, so an exception
-            # other than ``ValueError`` (notably the ``ApiError`` raised
-            # further down the loop body) skipped them: the watcher
-            # thread then stayed alive for the life of the process,
-            # holding a reference to a dead ``Popen`` and eventually
-            # SIGKILLing its (possibly recycled) pid.
-            idle_fired.set()
-            total_fired.set()  # cancel total timer on clean exit
-            # 2026-09-17 — hand the provider slot back. This runs on the
-            # clean path, on the idle/total-timeout paths, and on the
-            # ``ApiError`` raised from inside the loop, which is exactly
-            # the set of ways a dispatch can end. Idempotent, so the
-            # setup-region handler above may also have released it.
-            _release_scene_slot()
-            # Reap the child, then drop the credential. Both belong in
-            # this ``finally`` for the same reason the three statements
-            # above do: ``ApiError`` is not a ``ValueError``, so it
-            # escapes the ``except`` clause entirely and carries control
-            # past anything written after the statement. That is the
-            # ordinary provider-error exit — the raise site reaps the
-            # child itself, but the redaction used to sit after the
-            # whole statement, where that exit never reached it.
-            #
-            # The order is fixed by ``utils.secret_files``:
-            # ``coding_tool_hooks/pre_tool_use.sh`` reads
-            # ``$CLAUDE_SETTINGS_PATH`` on every tool call, so the
-            # credential may only be replaced once the child is gone.
-            # Reaping twice on the raise path is harmless —
-            # ``_graceful_shutdown`` returns as soon as ``wait`` reports
-            # the child gone. The ``finally`` on the shutdown is what
-            # keeps the credential from surviving a shutdown that itself
-            # raises.
-            #
-            # ONLY ``effective_settings_path`` — the file written above
-            # for this one child. ``self.settings`` is deliberately
-            # excluded: it is a caller-owned *input* that a later
-            # ``query()`` re-reads (``agent.py`` reassigns it once per
-            # task, but a task can make more than one call). Redacting
-            # it would hand the next dispatch ``<redacted>`` as its API
-            # key and silently break routing — caught by
-            # ``test_coding_tool_settings_write_order``.
-            try:
-                self._graceful_shutdown(process)
-            finally:
-                redact_all(
-                    [effective_settings_path],
-                    logger=logger,
-                )
-            # 2026-10-22 — the dispatch is over: the child is gone and
-            # the output has been read (or could not be read). The
-            # watchdog handle has to go with it, or the registry keeps
-            # offering the heartbeat a handle whose subprocess is
-            # already dead. This runs on the clean path, on the
-            # idle/total-timeout paths and on the ``ApiError`` path
-            # alike — all three leave the read loop through this
-            # ``finally``.
-            _unregister_dispatch(
-                _dispatch_registry, dispatch_plan_id, _dispatch_handle,
-            )
-            # 2026-10-26 — and the same for the live-dispatch registry.
-            # This ``finally`` is the point where the child is actually
-            # reaped, so it is where the tool stops being reachable for a
-            # cooperative stop. The ``ApiError`` path matters most: it
-            # leaves the read loop through here and never reaches the
-            # ``_current_process = None`` further down, so a tool that
-            # stayed registered would keep a dead child on the roster.
-            unregister_live_dispatch(self)
+        # 2026-10-25 — the runner resolved the conversation the run
+        # happened in, from the events themselves, and it is the same
+        # answer every other reader of this run already has. Its word
+        # is the last one: this layer and the runner must never
+        # disagree about which conversation a dispatch ran in.
+        if result.session_id:
+            resolved_session_id = result.session_id
 
         # Layer 3: stderr capture — do this BEFORE the total-timeout check
         # so we can include stderr context in the timeout error message.
-        try:
-            stderr_data = process.stderr.read(4096)
-        except Exception:
-            stderr_data = ""
-        finally:
-            with self._process_lock:
-                self._current_process = None
-            # 2026-10-26 — the dispatch is over: the child is gone (or
-            # could not be read) and the output has been collected. The
-            # tool leaves the live-dispatch registry here, so a later
-            # stop does not try to stop a child that is already gone.
-            unregister_live_dispatch(self)
+        #
+        # The runner drained the child's stderr while it read the stdout
+        # and reported what it drained as events of its own, so that is
+        # where this run's stderr is. Reading the pipe here would block
+        # (the child is gone and the pipe was closed by the runner) and
+        # would lose whatever the drain already took.
+        stderr_data = "\n".join(
+            event.text
+            for event in result.events
+            if event.type == STDERR_EVENT
+        )
 
         # 2026-10-22 — the operator stopped this plan while the dispatch
         # was in flight. The subprocess is gone (that is exactly how the
@@ -5343,8 +5831,8 @@ class ClaudeCodingTool(CodingTool):
         # can route this through auto-split / auto-refine. Generic
         # ``asyncio.TimeoutError`` from the outer 1-hour cap still
         # surfaces as a normal ``TimeoutError``.
-        if total_triggered[0] and not result_text:
-            elapsed = time.monotonic() - total_started_at[0]
+        if runner.total_triggered and not result_text:
+            elapsed = time.monotonic() - runner.total_started_at[0]
             # Last line the subprocess emitted before silence (for diagnostics).
             try:
                 last_line = (result_text.rsplit("\n", 2)[-2]
@@ -5383,7 +5871,7 @@ class ClaudeCodingTool(CodingTool):
                 last_line=last_line,
             )
 
-        if read_error is not None and not result_text:
+        if runner.read_error is not None and not result_text:
             raise TimeoutError(
                 f"Claude sub-process idle timeout ({idle_sec}s) in interactive mode: "
                 f"no stdout activity for too long. Stderr: {stderr_data[:500]}"
@@ -5403,11 +5891,11 @@ class ClaudeCodingTool(CodingTool):
         # would be a no-op exactly where it is needed most.
         if not (result_text or "").strip():
             try:
-                returncode = process.returncode
+                returncode = result.exit_code
             except Exception:
                 returncode = None
             stderr_excerpt = (stderr_data or "").strip()
-            elapsed = time.monotonic() - total_started_at[0]
+            elapsed = time.monotonic() - runner.total_started_at[0]
             logger.warning(
                 "[EMPTY RESPONSE] provider=%s returncode=%s elapsed=%.1fs "
                 "stdout_len=%d scene=%s stderr=%r",
@@ -5441,7 +5929,74 @@ class ClaudeCodingTool(CodingTool):
                 stdout_len=len(result_text or ""),
             )
 
+        # 2026-10-26 — the conversation this call asked for.
+        #
+        # The dispatch runs the CLI in interactive mode and reads the
+        # answer out of the run's CONVERSATION: the assistant's own
+        # turns, with the terminal envelope as the fallback (the read
+        # loop above). A run that carried nothing but its envelope
+        # never streamed that conversation, and the summary in it is
+        # not the conversation — so the run is refused rather than
+        # answered with the summary, because a caller that asked for
+        # the turns must not be handed the other thing.
+        #
+        # The answer API is a different contract and says so: it asks
+        # one question, wants one answer, and the terminal envelope is
+        # that answer on every backend (see the ``conversation`` flag
+        # on this method and its caller in
+        # ``_run_interactive_resilient``). The refusal here is the
+        # dispatch's own, and it is a different question from the
+        # runner's criterion — which refuses a run that PROMISED a
+        # stream and produced no assistant event, and stays where it
+        # is.
+        if conversation is None:
+            conversation = self._reads_the_conversation()
+        if conversation and not carried_the_conversation(result.events):
+            types = [event.type for event in result.events]
+            raise HarnessConfigError(
+                f"this dispatch reads the answer out of the run's "
+                f"conversation, and the run produced none: the run "
+                f"carried the terminal envelope only "
+                f"(stream_events 缺失 / 仅终态 envelope). "
+                f"Event types: {types!r}"
+            )
+
         return result_text, resolved_session_id, result_meta
+
+    def _reads_the_conversation(self) -> bool:
+        """Whether this tool's dispatches read the answer out of the run.
+
+        Two contracts, and the difference is what the caller came for.
+
+        * **A task call** — a dispatch of a tool that carries a settings
+          file — is a run of a CONFIGURED agent: that file is where the
+          run's hooks, its project and its provider live, and the work
+          of such a run is the CONVERSATION it had — the agent's turns
+          and the tool calls it made. The terminal envelope is only the
+          receipt of that run, and a run that carried nothing but its
+          receipt never streamed: the receipt is answered back as if it
+          were the work, and it is not.
+        * **A bare call** — a dispatch of a tool with no settings file,
+          no project and no hooks of its own — asks the CLI one
+          question. The receipt is the answer to that question, on
+          every backend, and a run that carried only its receipt
+          worked.
+
+        The answer API states its own contract explicitly, whatever the
+        tool is: it asks one question and wants one answer, and it
+        passes ``conversation=False`` to say so (see
+        :meth:`_run_interactive_resilient`). That is the production
+        path — the task dispatch in ``agent.py`` asks its questions
+        through ``query`` / ``query_json`` — so the configured task
+        runs of this codebase are served by the receipt, and the
+        refusal in :meth:`_run_claude_interactive` is the guard on the
+        direct call that asks for the conversation itself.
+
+        Returns:
+            ``True`` when a run of this tool that carried only its
+            terminal envelope is a failure rather than an answer.
+        """
+        return self.settings is not None
 
     @staticmethod
     def _estimate_tokens(text: Optional[str]) -> int:
@@ -5586,8 +6141,36 @@ class ClaudeCodingTool(CodingTool):
             },
         )
 
-    def _graceful_shutdown(self, process: subprocess.Popen) -> None:
+    def _note_output_line(self, line: str, when: float) -> None:
+        """Record the line the child wrote, for the heartbeat.
+
+        The sub-agent watchdog (``server.py::_handle_stuck_sub_agent``)
+        tells an active sub-agent -- still streaming tool calls, still
+        printing -- from a wedged one by how long ago something was
+        printed. Without this mirror the watchdog only saw
+        ``SubAgentHandle.last_progress_ts`` -- which the sub-agent only
+        touches on stage transitions -- so a 12-minute pytest re-run
+        inside one attempt looked "stale" and got killed.
+
+        The line is kept as well as the moment: the heartbeat carries
+        operator-visible progress, and a timestamp alone says that
+        something happened without saying what.
+
+        Args:
+            line: The line, as the child wrote it.
+            when: The moment it arrived.
+        """
+        self._last_output_ts = when
+        self._last_output_line = line[:400]
+
+    def _graceful_shutdown(self, process: Any) -> None:
         """Three-phase shutdown: stdin EOF → wait → SIGTERM group → SIGKILL group.
+
+        The child belongs to the runner, but the shutdown is still
+        this module's: the credential on disk may only be replaced
+        once the child is gone, so the reap has to happen before the
+        dispatch moves on -- and the dispatch is the only place that
+        knows when that is.
 
         Both escalation signals go through ``kill_process_group``, i.e.
         they reach the *whole* process group.  The earlier version
@@ -5731,6 +6314,14 @@ class ClaudeCodingTool(CodingTool):
         prose) still do their own ``--resume`` follow-up; this helper is
         orthogonal to that and only guards the empty case.
         """
+        # 2026-10-23: the backend this dispatch drives. Every dispatch
+        # kind reaches the spawn through this helper — the plain text
+        # query, the JSON query, the sub-agent query, the retry that
+        # follows an unusable answer and the recovery that re-opens a
+        # session — so this is where the harness is read: from the
+        # process's single answer, and the same object every time.
+        harness = current_harness()
+
         attempt = 0
         while True:
             try:
@@ -5743,6 +6334,15 @@ class ClaudeCodingTool(CodingTool):
                     total_timeout=total_timeout,
                     allowed_tools=allowed_tools,
                     scene=scene,
+                    harness=harness,
+                    # 2026-10-26 — this is the answer API: it asks one
+                    # question and wants one answer, and the terminal
+                    # envelope is that answer on every backend. The
+                    # run's conversation is not what it came for, so a
+                    # run that carried only its envelope is a run that
+                    # worked — and the dispatch is told so instead of
+                    # refusing it.
+                    conversation=False,
                 )
                 self._record_llm_call(
                     session_id=resolved_session_id,
@@ -5846,6 +6446,115 @@ class ClaudeCodingTool(CodingTool):
                 )
                 raise
 
+    def _session_mapping(self):
+        """The mapping for the plan this dispatch belongs to, if any.
+
+        The mapping lives in the plan's own directory, next to the
+        plan's other per-plan state, because that is the boundary a
+        later process can find: the run that opens a conversation and
+        the run that continues it are not the same process.
+
+        Returns:
+            The mapping, or ``None`` when this dispatch belongs to no
+            plan, or the plan's directory is not there. A mapping file
+            is never a reason to *create* a plan directory.
+        """
+        return plan_session_map(_dispatch_plan_id())
+
+    def _register_session_mapping(
+        self, pinned: Optional[str], observed: Optional[str]
+    ) -> Optional[str]:
+        """Record the conversation a create really opened.
+
+        Two ids answer to the same question — "which conversation is
+        this?" — and a backend that cannot be asked to create a
+        conversation under a chosen id makes them two different things.
+        The **pinned** key is the caller's own stable handle on the
+        work (a uuid5 of the plan and the task, so the same task
+        always looks up the same entry); the **observed** id is the
+        conversation the CLI really created, and only the CLI knows it.
+        The mapping between them is what makes a resume possible at
+        all.
+
+        The registration is on disk before this returns, so the caller
+        may hand the observed id on as soon as the call is done. The
+        order is the whole point: a crash *after* the registration can
+        only leave a conversation nobody references, while handing the
+        id out before it was recorded leaves an observed id that no
+        later process can resolve back to a conversation.
+
+        A backend that honoured the pinned id has no two ids to map,
+        and nothing is written for it.
+
+        Args:
+            pinned: The key the caller pinned.
+            observed: The id the conversation really has.
+
+        Returns:
+            The observed id, so the caller can hand it on.
+
+        Raises:
+            OSError: The mapping could not be written. It is raised
+                rather than swallowed: a caller that cannot record the
+                mapping must not go on to hand out an id that no later
+                process could resolve back to a conversation.
+        """
+        if not pinned or not observed or pinned == observed:
+            # The backend honoured the pinned id: it *is* the session,
+            # and there is nothing to map.
+            return observed
+        session_map = self._session_mapping()
+        if session_map is None:
+            # No plan, or no plan directory: there is nowhere to keep
+            # the mapping, and a mapping file is never a reason to
+            # create a plan directory.
+            return observed
+        try:
+            session_map.register(pinned, observed)
+        except ValueError:
+            # The id is not one this backend mints (a claude session id
+            # is a uuid), so there is nothing a ``--session`` could be
+            # given. The pinned id stays the name of the session.
+            logger.warning(
+                "[SESSION MAP] %r is not a mappable session id; the "
+                "pinned id %r stays the name of the session",
+                observed, pinned,
+            )
+            return observed
+        if self.logger:
+            self.logger.info(
+                "coding_session_mapping_registered",
+                f"recorded the session the CLI minted for {pinned}",
+                data={
+                    "pinned_session_id": pinned,
+                    "observed_session_id": observed,
+                },
+            )
+        return observed
+
+    def _mapped_session(self, pinned: Optional[str]) -> Optional[str]:
+        """The conversation the mapping names for ``pinned``, if any.
+
+        ``None`` means "this mapping does not exist": the task has never
+        opened a conversation, or the mapping was lost. The caller turns
+        that into an explicit create; it must never resolve the miss to
+        some *other* conversation, because a resume that silently
+        continues the wrong session is worse than one that starts a new
+        one.
+
+        Args:
+            pinned: The key the caller pinned.
+
+        Returns:
+            The id of the conversation the key stands for, or ``None``.
+        """
+        if not pinned:
+            return None
+        session_map = self._session_mapping()
+        if session_map is None:
+            return None
+        return session_map.lookup(pinned)
+
     def _resume_or_fresh_session(
         self,
         *,
@@ -5897,11 +6606,35 @@ class ClaudeCodingTool(CodingTool):
         the NEW session, so a caller that goes on to retry keeps
         pointing at a session that actually exists.
         """
+        # 2026-10-25 — the conversation to re-open. The caller handed
+        # over a key, and the key is not always the name of a
+        # conversation: a backend that mints the id of every
+        # conversation itself cannot re-open one under a key the caller
+        # chose. The mapping is what says which conversation the key
+        # stands for, so it is read BEFORE the resume is attempted.
+        #
+        # A miss is not a failure. It means this key has never opened a
+        # conversation (or the mapping was lost), and the resume below
+        # finds out what the backend makes of the key itself: a backend
+        # that can honour it resumes it, and a backend that cannot
+        # says so, which is the degradation this method audits.
+        observed_session_id = self._mapped_session(prev_session_id)
+        resume_session_id = observed_session_id or prev_session_id
+        if observed_session_id and self.logger:
+            self.logger.info(
+                "coding_session_resumed",
+                f"resuming the conversation the mapping names for "
+                f"{prev_session_id}",
+                data={
+                    "pinned_session_id": prev_session_id,
+                    "observed_session_id": observed_session_id,
+                },
+            )
         try:
             return self._run_interactive_resilient(
                 resume_prompt,
                 system_instruction,
-                session_id=prev_session_id,
+                session_id=resume_session_id,
                 resume=True,
                 excluded_providers=excluded_providers,
                 total_timeout=total_timeout,
@@ -5929,6 +6662,41 @@ class ClaudeCodingTool(CodingTool):
             # re-sent, to a provider that has already said it has no
             # budget. So the signal is passed up untouched, the same
             # way a hard timeout and a cancellation are.
+            raise
+        except SessionIdNotResumable as exc:
+            # 2026-10-25 — the backend cannot re-open the conversation
+            # this id names. That is not a provider failure and not a
+            # transport failure: it is the answer to "which
+            # conversation is this?", and the answer is "not one I can
+            # re-open". The fresh-session fallback below is for a
+            # provider that could not serve the call; it must not
+            # answer this question, because it would swap the task
+            # into a *random* conversation and record nothing about
+            # the swap.
+            #
+            # The key is kept. It is the caller's handle on the work,
+            # and a later round that holds the key has to find the
+            # conversation this task opened — so the new one is
+            # recorded under the same key, and the degradation is
+            # audited rather than silent.
+            return self._degraded_create(
+                pinned_session_id=prev_session_id,
+                fresh_prompt=fresh_prompt,
+                system_instruction=system_instruction,
+                excluded_providers=excluded_providers,
+                total_timeout=total_timeout,
+                allowed_tools=allowed_tools,
+                scene=scene,
+                error=exc,
+            )
+        except HarnessConfigError:
+            # 2026-10-25 — a configuration problem is not a provider
+            # problem. The fallback below answers a provider that could
+            # not serve the call; it must not answer a
+            # misconfiguration (a model that names no provider, an MCP
+            # configuration that is not JSON) with a second dispatch,
+            # which would hide the misconfiguration behind a
+            # successful-looking run.
             raise
         except Exception as exc:
             if is_deterministic_local_error(exc):
@@ -5981,6 +6749,8 @@ class ClaudeCodingTool(CodingTool):
                     f"retrying the same work in a fresh session",
                     data={
                         "session_id": prev_session_id,
+                        "pinned_session_id": prev_session_id,
+                        "observed_session_id": observed_session_id,
                         "resume": True,
                         "error": type(exc).__name__,
                         "error_detail": str(exc)[:500],
@@ -6006,6 +6776,75 @@ class ClaudeCodingTool(CodingTool):
                 allowed_tools=allowed_tools,
                 scene=scene,
             )
+
+    def _degraded_create(
+        self,
+        *,
+        pinned_session_id: str,
+        fresh_prompt: str,
+        system_instruction: Optional[str],
+        excluded_providers: Optional[list],
+        total_timeout: Optional[int],
+        allowed_tools: Optional[list],
+        scene: Optional[str],
+        error: BaseException,
+    ) -> tuple:
+        """Open a new conversation under the key the caller pinned.
+
+        The key is kept, and the new conversation is recorded under it,
+        so a later round that holds the key finds THIS conversation
+        rather than starting from nothing again. The degradation is
+        audited: a task that quietly continued in a new conversation is
+        a task whose operator was told something the transcript does
+        not say.
+
+        Args:
+            pinned_session_id: The key the caller pinned.
+            fresh_prompt: The prompt the new conversation is opened with.
+            system_instruction: The system prompt for the new dispatch.
+            excluded_providers: Providers to skip on this call.
+            total_timeout: The dispatch's own timeout.
+            allowed_tools: The tools the dispatch may use.
+            scene: The workflow scene of this dispatch.
+            error: Why the resume could not be honoured.
+
+        Returns:
+            The same ``(text, session_id)`` pair as
+            ``_run_interactive_resilient``.
+        """
+        text, used_sid = self._run_interactive_resilient(
+            fresh_prompt,
+            system_instruction,
+            session_id=pinned_session_id,
+            resume=False,
+            excluded_providers=excluded_providers,
+            total_timeout=total_timeout,
+            allowed_tools=allowed_tools,
+            scene=scene,
+        )
+        observed = self._register_session_mapping(pinned_session_id, used_sid)
+        if self.logger:
+            self.logger.warning(
+                "coding_session_degraded_to_create",
+                f"the session {pinned_session_id} names no conversation "
+                f"this backend can re-open; the work continues in a new "
+                f"conversation under the same key",
+                data={
+                    "pinned_session_id": pinned_session_id,
+                    "observed_session_id": observed or used_sid,
+                    "degraded_to_create": True,
+                    "error": type(error).__name__,
+                    "error_detail": str(error)[:500],
+                    "provider": getattr(self, "current_call_provider", None),
+                    "scene": scene,
+                },
+            )
+        logger.warning(
+            "[SESSION DEGRADED TO CREATE] pinned=%s observed=%s error=%s: %s",
+            pinned_session_id, observed or used_sid,
+            type(error).__name__, str(error)[:200],
+        )
+        return text, observed or used_sid or pinned_session_id
 
     def _query_internal_m1(self, prompt, system_instruction, timeout,
                            *, start_time, prompt_len,
@@ -6130,7 +6969,8 @@ class ClaudeCodingTool(CodingTool):
             # A pinned id wins over a random one: the caller chose it so
             # that the session this dispatch creates is the one a later
             # dispatch — in this process or the next — re-opens by name.
-            pinned_session_id = pinned_fresh or str(uuid.uuid4())
+            pinned_key = pinned_fresh or str(uuid.uuid4())
+            pinned_session_id = pinned_key
             text, _sid = self._run_interactive_resilient(
                 compacted_prompt, system_instruction,
                 session_id=pinned_session_id, resume=False,
@@ -6139,7 +6979,28 @@ class ClaudeCodingTool(CodingTool):
                 allowed_tools=None,
                 scene=scene,
             )
-            _remember(_sid or pinned_session_id)
+            # 2026-10-25 — a backend that mints the id of every
+            # conversation it creates makes the pinned key and the
+            # conversation two different ids, and only the CLI knows
+            # which conversation it opened. The mapping is recorded
+            # BEFORE the id is handed back, so a later dispatch that
+            # holds the key can find this conversation instead of
+            # starting a new one.
+            #
+            # A key that was invented here (the random uuid4) is not
+            # recorded: no later process can look it up, so the entry
+            # would be a line of litter in the mapping.
+            observed = (
+                self._register_session_mapping(pinned_key, _sid)
+                if pinned_fresh
+                else _sid
+            )
+            if observed:
+                # The dispatch continues in the conversation that
+                # really exists, so a provider switch resumes THAT one
+                # rather than the key it asked with.
+                pinned_session_id = observed
+            _remember(observed or pinned_session_id)
             return text
 
         # The session this call will dispatch into. Pinning the id here
@@ -6804,13 +7665,30 @@ class ClaudeCodingTool(CodingTool):
                     allowed_tools=allowed_tools,
                     scene=scene,
                 )
-                # The CLI may report an id other than the one pinned
-                # above. Only the reusable-session handle is told —
-                # ``pinned`` and ``session_id`` keep their existing
-                # meaning for the provider-fallback and format-retry
-                # paths, which are shared with callers that never opted
-                # into reuse.
-                _remember(resolved_sid)
+                # 2026-10-25 — the CLI may report an id other than the
+                # one pinned above, and the two paths below (the
+                # provider switch, the format retry) both RE-OPEN the
+                # session by name. Leaving them the pinned key would
+                # have them ask a backend that mints its own ids to
+                # re-open a conversation that does not exist.
+                #
+                # The mapping is recorded first, under the caller's own
+                # key, so a later process that holds the key finds
+                # this conversation. A key invented here (the random
+                # uuid4) is not recorded: no later process can look it
+                # up.
+                observed = (
+                    self._register_session_mapping(pinned_fresh, resolved_sid)
+                    if pinned_fresh
+                    else resolved_sid
+                )
+                if observed:
+                    session_id = observed
+                    pinned[0] = observed
+                # The reusable-session handle is told as well: the
+                # caller's loop has to be able to re-ask inside the
+                # conversation that actually exists.
+                _remember(observed or resolved_sid)
             try:
                 return parse_llm_json(response_text)
             except json.JSONDecodeError as exc:

@@ -43,6 +43,20 @@ coverage/
 # above matches the exact name only, so nothing else here covers it.
 .env.setup-tmp*
 
+# The MCP configuration the mcode adapter writes into a task's working
+# tree for the length of a run. It carries the run's credentials, and
+# the working tree is a tree the framework commits: the file must never
+# be able to reach the index — not even in the run that was killed
+# before it could put the workspace back.
+.mcp.json
+
+# The recovery journal the mcode adapter writes before it overwrites a
+# workspace's `.mcp.json`, and the private copy of the file it
+# replaced. Both live in the checkout's runtime state directory
+# (`.pdt/`, ignored below); this rule covers the case where they are
+# redirected somewhere else.
+.mcp-restore/
+
 # Runtime state
 #
 # 2026-09-28: the whole state family moved into `.pdt/` — state.db and its
@@ -178,3 +192,9 @@ CLAUDE.md
 # history of every commit that carried it, and clearing that is a history
 # rewrite, which is a separate decision with a separate owner.
 KEYCHAIN_STRICT_LANE_RECORD.md
+
+# Verification and harness run artifacts. These are raw streams and page
+# snapshots produced while a round runs; they are not source and must not
+# ride along in a `git add -A`.
+.playwright-mcp/
+artifacts/harness-runs/
