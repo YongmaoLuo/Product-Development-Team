@@ -130,18 +130,22 @@ SCAN_ROOTS: tuple[Path, ...] = (
     # plan directories are excluded by the ``plans`` entry in
     # :data:`EXCLUDED_DIRS`, so what is read here is the rest of it.
     #
-    # ``.playwright-mcp/`` is where the browser-automation tooling
-    # writes the page snapshots it captures. The captures are not
-    # tracked; the directory is, so that it is a directory the gates
-    # read rather than one they never look at.
+    # It is here for the reason the docstring above gives: the list is
+    # meant to be every tracked top-level directory. A tracked directory
+    # that no gate reads is a directory whose contents can be published
+    # without being checked, and the only thing that catches it is
+    # ``test_every_tracked_directory_is_scanned``.
     #
-    # Both of them are here for the reason the docstring above gives:
-    # the list is meant to be every tracked top-level directory. A
-    # tracked directory that no gate reads is a directory whose contents
-    # can be published without being checked, and the only thing that
-    # catches it is ``test_every_tracked_directory_is_scanned``.
+    # 2026-10-27 (merge): ``.playwright-mcp/`` used to be here too — the
+    # browser-automation tooling writes its page snapshots there, and the
+    # directory was tracked so that the gates would read the snapshots
+    # rather than never look at them. It is not tracked any more: the
+    # snapshots are debugging output, not source, and the repository's
+    # own ``.gitignore`` already covers the whole directory. A scan root
+    # that is not tracked is a root in name only — a fresh checkout has
+    # no such directory, so the walker would read nothing from it and
+    # listing it would check nothing.
     Path("tmp"),
-    Path(".playwright-mcp"),
 )
 
 #: Directory names that look like first-party source but must never

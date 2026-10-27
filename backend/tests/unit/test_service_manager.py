@@ -1488,6 +1488,163 @@ def test_reap_all_plans_only_visits_plans_with_a_ledger(tmp_path: Path):
     assert sorted(r.plan_id for r in reports) == ["a", "b"]
 
 
+# ---------------------------------------------------------------------------
+# Round liveness (2026-10-25)
+# ---------------------------------------------------------------------------
+#
+# 2026-10-25, observed on plan 20261023-PDT-MiniMax-CLI: a *second*
+# backend process (same repo, same shared ``plans/`` directory) ran its
+# startup / shutdown sweep and reaped the services the *first* backend's
+# running verification round was using. The four safety checks in
+# ``reap_services`` all passed — the ledger's pid was not recycled, the
+# listener was the recorded pid, the port was not protected — because
+# none of them asks the only question that matters here: "is this plan's
+# round still running?"
+#
+# The round now leaves a heartbeat behind while it runs, and a sweep
+# leaves a plan alone while that heartbeat is fresh.
+
+
+def test_round_liveness_marker_round_trips(tmp_path: Path):
+    path = sm.write_round_liveness(tmp_path, round_number=3)
+
+    assert path is not None
+    marker = sm.read_round_liveness(tmp_path)
+    assert marker["round"] == 3
+    assert sm.round_is_live(tmp_path) is True
+
+    assert sm.clear_round_liveness(tmp_path) is True
+    assert not sm.round_liveness_path(tmp_path).exists()
+    assert sm.round_is_live(tmp_path) is False
+
+
+def test_round_liveness_expires_with_its_ttl(tmp_path: Path):
+    sm.write_round_liveness(tmp_path, round_number=1)
+    beat = sm.read_round_liveness(tmp_path)["heartbeat_at"]
+
+    assert sm.round_is_live(tmp_path, now=beat + 60) is True
+    expired = beat + sm.ROUND_LIVENESS_TTL_SECONDS + 60
+    assert sm.round_is_live(tmp_path, now=expired) is False
+
+
+def test_a_corrupt_liveness_marker_is_not_live(tmp_path: Path):
+    sm.round_liveness_path(tmp_path).write_text("{not json", encoding="utf-8")
+
+    assert sm.round_is_live(tmp_path) is False
+
+
+def test_reap_skips_plan_whose_round_is_live(tmp_path: Path, monkeypatch):
+    """A sweep must not take the services of a round that is still running."""
+    _write_ledger(tmp_path, [_entry()])
+    sm.write_round_liveness(tmp_path, round_number=1)
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    killed = []
+
+    def _fake_stop(runtime, decl=None, **kw):
+        killed.append(runtime.pid)
+        return {"port_free": True, "detail": "stopped"}
+
+    monkeypatch.setattr(sm, "stop_service", _fake_stop)
+
+    report = sm.reap_services(tmp_path)
+
+    assert killed == []
+    assert report.reaped == []
+    assert report.skipped[0]["reason"] == "plan-round-live"
+    # The ledger survives: the round still owns these services, and the
+    # next sweep has to be able to find them again.
+    assert sm.ledger_path(tmp_path).exists()
+
+
+def test_reap_all_plans_skips_a_plan_whose_round_is_live(
+    tmp_path: Path, monkeypatch
+):
+    plan_dir = tmp_path / "live"
+    _write_ledger(plan_dir, [_entry()])
+    sm.write_round_liveness(plan_dir, round_number=1)
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    killed = []
+
+    def _fake_stop(runtime, decl=None, **kw):
+        killed.append(runtime.pid)
+        return {"port_free": True, "detail": "stopped"}
+
+    monkeypatch.setattr(sm, "stop_service", _fake_stop)
+
+    reports = sm.reap_all_plans(tmp_path)
+
+    assert killed == []
+    assert [r.plan_id for r in reports] == ["live"]
+    assert reports[0].skipped[0]["reason"] == "plan-round-live"
+
+
+def test_reap_reaps_a_plan_whose_round_liveness_expired(
+    tmp_path: Path, monkeypatch
+):
+    """An expired heartbeat means the round is gone: the orphan is ours."""
+    _write_ledger(tmp_path, [_entry()])
+    sm.write_round_liveness(tmp_path, round_number=1)
+    marker = sm.read_round_liveness(tmp_path)
+    marker["heartbeat_at"] = time.time() - sm.ROUND_LIVENESS_TTL_SECONDS - 60
+    sm.round_liveness_path(tmp_path).write_text(
+        json.dumps(marker), encoding="utf-8",
+    )
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    killed = []
+
+    def _fake_stop(runtime, decl=None, **kw):
+        killed.append(runtime.pid)
+        return {"port_free": True, "detail": "stopped"}
+
+    monkeypatch.setattr(sm, "stop_service", _fake_stop)
+
+    report = sm.reap_services(tmp_path)
+
+    assert killed == [4242]
+    assert report.reaped == ["chart"]
+
+
+def test_the_plans_own_round_end_reap_clears_the_marker(
+    tmp_path: Path, monkeypatch
+):
+    """The round is over when its own reap runs — the marker goes first, so
+    the guard cannot block the teardown the round asked for."""
+    _write_ledger(tmp_path, [_entry()])
+    sm.write_round_liveness(tmp_path, round_number=1)
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    killed = []
+
+    def _fake_stop(runtime, decl=None, **kw):
+        killed.append(runtime.pid)
+        return {"port_free": True, "detail": "stopped"}
+
+    monkeypatch.setattr(sm, "stop_service", _fake_stop)
+
+    report = sm.reap_services(
+        tmp_path, "plan-x", reason="verification_loop_exit",
+    )
+
+    assert killed == [4242]
+    assert report.reaped == ["chart"]
+    assert not sm.round_liveness_path(tmp_path).exists()
+
+
 def test_pid_reused_tolerates_ps_granularity(monkeypatch):
     monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1000.0)
 
@@ -3341,3 +3498,1056 @@ def test_the_runtime_carries_the_data_plane(monkeypatch):
     assert recorded["plan_routing_rows"] == 4
     assert recorded["boot_id"] == "boot-1234"
     assert recorded["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Round lease (2026-10-25, repair-r1-14)
+# ---------------------------------------------------------------------------
+#
+# The 2026-10-25 round started the plan's ``api`` service (port 62946,
+# pid 6723) and two minutes later a *different* backend process's
+# shutdown sweep stopped it: the ledger entry named the process but
+# carried no evidence that a round was still using it, so the sweep read
+# the entry as an orphan. The round's first ``api_test`` then found a
+# refused connection, and nine VPs failed the same way.
+#
+# The lease is that evidence. It is written into the ledger entry of
+# every service the round starts, and it names the round that owns it:
+# ``<round_id>@<backend_pid>``. A reaper that finds a live lease leaves
+# the service alone; a reaper that finds no lease at all must say
+# "unknown", not "live" — the absence of a lease is not evidence of a
+# running round, and a verdict that cannot tell the two apart is a
+# verdict that is always true.
+
+
+def _dead_pid() -> int:
+    """A pid that is not running — the owner of a dead lease."""
+    for candidate in range(99_999, 99_900, -1):
+        try:
+            os.kill(candidate, 0)
+        except ProcessLookupError:
+            return candidate
+        except OSError:
+            continue
+    raise AssertionError("no unused pid found")
+
+
+def _lease(**over) -> dict:
+    base = sm.make_lease(
+        round_id="plan-r1", backend_pid=os.getpid(), port=3000,
+        listener_pid=4242,
+    ).to_dict()
+    base.update(over)
+    return base
+
+
+def test_ensure_services_writes_lease_for_every_declared_service(
+    tmp_path: Path, monkeypatch,
+):
+    """Every service the round starts must carry a lease in the ledger."""
+    project = tmp_path / "project"
+    project.mkdir()
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    _stub_start(monkeypatch)
+    monkeypatch.setattr(sm, "probe_port", lambda p: _probe(p, []))
+
+    declarations = {
+        "api": _decl(name="api", port=18231),
+        "api-mcode": _decl(name="api-mcode", port=8231),
+    }
+    with sm.round_lease_context(plan_dir, round_id="plan-r1"):
+        result = sm.ensure_services(project, declarations)
+
+    ledger = sm.read_ledger(plan_dir)
+    entries = ledger.get("services") or []
+    assert len(entries) == 2, ledger
+    for entry in entries:
+        lease = entry.get("lease")
+        assert lease, f"no lease on {entry.get('name')}: {entry}"
+        assert lease["owner"], entry
+        # The owner names the round and the process that owns it.
+        assert lease["owner"] == f"plan-r1@{os.getpid()}", entry
+        assert lease["backend_pid"] == os.getpid(), entry
+        assert lease["port"] == entry["port"], entry
+        assert lease["listener_pid"] == entry["pid"], entry
+        assert lease["heartbeat_at"] > 0, entry
+
+    # The round's own token is on the map, so the ``services_ensured``
+    # event can carry it.
+    assert result.lease_owner == f"plan-r1@{os.getpid()}", result.to_dict()
+
+    # The plan-level liveness marker names the same owner: the two
+    # records of "this round is running" must not disagree.
+    marker = sm.read_round_liveness(plan_dir)
+    assert marker["owner"] == result.lease_owner, marker
+
+
+def test_service_address_event_never_has_empty_round_token(
+    tmp_path: Path, monkeypatch,
+):
+    """A reaped service must name the round it belonged to."""
+    # The lease's owner is gone, so the service is an orphan and the
+    # sweep may stop it — but the event still says whose it was.
+    dead_owner = sm.make_lease(
+        round_id="plan-r7", backend_pid=_dead_pid(), port=3000,
+        listener_pid=4242,
+    )
+    _write_ledger(tmp_path, [_entry(lease=dead_owner.to_dict())])
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    monkeypatch.setattr(
+        sm, "stop_service",
+        lambda runtime, decl=None, **kw: {"port_free": True, "detail": "x"},
+    )
+
+    sm.reap_services(tmp_path, reason="server_shutdown")
+
+    events = sm.read_service_events(tmp_path)
+    reaped = [e for e in events if e["event"] == "reaped"]
+    assert reaped, events
+    for event in reaped:
+        assert event["round_token"], event
+        assert event["round_token"] == dead_owner.owner, event
+        assert "plan-r7" in event["round_token"], event
+
+
+def test_lease_absent_means_unknown_not_live(tmp_path: Path):
+    """The negative control: no lease is "unknown", never "live"."""
+    entry = _entry(lease=_lease())
+
+    assert sm.lease_state(sm.ServiceLease.from_dict(entry["lease"])) == "live"
+
+    # The lease is removed by hand — the same question, asked again.
+    del entry["lease"]
+    assert sm.lease_state(sm.ServiceLease.from_dict(entry.get("lease"))) == (
+        "unknown"
+    )
+    # A lease that cannot be read is unknown too, not live.
+    assert sm.lease_state(sm.ServiceLease.from_dict({"owner": ""})) == (
+        "unknown"
+    )
+    assert sm.lease_state(None) == "unknown"
+
+
+def test_reap_skips_a_service_whose_lease_is_live(
+    tmp_path: Path, monkeypatch,
+):
+    """The protection itself: a leased service of a live round is left
+    alone by a foreign sweep."""
+    _write_ledger(tmp_path, [_entry(lease=_lease())])
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    killed = []
+
+    def _fake_stop(runtime, decl=None, **kw):
+        killed.append(runtime.pid)
+        return {"port_free": True, "detail": "stopped"}
+
+    monkeypatch.setattr(sm, "stop_service", _fake_stop)
+
+    report = sm.reap_services(tmp_path)
+
+    assert killed == [], "a live round's service was reaped"
+    assert report.reaped == []
+    assert report.skipped[0]["reason"] == "lease-live"
+    # The ledger survives: the round still owns these services.
+    assert sm.ledger_path(tmp_path).exists()
+
+
+def test_preflight_passes_the_round_id_down(
+    tmp_path: Path, monkeypatch,
+):
+    """The preflight must name the round that owns the services.
+
+    A lease is evidence only if the round says who it is. A call site
+    that leaves the round unnamed produces a service that no reaper can
+    recognise as "in use" — which is exactly what the 2026-10-25 sweep
+    did to the round's api service.
+    """
+    import verification_agent as va
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    agent = va.Orchestrator(
+        plan_dir=plan_dir, project_dir=project_dir, coding_tool=None,
+    )
+    agent._current_round = 3
+    agent._service_declarations = {"api": _decl(name="api", port=18231)}
+
+    monkeypatch.setattr(
+        agent, "_maybe_rebuild_before_service_start", lambda: None,
+    )
+    monkeypatch.setattr(agent, "_touch_round_liveness", lambda: None)
+
+    seen: dict = {}
+
+    def _fake_ensure(project_dir_arg, declarations, **kwargs):
+        seen.update(kwargs)
+        # The round's identity travels with the call as ambient
+        # context: it is what the services get leased to.
+        seen["context"] = sm.current_round_lease_context()
+        return sm.ServiceRuntimeMap(runtimes={})
+
+    monkeypatch.setattr(sm, "ensure_services", _fake_ensure)
+    monkeypatch.setattr(sm, "record_runtimes", lambda *a, **k: None)
+
+    events: list = []
+    monkeypatch.setattr(
+        agent, "_safe_log_freshness_event",
+        lambda vp_id, event_type, data: events.append(
+            (vp_id, event_type, data)
+        ),
+    )
+
+    agent._preflight_declared_services({})
+
+    # The round id and the plan directory reach the ledger writer.
+    context = seen.get("context") or {}
+    assert context.get("round_id"), seen
+    assert "plan-r3" in context["round_id"], context
+    assert Path(context["plan_dir"]) == plan_dir, context
+
+    # The event says who owns the services, even when the map itself
+    # carries no lease (a stub, an adopted service).
+    ensured = [e for e in events if e[1] == "services_ensured"]
+    assert ensured, events
+    assert ensured[0][2].get("lease_owner"), ensured[0][2]
+
+
+def test_lease_heartbeat_is_refreshed_while_the_round_runs(
+    tmp_path: Path,
+):
+    """A lease is a heartbeat, not a timestamp.
+
+    A round that runs longer than the lease TTL must not have its
+    services read as orphans half-way through: the round keeps saying
+    "still here", and the lease says it too.
+    """
+    stale = sm.make_lease(
+        round_id="plan-r1", backend_pid=os.getpid(), port=3000,
+        listener_pid=4242,
+    ).to_dict()
+    stale["heartbeat_at"] = time.time() - (sm.LEASE_TTL_SECONDS + 60)
+    _write_ledger(tmp_path, [_entry(lease=stale)])
+
+    # Without a refresh the lease has expired: the round is not
+    # speaking, so the service looks like an orphan.
+    assert sm.lease_state(sm.ServiceLease.from_dict(stale)) == "dead"
+
+    refreshed = sm.refresh_round_leases(tmp_path, round_id="plan-r1")
+
+    assert refreshed == 1, refreshed
+    ledger = sm.read_ledger(tmp_path)
+    lease = sm.ServiceLease.from_dict(ledger["services"][0]["lease"])
+    assert lease is not None, ledger
+    assert sm.lease_state(lease) == "live", lease
+    # The lease still belongs to the same round.
+    assert lease.owner.startswith("plan-r1@"), lease
+
+
+# ---------------------------------------------------------------------------
+# Cross-round reapers — one backend's shutdown sweep must not take the
+# services of another backend's running round
+# ---------------------------------------------------------------------------
+#
+# 2026-10-25, plan 20261023-PDT-MiniMax-Code-CLI: two backend processes
+# share one ``plans/`` directory. The second one's *shutdown* hook swept
+# every plan's ledger and SIGTERM'd the api service that the first
+# one's running verification round was using; the round's api_test VP
+# failed minutes later with a bare "connection refused".
+#
+# The lease is what says whose the service is. A reaper that is not the
+# round reads it, and leaves the service alone while the owning round's
+# heartbeat is still fresh — and says so in the event log, because a
+# deferral nobody can read is a silent failure.
+
+
+def _foreign_lease(*, heartbeat_at=None, owner_pid=None) -> dict:
+    """A lease held by a round that is NOT this process.
+
+    The owner is a **running** process by default — the parent, which
+    stands in for the other backend sharing the plans directory. A
+    round that is still speaking is the case the deferral is about.
+
+    The owner string is ``round-9@<other pid>``: the round is not ours
+    and the process behind it is not ours either. The heartbeat is
+    five seconds old — inside the fresh window, and inside the ten
+    seconds the acceptance criteria name.
+    """
+    pid = owner_pid if owner_pid is not None else os.getppid()
+    lease = sm.make_lease(
+        round_id="round-9", backend_pid=pid, port=3000, listener_pid=4242,
+    )
+    data = lease.to_dict()
+    data["heartbeat_at"] = (
+        time.time() - 5 if heartbeat_at is None else heartbeat_at
+    )
+    return data
+
+
+def _expired_lease(**over) -> dict:
+    """A lease whose heartbeat has aged out of its window."""
+    lease = _foreign_lease(**over)
+    lease["heartbeat_at"] = time.time() - (sm.LEASE_TTL_SECONDS + 60)
+    return lease
+
+
+def _stub_probe_and_stop(monkeypatch) -> list:
+    """The port is held by a process that matches the declaration."""
+    monkeypatch.setattr(sm, "_process_start_epoch", lambda pid: 1.0)
+    monkeypatch.setattr(
+        sm, "probe_port",
+        lambda p: _probe(p, ["npx next dev -p 3000"], start_epoch=1.0),
+    )
+    killed: list = []
+
+    def _fake_stop(runtime, decl=None, **kw):
+        killed.append(runtime.pid)
+        return {"port_free": True, "detail": "stopped"}
+
+    monkeypatch.setattr(sm, "stop_service", _fake_stop)
+    return killed
+
+
+@pytest.mark.parametrize("reason", ["server_shutdown", "startup_sweep"])
+def test_shutdown_reap_defers_service_leased_by_foreign_live_round(
+    tmp_path: Path, monkeypatch, reason: str,
+):
+    """The bug this closes: a backend sharing the plans directory with
+    another backend's *running* round must not stop that round's
+    services when it shuts down."""
+    _write_ledger(tmp_path, [_entry(lease=_foreign_lease())])
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    report = sm.reap_services(tmp_path, reason=reason)
+
+    assert killed == [], "a live round's service was reaped by a foreign sweep"
+    assert report.reaped == []
+    skipped = report.skipped[0]
+    assert skipped["reason"] == "reap_deferred_live_round"
+    assert skipped["lease_owner"], skipped
+    assert skipped["reaper_pid"] == os.getpid(), skipped
+    assert skipped["heartbeat_age"] >= 0, skipped
+    assert skipped["port"] == 3000, skipped
+    # The ledger survives: the round still owns these services, and the
+    # next sweep has to be able to find them again.
+    assert sm.ledger_path(tmp_path).exists()
+
+
+def test_the_deferral_is_written_down_not_silent(
+    tmp_path: Path, monkeypatch,
+):
+    """A deferral that leaves no trace is a silent failure."""
+    lease = _foreign_lease()
+    _write_ledger(tmp_path, [_entry(lease=lease)])
+    _stub_probe_and_stop(monkeypatch)
+
+    sm.reap_services(tmp_path, reason="server_shutdown")
+
+    events = sm.read_service_events(tmp_path)
+    deferred = [
+        e for e in events if e["event"] == "reap_deferred_live_round"
+    ]
+    assert len(deferred) == 1, events
+    event = deferred[0]
+    assert event["reaper_pid"] == os.getpid(), event
+    assert event["lease_owner"] == lease["owner"], event
+    assert event["heartbeat_age"] >= 0, event
+    assert event["port"] == 3000, event
+    # The event names the round that owns the service, like every other
+    # event in this log.
+    assert event["round_token"] == lease["owner"], event
+
+
+def test_shutdown_reap_stops_stale_lease(
+    tmp_path: Path, monkeypatch,
+):
+    """A deferral must not become a leak: an expired lease is an
+    orphan, and orphans are what a sweep exists to collect.
+
+    "Expired" means *outside the lease's own window* — the window is
+    ``LEASE_TTL_SECONDS`` (1800s), the one the lease contract already
+    defines, so the timestamp here sits behind it rather than at some
+    arbitrary number of seconds.
+    """
+    _write_ledger(tmp_path, [_entry(lease=_expired_lease())])
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    report = sm.reap_services(tmp_path, reason="server_shutdown")
+
+    assert killed == [4242]
+    assert report.reaped == ["chart"]
+    events = sm.read_service_events(tmp_path)
+    assert not [
+        e for e in events if e["event"] == "reap_deferred_live_round"
+    ], events
+
+
+def test_the_freshness_window_is_the_lease_ttl_itself(
+    tmp_path: Path, monkeypatch,
+):
+    """The deferral lasts exactly as long as the lease says the round is
+    alive — no shorter (that would kill live rounds) and no longer
+    (that would leak orphans)."""
+    inside = _foreign_lease(heartbeat_at=time.time() - 300)
+    outside = _foreign_lease(heartbeat_at=time.time() - (sm.LEASE_TTL_SECONDS + 60))
+    assert inside["heartbeat_at"] > outside["heartbeat_at"]
+
+    _write_ledger(tmp_path, [
+        _entry(name="api", port=3000, lease=inside),
+        _entry(name="chart", port=3001, lease=outside),
+    ])
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    report = sm.reap_services(tmp_path, reason="server_shutdown")
+
+    assert [s["name"] for s in report.skipped] == ["api"], report.to_dict()
+    assert report.reaped == ["chart"], report.to_dict()
+    assert killed == [4242]
+
+
+def test_a_foreign_sweep_reaps_a_service_whose_round_is_gone(
+    tmp_path: Path, monkeypatch,
+):
+    """The other half of the deferral: the process that took the lease
+    is gone, so the round that used the service is over — the service
+    is an orphan even though the lease's heartbeat has not aged out
+    yet. Leaving it would be the leak."""
+    _write_ledger(
+        tmp_path, [_entry(lease=_foreign_lease(owner_pid=_dead_pid()))],
+    )
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    report = sm.reap_services(tmp_path, reason="server_shutdown")
+
+    assert killed == [4242]
+    assert report.reaped == ["chart"]
+    events = sm.read_service_events(tmp_path)
+    assert not [
+        e for e in events if e["event"] == "reap_deferred_live_round"
+    ], events
+
+
+def test_shutdown_reap_stops_own_service(
+    tmp_path: Path, monkeypatch,
+):
+    """The other half of the rule: the reaper's own services are its own
+    to collect. Deferring them would trade a cross-backend kill for a
+    service leak."""
+    mine = sm.make_lease(
+        round_id="plan-r1", backend_pid=os.getpid(), port=3000,
+        listener_pid=4242,
+    ).to_dict()
+    _write_ledger(tmp_path, [_entry(lease=mine)])
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    report = sm.reap_services(tmp_path, reason="server_shutdown")
+
+    assert killed == [4242]
+    assert report.reaped == ["chart"]
+    events = sm.read_service_events(tmp_path)
+    assert not [
+        e for e in events if e["event"] == "reap_deferred_live_round"
+    ], events
+
+
+def test_the_rule_is_decided_entry_by_entry(tmp_path: Path, monkeypatch):
+    """One ledger can hold services of two rounds: the live one is left
+    alone, the expired one is collected."""
+    _write_ledger(tmp_path, [
+        _entry(name="api", port=3000, lease=_foreign_lease()),
+        _entry(name="chart", port=3001, lease=_expired_lease()),
+    ])
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    report = sm.reap_services(tmp_path, reason="server_shutdown")
+
+    assert report.reaped == ["chart"], report.to_dict()
+    assert [s["name"] for s in report.skipped] == ["api"], report.to_dict()
+    assert killed == [4242]
+
+
+def test_a_named_sweep_defers_another_rounds_service_and_keeps_its_marker(
+    tmp_path: Path, monkeypatch,
+):
+    """``own_round_end`` means "this plan's round is being torn down".
+    A cross-round reason says the teardown is **not** ours: the other
+    round's marker must survive, or the next sweep would find the plan
+    unprotected."""
+    _write_ledger(tmp_path, [_entry(lease=_foreign_lease())])
+    sm.write_round_liveness(tmp_path, round_number=1)
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    report = sm.reap_services(
+        tmp_path, "plan-under-repair", reason="server_shutdown",
+    )
+
+    assert killed == [], "a live round's service was reaped by a foreign sweep"
+    assert report.skipped[0]["reason"] == "reap_deferred_live_round"
+    assert sm.round_liveness_path(tmp_path).exists(), (
+        "the other round's liveness marker was cleared by a foreign sweep"
+    )
+
+
+def test_reap_all_plans_defers_the_services_of_a_live_round(
+    tmp_path: Path, monkeypatch,
+):
+    """The shape the incident had: one backend's sweep over every plan
+    in a directory another backend's round is using."""
+    plan_dir = tmp_path / "running"
+    _write_ledger(plan_dir, [_entry(lease=_foreign_lease())])
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    reports = sm.reap_all_plans(tmp_path, reason="server_shutdown")
+
+    assert killed == [], "a live round's service was reaped by a foreign sweep"
+    assert [r.plan_id for r in reports] == ["running"]
+    assert reports[0].skipped[0]["reason"] == "reap_deferred_live_round"
+    events = sm.read_service_events(plan_dir)
+    assert [
+        e for e in events if e["event"] == "reap_deferred_live_round"
+    ], events
+
+
+@pytest.mark.timeout(180)
+def test_a_foreign_sweep_leaves_a_real_running_service_alone(tmp_path: Path):
+    """The incident, with real processes instead of stubs.
+
+    The tests above pin the *decision* — this one pins the consequence
+    on a process that is really there: a service another round's lease
+    names must still be listening, and still answer, after a shutdown
+    sweep from a backend that is not that round.
+
+    It also carries its own negative control. The same sweep over the
+    same service, with the lease aged out of its window, collects it —
+    so the deferral is the lease's doing and not a sweep that quietly
+    stopped reaping anything.
+    """
+    import subprocess
+    import urllib.request
+
+    port = sm.allocate_free_port()
+    script = (
+        "import http.server,socketserver;"
+        f"socketserver.TCPServer(('127.0.0.1',{port}),"
+        "http.server.SimpleHTTPRequestHandler).serve_forever()"
+    )
+    decl = _decl(
+        name="api", port=port,
+        start_cmd=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+        cwd=str(tmp_path), ready_timeout_seconds=30,
+    )
+    # A round that is alive and is not this process.
+    owner = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+    )
+    runtime = None
+    try:
+        runtime_map = sm.ensure_services(tmp_path, {"api": decl})
+        runtime = runtime_map.runtimes["api"]
+        assert runtime.ready, runtime.detail
+        sm.record_runtimes(
+            tmp_path, tmp_path.name, runtime_map, project_dir=tmp_path,
+        )
+
+        ledger = json.loads(sm.ledger_path(tmp_path).read_text())
+        entry = ledger["services"][0]
+        entry["lease"] = sm.make_lease(
+            round_id="round-9", backend_pid=owner.pid, port=runtime.port,
+            listener_pid=runtime.pid,
+        ).to_dict()
+        sm.ledger_path(tmp_path).write_text(
+            json.dumps(ledger), encoding="utf-8",
+        )
+
+        report = sm.reap_services(tmp_path, reason="server_shutdown")
+
+        assert report.reaped == [], report.to_dict()
+        assert report.deferred, report.to_dict()
+        assert report.deferred[0]["reason"] == "reap_deferred_live_round"
+        assert sm.probe_port(runtime.port).listening, (
+            "a foreign sweep took a service a live round still holds"
+        )
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{runtime.port}/", timeout=5,
+        ) as response:
+            assert response.status == 200
+
+        # --- negative control: the lease ages out, the sweep collects ---
+        ledger["services"][0]["lease"]["heartbeat_at"] = (
+            time.time() - (sm.LEASE_TTL_SECONDS + 60)
+        )
+        sm.ledger_path(tmp_path).write_text(
+            json.dumps(ledger), encoding="utf-8",
+        )
+
+        report = sm.reap_services(tmp_path, reason="server_shutdown")
+
+        assert report.reaped == ["api"], report.to_dict()
+        deadline = time.monotonic() + 15
+        while (
+            time.monotonic() < deadline
+            and sm.probe_port(runtime.port).listening
+        ):
+            time.sleep(0.2)
+        assert not sm.probe_port(runtime.port).listening, (
+            "an aged-out lease left the service running — the deferral "
+            "would have become a leak"
+        )
+    finally:
+        if runtime is not None:
+            _force_cleanup(runtime.pid)
+        try:
+            owner.kill()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Round ownership — who may stop a service, and who may claim it
+# ---------------------------------------------------------------------------
+#
+# 2026-10-26, plan 20261023-PDT-MiniMax-Code-CLI: the round's own
+# ``api_test`` (VP-005) failed with a bare "connection refused" — the
+# service it was talking to had been stopped by a reap that did not
+# belong to that round.
+#
+# Two things were missing. The ledger said nothing about **which round**
+# owned a service, so a reader could not tell "a round is using this"
+# from "this is an orphan"; and the round-exit path stopped whatever the
+# ledger named, whoever owned it.
+#
+# The lease answers the first question. The reap answers the second: a
+# round-exit reap stops what its own round owns and leaves the rest
+# alone, and the next round takes over the leftovers whose lease has
+# expired.
+
+
+def test_round_exit_reap_leaves_a_service_leased_by_another_round(
+    tmp_path: Path, monkeypatch,
+):
+    """The bug this closes: ending a round must not stop a service that
+    another round's lease says is still in use."""
+    _write_ledger(tmp_path, [_entry(lease=_foreign_lease())])
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    report = sm.reap_services(
+        tmp_path, "plan-x", reason="verification_loop_exit",
+    )
+
+    assert killed == [], "a round-exit reap stopped another round's service"
+    assert report.reaped == []
+    skipped = report.skipped[0]
+    assert skipped["reason"] == "lease_owner_mismatch", skipped
+    assert skipped["lease_owner"], skipped
+    assert skipped["reaper_pid"] == os.getpid(), skipped
+    assert skipped["port"] == 3000, skipped
+    # The lease survives: the other round still owns the service, and the
+    # next sweep has to be able to find it again.
+    assert sm.ledger_path(tmp_path).exists()
+    ledger = sm.read_ledger(tmp_path)
+    assert ledger["services"][0]["lease"]["owner"], ledger
+
+
+def test_the_owner_mismatch_is_written_down_not_silent(
+    tmp_path: Path, monkeypatch,
+):
+    """A decision nobody can read is a silent failure."""
+    lease = _foreign_lease()
+    _write_ledger(tmp_path, [_entry(lease=lease)])
+    _stub_probe_and_stop(monkeypatch)
+
+    sm.reap_services(tmp_path, "plan-x", reason="verification_loop_exit")
+
+    events = sm.read_service_events(tmp_path)
+    mismatched = [
+        e for e in events if e["event"] == "lease_owner_mismatch"
+    ]
+    assert len(mismatched) == 1, events
+    event = mismatched[0]
+    assert event["lease_owner"] == lease["owner"], event
+    assert event["reaper_pid"] == os.getpid(), event
+    assert event["port"] == 3000, event
+    # The event names the round that owns the service, like every other
+    # event in this log.
+    assert event["round_token"] == lease["owner"], event
+
+
+def test_round_exit_reap_stops_the_service_this_round_leased(
+    tmp_path: Path, monkeypatch,
+):
+    """The other half of the rule: the reaper's own services are its own
+    to collect. Leaving them would trade a cross-round kill for a
+    service leak."""
+    mine = sm.make_lease(
+        round_id="plan-r1", backend_pid=os.getpid(), port=3000,
+        listener_pid=4242,
+    ).to_dict()
+    _write_ledger(tmp_path, [_entry(lease=mine)])
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    report = sm.reap_services(
+        tmp_path, "plan-x", reason="verification_loop_exit",
+    )
+
+    assert killed == [4242]
+    assert report.reaped == ["chart"]
+    assert not [
+        e for e in sm.read_service_events(tmp_path)
+        if e["event"] == "lease_owner_mismatch"
+    ]
+
+
+def test_round_exit_reap_collects_an_orphan_whose_lease_expired(
+    tmp_path: Path, monkeypatch,
+):
+    """The other half of the rule: a lease that has aged out of its
+    window is not a live round — it is an orphan, and orphans are what
+    a reap exists to collect. Refusing to collect it would turn the
+    deferral into a leak."""
+    _write_ledger(tmp_path, [_entry(lease=_expired_lease())])
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    report = sm.reap_services(
+        tmp_path, "plan-x", reason="verification_loop_exit",
+    )
+
+    assert killed == [4242]
+    assert report.reaped == ["chart"]
+
+
+def test_ensure_services_takes_over_a_stale_residual_lease(
+    tmp_path: Path, monkeypatch,
+):
+    """A leftover entry from an earlier round must not keep saying "a
+    round owns this" once that round is gone: the new round claims the
+    service and says whose claim it took over."""
+    project = tmp_path / "project"
+    project.mkdir()
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    _write_ledger(
+        plan_dir,
+        [_entry(name="api", port=18231, lease=_expired_lease())],
+    )
+    _stub_start(monkeypatch)
+    monkeypatch.setattr(sm, "probe_port", lambda p: _probe(p, []))
+
+    with sm.round_lease_context(plan_dir, round_id="plan-r2"):
+        sm.ensure_services(project, {"api": _decl(name="api", port=18231)})
+
+    events = sm.read_service_events(plan_dir)
+    taken = [e for e in events if e["event"] == "lease_taken_over"]
+    assert len(taken) == 1, events
+    event = taken[0]
+    assert event["from_owner"], event
+    assert event["to_owner"] == f"plan-r2@{os.getpid()}", event
+    assert event["reason"] == "stale", event
+
+    # The ledger now says who owns the service: the round that is
+    # running it, not the round that ran it last.
+    ledger = sm.read_ledger(plan_dir)
+    lease = ledger["services"][0]["lease"]
+    assert lease["owner"] == f"plan-r2@{os.getpid()}", ledger
+
+
+def test_ensure_services_does_not_take_over_a_live_residual_lease(
+    tmp_path: Path, monkeypatch,
+):
+    """A lease whose heartbeat is still fresh belongs to a round that is
+    still speaking: it is not a leftover, and taking it over would
+    steal a live round's claim."""
+    project = tmp_path / "project"
+    project.mkdir()
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    _write_ledger(
+        plan_dir,
+        [_entry(name="api", port=18231, lease=_foreign_lease())],
+    )
+    _stub_start(monkeypatch)
+    monkeypatch.setattr(sm, "probe_port", lambda p: _probe(p, []))
+
+    with sm.round_lease_context(plan_dir, round_id="plan-r2"):
+        sm.ensure_services(project, {"api": _decl(name="api", port=18231)})
+
+    events = sm.read_service_events(plan_dir)
+    assert not [
+        e for e in events if e["event"] == "lease_taken_over"
+    ], events
+
+
+def test_the_round_exit_hook_leaves_another_rounds_service_alone(
+    tmp_path: Path, monkeypatch,
+):
+    """The hook the workflow actually calls.
+
+    ``server._reap_managed_services`` is the round-exit path, and it is
+    the one that has to know **which** round it is ending: the plan's
+    marker names it, and the ledger's leases say whose the services
+    are. A service another round's lease names is left alone, and the
+    decision says whose round was being ended.
+    """
+    import server
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    _write_ledger(plan_dir, [_entry(lease=_foreign_lease())])
+    round_owner = f"plan-r1@{os.getpid()}"
+    sm.write_round_liveness(plan_dir, round_number=1, owner=round_owner)
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    server._reap_managed_services(
+        plan_dir.name, plan_dir, "verification_loop_exit",
+    )
+
+    assert killed == [], "the round-exit hook stopped another round's service"
+    events = sm.read_service_events(plan_dir)
+    mismatched = [
+        e for e in events if e["event"] == "lease_owner_mismatch"
+    ]
+    assert len(mismatched) == 1, events
+    assert mismatched[0]["expected_owner"] == round_owner, mismatched[0]
+
+
+# ---------------------------------------------------------------------------
+# Symmetry — the two cross-round sweeps judge a lease the same way, and
+# say what they decided
+# ---------------------------------------------------------------------------
+#
+# 2026-10-26, plan 20261023-PDT-MiniMax-Code-CLI, task repair-r1-20:
+# the plan's own ``api`` service is a ``backend.server`` instance, so a
+# backend booting (``startup_sweep``) and a backend going down
+# (``server_shutdown``) are the *same* kind of scan over every plan in
+# the plans directory — and either of them can take a live round's
+# service down. The round's own ``api_test`` then answers with a bare
+# "connection refused" minutes later.
+#
+# Two things were missing. The two sweeps judged the same ledger entry
+# through two separate copies of the rule, so "the same judgment" was
+# a coincidence rather than a fact about the code; and the *decision*
+# was only half written down: the deferral event named the process that
+# made it, while the event for the consequential half — the one that
+# says a service was stopped — named nobody.
+
+
+def test_both_cross_round_sweeps_judge_a_live_lease_the_same_way(
+    tmp_path: Path, monkeypatch,
+):
+    """``startup_sweep`` and ``server_shutdown`` must reach the same
+    verdict on the same ledger entry — and write down the same verdict.
+
+    A sweep that boots and a sweep that shuts down see the same plans
+    directory, so a rule that only one of them applies is a rule that
+    will eventually take a live round's service down.
+    """
+    seen = {}
+    for reason in ("startup_sweep", "server_shutdown"):
+        plan_dir = tmp_path / reason
+        _write_ledger(plan_dir, [_entry(lease=_foreign_lease())])
+        killed = _stub_probe_and_stop(monkeypatch)
+
+        report = sm.reap_services(plan_dir, reason=reason)
+
+        assert killed == [], f"{reason} stopped a live round's service"
+        assert report.reaped == [], reason
+        events = sm.read_service_events(plan_dir)
+        seen[reason] = [
+            (e["event"], e.get("decision"), e.get("reaper_pid"))
+            for e in events
+        ]
+
+    assert seen["startup_sweep"] == seen["server_shutdown"], seen
+    assert seen["startup_sweep"] == [
+        ("reap_deferred_live_round", "deferred_live_round", os.getpid())
+    ], seen
+
+
+def test_both_cross_round_sweeps_collect_an_orphan_the_same_way(
+    tmp_path: Path, monkeypatch,
+):
+    """The other half of the rule, and the half that must not change: an
+    orphan — no lease, or a lease whose heartbeat has aged out — is
+    collected by either sweep.
+
+    A sweep that refuses to collect anything would trade a cross-round
+    kill for a service leak.
+    """
+    seen = {}
+    for reason in ("startup_sweep", "server_shutdown"):
+        plan_dir = tmp_path / reason
+        _write_ledger(plan_dir, [_entry(lease=_expired_lease())])
+        killed = _stub_probe_and_stop(monkeypatch)
+
+        report = sm.reap_services(plan_dir, reason=reason)
+
+        assert killed == [4242], reason
+        assert report.reaped == ["chart"], reason
+        events = sm.read_service_events(plan_dir)
+        seen[reason] = [
+            (e["event"], e.get("decision"), e.get("reaper_pid"))
+            for e in events
+        ]
+
+    assert seen["startup_sweep"] == seen["server_shutdown"], seen
+    assert seen["startup_sweep"] == [
+        ("reaped", "reaped", os.getpid())
+    ], seen
+
+
+def test_the_collect_decision_names_the_process_that_made_it(
+    tmp_path: Path, monkeypatch,
+):
+    """The consequential half of the record.
+
+    The deferral event has named the process that made the decision
+    since 2026-10-25; the event for the decision that actually stops a
+    service named nobody. So a reader could tell "the sweep saw that
+    service and left it alone" from "the sweep never saw it", but not
+    **who took it down**.
+    """
+    _write_ledger(tmp_path, [_entry(lease=_expired_lease())])
+    _stub_probe_and_stop(monkeypatch)
+
+    sm.reap_services(tmp_path, reason="server_shutdown")
+
+    events = sm.read_service_events(tmp_path)
+    reaped = [e for e in events if e["event"] == "reaped"]
+    assert len(reaped) == 1, events
+    event = reaped[0]
+    assert event["reaper_pid"] == os.getpid(), event
+    assert event["decision"] == "reaped", event
+    assert event["reason"], event
+
+
+def test_an_orphan_without_a_lease_is_collected_and_recorded(
+    tmp_path: Path, monkeypatch,
+):
+    """No lease at all: the entry is an orphan, the sweep collects it,
+    and the collection is written down like every other decision."""
+    _write_ledger(tmp_path, [_entry()])
+    killed = _stub_probe_and_stop(monkeypatch)
+
+    report = sm.reap_services(tmp_path, reason="startup_sweep")
+
+    assert killed == [4242]
+    assert report.reaped == ["chart"]
+    events = sm.read_service_events(tmp_path)
+    reaped = [e for e in events if e["event"] == "reaped"]
+    assert len(reaped) == 1, events
+    assert reaped[0]["decision"] == "reaped", reaped[0]
+    assert reaped[0]["reaper_pid"] == os.getpid(), reaped[0]
+
+
+def test_every_reap_decision_carries_reaper_pid_reason_and_decision(
+    tmp_path: Path, monkeypatch,
+):
+    """The three fields the brief names, on every decision a sweep makes.
+
+    A decision recorded without them is a decision nobody can act on:
+    the log says *what* happened, but not *who decided* and not *which
+    of the possible decisions* it was.
+    """
+    _write_ledger(tmp_path, [
+        _entry(name="api", port=3000, lease=_foreign_lease()),
+        _entry(name="chart", port=3001, lease=_expired_lease()),
+    ])
+    _stub_probe_and_stop(monkeypatch)
+
+    sm.reap_services(tmp_path, reason="startup_sweep")
+
+    events = sm.read_service_events(tmp_path)
+    decisions = [
+        e for e in events
+        if e["event"] in {
+            "reaped", "reap_deferred_live_round", "lease_owner_mismatch",
+        }
+    ]
+    assert len(decisions) == 2, events
+    for event in decisions:
+        assert event["reaper_pid"] == os.getpid(), event
+        assert event["reason"], event
+        assert event["decision"], event
+    assert {
+        e["decision"] for e in decisions
+    } == {"deferred_live_round", "reaped"}, decisions
+
+
+def test_the_owner_mismatch_records_the_decision_it_made(
+    tmp_path: Path, monkeypatch,
+):
+    """The round-exit path records its decision the same way the two
+    cross-round sweeps do — the same three fields, the same event."""
+    _write_ledger(tmp_path, [_entry(lease=_foreign_lease())])
+    _stub_probe_and_stop(monkeypatch)
+
+    sm.reap_services(tmp_path, "plan-x", reason="verification_loop_exit")
+
+    events = sm.read_service_events(tmp_path)
+    mismatched = [
+        e for e in events if e["event"] == "lease_owner_mismatch"
+    ]
+    assert len(mismatched) == 1, events
+    event = mismatched[0]
+    assert event["decision"] == "left_alone_owner_mismatch", event
+    assert event["reaper_pid"] == os.getpid(), event
+    assert event["reason"], event
+
+
+def test_the_two_sweeps_share_one_lease_judgment():
+    """The rule is one named judgment, not two copies of it.
+
+    ``startup_sweep`` and ``server_shutdown`` reach the same verdict
+    because they call the same function — a copy that drifts is a sweep
+    that eventually takes a live round's service down.
+    """
+    assert sm.lease_is_held_by_a_live_round(
+        sm.ServiceLease.from_dict(_foreign_lease())
+    ) is True
+    assert sm.lease_is_held_by_a_live_round(
+        sm.ServiceLease.from_dict(_expired_lease())
+    ) is False
+    # No lease at all is not a live round: an entry nobody claimed is an
+    # orphan, and orphans are what a sweep exists to collect.
+    assert sm.lease_is_held_by_a_live_round(None) is False
+
+
+def test_the_server_reports_both_sweeps_the_same_way(
+    tmp_path: Path, monkeypatch, caplog,
+):
+    """The shutdown hook used to throw its reports away.
+
+    The startup sweep said what it decided (deferred, reaped) in the
+    server's own log; the shutdown hook — the one that ends a live
+    round's service — said nothing at all. So the decision that hurt
+    was the one nobody could read in the log of the process that made
+    it. Both now report through the same helper.
+    """
+    import logging
+
+    import server
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    _write_ledger(plan_dir, [_entry(lease=_foreign_lease())])
+
+    report = sm.reap_services(plan_dir, reason="server_shutdown")
+
+    with caplog.at_level(logging.INFO, logger="server"):
+        server._log_reap_reports([report], "server_shutdown")
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        "server_shutdown" in m and "left" in m and "alone" in m
+        for m in messages
+    ), messages

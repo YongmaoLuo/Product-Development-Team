@@ -356,6 +356,43 @@ def resolve_sandbox_profile_file() -> Optional[Path]:
     bundled = resolve_config_dir() / "sandbox_profile.sb"
     return bundled if bundled.is_file() else None
 
+#: Environment variable that relocates the MiniMax Code profile map.
+#: Read through :func:`resolve_mcode_profile_map_file` — never
+#: ``os.environ`` directly.
+MCODE_PROFILE_MAP_FILE_ENV: str = "PDT_MCODE_PROFILE_MAP_FILE"
+
+
+def resolve_mcode_profile_map_file() -> Path:
+    """Return the absolute path to ``mcode_profile_map.yaml``.
+
+    Precedence (first hit wins):
+
+    1. ``PDT_MCODE_PROFILE_MAP_FILE`` environment variable — absolute, or
+       relative to :data:`PROJECT_ROOT`.
+    2. ``<config dir>/mcode_profile_map.yaml``.
+
+    The file translates a PDT provider name into a MiniMax Code account
+    name, and that is a fact about the machine rather than about this
+    repository: which account a provider runs on is operator-owned
+    configuration, so the file lives in the gitignored
+    :data:`CONFIG_DIR` and a template ships in ``example/``.
+
+    There is deliberately **no bundled fallback**. A deployment that has
+    not written a map simply has no mapping — the same principle that
+    removed the built-in provider chain.
+
+    Resolution is re-run on every call (never cached) so a test that
+    sets the env var after import still gets the redirected file.
+    """
+    env_value = os.environ.get(MCODE_PROFILE_MAP_FILE_ENV)
+    if env_value:
+        candidate = Path(env_value).expanduser()
+        if not candidate.is_absolute():
+            candidate = (PROJECT_ROOT / candidate).resolve()
+        return candidate
+    return resolve_config_dir() / "mcode_profile_map.yaml"
+
+
 #: Interface the HTTP server binds to when ``PDT_HOST`` is unset.
 #: Loopback on purpose — see :func:`resolve_server_host`.
 DEFAULT_SERVER_HOST: str = "127.0.0.1"

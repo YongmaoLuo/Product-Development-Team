@@ -26,6 +26,7 @@ from dataclasses import dataclass
 # 2026-10-26 (merge): main 的 ``_service_recovery_locks`` / ``_recover_service_port``
 # 用到 ``threading.Lock``，本分支用到 ``uuid`` / ``dataclass`` —— 两边都要。
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional, List, Dict, Any, Set, Tuple
@@ -274,6 +275,108 @@ class VerificationBranchPlanError(RuntimeError):
 #: sub-agent walks are the same chain, and so a future scene change
 #: cannot move one without the other.
 VERIFICATION_SCENE = "verification"
+
+
+#: 裁决 / 结果里记录"**判它的那次提交**"的字段。
+#:
+#: 2026-10-26（VP-031）：一条 FAILED 结论绑在 dfd1c27 上，而当前 HEAD 已经是
+#: 876fb19 —— 那是**旧代码上的**失败，当前这份代码还没被它验过。而结果里
+#: 不记"判它的是哪次提交"，跨提交沿用这件事根本无从发现：报告里看到的是
+#: 一条"失败"，没人知道它是哪棵树上失败的。
+#:
+#: 与 :mod:`verification_verdict_provenance` 的命令指纹同源同向：结论只对
+#: 产生它的那份代码有效。
+JUDGED_HEAD_FIELD = "judged_head"
+
+#: 没有定义就不许沿用旧结论的标记。
+#:
+#: 2026-10-26（VP-031）：增量评估发过 VP-031 这个号，但它的定义从未落进
+#: ``verification_plan.json``。执行器**无定义可分派** —— 那条 VP 这一轮
+#: 一次都没跑；它此前挣到的失败被原样沿用，报告里 VP-031 的 title /
+#: expected_result 是空的，失败却是"真的"。
+#:
+#: 框架必须把这件事**显式**记下来，而不是让一条旧失败冒充今天的结论。
+BLOCKED_DEFINITION_MISSING = "BLOCKED_DEFINITION_MISSING"
+
+
+def stamp_judged_head(verdict: Dict[str, Any], head: str) -> Dict[str, Any]:
+    """给裁决盖上"判它的那次提交"（返回副本，不改原对象）。
+
+    两处都写：
+
+    * 顶层 —— 内存路径（``collect_verdicts`` → 报告信封）读它；
+    * ``evidence`` 里 —— 落库路径。``VerificationExecutor.record_verdict``
+      只把固定几个字段写进 SQLite（``vp_id`` / ``status`` / ``reasons`` /
+      ``evidence`` / 命令指纹），``evidence`` 是唯一能原样落库的地方。
+
+    ``head`` 为空时**不盖** —— "不知道判它的是哪次提交"与"知道是某次提交"
+    是两件事，把空串盖上去会让两者看起来一样。
+
+    2026-10-27：裁决**已经**带着出处时不覆盖。全量门禁的裁决自带它
+    **跑的时候**那棵树的 HEAD（框架执行的，不是子 agent 自报），那是
+    更贴切的一个 —— 覆盖它等于用本轮开头的缓存 HEAD 冒充门禁真的跑过
+    的那棵树。顶层没有但 ``evidence`` 里有的，以 ``evidence`` 里那个为
+    准（同一个道理：更具体的出处胜出）。
+    """
+    if not isinstance(verdict, dict) or not head:
+        return verdict
+    existing = str(verdict.get(JUDGED_HEAD_FIELD) or "")
+    if existing:
+        return verdict
+    evidence = verdict.get("evidence")
+    evidence_head = ""
+    if isinstance(evidence, dict):
+        evidence_head = str(evidence.get(JUDGED_HEAD_FIELD) or "")
+    stamped = dict(verdict)
+    stamped[JUDGED_HEAD_FIELD] = evidence_head or head
+    if isinstance(evidence, dict):
+        stamped["evidence"] = {
+            **evidence,
+            JUDGED_HEAD_FIELD: stamped[JUDGED_HEAD_FIELD],
+        }
+    return stamped
+
+
+def definition_missing(
+    definitions: Dict[str, Dict[str, Any]], vp_id: str,
+) -> bool:
+    """这个 id 在计划里**查不到定义**吗？
+
+    计划一条 VP 都没有时**不下**这个判断：没有计划可比对，"查不到"就分不清
+    是"定义没落盘"（VP-031）还是"压根没有计划"（退化输入）。这种时候下
+    判断只会凭空造出一条 ``BLOCKED_DEFINITION_MISSING`` —— 那不是任何人的
+    结论。
+
+    分派前与投影前用的是**同一个**判据（只写一处）：两处对"有没有定义"
+    的看法一旦漂移，同一条 VP 会在一处被记成"跑不了"、在另一处被记成
+    "跑过了"。
+    """
+    if not definitions:
+        return False
+    return str(vp_id) not in definitions
+
+
+def requires_reexecution(result: Any, current_head: str) -> bool:
+    """这条失败必须重跑吗？
+
+    判据：**判它的那次提交**不是当前 HEAD —— 那是旧代码上的失败，当前
+    这份代码还没被它验过。
+
+    缺 ``judged_head`` 的旧结论按同一条路处理（"无法证明出处"），与
+    :func:`verification_verdict_provenance.is_stale` 的"没有指纹 = 失效"
+    同一个方向。
+
+    只对 FAILED 生效：PASSED / SKIPPED 是终态成功，不重跑。``current_head``
+    为空（不是 git 仓库 / git 不可用）时**不**下判断 —— 无从比较时不猜。
+    """
+    if not isinstance(result, dict):
+        return False
+    if str(result.get("status") or "") != "FAILED":
+        return False
+    if not current_head:
+        return False
+    judged_head = str(result.get(JUDGED_HEAD_FIELD) or "")
+    return judged_head != current_head
 
 
 def _verification_vp_capacity(
@@ -596,6 +699,15 @@ def _log_phase_distribution(context: str, summary: dict) -> None:
 # needed. 8000 comfortably covers the observed worst case; anything
 # beyond it is clipped — but *declared*, see ``_truncate_annotated``.
 _MAX_PROMPT_EVIDENCE_CHARS = 8000
+
+
+# 2026-10-25: cap on the command summary a service-relaunch event
+# carries.  The command is copied verbatim — it is the audit record of
+# *what was re-run*, and the mcode/claude difference lives entirely in
+# it — so the cap exists only to keep a pathologically long command
+# from growing the event log without bound.  A real declaration is a
+# few hundred characters, so it is never trimmed.
+MAX_EVENT_COMMAND_CHARS = 4000
 
 
 def _truncate_annotated(text: str, limit: int, label: str = "evidence") -> str:
@@ -1828,6 +1940,11 @@ def _service_self_check(
         "content_type": "",
         "body_status": "",
         "error": "",
+        # 2026-10-27 (merge): the body the service answered with, kept
+        # so that the api phase's registration can quote it without
+        # asking the same endpoint a second time (see
+        # :meth:`_recorded_health_answer`).
+        "body": "",
         # 2026-10-26: the address that answered.  The round's own
         # probe is a **witness** — it says this address was being
         # served — and a witness that does not say which address it
@@ -1876,6 +1993,10 @@ def _service_self_check(
         body = None
     if isinstance(body, dict):
         result["body_status"] = str(body.get("status") or "")
+    # 2026-10-27 (merge): the body is kept so that the api phase's
+    # registration can quote the same answer instead of asking the
+    # endpoint a second time.
+    result["body"] = raw
     return result
 
 
@@ -2422,6 +2543,443 @@ def _health_endpoint_answers(health_url: str, timeout: float = 3.0) -> bool:
         return False
 
 
+# Execution surface — which code is actually running this round
+# ---------------------------------------------------------------------------
+#
+# A round's verdict says what the request did.  It used to say nothing
+# about *who* ran it: which tree the framework was imported from, and
+# which commit that tree was at.  A round graded by a copy of the
+# framework that did not contain the fix under repair therefore looked
+# exactly like a round whose service had been killed — and those two
+# need completely different repairs.
+#
+# The facts below are recorded as evidence, once per round, so the
+# question can be answered by reading a log instead of by
+# reconstructing a timeline.
+
+
+def _framework_file() -> str:
+    """The file of the backend package this process actually imported.
+
+    ``import backend`` resolves against ``sys.path``, so it answers the
+    question that matters — *which checkout is running* — rather than
+    the question this file's own location answers.  The fallback (this
+    module's own file) is the same tree in every layout where the
+    backend package is importable as a top-level module.
+    """
+    try:
+        import backend as _backend
+    except Exception:  # noqa: BLE001 - the package may not be importable
+        return os.path.realpath(__file__)
+    raw = getattr(_backend, "__file__", None)
+    if not raw:
+        return os.path.realpath(__file__)
+    return os.path.realpath(str(raw))
+
+
+def _framework_root(framework_file: str) -> str:
+    """The tree the framework file belongs to.
+
+    ``<tree>/backend/__init__.py`` → ``<tree>``: the tree is the unit
+    a ``git rev-parse`` and a checkout comparison both mean.
+    """
+    parent = Path(framework_file).resolve().parent
+    if parent.name == "backend":
+        return str(parent.parent)
+    return str(parent)
+
+
+def _git_head(directory: Optional[str]) -> str:
+    """The commit ``directory`` is checked out at, or ``"unknown"``.
+
+    Read through :class:`git_manager.GitManager` rather than through a
+    ``subprocess`` call: this module does not shell out (see the
+    boundary note above), GitPython is already a dependency, and a tree
+    that is not a repository at all has no HEAD to report.
+    """
+    if not directory:
+        return "unknown"
+    try:
+        from git_manager import GitManager
+
+        head = str(GitManager(str(directory)).rev_parse("HEAD") or "").strip()
+    except Exception:  # noqa: BLE001 - no git, no repo, no HEAD
+        return "unknown"
+    return head or "unknown"
+
+
+def _path_is_inside(child: str, parent: str) -> bool:
+    """Whether ``child`` is inside ``parent`` (both already real paths)."""
+    try:
+        return Path(child).is_relative_to(Path(parent))
+    except (ValueError, OSError):  # pragma: no cover - defensive
+        return False
+
+
+def _harness_env_var() -> str:
+    """The environment variable that says which backend a service runs under.
+
+    Read out of :mod:`service_manager` — the module that owns the
+    variable — so there is one name in the code base and not two that
+    have to be kept in step.
+    """
+    try:
+        from service_manager import HARNESS_ENV_VAR
+
+        return str(HARNESS_ENV_VAR)
+    except Exception:  # pragma: no cover - defensive
+        return "PDT_HARNESS"
+
+
+# ---------------------------------------------------------------------------
+# Data plane — was the field observed, and if not, why not
+# ---------------------------------------------------------------------------
+#
+# ``/health/data`` answers ``{"status": "ok", "plan_routing_rows": N}``.
+# The count is the only thing that says the **SQLite data plane** is
+# readable: a server with no database at all answers
+# ``{"status": "ok", "plan_routing_rows": 0}``, and a server whose
+# endpoint does not carry the field answers ``{"status": "ok"}``.  So
+# "the field was not observed" is three different faults wearing one
+# sentence:
+#
+#   * nothing answered — the service was not there;
+#   * something answered, and the field was not in it;
+#   * the field was observed, with its value.
+#
+# The framework records which one happened.  It never *asserts* the
+# field on the VP's behalf: the VP's own assertions (200, ``status ==
+# ok``, the field itself) stay the only basis for a PASSED — the PRD's
+# decision point 4 requires the default claude path to be unchanged,
+# and a probe that could pass a VP would change it.
+
+
+#: The data-plane field the ``/health/data`` endpoint reports.
+DATA_PLANE_FIELD = "plan_routing_rows"
+
+#: The three states a data-plane observation can be in.  ``observed``
+#: carries the value; the two ``not-observed`` states carry the reason
+#: the field was missing.
+OBSERVATION_OBSERVED = "observed"
+OBSERVATION_SERVICE_UNREACHABLE = "not-observed(service-unreachable)"
+OBSERVATION_FIELD_ABSENT = "not-observed(field-absent)"
+
+#: The two further states a **negative** expectation can be in.  A VP
+#: that expects a rejection (``{"status": 403}``) is asserting that a
+#: guard is in effect, and the two ways that expectation can go
+#: unproven are different faults with different repairs:
+#:
+#:   * ``not-observed(status-mismatch)`` — a response came back, but
+#:     with another status: the guard was **bypassed**;
+#:   * ``not-observed(body-absent)`` — the expected status arrived, but
+#:     the answer no longer carries the text the criterion demands: the
+#:     guard **degraded** silently.
+OBSERVATION_STATUS_MISMATCH = "not-observed(status-mismatch)"
+OBSERVATION_BODY_ABSENT = "not-observed(body-absent)"
+
+#: The response header the criterion names.  A header is a **dimension**
+#: of the answer, not a property of its body: the same answer can carry
+#: a JSON body and declare ``text/plain``, and it can be refused before
+#: it declares anything at all.  Booked down on its own, the header says
+#: which of those happened.
+CONTENT_TYPE_HEADER = "content-type"
+
+#: The two further states a **header** observation can be in:
+#:
+#:   * ``not-observed(header-absent)`` — a response came back and it
+#:     carried no such header: the endpoint answered without declaring
+#:     what it answered;
+#:   * ``not-observed(headers-unreadable)`` — a response came back, but
+#:     the framework could not read its headers, so the header was
+#:     never observed.  "I could not look" is not "it was not there",
+#:     and the two have different repairs.
+OBSERVATION_HEADER_ABSENT = "not-observed(header-absent)"
+OBSERVATION_HEADERS_UNREADABLE = "not-observed(headers-unreadable)"
+
+# ---------------------------------------------------------------------------
+# The static entry — three halves, three books
+# ---------------------------------------------------------------------------
+#
+# The static UI entry is the one path behind PRD decision point 4 ("默认
+# claude 路径零变化") together with constraint 2: the root path is the
+# one a browser navigates to, so it has to keep answering exactly as it
+# did before.  Its criterion has three halves — the status, the media
+# type and the title — and the three are **separate facts**: a ``200``
+# with a JSON envelope answers the status half and neither of the
+# others, and an answer that never came answers none of them.
+#
+# So the three are booked down on their own, each saying whether it was
+# observed or why it was not.  One sentence for the three is what made
+# the faults indistinguishable in the first place: "connection refused"
+# reads the same whether the entry was never reached, was reached and
+# answered with the wrong document, or was reached and answered with no
+# title at all.
+
+#: The media type the static entry answers with.  A criterion that
+#: expects it is grading the document a browser navigates to.
+STATIC_ENTRY_MEDIA_TYPE = "text/html"
+
+#: The further state the **title** observation can be in when the
+#: response came back without the title the criterion names: the
+#: endpoint answered, and what it answered was not the document.  "The
+#: service did not answer" and "the answer was not the page" are
+#: different faults with different repairs.
+OBSERVATION_TITLE_ABSENT = "not-observed(title-absent)"
+
+#: The three halves of the static entry's criterion.  They are booked
+#: down separately, and all three are always present together — a cell
+#: that only appears when one of them was seen cannot be checked
+#: afterwards.
+STATIC_ENTRY_DIMENSIONS = ("status_code", "content_type", "title")
+
+#: The side condition a **negative**, plan-scoped criterion carries: a
+#: plan that does not exist must not be created by the request that asked
+#: for it.  "The endpoint answered 404" and "the endpoint left the plan
+#: alone" are two different facts, and only the first one is a status
+#: code — the caller can read the status, but it can only *infer* the
+#: second one, and it may not infer it from a request that never got
+#: an answer.
+ZERO_SIDE_EFFECT_CONDITION = "no-plan-created"
+
+#: The further state the side-condition observation can be in when the
+#: plans tree could not be read at all: the framework cannot say whether
+#: the plan was created when it could not look.  "I could not look" is
+#: not "nothing was created", and the two have different repairs.
+OBSERVATION_PLANS_TREE_UNREADABLE = "not-observed(plans-tree-unreadable)"
+
+#: The vocabulary of the **harness identity** cell: what is known about
+#: the backend the process answering a service's port really runs under.
+#:
+#: The three answers are deliberately distinct, because they are three
+#: different faults:
+#:
+#:   * ``observed`` — the backend was read out of the operating system
+#:     and it is the declared one;
+#:   * ``mismatch`` — it was read, and it is **not** the declared one:
+#:     the "configured but not actually in effect" case, which is an
+#:     acceptance failure and not something to paper over;
+#:   * ``not-observed(service-unreachable)`` — nothing was listening, so
+#:     there was no process to read: this round has **no evidence**
+#:     either way, and that is not the same answer as the two above.
+HARNESS_IDENTITY_OBSERVED = "observed"
+HARNESS_IDENTITY_MISMATCH = "mismatch"
+HARNESS_IDENTITY_NOT_OBSERVED_UNREACHABLE = (
+    "not-observed(service-unreachable)"
+)
+HARNESS_IDENTITY_NOT_OBSERVED_UNREADABLE = "not-observed(unreadable)"
+HARNESS_IDENTITY_NOT_OBSERVED_UNCHECKABLE = (
+    "not-observed(uncheckable-harness)"
+)
+
+#: What the snapshot writes when the environment of the listener could
+#: not be read at all.  Distinct from ``None``: ``None`` is a fact the
+#: operating system reported (the variable is not set in that process),
+#: ``"unknown"`` is the absence of a fact.
+HARNESS_IDENTITY_UNKNOWN = "unknown"
+
+# ---------------------------------------------------------------------------
+# Service identity — which process answered, and which code it runs
+# ---------------------------------------------------------------------------
+#
+# The **harness identity** above answers "which backend is the process
+# answering this port running under".  It does not answer the other
+# half: *which code* is that process running.  A service can be running
+# the right backend from a tree that is three commits behind, and a
+# verdict graded on it says nothing about the code under repair — the
+# report reads "PASSED" and the reader cannot tell that the request was
+# answered by a process that predates the change.
+#
+# So the service identity is a second, independent observation, and it
+# has three answers:
+#
+#   * ``confirmed`` — the process answering the port is the one the
+#     round holds the claim on, and the tree it runs in is the tree the
+#     round started it from;
+#   * ``mismatch`` — the observation contradicts the claim: a different
+#     process is answering the port, or the answering process runs a
+#     different tree than the one the round started;
+#   * ``unconfirmed`` — one side of the comparison is **blank**: nobody
+#     is listening, the round holds no claim, the tree could not be
+#     read.  A blank is never agreement — "we could not check" and
+#     "it agrees" are two different sentences, and only the second one
+#     may be read as a confirmation.
+SERVICE_IDENTITY_CONFIRMED = "confirmed"
+SERVICE_IDENTITY_MISMATCH = "mismatch"
+SERVICE_IDENTITY_UNCONFIRMED = "unconfirmed"
+
+#: The phases whose **dispatch record** carries the service identity.
+#: The api phase has a snapshot and an event of its own; these two are
+#: dispatched to a sub-agent, and nothing else in their path says which
+#: process the criterion is graded against — a ``target_url`` is a page
+#: to open, not a port the framework owns.
+SERVICE_IDENTITY_DISPATCH_METHODS = ("ui_validation", "e2e")
+
+#: "The environment of this process has not been read yet."  Distinct
+#: from ``None``, which is the answer "it was read and it could not be
+#: read" — the two must never be confused, because one of them is a
+#: missing fact and the other is a missing *possibility*.
+_ENV_UNREAD = object()
+
+#: Markers that identify an evidence field carrying a **side
+#: observation** — a fact gathered somewhere else (another VP, a
+#: sub-agent, a neighbouring round) and pasted into this VP's verdict.
+#: Such a field may be logged; it may never be part of the evidence a
+#: verdict is read from, because a verdict that says "observed" on the
+#: strength of somebody else's answer is a verdict nobody can check.
+SIDE_EVIDENCE_KEY_MARKERS = (
+    "corroborat",
+    "side_evidence",
+    "side_observation",
+    "旁证",
+    "other_vp",
+    "neighbour",
+    "sub_agent",
+)
+
+#: The audit artifact the api runner writes for every api_test VP: the
+#: record of the response — status, **headers**, body — that lets an
+#: operator re-check a verdict afterwards.  The verdict's own evidence
+#: keeps the status and the body; the headers live here.
+API_RESPONSE_ARTIFACT = "api_response.json"
+
+#: How long the read-only health registration waits.  It is a
+#: diagnostic, not the criterion: it must never delay a round by the
+#: VP's own timeout.
+HEALTH_PROBE_TIMEOUT_SECONDS = 5.0
+
+#: How much of the health endpoint's answer is kept in the evidence.
+HEALTH_PROBE_BODY_CHARS = 500
+
+
+# ---------------------------------------------------------------------------
+# Failure class — which of the three faults a failed api_test was
+# ---------------------------------------------------------------------------
+#
+# "connection refused" is one sentence for three faults with three
+# different repairs:
+#
+#   * the round never brought the service up;
+#   * the service was up and died before the request went out;
+#   * the service is listening and the request failed anyway.
+#
+# The class is decided by three facts the framework already holds: the
+# round's **ready record** for the service (``services_ensured``), the
+# **listener pid** the api-phase snapshot found at request time, and
+# whether the **request itself** raised.
+
+
+#: The round never had a ready service for the VP's target.
+FAILURE_CLASS_NEVER_STARTED = "never-started"
+
+#: The service was ready, and nothing is listening on the port the
+#: request uses any more.
+FAILURE_CLASS_DIED_BEFORE_REQUEST = "died-before-request"
+
+#: Something is listening on that port and the request still failed.
+FAILURE_CLASS_REQUEST_FAILED = "request-failed"
+
+
+#: The exception types that mean *the request never reached a response*:
+#: the connection could not be made, or the peer went away.  A request
+#: that fails this way says the service is **not there** — which is a
+#: fact about the round, not about the verification point that happened
+#: to ask.
+#:
+#: A **timeout** is deliberately not in this set.  A service that
+#: answers too late is still there, and calling that "the service is
+#: gone" would be a wrong attribution — the very confusion this
+#: classification exists to remove.
+TRANSPORT_LOSS_ERROR_TYPES = frozenset({
+    "URLError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
+    "ConnectionAbortedError",
+    "ConnectionError",
+    "BrokenPipeError",
+    "gaierror",
+    "RemoteDisconnected",
+    "BadStatusLine",
+    "IncompleteRead",
+    "ProxyError",
+})
+
+
+def _read_only_get(url: str, timeout: float) -> Dict[str, Any]:
+    """One read-only GET, reduced to what a verdict may record.
+
+    A 4xx/5xx is a **response**: the endpoint answered, so the service
+    is reachable — only a transport failure means "not reachable".  The
+    distinction is the whole point of the registration.
+    """
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        url, method="GET", headers={"Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = int(response.status)
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code)
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - an unreadable body is no body
+            body = ""
+    except Exception as exc:  # noqa: BLE001 - the probe never raises
+        return {
+            "reachable": False,
+            "status_code": None,
+            "error": f"{type(exc).__name__}: {exc}",
+            "body": "",
+        }
+    return {"reachable": True, "status_code": status, "error": None, "body": body}
+
+
+def _field_in_body(body: Optional[str], field: str) -> Tuple[bool, Any]:
+    """Whether ``field`` is in ``body``, and its value when it is.
+
+    The body is parsed as JSON when it can be.  When it cannot — a body
+    the api runner truncated, a payload that is not JSON at all — the
+    field *name* is still looked for, so a truncated answer is never
+    reported as "the field was absent".
+    """
+    if not body:
+        return False, None
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        if field in payload:
+            return True, payload[field]
+        return False, None
+    if f'"{field}"' in body:
+        return True, None
+    return False, None
+
+
+def _declared_plans_dir(start_cmd: str) -> Optional[str]:
+    """The plans tree a service's start command exports, if it names one.
+
+    A service is told which plans tree it reads — ``export
+    PDT_PLANS_DIR=/tmp/…/plans`` — and that tree is where a plan's
+    directory would appear.  It is the only tree the framework may look
+    in when it checks that a missing plan stayed missing: the tree *this*
+    framework keeps its own plans in is a different tree whenever the
+    service was pointed elsewhere, and looking in the wrong one answers
+    a question nobody asked.
+    """
+    match = re.search(
+        r"PDT_PLANS_DIR=(?P<path>[^;\s'\"]+)", str(start_cmd or ""),
+    )
+    if match is None:
+        return None
+    path = match.group("path").strip()
+    return path or None
+
+
 class Orchestrator:
     """Three-phase verification orchestrator for quality assurance.
 
@@ -2800,6 +3358,66 @@ class Orchestrator:
         self._round_service_preflight: Optional[
             Callable[[], Optional[Dict[str, Any]]]
         ] = None
+        #: 2026-10-27: which declared service each VP's URL came from.
+        #: Keyed by VP id, valued by service name.
+        #:
+        #: A plan writes its api_test URL against the **placeholder**
+        #: (``{{svc.api.url}}/health``), and the round expands it once,
+        #: at preflight.  The expanded URL says *where* to go but no
+        #: longer says *which service* that is — and the difference
+        #: matters as soon as the service dies: the port alone can be
+        #: answered by a stranger's process, so the round needs the
+        #: name the plan asked for.
+        #:
+        #: **In memory only.**  The binding is the round's own
+        #: bookkeeping; the plan on disk keeps its placeholders and is
+        #: re-resolved every round, so nothing here may ever be written
+        #: back to ``verification_plan.json``.
+        self._vp_service_bindings: Dict[str, str] = {}
+        #: 2026-10-27: the ports this round has already been told about —
+        #: the ones that belong to no declared service.  Reported once
+        #: each: a round asks about a port a dozen times, and that is
+        #: one fact, not a dozen.
+        self._unowned_ports_reported: set = set()
+        #: 2026-10-25: when the round brought its services up. The
+        #: api phase reports how long ago that was, so a verdict can
+        #: say "the service has been dead for 40 seconds" instead of
+        #: leaving the reader to guess. ``None`` until the preflight
+        #: runs.
+        self._services_ensured_at: Optional[float] = None
+        #: 2026-10-25: the execution surface of this round (which tree
+        #: the framework was imported from, which commit it is at, and
+        #: whether that is the tree under test). Computed once and
+        #: cached — the framework does not change under a running round.
+        self._execution_surface_cache: Optional[Dict[str, Any]] = None
+        #: 2026-10-26: the round's **lease loss** — set once, when the
+        #: round discovers that it no longer owns the services it
+        #: started (see :meth:`_assert_round_lease`). A round-level
+        #: incident, not a per-VP one: it is recorded once, it stops the
+        #: remaining VPs, and it keeps the round from dressing one
+        #: accident up as nine identical per-VP failures.
+        self._round_lease_lost: Optional[Dict[str, Any]] = None
+        #: 2026-10-26: the round's **api-phase service loss** — set once,
+        #: when a request went out and produced *no response at all*
+        #: (the connection was refused, the peer went away).  A
+        #: round-level incident for the same reason the lease loss is
+        #: one: the service is gone, so the fact belongs to the round,
+        #: not to the verification point that happened to ask first.
+        #: It is recorded once, it stops the remaining api VPs instead
+        #: of asking a dead port the same question nine times, and it
+        #: keeps one accident from being dressed up as nine identical
+        #: per-VP failures.
+        self._api_phase_service_lost: Optional[Dict[str, Any]] = None
+        #: 阶段归一化摘要（Phase 1/2 计数 + 被兜底提升的 VP），由
+        #: :meth:`generate_verification_plan` 填充，供审计/展示读取。
+        #: 2026-10-26：本轮判结论的**那棵树的 HEAD**（被验代码的提交）。
+        #: 结论只对产生它的那份代码有效 —— 与
+        #: :mod:`verification_verdict_provenance` 的命令指纹同一个方向。
+        #: ``None`` = 还没查（不是"没有 HEAD"）。
+        self._round_head: Optional[str] = None
+        #: 2026-10-26：计划里的 VP 定义（id → 定义）。分派前按 id 查它：
+        #: 查不到就不分派（见 :meth:`_build_verification_executor`）。
+        self._vp_definitions: Dict[str, Dict[str, Any]] = {}
 
     def _note_vp_capacity(self, peak: Optional[int]) -> None:
         """Record the concurrency the round reached, for the report to quote.
@@ -3200,10 +3818,10 @@ class Orchestrator:
                 allocated_vp_ids,
                 apply_delta_persisted,
                 build_delta_prompt,
+                build_delta_state,
                 collect_acceptance,
                 collect_new_tasks,
                 load_delta_state,
-                merge_allocated_ids,
                 parse_delta_payload,
                 save_delta_state,
             )
@@ -3238,19 +3856,25 @@ class Orchestrator:
             # 首轮（尚无基线）：只记录"已经看过哪些任务"，不评估——此时
             # 不存在"新增任务"，评估只会浪费一次 LLM 调用。
             if not seen:
-                save_delta_state(self.plan_dir, {
-                    "seen_task_ids": all_ids,
-                    "round": round_number,
-                    "allocated_vp_ids": merge_allocated_ids(state),
-                })
+                save_delta_state(
+                    self.plan_dir,
+                    build_delta_state(
+                        state,
+                        seen_task_ids=all_ids,
+                        round_number=round_number,
+                    ),
+                )
                 return {}
 
             if not new_tasks:
-                save_delta_state(self.plan_dir, {
-                    "seen_task_ids": all_ids,
-                    "round": round_number,
-                    "allocated_vp_ids": merge_allocated_ids(state),
-                })
+                save_delta_state(
+                    self.plan_dir,
+                    build_delta_state(
+                        state,
+                        seen_task_ids=all_ids,
+                        round_number=round_number,
+                    ),
+                )
                 return {}
 
             acceptance = collect_acceptance(self.plan_dir)
@@ -3262,6 +3886,11 @@ class Orchestrator:
                 scene="verification_plan_delta",
             )
             delta = parse_delta_payload(raw, plan_data, reserved_ids=reserved)
+            # 2026-10-26（VP-031）：发出去的号必须**带着定义**落进计划
+            # 文件，并在 state 里记下写入时的 HEAD。只在内存里发号，下一轮
+            # 读到的仍是一份没有这条定义的计划 —— 那条 VP 于是无定义可
+            # 分派，它此前挣到的失败又被原样沿用。
+            head = self._current_project_head()
 
             # 2026-10-22：增量必须**落盘**。
             #
@@ -3283,6 +3912,7 @@ class Orchestrator:
                     expected_digest=expected_digest,
                     avoid_ids=avoid_ids,
                     reserved_ids=reserved,
+                    head=head,
                 )
             except PlanDeltaPersistError as exc:
                 # 这次增量**没有**落盘（写失败，或计划在评估期间被外部改写）。
@@ -3308,24 +3938,24 @@ class Orchestrator:
             # 2026-10-25（VP-031）：发号账本。**本函数是这个状态文件的
             # 主人**（"看过哪些任务"每轮都写它），所以账本也在这里落盘 ——
             # 而且要写**合并后**的整份账本：只写这一轮新发的号会把之前
-            # 发出去的号抹掉。
-            ledger: List[str] = []
-            for vp_id in list(state.get("allocated_vp_ids") or []) + list(
-                summary.get("allocated_vp_ids") or []
-            ):
-                key = str(vp_id or "").strip()
-                if key and key not in ledger:
-                    ledger.append(key)
+            # 发出去的号抹掉。``build_delta_state`` 就是那份合并：它把上一轮
+            # 账上的号与这一轮新发的号并成一份写下去。
+            #
+            # 2026-10-26：护栏丢弃的 VP **不会**留在计划文件里 ——
+            # ``apply_delta_persisted`` 是**先过护栏、再落盘**（原子写 + 摘要
+            # 校验），所以文件里从来不会有一条已经被判"跑不了"的定义，
+            # 下一轮也就不会分派它。
 
-            save_delta_state(self.plan_dir, {
-                "seen_task_ids": all_ids,
-                "round": round_number,
-                "last_delta": summary,
-                # 本轮分配出去的 id 累加进去 —— 下一轮据此跳过它们，id 才
-                # 跨轮单调（2026-10-24）。写的是**合并后**的整份账本：只写
-                # 这一轮新发的号会把之前发出去的号抹掉。
-                "allocated_vp_ids": ledger,
-            })
+            save_delta_state(
+                self.plan_dir,
+                build_delta_state(
+                    state,
+                    seen_task_ids=all_ids,
+                    round_number=round_number,
+                    summary=summary,
+                    head=head,
+                ),
+            )
             self._safe_log_freshness_event(
                 "__plan_delta__", "plan_delta_evaluated", summary,
             )
@@ -5042,6 +5672,21 @@ class Orchestrator:
         Everything downstream (placeholder resolution, the VP prompt's
         service block) reads through here, so there is exactly one place
         that knows where a service actually lives.
+
+        The runtime map is the round's own record of that, and it keeps
+        recording the port after the process dies.  ``ready`` says
+        whether the service answers **right now**; it does not say where
+        the service lives.  Gating on it (as this did until 2026-10-27)
+        made the round forget the port it had relocated to the moment the
+        service died — and a VP whose URL still named that port could
+        then no longer be healed: the port was nobody's, so nothing was
+        restarted, and the request ended in "connection refused" with
+        nothing in the round's log saying a service had been killed.
+
+        The declared port is **not** the fallback here either: it is the
+        port a stranger was holding, and pointing a verification point at
+        a stranger's process is the hazard the relocation exists to
+        avoid.
         """
         runtime_map = self._service_runtime_map
         if runtime_map is None and not self._service_bindings:
@@ -6070,6 +6715,4124 @@ class Orchestrator:
                 ),
             },
         )
+    def _declaration_for_port(self, port: int) -> Tuple[str, Any]:
+        """The declared service that listens on ``port``.
+
+        Read through :meth:`_effective_declarations`, so the answer is
+        the port the service *really* listens on — the relocated one
+        when the preflight had to move it — which is the port the VP's
+        URL was resolved to.
+
+        When the effective declarations do not carry the port, the
+        round's own **ledgers** are asked as well: the runtime map in
+        memory and the ledger on disk.  Both record the port a service
+        really listens on, and the ledger on disk records it next to the
+        port it was declared on, so a reader can tell "it moved" from
+        "it failed".
+
+        A port that neither the declarations nor the ledgers name is
+        **reported**, not swallowed: "no declared service" is the answer
+        a reader needs, and a silent ``None`` reads like "nothing to
+        do here" — which is how a VP whose service had died ended up
+        asking a dead port the same question nine times.
+        """
+        try:
+            wanted = int(port)
+        except (TypeError, ValueError):
+            return "", None
+        for name, decl in self._effective_declarations().items():
+            try:
+                if int(getattr(decl, "port", 0) or 0) == wanted:
+                    return str(name), decl
+            except (TypeError, ValueError):
+                continue
+
+        from_ledger = self._declaration_from_ledger(wanted)
+        if from_ledger is not None:
+            return from_ledger
+
+        # The port is nobody's.  Say so — once per port, so a round that
+        # asks about it a dozen times still reads as one fact.
+        if self._service_declarations:
+            if wanted not in self._unowned_ports_reported:
+                self._unowned_ports_reported.add(wanted)
+                logger.warning(
+                    "[verification_agent] port %s belongs to no declared "
+                    "service of this round (declared: %s); the request "
+                    "targets an endpoint this round does not own",
+                    wanted, sorted(self._service_declarations),
+                )
+        else:
+            # The default claude path declares no service at all, so
+            # every port is nobody's — that is not news, and the round's
+            # behaviour must not change because of it.
+            logger.debug(
+                "[verification_agent] port %s belongs to no declared "
+                "service; this round declares none", wanted,
+            )
+        return "", None
+
+    def _declaration_from_ledger(self, port: int) -> Optional[Tuple[str, Any]]:
+        """The declared service this round's ledger says owns ``port``.
+
+        Two ledgers are read: the round's in-memory runtime map, and the
+        persisted one under the plan.  The **declaration** is still what
+        is returned — the ledger says where the service lives, the
+        declaration says which backend it runs under, and only the
+        declaration may say that.
+
+        ``None`` when neither ledger names this port.
+        """
+        runtime_map = self._service_runtime_map
+        runtimes = getattr(runtime_map, "runtimes", None) or {}
+        for name, runtime in runtimes.items():
+            try:
+                runtime_port = int(getattr(runtime, "port", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if runtime_port != int(port):
+                continue
+            key = str(name).strip().lower()
+            decl = self._service_declarations.get(key)
+            if decl is None:
+                continue
+            return key, self._declaration_at_port(decl, runtime_port)
+
+        # The persisted ledger: the record of what this round started,
+        # kept next to the port the service was declared on.
+        for entry in self._ledger_entries():
+            try:
+                entry_port = int(entry.get("port") or 0)
+            except (TypeError, ValueError):
+                continue
+            if entry_port != int(port):
+                continue
+            key = str(entry.get("name") or "").strip().lower()
+            decl = self._service_declarations.get(key)
+            if decl is None:
+                continue
+            return key, self._declaration_at_port(decl, entry_port)
+        return None
+
+    def _ledger_entries(self) -> List[Dict[str, Any]]:
+        """The service entries of this plan's persisted ledger."""
+        plan_dir = getattr(self, "plan_dir", None)
+        if plan_dir is None:
+            return []
+        try:
+            from service_manager import read_ledger
+        except Exception:  # pragma: no cover - defensive
+            return []
+        try:
+            ledger = read_ledger(plan_dir)
+        except Exception:  # noqa: BLE001 - a broken record is no record
+            return []
+        entries = ledger.get("services") if isinstance(ledger, dict) else None
+        if not isinstance(entries, list):
+            return []
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+    @staticmethod
+    def _declaration_at_port(decl: Any, port: int) -> Any:
+        """``decl`` as it runs on ``port``."""
+        try:
+            from service_manager import render_declaration
+        except Exception:  # pragma: no cover - defensive
+            return decl
+        try:
+            return render_declaration(decl, int(port))
+        except Exception:  # pragma: no cover - defensive
+            return decl
+
+    def _known_service_pid(self, name: str) -> Optional[int]:
+        """The pid the round last saw for ``name``, or ``None``."""
+        runtime_map = self._service_runtime_map
+        if runtime_map is None:
+            return None
+        runtime = (runtime_map.runtimes or {}).get(name)
+        return getattr(runtime, "pid", None) if runtime is not None else None
+
+    def _remember_service_runtime(self, name: str, runtime: Any) -> None:
+        """Point the round's runtime map at a service's new process."""
+        runtime_map = self._service_runtime_map
+        if runtime_map is None:
+            return
+        try:
+            runtime_map.runtimes[name] = runtime
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "[service_manager] could not update the runtime map for %s",
+                name,
+            )
+
+    @staticmethod
+    def _start_cmd_summary(decl: Any) -> str:
+        """The command a relaunch of *decl* re-runs, as an event records it.
+
+        Verbatim, because the command **is** the audit record: the
+        mcode-side declaration differs from the claude-side one by an
+        export (``PDT_HARNESS=mcode``) and two paths and nothing else,
+        so a summary that was rewritten or trimmed would hide exactly
+        the fact a reader of the round log has to check.
+
+        Capped, so a pathologically long command cannot grow the event
+        log without bound.  The cap sits far above any real
+        declaration, so a real command is never trimmed.
+        """
+        command = str(getattr(decl, "start_cmd", "") or "")
+        if len(command) > MAX_EVENT_COMMAND_CHARS:
+            return command[:MAX_EVENT_COMMAND_CHARS] + " …[truncated]"
+        return command
+
+    def _verify_relaunched_harness(
+        self, name: str, decl: Any, runtime: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Check that the relaunched process runs the declared backend.
+
+        A declaration that pins ``PDT_HARNESS=mcode`` is a declaration
+        about the **mcode** backend: the service it starts is the mcode
+        side of the round.  A relaunch that comes up *without* that
+        export still answers the service's port, so a VP graded on that
+        process would be grading the endpoint and ignoring the backend —
+        a "configured but not actually in effect" service, which the
+        hard constraints call an acceptance failure.
+
+        The expectation comes from the **declaration**, because the
+        declaration is the contract: the command that was re-run
+        verbatim is the one that says which backend the service is.  The
+        observation comes from the **operating system**: the environment
+        of the process that is actually answering the port.
+
+        Returns ``None`` when the declaration says nothing about the
+        harness — the default claude path pins none, and inventing a
+        requirement there would change that path's behaviour for no
+        reason.  Otherwise a dict with ``ok`` and, when it failed, the
+        reason.  A value that cannot be read is a failure and not a
+        pass: "I could not check" is not a reason to let a configured
+        backend through unverified.
+        """
+        try:
+            from service_manager import (
+                HARNESS_ENV_VAR,
+                declared_harness,
+                harness_assignment,
+                process_environment,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+        assignment = harness_assignment(decl)
+        if assignment is None:
+            # The declaration pins no harness: nothing to verify.
+            return None
+
+        expected = declared_harness(decl)
+        if expected is None:
+            return {
+                "ok": False,
+                "expected": None,
+                "actual": None,
+                "detail": (
+                    f"service {name!r} declares {HARNESS_ENV_VAR}="
+                    f"{assignment!r}, which is not a name this framework "
+                    f"can check; the backend the relaunched service runs "
+                    f"under cannot be verified"
+                ),
+            }
+
+        pid = getattr(runtime, "pid", None)
+        if not pid:
+            return {
+                "ok": False,
+                "expected": expected,
+                "actual": None,
+                "detail": (
+                    f"service {name!r} was relaunched but the framework "
+                    f"has no pid to read {HARNESS_ENV_VAR} from; the "
+                    f"{expected} backend is configured but not actually in "
+                    f"effect, so it cannot be verified"
+                ),
+            }
+
+        env = process_environment(pid)
+        if env is None:
+            return {
+                "ok": False,
+                "expected": expected,
+                "actual": None,
+                "detail": (
+                    f"the environment of the relaunched process (pid {pid}) "
+                    f"could not be read, so {HARNESS_ENV_VAR}={expected!r} "
+                    f"could not be verified; the {expected} backend is "
+                    f"configured but not actually in effect"
+                ),
+            }
+
+        actual = env.get(HARNESS_ENV_VAR)
+        if actual != expected:
+            return {
+                "ok": False,
+                "expected": expected,
+                "actual": actual,
+                "detail": (
+                    f"the relaunched process (pid {pid}) runs with "
+                    f"{HARNESS_ENV_VAR}={actual!r}, but the declaration of "
+                    f"service {name!r} pins {HARNESS_ENV_VAR}={expected!r}; "
+                    f"the {expected} backend is configured but not actually "
+                    f"in effect — the process answering the port is not the "
+                    f"declared backend"
+                ),
+            }
+        return {
+            "ok": True, "expected": expected, "actual": actual, "pid": pid,
+        }
+
+    def _vp_request_url(self, vp: dict) -> str:
+        """The VP's request URL, with its ``{{svc.*}}`` placeholders
+        expanded.
+
+        The plan on disk keeps the placeholders — they are re-resolved
+        every round, against the port the service *really* listens on
+        (the preflight may have had to relocate it).  A VP that reaches
+        the relaunch path before that expansion happened still names the
+        same service, so the same expansion is applied here: the
+        effective declarations, which is what the preflight resolved
+        the plan against.
+        """
+        request = vp.get("request") or {}
+        url = str(request.get("url") or "").strip()
+        if not url or "{{" not in url:
+            return url
+        try:
+            from service_declaration import resolve_text
+        except Exception:  # pragma: no cover - defensive
+            return url
+        try:
+            resolved, _unresolved = resolve_text(
+                url, self._effective_declarations(),
+            )
+        except Exception:  # pragma: no cover - defensive
+            return url
+        return str(resolved or url)
+
+    def _vp_with_resolved_request_url(self, vp: dict) -> dict:
+        """The VP with its request URL resolved against this round.
+
+        A plan writes its api_test URL against the service
+        **placeholder** — ``{{svc.api.url}}/health/data`` — because the
+        port is declared once and re-resolved every round.  The
+        placeholder is not a URL, so a request made against it never
+        leaves the process: ``urllib`` raises ``unknown url type`` and
+        the criterion is never observed, no matter how well the service
+        is running.  That is what made the data plane invisible in the
+        rounds that failed: the service was brought back, and the
+        request still went nowhere.
+
+        The resolution is the one the relaunch path already uses
+        (:meth:`_vp_request_url`, against the **effective**
+        declarations), so the request and the relaunch cannot disagree
+        about which port the VP is about to talk to.
+
+        A VP whose URL carries no placeholder is returned **unchanged**:
+        the default claude path keeps byte-for-byte the behaviour it
+        had.  An unresolvable placeholder is also left alone — the
+        request then fails with its own reason, instead of being
+        rewritten into something that looks like a URL but points
+        nowhere.
+        """
+        request = vp.get("request")
+        if not isinstance(request, dict):
+            return vp
+        url = str(request.get("url") or "")
+        if "{{" not in url:
+            return vp
+        resolved = self._vp_request_url(vp)
+        if not resolved or resolved == url:
+            return vp
+        resolved_vp = dict(vp)
+        resolved_vp["request"] = dict(request)
+        resolved_vp["request"]["url"] = resolved
+        return resolved_vp
+
+    def _vp_placeholder_service(self, vp: dict) -> str:
+        """The service a ``{{svc.*}}`` placeholder in the VP's URL names.
+
+        Empty when the URL names no service — a literal address, or a
+        placeholder the vocabulary does not recognise.
+
+        A URL that has **already been expanded** names no service
+        literally, and that is the case that used to end the search
+        here: the round resolves the placeholders once, at preflight,
+        and the VP the executor dispatches carries the resolved URL.  A
+        service that died after that had no name left to be found by,
+        so the round could not tell *which* service to bring back — and
+        a port alone is not an answer, because a stranger's process can
+        hold a port too.
+
+        So the name falls back to the **binding** the round recorded
+        when it expanded the URL (see
+        :meth:`_record_vp_service_bindings`).  The binding is the
+        round's own bookkeeping and lives in memory only.
+        """
+        request = vp.get("request") or {}
+        url = str(request.get("url") or "")
+        if "{{" in url:
+            try:
+                from service_declaration import iter_placeholders
+            except Exception:  # pragma: no cover - defensive
+                pass
+            else:
+                try:
+                    for _raw, name, _field in iter_placeholders(url):
+                        return str(name)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+        return self._bound_service_for_vp(vp)
+
+    def _bound_service_for_vp(self, vp: dict) -> str:
+        """The service this VP's URL was resolved from, or ``""``.
+
+        Read out of the round's own record of the resolution — the
+        binding written by :meth:`_record_vp_service_bindings` when the
+        placeholders were expanded.  Empty when the VP was never bound
+        to a declared service.
+        """
+        vp_id = str(vp.get("id") or "").strip()
+        if not vp_id:
+            return ""
+        return str(self._vp_service_bindings.get(vp_id) or "")
+
+    def _declaration_for_service(self, name: str) -> Tuple[str, Any]:
+        """The declared service called ``name``, as this round runs it.
+
+        Read through :meth:`_effective_declarations`, so the answer is
+        the port the service really listens on — the relocated one when
+        the preflight had to move it.
+        """
+        key = str(name or "").strip().lower()
+        if not key:
+            return "", None
+        decl = self._effective_declarations().get(key)
+        if decl is None:
+            return "", None
+        return key, decl
+
+    @staticmethod
+    def _loopback_port(url: str) -> Optional[int]:
+        """The port of a loopback URL, or ``None``.
+
+        ``None`` for a URL that does not parse, carries no port, or
+        points at another machine — only a service this round declared
+        is ours to touch.
+        """
+        import urllib.parse
+
+        try:
+            parts = urllib.parse.urlsplit(url)
+            port = parts.port
+        except ValueError:
+            return None
+        if not port:
+            return None
+        host = (parts.hostname or "").lower()
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return None
+        return int(port)
+
+    @staticmethod
+    def _guard_vp_port(port: int) -> Optional[int]:
+        """``port``, unless it is the backend's own control plane."""
+        try:
+            from service_freshness import PROTECTED_PORTS
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if int(port) in PROTECTED_PORTS:
+            # The backend's own control plane — never ours to touch.
+            return None
+        return int(port)
+
+    def _vp_target_port(self, vp: dict) -> Optional[int]:
+        """The loopback port this VP's request is about to use.
+
+        ``None`` for a request that does not target a service this round
+        could own: no URL, a URL that does not parse, a host that is not
+        this machine, or the backend's own control plane.
+
+        The URL a plan writes is usually a **placeholder** —
+        ``{{svc.api.url}}/health`` — and a placeholder has no netloc, so
+        it cannot be ``urlsplit``-ed into a port.  The placeholder is
+        therefore expanded first, against the same effective
+        declarations the preflight resolved the plan against, so the
+        port is the one the request will really use.  When the
+        placeholder cannot be expanded into a parseable URL at all, the
+        service it *names* still gives the port: giving up there would
+        leave every placeholder URL unhealable, which is exactly the
+        bug this fixes.
+
+        One reader for "which port is this VP about to talk to", so the
+        relaunch path and the backend-confirmation path cannot disagree
+        about the port they are looking at.
+        """
+        request = vp.get("request") or {}
+        url = str(request.get("url") or "").strip()
+        if not url:
+            return None
+
+        resolved = self._vp_request_url(vp)
+        port = self._loopback_port(resolved)
+        if port is not None:
+            return self._guard_vp_port(port)
+
+        # The URL did not yield a loopback port.  Either it points
+        # somewhere that is not ours — a third-party endpoint, which is
+        # none of this round's business — or it still carries a
+        # placeholder this round could not expand.  Only the second is
+        # healable, and only when it names a service we declared.
+        if "{{" not in resolved:
+            return None
+        name = self._vp_placeholder_service(vp)
+        if not name:
+            return None
+        _service, decl = self._declaration_for_service(name)
+        if decl is None:
+            return None
+        try:
+            port = int(getattr(decl, "port", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if not port:
+            return None
+        return self._guard_vp_port(port)
+
+    def _relaunch_service_for_vp(self, vp: dict) -> Optional[Dict[str, Any]]:
+        """Make sure the service this VP is about to call is alive.
+
+        The round resolved the service URL once, at preflight. A service
+        that died after that — a foreign sweep taking it, a crash, an
+        OOM — used to turn into a bare "connection refused" minutes
+        later, with nothing in the round's log saying the service had
+        been killed. This probes the port the request is about to use
+        and, if it is dead, starts the service again **on the same
+        port**, so the URL the VP was given stays true.
+
+        Returns ``None`` when there is nothing to do — the port answers,
+        or the request does not target a service this round declared —
+        and a dict with ``ok`` when a restart was attempted. Never
+        raises: a broken probe must not take the VP down, it must only
+        mean "no relaunch".
+        """
+        vp_id = str(vp.get("id", "unknown"))
+        port = self._vp_target_port(vp)
+        if port is None:
+            return None
+        try:
+            from service_freshness import probe_port
+        except Exception:  # pragma: no cover - defensive
+            return None
+        try:
+            probe = probe_port(int(port))
+        except Exception:  # noqa: BLE001 - the probe never raises
+            return None
+        if probe.listening:
+            return None
+
+        # The service the URL *names* wins over the port: the name is
+        # what the plan asked for, and a port alone can be answered by a
+        # stranger's process.  A URL with no placeholder falls back to
+        # the port, which is the only thing it carries.
+        name, decl = "", None
+        service_name = self._vp_placeholder_service(vp)
+        if service_name:
+            name, decl = self._declaration_for_service(service_name)
+        if decl is None:
+            name, decl = self._declaration_for_port(int(port))
+        if decl is None:
+            # Not a service this round declared — nothing to restart.
+            return None
+
+        # The service has to come back on the port the VP's URL names:
+        # the URL is never rewritten to meet the service.  When the round
+        # had to **move** the service — the declared port was held by a
+        # stranger — the declaration still names the port it was
+        # declared with, and restarting it there would leave the URL
+        # pointing at nothing.  ``render_declaration`` is how the
+        # service manager itself renders a declaration for a port, so
+        # the command, the health URL and the log file all move with it.
+        from service_manager import render_declaration
+
+        decl = render_declaration(decl, int(port))
+
+        old_pid = self._known_service_pid(name)
+        reason = "port was not listening before the request"
+        # The command that is about to be re-run, recorded with the
+        # outcome.  The declaration's command is the *only* thing that
+        # says which backend the relaunched service runs under — the
+        # mcode side differs from the claude side by an export and two
+        # paths and nothing else — so a round log that says "service
+        # relaunched" without it cannot be checked afterwards.
+        start_cmd = self._start_cmd_summary(decl)
+        try:
+            from service_manager import ensure_services, round_lease_context
+
+            # The relaunched service is leased to this round too: a
+            # sweep that cannot see the round must not stop it either.
+            with round_lease_context(
+                getattr(self, "plan_dir", None),
+                round_id=self._round_id(),
+            ):
+                runtime_map = ensure_services(
+                    self.project_dir, {name: decl},
+                )
+        except Exception as exc:  # noqa: BLE001 - ensure never raises
+            logger.exception(
+                "[service_manager] relaunch of service %s failed", name,
+            )
+            detail = f"{type(exc).__name__}: {exc}"
+            self._safe_log_freshness_event(
+                vp_id, "service_relaunch",
+                {
+                    "ok": False, "service": name, "port": int(port),
+                    "old_pid": old_pid, "new_pid": None, "reason": reason,
+                    "detail": detail, "start_cmd": start_cmd,
+                },
+            )
+            return {
+                "ok": False, "service": name, "port": int(port),
+                "old_pid": old_pid, "new_pid": None, "reason": reason,
+                "detail": detail, "start_cmd": start_cmd,
+            }
+
+        runtime = runtime_map.runtimes.get(name)
+        new_pid = getattr(runtime, "pid", None)
+        started_port = getattr(runtime, "port", None)
+        ready = bool(getattr(runtime, "ready", False))
+        if not ready:
+            # The service did not come up.  The URL this VP holds names
+            # the port it was supposed to answer on, and nothing is
+            # answering it, so the request would fail for a reason the
+            # verdict must name.
+            detail = str(
+                getattr(runtime, "detail", "") or "service did not come up"
+            )
+            if started_port is not None:
+                detail = f"{detail} (listening port: {started_port})"
+            self._safe_log_freshness_event(
+                vp_id, "service_relaunch",
+                {
+                    "ok": False, "service": name, "port": int(port),
+                    "old_pid": old_pid, "new_pid": new_pid, "reason": reason,
+                    "detail": detail, "start_cmd": start_cmd,
+                },
+            )
+            return {
+                "ok": False, "service": name, "port": int(port),
+                "old_pid": old_pid, "new_pid": new_pid, "reason": reason,
+                "detail": detail, "start_cmd": start_cmd,
+            }
+        if started_port != int(port):
+            # The service came up on a *different* port, which happens
+            # when the port was taken by a stranger in the meantime and
+            # the relocation rules moved us.  The URL this VP holds
+            # names ``port`` and only ``port``; it is never rewritten to
+            # follow the service, because a criterion graded against a
+            # different endpoint is not the criterion.  So this is a
+            # failure, and the reason says which port the service took.
+            detail = str(getattr(runtime, "detail", "") or "")
+            mismatch_reason = (
+                f"the service came up on port {started_port}, not on port "
+                f"{int(port)} that the request uses; the request's URL is "
+                f"not rewritten to follow the service"
+            )
+            self._safe_log_freshness_event(
+                vp_id, "service_relaunch",
+                {
+                    "ok": False, "service": name, "port": int(port),
+                    "listening_port": started_port,
+                    "old_pid": old_pid, "new_pid": new_pid,
+                    "reason": mismatch_reason, "detail": detail,
+                    "start_cmd": start_cmd,
+                },
+            )
+            return {
+                "ok": False, "service": name, "port": int(port),
+                "old_pid": old_pid, "new_pid": new_pid,
+                "reason": mismatch_reason, "detail": detail,
+                "listening_port": started_port, "start_cmd": start_cmd,
+            }
+
+        # The process that just came up must be the service the
+        # declaration describes — including the backend it runs under.
+        # The relaunch re-runs the declaration's own command verbatim,
+        # so the command is not in question; what is in question is the
+        # process that came up from it.
+        harness = self._verify_relaunched_harness(name, decl, runtime)
+        if harness is not None and not harness.get("ok"):
+            # The service is up but it is the *wrong* service: it answers
+            # the port without running the backend the declaration pins.
+            # Stop it rather than leave it holding the port, so the next
+            # round starts from a free port instead of inheriting a
+            # service that answers but is not the declared backend.
+            try:
+                from service_manager import stop_service
+
+                stop_service(
+                    runtime, decl,
+                    plan_dir=getattr(self, "plan_dir", None),
+                    round_token=self._round_id(),
+                    reason="harness_check_failed",
+                )
+            except Exception:  # noqa: BLE001 - a stop never raises
+                logger.warning(
+                    "[service_manager] could not stop the relaunched "
+                    "service %s after the harness check failed", name,
+                )
+            harness_detail = str(harness.get("detail") or "")
+            self._safe_log_freshness_event(
+                vp_id, "service_relaunch",
+                {
+                    "ok": False, "service": name, "port": int(port),
+                    "old_pid": old_pid, "new_pid": new_pid, "reason": reason,
+                    "detail": harness_detail, "start_cmd": start_cmd,
+                },
+            )
+            return {
+                "ok": False, "service": name, "port": int(port),
+                "old_pid": old_pid, "new_pid": new_pid, "reason": reason,
+                "detail": harness_detail, "start_cmd": start_cmd,
+                "harness_check": harness,
+            }
+
+        # The round's runtime map still points at the dead process; the
+        # next VP's placeholder resolution and PDT_SVC_* env must see the
+        # new one.
+        self._remember_service_runtime(name, runtime)
+        try:
+            from service_manager import record_runtime
+
+            record_runtime(
+                self.plan_dir, self.plan_dir.name, runtime,
+                project_dir=self.project_dir,
+                round_number=self._current_round,
+            )
+        except Exception:  # noqa: BLE001 - a ledger write never raises
+            logger.warning(
+                "[service_manager] could not record the relaunched "
+                "service %s", name,
+            )
+        self._safe_log_freshness_event(
+            vp_id,
+            "service_relaunch",
+            {
+                "ok": True, "service": name, "port": int(port),
+                "old_pid": old_pid, "new_pid": new_pid, "reason": reason,
+                "start_cmd": start_cmd,
+            },
+        )
+        self._safe_log_freshness_event(
+            vp_id,
+            "service_relaunched_before_vp",
+            {
+                "service": name,
+                "port": int(port),
+                "old_pid": old_pid,
+                "new_pid": new_pid,
+                "reason": reason,
+                # The command that was re-run, verbatim.  The
+                # declaration's command is what says which backend the
+                # relaunched service runs under, so an event without it
+                # cannot be checked afterwards — and a relaunch that
+                # re-ran a *different* command is precisely the silent
+                # downgrade this round has to catch.
+                "start_cmd": start_cmd,
+            },
+        )
+        return {
+            "ok": True, "service": name, "port": int(port),
+            "old_pid": old_pid, "new_pid": new_pid, "reason": reason,
+            "detail": str(getattr(runtime, "detail", "") or ""),
+            "start_cmd": start_cmd,
+        }
+
+    def _round_lease_for_service(
+        self, name: str, port: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """The lease this round holds on one service, or ``None``.
+
+        Read out of the plan's own records — the ledger, and the
+        liveness marker behind it — so the answer is the one a reaper in
+        another process would read too.  ``None`` when the plan holds no
+        lease for the service: nobody claimed it, so nothing can be
+        said about who is supposed to be serving it.
+        """
+        plan_dir = getattr(self, "plan_dir", None)
+        if plan_dir is None:
+            return None
+        try:
+            from service_manager import read_service_lease
+        except Exception:  # pragma: no cover - defensive
+            return None
+        try:
+            return read_service_lease(plan_dir, name=name, port=port)
+        except Exception:  # noqa: BLE001 - a broken record is no lease
+            return None
+
+    @staticmethod
+    def _lease_listener_mismatch(
+        lease: Optional[Dict[str, Any]],
+        pids: List[int],
+        expected: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Is the process answering the port the one the round leased?
+
+        ``None`` when there is nothing to contradict:
+
+          * no lease, or a lease without a listener — nobody claimed
+            the service, so nobody can say the answer came from the
+            wrong process;
+          * the listener is the process the round ensured;
+          * the listener is in the process group the round started it
+            in — the round starts its services through a shell, and the
+            process that binds the port may be that shell's child
+            rather than the shell itself;
+          * the holder could not be named.
+
+        "I could not check" is not "it is not mine", and a check that
+        accused the round on a degraded probe would stop every round
+        that declared a service.
+        """
+        if not lease:
+            return None
+        try:
+            expected_pid = int(lease.get("listener_pid") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not expected_pid:
+            return None
+        live: List[int] = []
+        for pid in (pids or []):
+            try:
+                live.append(int(pid))
+            except (TypeError, ValueError):
+                continue
+        if not live:
+            return None
+        if expected_pid in live:
+            return None
+        try:
+            pgid = int(lease.get("pgid") or 0)
+        except (TypeError, ValueError):
+            pgid = 0
+        if pgid:
+            for pid in live:
+                try:
+                    if os.getpgid(pid) == pgid:
+                        return None
+                except (ProcessLookupError, PermissionError, OSError):
+                    continue
+        service = str(lease.get("service") or "")
+        backend = str(expected or "declared")
+        return {
+            "expected_pid": expected_pid,
+            "actual_pid": live[0],
+            "detail": (
+                f"the process answering port {lease.get('port')} "
+                f"(pid {live[0]}) is not the instance this round leased "
+                f"for service {service!r} (pid {expected_pid}); its answer "
+                f"is not the {service!r} service's answer, and no other "
+                f"instance's answer may stand in for the {backend} "
+                f"backend this verification point grades"
+            ),
+        }
+
+    def _pinned_backend_capability(self, name: str) -> Dict[str, Any]:
+        """What a declared service pins — for the verdict that lost it.
+
+        ``{}`` when the service pins no backend: the default claude
+        path, whose behaviour must not change.  The plan that declares
+        an ``api-mcode`` service gets a sentence that names the backend
+        by name, because "the mcode backend is unavailable" and "the
+        service could not be restarted" are not the same fault and the
+        repair loop acts on the difference.
+        """
+        if not name:
+            return {}
+        try:
+            from service_manager import (
+                HARNESS_ENV_VAR, declared_harness,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return {}
+        _key, decl = self._declaration_for_service(name)
+        if decl is None:
+            return {}
+        try:
+            backend = str(declared_harness(decl) or "")
+        except Exception:  # noqa: BLE001 - a broken declaration says none
+            return {}
+        if not backend:
+            return {}
+        return {
+            "service": name,
+            "backend": backend,
+            "env_var": HARNESS_ENV_VAR,
+            "detail": (
+                f"service {name!r} — the one whose declaration pins "
+                f"{HARNESS_ENV_VAR}={backend!r} — is not available: the "
+                f"{backend} backend this verification point grades is not "
+                f"running, and the answer of any other instance may not "
+                f"stand in for it"
+            ),
+        }
+
+    def _verify_service_backend_for_vp(
+        self, vp: dict,
+    ) -> Optional[Dict[str, Any]]:
+        """Confirm the backend the service this VP grades on runs under.
+
+        :meth:`_verify_relaunched_harness` checks the backend of the
+        process the framework just started.  This is the other half: a
+        service that was **already alive** was never checked, so a VP
+        could be graded on a process that answers the port without
+        running the backend its declaration pins — a service that is
+        *configured* for the mcode backend but is not actually running
+        under it, which the hard constraints call an acceptance failure
+        rather than something to paper over.
+
+        The endpoint cannot make that distinction itself: the same
+        server code answers ``/api/system/active`` on both sides, with
+        the same five fields.  So the confirmation has to be about the
+        **process**: the expectation comes from the declaration (the
+        contract) and the observation from the operating system (the
+        environment of the process that is actually answering the port).
+
+        Returns ``None`` when there is nothing to confirm:
+
+          * the declaration pins no harness — the default claude path,
+            which must keep behaving exactly as it did;
+          * the request does not target a service this round declared.
+
+        Otherwise a dict with ``ok`` and, when it failed, the reason.  A
+        value that cannot be read is a failure and not a pass: "I could
+        not check" is not a reason to let a configured backend through
+        unverified.
+
+        Three questions, in this order, and the first two are about
+        the **instance** rather than about its environment:
+
+          * **is the service there at all?** — a service that pins a
+            backend and is not answering means the capability is
+            unavailable.  The hard constraints call that an explicit
+            failure; it must not be answered with a shrug ("there is no
+            process to read an environment from"), and the request must
+            not be sent to whatever else may be listening on the port;
+          * **is the process answering the port the one this round
+            leased for this service?** — the lease names it, and the
+            answer of anybody else may not stand in for it.  The
+            environment alone cannot say this: the default backend
+            inherits the harness variable from the backend that started
+            it, so it *claims* the mcode backend while running the
+            claude one;
+          * **does that process really run the declared backend?** — the
+            environment, read out of the operating system.
+        """
+        try:
+            from service_manager import (
+                HARNESS_ENV_VAR,
+                declared_harness,
+                harness_assignment,
+                process_environment,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+        port = self._vp_target_port(vp)
+        if port is None:
+            return None
+        name, decl = self._declaration_for_port(port)
+        if decl is None:
+            # Not a service this round declared — nothing to confirm.
+            return None
+        assignment = harness_assignment(decl)
+        if assignment is None:
+            # The declaration pins no harness: nothing to verify.
+            return None
+        expected = declared_harness(decl)
+        if expected is None:
+            return {
+                "ok": False, "expected": None, "actual": None,
+                "service": name, "port": port,
+                "detail": (
+                    f"service {name!r} declares {HARNESS_ENV_VAR}="
+                    f"{assignment!r}, which is not a name this framework "
+                    f"can check; the backend the service runs under cannot "
+                    f"be verified"
+                ),
+            }
+
+        # 2026-10-26: the round's **lease** on this service.  It names
+        # the process this round ensured, and it is the only record
+        # that says which service that process was ensured *for* — the
+        # round's two services share an owner and differ in the port.
+        lease = self._round_lease_for_service(name, port)
+
+        try:
+            from service_freshness import probe_port
+
+            probe = probe_port(port)
+        except Exception:  # noqa: BLE001 - the probe never raises
+            return None
+        if not probe.listening:
+            # The service this verification point grades is **not
+            # there**.  For a declaration that pins a backend that is
+            # the capability being unavailable, and the hard constraints
+            # call it an explicit failure: the request must not go to
+            # whatever else may be listening, and the verdict has to
+            # name the capability that is missing.
+            return {
+                "ok": False, "expected": expected, "actual": None,
+                "service": name, "port": port,
+                "service_absent": True,
+                "kind": "service_absent",
+                "expected_pid": (lease or {}).get("listener_pid"),
+                "actual_pid": None,
+                "lease": lease or {},
+                "detail": (
+                    f"service {name!r} — the one whose declaration pins "
+                    f"{HARNESS_ENV_VAR}={expected!r} — is not answering on "
+                    f"port {port}: the {expected} backend this verification "
+                    f"point grades is not available, and the answer of any "
+                    f"other instance may not stand in for it"
+                ),
+            }
+        pids = list(probe.pids or [])
+        if not pids:
+            return {
+                "ok": False, "expected": expected, "actual": None,
+                "service": name, "port": port,
+                "detail": (
+                    f"port {port} answers but the process behind it could "
+                    f"not be identified, so {HARNESS_ENV_VAR}={expected!r} "
+                    f"could not be verified; the {expected} backend is "
+                    f"configured but not actually in effect"
+                ),
+            }
+
+        # 2026-10-26: the process answering the port must be the one
+        # this round leased **for this service**.  The environment
+        # cannot say this on its own — the default backend inherits
+        # the harness variable from the backend that started it, so it
+        # claims the mcode backend while running the claude one — and a
+        # criterion about the mcode backend must never be graded on the
+        # claude instance's answer.
+        mismatch = self._lease_listener_mismatch(lease, pids, expected)
+        if mismatch is not None:
+            return {
+                "ok": False, "expected": expected, "actual": None,
+                "service": name, "port": port,
+                "listener_mismatch": True,
+                "kind": "listener_mismatch",
+                "expected_pid": mismatch["expected_pid"],
+                "actual_pid": mismatch["actual_pid"],
+                "lease": lease or {},
+                "detail": mismatch["detail"],
+            }
+
+        pid = pids[0]
+        env = process_environment(pid)
+        if env is None:
+            return {
+                "ok": False, "expected": expected, "actual": None,
+                "service": name, "port": port, "pid": pid,
+                "detail": (
+                    f"the environment of the process answering port {port} "
+                    f"(pid {pid}) could not be read, so "
+                    f"{HARNESS_ENV_VAR}={expected!r} could not be verified; "
+                    f"the {expected} backend is configured but not actually "
+                    f"in effect"
+                ),
+            }
+        actual = env.get(HARNESS_ENV_VAR)
+        if actual != expected:
+            return {
+                "ok": False, "expected": expected, "actual": actual,
+                "service": name, "port": port, "pid": pid,
+                "detail": (
+                    f"the process answering port {port} (pid {pid}) runs "
+                    f"with {HARNESS_ENV_VAR}={actual!r}, but the declaration "
+                    f"of service {name!r} pins {HARNESS_ENV_VAR}={expected!r}; "
+                    f"the {expected} backend is configured but not actually "
+                    f"in effect — the process answering the port is not the "
+                    f"declared backend"
+                ),
+            }
+        return {
+            "ok": True, "expected": expected, "actual": actual,
+            "service": name, "port": port, "pid": pid,
+        }
+
+    # ------------------------------------------------------------------
+    # Execution surface — which code is grading this round
+    # ------------------------------------------------------------------
+
+    def _execution_surface(self) -> Dict[str, Any]:
+        """Which code is running this round, and which code is under test.
+
+        ``framework_*`` describes the tree this process actually
+        imported; ``project_*`` describes the tree the round is
+        verifying.  ``same_tree`` answers the question an operator
+        really has after a failed round: *is the code that graded this
+        VP the code under repair?*
+
+        Cached per agent — the framework does not change under a running
+        round, and every answer costs two repository reads.
+        """
+        cached = self._execution_surface_cache
+        if cached is not None:
+            return cached
+        framework_file = _framework_file()
+        framework_root = _framework_root(framework_file)
+        project_dir = os.path.realpath(str(self.project_dir))
+        surface = {
+            "framework_file": framework_file,
+            "framework_root": framework_root,
+            "framework_head": _git_head(framework_root),
+            "project_dir": project_dir,
+            "project_head": _git_head(project_dir),
+            "same_tree": _path_is_inside(framework_file, project_dir),
+            "pid": os.getpid(),
+        }
+        self._execution_surface_cache = surface
+        return surface
+
+    def _emit_execution_surface_provenance(self) -> Dict[str, Any]:
+        """Record the execution surface of this round, once.
+
+        Emitted when the verification executor is built — before any
+        VP runs — so the round log says which tree graded it even when
+        every VP passes.  A round whose log carries
+        ``verification_executor_provenance`` with ``same_tree=false``
+        was graded by a copy of the framework that is not the code
+        under test, and its verdicts say nothing about the product.
+        """
+        surface = self._execution_surface()
+        self._safe_log_freshness_event(
+            "__executor__", "verification_executor_provenance", surface,
+        )
+        logger.info(
+            "verification_executor_provenance %s",
+            json.dumps(surface, ensure_ascii=False),
+        )
+        return surface
+
+    def _seconds_since_services_ensured(self) -> Optional[float]:
+        """How long ago the round brought its services up.
+
+        ``None`` when the round never ensured them — a plan with no
+        service declaration, or a preflight that did not run.
+        """
+        ensured_at = self._services_ensured_at
+        if ensured_at is None:
+            return None
+        return round(time.monotonic() - ensured_at, 3)
+
+    def _api_phase_service_snapshot(self, vp: dict) -> Dict[str, Any]:
+        """What was listening on the services, at the moment before the request.
+
+        The api phase is where "the request failed" and "the service was
+        not there" have to be told apart, so the snapshot is taken
+        **before** the request goes out — not after the failure is
+        known.
+
+        ``listener_pid`` is the process the operating system says is
+        listening on the port (``null`` when nothing is), and
+        ``known_pid`` is the process the round had started.  The pair
+        separates "the service never came up" (both null) from "the
+        service was killed between the phases" (a known pid, no
+        listener).
+
+        ``harness_identity`` books down, for every declared service that
+        pins a **backend**, which backend the process answering that
+        service's port really runs under.  The observation comes from the
+        operating system — the environment of the very process the
+        snapshot names as the listener — so an mcode copy on another
+        port can never stand in for it.
+
+        ``service_identity`` books down the **other** half: which
+        process answered, which **tree** it runs in and which commit
+        that tree is checked out at.  The harness identity says *which
+        backend*; this one says *which code* — and the two together are
+        what make "the change was made but the request ran against the
+        old process" readable instead of invisible.
+        """
+        services: Dict[str, Any] = {}
+        harness_identity: Dict[str, Any] = {}
+        identities: Dict[str, Any] = {}
+        for name, decl in sorted(self._effective_declarations().items()):
+            port = int(getattr(decl, "port", 0) or 0)
+            identity = self._service_identity(name, decl, port)
+            # The raw environment of the answering process is a working
+            # detail, not an observation: it holds whatever the operator
+            # put in it.  Only the one variable that says which backend
+            # the service runs under is booked down.
+            env = identity.get("env")
+            identity = self._without_raw_env(identity)
+            listener_pid = identity.get("listener_pid")
+            services[name] = {
+                "port": port,
+                # The port the service **really** listens on: the
+                # preflight may have had to relocate it off a port a
+                # stranger was holding, and the declared port is then
+                # the stranger's.
+                "actual_port": identity.get("port"),
+                "listener_pid": listener_pid,
+                "known_pid": self._known_service_pid(name),
+                "seconds_since_services_ensured": (
+                    self._seconds_since_services_ensured()
+                ),
+                # The tree the answering process runs in and the commit
+                # that tree is checked out at.  Blank when it could not
+                # be read — never a guess.
+                "service_cwd": identity.get("service_cwd"),
+                "service_head": identity.get("service_head"),
+                "harness_env": identity.get("harness_env"),
+                "start_cmd": identity.get("start_cmd"),
+                "cmdlines": identity.get("cmdlines"),
+                "process_start_epoch": identity.get("process_start_epoch"),
+                "identity_status": identity.get("status"),
+                "identity_head_status": identity.get("head_status"),
+                "identity_detail": identity.get("detail"),
+            }
+            identities[str(name)] = identity
+            harness = self._harness_identity_observation(
+                decl, listener_pid, env=env,
+            )
+            if harness is not None:
+                harness = dict(harness)
+                harness["service"] = str(name)
+                harness_identity[str(name)] = harness
+        # The port the request is about to use, when the round declared
+        # no service for it.  The reader still wants to know whether
+        # anything was listening there — "no service was declared" is an
+        # answer about the *plan*, not about the *port*.
+        declared_ports = {
+            int(info.get("port") or 0) for info in services.values()
+        }
+        target_port = self._vp_target_port(vp)
+        target: Optional[Dict[str, Any]] = None
+        if target_port is not None and int(target_port) not in declared_ports:
+            target = {
+                "port": int(target_port),
+                "listener_pid": self._listener_pid(int(target_port)),
+                "declared": False,
+            }
+        return {
+            "vp_id": str(vp.get("id", "unknown")),
+            "services": services,
+            "target_port": target,
+            "seconds_since_services_ensured": (
+                self._seconds_since_services_ensured()
+            ),
+            "harness_identity": harness_identity,
+            "service_identity": identities,
+        }
+
+    def _api_phase_service_snapshot_summary(
+        self,
+        vp: dict,
+        identity: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Which instance answered this VP's request — the facts.
+
+        A verdict says what the endpoint **answered**.  It does not say
+        **who** answered, and without that a negative criterion is only
+        evidence when the answer came from the instance this round
+        declared: the same endpoint answers 404 on a stranger's process
+        too, and "the route answered wrong" and "there was nobody
+        listening" have to be told apart afterwards.
+
+        The facts, every one of them readable afterwards:
+
+          * ``port`` — the port the request went to;
+          * ``listener_pid`` — the process the operating system says is
+            answering that port (``null`` when nothing is);
+          * ``lease_owner`` — who the ledger says owns the service on
+            that port (the round that ensured it);
+          * ``seconds_since_services_ensured`` — how long ago the round
+            brought its services up.
+
+        They ride on the ``api_test_executed`` event, so the event
+        itself answers "which instance produced this verdict" instead of
+        sending the reader to another file to find out.  The **service
+        identity** — the process, the tree it runs in, the commit that
+        tree is checked out at — rides on the same event, beside them.
+
+        ``identity`` is the identity already observed for this request.
+        When it is given its listener is the one that is reported, so
+        the port is not probed a second time: the two facts on the
+        event have to describe the **same** observation, and two probes
+        are two observations.
+        """
+        port = self._vp_target_port(vp)
+        if identity is not None:
+            listener_pid = identity.get("listener_pid")
+            if listener_pid is not None:
+                listener_pid = int(listener_pid)
+        else:
+            listener_pid = self._listener_pid(port) if port else None
+        lease_owner = ""
+        if port is not None:
+            leased = self._leased_listener_for_port(
+                port, service_name=self._vp_service_key(vp),
+            )
+            if leased is not None:
+                lease_owner = str(leased.get("owner") or "")
+        return {
+            "port": port,
+            "listener_pid": listener_pid,
+            "lease_owner": lease_owner,
+            "seconds_since_services_ensured": (
+                self._seconds_since_services_ensured()
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # Service identity — which process answered, and which code it runs
+    # ------------------------------------------------------------------
+
+    def _service_runtime(self, name: str) -> Any:
+        """The round's own record of the service called ``name``."""
+        runtime_map = self._service_runtime_map
+        if runtime_map is None:
+            return None
+        return (runtime_map.runtimes or {}).get(str(name))
+
+    def _probe_service_port(self, port: int) -> Any:
+        """The operating system's answer about ``port``.
+
+        ``None`` when the probe itself failed — a broken probe is no
+        observation, and it must never be read as "nothing is
+        listening".
+        """
+        if not port:
+            return None
+        try:
+            from service_freshness import probe_port
+
+            return probe_port(int(port))
+        except Exception:  # noqa: BLE001 - a broken probe is no observation
+            return None
+
+    def _process_environment(
+        self, pid: Optional[int],
+    ) -> Optional[Dict[str, str]]:
+        """The environment of *pid*, or ``None`` when it cannot be read."""
+        if not pid:
+            return None
+        try:
+            from service_manager import process_environment
+        except Exception:  # pragma: no cover - defensive
+            return None
+        try:
+            return process_environment(int(pid))
+        except Exception:  # noqa: BLE001 - unreadable is a fact, not a crash
+            return None
+
+    @staticmethod
+    def _tree_head(directory: str) -> Optional[str]:
+        """The commit the tree at ``directory`` is checked out at.
+
+        ``None`` when the directory is not inside a repository, or the
+        repository has no commit yet.  Never the **executor's** head:
+        this is the head of the tree the answering process runs in, and
+        the two are different trees whenever the service runs from
+        somewhere else.
+        """
+        if not directory:
+            return None
+        head = _git_head(directory)
+        if not head or head == "unknown":
+            return None
+        return head
+
+    def _resolve_claim_cwd(self, cwd: str) -> str:
+        """The claimed working directory, as an absolute path.
+
+        A declaration's ``cwd`` is **relative** to the project (that is
+        the containment rule in :mod:`service_declaration`), so a
+        relative claim is resolved against the project directory before
+        it is compared with an observed one.  A claim that is not a
+        directory at all resolves to ``""`` — and a blank claim is never
+        read as agreement.
+        """
+        text = str(cwd or "").strip()
+        if not text:
+            return ""
+        project_dir = getattr(self, "project_dir", None)
+        if not project_dir:
+            return ""
+        try:
+            path = Path(text)
+            if not path.is_absolute():
+                path = Path(os.path.realpath(str(project_dir))) / path
+            resolved = os.path.realpath(str(path))
+        except (OSError, ValueError):  # pragma: no cover - defensive
+            return ""
+        return resolved if os.path.isdir(resolved) else ""
+
+    def _service_claim(self, name: str, port: int) -> Dict[str, Any]:
+        """What the round's own records claim about this service.
+
+        Two records of the same claim: the **lease** in the plan's
+        ledger (what every reaper reads, and who owns the service) and
+        the round's own **runtime** map (the process the round started,
+        and the directory it started it in).
+
+        Both are consulted, and neither may stand in for the other: a
+        lease that names one process and a runtime map that names
+        another are two claims, and the observation has to be compared
+        with both of them.
+        """
+        claim: Dict[str, Any] = {
+            "listener_pids": [],
+            "cwd": "",
+            "start_cmd": "",
+            "owner": "",
+            "sources": [],
+        }
+        if port:
+            leased = self._leased_listener_for_port(
+                int(port), service_name=str(name or ""),
+            )
+            if leased is not None:
+                pid = leased.get("listener_pid")
+                if pid:
+                    claim["listener_pids"].append(int(pid))
+                claim["owner"] = str(leased.get("owner") or "")
+                claim["sources"].append("lease")
+        runtime = self._service_runtime(name) if name else None
+        if runtime is not None:
+            pid = getattr(runtime, "pid", None)
+            if pid:
+                value = int(pid)
+                if value not in claim["listener_pids"]:
+                    claim["listener_pids"].append(value)
+            cwd = str(getattr(runtime, "cwd", "") or "")
+            if cwd:
+                claim["cwd"] = cwd
+            command = str(getattr(runtime, "start_cmd", "") or "")
+            if command:
+                claim["start_cmd"] = command
+            claim["sources"].append("runtime")
+        return claim
+
+    def _service_identity(
+        self, name: str, decl: Any = None, port: int = 0,
+    ) -> Dict[str, Any]:
+        """Which process is answering this service's port — and which code.
+
+        The **observation** comes from the operating system: the pid
+        that holds the port, the command line it was started with, the
+        directory it runs in, the commit that directory is checked out
+        at, and the backend its environment pins.
+
+        The **comparison** comes from the round's own records — the
+        lease and the runtime map.  Three answers, and the third one is
+        the point:
+
+          * ``confirmed`` — the process answering the port is the one
+            the round holds the claim on, and it runs the tree the
+            round started it from;
+          * ``mismatch`` — the observation contradicts the claim: a
+            different process is answering the port, or the answering
+            process runs a different tree;
+          * ``unconfirmed`` — one side of the comparison is **blank**:
+            nobody is listening, the round holds no claim, or the tree
+            could not be read.  "We could not check" and "it agrees" are
+            two different sentences, and only the second one may be
+            read as a confirmation.
+
+        ``env`` carries the raw environment of the answering process.
+        It is **not** part of the observation: the environment of a
+        service holds whatever the operator put in it, and the event log
+        is a file on disk.  Only ``harness_env`` — the one variable
+        that says which backend the service runs under — is booked
+        down.
+        """
+        runtime = self._service_runtime(name) if name else None
+        declared_port = 0
+        if decl is not None:
+            try:
+                declared_port = int(getattr(decl, "port", 0) or 0)
+            except (TypeError, ValueError):
+                declared_port = 0
+        actual_port = int(port or 0) or declared_port
+        if runtime is not None:
+            try:
+                actual_port = (
+                    int(getattr(runtime, "port", 0) or 0) or actual_port
+                )
+            except (TypeError, ValueError):
+                pass
+        start_cmd = ""
+        if decl is not None:
+            start_cmd = self._start_cmd_summary(decl)
+        if not start_cmd and runtime is not None:
+            start_cmd = str(getattr(runtime, "start_cmd", "") or "")
+
+        probe = self._probe_service_port(actual_port)
+        listener_pid: Optional[int] = None
+        cmdlines: List[str] = []
+        start_epoch: Optional[float] = None
+        service_cwd = ""
+        if probe is not None:
+            if probe.pids:
+                listener_pid = int(probe.pids[0])
+            cmdlines = list(probe.cmdlines)
+            start_epoch = probe.process_start_epoch
+            if probe.processes:
+                service_cwd = str(probe.processes[0].get("cwd") or "")
+
+        env = self._process_environment(listener_pid)
+        harness_env: Optional[str] = None
+        if env is not None:
+            harness_env = env.get(_harness_env_var()) or None
+
+        service_head = self._tree_head(service_cwd)
+        claim = self._service_claim(name, actual_port)
+        claimed_cwd = self._resolve_claim_cwd(claim.get("cwd") or "")
+        claimed_head = self._tree_head(claimed_cwd)
+        status, head_status, detail = self._service_identity_status(
+            listener_pid=listener_pid,
+            claimed_pids=list(claim.get("listener_pids") or []),
+            service_head=service_head,
+            claimed_head=claimed_head,
+        )
+        return {
+            "service": str(name or ""),
+            "declared_port": declared_port,
+            "port": actual_port,
+            "listener_pid": listener_pid,
+            "cmdlines": cmdlines,
+            "process_start_epoch": start_epoch,
+            "service_cwd": service_cwd or None,
+            "service_head": service_head,
+            "claimed_listener_pids": list(claim.get("listener_pids") or []),
+            "claimed_cwd": claimed_cwd or None,
+            "claimed_head": claimed_head,
+            "claimed_start_cmd": claim.get("start_cmd") or "",
+            "claim_sources": list(claim.get("sources") or []),
+            "lease_owner": claim.get("owner") or "",
+            "harness_env": harness_env,
+            "start_cmd": start_cmd,
+            "status": status,
+            "head_status": head_status,
+            "detail": detail,
+            # The raw environment — stripped before anything is written
+            # down.  See the docstring.
+            "env": env,
+        }
+
+    @staticmethod
+    def _service_identity_status(
+        *,
+        listener_pid: Optional[int],
+        claimed_pids: List[int],
+        service_head: Optional[str],
+        claimed_head: Optional[str],
+    ) -> Tuple[str, str, str]:
+        """The three answers a service identity can have.
+
+        Returns ``(status, head_status, detail)``.
+
+        The **head status** answers "is the answering process running
+        the tree the round started it from".  The **status** answers the
+        whole question, and it is the **worse** of the two halves: a
+        confirmed process running an unreadable tree is not a confirmed
+        identity, because half of the answer is blank.
+
+        A blank is never agreement.  No listener, no claim, or an
+        unreadable tree all land on ``unconfirmed`` — never on
+        ``confirmed`` — because "we could not check" and "it agrees" are
+        two different sentences and only the second one is evidence.
+        """
+        if listener_pid is None:
+            return (
+                SERVICE_IDENTITY_UNCONFIRMED,
+                SERVICE_IDENTITY_UNCONFIRMED,
+                "nothing is listening on the port: there is no process "
+                "whose identity could be observed",
+            )
+        if not claimed_pids:
+            return (
+                SERVICE_IDENTITY_UNCONFIRMED,
+                SERVICE_IDENTITY_UNCONFIRMED,
+                "the round holds no claim on the process answering the "
+                "port: there is nothing to compare the observation with, "
+                "and no claim is not agreement",
+            )
+        if int(listener_pid) not in {int(pid) for pid in claimed_pids}:
+            return (
+                SERVICE_IDENTITY_MISMATCH,
+                SERVICE_IDENTITY_UNCONFIRMED,
+                f"the process answering the port (pid {listener_pid}) is "
+                f"not the one the round holds the claim on "
+                f"(pid {', '.join(str(pid) for pid in claimed_pids)})",
+            )
+        if service_head is None:
+            return (
+                SERVICE_IDENTITY_UNCONFIRMED,
+                SERVICE_IDENTITY_UNCONFIRMED,
+                "the process answering the port is the one the round "
+                "holds the claim on, but the tree it runs in has no "
+                "readable commit: which code it runs cannot be confirmed",
+            )
+        if claimed_head is None:
+            return (
+                SERVICE_IDENTITY_UNCONFIRMED,
+                SERVICE_IDENTITY_UNCONFIRMED,
+                "the process answering the port is the one the round "
+                "holds the claim on, but the tree the round started it "
+                "from has no readable commit: the two trees cannot be "
+                "compared, and no comparison is not agreement",
+            )
+        if service_head != claimed_head:
+            return (
+                SERVICE_IDENTITY_MISMATCH,
+                SERVICE_IDENTITY_MISMATCH,
+                "the process answering the port is the one the round "
+                "holds the claim on, but it runs a different commit "
+                f"({service_head}) than the tree the round started it "
+                f"from ({claimed_head})",
+            )
+        return (
+            SERVICE_IDENTITY_CONFIRMED,
+            SERVICE_IDENTITY_CONFIRMED,
+            "the process answering the port is the one the round holds "
+            "the claim on, and it runs the tree the round started it "
+            "from",
+        )
+
+    def _vp_service_identity(self, vp: dict) -> Dict[str, Any]:
+        """The identity of the service this VP is about.
+
+        The api phase reads it off the request URL.  The ui / e2e
+        phases read it off the VP's ``target_url`` — the field the plan
+        prompt writes for them — and fall back to the services the VP
+        says it uses.
+        """
+        name, decl, port = self._vp_service_target(vp)
+        if not port and not name:
+            return {}
+        return self._without_raw_env(
+            self._service_identity(name, decl, port),
+        )
+
+    @staticmethod
+    def _without_raw_env(identity: Dict[str, Any]) -> Dict[str, Any]:
+        """The identity without the raw environment of the process.
+
+        The environment of a service holds whatever the operator put in
+        it.  The event log and the verdict are files on disk, and the
+        one fact about the environment that belongs in them — which
+        backend the service runs under — is already booked down on its
+        own.
+        """
+        return {
+            key: value for key, value in identity.items() if key != "env"
+        }
+
+    def _snapshot_service_identity(
+        self, snapshot: Optional[Dict[str, Any]], vp: dict,
+    ) -> Dict[str, Any]:
+        """The identity of the service this VP is about, out of the snapshot.
+
+        The snapshot was taken **before** the request went out, so this
+        is the identity of the process that was serving the port when
+        the criterion was graded — which is the question a reader of a
+        verdict has.
+
+        When the snapshot carries no identity for this VP's service —
+        the request went to a port no declared service holds — the
+        identity is read now, so the cell says "unconfirmed" rather
+        than vanishing.
+        """
+        identities = dict((snapshot or {}).get("service_identity") or {})
+        if identities:
+            name = self._vp_service_key(vp)
+            identity = identities.get(name)
+            if identity is None and len(identities) == 1:
+                identity = next(iter(identities.values()))
+            return dict(identity or {})
+        return self._vp_service_identity(vp)
+
+    def _vp_service_target(
+        self, vp: dict,
+    ) -> Tuple[str, Any, int]:
+        """The service this VP is about: its name, its declaration, its port.
+
+        Three sources, in this order:
+
+          * the ``{{svc.*}}`` placeholder in the VP's URL — the name the
+            plan itself wrote;
+          * the VP's ``target_url`` (ui / e2e), whose port names the
+            declaration the round is running;
+          * the VP's ``uses_services`` — the services the plan says the
+            criterion depends on.
+        """
+        name = self._vp_placeholder_service(vp)
+        if not name:
+            name = self._vp_uses_service(vp)
+        port = self._vp_target_port(vp)
+        if not port:
+            port = self._vp_target_url_port(vp)
+        decl = None
+        if name:
+            _key, decl = self._declaration_for_service(name)
+            if decl is not None:
+                name = _key
+        if not name and port:
+            name, decl = self._declaration_for_port(int(port))
+        return str(name or ""), decl, int(port or 0)
+
+    def _vp_uses_service(self, vp: dict) -> str:
+        """The first declared service the VP says it uses, or ``""``."""
+        uses = vp.get("uses_services") or []
+        if not isinstance(uses, (list, tuple)):
+            return ""
+        for candidate in uses:
+            key, decl = self._declaration_for_service(str(candidate))
+            if decl is not None:
+                return key
+        return ""
+
+    def _vp_target_url(self, vp: dict) -> str:
+        """The URL this VP is about, with its ``{{svc.*}}`` placeholders
+        expanded.
+
+        The api phase keeps its URL in ``request.url``; the ui / e2e
+        phases keep theirs in ``target_url``.  Both are answered here so
+        that "which service does this criterion talk to" has one answer
+        for every phase.
+        """
+        url = str(vp.get("target_url") or "").strip()
+        if not url:
+            url = self._vp_request_url(vp)
+        if not url or "{{" not in url:
+            return url
+        try:
+            from service_declaration import resolve_text
+        except Exception:  # pragma: no cover - defensive
+            return url
+        try:
+            resolved, _unresolved = resolve_text(
+                url, self._effective_declarations(),
+            )
+        except Exception:  # noqa: BLE001 - defensive
+            return url
+        return str(resolved or url)
+
+    def _vp_target_url_port(self, vp: dict) -> Optional[int]:
+        """The loopback port the VP's ``target_url`` names, or ``None``."""
+        url = self._vp_target_url(vp)
+        if not url:
+            return None
+        port = self._loopback_port(url)
+        if port is None:
+            return None
+        return self._guard_vp_port(port)
+
+    @staticmethod
+    def _service_identity_reason(identity: Dict[str, Any]) -> str:
+        """One line naming the process and the code behind a service."""
+        if not identity:
+            return "service_identity: no service was observed"
+        return (
+            "service_identity: "
+            f"service={json.dumps(identity.get('service') or None)} "
+            f"port={json.dumps(identity.get('port'))} "
+            f"listener_pid={json.dumps(identity.get('listener_pid'))} "
+            f"service_cwd={json.dumps(identity.get('service_cwd'))} "
+            f"service_head={json.dumps(identity.get('service_head'))} "
+            f"harness_env={json.dumps(identity.get('harness_env'))} "
+            f"status={json.dumps(identity.get('status'))} "
+            f"head_status={json.dumps(identity.get('head_status'))}"
+        )
+
+    @staticmethod
+    def _harness_identity_observation(
+        decl: Any, listener_pid: Optional[int], env: Any = _ENV_UNREAD,
+    ) -> Optional[Dict[str, Any]]:
+        """The backend the process answering this service's port really runs.
+
+        A declaration that pins ``PDT_HARNESS=mcode`` is a declaration
+        about the **mcode** backend: the service it starts is the mcode
+        side of the round.  Whether that backend was *actually* in
+        effect cannot be read off the endpoint — the same server code
+        answers ``/health`` on both sides — so it has to be read out of
+        the **process**: the environment of the very pid that is
+        answering the port.
+
+        The three answers are distinct, and the third one is the one
+        this cell exists for:
+
+          * ``observed`` — the backend was read and it is the declared
+            one;
+          * ``mismatch`` — it was read and it is **not** the declared
+            one: the "configured but not actually in effect" case, which
+            the hard constraints call an acceptance failure;
+          * ``not-observed(service-unreachable)`` — nothing was
+            listening, so there was no process to read.  This round has
+            **no evidence** either way, and saying so is not the same
+            as saying the backend was in effect — nor as saying it was
+            not.
+
+        ``env`` is the environment of the listener, when the caller has
+        already read it: reading it twice is two more processes for the
+        same answer.  ``_ENV_UNREAD`` means "not read yet", and
+        ``None`` means "read, and it could not be read".
+
+        Returns ``None`` when the declaration pins no backend at all:
+        the default claude path has nothing to observe, and inventing a
+        requirement there would change that path's behaviour for no
+        reason.
+        """
+        try:
+            from service_manager import (
+                HARNESS_ENV_VAR,
+                declared_harness,
+                harness_assignment,
+                process_environment,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+        declared = harness_assignment(decl)
+        if declared is None:
+            # The declaration pins no backend: nothing to observe.
+            return None
+
+        expected = declared_harness(decl)
+        identity: Dict[str, Any] = {
+            "env_var": HARNESS_ENV_VAR,
+            "declared": declared,
+            "expected": expected,
+            "observed": HARNESS_IDENTITY_UNKNOWN,
+            "status": HARNESS_IDENTITY_NOT_OBSERVED_UNREADABLE,
+            "listener_pid": listener_pid,
+        }
+        if not listener_pid:
+            # Nothing is listening: there is no process to read, so this
+            # round has no evidence — which is not the same answer as
+            # "the backend was not in effect".
+            identity["status"] = HARNESS_IDENTITY_NOT_OBSERVED_UNREACHABLE
+            return identity
+        if env is _ENV_UNREAD:
+            env = process_environment(int(listener_pid))
+        if env is None:
+            # The listener is there and its environment could not be
+            # read.  "I could not check" is not a reason to let a
+            # configured backend through unverified, and it is not a
+            # reason to declare it wrong either.
+            identity["status"] = HARNESS_IDENTITY_NOT_OBSERVED_UNREADABLE
+            return identity
+        actual = env.get(HARNESS_ENV_VAR)
+        identity["observed"] = actual
+        if expected is None:
+            # The declaration pins a value this framework cannot read
+            # as a backend name: it cannot say whether the backend is in
+            # effect, and it may not say it is.
+            identity["status"] = HARNESS_IDENTITY_NOT_OBSERVED_UNCHECKABLE
+        elif actual == expected:
+            identity["status"] = HARNESS_IDENTITY_OBSERVED
+        else:
+            identity["status"] = HARNESS_IDENTITY_MISMATCH
+        return identity
+
+    @staticmethod
+    def _harness_identity_reason(identity: Dict[str, Any]) -> str:
+        """One line naming what is known about the backend behind a port."""
+        service = identity.get("service")
+        declared = identity.get("declared")
+        observed = identity.get("observed")
+        status = identity.get("status")
+        listener_pid = identity.get("listener_pid")
+        detail = (
+            f"service {service!r} declares "
+            f"{identity.get('env_var')}={declared!r}; "
+            f"observed={json.dumps(observed)}; status={status}; "
+            f"listener_pid={json.dumps(listener_pid)}"
+        )
+        if status == HARNESS_IDENTITY_NOT_OBSERVED_UNREACHABLE:
+            detail += (
+                f"; whether the {declared} backend was actually in effect "
+                f"this round has no evidence: the service was unreachable "
+                f"at request time, so there was no process to read"
+            )
+        elif status == HARNESS_IDENTITY_NOT_OBSERVED_UNREADABLE:
+            detail += (
+                f"; whether the {declared} backend was actually in effect "
+                f"this round has no evidence: the environment of the "
+                f"process answering the port could not be read"
+            )
+        elif status == HARNESS_IDENTITY_NOT_OBSERVED_UNCHECKABLE:
+            detail += (
+                f"; whether the {declared} backend was actually in effect "
+                f"this round has no evidence: the declared value is not a "
+                f"backend name this framework can check"
+            )
+        elif status == HARNESS_IDENTITY_MISMATCH:
+            detail += (
+                f"; the {declared} backend is configured but not actually "
+                f"in effect: the process answering the port runs "
+                f"{identity.get('env_var')}={observed!r}"
+            )
+        elif status == HARNESS_IDENTITY_OBSERVED:
+            detail += f"; the {declared} backend was observed to be in effect"
+        return "harness_identity: " + detail
+
+    @staticmethod
+    def _listener_pid(port: int) -> Optional[int]:
+        """The process listening on ``port``, or ``None``.
+
+        ``None`` for "nothing is listening" and for "the port could not
+        be probed" alike: both mean the framework has no pid to name,
+        and the liveness section says so either way.
+        """
+        if not port:
+            return None
+        try:
+            from service_freshness import probe_port
+
+            probe = probe_port(int(port))
+        except Exception:  # noqa: BLE001 - a broken probe is no pid
+            return None
+        if not probe.pids:
+            return None
+        return int(probe.pids[0])
+
+    def _record_api_phase_service_snapshot(self, vp: dict) -> Dict[str, Any]:
+        """Take the api-phase service snapshot and record it in the log.
+
+        The event is what makes the facts reviewable even when nobody
+        reads the verdict: it sits in the round's own log, next to the
+        request it describes.
+        """
+        snapshot = self._api_phase_service_snapshot(vp)
+        self._safe_log_freshness_event(
+            str(vp.get("id", "unknown")),
+            "api_phase_service_snapshot",
+            snapshot,
+        )
+        return snapshot
+
+    @staticmethod
+    def _execution_surface_reason(surface: Dict[str, Any]) -> str:
+        """One line naming the code that graded the VP."""
+        return (
+            "execution_surface: "
+            f"same_tree={surface.get('same_tree')} "
+            f"framework_head={surface.get('framework_head')} "
+            f"project_head={surface.get('project_head')} "
+            f"framework_file={surface.get('framework_file')} "
+            f"framework_root={surface.get('framework_root')} "
+            f"project_dir={surface.get('project_dir')} "
+            f"pid={surface.get('pid')}"
+        )
+
+    @staticmethod
+    def _service_liveness_reason(snapshot: Dict[str, Any]) -> str:
+        """One line naming what was alive when the request went out."""
+        services = snapshot.get("services") or {}
+        parts = [
+            f"{name}(port={info.get('port')},"
+            f"listener_pid={json.dumps(info.get('listener_pid'))},"
+            f"known_pid={json.dumps(info.get('known_pid'))})"
+            for name, info in sorted(services.items())
+        ]
+        target = snapshot.get("target_port")
+        target_part = ""
+        if target:
+            target_part = (
+                f" target_port={target.get('port')}"
+                f"(listener_pid={json.dumps(target.get('listener_pid'))})"
+            )
+        return (
+            "service_liveness: "
+            f"seconds_since_services_ensured="
+            f"{snapshot.get('seconds_since_services_ensured')} "
+            f"services={'; '.join(parts) if parts else '(none declared)'}"
+            f"{target_part}"
+        )
+
+    # ------------------------------------------------------------------
+    # Failure class — which of the three faults a failed api_test was
+    # ------------------------------------------------------------------
+
+    def _vp_service_key(self, vp: dict) -> str:
+        """The name of the service this VP talks to, or ``""``.
+
+        The name the URL *names* wins over the port: a port alone can
+        be answered by a stranger's process, and a stranger's process
+        is not a service this round ever started.
+        """
+        name = self._vp_placeholder_service(vp)
+        if name:
+            key, decl = self._declaration_for_service(name)
+            if decl is not None:
+                return key
+        port = self._vp_target_port(vp)
+        if port is None:
+            return ""
+        key, _decl = self._declaration_for_port(port)
+        return key
+
+    def _services_ready_record(self) -> Dict[str, bool]:
+        """Which services the round had ready, as it last recorded it.
+
+        This is the round's runtime map — the map the ``services_ensured``
+        event carries — read **before** this VP's relaunch: a relaunch
+        that succeeds rewrites the map, and the question the failure
+        class answers is what the round had *before* it started healing
+        itself.
+        """
+        runtime_map = self._service_runtime_map
+        if runtime_map is None:
+            return {}
+        record: Dict[str, bool] = {}
+        for name, runtime in (runtime_map.runtimes or {}).items():
+            record[str(name)] = bool(getattr(runtime, "ready", False))
+        return record
+
+    @staticmethod
+    def _snapshot_listener_pid(
+        snapshot: Dict[str, Any], port: Optional[int],
+    ) -> Optional[int]:
+        """The pid listening on ``port`` when the snapshot was taken.
+
+        ``None`` for "nothing is listening" and for "the snapshot knows
+        of no such port" alike — both mean the framework has no process
+        to name for that port.
+        """
+        if port is None:
+            return None
+        for info in (snapshot.get("services") or {}).values():
+            try:
+                if int(info.get("port") or 0) == int(port):
+                    return info.get("listener_pid")
+            except (TypeError, ValueError):
+                continue
+        target = snapshot.get("target_port") or {}
+        try:
+            if int(target.get("port") or 0) == int(port):
+                return target.get("listener_pid")
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    def _classify_api_failure(
+        self,
+        vp: dict,
+        snapshot: Dict[str, Any],
+        ready_record: Dict[str, bool],
+        request_error: Optional[str] = None,
+        response_received: bool = False,
+        note: str = "",
+    ) -> Dict[str, Any]:
+        """Which of the three faults a failed api_test was.
+
+        The three facts, and the class each combination decides:
+
+          * **never-started** — the round has no ready record for the
+            service this VP talks to: it never had one, so the request
+            had nothing to talk to;
+          * **died-before-request** — the service *was* ready and
+            nothing is listening on the port the request is about to
+            use: it was up, and it is gone;
+          * **request-failed** — something is listening on that port
+            and the request still failed: the fault is in the request
+            or in what it answered, not in the service's absence.
+
+        The basis travels with the class, because the class alone cannot
+        be checked afterwards: which service, which port, whether the
+        round had it ready, who was listening, and what the request
+        said.
+        """
+        service_key = self._vp_service_key(vp)
+        ready = bool(ready_record.get(service_key, False))
+        port = self._vp_target_port(vp)
+        listener_pid = self._snapshot_listener_pid(snapshot, port)
+        listening = listener_pid is not None
+        target = service_key or f"port {port}"
+        if not ready:
+            failure_class = FAILURE_CLASS_NEVER_STARTED
+            detail = f"the round never had a ready service for {target}"
+        elif not listening:
+            failure_class = FAILURE_CLASS_DIED_BEFORE_REQUEST
+            detail = (
+                f"service {service_key!r} was ready and nothing is "
+                f"listening on port {port} any more"
+            )
+        else:
+            failure_class = FAILURE_CLASS_REQUEST_FAILED
+            detail = f"something is listening on port {port}"
+            if request_error:
+                detail += f" and the request failed: {request_error}"
+            elif response_received:
+                detail += (
+                    " and answered, but the answer did not satisfy the "
+                    "criterion"
+                )
+            else:
+                detail += " and the request produced no response"
+        if note:
+            detail += f"; {note}"
+        return {
+            "failure_class": failure_class,
+            "basis": {
+                "service": service_key or None,
+                "port": port,
+                "service_ready": ready,
+                "listener_pid": listener_pid,
+                "request_error": request_error,
+                "response_received": bool(response_received),
+                "detail": detail,
+            },
+        }
+
+    def _attach_failure_class(
+        self,
+        verdict: dict,
+        vp: dict,
+        snapshot: Dict[str, Any],
+        ready_record: Dict[str, bool],
+        request_error: Optional[str] = None,
+        response_received: bool = False,
+        note: str = "",
+    ) -> dict:
+        """Say which of the three faults a failed api_test was.
+
+        The class goes into the verdict's evidence — it is what a reader
+        checks afterwards — and the sentence goes into its reasons: the
+        reason is what a reader reads.
+        """
+        classification = self._classify_api_failure(
+            vp, snapshot, ready_record, request_error, response_received,
+            note,
+        )
+        evidence = dict(verdict.get("evidence") or {})
+        evidence["failure_class"] = classification["failure_class"]
+        evidence["failure_class_basis"] = classification["basis"]
+        verdict["evidence"] = evidence
+        reasons = list(verdict.get("reasons") or [])
+        reasons.append(
+            f"failure_class: {classification['failure_class']} "
+            f"({classification['basis']['detail']})"
+        )
+        verdict["reasons"] = reasons
+        return verdict
+
+    # ------------------------------------------------------------------
+    # The request's own outcome — an HTTP verdict, or a transport fault
+    # ------------------------------------------------------------------
+    #
+    # 2026-10-25, observed on a live round: the api service was taken
+    # away two minutes into the round, and the round sent nine requests
+    # at the dead port.  Every one came back "connection refused", every
+    # one was written as that verification point's own FAILED verdict,
+    # and the report carried nine identical failures for what was one
+    # accident.  The framework had no way to tell the two apart: a
+    # transport fault and an HTTP verdict both arrive as "the request
+    # did not succeed".
+
+    @staticmethod
+    def _api_result_transport_error(result: Any) -> str:
+        """The transport fault this result carries — or ``""``.
+
+        The runner turns every failure into a verdict, so the request's
+        own outcome has to be read back out of the evidence.  A request
+        that produced **no response** has no ``status_code`` and an
+        ``error``; a request that produced a response always has a
+        status code, even when the response is a 500.  The two can
+        therefore never be confused.
+        """
+        evidence = getattr(result, "evidence", None) or {}
+        error = str(evidence.get("error") or "")
+        if not error:
+            return ""
+        if evidence.get("status_code") is not None:
+            # A response came back; whatever else went wrong, this was
+            # not a transport fault.
+            return ""
+        return error
+
+    @staticmethod
+    def _assertions_executed(result: Any) -> int:
+        """How many of the VP's assertions actually ran.
+
+        A request that produced **no response** ran none of them: there
+        was no response to compare against.  The number is written into
+        the verdict's evidence so that a transport fault cannot be read
+        afterwards as a broken contract (assertions failed) or as a
+        satisfied one (assertions passed) — it is a fault of the
+        transport, and the criterion was not observed at all.
+        """
+        evidence = getattr(result, "evidence", None) or {}
+        passed = evidence.get("assertions_passed")
+        failed = evidence.get("assertions_failed")
+        if passed is None and failed is None:
+            return 0
+        try:
+            return len(list(passed or [])) + len(list(failed or []))
+        except TypeError:
+            return 0
+
+    @staticmethod
+    def _transport_error_kind(error: str) -> str:
+        """The kind of transport fault an error names — or ``""``.
+
+        Only the faults that mean *the service is not there* count: the
+        connection was refused, the peer went away, the name did not
+        resolve.  A timeout is not one of them — a service that answers
+        too late is still there — and an error this framework cannot
+        classify is not one either: "I could not tell" must never be
+        written down as "the service is gone".
+
+        The refused connection is named apart from the rest, because it
+        is the one fault the operating system vouches for: nothing was
+        listening on that port.  Every other kind has to be asked about
+        the port again before it may be called a loss.
+        """
+        text = str(error or "")
+        name = text.split(":", 1)[0].strip()
+        if name not in TRANSPORT_LOSS_ERROR_TYPES:
+            return ""
+        lowered = text.lower()
+        if "timed out" in lowered or "timeout" in lowered:
+            # A slow service is still there.
+            return ""
+        if "connection refused" in lowered or "errno 61" in lowered:
+            return "connection-refused"
+        if "reset by peer" in lowered or "errno 54" in lowered:
+            return "connection-reset"
+        return name
+
+    def _round_service_port_claim(self, vp: dict) -> bool:
+        """Is the port this request used **the round's own** service?
+
+        The round's runtime map is the round's own record of the
+        services it brought up — the same map the ``services_ensured``
+        event carries.  A service on that map is the round's business: a
+        request that got no answer from **it** is a fact about the
+        round.
+
+        An endpoint the round never brought up is a different thing.
+        It may be a service somebody else runs, or an address outside
+        this machine entirely, and a request that got no answer there
+        says something about **that** endpoint, not about this round.
+        The round must not stop its api phase — and must not call it a
+        loss — over an endpoint it does not own.
+
+        A service the round brought up but never had ready is not a
+        claim either: that is the ``never-started`` fault, and it
+        belongs to the verification point.
+        """
+        port = self._vp_target_port(vp)
+        if port is None:
+            return False
+        runtime_map = getattr(self, "_service_runtime_map", None)
+        runtimes = getattr(runtime_map, "runtimes", None) or {}
+        for runtime in runtimes.values():
+            try:
+                runtime_port = int(getattr(runtime, "port", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if runtime_port != int(port):
+                continue
+            if not bool(getattr(runtime, "ready", False)):
+                continue
+            return True
+        return False
+
+    def _api_phase_service_gone(self, vp: dict, kind: str) -> bool:
+        """Is the service this request was about really gone?
+
+        A request that produced no response does not say the service is
+        gone: a listener that hangs up on every connection is still
+        there, and that fault belongs to the request — the
+        ``request-failed`` class — not to the round.
+
+        A refused connection is the operating system saying the port was
+        free, and that is taken at its word.  Every other kind is asked
+        about the port once more, and only a port that is provably free
+        counts: a probe that could not read the port says nothing
+        either way, and "I could not check" is not "it is gone".
+        """
+        if kind == "connection-refused":
+            return True
+        port = self._vp_target_port(vp)
+        if port is None:
+            return False
+        try:
+            from service_freshness import probe_port
+
+            probe = probe_port(int(port))
+        except Exception:  # noqa: BLE001 - a broken probe says nothing
+            return False
+        if probe.error:
+            return False
+        return not bool(probe.listening)
+
+    @staticmethod
+    def _vp_contract_fields(vp: dict) -> List[str]:
+        """The top-level fields the VP's own assertions name.
+
+        The contract belongs to the VP: the five fields of
+        ``/api/system/active`` are the five ``json_path``s VP-003's
+        assertions carry, and a framework that hard-coded them would be
+        grading a criterion the plan never wrote.
+        """
+        fields: List[str] = []
+        for assertion in vp.get("assertions") or []:
+            if not isinstance(assertion, dict):
+                continue
+            path = str(assertion.get("json_path") or "").strip()
+            if not path.startswith("$."):
+                continue
+            name = path[2:].split("[", 1)[0].split(".", 1)[0].strip()
+            if name and name not in fields:
+                fields.append(name)
+        return fields
+
+    def _contract_observation(
+        self, vp: dict, response_body: Optional[str],
+        source: Optional[Dict[str, Any]] = None,
+        attestation: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """What the VP's own response said about each field it asserts.
+
+        When the fields were observed, each one is recorded **with its
+        type**: the contract is about shapes, and a body carrying
+        ``"execution_running": "0"`` is broken in a way a body carrying
+        ``0`` is not.
+
+        When they were not observed, they are listed under
+        ``not_observed`` rather than left out.  "The request failed" and
+        "the request answered without these fields" are different
+        faults, and an entry that is simply absent cannot tell them
+        apart — which is the whole reason this cell exists.
+
+        ``source`` is the backend the body came from, when the
+        declaration pins one.  The fields and the backend are **one**
+        fact: ``/api/system/active`` is served by the same server code
+        on both sides of the round, so a body carrying the fields
+        proves nothing about the instance that produced it.
+
+        ``attestation`` is the round's **claim** on the instance (see
+        :meth:`_contract_instance_attestation`).  When the claim does
+        not hold, the body is somebody else's and **not one field is
+        booked from it**: every field is listed under ``not_observed``
+        and gets its own ``unobserved`` entry saying why, with the two
+        pids that disagree.  A field booked from a stranger's answer is
+        worse than a field booked as missing — it looks like a pass.
+        """
+        fields = self._vp_contract_fields(vp)
+        observed: Dict[str, str] = {}
+        not_observed: List[str] = []
+        unobserved: Dict[str, Dict[str, Any]] = {}
+        # 2026-10-26 (VP-009): the round's claim on the instance.  When
+        # it does not hold, the answer is not this round's answer, and
+        # no field of it may be booked.
+        refuted = bool(attestation) and attestation.get("attested") is False
+        payload: Any = None
+        if response_body and not refuted:
+            try:
+                payload = json.loads(response_body)
+            except (TypeError, ValueError):
+                payload = None
+        if refuted:
+            for field in fields:
+                not_observed.append(field)
+                unobserved[field] = {
+                    "status": "unobserved",
+                    "reason": str(
+                        attestation.get("reason") or "service_lost"
+                    ),
+                    "expected_pid": attestation.get("expected_pid"),
+                    "actual_pid": attestation.get("actual_pid"),
+                }
+        elif isinstance(payload, dict):
+            for field in fields:
+                if field in payload:
+                    observed[field] = type(payload[field]).__name__
+                else:
+                    not_observed.append(field)
+        else:
+            # Not a JSON object: a body the runner truncated, or a
+            # payload that is not JSON at all.  The field *names* may
+            # still be in it, so a truncated body is never reported as
+            # "the field was absent" — the type, though, cannot be told.
+            for field in fields:
+                if f'"{field}"' in (response_body or ""):
+                    observed[field] = "unknown"
+                else:
+                    not_observed.append(field)
+        if not fields:
+            status = "no-contract"
+            detail = "the VP asserts no json_path field"
+        elif refuted:
+            status = "not-observed"
+            detail = (
+                f"not one of the {len(fields)} field(s) the VP asserts was "
+                f"booked from the response: the instance that answered is "
+                f"not the one this round holds the claim on, so its answer "
+                f"is not this criterion's answer"
+            )
+        elif not not_observed:
+            status = "observed"
+            detail = (
+                f"the VP's own response carried all {len(fields)} field(s) "
+                f"it asserts"
+            )
+        elif not observed:
+            status = "not-observed"
+            detail = (
+                f"the VP's own response carried none of the {len(fields)} "
+                f"field(s) it asserts"
+            )
+        else:
+            status = "partially-observed"
+            detail = (
+                f"the VP's own response carried {len(observed)} of the "
+                f"{len(fields)} field(s) it asserts"
+            )
+        if response_body is None:
+            detail += "; the request produced no response"
+        if refuted:
+            reason_detail = str(attestation.get("detail") or "")
+            if reason_detail:
+                detail += "; " + reason_detail
+        source_detail = self._contract_source_detail(source, bool(observed))
+        if source_detail:
+            detail += "; " + source_detail
+        observation = {
+            "fields": fields,
+            "observed": observed,
+            "not_observed": not_observed,
+            "status": status,
+            "detail": detail,
+        }
+        if unobserved:
+            observation["unobserved"] = unobserved
+        if source is not None:
+            source = dict(source)
+            if refuted:
+                # Nothing was booked, so nothing may be credited to the
+                # declared backend either: the body is not its answer.
+                source["confirmed"] = False
+            observation["source"] = source
+        return observation
+
+    def _contract_source(
+        self, vp: dict, snapshot: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """The backend the service this VP's contract comes from runs under.
+
+        ``None`` when there is nothing to attribute: the declaration
+        pins no backend — the default claude path, which must keep
+        behaving exactly as it did — or the VP's own service cannot be
+        named.
+
+        The identity is the one the **snapshot** booked down: read out
+        of the operating system, from the very process that was
+        answering the port when the request went out.  The contract is
+        therefore attributed to the process that really answered it,
+        and never to a neighbour's copy on another port.
+        """
+        identity = dict((snapshot or {}).get("harness_identity") or {})
+        if not identity:
+            return None
+        key = self._vp_service_key(vp)
+        if not key:
+            return None
+        booked = identity.get(key)
+        if not isinstance(booked, dict):
+            return None
+        source = dict(booked)
+        # ``confirmed`` is the one thing the fields alone cannot say:
+        # the declared backend was read out of the listener, so the
+        # contract may be credited to that instance.
+        source["confirmed"] = (
+            str(source.get("status") or "") == HARNESS_IDENTITY_OBSERVED
+        )
+        return source
+
+    @staticmethod
+    def _pid_of(value: Any) -> Optional[int]:
+        """A pid (or a process group id) as an int, or ``None``.
+
+        ``None`` for "the record names no process" — which is not the
+        same as "the process is 0", and must not be read as it.
+        """
+        try:
+            pid = int(value)
+        except (TypeError, ValueError):
+            return None
+        return pid or None
+
+    def _contract_instance_claim(self, vp: dict) -> Optional[Dict[str, Any]]:
+        """The instance this round holds a claim on, for this VP's service.
+
+        A claim is a **process**: the one the round ensured for the
+        service, named by the lease it holds on it.  Two records carry
+        it, and in a live round they say the same thing — the ledger
+        entry is written from the very runtime the round holds in
+        memory:
+
+          * the **lease**, when the ledger holds one: the record a
+            reaper in another process reads;
+          * the round's **own runtime record**, when it holds none: the
+            map the ``services_ensured`` event carries.
+
+        ``None`` when there is nothing to claim — the request does not
+        target a service this round declared, or the service pins **no
+        backend**.  The default claude path pins no backend and has
+        always been graded on the answer of the process that was
+        listening; that behaviour does not change.
+        """
+        port = self._vp_target_port(vp)
+        if port is None:
+            return None
+        name, decl = self._declaration_for_port(port)
+        if decl is None:
+            return None
+        if not self._pinned_backend_capability(name):
+            # The service pins no backend: the default claude path.
+            return None
+        lease = self._round_lease_for_service(name, port)
+        listener_pid: Optional[int] = None
+        pgid = 0
+        source = ""
+        if lease:
+            listener_pid = self._pid_of(lease.get("listener_pid"))
+            pgid = self._pid_of(lease.get("pgid")) or 0
+            source = str(lease.get("source") or "ledger")
+        if listener_pid is None:
+            runtime = None
+            runtime_map = getattr(self, "_service_runtime_map", None)
+            if runtime_map is not None:
+                runtime = (runtime_map.runtimes or {}).get(name)
+            listener_pid = self._pid_of(getattr(runtime, "pid", None))
+            pgid = self._pid_of(getattr(runtime, "pgid", None)) or 0
+            source = "runtime"
+        return {
+            "service": name,
+            "port": int(port),
+            "listener_pid": listener_pid,
+            "pgid": pgid,
+            "source": source,
+        }
+
+    def _contract_instance_attestation(
+        self, vp: dict, snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """May the contract of this verification point be booked at all?
+
+        The four fields of a contract are a fact about an **instance**.
+        ``/api/system/active`` is served by the same server code on both
+        sides of the round, so a body carrying the four fields proves
+        nothing about the backend that produced it — and the
+        **environment** of the listener does not prove it either: the
+        default backend inherits ``PDT_HARNESS`` from the backend that
+        started it, so a claude instance *claims* the mcode harness
+        while running the claude one.
+
+        What does prove it is the round's **claim**: the lease it holds
+        on the service, which names the process it ensured for it.  So
+        an answer may be booked only when the process that was
+        answering the port **is** the one the claim names.
+
+        Three answers, and the middle one is the point:
+
+          * ``attested`` — the claim holds: the fields may be booked,
+            and they belong to the instance the round holds;
+          * ``refuted`` — the claim does not hold: the service is gone,
+            or the port answers for somebody else.  The fields may
+            **not** be booked, and every one of them says so, with the
+            two pids that disagree;
+          * ``not-applicable`` — the service pins no backend (the
+            default claude path) or the request does not target a
+            declared service: there is nothing to attest, and that
+            path's behaviour does not change.
+        """
+        claim = self._contract_instance_claim(vp)
+        if claim is None:
+            return {
+                "attested": None, "reason": "", "detail": "",
+                "service": "", "port": None,
+                "expected_pid": None, "actual_pid": None,
+            }
+        service = str(claim["service"])
+        port = int(claim["port"])
+        expected_pid = claim["listener_pid"]
+
+        # The listener: the process that was answering the port when the
+        # request went out.  The snapshot holds it; without a snapshot
+        # the port is asked now.
+        actual_pid: Optional[int] = None
+        entry = (dict((snapshot or {}).get("services") or {})).get(service)
+        if isinstance(entry, dict):
+            actual_pid = self._pid_of(entry.get("listener_pid"))
+        else:
+            actual_pid = self._listener_pid(port)
+
+        if expected_pid is None:
+            return {
+                "attested": False,
+                "reason": "service_lost",
+                "service": service,
+                "port": port,
+                "expected_pid": None,
+                "actual_pid": actual_pid,
+                "detail": (
+                    f"the round holds no claim on the instance answering "
+                    f"port {port} for service {service!r}, so the answer "
+                    f"cannot be booked as that service's own; no other "
+                    f"instance's answer may stand in for the backend this "
+                    f"verification point grades"
+                ),
+            }
+        if actual_pid is None:
+            return {
+                "attested": False,
+                "reason": "service_lost",
+                "service": service,
+                "port": port,
+                "expected_pid": expected_pid,
+                "actual_pid": None,
+                "detail": (
+                    f"nothing is answering port {port} for service "
+                    f"{service!r}: the instance this round holds the claim "
+                    f"on (pid {expected_pid}) is not serving it"
+                ),
+            }
+        mismatch = self._lease_listener_mismatch(
+            {
+                "listener_pid": expected_pid,
+                "pgid": claim["pgid"],
+                "port": port,
+                "service": service,
+            },
+            [actual_pid],
+            str(
+                (self._pinned_backend_capability(service) or {}).get(
+                    "backend",
+                ) or "",
+            ),
+        )
+        if mismatch is not None:
+            return {
+                "attested": False,
+                "reason": "service_lost",
+                "service": service,
+                "port": port,
+                "expected_pid": mismatch["expected_pid"],
+                "actual_pid": mismatch["actual_pid"],
+                "detail": mismatch["detail"],
+            }
+        return {
+            "attested": True,
+            "reason": "",
+            "service": service,
+            "port": port,
+            "expected_pid": expected_pid,
+            "actual_pid": actual_pid,
+            "detail": "",
+        }
+
+    @staticmethod
+    def _contract_source_detail(
+        source: Optional[Dict[str, Any]], contract_observed: bool,
+    ) -> str:
+        """One clause naming the backend the contract came from.
+
+        The four fields and the backend they came from are **one**
+        fact, and the clause answers the question the fields cannot:
+
+          * the contract was observed and the listener was the declared
+            backend → it came from there;
+          * the contract was not observed, and the listener was the
+            declared backend → the cell says so, instead of leaving a
+            reader to guess whether a contract was expected at all;
+          * the listener was **not** the declared backend → the
+            contract did not come from the declared instance, and the
+            clause names the backend that answered the port instead;
+          * nothing was listening → there is no evidence which backend
+            the contract would have come from, and the clause says
+            exactly that.
+        """
+        if not source:
+            return ""
+        status = str(source.get("status") or "")
+        declared = source.get("declared")
+        observed = source.get("observed")
+        pid = source.get("listener_pid")
+        env_var = str(source.get("env_var") or "PDT_HARNESS")
+        if status == HARNESS_IDENTITY_OBSERVED:
+            if contract_observed:
+                return (
+                    f"the contract came from the declared {declared} "
+                    f"backend (pid {pid})"
+                )
+            return (
+                f"no contract was observed; the service answering the port "
+                f"runs the declared {declared} backend (pid {pid})"
+            )
+        if status == HARNESS_IDENTITY_MISMATCH:
+            return (
+                f"the contract did not come from the declared {declared} "
+                f"backend: the service answering the port runs "
+                f"{env_var}={observed!r} (pid {pid})"
+            )
+        if status == HARNESS_IDENTITY_NOT_OBSERVED_UNREACHABLE:
+            return (
+                f"no contract was observed: the service was unreachable at "
+                f"request time, so there is no evidence which backend the "
+                f"contract would have come from"
+            )
+        if status == HARNESS_IDENTITY_NOT_OBSERVED_UNREADABLE:
+            return (
+                f"no contract was observed: the environment of the process "
+                f"answering the port could not be read, so there is no "
+                f"evidence which backend the contract came from"
+            )
+        if status == HARNESS_IDENTITY_NOT_OBSERVED_UNCHECKABLE:
+            return (
+                f"no contract was observed: the declared value is not a "
+                f"backend this framework can check, so there is no evidence "
+                f"which backend the contract came from"
+            )
+        return ""
+
+    # ------------------------------------------------------------------
+    # Negative expectation — was the expected rejection observed?
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _vp_expected_statuses(vp: dict) -> List[int]:
+        """The status codes the VP's own assertions expect.
+
+        The status assertion is self-contained (``{"status": 403}``, or
+        ``{"status": [401, 403]}`` for "either will do"), so the
+        expectation is read straight off the declaration.  The framework
+        never decides on its own what a VP should have seen.
+        """
+        expected: List[int] = []
+        for assertion in vp.get("assertions") or []:
+            if not isinstance(assertion, dict) or "status" not in assertion:
+                continue
+            declared = assertion.get("status")
+            candidates = (
+                declared if isinstance(declared, list) else [declared]
+            )
+            for candidate in candidates:
+                if (
+                    isinstance(candidate, int)
+                    and not isinstance(candidate, bool)
+                    and candidate not in expected
+                ):
+                    expected.append(candidate)
+        return expected
+
+    @staticmethod
+    def _vp_body_targets(vp: dict) -> List[str]:
+        """The body texts the VP's assertions require to be present.
+
+        ``body_contains`` is the only subject that speaks about the raw
+        body, and it is self-contained: the text *is* the expectation.
+        """
+        targets: List[str] = []
+        for assertion in vp.get("assertions") or []:
+            if not isinstance(assertion, dict):
+                continue
+            text = assertion.get("body_contains")
+            if isinstance(text, str) and text and text not in targets:
+                targets.append(text)
+        return targets
+
+    @staticmethod
+    def _expected_status_text(expected: List[int]) -> str:
+        """How the expected status reads in a sentence."""
+        if not expected:
+            return "(none)"
+        return " or ".join(str(status) for status in expected)
+
+    def _negative_expectation_observation(
+        self,
+        vp: dict,
+        status_code: Optional[int],
+        response_body: Optional[str],
+        request_note: str = "",
+        body_truncated: bool = False,
+    ) -> Dict[str, Any]:
+        """What the VP's own response said about the status it expects.
+
+        A VP that expects a **rejection** — ``{"status": 403}`` — is
+        asserting that a guard is in effect.  "The guard held" and "no
+        response came back" are different facts, and only the first one
+        may ever be reported as the expectation being met:
+
+          * ``observed`` — the response carried the status the VP
+            expects, and the body carried every text the VP requires;
+          * ``not-observed(service-unreachable)`` — the request produced
+            no response at all, so nothing proved the guard is in
+            effect;
+          * ``not-observed(status-mismatch)`` — a response came back,
+            but with another status: the guard was **bypassed**;
+          * ``not-observed(body-absent)`` — the expected status arrived,
+            but the answer no longer carries the text the criterion
+            demands: the guard **degraded**.
+
+        The body texts the VP declares travel with it.  When the body
+        was never seen, the texts it must carry are listed under
+        ``not_observed`` rather than dropped: an expectation that
+        vanishes from the report is a silent failure.
+        """
+        expected_statuses = self._vp_expected_statuses(vp)
+        error_statuses = [
+            status for status in expected_statuses
+            if status < 200 or status >= 300
+        ]
+        targets = self._vp_body_targets(vp)
+        expected_text = self._expected_status_text(expected_statuses)
+        if status_code is None:
+            observed = OBSERVATION_SERVICE_UNREACHABLE
+            not_observed = list(targets)
+            detail = request_note or "the request produced no response"
+            if expected_statuses:
+                detail += (
+                    f"; the expected status {expected_text} was not observed"
+                )
+        else:
+            not_observed = [
+                target for target in targets
+                if target not in (response_body or "")
+            ]
+            if expected_statuses and status_code not in expected_statuses:
+                observed = OBSERVATION_STATUS_MISMATCH
+                detail = (
+                    f"the response answered {status_code} instead of the "
+                    f"expected {expected_text}"
+                )
+            elif not_observed:
+                observed = OBSERVATION_BODY_ABSENT
+                detail = (
+                    f"the response answered {status_code}, but the body "
+                    f"text(s) "
+                    + ", ".join(repr(text) for text in not_observed)
+                    + " were not observed"
+                )
+            else:
+                observed = OBSERVATION_OBSERVED
+                detail = (
+                    f"the response answered {status_code}, the status the "
+                    f"VP expects"
+                )
+            if not_observed and observed != OBSERVATION_BODY_ABSENT:
+                detail += (
+                    "; the body text(s) "
+                    + ", ".join(repr(text) for text in not_observed)
+                    + " were not observed"
+                )
+        if body_truncated and not_observed:
+            detail += (
+                "; the body the runner kept is truncated, so the text may "
+                "have been in the part that was cut"
+            )
+        return {
+            "expects_error_status": bool(error_statuses),
+            "expected_status": (
+                expected_statuses[0] if len(expected_statuses) == 1
+                else (expected_statuses or None)
+            ),
+            "observed_status": status_code,
+            "observed": observed,
+            "body_targets": targets,
+            "not_observed": not_observed,
+            "detail": detail,
+        }
+
+    @staticmethod
+    def _negative_expectation_reason(observation: Dict[str, Any]) -> str:
+        """The sentence a reader of the report gets about the expectation."""
+        not_observed = observation.get("not_observed") or []
+        reason = (
+            f"negative_expectation: "
+            f"expected_status={observation.get('expected_status')}, "
+            f"observed={observation.get('observed')}"
+        )
+        if observation.get("observed_status") is not None:
+            reason += f", observed_status={observation.get('observed_status')}"
+        if not_observed:
+            reason += ", not_observed=" + ", ".join(
+                repr(text) for text in not_observed
+            )
+        reason += f"; {observation.get('detail')}"
+        return reason
+
+    @staticmethod
+    def _guard_negative_expectation(
+        verdict: dict, observation: Dict[str, Any],
+    ) -> dict:
+        """A negative expectation that was never observed cannot be met.
+
+        Only the *no response* case is guarded here, because that is
+        the one the criterion forbids being read as a pass: a report
+        that says "the guard is in effect" when nothing ever answered.
+
+        The body texts are **not** grounds for overturning the runner:
+        the runner grades the body against the whole answer, while the
+        framework only keeps an excerpt of it, so "the text is not in
+        the excerpt" is not a reason to overturn a verdict the runner
+        reached on the full body.
+        """
+        if str(verdict.get("status") or "") != "PASSED":
+            return verdict
+        if observation.get("observed") != OBSERVATION_SERVICE_UNREACHABLE:
+            return verdict
+        verdict["status"] = "FAILED"
+        reasons = list(verdict.get("reasons") or [])
+        reasons.append(
+            "the negative expectation was never observed, so the criterion "
+            f"cannot be met: {observation.get('detail')}"
+        )
+        verdict["reasons"] = reasons
+        return verdict
+
+    def _attach_negative_expectation(
+        self,
+        verdict: dict,
+        vp: dict,
+        status_code: Optional[int],
+        response_body: Optional[str],
+        request_note: str = "",
+        body_truncated: bool = False,
+    ) -> dict:
+        """Book the negative expectation down in the verdict's evidence.
+
+        The cell decides nothing: the verdict's status is the one the
+        VP's own assertions produced.  What the cell adds is the
+        bookkeeping a *negative* criterion needs — an expectation that
+        was never observed has to be visible, or "the guard is in
+        effect" and "nobody ever asked" read the same in the report.
+        """
+        observation = self._negative_expectation_observation(
+            vp, status_code, response_body, request_note, body_truncated,
+        )
+        evidence = dict(verdict.get("evidence") or {})
+        evidence["negative_expectation"] = observation
+        verdict["evidence"] = evidence
+        verdict = self._guard_negative_expectation(verdict, observation)
+        if str(verdict.get("status") or "") != "PASSED":
+            reasons = list(verdict.get("reasons") or [])
+            reasons.append(self._negative_expectation_reason(observation))
+            verdict["reasons"] = reasons
+        return verdict
+
+    # ------------------------------------------------------------------
+    # The side condition — a plan that does not exist must stay missing
+    # ------------------------------------------------------------------
+    #
+    # ``GET /api/plan/<id>/state`` answers 404 for a plan id it does not
+    # know, and that 404 is what lets the caller tell "does not exist"
+    # from "exists" without a second request.  The status code alone
+    # does not carry that promise: a server that mints an empty plan for
+    # an unknown id and then answers 404 has broken it, and the caller
+    # cannot tell the difference from the outside.
+    #
+    # So the criterion carries a **side condition** — the missing plan
+    # must not be created by the request that asked for it — and the
+    # framework checks it against the plans tree, before and after the
+    # request.  When the request produced no answer the condition is
+    # **not observed**: a tree that did not change because nothing ran
+    # is not evidence that the endpoint left the plan alone, and it may
+    # never be reported as though it were.
+
+    @staticmethod
+    def _request_path(url: str) -> str:
+        """The path a request URL addresses, placeholder or not.
+
+        A plan writes ``{{svc.api.url}}/api/plan/<id>/state`` — the
+        placeholder is not a URL, so the path is read off the string
+        rather than off a parsed URL.  A literal address is stripped of
+        its scheme and authority the same way, so both forms are read
+        by one rule.
+        """
+        text = str(url or "").strip()
+        if not text:
+            return ""
+        if "://" in text:
+            rest = text.split("://", 1)[1]
+            slash = rest.find("/")
+            return rest[slash:] if slash >= 0 else "/"
+        marker = text.find("}}")
+        if marker >= 0:
+            text = text[marker + 2:]
+        if not text.startswith("/"):
+            text = "/" + text
+        return text
+
+    @classmethod
+    def _vp_plan_target(cls, vp: dict) -> Optional[str]:
+        """The plan a request URL addresses, when it addresses one.
+
+        The shape is the server's own: ``/api/plan/<plan_id>/…``.  A URL
+        that addresses no plan — a health probe, the plan list — carries
+        no plan-scoped side condition.
+        """
+        request = vp.get("request") or {}
+        path = cls._request_path(str(request.get("url") or ""))
+        match = re.match(r"^/api/plan/(?P<plan_id>[^/?#]+)", path)
+        if match is None:
+            return None
+        return match.group("plan_id").strip() or None
+
+    def _service_plans_dir(self, vp: dict) -> Tuple[Path, str]:
+        """The plans tree the service this VP talks to reads.
+
+        Three sources, in the order in which they answer that question
+        directly:
+
+          * the service's own start command exports ``PDT_PLANS_DIR`` —
+            that is the tree the service was told to use;
+          * the framework's own environment: the service is spawned by
+            this process and inherits it;
+          * the project's ``plans/`` tree, which is what the server
+            falls back to when nothing says otherwise.
+
+        The source travels with the answer, so a reader can tell a tree
+        the service named from one the framework inferred.
+        """
+        _name, decl = self._declared_service_for_vp(vp)
+        if decl is not None:
+            declared = _declared_plans_dir(getattr(decl, "start_cmd", ""))
+            if declared:
+                return Path(os.path.expandvars(declared)).expanduser(), (
+                    "declaration"
+                )
+        env_value = os.environ.get("PDT_PLANS_DIR")
+        if env_value:
+            return Path(env_value).expanduser(), "process-env"
+        return Path(self.project_dir) / "plans", "project-default"
+
+    @staticmethod
+    def _plan_directory_snapshot(
+        plans_dir: Path, plan_id: str,
+    ) -> Dict[str, Any]:
+        """Whether the plan's own directory is in the plans tree.
+
+        "It is not there" and "I could not look" are different facts:
+        only the first one may be read as "the plan was not created".
+        """
+        target = Path(plans_dir) / str(plan_id)
+        try:
+            os.stat(str(target))
+        except FileNotFoundError:
+            return {"exists": False}
+        except OSError as exc:
+            return {
+                "exists": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        return {"exists": True}
+
+    def _side_effect_snapshot(
+        self, target: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """One snapshot of the plan's directory, when there is a target."""
+        if target is None:
+            return None
+        return self._plan_directory_snapshot(
+            target.get("plans_dir"), target.get("plan_id"),
+        )
+
+    def _zero_side_effect_target(self, vp: dict) -> Optional[Dict[str, Any]]:
+        """The plan this VP's criterion says must not be created.
+
+        The side condition belongs to a **negative**, plan-scoped
+        criterion: the VP asks for the state of a plan and expects a
+        rejection, so the plan has to still be missing afterwards.  A
+        criterion that expects a success, or one that addresses no plan,
+        carries no such condition — there is nothing to compare, and the
+        framework does not invent a criterion the plan never wrote.
+        """
+        plan_id = self._vp_plan_target(vp)
+        if not plan_id:
+            return None
+        expected = self._vp_expected_statuses(vp)
+        if not any(400 <= status < 500 for status in expected):
+            return None
+        plans_dir, source = self._service_plans_dir(vp)
+        return {
+            "plan_id": plan_id,
+            "plans_dir": plans_dir,
+            "plans_dir_source": source,
+        }
+
+    def _zero_side_effect_observation(
+        self,
+        target: Optional[Dict[str, Any]],
+        before: Optional[Dict[str, Any]],
+        after: Optional[Dict[str, Any]],
+        status_code: Optional[int] = None,
+        request_note: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Whether the side condition was observed, and what it said.
+
+        Three states, and they are the whole vocabulary:
+
+          * ``observed`` — the request was answered, so the comparison of
+            the two snapshots says something about the endpoint: the
+            missing plan was left alone, or the request created it;
+          * ``not-observed(service-unreachable)`` — the request produced
+            no response at all, so nothing proved the endpoint leaves
+            the missing plan alone.  The side effect stays **unknown**:
+            it is not ``False``, because "nothing ran" is not "nothing
+            was created";
+          * ``not-observed(plans-tree-unreadable)`` — the request was
+            answered, but the plans tree could not be read, so the
+            comparison could not be made.
+        """
+        if target is None:
+            return None
+        plan_id = target.get("plan_id")
+        plans_dir = target.get("plans_dir")
+        base = {
+            "condition": ZERO_SIDE_EFFECT_CONDITION,
+            "plan_id": plan_id,
+            "plans_dir": str(plans_dir) if plans_dir else None,
+            "plans_dir_source": target.get("plans_dir_source"),
+        }
+        if status_code is None:
+            return {
+                **base,
+                "status": OBSERVATION_SERVICE_UNREACHABLE,
+                "side_effect": None,
+                "before": before,
+                "after": after,
+                "detail": (
+                    (request_note or "the request produced no response")
+                    + "; the side condition was not observed: a plans tree "
+                    "that did not change because nothing ran is not "
+                    "evidence that the endpoint left the missing plan "
+                    "alone"
+                ),
+            }
+        before_exists = (before or {}).get("exists")
+        after_exists = (after or {}).get("exists")
+        if before is None or after is None or (
+            before_exists is None or after_exists is None
+        ):
+            return {
+                **base,
+                "status": OBSERVATION_PLANS_TREE_UNREADABLE,
+                "side_effect": None,
+                "before": before,
+                "after": after,
+                "detail": (
+                    f"the request answered {status_code}, but the plans tree "
+                    f"could not be read, so it could not be said whether "
+                    f"{plan_id!r} was created"
+                ),
+            }
+        side_effect = bool(
+            before_exists is False and after_exists is True,
+        )
+        if side_effect:
+            detail = (
+                f"the request answered {status_code} and the plans tree "
+                f"gained {plan_id!r}: the answer says the plan does not "
+                "exist while the request created it"
+            )
+        else:
+            detail = (
+                f"the request answered {status_code} and the plans tree "
+                f"did not gain {plan_id!r}: the missing plan was left alone"
+            )
+        return {
+            **base,
+            "status": OBSERVATION_OBSERVED,
+            "side_effect": side_effect,
+            "before": before,
+            "after": after,
+            "detail": detail,
+        }
+
+    @staticmethod
+    def _zero_side_effect_reason(observation: Dict[str, Any]) -> str:
+        """The sentence a reader of the report gets about the condition."""
+        return (
+            f"zero_side_effect_observation: "
+            f"condition={observation.get('condition')!r}, "
+            f"plan_id={observation.get('plan_id')!r}, "
+            f"observed={observation.get('status')}, "
+            f"side_effect={observation.get('side_effect')!r}; "
+            f"{observation.get('detail')}"
+        )
+
+    @staticmethod
+    def _guard_zero_side_effect(
+        verdict: dict, observation: Optional[Dict[str, Any]],
+    ) -> dict:
+        """A side condition that was not met cannot be a PASSED.
+
+        Two ways it is not met:
+
+          * it was **never observed** — the request produced no answer,
+            so nothing proved the endpoint leaves the missing plan
+            alone, and "the service was unreachable, so nothing was
+            created" is a conclusion drawn from an execution that never
+            happened;
+          * it was **violated** — the answer said the plan does not
+            exist while the request created it, which is exactly the
+            ambiguity the criterion exists to rule out.
+        """
+        if observation is None:
+            return verdict
+        if str(verdict.get("status") or "") != "PASSED":
+            return verdict
+        if observation.get("status") != OBSERVATION_OBSERVED:
+            reason = (
+                "the zero-side-effect condition was never observed, so the "
+                "criterion cannot be met"
+            )
+        elif observation.get("side_effect") is True:
+            reason = (
+                "the zero-side-effect condition was violated: the request "
+                "created the plan the answer said does not exist"
+            )
+        else:
+            return verdict
+        verdict["status"] = "FAILED"
+        reasons = list(verdict.get("reasons") or [])
+        reasons.append(reason)
+        verdict["reasons"] = reasons
+        return verdict
+
+    def _attach_zero_side_effect(
+        self, verdict: dict, observation: Optional[Dict[str, Any]],
+    ) -> dict:
+        """Book the side condition down in the verdict's evidence.
+
+        The cell decides nothing on its own: the verdict's status is the
+        one the VP's own assertions produced.  What the cell adds is the
+        bookkeeping a negative, plan-scoped criterion needs — a condition
+        that was never observed has to be visible, or "the plan was left
+        alone" and "nobody ever asked" read the same in the report.
+        """
+        if observation is None:
+            return verdict
+        evidence = dict(verdict.get("evidence") or {})
+        evidence["zero_side_effect_observation"] = observation
+        verdict["evidence"] = evidence
+        verdict = self._guard_zero_side_effect(verdict, observation)
+        if str(verdict.get("status") or "") != "PASSED":
+            reasons = list(verdict.get("reasons") or [])
+            reasons.append(self._zero_side_effect_reason(observation))
+            verdict["reasons"] = reasons
+        return verdict
+
+    # ------------------------------------------------------------------
+    # Data plane — was the field observed, and if not, why not
+    # ------------------------------------------------------------------
+
+    def _declared_service_for_vp(self, vp: dict) -> Tuple[str, Any]:
+        """The service this VP talks to, as this round runs it.
+
+        The service the URL *names* wins over the one that happens to
+        answer the port: the name is what the plan asked for, and a
+        port alone can be answered by a stranger's process.
+        """
+        name = self._vp_placeholder_service(vp)
+        if name:
+            key, decl = self._declaration_for_service(name)
+            if decl is not None:
+                return key, decl
+        port = self._vp_target_port(vp)
+        if port is None:
+            return "", None
+        return self._declaration_for_port(port)
+
+    @staticmethod
+    def _is_loopback_url(url: str) -> bool:
+        """Whether ``url`` points at this machine.
+
+        The registration only ever talks to a service this round owns,
+        and the round only ever owns loopback ones.  A health URL that
+        points elsewhere is therefore skipped rather than fetched: the
+        plan is generated content, and the framework does not make
+        outbound calls on its word — least of all a call the default
+        claude path never made before.
+        """
+        import urllib.parse
+
+        try:
+            parts = urllib.parse.urlsplit(url)
+        except ValueError:
+            return False
+        if parts.scheme not in ("http", "https"):
+            return False
+        host = (parts.hostname or "").lower()
+        return host in ("127.0.0.1", "localhost", "::1")
+
+    def _probe_declared_health_url(self, vp: dict) -> Dict[str, Any]:
+        """Register, read-only, whether the declared health endpoint answers.
+
+        One GET against the health URL the plan's declaration names,
+        taken **before** the VP's own request.  It is a *registration*,
+        not an assertion: it decides nothing about the verdict.  It
+        exists so that a data-plane field which was not observed can say
+        *why* — the service was not answering, or it was answering
+        without the field.
+
+        Taken before the request rather than after, so it records what
+        the round **found** rather than what the round fixed: a service
+        that had to be restarted is registered as "not answering", which
+        is the fact the report needs.
+
+        Never raises and never retries.  A health endpoint that does not
+        answer is a fact worth recording, not an error to swallow.
+        """
+        name, decl = self._declared_service_for_vp(vp)
+        if decl is None:
+            return {
+                "performed": False,
+                "service": None,
+                "health_url": None,
+                "reachable": False,
+                "status_code": None,
+                "error": None,
+                "reason": "no-declared-service",
+                "body": "",
+            }
+        try:
+            health_url = str(decl.resolved_health_url() or "").strip()
+        except Exception:  # noqa: BLE001 - defensive
+            health_url = ""
+        if not health_url:
+            return {
+                "performed": False,
+                "service": name or None,
+                "health_url": None,
+                "reachable": False,
+                "status_code": None,
+                "error": None,
+                "reason": "no-declared-health-url",
+                "body": "",
+            }
+        if not self._is_loopback_url(health_url):
+            return {
+                "performed": False,
+                "service": name or None,
+                "health_url": health_url,
+                "reachable": False,
+                "status_code": None,
+                "error": None,
+                "reason": "health-url-not-loopback",
+                "body": "",
+            }
+        # 2026-10-27 (merge): the round asks the declared health
+        # endpoint over the guarded road when it re-ensures a service
+        # (:meth:`_service_reensure_gates`) and **keeps the answer**,
+        # precisely so that "one service, one question, one answer"
+        # holds.  This registration asks the very same endpoint one
+        # moment later — so it reuses that answer instead of asking a
+        # second time: two answers to one question could disagree, and
+        # then the round's own precondition and its own report would
+        # tell two different stories about the same service.
+        recorded = self._recorded_health_answer(health_url)
+        if recorded is not None:
+            return {
+                "performed": True,
+                "service": name or None,
+                "health_url": health_url,
+                "reachable": bool(recorded.get("reachable")),
+                "status_code": recorded.get("status_code"),
+                "error": recorded.get("error") or None,
+                "reason": None,
+                "body": str(recorded.get("body") or ""),
+                "source": "round-precondition",
+            }
+        answer = _read_only_get(health_url, HEALTH_PROBE_TIMEOUT_SECONDS)
+        return {
+            "performed": True,
+            "service": name or None,
+            "health_url": health_url,
+            "reachable": bool(answer.get("reachable")),
+            "status_code": answer.get("status_code"),
+            "error": answer.get("error"),
+            "reason": None,
+            "body": answer.get("body") or "",
+        }
+
+    def _recorded_health_answer(self, health_url: str) -> Optional[Dict[str, Any]]:
+        """The answer the round's own precondition already got for this URL.
+
+        The round's precondition asks a service whether it is alive over
+        the guarded road and keeps the answer
+        (``_service_self_check_records``).  The api phase's registration
+        asks the **same** endpoint, so it reads that answer instead of
+        asking again.
+
+        ``None`` when the round never asked this endpoint — then the
+        registration asks it itself, and that answer is the freshest one
+        there is.
+        """
+        wanted = str(health_url or "").strip().rstrip("/")
+        if not wanted:
+            return None
+        records = getattr(self, "_service_self_check_records", None) or {}
+        for record in records.values():
+            if not isinstance(record, dict) or not record.get("asked"):
+                continue
+            url = str(record.get("url") or "").strip().rstrip("/")
+            if url != wanted:
+                continue
+            status = record.get("status_code")
+            return {
+                "status_code": status,
+                # A 4xx/5xx is still an answer: only a transport
+                # failure means "not reachable" — the same rule as
+                # :func:`_read_only_get`.
+                "reachable": status is not None,
+                "error": str(record.get("error") or ""),
+                "body": str(record.get("body") or ""),
+            }
+        return None
+
+    def _data_plane_observation(
+        self,
+        probe: Dict[str, Any],
+        response_body: Optional[str],
+        request_note: str = "",
+    ) -> Dict[str, Any]:
+        """Whether the data-plane field was observed, and when it was not, why.
+
+        The three states are the whole vocabulary:
+
+          * ``observed`` — the field was seen, with its value;
+          * ``not-observed(service-unreachable)`` — the VP's own request
+            produced no response, so there was no field to be seen in;
+          * ``not-observed(field-absent)`` — a response came back, and
+            the field was not in it.
+
+        The label is decided by the VP's **own** traffic and by nothing
+        else: the registration is an explanation, never a substitute
+        assertion.  A health endpoint that happens to answer with the
+        field does not make the observation "observed" — the VP's own
+        request is what the criterion is about, and the VP's own
+        assertions (200, ``status == ok``, the field itself) remain the
+        only basis for a PASSED.
+        """
+        field = DATA_PLANE_FIELD
+        vp_answered = response_body is not None
+
+        vp_has, vp_value = _field_in_body(response_body, field)
+        if vp_has:
+            return {
+                "field": field,
+                "status": OBSERVATION_OBSERVED,
+                "value": vp_value,
+                "detail": "the VP's own response carried the field",
+            }
+
+        if vp_answered:
+            return {
+                "field": field,
+                "status": OBSERVATION_FIELD_ABSENT,
+                "value": None,
+                "detail": (
+                    "the VP's own response did not carry the field"
+                    + self._probe_hint(probe)
+                ),
+            }
+
+        return {
+            "field": field,
+            "status": OBSERVATION_SERVICE_UNREACHABLE,
+            "value": None,
+            "detail": (
+                request_note or "the VP's own request produced no response"
+            ) + self._probe_hint(probe),
+        }
+
+    @staticmethod
+    def _probe_hint(probe: Dict[str, Any]) -> str:
+        """One clause naming what the health registration saw."""
+        if not probe.get("performed"):
+            return (
+                f"; no health endpoint was declared to register "
+                f"({probe.get('reason')})"
+            )
+        if probe.get("reachable"):
+            return (
+                f"; the declared health endpoint {probe.get('health_url')!r} "
+                f"answered {probe.get('status_code')}, so the service was up"
+            )
+        return (
+            f"; the declared health endpoint {probe.get('health_url')!r} "
+            f"did not answer ({probe.get('error')})"
+        )
+
+    @staticmethod
+    def _public_probe(probe: Dict[str, Any]) -> Dict[str, Any]:
+        """The registration as it is recorded: no raw body, just an excerpt."""
+        body = str(probe.get("body") or "")
+        public = {key: value for key, value in probe.items() if key != "body"}
+        public["body_excerpt"] = body[:HEALTH_PROBE_BODY_CHARS]
+        public["body_truncated"] = len(body) > HEALTH_PROBE_BODY_CHARS
+        return public
+
+    def _attach_data_plane_evidence(
+        self,
+        verdict: dict,
+        vp: dict,
+        probe: Dict[str, Any],
+        response_body: Optional[str] = None,
+        request_note: str = "",
+        source: Optional[Dict[str, Any]] = None,
+        attestation: Optional[Dict[str, Any]] = None,
+    ) -> dict:
+        """Put the api phase's evidence cells into the verdict's evidence.
+
+        Two cells, and they stay separate on purpose:
+
+          * the **data-plane cell** — the read-only registration says
+            whether the service was answering, the observation says
+            what happened to the field.  Collapsing them into one
+            sentence is what made the two faults indistinguishable in
+            the first place;
+          * the **contract cell** — what the VP's own response said
+            about each field its assertions name, field by field, with
+            the fields that were not observed listed rather than
+            dropped, and — when the declaration pins a backend — with
+            the backend the body came from.
+
+        Neither of them decides anything — the verdict's status is the
+        one the VP's own assertions produced.
+        """
+        observation = self._data_plane_observation(
+            probe, response_body, request_note,
+        )
+        evidence = dict(verdict.get("evidence") or {})
+        evidence["health_url_probe"] = self._public_probe(probe)
+        evidence["plan_routing_rows_observation"] = observation
+        evidence["contract_observation"] = self._contract_observation(
+            vp, response_body, source, attestation,
+        )
+        verdict["evidence"] = evidence
+        return verdict
+
+    # ------------------------------------------------------------------
+    # The response header — a dimension of its own
+    # ------------------------------------------------------------------
+
+    def _api_artifact_path(self, vp_id: str) -> Path:
+        """Where the api runner writes the audit artifact of this VP."""
+        return (
+            self.plan_dir / "vp_artifacts" / str(vp_id) / API_RESPONSE_ARTIFACT
+        )
+
+    def _api_artifact_stamp(self, vp_id: str) -> Optional[Tuple[int, int]]:
+        """A fingerprint of the audit artifact, taken **before** the request.
+
+        The artifact is rewritten by every api_test run, so its identity
+        is what tells *this* round's copy from the previous round's.
+        The runner writes through a temporary file and renames it into
+        place, so a fresh copy always has a fresh identity — the stamp
+        changes even when the answer is byte-for-byte the same one.
+
+        ``None`` when there is no artifact yet, which is the ordinary
+        state of the first round.
+        """
+        try:
+            stat = self._api_artifact_path(vp_id).stat()
+        except OSError:
+            return None
+        return (int(stat.st_ino), int(stat.st_mtime_ns))
+
+    def _read_response_content_type(
+        self, vp_id: str, stamp: Optional[Tuple[int, int]],
+    ) -> Tuple[Optional[str], bool]:
+        """The ``Content-Type`` of **this VP's own** response.
+
+        The runner keeps the response **headers** in the audit artifact
+        it writes for the VP — the verdict's own evidence holds the
+        status and the body, not the headers — so the header dimension
+        is read back from there.
+
+        It is this VP's own traffic and nothing else: the artifact
+        belongs to this VP's own id, and it is read only when it was
+        written **during this call**.  A copy left over from an earlier
+        round is a neighbour's observation, and a neighbour's
+        observation may never be booked in as if it were this VP's.
+
+        Returns ``(content_type, readable)``:
+
+          * ``readable`` is ``False`` when there is no audit copy of
+            *this* request — it was never written, or what is on disk
+            is the previous round's.  The header is then unknown, and
+            the cell says so instead of borrowing an answer;
+          * ``content_type`` is the header's value, or ``None`` when the
+            response carried no such header.
+        """
+        path = self._api_artifact_path(vp_id)
+        try:
+            stat = path.stat()
+        except OSError:
+            return None, False
+        current = (int(stat.st_ino), int(stat.st_mtime_ns))
+        if stamp is not None and current == stamp:
+            # The copy on disk is the one that was already there: this
+            # call did not write one.
+            return None, False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None, False
+        headers = (
+            payload.get("response_headers")
+            if isinstance(payload, dict) else None
+        )
+        if not isinstance(headers, dict):
+            return None, True
+        value = headers.get(CONTENT_TYPE_HEADER)
+        return (str(value) if value else None), True
+
+    def _content_type_observation(
+        self,
+        status_code: Optional[int],
+        content_type: Optional[str],
+        headers_read: bool = True,
+        request_note: str = "",
+    ) -> Dict[str, Any]:
+        """Whether the response's content type was observed, and when not, why.
+
+        The four states are the whole vocabulary:
+
+          * ``observed`` — the VP's own response carried the header,
+            with its value.  Observing the header is **not** the same
+            as it matching the criterion: a ``text/plain`` answer is
+            observed, and it is the VP's own assertion that fails;
+          * ``not-observed(service-unreachable)`` — the VP's own request
+            produced no response, so there was no header to observe;
+          * ``not-observed(header-absent)`` — a response came back and
+            it carried no such header;
+          * ``not-observed(headers-unreadable)`` — a response came
+            back, but the framework could not read its headers, so the
+            header was never observed at all.
+
+        The label is decided by this VP's own traffic and by nothing
+        else.  Another VP's answer, a sub-agent's ``curl``, a
+        neighbouring round's note — those are side observations: they
+        may be logged, they may never stand in for what this VP did not
+        see.
+        """
+        if status_code is None:
+            return {
+                "header": CONTENT_TYPE_HEADER,
+                "status": OBSERVATION_SERVICE_UNREACHABLE,
+                "value": None,
+                "detail": (
+                    request_note or "the VP's own request produced no response"
+                ),
+            }
+        if not headers_read:
+            return {
+                "header": CONTENT_TYPE_HEADER,
+                "status": OBSERVATION_HEADERS_UNREADABLE,
+                "value": None,
+                "detail": (
+                    f"the VP's own response answered {status_code}, but the "
+                    "framework could not read its headers, so the content "
+                    "type was not observed"
+                ),
+            }
+        if not content_type:
+            return {
+                "header": CONTENT_TYPE_HEADER,
+                "status": OBSERVATION_HEADER_ABSENT,
+                "value": None,
+                "detail": (
+                    f"the VP's own response answered {status_code} without a "
+                    f"{CONTENT_TYPE_HEADER!r} header"
+                ),
+            }
+        return {
+            "header": CONTENT_TYPE_HEADER,
+            "status": OBSERVATION_OBSERVED,
+            "value": content_type,
+            "detail": (
+                f"the VP's own response answered {status_code} and carried "
+                f"{CONTENT_TYPE_HEADER!r}: {content_type!r}"
+            ),
+        }
+
+    @staticmethod
+    def _content_type_reason(observation: Dict[str, Any]) -> str:
+        """The sentence a reader of the report gets about the header."""
+        return (
+            f"content_type_observation: header="
+            f"{observation.get('header')!r}, "
+            f"observed={observation.get('status')}, "
+            f"value={observation.get('value')!r}; "
+            f"{observation.get('detail')}"
+        )
+
+    # ------------------------------------------------------------------
+    # The static entry — three halves, three books
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _vp_static_entry_media_type(vp: dict) -> Optional[str]:
+        """The media type the criterion expects of the response.
+
+        ``None`` for a criterion that does not grade a document.  The
+        dimensions are the **criterion's**, and the framework never
+        invents one: a JSON endpoint's dimensions are its status and its
+        fields, not a page title, and booking a title down for it would
+        be a fact about a document nobody asked for.
+        """
+        for assertion in vp.get("assertions") or []:
+            if not isinstance(assertion, dict):
+                continue
+            name = str(assertion.get("header") or "").strip().lower()
+            if name != CONTENT_TYPE_HEADER:
+                continue
+            for comparator in ("contains", "equals"):
+                if comparator not in assertion:
+                    continue
+                expected = assertion.get(comparator)
+                if (
+                    isinstance(expected, str)
+                    and STATIC_ENTRY_MEDIA_TYPE in expected.lower()
+                ):
+                    return expected
+                break
+        return None
+
+    @staticmethod
+    def _vp_static_entry_title(vp: dict) -> Optional[str]:
+        """The title text the criterion requires the document to carry.
+
+        Read off the criterion's own ``body_contains`` assertions — the
+        same texts the runner grades the body against.  The framework
+        never decides what the title is: it reports whether the title
+        the criterion names was seen.
+        """
+        targets = VerificationAgent._vp_body_targets(vp)
+        return targets[0] if targets else None
+
+    @staticmethod
+    def _document_title(body: Optional[str]) -> Optional[str]:
+        """The ``<title>`` a document carries, if it carries one.
+
+        Only used when the criterion names no title of its own: the
+        framework then reports the document's own title, and never a
+        title it made up.
+        """
+        if not body:
+            return None
+        match = re.search(
+            r"<title[^>]*>(.*?)</title>", body,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None
+        return match.group(1).strip() or None
+
+    def _static_entry_observation(
+        self,
+        vp: dict,
+        status_code: Optional[int],
+        response_body: Optional[str],
+        response_content_type: Optional[str] = None,
+        response_headers_read: bool = True,
+        request_note: str = "",
+        body_truncated: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """The static entry's three halves, booked down one by one.
+
+        ``None`` for a criterion that does not grade a document — the
+        cell belongs to the criterion that declares it.
+
+        The three halves are **separate books**, and each one says
+        whether it was observed:
+
+          * ``status_code`` — ``observed`` with the status the VP's own
+            response carried, or ``not-observed(service-unreachable)``
+            when the request produced no response at all;
+          * ``content_type`` — the same two ways, plus the two ways a
+            response can come back without saying what it is;
+          * ``title`` — the same two ways, plus
+            ``not-observed(title-absent)`` for an answer that came back
+            without the title the criterion names.
+
+        "Observed" is not "matching": a ``200`` with a JSON envelope is
+        an observed status and an observed media type, and it is the
+        criterion's own assertions that say the entry is broken.  The
+        cell decides nothing.
+
+        Everything here comes from **this VP's own** traffic.  A
+        browser's answer on a copy of the service, another VP's answer,
+        a neighbouring round's note — those are side observations, and
+        they may never be booked in as if this request had answered.
+        """
+        media_type = self._vp_static_entry_media_type(vp)
+        if media_type is None:
+            return None
+        title = self._vp_static_entry_title(vp)
+        answered = status_code is not None
+
+        if answered:
+            status_cell = {
+                "status": OBSERVATION_OBSERVED,
+                "value": int(status_code),
+                "detail": f"the VP's own response answered {status_code}",
+            }
+        else:
+            status_cell = {
+                "status": OBSERVATION_SERVICE_UNREACHABLE,
+                "value": None,
+                "detail": (
+                    request_note or "the VP's own request produced no response"
+                ),
+            }
+
+        content_type_cell = self._content_type_observation(
+            status_code, response_content_type, response_headers_read,
+            request_note,
+        )
+
+        if not answered:
+            title_cell = {
+                "status": OBSERVATION_SERVICE_UNREACHABLE,
+                "value": None,
+                "detail": (
+                    request_note or "the VP's own request produced no response"
+                ),
+            }
+        elif title is not None:
+            if title in (response_body or ""):
+                title_cell = {
+                    "status": OBSERVATION_OBSERVED,
+                    "value": title,
+                    "detail": (
+                        f"the VP's own response carried the title {title!r}"
+                    ),
+                }
+            else:
+                title_cell = {
+                    "status": OBSERVATION_TITLE_ABSENT,
+                    "value": None,
+                    "detail": (
+                        f"the VP's own response did not carry the title "
+                        f"{title!r}"
+                    ),
+                }
+        else:
+            document_title = self._document_title(response_body)
+            if document_title is not None:
+                title_cell = {
+                    "status": OBSERVATION_OBSERVED,
+                    "value": document_title,
+                    "detail": (
+                        "the VP's own response carried a document titled "
+                        f"{document_title!r}"
+                    ),
+                }
+            else:
+                title_cell = {
+                    "status": OBSERVATION_TITLE_ABSENT,
+                    "value": None,
+                    "detail": "the VP's own response carried no title",
+                }
+        if (
+            title_cell["status"] == OBSERVATION_TITLE_ABSENT
+            and body_truncated
+        ):
+            # The runner grades the **whole** body; the framework only
+            # keeps an excerpt of it.  The title may well be in the part
+            # that was cut, so the cut says so rather than pretending
+            # the document had none.
+            title_cell["detail"] += (
+                "; the body the runner kept is truncated, so the title may "
+                "have been in the part that was cut"
+            )
+
+        cells = (status_cell, content_type_cell, title_cell)
+        observed = sum(
+            1 for cell in cells if cell.get("status") == OBSERVATION_OBSERVED
+        )
+        return {
+            "criterion": "static-entry-document",
+            "expected_media_type": media_type,
+            "expected_title": title,
+            "status_code": status_cell,
+            "content_type": content_type_cell,
+            "title": title_cell,
+            "observed_dimensions": observed,
+            "detail": (
+                f"{observed} of {len(STATIC_ENTRY_DIMENSIONS)} dimension(s) of "
+                "the static entry were observed in the VP's own response"
+            ),
+        }
+
+    @staticmethod
+    def _static_entry_reason(observation: Dict[str, Any]) -> str:
+        """The sentence a reader of the report gets about the entry."""
+        parts = []
+        for dimension in STATIC_ENTRY_DIMENSIONS:
+            cell = observation.get(dimension) or {}
+            parts.append(
+                f"{dimension}={cell.get('status')}({cell.get('value')!r})"
+            )
+        return (
+            "static_entry_observation: "
+            + ", ".join(parts)
+            + f"; {observation.get('detail')}"
+        )
+
+    def _attach_static_entry_observation(
+        self,
+        verdict: dict,
+        vp: dict,
+        status_code: Optional[int] = None,
+        response_body: Optional[str] = None,
+        response_content_type: Optional[str] = None,
+        response_headers_read: bool = True,
+        request_note: str = "",
+        body_truncated: bool = False,
+    ) -> dict:
+        """Put the static entry's three halves into the verdict's evidence.
+
+        The cell goes on **every** path the api phase can end on — the
+        request was made and answered, the request never went out, the
+        runner crashed — so a verdict always carries the same
+        bookkeeping, whatever the fault was.  A cell that only appears
+        on the happy path is a cell that cannot be checked afterwards.
+
+        It decides nothing: the verdict's status is the one the VP's
+        own assertions produced.
+        """
+        observation = self._static_entry_observation(
+            vp, status_code, response_body, response_content_type,
+            response_headers_read, request_note, body_truncated,
+        )
+        if observation is None:
+            return verdict
+        evidence = dict(verdict.get("evidence") or {})
+        evidence["static_entry_observation"] = observation
+        verdict["evidence"] = evidence
+        if str(verdict.get("status") or "") != "PASSED":
+            reasons = list(verdict.get("reasons") or [])
+            reasons.append(self._static_entry_reason(observation))
+            verdict["reasons"] = reasons
+        return verdict
+
+    @staticmethod
+    def _is_side_evidence_key(key: Any) -> bool:
+        """Whether an evidence field carries a side observation.
+
+        A side observation is a fact gathered somewhere else — another
+        VP's answer, a sub-agent's ``curl``, a neighbouring round's
+        note — and pasted into this VP's verdict.  It may be logged; it
+        may never be part of the evidence a verdict is read from.
+        """
+        name = str(key).lower()
+        return any(marker in name for marker in SIDE_EVIDENCE_KEY_MARKERS)
+
+    @classmethod
+    def _strip_side_evidence(
+        cls, evidence: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """Drop every side observation from a verdict's evidence.
+
+        The dropped fields are **named** in the log, so the drop is
+        visible rather than silent: a round that produced one has
+        something to say about it, and the report that reads the
+        verdict never has to wonder whether the fact was borrowed.
+        """
+        dropped: List[str] = []
+
+        def _walk(node: Any) -> Any:
+            if isinstance(node, dict):
+                kept: Dict[str, Any] = {}
+                for key, value in node.items():
+                    if cls._is_side_evidence_key(key):
+                        dropped.append(str(key))
+                        continue
+                    kept[key] = _walk(value)
+                return kept
+            if isinstance(node, list):
+                return [_walk(item) for item in node]
+            return node
+
+        return _walk(evidence or {}), dropped
+
+    def _finish_api_verdict(
+        self,
+        verdict: dict,
+        vp: dict,
+        probe: Dict[str, Any],
+        status_code: Optional[int] = None,
+        response_body: Optional[str] = None,
+        request_note: str = "",
+        body_truncated: bool = False,
+        response_content_type: Optional[str] = None,
+        response_headers_read: bool = True,
+        side_effect_target: Optional[Dict[str, Any]] = None,
+        side_effect_before: Optional[Dict[str, Any]] = None,
+        side_effect_after: Optional[Dict[str, Any]] = None,
+        snapshot: Optional[Dict[str, Any]] = None,
+        attestation: Optional[Dict[str, Any]] = None,
+    ) -> dict:
+        """Attach every api-phase evidence cell and hand the verdict back.
+
+        The cells go on **every** path the api phase can end on — the
+        request was made and answered, the request never went out, the
+        runner crashed — so a verdict always carries the same
+        bookkeeping, whatever the fault was.  A cell that only appears
+        on the happy path is a cell that cannot be checked afterwards.
+
+        Two things happen here that are not about the VP's own
+        assertions:
+
+          * the **header dimension** is booked down on its own, so a
+            content type that was never observed says so instead of
+            vanishing from the report;
+          * every **side observation** is dropped from the evidence.
+            A fact borrowed from another VP or from a sub-agent may be
+            logged; it may never be part of what a verdict is read
+            from.
+
+        And one more cell rides along with them: the **side condition**
+        of a negative, plan-scoped criterion — the missing plan must
+        not be created by the request that asked for it.  It is booked
+        down on the same terms as the others: a condition that was
+        never observed says so, and it is never reported as satisfied
+        because nothing ran.
+
+        The **harness identity** rides along with them too: which
+        backend the process answering a service's port really ran
+        under, read out of that process at snapshot time.  It is a cell
+        about the *service*, so it is booked down on every path — a
+        criterion that was never graded against the mcode backend must
+        say so, and "we could not tell" must never be read as "it was".
+
+        ``attestation`` is the round's **claim** on the instance the
+        contract would be booked from.  When the claim does not hold,
+        the contract cell books no field value at all: every field is
+        listed as ``unobserved`` with the reason and the two pids, so
+        an answer that came from somebody else's instance can never be
+        read as this criterion's own.
+        """
+        verdict = self._attach_data_plane_evidence(
+            verdict, vp, probe, response_body, request_note,
+            source=self._contract_source(vp, snapshot),
+            attestation=attestation,
+        )
+        verdict = self._attach_negative_expectation(
+            verdict, vp, status_code, response_body, request_note,
+            body_truncated,
+        )
+        verdict = self._attach_zero_side_effect(
+            verdict,
+            self._zero_side_effect_observation(
+                side_effect_target, side_effect_before, side_effect_after,
+                status_code, request_note,
+            ),
+        )
+        observation = self._content_type_observation(
+            status_code, response_content_type, response_headers_read,
+            request_note,
+        )
+        evidence = dict(verdict.get("evidence") or {})
+        evidence["content_type_observation"] = observation
+        # 2026-10-25 (VP-008): the **harness identity** — which backend
+        # the process answering a service's port really ran under, read
+        # out of that very process when the snapshot was taken.  It is
+        # booked down on every path, so a verdict always says whether
+        # the mcode backend was *observed* to be in effect, was observed
+        # **not** to be, or could not be observed at all.  The last
+        # answer is the one that used to be missing, and it is the one
+        # that must never be read as the first.
+        identity = dict((snapshot or {}).get("harness_identity") or {})
+        evidence["harness_identity"] = identity
+        # 2026-10-27: the **service identity** rides along with them:
+        # which process answered this VP's request, which tree it runs
+        # in, which commit that tree is checked out at, and whether the
+        # round's own claim agrees with what was observed.  The harness
+        # identity says *which backend*; this one says *which code* —
+        # and without it a PASSED verdict cannot be told apart from one
+        # that was answered by a process running a tree three commits
+        # behind.
+        service_identity = self._snapshot_service_identity(snapshot, vp)
+        evidence["service_identity"] = service_identity
+        verdict["evidence"] = evidence
+        if str(verdict.get("status") or "") != "PASSED":
+            reasons = list(verdict.get("reasons") or [])
+            reasons.append(self._content_type_reason(observation))
+            verdict["reasons"] = reasons
+        if identity:
+            # The reason names the service **this** VP is about: the
+            # identity of a service the criterion does not depend on is
+            # not this verdict's business.  When the VP's own service
+            # cannot be named, every identity is stated — the fact is
+            # never dropped.
+            target_service = self._vp_service_key(vp)
+            if target_service and target_service in identity:
+                named = [target_service]
+            elif target_service:
+                named = []
+            else:
+                named = sorted(identity)
+            if named:
+                reasons = list(verdict.get("reasons") or [])
+                for name in named:
+                    reasons.append(
+                        self._harness_identity_reason(identity[name]),
+                    )
+                verdict["reasons"] = reasons
+        # 2026-10-25 (VP-007): the **static entry** rides along with the
+        # header dimension.  Its three halves — the status, the media
+        # type and the title — are booked down one by one, out of this
+        # VP's own response, so a criterion that was never observed
+        # says which of the three it never saw.  The cell decides
+        # nothing: the verdict above is the one the VP's own assertions
+        # produced.
+        verdict = self._attach_static_entry_observation(
+            verdict, vp,
+            status_code=status_code,
+            response_body=response_body,
+            response_content_type=response_content_type,
+            response_headers_read=response_headers_read,
+            request_note=request_note,
+            body_truncated=body_truncated,
+        )
+        verdict["evidence"], dropped = self._strip_side_evidence(
+            verdict.get("evidence") or {},
+        )
+        if dropped:
+            vp_id = str(vp.get("id", "unknown"))
+            logger.warning(
+                "[api_runner] dropped %d side-observation evidence field(s) "
+                "from %s: %s",
+                len(dropped), vp_id, ", ".join(dropped),
+            )
+            self._safe_log_freshness_event(
+                vp_id, "side_evidence_dropped", {"fields": dropped},
+            )
+        return verdict
 
     def _run_api_test_vp(self, vp: dict) -> dict:
         """Grade an ``api_test`` VP without an LLM (2026-09-18).
@@ -6104,16 +10867,218 @@ class Orchestrator:
         from verification_api_runner import run_api_verification
 
         vp_id = str(vp.get("id", "unknown"))
-        # 2026-10-26 (merge): main 的 api_test 前置门禁 + 本分支的绑定/记账，
-        # 两边都要，顺序有讲究：
+        # 2026-10-26: the round already lost its lease (see
+        # :meth:`_assert_round_lease`) — this VP is **stopped**, not
+        # failed: it never ran, so it has no verdict of its own. Failing
+        # it would put one more red verification point in front of the
+        # repair loop for a fault that already happened once.
+        if getattr(self, "_round_lease_lost", None):
+            return self._round_lease_lost_stop_verdict(vp_id)
+        # 2026-10-26: the api phase already lost its service — a request
+        # went out and produced no response at all.  This VP is
+        # **stopped**, not run: asking a dead port the same question
+        # again is what turned one accident into nine identical
+        # failures.
+        if getattr(self, "_api_phase_service_lost", None):
+            return self._api_phase_service_lost_stop_verdict(vp_id)
+        # 2026-10-26: the round's **lease** on its services, checked
+        # before the request goes out.  On 2026-10-25 the api service was
+        # taken away by another backend's shutdown hook two minutes into
+        # the round, and the round never noticed: it sent nine requests
+        # at a dead port and reported nine identical "connection
+        # refused" failures.  The lease says who the service belongs to
+        # — reading it back is what turns "the service is gone" into
+        # "the service was taken away from me", and one round-level
+        # accident into one round-level conclusion.
+        loss = self._assert_round_lease()
+        if loss is not None:
+            return self._round_lease_lost_verdict(vp_id)
+        # 2026-10-26: the round's heartbeat, refreshed before the request
+        # goes out.  The lease is what keeps a foreign sweep from taking
+        # the service while this request is in flight, so the heartbeat
+        # has to be fresh at every request — not only at the preflight,
+        # where it was written once and then left to age.
+        self._touch_round_liveness()
+        # 2026-10-26 (merge): main 的 api_test 前置门禁 + 本分支的租约、
+        # 重启与绑定/记账，两边都要，顺序有讲究：
         #
-        # 1) **先**问 main 的门禁（``_ensure_api_test_services``）：它可能直接
+        # 1) **先**问本分支的轮次级事故（租约丢失 / api 阶段服务丢失）：
+        #    那是**轮次级**的一次事故，不是这条验证点自己的失败。
+        # 2) **再**是本分支的注册与重启：注册把「服务当时答没答」记下来，
+        #    重启把死在半路的服务拉回来 —— 拉不回来是 FAILED（判据根本没有
+        #    被观测到，不能藏起来不交给修复循环）。
+        # 3) **然后**问 main 的门禁（``_ensure_api_test_services``）：它判
+        #    BLOCKED —— 环境没就绪，不是产品的锅。
+        # 4) **最后**才绑定与记账：门禁放行之后请求确实会发出去，这时才
+        #    记录地址（这个 VP 会被发到哪儿、绑定的是哪个实例）并把 attempt
+        #    计数 +1。
+        #
         #    判 BLOCKED —— 那时请求一次都没发出去，所以本分支的 attempt 计数
         #    必须是 0（「0 = 从没发过请求」这条不变量不能破）。
-        # 2) **再**做本分支的绑定与记账：门禁放行之后请求确实会发出去，
         #    这时才记录地址（这个 VP 会被发到哪儿、绑定的是哪个实例）并把
         #    attempt 计数 +1。
+        #
+        # 2026-10-27 (merge): 第 2 步与第 3 步的先后是被两边各自的测试
+        # 钉住的，两条规则说的**不是**同一件事：
+        #
+        # * main 的门禁问的是「这条验证点声明的服务现在能用吗」——端口在听
+        #   **且**健康端点答话；不能用就是环境没就绪 → BLOCKED（infra，可重试，
+        #   不计同因阈值）。
+        # * 本分支的重启问的是「这条请求要打的那个服务还在吗」——不在就拉它，
+        #   拉不回来同样是环境没就绪 → BLOCKED（见下面 2026-10-27 的更正）。
+        #
+        # 所以顺序是**先重启、后门禁**：服务被拉回来之后门禁照样问它（端口在
+        # 听但健康端点哑了 → 仍然是 BLOCKED），而拉都拉不回来的那种情况由
+        # 重启自己给出 BLOCKED —— 它比门禁更具体（它知道是哪个服务、哪个
+        # 端口、为什么没拉回来），但**判据不变**。反过来（门禁在前）的话，
+        # 门禁会先判成 BLOCKED，重启这一次“先把服务拉回来”的努力就白费了。
+        #
+        # 2026-10-27 (merge): 本分支原来那条「拉不回来就是 FAILED」的规则
+        # 已改为「拉不回来就是 BLOCKED」—— **以 main 的语义为准**：只有断言
+        # 真的被证据证伪才判 FAILED。请求一次都没发出去，就谈不上「判据被
+        # 证伪」；把环境没就绪记成交付物失败，会让修复循环去修一条根本没
+        # 跑过的判据。
+        #
+        # 唯一保留 FAILED 的是**钉了后端**的服务（mcode）：那条判据量的就是
+        # 那个后端，后端不在 = 能力缺失 = 明确的失败（2026-10-26 的
+        # ``api_phase_service_lost``）。
 
+        # 2026-10-25 (repair-r1-22): the request is built from the
+        # instance the round bound — the one its ensure produced.  The
+        # URL the VP carries was resolved when the plan was resolved;
+        # this is the last word on where it points.
+        # 2026-10-25: the round's **ready record**, read before this
+        # VP's relaunch.  A relaunch that succeeds rewrites the
+        # runtime map, and the question the failure class answers is
+        # what the round had *before* it started healing itself.
+        ready_record = self._services_ready_record()
+        # 2026-10-25: one **read-only** registration of the declared
+        # health endpoint, taken before the request and before the
+        # relaunch — so it records what the round *found*, not what the
+        # round fixed.  It says whether the service was answering, which
+        # is what turns "the data-plane field was not observed" into a
+        # diagnosable sentence instead of "the request failed".  It
+        # decides nothing: the VP's own assertions stay the only basis
+        # for a PASSED.
+        probe = self._probe_declared_health_url(vp)
+        self._safe_log_freshness_event(
+            vp_id, "data_plane_probe", self._public_probe(probe),
+        )
+        # 2026-10-25 (VP-006): the **side condition** of a negative,
+        # plan-scoped criterion — a plan that does not exist must not be
+        # created by the request that asked for it.  The target is
+        # resolved here, before the relaunch, so the cell is booked down
+        # on every path the api phase can end on; the snapshots that go
+        # with it are taken around the request itself.
+        side_effect_target = self._zero_side_effect_target(vp)
+        # 2026-10-25 (Leg B): the round resolved the service URL once,
+        # at preflight, and never looked at the port again. A service
+        # that died in between — a foreign sweep taking it, a crash —
+        # turned into a connection-refused minutes later, with nothing
+        # in the round's log to say why. Probe the port the request is
+        # about to use, and if it is dead, start the service again **on
+        # the same port**, so the URL the VP was given stays true.
+        relaunch = self._relaunch_service_for_vp(vp)
+        if relaunch is not None and not relaunch.get("ok"):
+            snapshot = self._record_api_phase_service_snapshot(vp)
+            # 2026-10-26: a service that **pins a backend** and cannot be
+            # brought back is a missing capability, and the hard
+            # constraints call that an explicit failure by name: the
+            # mcode backend is unavailable, so the criterion that grades
+            # it was not observed.  The loss is written down under the
+            # service's own name, so "the mcode service is not there" and
+            # "the api service is not there" stay two different facts —
+            # and the default claude path, which pins no backend, keeps
+            # the verdict it always had.
+            capability = self._pinned_backend_capability(
+                str(relaunch.get("service") or ""),
+            )
+            if not capability:
+                # 2026-10-27 (merge): **main 的语义** —— 服务不可用且重试
+                # 后仍不可达 → BLOCKED（infra，可重试，不计同因阈值）。
+                # 只有断言真的被证据证伪才判 FAILED；请求一次都没发出去，
+                # 谈不上「判据被证伪」。
+                #
+                # 重启尝试保留在前面（先重启、再判 BLOCKED）：先尽力把服务
+                # 拉回来，拉不回来才判 BLOCKED —— 判据仍然是环境没就绪。
+                #
+                # 这个 BLOCKED 走的是和别的路径**同一个**收尾
+                # （:meth:`_finish_api_verdict`）：证据格是每一格都要订的
+                # —— 请求没发出去/health 探针看到了什么/负向判据有没有被
+                # 观测到，都得落在裁决上，否则"环境没就绪"这条结论就只剩
+                # 一句话，没有可核对的凭据。
+                return self._finish_api_verdict(
+                    self._attach_failure_class(
+                        self._build_api_test_relaunch_blocked_verdict(
+                            vp_id, relaunch, snapshot,
+                        ),
+                        vp, snapshot, ready_record,
+                        note="the service could not be restarted",
+                    ),
+                    vp, probe,
+                    request_note=(
+                        "the request was never made: the service could not "
+                        "be restarted"
+                    ),
+                    side_effect_target=side_effect_target,
+                    snapshot=snapshot,
+                )
+            # A service that cannot be brought back is a FAILED verdict,
+            # never a SKIPPED one: the VP's acceptance criterion (the
+            # endpoint's contract) was not observed, and pretending it
+            # was not applicable would hide it from the repair loop.
+            surface = self._execution_surface()
+            reasons = [
+                "service unavailable at request time",
+                (
+                    f"service {relaunch.get('service')!r} on port "
+                    f"{relaunch.get('port')} could not be restarted: "
+                    f"{relaunch.get('reason')}"
+                    + (
+                        f"; {relaunch.get('detail')}"
+                        if relaunch.get("detail") else ""
+                    )
+                ),
+            ]
+            evidence: Dict[str, Any] = {
+                "vp_id": vp_id,
+                "service_relaunch": relaunch,
+                "execution_surface": surface,
+                "service_liveness": snapshot,
+            }
+            loss = self._record_api_phase_service_lost(
+                vp,
+                port=relaunch.get("port"),
+                expected_pid=None,
+                actual_pid=None,
+                leased=None,
+                kind="service_not_restarted",
+                scope="vp",
+                detail=capability["detail"],
+            )
+            reasons.append(capability["detail"])
+            evidence["api_phase_service_lost"] = loss
+            reasons.append(self._execution_surface_reason(surface))
+            reasons.append(self._service_liveness_reason(snapshot))
+            verdict = {
+                "status": "FAILED",
+                "reasons": reasons,
+                "evidence": evidence,
+            }
+            return self._finish_api_verdict(
+                self._attach_failure_class(
+                    verdict, vp, snapshot, ready_record,
+                    note="the service could not be restarted",
+                ),
+                vp, probe,
+                request_note=(
+                    "the request was never made: the service could not be "
+                    "restarted"
+                ),
+                side_effect_target=side_effect_target,
+                snapshot=snapshot,
+            )
+        # 2026-10-27 (merge): main 的门禁在重启之后 —— 见上面那段顺序说明。
         # The service has to be there before the question is asked.
         blocked_ports, detail = self._ensure_api_test_services(vp)
         if blocked_ports:
@@ -6124,11 +11089,246 @@ class Orchestrator:
             return self._build_api_test_blocked_verdict(
                 vp_id, blocked_ports, detail,
             )
-
-        # 2026-10-25 (repair-r1-22): the request is built from the
-        # instance the round bound — the one its ensure produced.  The
-        # URL the VP carries was resolved when the plan was resolved;
-        # this is the last word on where it points.
+        # 2026-10-25 (VP-009): the relaunch path checks the backend of
+        # the process it starts, but a service that was **already alive**
+        # was never checked at all. The endpoint answers the same way on
+        # both backends, so a VP could be graded on a claude backend
+        # process while its declaration names the mcode one — the
+        # "configured but not actually in effect" service the hard
+        # constraints call an acceptance failure. Confirm the backend of
+        # the process that is actually answering the port before the
+        # request is graded.
+        backend = self._verify_service_backend_for_vp(vp)
+        if backend is not None and not backend.get("ok"):
+            snapshot = self._record_api_phase_service_snapshot(vp)
+            surface = self._execution_surface()
+            # 2026-10-26: the headline depends on **what** is wrong.
+            # The service being gone and the service answering for
+            # somebody else are two different accidents, and the verdict
+            # has to say which one it is.
+            if backend.get("service_absent"):
+                headline = (
+                    "the backend this verification point grades is not "
+                    "available: its service is not answering"
+                )
+            elif backend.get("listener_mismatch"):
+                headline = (
+                    "the service answering the request is not the "
+                    "instance this round leased for it"
+                )
+            else:
+                headline = (
+                    "the service answering the request does not run the "
+                    "backend its declaration pins"
+                )
+            reasons = [headline, str(backend.get("detail") or "")]
+            evidence: Dict[str, Any] = {
+                "vp_id": vp_id,
+                "service_backend": backend,
+                "execution_surface": surface,
+                "service_liveness": snapshot,
+            }
+            # 2026-10-26: the service is **gone** (or answering for
+            # somebody else).  The round writes that down under the
+            # service's own name, because "the mcode service is not
+            # there" and "the api service is not there" are two
+            # different repairs, and because the loss has to be in the
+            # log before the repair loop reads the report.
+            if backend.get("service_absent") or backend.get("listener_mismatch"):
+                loss = self._record_api_phase_service_lost(
+                    vp,
+                    port=backend.get("port"),
+                    expected_pid=backend.get("expected_pid"),
+                    actual_pid=backend.get("actual_pid"),
+                    leased=backend.get("lease") or None,
+                    kind=str(backend.get("kind") or ""),
+                    scope="vp",
+                    detail=str(backend.get("detail") or ""),
+                )
+                evidence["api_phase_service_lost"] = loss
+            reasons.append(self._execution_surface_reason(surface))
+            reasons.append(self._service_liveness_reason(snapshot))
+            verdict = {
+                "status": "FAILED",
+                "reasons": reasons,
+                "evidence": evidence,
+            }
+            # The sentence says **which** fault it was.  The failure
+            # class it feeds is read by a repair loop that acts on the
+            # difference between "the service is gone" and "somebody else
+            # answered", and a note that says the same thing for both
+            # sends it back to the same repair.
+            if backend.get("service_absent"):
+                request_note = (
+                    "the request was never made: the service this "
+                    "verification point grades is not answering"
+                )
+            elif backend.get("listener_mismatch"):
+                request_note = (
+                    "the request was never made: the service answering the "
+                    "port is not the instance this round leased for it"
+                )
+            else:
+                request_note = (
+                    "the request was never made: the service answering the "
+                    "port does not run the backend its declaration pins"
+                )
+            return self._finish_api_verdict(
+                self._attach_failure_class(
+                    verdict, vp, snapshot, ready_record,
+                    note=request_note,
+                ),
+                vp, probe,
+                request_note=request_note,
+                side_effect_target=side_effect_target,
+                snapshot=snapshot,
+            )
+        # 2026-10-25: the snapshot is taken **before** the request goes
+        # out. A failed request used to say only "connection refused",
+        # which is the same sentence for three different faults: the
+        # service never came up, the service was killed between the
+        # phases, and the code that graded this VP is not the code
+        # under test. The snapshot says what was listening, and the
+        # execution surface says who was asking.
+        snapshot = self._record_api_phase_service_snapshot(vp)
+        # 2026-10-26 (VP-009): the round's **claim** on the instance.
+        # The lease is the record a reaper in another process reads; the
+        # round's own runtime map is the record it keeps when the ledger
+        # holds none (a foreign reap finalised the ledger, and the
+        # round still knows which process it started).  When the claim
+        # names the process that is answering the port, the answer is
+        # this round's answer.  When it does not — the service was
+        # taken away and somebody else took the port — the request is
+        # **not made**: a criterion about the mcode backend graded on
+        # the claude instance's answer is worse than no answer, because
+        # it looks like an observation.
+        #
+        # The default claude path pins no backend and has no claim to
+        # attest: its behaviour does not change.
+        attestation = self._contract_instance_attestation(vp, snapshot)
+        if attestation.get("attested") is False:
+            surface = self._execution_surface()
+            detail = str(attestation.get("detail") or "")
+            reasons = [
+                "the backend this verification point grades is not "
+                "available: the instance that answered the port is not "
+                "the one this round holds the claim on for it",
+                detail,
+            ]
+            evidence: Dict[str, Any] = {
+                "vp_id": vp_id,
+                "execution_surface": surface,
+                "service_liveness": snapshot,
+                "contract_instance_attestation": attestation,
+            }
+            # 2026-10-26: the loss is written down under the service's
+            # own name, with the two pids that disagree — the round
+            # expected one process to be serving the port and another
+            # one is.  That is the fact the repair loop acts on.
+            loss = self._record_api_phase_service_lost(
+                vp,
+                port=attestation.get("port"),
+                expected_pid=attestation.get("expected_pid"),
+                actual_pid=attestation.get("actual_pid"),
+                leased=None,
+                kind=str(
+                    "listener_mismatch"
+                    if attestation.get("actual_pid") is not None
+                    else "service_absent"
+                ),
+                scope="vp",
+                detail=detail,
+            )
+            evidence["api_phase_service_lost"] = loss
+            reasons.append(self._execution_surface_reason(surface))
+            reasons.append(self._service_liveness_reason(snapshot))
+            verdict = {
+                "status": "FAILED",
+                "reasons": reasons,
+                "evidence": evidence,
+            }
+            request_note = (
+                "the request was never made: the instance answering the "
+                "port is not the one this round holds the claim on for it"
+            )
+            return self._finish_api_verdict(
+                self._attach_failure_class(
+                    verdict, vp, snapshot, ready_record,
+                    note=request_note,
+                ),
+                vp, probe,
+                request_note=request_note,
+                side_effect_target=side_effect_target,
+                snapshot=snapshot,
+                attestation=attestation,
+            )
+        # 2026-10-25: the audit artifact is stamped **before** the
+        # request.  The runner keeps the response headers there, and
+        # the stamp is what tells this round's copy of it from the
+        # previous round's — a copy left over from an earlier round is
+        # a neighbour's observation, and it may not be booked in as if
+        # it were this VP's own.
+        artifact_stamp = self._api_artifact_stamp(vp_id)
+        # 2026-10-25 (VP-006): the **before** snapshot of the side
+        # condition.  It is taken here, right before the request goes
+        # out, so the comparison that follows is about the request and
+        # about nothing else.
+        side_effect_before = self._side_effect_snapshot(side_effect_target)
+        # 2026-10-26 (VP-004): the **listener's identity**.  The
+        # criterion asks whether *this* instance refuses a request that
+        # does not carry the guard header; a refusal from any process on
+        # the port would say nothing about the backend the plan
+        # declared.  The port is checked against the process this round
+        # leased before the request goes out, and if it answers for
+        # somebody else the request is **not made**: a verdict graded on
+        # a stranger's answer is worse than no verdict, because it looks
+        # like an observation.
+        #
+        # Nothing is restarted here.  A service that is gone is
+        # reported as gone: restarting it so the criterion comes out
+        # right would hide the very crash the criterion is about.
+        service_lost = self._assert_service_listener_identity(vp)
+        if service_lost is not None:
+            snapshot = self._record_api_phase_service_snapshot(vp)
+            surface = self._execution_surface()
+            verdict = {
+                "status": "BLOCKED",
+                "status_detail": "BLOCKED_SERVICE_LOST",
+                "reasons": [
+                    "BLOCKED_SERVICE_LOST: the port this request uses is "
+                    "answered by a process this round did not ensure, so "
+                    "the criterion was not observed",
+                    f"port: {service_lost.get('port')}",
+                    f"expected_pid: {service_lost.get('expected_pid')}",
+                    f"actual_pid: {service_lost.get('actual_pid')}",
+                    "last_reap_reason: "
+                    f"{service_lost.get('last_reap_reason')}",
+                    f"lease_owner: {service_lost.get('lease_owner')}",
+                    self._execution_surface_reason(surface),
+                    self._service_liveness_reason(snapshot),
+                ],
+                "actual_result": (
+                    "本轮租约里的服务实例已不在这个端口上（监听者与租约不符），"
+                    "请求没有发出；该判据没有被观测，也不是它自身的失败。"
+                ),
+                "evidence": {
+                    "vp_id": vp_id,
+                    "status_detail": "BLOCKED_SERVICE_LOST",
+                    "api_phase_service_lost": service_lost,
+                    "execution_surface": surface,
+                    "service_liveness": snapshot,
+                },
+            }
+            return self._finish_api_verdict(
+                verdict, vp, probe,
+                request_note=(
+                    "the request was never made: the port is answered by a "
+                    "process this round did not ensure"
+                ),
+                side_effect_target=side_effect_target,
+                side_effect_before=side_effect_before,
+                snapshot=snapshot,
+            )
         vp = self._bind_vp_service_address(vp)
         # 2026-10-25 (repair-r1-31): the address this request goes to
         # is recorded **before** it goes there — the transport's own
@@ -6138,20 +11338,49 @@ class Orchestrator:
         self._note_vp_attempt(vp_id)
         try:
             result = run_api_verification(
-                vp,
+                # 2026-10-25 (VP-002): the plan's URL is the service
+                # **placeholder** (``{{svc.api.url}}/health/data``), and
+                # a placeholder is not a URL — the request died with
+                # ``unknown url type`` even when the relaunch had just
+                # put the service back.  Resolve it against the same
+                # effective declarations the relaunch used, so the
+                # request and the restart agree on the port.
+                self._vp_with_resolved_request_url(vp),
                 artifact_dir=self.plan_dir / "vp_artifacts",
             )
         except Exception as exc:  # noqa: BLE001 - runner never raises
             logger.exception(
                 "[api_runner] unexpected failure for %s", vp_id,
             )
-            return {
+            surface = self._execution_surface()
+            verdict = {
                 "status": "FAILED",
                 "reasons": [
-                    f"api_test runner crashed: {type(exc).__name__}: {exc}"
+                    f"api_test runner crashed: {type(exc).__name__}: {exc}",
+                    self._execution_surface_reason(surface),
+                    self._service_liveness_reason(snapshot),
                 ],
-                "evidence": {"vp_id": vp_id},
+                "evidence": {
+                    "vp_id": vp_id,
+                    "execution_surface": surface,
+                    "service_liveness": snapshot,
+                },
             }
+            return self._finish_api_verdict(
+                self._attach_failure_class(
+                    verdict, vp, snapshot, ready_record,
+                    request_error=f"{type(exc).__name__}: {exc}",
+                    note="the api_test runner crashed",
+                ),
+                vp, probe,
+                request_note=(
+                    "the request produced no response: the api_test runner "
+                    "crashed"
+                ),
+                side_effect_target=side_effect_target,
+                side_effect_before=side_effect_before,
+                snapshot=snapshot,
+            )
 
         # 2026-10-25 (repair-r1-31): a response came back, so the
         # instance that answered can be named.  Its boot id is what
@@ -6164,18 +11393,80 @@ class Orchestrator:
             if answering:
                 address["answering_boot_id"] = answering
 
+        # 2026-10-25 (VP-006): the **after** snapshot of the side
+        # condition — taken once the request has been answered, so the
+        # comparison is about this request and about nothing else.
+        side_effect_after = self._side_effect_snapshot(side_effect_target)
         verdict = result.to_verdict_dict()
+        # 2026-10-27: the accounting of what the request actually did.
+        # A request that produced **no response** ran none of the VP's
+        # assertions — there was nothing to compare against.  Writing
+        # that number down keeps a transport fault from being read as a
+        # broken contract (assertions failed) or as a satisfied one
+        # (assertions passed): it is neither, it is a fault of the
+        # transport, and the criterion was not observed at all.
+        assertions_executed = self._assertions_executed(result)
+        verdict.setdefault("evidence", {})["assertions_executed"] = (
+            assertions_executed
+        )
         # 2026-10-25 (repair-r1-26): a request that never reached the
         # service is not a verdict about the product.  The
         # classification layer runs **before** the verdict is recorded,
         # so what lands on disk is BLOCKED, not FAILED.
         verdict = self._classify_transport_failure(vp_id, verdict)
 
+        # 2026-10-26: the request's own outcome, split into the two
+        # kinds that must never be confused again.  A request that came
+        # back — with any status code, even a 500 — was **answered**,
+        # and its verdict belongs to this verification point.  A request
+        # that produced no response at all was not answered by anybody.
+        #
+        # When the port that did not answer is **the round's own
+        # service** — the one this round brought up, now gone — that is
+        # a fact about the **round**, and it is escalated as one (see
+        # below) instead of being written down as this verification
+        # point's own failure.  An endpoint the round does not own is
+        # left alone: its silence is that endpoint's business, and the
+        # round must not stop for it.
+        transport_error = self._api_result_transport_error(result)
+        transport_kind = self._transport_error_kind(transport_error)
+        if (
+            transport_kind
+            and self._round_service_port_claim(vp)
+            and self._api_phase_service_gone(vp, transport_kind)
+        ):
+            loss = self._record_api_phase_service_lost(
+                vp,
+                port=self._vp_target_port(vp),
+                expected_pid=None,
+                actual_pid=None,
+                leased=None,
+                error=transport_error,
+                kind=transport_kind,
+                scope="round",
+            )
+            self._api_phase_service_lost = loss
+            verdict = self._api_phase_service_lost_verdict(vp_id, loss)
+            # The escalation replaces the verdict, not the accounting:
+            # the criterion was still not observed, and the number of
+            # assertions that ran is still zero.
+            verdict.setdefault("evidence", {})["assertions_executed"] = (
+                assertions_executed
+            )
         # 2026-10-26 (merge): main 的分类在**之后**：它只往裁决上补两个键
         # （``failure_class`` / ``failure_class_source``），是就地改写；而本分支
         # 的分类会把 FAILED 换成一个**新的**裁决字典 —— 所以必须本分支先跑，
         # 否则 main 补的键会被新字典丢掉。
         self._classify_api_test_verdict(verdict, result)
+        # 2026-10-26: the **service snapshot** rides on this event, so
+        # the event itself says which instance answered: the port, the
+        # process that was listening on it, the round that owns the
+        # lease on it, and how long ago the round brought its services
+        # up.  Without it the event says "the request failed" and
+        # nothing about *what* answered — and a reader cannot tell a
+        # wrong answer from no answer at all without going to look in
+        # another file.
+        service_identity = self._vp_service_identity(vp)
         self._safe_log_freshness_event(
             vp_id, "api_test_executed",
             {
@@ -6183,9 +11474,113 @@ class Orchestrator:
                 "status_code": result.evidence.get("status_code"),
                 "assertions_failed": result.evidence.get("assertions_failed"),
                 "signal": result.evidence.get("signal"),
+                # How many assertions ran.  Zero when the request
+                # produced no response: there was nothing to compare
+                # against, so the criterion was not observed — which is
+                # not the same thing as a criterion that failed.
+                "assertions_executed": assertions_executed,
+                "service_snapshot": (
+                    self._api_phase_service_snapshot_summary(
+                        vp, identity=service_identity
+                    )
+                ),
+                # 2026-10-27: the **service identity** — which process
+                # answered this request, which **tree** it runs in, which
+                # commit that tree is checked out at, and whether the
+                # round's own claim agrees with what was observed.  The
+                # four facts above say *who* answered; this one says
+                # *which code* answered, and without it "the change was
+                # made but the request ran against the old process" is
+                # not readable after the fact.
+                "service_identity": service_identity,
+                # The transport fault, when there was one: "no response"
+                # and "the service is gone" are different sentences, and
+                # the event is where the difference is written down.
+                "error": transport_error or None,
             },
         )
-        return verdict
+        # 2026-10-27: the execution surface and the service liveness
+        # are booked down on **every** verdict, a PASSED one included.
+        # They used to ride only on the failed ones, and that is
+        # exactly the case where they are worth nothing: a PASSED
+        # verdict is read as "the code under repair works", and the
+        # reader has no way to see that the answer came from a process
+        # running a tree three commits behind.  The fork is gone — a
+        # fact that is only written down when it is inconvenient is not
+        # a fact.
+        surface = self._execution_surface()
+        evidence = dict(verdict.get("evidence") or {})
+        evidence["execution_surface"] = surface
+        evidence["service_liveness"] = snapshot
+        verdict["evidence"] = evidence
+        if str(verdict.get("status") or "") != "PASSED":
+            # 2026-10-25: a failed request names the execution surface
+            # and the service liveness, so the report can tell the
+            # three faults apart instead of repeating "connection
+            # refused" nine times.
+            reasons = list(verdict.get("reasons") or [])
+            reasons.append(self._execution_surface_reason(surface))
+            reasons.append(self._service_liveness_reason(snapshot))
+            verdict["reasons"] = reasons
+            # 2026-10-25: and it says **which** of the three faults
+            # this was — the round never had the service, the service
+            # died before the request, or the request failed against a
+            # service that is there.  "connection refused" is one
+            # sentence for all three, and they have three different
+            # repairs.
+            verdict = self._attach_failure_class(
+                verdict, vp, snapshot, ready_record,
+                request_error=result.evidence.get("error"),
+                response_received="response_body" in result.evidence,
+            )
+        # 2026-10-25: the data-plane cell. The registration and the
+        # observation go into the evidence of **every** verdict — a
+        # PASSED one included — so the reader can see that the field
+        # was observed without having to look for the audit artifact.
+        # Neither of them touches the status: the verdict above is the
+        # one the VP's own assertions produced.
+        #
+        # The negative-expectation cell rides along with it: a VP that
+        # expects a rejection has to say whether the rejection was
+        # really seen, and "the request produced no response" is not it.
+        request_error = result.evidence.get("error")
+        schema_issues = result.evidence.get("schema_issues") or []
+        if schema_issues:
+            request_note = (
+                "the request was never made: the api_test declaration is "
+                f"not executable ({schema_issues[0].get('detail')})"
+            )
+        elif request_error:
+            request_note = (
+                f"the request produced no response: {request_error}"
+            )
+        else:
+            request_note = ""
+        # 2026-10-25: the **header dimension**.  The response headers
+        # live in the audit artifact the runner has just written, so
+        # they are read back from there — but only when the copy on
+        # disk is the one this request wrote.  The header is booked
+        # down on its own, apart from the body: a content type that was
+        # never observed has to say so, and it must not be confused with
+        # a body field that was not observed.
+        content_type, headers_read = self._read_response_content_type(
+            vp_id, artifact_stamp,
+        )
+        return self._finish_api_verdict(
+            verdict, vp, probe,
+            status_code=result.evidence.get("status_code"),
+            response_body=result.evidence.get("response_body"),
+            request_note=request_note,
+            body_truncated=bool(
+                result.evidence.get("response_body_truncated")
+            ),
+            response_content_type=content_type,
+            response_headers_read=headers_read,
+            side_effect_target=side_effect_target,
+            side_effect_before=side_effect_before,
+            side_effect_after=side_effect_after,
+            snapshot=snapshot,
+        )
 
     def _classify_transport_failure(
         self, vp_id: str, verdict: dict,
@@ -7605,6 +13000,52 @@ class Orchestrator:
         )
         return verdict
 
+    def _build_api_test_relaunch_blocked_verdict(
+        self,
+        vp_id: str,
+        relaunch: Dict[str, Any],
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> dict:
+        """A BLOCKED verdict for a service that could not be brought back.
+
+        2026-10-27 (merge): **main 的语义** —— 服务不可用且重试后仍不可达
+        → BLOCKED。只有断言真的被证据证伪才判 FAILED；这里请求一次都没发
+        出去，谈不上「判据被证伪」。把环境没就绪记成交付物失败，会让修复
+        循环去修一条根本没跑过的判据。
+
+        信封是 main 的那个门禁的同一个（:meth:`_build_api_test_blocked_verdict`）：
+        signal 是 ``service_not_ready``，failure_class 是 ``infra`` —— 环境
+        没就绪，可重试，不计同因阈值。
+
+        重启的事实（哪个服务、哪个端口、为什么没拉回来）挂在 evidence 上：
+        它是**诊断**，不是判定依据 —— 判定依据只有一条：服务不可达。
+
+        钉了后端的服务不走这里：那种服务拉不回来是**能力缺失**，由
+        ``_pinned_backend_capability`` 判成 FAILED（见调用处）。
+        """
+        port = relaunch.get("port")
+        try:
+            ports = [int(port)] if port is not None else []
+        except (TypeError, ValueError):
+            ports = []
+        detail = (
+            f"service {relaunch.get('service')!r} on port {port} could not "
+            f"be restarted: {relaunch.get('reason')}"
+            + (
+                f"; {relaunch.get('detail')}"
+                if relaunch.get("detail") else ""
+            )
+        )
+        verdict = self._build_api_test_blocked_verdict(vp_id, ports, detail)
+        evidence = verdict.get("evidence")
+        if not isinstance(evidence, dict):
+            evidence = {}
+        evidence["service_relaunch"] = relaunch
+        if snapshot is not None:
+            evidence["service_liveness"] = snapshot
+        verdict["evidence"] = evidence
+        return verdict
+
     # ------------------------------------------------------------------
     # The service gate — recoverable, and diagnosable when it blocks
     # ------------------------------------------------------------------
@@ -7972,6 +13413,19 @@ class Orchestrator:
         # (surface metadata for the vp_start event, not enforcement).
         timeout_seconds = self.timeout_policy.resolve(method)
 
+        # 2026-10-27: the **service identity** of the ui / e2e phases.
+        # Those two phases are dispatched to a sub-agent, and nothing
+        # else in their path says which process the criterion will be
+        # graded against: their url is a page to open, not a port the
+        # framework owns.  So the dispatch record carries the identity
+        # of the service that url names — the process, the tree it runs
+        # in, the commit that tree is checked out at — and a reader can
+        # tell "the page was checked" from "the page was checked
+        # against the code under repair".
+        dispatch_identity: Dict[str, Any] = {}
+        if method in SERVICE_IDENTITY_DISPATCH_METHODS:
+            dispatch_identity = self._vp_service_identity(vp)
+
         # Log verification point start
         self.persistence.write_verification_point_log(
             vp_id,
@@ -7982,6 +13436,7 @@ class Orchestrator:
                 "priority": vp.get("priority", ""),
                 "expected_result": vp.get("expected_result", ""),
                 "timeout_seconds": timeout_seconds,
+                "service_identity": dispatch_identity,
             }
         )
 
@@ -8837,6 +14292,13 @@ class Orchestrator:
         # ``status="SPLIT" + child_results=[...]`` envelope.
         execution_results = self._aggregate_split_vps(execution_results)
 
+        # 2026-10-26: the round's lease, checked once more before the
+        # judgment.  The judgment phase can run for minutes, and a round
+        # whose services were taken away in the meantime must publish
+        # that as a round-level error — not as a verdict about a service
+        # nobody was serving any more.
+        self._assert_round_lease()
+
         # Generate report using LLM
         prompt = self._build_judgment_prompt(execution_results)
 
@@ -8957,6 +14419,13 @@ class Orchestrator:
                 report_data = self._exclude_environment_blocked_from_failures(
                     report_data, execution_results,
                 )
+                # 2026-10-27：把"判它的是哪次提交"盖到报告行上。
+                #
+                # 这个字段只能由框架盖 —— 判定 LLM 不知道 HEAD，也不该编一
+                # 个。执行结果里带着的按执行结果盖（本轮真跑出来的那棵树上
+                # 的结论）；执行结果里没有的（本轮延后的关卡：什么都没判）
+                # 把 LLM 可能编出来的值抹掉。
+                self._stamp_judged_heads(report_data, execution_results)
 
                 # Add metadata
                 report_data["generated_at"] = datetime.now().isoformat()
@@ -8973,6 +14442,16 @@ class Orchestrator:
                     report_data["environment_blocked_reason"] = (
                         self._environment_blocked_summary()
                     )
+
+                # 2026-10-26: a round that lost its lease on its services
+                # is an **error**.  It is published at the top level of
+                # the report, because the per-VP verdicts alone ("nine
+                # api_test VPs failed with connection refused") point the
+                # repair loop at nine features that were never broken.
+                round_error = self._round_error_report()
+                if round_error:
+                    report_data["round_error"] = round_error
+                    report_data["overall_status"] = "FAILED"
 
                 # Compute execution_profile (static budget projection
                 # consumed by the bridge UI). The profile mirrors
@@ -9055,6 +14534,12 @@ class Orchestrator:
             parts.append(
                 f"- 判定依据: {_render_evidence_for_prompt(evidence)}"
             )
+            # 2026-10-27：判定 LLM 要能看到"这条结论判在哪次提交上" ——
+            # 结论只对产生它的那份代码有效。看不到它，LLM 就无法区分
+            # "这一轮真的跑过了"和"沿用了一份别的提交上的结论"。
+            judged_head = str(result.get(JUDGED_HEAD_FIELD) or "")
+            if judged_head:
+                parts.append(f"- 判定提交 (judged_head): {judged_head}")
             parts.append("")
 
         return "\n".join(parts)
@@ -9083,6 +14568,10 @@ class Orchestrator:
             )
         except Exception:
             pass
+        # The judgment phase can run for minutes with no VP activity;
+        # the round is still alive, so the heartbeat that protects its
+        # services has to keep saying so.
+        self._touch_round_liveness()
 
     def _generate_minimal_report(self, execution_results: dict) -> dict:
         """Generate minimal verification report when LLM fails."""
@@ -9144,6 +14633,14 @@ class Orchestrator:
         into a crashed verification run.
         """
         report = self._generate_minimal_report(execution_results)
+
+        # 2026-10-26: the round-level error travels with the fallback
+        # report too — a degraded judgment must not hide the fact that
+        # the round lost its lease on its services.
+        round_error = self._round_error_report()
+        if round_error:
+            report["round_error"] = round_error
+            report["overall_status"] = "FAILED"
 
         # ``rounds`` is owned by ``snapshot_round_results``; a bare
         # overwrite would drop every earlier round's audit trail.
@@ -9499,6 +14996,61 @@ class Orchestrator:
             if isinstance(vp, dict)
         }
 
+    def _plan_vp_definitions(
+        self, plan_data: Any = None,
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        """The verification points as the plan defines them (id → entry).
+
+        Two callers, two sources, one authority:
+
+        * ``plan_data`` given → the **in-memory** plan the executor was
+          built from (this branch: an id issued by the delta evaluation
+          must be looked up before it is dispatched);
+        * ``plan_data`` omitted → the plan **file** on disk (main: the
+          file is the authority on what a verification point is — the
+          in-memory plan cannot answer that, because the plan-to-executor
+          conversion defaults a missing method to ``code_review``, so a
+          definition-less entry arrives wearing a method it never
+          declared).
+
+        ``None`` means "there is no plan on disk" (missing or unreadable).
+        The dispatch guard stands down in that case: with nothing to
+        compare against, every verification point would look undefined,
+        and blocking the whole round would be worse than the defect it
+        guards against.
+
+        Keys use the same id derivation as the executor
+        (``_convert_plan_to_executor_schema`` uses ``vp.get("id",
+        "unknown")``), otherwise "look the definition up" would read a
+        nameless VP as "no definition".
+        """
+        if plan_data is None:
+            try:
+                raw = json.loads(self.verification_plan_file.read_bytes())
+            except FileNotFoundError:
+                return None
+            except (OSError, json.JSONDecodeError):
+                logger.warning(
+                    "[Verification] %s is unreadable; the VP definition guard "
+                    "stands down for this round",
+                    self.verification_plan_file,
+                )
+                return None
+            if not isinstance(raw, dict):
+                return None
+            points = raw.get("verification_points")
+            if not isinstance(points, list):
+                return None
+        else:
+            if not isinstance(plan_data, dict):
+                return {}
+            points = plan_data.get("verification_points") or []
+        return {
+            str(vp.get("id") or "unknown"): vp
+            for vp in points
+            if isinstance(vp, dict)
+        }
+
     def _build_vp_definition_blocked_verdict(
         self, vp_id: str, gaps: List[str],
     ) -> Dict[str, Any]:
@@ -9549,6 +15101,184 @@ class Orchestrator:
             "framework_checks": [],
         }
 
+    # ------------------------------------------------------------------
+    # 2026-10-26：裁决的出处 —— "这条结论是哪条定义、哪次提交挣来的"
+    # ------------------------------------------------------------------
+    #
+    # 事故（VP-031）：增量评估发过 VP-031 这个号，但它的定义从未落进
+    # ``verification_plan.json``。于是
+    #
+    #   * 执行器**无定义可分派** —— 那条 VP 这一轮一次都没跑；
+    #   * 它此前挣到的失败被原样沿用，报告里 VP-031 的 title /
+    #     expected_result 是空的，失败却是"真的"；
+    #   * 而结果里不记"判它的是哪次提交"，跨提交沿用根本无从发现。
+    #
+    # 下面这几个方法是那三件事的落地：分派前查定义、结论盖上 HEAD、
+    # 投影时不沿用无定义的旧结论。
+
+    def _current_project_head(self) -> str:
+        """被验代码当前所在的提交（判结论的"这份代码"）。
+
+        空串 = 查不到（不是 git 仓库 / git 不可用）。查不到时**不下**
+        "要不要重跑"的判断 —— 无从比较时不猜（见
+        :func:`requires_reexecution`）。
+
+        缓存一次：一次 round 里代码不会变，而每条 VP 都查一次 git 是
+        白烧的进程。
+        """
+        if getattr(self, "_round_head", None) is None:
+            from verification_plan_delta import current_git_head
+            # ``getattr`` 而不是直接取属性：这个方法会被
+            # ``VerificationAgent.__new__`` 造出来的（没跑 ``__init__``）
+            # 实例调用 —— 那样的实例没有 ``project_dir``。
+            self._round_head = current_git_head(
+                getattr(self, "project_dir", None)
+            )
+        return self._round_head or ""
+
+    @staticmethod
+    def _judged_head_of(verdict: Any) -> str:
+        """一条裁决里"判它的那次提交"。
+
+        两处都读：顶层（内存路径）与 ``evidence`` 里（落库路径 ——
+        ``VerificationRepository.append_verdict`` 只保留固定几个字段，
+        ``evidence`` 是唯一能原样落库的地方）。
+        """
+        if not isinstance(verdict, dict):
+            return ""
+        head = str(verdict.get(JUDGED_HEAD_FIELD) or "")
+        if head:
+            return head
+        evidence = verdict.get("evidence")
+        if isinstance(evidence, dict):
+            return str(evidence.get(JUDGED_HEAD_FIELD) or "")
+        return ""
+
+    @staticmethod
+    def _is_unexecuted_final_gate(
+        verdict: Any,
+        definition: Any,
+    ) -> bool:
+        """这条 Phase 2 全量关卡的结论是**本轮没跑**时沿用下来的吗？
+
+        2026-10-27：执行器从库里水合回来的历史结论带 ``executed_this_round
+        = False``。整仓门禁的结论只对产生它的那份代码有效 —— 拿一份没跑过
+        的结论当本轮的结论，报告就成了一张空白支票（VP-029 的整仓门禁在
+        一轮里一次都没跑，却仍被判过）。
+
+        缺这个键的旧裁决按"跑过了"处理：不是所有执行器都会写它（测试里
+        的假执行器就没有），宁可沿用旧行为，也不凭空把别人的结论作废。
+        """
+        if not isinstance(verdict, dict):
+            return False
+        if verdict.get("executed_this_round") is not False:
+            return False
+        if not isinstance(definition, dict):
+            return False
+        return _is_final_gate(definition)
+
+    def _build_deferred_gate_row(
+        self, verdict: Any, vp_id: str, current_head: str,
+    ) -> Dict[str, Any]:
+        """本轮没跑的 Phase 2 全量关卡 → ``DEFERRED``（不是旧结论）。
+
+        旧结论留在 ``evidence`` 里作审计痕迹："被丢掉的是哪条旧结论、它
+        判在哪次提交上"。报告行上**不**写 ``judged_head`` —— 这一轮没有
+        任何东西被判过，写上 HEAD 等于给一条没跑过的关卡盖一个假出处。
+
+        状态只能是 ``DEFERRED``：一份本轮没跑出来的结论不许带着
+        ``PASSED`` 或 ``FAILED`` 进报告 —— 前者会让"整仓门禁通过"这个
+        合入判据成立在一次没跑的门禁上，后者会为一个没跑过的关卡生成
+        修复任务。
+        """
+        old_status = str(verdict.get("status") or "") if isinstance(
+            verdict, dict
+        ) else ""
+        old_head = self._judged_head_of(verdict)
+        if old_head and current_head and old_head == current_head:
+            why = (
+                f"上一轮那份结论判在 {old_head} 上（同一棵树），"
+                f"但本轮没有真的执行，已作废"
+            )
+        else:
+            why = (
+                f"上一轮那份结论判在 {old_head or '(未知提交)'} 上，"
+                f"与当前 HEAD {current_head or '(未知)'} 不是同一棵树，已作废"
+            )
+        actual = f"Phase 2 全量关卡本轮未执行（{why}）"
+        evidence = {
+            "gate": "verification_phase_2",
+            "executed_this_round": False,
+            "discarded_status": old_status,
+            "discarded_judged_head": old_head,
+        }
+        return {
+            "id": vp_id,
+            "status": "DEFERRED",
+            "actual_result": actual,
+            "evidence": json.dumps(evidence, ensure_ascii=False),
+        }
+
+    @staticmethod
+    def _stamp_judged_heads(report_data: dict, execution_results: dict) -> None:
+        """把"判它的是哪次提交"盖到报告行上。
+
+        2026-10-27：结论只对产生它的那份代码有效 —— 报告行必须写明它是
+        判在哪次提交上的。这个字段**只能由框架盖**：判定 LLM 不知道
+        HEAD，也不该编一个。
+
+        * 执行结果里带着的 → 按执行结果盖（本轮跑出来的，或同一棵树上
+          沿用的旧结论）；
+        * 执行结果里没有的 → 把 LLM 可能编出来的值抹掉（本轮延后的
+          Phase 2 关卡：这一轮什么都没判，写上 HEAD 等于给一条没跑过的
+          关卡盖一个假出处）。
+        """
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for er in (execution_results or {}).get("execution_results") or []:
+            if not isinstance(er, dict):
+                continue
+            vid = er.get("id")
+            if vid:
+                by_id[str(vid)] = er
+        for vr in (report_data or {}).get("verification_results") or []:
+            if not isinstance(vr, dict):
+                continue
+            er = by_id.get(str(vr.get("id"))) or {}
+            head = str(er.get(JUDGED_HEAD_FIELD) or "")
+            if head:
+                vr[JUDGED_HEAD_FIELD] = head
+            else:
+                vr.pop(JUDGED_HEAD_FIELD, None)
+
+    def _build_definition_missing_verdict(
+        self, vp_id: str, missing: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """一条"没有定义"的 VP 的 BLOCKED 裁决。
+
+        2026-10-26（VP-031）：占了号却没有定义的条目，执行器无定义可
+        分派 —— 它既没跑，也没被记成"跑不了"，只剩一条历史失败被沿用。
+
+        框架必须把这件事**显式**记成"没有定义"，而不是让一条旧失败冒充
+        今天的结论。
+        """
+        detail = "、".join(missing) if missing else "计划里查不到这个 id"
+        return {
+            "status": "BLOCKED",
+            "reasons": [
+                f"{BLOCKED_DEFINITION_MISSING}: {vp_id} 在计划里没有可用定义"
+                f"（{detail}），本轮未分派"
+            ],
+            "actual_result": (
+                f"{BLOCKED_DEFINITION_MISSING} —— {vp_id} 在计划里没有可用定义"
+                f"（{detail}），本轮**未分派**；此前那条旧结论不作为本轮结论沿用。"
+            ),
+            "evidence": {
+                "blocked_reason": BLOCKED_DEFINITION_MISSING,
+                "missing_definition_fields": list(missing or []),
+            },
+            "framework_checks": [],
+        }
+
     def _build_verification_executor(self, plan_data: dict) -> "VerificationExecutor":
         """Build a :class:`VerificationExecutor` wired to this agent.
 
@@ -9580,13 +15310,30 @@ class Orchestrator:
         #: round's plan does not change under it.
         plan_definitions = self._plan_vp_definitions()
 
+        # 2026-10-26（VP-031）：分派前按 id 查定义。查不到 → **不分派**。
+        #
+        # 增量评估发出去的号必须带着定义一起落进计划文件（见
+        # :mod:`verification_plan_delta`）；查不到定义的 id 说明这条定义
+        # 没落下来 —— 分派它等于让子 agent 去猜"这条 VP 要验什么"，猜
+        # 出来的结论与这条 VP 无关。
+        self._vp_definitions = self._plan_vp_definitions(plan_data) or {}
+
         async def _dispatch_vp(vp_node: dict) -> dict:
+            vp = dict(vp_node)
+            vp_id = str(vp.get("id", "unknown"))
+            # 2026-10-26: the round lost its lease on its services — a
+            # foreign process took them away (see
+            # :meth:`_assert_round_lease`).  The VPs that come after the
+            # loss are **stopped**, not run: each of them would report
+            # the same symptom ("connection refused") and dress one
+            # round-level accident up as one failure per VP.
+            if getattr(self, "_round_lease_lost", None):
+                return self._round_lease_lost_stop_verdict(vp_id)
             # 2026-10-25 (repair-r1-32): the round keeps its own
             # dispatcher, so the one automatic re-run of the points the
             # environment blocked is graded by exactly the rules the
             # first attempt used — the same gates, the same evidence.
-            vp = dict(vp_node)
-            vp_id = str(vp.get("id", "unknown"))
+            #
             # 2026-10-24（VP-031）：**分派前**先问"这条验证点有判据吗"。
             #
             # 有 id、没有定义的条目不是验证点，是占位。派给它等于让框架
@@ -9597,6 +15344,14 @@ class Orchestrator:
             #
             # 门禁在最前面：它必须先于任何一次 coding tool 调用（连
             # 二进制重建那条路上的子 agent 也不能碰到）。
+            #
+            # 2026-10-26 (merge): 两边的定义门禁**都要**，而且顺序有讲究 ——
+            # main 的门禁问的是"计划文件里这条验证点完整吗"（更全：它还查
+            # 标题与方法），本分支的门禁问的是"计划里查得到这个 id 吗"。
+            # main 的门禁**先**跑：它读的是计划文件（权威），而且计划文件
+            # 不在时它会**让门禁退下**（没有可比对的东西时，拦住整轮比它要
+            # 防的缺陷更糟）—— 本分支的门禁读的是内存里的计划，正好补上
+            # "定义还没落盘"这一种情况。
             _gaps = vp_dispatch_gaps(vp, plan_definitions)
             if _gaps:
                 self._safe_log_freshness_event(
@@ -9604,12 +15359,37 @@ class Orchestrator:
                 )
                 return self._build_vp_definition_blocked_verdict(vp_id, _gaps)
 
+            # 2026-10-26（VP-031）：分派前按 id 查定义。查不到 → **不分派**。
+            #
+            # 增量评估发出去的号必须带着定义一起落进计划文件（见
+            # :mod:`verification_plan_delta`）；查不到定义的 id 说明这条定义
+            # 没落下来 —— 分派它等于让子 agent 去猜"这条 VP 要验什么"，猜
+            # 出来的结论与这条 VP 无关。
+            #
+            # 门禁排在租约检查**之后**：租约丢失是**轮次级**事故（服务被
+            # 别的进程收走以后本轮什么都不该再跑，被停下来的验证点"没有
+            # 裁决"），定义缺失是**每条**验证点的事。两者换序，一次轮次级
+            # 事故就会被改写成一条"判据缺陷"，把"没跑"的原因改得面目全非。
+            if definition_missing(
+                getattr(self, "_vp_definitions", {}), vp_id,
+            ):
+                self._safe_log_freshness_event(
+                    vp_id,
+                    "definition_missing_blocked",
+                    {"blocked_reason": BLOCKED_DEFINITION_MISSING},
+                )
+                return self._build_definition_missing_verdict(vp_id)
+
             # 2026-10-25 (repair-r1-31): the address this VP is about
             # to use is recorded **before** anything can block it — a
             # VP that never got a request out still has to say which
             # address it would have used, and which instance the round
             # had bound for it.
             self._record_vp_address(vp_id, vp)
+            # The round is alive and working: refresh the heartbeat that
+            # keeps a foreign sweep from taking the services this VP is
+            # about to use.
+            self._touch_round_liveness()
             # Binary freshness pre-check (runs before every VP).
             # Audit-logged via ``write_verification_point_log`` so the
             # operator can audit stale-binary detection per VP from
@@ -9912,6 +15692,16 @@ class Orchestrator:
             marks the point ``invalid_env`` and gives it the **one**
             second look every other contradicted point gets.  What the
             second look says is what lands.
+
+
+            2026-10-26（VP-031）：每条裁决都盖上 ``judged_head`` —— 结论
+            只对产生它的那份代码有效（与
+            :mod:`verification_verdict_provenance` 的命令指纹同向）。
+
+            "这条 VP 有没有定义"的门禁在 :func:`_dispatch_vp` 里（租约
+            检查之后）：分派一条没有定义的 VP，等于让子 agent 去猜"这条要
+            验什么" —— 猜出来的结论与这条 VP 无关，却会占着这条 VP 的名字
+            进报告。
             """
             self._vp_dispatch_runner = _sub_agent_runner
             vp_id = str(vp_node.get("id", "unknown"))
@@ -9931,17 +15721,35 @@ class Orchestrator:
             token = str(getattr(self, "_instance_epoch_token", "") or "")
             if token:
                 self._vp_epoch_tokens[vp_id] = token
+
             verdict = await _dispatch_vp(vp_node)
             after = self._capture_serving_snapshot(vp_node, vp_id)
-            return self._apply_serving_handover(vp_id, before, after, verdict)
+            verdict = self._apply_serving_handover(
+                vp_id, before, after, verdict,
+            )
+            # 2026-10-26（VP-031）：每条裁决都盖上 ``judged_head`` —— 结论
+            # 只对产生它的那份代码有效（与
+            # :mod:`verification_verdict_provenance` 的命令指纹同向）。
+            return stamp_judged_head(verdict, self._current_project_head())
 
-        return VerificationExecutor(
+        executor = VerificationExecutor(
             verification_plan=executor_plan,
             plan_id=self.plan_dir.name,
             plan_dir=self.plan_dir,
             sub_agent_runner=_sub_agent_runner,
             verif_repo=getattr(self, "verif_repo", None),
+            # 2026-10-27：这一轮跑的是哪次提交。Phase 2 全量关卡的结论只对
+            # 产生它的那份代码有效 —— 执行器据此拒绝把"判在别的提交上"的
+            # 整仓门禁当成终态成功跳过。
+            current_head=self._current_project_head(),
         )
+        # 2026-10-25: the executor is up — say which tree it is running
+        # from, before any VP can be graded by it. A round whose log
+        # shows ``same_tree=false`` was graded by a copy of the
+        # framework that does not contain the fix under repair, and its
+        # verdicts are evidence about that copy, not about the product.
+        self._emit_execution_surface_provenance()
+        return executor
 
     # ------------------------------------------------------------------
     # BLOCKED verdicts — retired / unknown verification_method
@@ -10145,8 +15953,16 @@ class Orchestrator:
         self._service_unreachable = {}
         try:
             if self._service_declarations:
-                return self._preflight_declared_services(plan_data)
-            return self._preflight_legacy_service_freshness(plan_data)
+                report = self._preflight_declared_services(plan_data)
+            else:
+                report = self._preflight_legacy_service_freshness(plan_data)
+            # 2026-10-25: the round now owns the state of its services.
+            # This is the moment the api phase measures "how long ago
+            # were the services ensured" from, so a verdict can say how
+            # long a port has been dead instead of leaving the reader to
+            # reconstruct it.
+            self._services_ensured_at = time.monotonic()
+            return report
         except Exception as exc:  # noqa: BLE001 — preflight never aborts
             logger.warning(
                 "[service_freshness] preflight errored: %s; proceeding",
@@ -10185,17 +16001,49 @@ class Orchestrator:
         A stale build artefact is rebuilt first — relaunching a service
         against yesterday's binary would just serve old code again,
         which is the ordering the legacy path already had.
+
+        The round takes a **lease** on every service it starts: the lease
+        names the round (``<round_id>@<backend_pid>``) and lands in the
+        plan's ledger, so a reaper in another backend process can tell
+        "a round is using this" from "this is an orphan". On 2026-10-25
+        that evidence did not exist, a foreign sweep stopped the round's
+        api service two minutes after the round had started it, and the
+        round's first ``api_test`` found a refused connection.
         """
         service_manager = _load_service_manager(self.project_dir)
         ensure_services = service_manager.ensure_services
         record_runtimes = service_manager.record_runtimes
+        # 2026-10-26: the lease context has to come from the **same**
+        # module as ``ensure_services`` — the lease is a ContextVar in
+        # that module, so a context manager taken from another copy of it
+        # would install its own variable and the services would start
+        # without a lease.
+        round_lease_context = getattr(
+            service_manager, "round_lease_context", None,
+        )
+        if round_lease_context is None:
+            from service_manager import round_lease_context
 
         self._maybe_rebuild_before_service_start()
-        runtime_map = ensure_services(
-            self.project_dir,
-            self._service_declarations,
-            round_number=self._current_round,
-        )
+        # 2026-10-25: claim the plan BEFORE the services start. The
+        # window between "the api service is up" and "the round owns it"
+        # is exactly the window a foreign backend's startup sweep used to
+        # take it in — that sweep reaped this plan's services 14 seconds
+        # after they came up, and the round only found out seven minutes
+        # later, as a connection-refused.
+        self._touch_round_liveness()
+        round_id = self._round_id()
+        # The round's identity travels with the call: the services it
+        # starts are leased to it, and the ledger says whose they are.
+        with round_lease_context(
+            self.plan_dir,
+            round_id=round_id,
+        ):
+            runtime_map = ensure_services(
+                self.project_dir,
+                self._service_declarations,
+                round_number=self._current_round,
+            )
         self._service_runtime_map = runtime_map
         # 2026-10-25 (repair-r1-22): 本轮 ensure 产出的实例就是本轮的绑定 ——
         # VP 的请求地址由它决定，而不是由 runtime map 每次重新推导。map 仍然
@@ -10214,10 +16062,24 @@ class Orchestrator:
             for runtime in runtime_map.runtimes.values()
             if not runtime.ready
         }
+        # 2026-10-26: the round's heartbeat, refreshed **after** the
+        # services are up.  Starting them can take a minute (the
+        # readiness probe is what takes the time), and the claim written
+        # before them is already that old by the time the first request
+        # goes out — so the round says "still here" again the moment it
+        # actually owns something.
+        self._touch_round_liveness()
+        ensured = runtime_map.to_dict()
+        if not ensured.get("lease_owner"):
+            # The map was built without a round (a stub, a test): the
+            # event still has to name the round that asked for it.
+            ensured["lease_owner"] = self._round_lease_owner()
+        # 2026-10-26 (merge): 一个事件，两边的事实 —— ``unready_details``
+        # 说服务为什么没起来，``lease_owner`` 说这一轮拿的是谁的租约。
         self._safe_log_freshness_event(
             "__preflight__", "services_ensured",
             {
-                **runtime_map.to_dict(),
+                **ensured,
                 "unready_details": unready_details,
             },
         )
@@ -12536,6 +18398,719 @@ class Orchestrator:
         if declared_port is not None:
             self._blocked_service_ports.discard(int(declared_port))
 
+    def _round_id(self) -> str:
+        """The id of the round that is running right now.
+
+        It names the round in every lease it takes and in every event
+        it writes, so a log line can be traced back to the round that
+        produced it — and so a reaper in another backend process can
+        tell "this service belongs to a running round" from "this
+        service is an orphan".
+
+        The id is derived from the plan directory and the round number:
+        the plan is already unique per verification plan, and the round
+        number distinguishes one round from the next.
+
+        Defensive on purpose: a half-built agent (the tests build one
+        with ``__new__``) may have no ``plan_dir`` at all, and a round
+        id that raises would take the whole preflight down.
+        """
+        plan_dir = getattr(self, "plan_dir", None)
+        plan_name = getattr(plan_dir, "name", "") or ""
+        if not plan_name:
+            plan_name = "plan"
+        try:
+            round_number = int(getattr(self, "_current_round", 0) or 0)
+        except (TypeError, ValueError):
+            round_number = 0
+        return f"{plan_name}-r{round_number}"
+
+    def _round_lease_owner(self) -> str:
+        """The owner token of this round's lease: ``<round_id>@<backend_pid>``.
+
+        The backend pid is part of the token on purpose: two backend
+        processes can run rounds for the same plan (a restart while the
+        old one drains), and only the pid tells the two apart.
+        """
+        return f"{self._round_id()}@{os.getpid()}"
+
+    def _touch_round_liveness(self) -> None:
+        """Refresh this plan's "my round is running" heartbeat.
+
+        The heartbeat is what keeps another backend process's startup /
+        shutdown sweep from reaping the services this round is using
+        (see :func:`service_manager.round_is_live`). It is refreshed
+        before the services start, before every VP, and during the
+        judgment phase, so it stays fresh for as long as the round is
+        alive.
+
+        The same heartbeat refreshes the **leases** the round holds on
+        its services: a lease that stopped saying "still here" would
+        expire mid-round and expose a running round's service to the
+        next sweep. The lease lives in two places — the plan's ledger
+        (one lease per service, the record a reaper reads) and the
+        plan-level marker (the same leases, plus the round's own
+        heartbeat) — and both are stamped together, with one timestamp.
+        A refresh that only stamped one of them would leave the other
+        reading as stale, and whichever reader consulted the stale one
+        would conclude the round is gone.
+
+        Best-effort: a marker that cannot be written costs the round its
+        protection from foreign sweeps, which is strictly better than
+        taking the round down.
+        """
+        try:
+            from service_manager import refresh_round_liveness
+
+            refresh_round_liveness(
+                self.plan_dir,
+                round_number=self._current_round,
+                round_id=self._round_id(),
+            )
+        except Exception:  # noqa: BLE001 - the marker is best-effort
+            # NOTE: the handler must not touch ``self`` either — a
+            # half-built agent (the tests build one with ``__new__``) has
+            # no ``plan_dir`` at all, and an except block that raises
+            # turns a best-effort refresh into a crash.
+            logger.debug(
+                "[service_manager] could not refresh the round liveness "
+                "marker",
+            )
+
+    # ------------------------------------------------------------------
+    # The round's lease on its services — "is this still mine?"
+    # ------------------------------------------------------------------
+    #
+    # 2026-10-25, observed live on a real round:
+    # the round's api service was SIGTERM'd by another backend's
+    # shutdown hook two minutes into the round, and the round did not
+    # notice. It sent nine api_test requests over the next minute and
+    # every one of them came back "connection refused" — so the report
+    # carried nine identical failures and nothing else, and the repair
+    # loop was pointed at nine features that had never been broken.
+    #
+    # The lease existed (it says "this service belongs to this round"),
+    # but the round never read it back. Reading it back is what turns
+    # "the service is gone" into "the service was taken away from me",
+    # and a round-level incident into a round-level conclusion.
+
+    def _round_lease_expectations(self) -> List[Dict[str, Any]]:
+        """The leases this round believes it holds.
+
+        The round's own runtime map is the record of what it started:
+        every service it spawned carries the lease it took on it. An
+        adopted service (somebody else's listener) and a service that
+        never came up carry none — nobody claimed them, so nobody can
+        lose them.
+        """
+        runtime_map = getattr(self, "_service_runtime_map", None)
+        if runtime_map is None:
+            return []
+        expectations: List[Dict[str, Any]] = []
+        runtimes = getattr(runtime_map, "runtimes", None) or {}
+        for name, runtime in runtimes.items():
+            lease = getattr(runtime, "lease", None)
+            if not isinstance(lease, dict) or not lease.get("owner"):
+                continue
+            try:
+                port = int(lease.get("port") or getattr(runtime, "port", 0) or 0)
+            except (TypeError, ValueError):
+                port = 0
+            expectations.append({
+                "name": str(name),
+                "port": port,
+                "owner": str(lease.get("owner") or ""),
+                "listener_pid": lease.get("listener_pid"),
+                "heartbeat_at": float(lease.get("heartbeat_at") or 0.0),
+            })
+        return expectations
+
+    def _assert_round_lease(self) -> Optional[Dict[str, Any]]:
+        """Is this round still the owner of the services it started?
+
+        Returns ``None`` when the round still holds its leases, and the
+        loss record when it does not. The loss record is written down
+        once (see :meth:`_record_round_lease_lost`) and kept on the
+        agent, so every later call says the same thing.
+
+        Two ways to lose a lease, and both are read out of the ledger —
+        the record the reapers read:
+
+          * **the lease is gone** — the ledger no longer holds a lease
+            for this round's service, or holds one owned by somebody
+            else. That is what a foreign reap looks like: the reaper
+            finalises the ledger, and the round's claim goes with it;
+          * **the lease went stale** — the lease is still there, but
+            nobody has stamped it for longer than
+            :data:`service_manager.LEASE_TTL_SECONDS`. A reaper would
+            read that lease as dead, so the round must not read it as
+            alive.
+
+        Never raises: a check that cannot read the ledger finds no
+        lease to complain about and says nothing, because a broken read
+        is not evidence of a lost lease.
+        """
+        recorded = getattr(self, "_round_lease_lost", None)
+        if recorded:
+            return recorded
+        expectations = self._round_lease_expectations()
+        if not expectations:
+            # The round owns no leased service — nothing to lose.
+            return None
+        plan_dir = getattr(self, "plan_dir", None)
+        if plan_dir is None:
+            return None
+        try:
+            from service_manager import (
+                LEASE_KEY, LEASE_TTL_SECONDS, ServiceLease,
+                lease_heartbeat_age, read_ledger, read_round_liveness,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+        round_id = self._round_id()
+        ledger_leases: Dict[Any, Any] = {}
+        for entry in read_ledger(plan_dir).get("services") or []:
+            if not isinstance(entry, dict):
+                continue
+            lease = ServiceLease.from_dict(entry.get(LEASE_KEY))
+            if lease is None:
+                continue
+            try:
+                port = int(entry.get("port") or 0)
+            except (TypeError, ValueError):
+                port = 0
+            ledger_leases[(str(entry.get("name") or ""), port)] = lease
+
+        # The marker keeps its own copy of the leases. It is the round's
+        # last word on when it said "still here", so it is where
+        # ``last_heartbeat_at`` comes from once the ledger's copy is
+        # gone.
+        marker_leases: Dict[int, Any] = {}
+        for item in (read_round_liveness(plan_dir).get("leases") or []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                marker_leases[int(item.get("port") or 0)] = item
+            except (TypeError, ValueError):
+                continue
+
+        now = time.time()
+        for expectation in expectations:
+            key = (expectation["name"], expectation["port"])
+            lease = ledger_leases.get(key)
+            if lease is None:
+                return self._record_round_lease_lost(
+                    expectation,
+                    reason=(
+                        "the plan's ledger no longer holds a lease for this "
+                        "round's service"
+                    ),
+                    marker_lease=marker_leases.get(expectation["port"]),
+                )
+            if not str(lease.owner or "").startswith(f"{round_id}@"):
+                return self._record_round_lease_lost(
+                    expectation,
+                    reason=(
+                        f"the lease on this round's service is now held by "
+                        f"{lease.owner!r}"
+                    ),
+                    last_lease=lease,
+                    marker_lease=marker_leases.get(expectation["port"]),
+                )
+            age = lease_heartbeat_age(lease, now=now)
+            if age is None or age > float(LEASE_TTL_SECONDS):
+                return self._record_round_lease_lost(
+                    expectation,
+                    reason=(
+                        f"the lease's heartbeat is {age!r}s old, which is "
+                        f"outside the {LEASE_TTL_SECONDS}s window a reaper "
+                        f"reads it with"
+                    ),
+                    last_lease=lease,
+                    marker_lease=marker_leases.get(expectation["port"]),
+                )
+        return None
+
+    def _record_round_lease_lost(
+        self,
+        expectation: Dict[str, Any],
+        *,
+        reason: str,
+        last_lease: Optional[Any] = None,
+        marker_lease: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Write down that the round lost its lease, and stop the round.
+
+        The record carries the three facts a reader needs to understand
+        what happened, all of them read out of evidence that already
+        exists rather than guessed:
+
+          * ``last_reap_reason`` — why the service went away, as the
+            plan's service-event log records it (the reaper's own
+            words: "stopped (reason=server_shutdown)");
+          * ``expected_pid`` — the process the round expected to be
+            serving the port;
+          * ``last_heartbeat_at`` — the last time the round said it was
+            still here.
+
+        The event is written to the plan's service-event log (where the
+        reap that caused it is also recorded) **and** to the round's own
+        log. Written once: the loss is a fact about the round, not about
+        every VP that follows it.
+        """
+        from service_manager import last_reap_reason, record_service_event
+
+        name = str(expectation.get("name") or "")
+        port = expectation.get("port")
+        reap_reason = ""
+        try:
+            reap_reason = last_reap_reason(
+                self.plan_dir, name=name, port=port,
+            )
+        except Exception:  # noqa: BLE001 - the evidence is best-effort
+            reap_reason = ""
+
+        heartbeats: List[float] = [float(expectation.get("heartbeat_at") or 0.0)]
+        expected_pid = expectation.get("listener_pid")
+        if last_lease is not None:
+            heartbeats.append(float(getattr(last_lease, "heartbeat_at", 0.0) or 0.0))
+            if getattr(last_lease, "listener_pid", None):
+                expected_pid = last_lease.listener_pid
+        if isinstance(marker_lease, dict):
+            heartbeats.append(float(marker_lease.get("heartbeat_at") or 0.0))
+            if marker_lease.get("listener_pid") and not expected_pid:
+                expected_pid = marker_lease.get("listener_pid")
+        last_heartbeat_at = max(heartbeats) if heartbeats else 0.0
+
+        loss = {
+            "round_id": self._round_id(),
+            "service": name,
+            "port": port,
+            "owner": expectation.get("owner"),
+            "expected_pid": expected_pid,
+            "last_heartbeat_at": last_heartbeat_at,
+            "last_reap_reason": reap_reason,
+            "reason": reason,
+        }
+        self._round_lease_lost = loss
+        logger.error(
+            "[verification] round_lease_lost: %s (service %r on port %s, "
+            "expected_pid=%s, last_reap_reason=%r)",
+            reason, name, port, expected_pid, reap_reason,
+        )
+        try:
+            record_service_event(
+                self.plan_dir,
+                "round_lease_lost",
+                round_token=str(expectation.get("owner") or ""),
+                run_id=self.plan_dir.name,
+                name=name,
+                port=port if isinstance(port, int) else None,
+                pid=expected_pid if isinstance(expected_pid, int) else None,
+                reason=reason,
+                details={
+                    "last_reap_reason": reap_reason,
+                    "expected_pid": expected_pid,
+                    "last_heartbeat_at": last_heartbeat_at,
+                    "round_id": self._round_id(),
+                },
+            )
+        except Exception:  # noqa: BLE001 - an event write never raises
+            logger.debug(
+                "[service_manager] could not write the round_lease_lost "
+                "event for %s", name,
+            )
+        self._safe_log_freshness_event("__round__", "round_lease_lost", loss)
+        return loss
+
+    def _round_lease_lost_verdict(self, vp_id: str = "") -> Dict[str, Any]:
+        """The verdict for a VP that must not run: the round lost its lease.
+
+        The VP's own criterion was not observed — the request was never
+        made — so the verdict says exactly that, and names the
+        round-level fault instead of repeating the symptom nine times.
+        """
+        loss = getattr(self, "_round_lease_lost", None) or {}
+        reasons = [
+            "round_lease_lost: this round no longer holds the lease on its "
+            "services, so the verification point was not executed",
+            f"lease: {loss.get('reason')}",
+            f"expected_pid: {loss.get('expected_pid')}",
+            f"last_heartbeat_at: {loss.get('last_heartbeat_at')}",
+        ]
+        if loss.get("last_reap_reason"):
+            reasons.append(f"last_reap_reason: {loss.get('last_reap_reason')}")
+        return {
+            "status": "FAILED",
+            "reasons": reasons,
+            "actual_result": (
+                "本轮丢失了对声明服务的租约，请求没有发出；这不是该验证点"
+                "自身的失败。"
+            ),
+            "evidence": {"round_lease_lost": loss},
+        }
+
+    def _round_lease_lost_stop_verdict(self, vp_id: str = "") -> Dict[str, Any]:
+        """The verdict for a VP that is **stopped** by the lease loss.
+
+        These VPs never ran: the round found out that its services were
+        taken away and stopped instead of asking a dead port the same
+        question nine times. A stopped VP has no verdict of its own, so
+        it is reported as skipped — with the round-level fault named,
+        so a reader can see *why* it did not run.
+        """
+        loss = getattr(self, "_round_lease_lost", None) or {}
+        reasons = [
+            "round_lease_lost: the round lost the lease on its services, so "
+            "this verification point was not executed",
+            f"lease: {loss.get('reason')}",
+        ]
+        if loss.get("last_reap_reason"):
+            reasons.append(f"last_reap_reason: {loss.get('last_reap_reason')}")
+        return {
+            "status": "SKIPPED",
+            "reasons": reasons,
+            "actual_result": (
+                "本轮丢失了对声明服务的租约，该验证点没有执行。"
+            ),
+            "evidence": {"round_lease_lost": loss},
+        }
+
+    def _api_phase_service_lost_verdict(
+        self, vp_id: str, loss: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """The verdict for the VP whose request produced no response.
+
+        The request went out and nobody answered it — the service was
+        gone.  The criterion was therefore **not observed**, and this
+        verification point did not fail: the fault belongs to the round.
+        The verdict says so, and names the round-level fact instead of
+        repeating the symptom.
+        """
+        return {
+            "status": "BLOCKED",
+            "status_detail": "BLOCKED_SERVICE_LOST",
+            "reasons": [
+                "BLOCKED_SERVICE_LOST: the request produced no response — "
+                "the service this round declared is not answering any "
+                "more, so the criterion was not observed",
+                f"port: {loss.get('port')}",
+                f"expected_pid: {loss.get('expected_pid')}",
+                f"actual_pid: {loss.get('actual_pid')}",
+                f"error: {loss.get('transport_error')}",
+                "last_reap_reason: "
+                f"{loss.get('last_reap_reason')}",
+                f"lease_owner: {loss.get('lease_owner')}",
+            ],
+            "actual_result": (
+                "本轮 api 阶段的请求没有拿到任何响应（服务已不在监听）；"
+                "判据没有被观测，也不是该验证点自身的失败。"
+            ),
+            "evidence": {
+                "vp_id": vp_id,
+                "status_detail": "BLOCKED_SERVICE_LOST",
+                "api_phase_service_lost": loss,
+            },
+        }
+
+    def _api_phase_service_lost_stop_verdict(
+        self, vp_id: str = "",
+    ) -> Dict[str, Any]:
+        """The verdict for a VP that is **stopped** by the api-phase loss.
+
+        These VPs never ran: the round found out that the service was
+        gone and stopped instead of asking a dead port the same question
+        nine times.  A stopped VP has no verdict of its own, so it is
+        reported as skipped — with the round-level fault named, so a
+        reader can see *why* it did not run.
+        """
+        loss = getattr(self, "_api_phase_service_lost", None) or {}
+        reasons = [
+            "api_phase_service_lost: the api phase lost its service, so "
+            "this verification point was not executed",
+            f"port: {loss.get('port')}",
+            f"error: {loss.get('transport_error')}",
+        ]
+        if loss.get("last_reap_reason"):
+            reasons.append(f"last_reap_reason: {loss.get('last_reap_reason')}")
+        return {
+            "status": "SKIPPED",
+            "reasons": reasons,
+            "actual_result": (
+                "本轮 api 阶段丢失了服务（请求没有拿到任何响应），"
+                "该验证点没有执行。"
+            ),
+            "evidence": {"api_phase_service_lost": loss},
+        }
+
+    def _round_error_report(self) -> Optional[Dict[str, Any]]:
+        """The round-level error of this round, when it has one.
+
+        A round that lost its lease on its services is an **error**,
+        not a set of per-VP failures: the report has to say so at the
+        top level, because "nine api_test VPs failed with connection
+        refused" and "the api service was taken away by another
+        backend" call for completely different repairs.
+
+        The same is true of a request that produced no response: the
+        service was gone, so the fact belongs to the round as well.
+        """
+        loss = getattr(self, "_round_lease_lost", None)
+        if loss:
+            return {
+                "kind": "round_lease_lost",
+                "message": (
+                    "the round lost the lease on its services; the "
+                    "verification points after the loss were not executed"
+                ),
+                "lease": loss,
+            }
+        api_loss = getattr(self, "_api_phase_service_lost", None)
+        if api_loss:
+            return {
+                "kind": "api_phase_service_lost",
+                "message": (
+                    "the api phase lost its service — a request produced "
+                    "no response; the verification points after the loss "
+                    "were not executed"
+                ),
+                "api_phase_service_lost": api_loss,
+            }
+        return None
+
+    # ------------------------------------------------------------------
+    # The listener's identity — "is the answer this round's own?"
+    # ------------------------------------------------------------------
+    #
+    # 2026-10-25, observed on a live run: an api criterion asked
+    # whether the default backend refuses a request that does not carry
+    # the guard header.  The criterion is about **this** instance: a
+    # 403 from any process on the port would say nothing about the
+    # backend the plan declared, and the round never asked who was
+    # answering — it sent the request and graded whatever came back.
+    # So a stranger's refusal (or a stranger's 200) was booked as the
+    # declared service's answer.
+
+    def _leased_listener_for_port(
+        self, port: int, service_name: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """The lease the plan's ledger holds for ``port``.
+
+        The ledger is the record every reaper reads, and the lease in
+        it names the process that was serving the port when this round
+        ensured the service — together with the round that owns it.
+
+        ``None`` when the ledger holds no lease for that port: an
+        adopted service (somebody else's listener), a service this
+        round never started, or a ledger that cannot be read. None of
+        those is a contradiction, and a check that invented one would
+        stop every round that declared a service.
+        """
+        plan_dir = getattr(self, "plan_dir", None)
+        if plan_dir is None:
+            return None
+        try:
+            from service_manager import (
+                LEASE_KEY, ServiceLease, read_ledger,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None
+        try:
+            ledger = read_ledger(plan_dir)
+        except Exception:  # noqa: BLE001 - a broken ledger is no lease
+            return None
+
+        wanted = str(service_name or "").strip().lower()
+        fallback: Optional[Dict[str, Any]] = None
+        for entry in ledger.get("services") or []:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                entry_port = int(entry.get("port") or 0)
+            except (TypeError, ValueError):
+                continue
+            if entry_port != int(port):
+                continue
+            lease = ServiceLease.from_dict(entry.get(LEASE_KEY))
+            if lease is None or not lease.listener_pid:
+                continue
+            found = {
+                "service": str(entry.get("name") or ""),
+                "port": entry_port,
+                "owner": str(lease.owner or ""),
+                "listener_pid": int(lease.listener_pid),
+            }
+            if wanted and found["service"].strip().lower() == wanted:
+                return found
+            if fallback is None:
+                fallback = found
+        return fallback
+
+    def _assert_service_listener_identity(
+        self, vp: dict,
+    ) -> Optional[Dict[str, Any]]:
+        """Is the process answering this VP's port the one the round leased?
+
+        Returns ``None`` when the identity cannot be contradicted, and
+        the loss record when it can.
+
+        Three answers, and the third one is the point:
+
+          * **the port answers for the leased process** — the request
+            is graded on the instance this round ensured, which is what
+            the criterion is about;
+          * **nothing to compare** — the ledger holds no lease for this
+            port, so nobody claimed it and nobody can say the answer
+            came from the wrong process;
+          * **the port answers for somebody else** — the answer is not
+            this round's, and a criterion graded on it would be graded
+            on a stranger's behaviour.
+
+        The third answer is what the 2026-10-25 round could not give:
+        the service was taken away, another process took the port, and
+        the 403 that came back was the stranger's.
+
+        The holder is looked up with **lsof**, because the pid is the
+        thing being compared. A probe that cannot name the holder says
+        "I could not check", which is not "it is not mine" — and a
+        check that accused the round on a degraded probe would stop
+        every round that declared a service.
+        """
+        port = self._vp_target_port(vp)
+        if port is None:
+            return None
+        leased = self._leased_listener_for_port(
+            port, service_name=self._vp_service_key(vp),
+        )
+        if leased is None:
+            return None
+        expected_pid = int(leased["listener_pid"])
+        try:
+            from service_freshness import probe_port
+
+            probe = probe_port(int(port))
+        except Exception:  # noqa: BLE001 - the probe never raises
+            return None
+        if probe.error:
+            # The holder could not be named: this round has no evidence
+            # either way, and "I could not check" must never be read as
+            # "it is not mine".
+            return None
+        actual_pid = int(probe.pids[0]) if probe.pids else None
+        if actual_pid == expected_pid:
+            return None
+        return self._record_api_phase_service_lost(
+            vp,
+            port=int(port),
+            expected_pid=expected_pid,
+            actual_pid=actual_pid,
+            leased=leased,
+        )
+
+    def _record_api_phase_service_lost(
+        self,
+        vp: dict,
+        *,
+        port: Optional[int],
+        expected_pid: Optional[int] = None,
+        actual_pid: Optional[int] = None,
+        leased: Optional[Dict[str, Any]] = None,
+        error: str = "",
+        kind: str = "",
+        scope: str = "vp",
+        detail: str = "",
+    ) -> Dict[str, Any]:
+        """Write down that the api phase lost its service.
+
+        Two shapes, one record and one event:
+
+          * ``scope="vp"`` — the port answers for a process this round
+            did not ensure.  The request was never made, and the
+            verification point is blocked: its criterion was not
+            observed.
+          * ``scope="round"`` — the request went out and produced **no
+            response** (the connection was refused, the peer went away).
+            That is not this verification point's failure but the
+            round's: the service is gone, so the api phase stops here
+            and the verification points after it are not asked the same
+            question at a dead port.
+
+        The record carries the facts a reader needs and cannot guess:
+        the port, the process the round expected to be serving it, the
+        process that is serving it now, the round that owns the lease,
+        and why the expected process went away — as the plan's own
+        service-event log records it, in the reaper's own words.
+
+        Written to the round's log, next to the request it describes.
+        A round-level loss is written under the round (``__round__``),
+        because it is a fact about the round and not about one request.
+        """
+        from service_manager import last_reap_reason
+
+        if leased is None:
+            leased = (
+                self._leased_listener_for_port(
+                    int(port), service_name=self._vp_service_key(vp),
+                )
+                if port is not None else None
+            ) or {}
+        name = str(leased.get("service") or "") or self._vp_service_key(vp)
+        if expected_pid is None:
+            expected_pid = leased.get("listener_pid")
+        if actual_pid is None and port is not None:
+            actual_pid = self._listener_pid(int(port))
+        reap_reason = ""
+        try:
+            reap_reason = last_reap_reason(
+                self.plan_dir, name=name, port=port,
+            )
+            if not reap_reason and name:
+                # The reap may have named the service on another port
+                # (the preflight relocated it); the reason is about the
+                # **service**, so the port alone must not hide it.
+                reap_reason = last_reap_reason(
+                    self.plan_dir, name=name, port=None,
+                )
+        except Exception:  # noqa: BLE001 - the evidence is best-effort
+            reap_reason = ""
+
+        if scope == "round":
+            detail = detail or (
+                f"the request to port {port} produced no response "
+                f"({error}); the service this round declared is gone, so "
+                f"the api phase was stopped here"
+            )
+        else:
+            detail = detail or (
+                f"the process answering port {port} is not the instance "
+                f"this round ensured (expected pid {expected_pid}, found "
+                f"{actual_pid}); the request was not made"
+            )
+        record = {
+            "scope": scope,
+            "round_id": self._round_id(),
+            "vp_id": str(vp.get("id", "unknown")),
+            "service": name,
+            "port": int(port) if port is not None else None,
+            "expected_pid": (
+                int(expected_pid) if expected_pid is not None else None
+            ),
+            "actual_pid": actual_pid,
+            "last_reap_reason": reap_reason,
+            "lease_owner": str(leased.get("owner") or ""),
+            "transport_error": error,
+            "transport_error_kind": kind,
+            "detail": detail,
+        }
+        logger.error(
+            "[verification] api_phase_service_lost: %s", record["detail"],
+        )
+        self._safe_log_freshness_event(
+            "__round__" if scope == "round" else record["vp_id"],
+            "api_phase_service_lost", record,
+        )
+        return record
 
     def _maybe_rebuild_before_service_start(self) -> None:
         """Rebuild a stale build artefact before (re)starting services.
@@ -12630,11 +19205,59 @@ class Orchestrator:
         # 此时 {{svc.<name>.url}} 必须指向新端口，否则 VP 会去打那个别人的
         # 进程。
         resolved = apply_resolution(plan_data, self._effective_declarations())
+        # 2026-10-27：解析的同时记下「这个 VP 的 URL 来自哪个声明服务」。
+        # 展开之后 URL 里就没有占位符了，VP 自己说不出服务是谁 —— 而服务
+        # 死掉以后要把它按原端口拉起来，正需要这个名字（见
+        # :meth:`_vp_placeholder_service`）。绑定只存在内存里。
+        self._record_vp_service_bindings(plan_data)
         self._safe_log_freshness_event(
             "__preflight__", "service_placeholders_resolved",
             {"services": sorted(self._service_declarations)},
         )
         return resolved
+
+    def _record_vp_service_bindings(self, plan_data: dict) -> None:
+        """Bind every VP whose URL names a service to that service.
+
+        The binding answers a question the expanded URL can no longer
+        answer: *which* declared service is this VP about to talk to.
+        It is the round's own bookkeeping, so it is kept **in memory
+        only** — the plan on disk keeps its placeholders and is
+        re-resolved every round, and nothing here may ever be written
+        back to it.
+        """
+        points = (
+            plan_data.get("verification_points")
+            if isinstance(plan_data, dict) else None
+        )
+        if not isinstance(points, list):
+            return
+        try:
+            from service_declaration import iter_placeholders
+        except Exception:  # pragma: no cover - defensive
+            return
+        for vp in points:
+            if not isinstance(vp, dict):
+                continue
+            vp_id = str(vp.get("id") or "").strip()
+            if not vp_id:
+                continue
+            request = vp.get("request") or {}
+            url = str(request.get("url") or "")
+            if "{{" not in url:
+                # The VP names no service any more.  Drop the binding
+                # a previous round left for it: a stale name would
+                # attribute this VP to a service it does not talk to.
+                self._vp_service_bindings.pop(vp_id, None)
+                continue
+            try:
+                for _raw, name, _field in iter_placeholders(url):
+                    key = str(name).strip().lower()
+                    if key in self._service_declarations:
+                        self._vp_service_bindings[vp_id] = key
+                    break
+            except Exception:  # pragma: no cover - defensive
+                continue
 
     def _preflight_legacy_service_freshness(self, plan_data: dict) -> Any:
         """The pre-2026-09-18 preflight, for plans with no ``services``
@@ -12933,10 +19556,22 @@ class Orchestrator:
             str(vp.get("id")): vp for vp in verification_points
             if isinstance(vp, dict)
         }
+        # 2026-10-26（VP-031）：投影这一层要钉住两件事 ——
+        #
+        #   * 这条结论是**哪条定义**的结论（计划里查得到吗）；
+        #   * 它是在**哪次提交**上判出来的（与当前 HEAD 一致吗）。
+        #
+        # 查不到定义 → 旧结论**不许沿用**：那条 id 这一轮压根没被分派
+        # （执行器的计划就是这份计划），它带着的失败是**别的轮次、别的
+        # 提交**上挣来的。判据是 :func:`definition_missing` —— 计划里一条
+        # VP 都没有时不下这个判断（那是输入退化，没有计划可比对），分派前
+        # 与这里用的是同一条规则。
+        definitions = self._plan_vp_definitions(plan_data)
+        current_head = self._current_project_head()
 
         results: List[Dict[str, Any]] = []
         for v in executor_verdicts:
-            vp_id = v.get("vp_id", "unknown")
+            vp_id = str(v.get("vp_id", "unknown"))
             status = v.get("status", "FAILED")
             # Preserve explicit actual_result if the verdict carries one;
             # otherwise fall back to the legacy reasons-join behavior.
@@ -12961,7 +19596,8 @@ class Orchestrator:
             evidence = self._enrich_evidence_with_address(
                 str(vp_id), evidence, plan_vps_by_id.get(str(vp_id)),
             )
-            result = {
+            judged_head = self._judged_head_of(v)
+            row: Dict[str, Any] = {
                 "id": vp_id,
                 "status": status,
                 "actual_result": actual_result,
@@ -12980,8 +19616,75 @@ class Orchestrator:
             for key in ("failure_class", "failure_class_source"):
                 value = v.get(key)
                 if value:
-                    result[key] = str(value)
-            results.append(result)
+                    row[key] = str(value)
+            if judged_head:
+                row[JUDGED_HEAD_FIELD] = judged_head
+            if definition_missing(definitions, vp_id):
+                # 无定义 → 不沿用旧结论。旧结论判在哪次提交上要留痕
+                # （审计要能回答"被丢掉的是哪条旧结论"）。
+                discarded = self._build_definition_missing_verdict(vp_id)
+                discarded_evidence = dict(discarded.get("evidence") or {})
+                if judged_head:
+                    discarded_evidence["discarded_judged_head"] = judged_head
+                discarded["evidence"] = discarded_evidence
+                row = {
+                    "id": vp_id,
+                    "status": discarded["status"],
+                    "actual_result": discarded["actual_result"],
+                    "evidence": json.dumps(discarded_evidence, ensure_ascii=False),
+                }
+                if current_head:
+                    row[JUDGED_HEAD_FIELD] = current_head
+            elif self._is_unexecuted_final_gate(
+                v, definitions.get(vp_id),
+            ):
+                # 2026-10-27：本轮**没跑**的 Phase 2 全量关卡。
+                #
+                # 报告里只能记 ``DEFERRED``（本轮延后，下轮真跑），旧结论
+                # 留在 evidence 里作审计痕迹。**不能**让一条本轮没跑出来的
+                # 结论带着 ``PASSED`` / ``FAILED`` 进报告：前者会让"整仓
+                # 门禁通过"这个合入判据成立在一次没跑的门禁上，后者会为
+                # 一个没跑过的关卡生成修复任务。
+                row = self._build_deferred_gate_row(v, vp_id, current_head)
+            elif requires_reexecution(row, current_head):
+                # 旧提交上判出来的失败：这一轮**没验过**当前这份代码。
+                # 它必须重跑，不能当成本轮的结论。
+                row["reexecute_required"] = True
+                row["reexecute_reason"] = (
+                    f"这条失败判在 {row.get(JUDGED_HEAD_FIELD) or '(未知提交)'} 上，"
+                    f"当前 HEAD 是 {current_head} —— 当前这份代码还没被它验过，必须重跑。"
+                )
+            results.append(row)
+
+        # 2026-10-26（VP-031，合并后的口径）：被隔离的孤儿裁决（main 的
+        # ``executor._quarantine_orphan_verdicts``）不进 ``_verdicts`` ——
+        # 它不是任何东西的失败，旧结论也不许沿用（那是别的轮次、别的提交上
+        # 挣来的）。但它也**不许静默消失**：报告里要看得见"有个 id 谁也跑
+        # 不了"（本分支的 BLOCKED 行），否则操作者看到的是一份少了一条点
+        # 的报告，看不出这一轮少跑了一个。
+        #
+        # 判据与分派前是同一条（:func:`definition_missing`）：计划里查得到
+        # 这个 id 的不算孤儿 —— 它只是上一轮被作废过，这一轮会重跑并挣到
+        # 一条新结论。
+        for orphan_id in sorted(
+            getattr(executor, "_orphaned_vps", {}) or {}
+        ):
+            if not definition_missing(definitions, orphan_id):
+                continue
+            if any(str(r.get("id")) == orphan_id for r in results):
+                continue
+            discarded = self._build_definition_missing_verdict(orphan_id)
+            orphan_row = {
+                "id": orphan_id,
+                "status": discarded["status"],
+                "actual_result": discarded["actual_result"],
+                "evidence": json.dumps(
+                    dict(discarded.get("evidence") or {}), ensure_ascii=False,
+                ),
+            }
+            if current_head:
+                orphan_row[JUDGED_HEAD_FIELD] = current_head
+            results.append(orphan_row)
 
         # 2026-10-25 (repair-r1-26): the environment verdict is a round
         # verdict.  If the round could not reach the service, none of
