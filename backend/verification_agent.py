@@ -10856,21 +10856,38 @@ class Orchestrator:
         # instead of making the service answer a second question.
         self._observed_instances[int(port)] = instance
 
-    def _expected_plans_dirs(self) -> List[str]:
+    def _expected_plans_dirs(self, name: str) -> List[str]:
         """The plans trees this round's service may be serving.
 
-        The service publishes the plans **root** it serves; the round
-        lives in ``<root>/<plan_id>``, so the root the round expects is
-        the plan directory's parent.  The plan directory itself is
-        accepted as well — a deployment that serves the round's plan
-        directory as its own root is serving the round's plans either
-        way.
+        The **first** entry is the tree the round's own service declared
+        about itself when it was started: the round records that
+        declaration (the ``instance`` block of ``/health/data``) and a
+        service answering with anything else is a different instance.
 
-        The first entry is the *primary* expectation (the plans root);
-        the second is the tolerated alternative.
+        The declaration leads and the round's own directories follow
+        because the two are not the same question.  A service started
+        against a **fixture data plane** — the plan's ``start_cmd``
+        pointing ``PDT_PLANS_DIR`` at e.g. ``.pdt/vp_quota/plans`` — is
+        a legal deployment: it serves the plans the round gave it,
+        honestly, and it says so.  Judging it by where *this round's*
+        plan directory happens to live blocked every verification point
+        of the 2026-10-27 round at ``identity_mismatch``: the service
+        was the round's own, and the gate did not know it.
+
+        The round's ``plan_dir.parent`` and ``plan_dir`` are still
+        accepted, so a deployment whose service serves the round's own
+        tree keeps working.  A service the round recorded **no**
+        declaration for has no first entry; the round's own directories
+        are then the whole expectation, exactly as before.
         """
         dirs: List[str] = []
-        for candidate in (self.plan_dir.parent, self.plan_dir):
+        recorded = self._service_instance_identity.get(str(name).lower()) or {}
+        candidates: List[Any] = []
+        declared = str(recorded.get("plans_dir") or "")
+        if declared:
+            candidates.append(declared)
+        candidates.extend((self.plan_dir.parent, self.plan_dir))
+        for candidate in candidates:
             try:
                 resolved = str(Path(candidate).resolve())
             except OSError:  # pragma: no cover - defensive
@@ -10961,7 +10978,12 @@ class Orchestrator:
         self._observed_instances[int(port)] = actual
 
         recorded = self._service_instance_identity.get(str(name).lower()) or {}
-        expected_dirs = self._expected_plans_dirs()
+        expected_dirs = self._expected_plans_dirs(name)
+        # The first entry is the primary expectation — the plans tree
+        # the round's own service declared when it was started (or the
+        # round's plans root when it declared none).  That is the value
+        # the mismatch record reports as "expected", because it is the
+        # one a reader is trying to match against.
         expected_plans_dir = expected_dirs[0] if expected_dirs else ""
         actual_plans_dir = str(actual.get("plans_dir") or "")
         expected_boot_id = str(recorded.get("boot_id") or "")
