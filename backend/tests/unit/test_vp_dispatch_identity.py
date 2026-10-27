@@ -690,3 +690,73 @@ def test_without_a_declaration_the_rounds_own_tree_is_expected(
     mismatch = agent._compare_service_instance("api", actual_foreign, 12345)
     assert mismatch is not None, "a foreign tree was let through"
     assert mismatch["mismatched_fields"] == ["plans_dir"], mismatch
+
+
+# ---------------------------------------------------------------------------
+# 8. The same question for the state database
+# ---------------------------------------------------------------------------
+
+
+def _recorded_inode_agent(tmp_path: Path, inode: Optional[int]):
+    """An agent that recorded *inode* as the service's declaration."""
+    agent = _make_agent(tmp_path)
+    block: Dict[str, Any] = {"boot_id": "boot-1", "pid": 4242}
+    if inode is not None:
+        block["state_db_inode"] = int(inode)
+    agent._service_instance_identity["api"] = block
+    return agent
+
+
+def test_a_declared_fixture_state_database_is_not_a_mismatch(
+    tmp_path: Path, monkeypatch,
+):
+    """The round's own service declared a fixture database → not a stranger.
+
+    ``PDT_STATE_DB_PATH`` in the plan's ``start_cmd`` points the service
+    at its own database, and the round recorded the service declaring
+    exactly that inode.  The backend has another database open; that no
+    longer turns the round's own service into somebody else's — the
+    2026-10-28 shape of 20261024-429-plan.
+    """
+    _state_db(tmp_path, monkeypatch)
+    agent = _recorded_inode_agent(tmp_path, 424242)
+    actual = {"boot_id": "boot-1", "pid": 4242, "state_db_inode": 424242}
+
+    assert agent._compare_service_instance("api", actual, 12345) is None
+
+
+def test_a_third_state_database_is_still_a_mismatch(
+    tmp_path: Path, monkeypatch,
+):
+    """Neither the declared database nor the backend's own → BLOCKED.
+
+    The negative control for the loosening above: a third inode is a
+    stranger's data plane and the request must not go out.
+    """
+    _state_db(tmp_path, monkeypatch)
+    agent = _recorded_inode_agent(tmp_path, 424242)
+    actual = {"boot_id": "boot-1", "pid": 4242, "state_db_inode": 999999}
+
+    mismatch = agent._compare_service_instance("api", actual, 12345)
+
+    assert mismatch is not None, "a stranger's database was let through"
+    assert mismatch["mismatched_fields"] == ["state_db_inode"], mismatch
+    assert mismatch["expected_state_db_inode"] == 424242, mismatch
+    assert mismatch["actual_state_db_inode"] == 999999, mismatch
+
+
+def test_without_a_declaration_the_rounds_own_database_is_expected(
+    tmp_path: Path, monkeypatch,
+):
+    """No recorded inode → the backend's own database, as before."""
+    state_db = _state_db(tmp_path, monkeypatch)
+    agent = _recorded_inode_agent(tmp_path, None)
+    own_inode = int(state_db.stat().st_ino)
+
+    own = {"boot_id": "boot-1", "state_db_inode": own_inode}
+    assert agent._compare_service_instance("api", own, 12345) is None
+
+    foreign = {"boot_id": "boot-1", "state_db_inode": own_inode + 1}
+    mismatch = agent._compare_service_instance("api", foreign, 12345)
+    assert mismatch is not None, "a foreign database was let through"
+    assert mismatch["mismatched_fields"] == ["state_db_inode"], mismatch

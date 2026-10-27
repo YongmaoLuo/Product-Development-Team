@@ -431,7 +431,7 @@ def test_the_pre_dispatch_identity_check_fills_the_answering_boot_id(
         # service the VP is about to talk to, and compares it with what
         # the round expects.  The state database of this test is not
         # the round's, so that comparison is switched off.
-        monkeypatch.setattr(agent, "_expected_state_db_inode", lambda: None)
+        monkeypatch.setattr(agent, "_expected_state_db_inodes", lambda name: [])
         declaration = SimpleNamespace(port=service.port)
         mismatch = agent._service_instance_mismatch("api", declaration)
         assert mismatch is None, mismatch
