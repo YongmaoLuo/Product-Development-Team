@@ -66,6 +66,7 @@ nav:
       - Running it: operations/running.md
       - Configuration: operations/configuration.md
       - Keychain migration: operations/keychain-migration.md
+      - Orphan reaper: operations/orphan-reaper.md
   - Development:
       - Tests: development/testing.md
       - Contributing: development/contributing.md
