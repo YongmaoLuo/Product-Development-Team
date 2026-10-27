@@ -38,6 +38,11 @@ Test contract:
   6. The round's own re-ensure moves the expectation with it — a
      service the round itself restarted must not be blocked against
      the boot id of the instance it replaced.
+  7. The expected plans tree is the one the round's service
+     **declared** when it was started — a fixture data plane is a
+     legal deployment, and the round's own directories stay accepted.
+     A tree that is neither declared nor the round's own is still a
+     stranger (see the negative control at the end of this file).
 """
 
 from __future__ import annotations
@@ -557,3 +562,131 @@ def test_a_re_ensured_service_is_not_blocked_against_its_old_boot_id(
     assert dispatched == ["VP-001"], dispatched
     assert results[0]["status"] == "PASSED", results[0]
     assert _mismatch_events(agent) == []
+
+
+# ---------------------------------------------------------------------------
+# 7. The expected plans tree is the one the service **declared**
+# ---------------------------------------------------------------------------
+#
+# 2026-10-27 round: the round's service is started against a fixture
+# data plane on purpose (``PDT_PLANS_DIR=.pdt/vp_quota/plans`` inside the
+# plan's ``start_cmd``).  It publishes that tree honestly; the gate only
+# knew the round's own directories, so every verification point of the
+# round stopped dead at ``identity_mismatch`` before one request went
+# out.  The expectation now follows the declaration the round recorded
+# from the service itself, the round's own directories stay tolerated,
+# and the comparisons that catch a swapped instance keep their teeth.
+
+
+def _recorded_agent(tmp_path: Path, plans_dir: Optional[Path]):
+    """An agent that recorded *plans_dir* as the service's declaration.
+
+    *plans_dir* is ``None`` for a service the round recorded no
+    declaration for — the shape of an instance block without a plans
+    tree.
+    """
+    agent = _make_agent(tmp_path)
+    block: Dict[str, Any] = {"boot_id": "boot-1", "pid": 4242}
+    if plans_dir is not None:
+        block["plans_dir"] = str(plans_dir)
+    agent._service_instance_identity["api"] = block
+    return agent
+
+
+def test_a_declared_fixture_data_plane_is_not_a_mismatch(tmp_path: Path):
+    """The round's own service declared a fixture tree → not a stranger.
+
+    The plan's ``start_cmd`` points the service at a fixture data
+    plane, and the round recorded the service declaring exactly that.
+    The round's plan directory lives somewhere else entirely; that no
+    longer turns the round's own service into somebody else's.
+    """
+    fixture = tmp_path / "fixture" / "plans"
+    agent = _recorded_agent(tmp_path, fixture)
+    actual = {"boot_id": "boot-1", "pid": 4242, "plans_dir": str(fixture)}
+
+    assert agent._compare_service_instance("api", actual, 12345) is None
+
+
+def test_a_fixture_data_plane_round_dispatches_its_vp(
+    tmp_path: Path, monkeypatch,
+):
+    """The B14 shape end to end: the declaration is read, then honoured.
+
+    The round's preflight reads the fixture declaration from the real
+    ``/health/data`` of the service, and the VP's dispatch compares
+    against it over the same road.  Before the fix the VP never left
+    the round: the service was the round's own and the gate called it
+    a stranger.
+    """
+    service = _Service()
+    try:
+        state_db = _state_db(tmp_path, monkeypatch)
+        agent, plan = _prepare(tmp_path, monkeypatch, service)
+        fixture = tmp_path / "fixture" / "plans"
+        service.publish(_instance_block("boot-1", fixture, state_db))
+        agent._preflight_service_freshness(plan)
+        dispatched: List[str] = []
+        _spy_api_runner(monkeypatch, dispatched)
+
+        executor = agent._build_verification_executor(
+            agent._resolve_service_placeholders(plan)
+        )
+        results = _run_all_vps(executor)
+    finally:
+        service.close()
+
+    assert dispatched == ["VP-001"], dispatched
+    assert results[0]["status"] == "PASSED", results[0]
+    assert _mismatch_events(agent) == []
+
+
+def test_a_third_plans_tree_is_still_a_mismatch(tmp_path: Path):
+    """Neither the declared tree nor the round's own → still BLOCKED.
+
+    The negative control for the loosening above: recorded ≠ actual,
+    and the actual tree is not one of the round's directories either,
+    so this is a stranger and the request must not go out.
+    """
+    fixture = tmp_path / "fixture" / "plans"
+    agent = _recorded_agent(tmp_path, fixture)
+    actual = {
+        "boot_id": "boot-1",
+        "pid": 4242,
+        "plans_dir": str(tmp_path / "somebody-else" / "plans"),
+    }
+
+    mismatch = agent._compare_service_instance("api", actual, 12345)
+
+    assert mismatch is not None, "a stranger's plans tree was let through"
+    assert mismatch["mismatched_fields"] == ["plans_dir"], mismatch
+    assert mismatch["expected_plans_dir"] == str(fixture.resolve()), mismatch
+    assert mismatch["actual_plans_dir"] == str(
+        tmp_path / "somebody-else" / "plans"
+    ), mismatch
+
+
+def test_without_a_declaration_the_rounds_own_tree_is_expected(
+    tmp_path: Path,
+):
+    """No recorded plans tree → the round's own directories, as before.
+
+    A service that never published a plans tree is still gated against
+    where the round lives: its own plans root passes, a third tree does
+    not.  The fallback is the behaviour every earlier round relied on.
+    """
+    agent = _recorded_agent(tmp_path, None)
+    own_root = agent.plan_dir.parent
+
+    actual_own = {"boot_id": "boot-1", "plans_dir": str(own_root)}
+    assert agent._compare_service_instance(
+        "api", actual_own, 12345,
+    ) is None
+
+    actual_foreign = {
+        "boot_id": "boot-1",
+        "plans_dir": str(tmp_path / "a-third-tree" / "plans"),
+    }
+    mismatch = agent._compare_service_instance("api", actual_foreign, 12345)
+    assert mismatch is not None, "a foreign tree was let through"
+    assert mismatch["mismatched_fields"] == ["plans_dir"], mismatch

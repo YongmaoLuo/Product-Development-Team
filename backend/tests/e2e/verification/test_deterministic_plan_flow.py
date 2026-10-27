@@ -542,6 +542,15 @@ def workspace(tmp_path_factory: pytest.TempPathFactory) -> Workspace:
         E2E_SCRIPT_SOURCE, encoding="utf-8"
     )
 
+    # 新鲜度判定拿源码 mtime（小数秒）和 `ps -o lstart`（**整秒**）比。
+    # 文件刚写完、服务在同一秒里起来时，lstart 向下取整会让服务看起来
+    # 比源码旧，预检于是判"需要重启"，重启代理在 scripted 模式下没有
+    # 应答 ⇒ 整轮 VP-001 变 BLOCKED。把源码 mtime 钉到过去，判定就有
+    # 明确余量，而不是掷同一秒内的先后顺序。
+    _source_epoch = time.time() - 3600
+    for _script in (project_dir / "scripts").glob("*.py"):
+        os.utime(_script, (_source_epoch, _source_epoch))
+
     # 被测服务的源码（写在工作区里，不在项目目录里 —— 项目目录的最新源码
     # mtime 是服务新鲜度判定的基准，服务自己的脚本不该搅进去）。
     service_script = root / "tiny_service.py"
