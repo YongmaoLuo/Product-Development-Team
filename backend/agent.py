@@ -2090,6 +2090,18 @@ def _make_task_session(
     needs: it had no id anywhere, so the ``/start`` that followed it
     used to fall back to a full re-run.
 
+    The handle says which stage produced it
+    ---------------------------------------
+    Stages 1 and 2 both name a session that *exists* and is re-opened;
+    stage 3 names an id that does not exist yet and is created by the
+    first dispatch. The ids themselves do not tell those apart, so the
+    handle carries the distinction in ``stage``: ``"resumed"`` for
+    stages 1 and 2, ``"pinned"`` for stage 3, and ``None`` for the
+    empty handle handed out when there is no plan id to derive one
+    from. A caller that writes a ``task_session_bound`` event before
+    the dispatch reads it to say whether the task is continuing an old
+    conversation or starting a new one.
+
     Nothing here raises. A missing plan directory, an unreadable
     sidecar or a sidecar that cannot be written costs the *record* of
     the id, never the task.
@@ -2097,7 +2109,7 @@ def _make_task_session(
     # 1. The recovery mapping wins outright.
     mapped = _resume_session_id_for(task_id)
     if mapped:
-        return JsonSession(session_id=mapped)
+        return JsonSession(session_id=mapped, stage="resumed")
 
     key = _task_session_key(task_id)
 
@@ -2114,7 +2126,7 @@ def _make_task_session(
             )
             recorded = None
     if recorded:
-        return JsonSession(session_id=recorded)
+        return JsonSession(session_id=recorded, stage="resumed")
 
     # 3. The deterministic id — pinned, and recorded before the first
     #    dispatch so that the next process finds it.
@@ -2133,7 +2145,73 @@ def _make_task_session(
                 "under it, but a later process will not find it here",
                 task_id, type(exc).__name__,
             )
-    return JsonSession(pinned_session_id=pinned)
+    return JsonSession(pinned_session_id=pinned, stage="pinned")
+
+
+def _log_task_session_bound(
+    logger,
+    task_id: str,
+    session: Optional[JsonSession],
+    attempt: int,
+) -> None:
+    """Write the one event that records a task's session binding.
+
+    2026-10-26. A task's session binding is worth recording twice: once
+    when the dispatch is about to start (the id it was *asked* for) and
+    once when the dispatch returns (the id it *actually* used — a
+    provider fallback may have switched it). Both records must have the
+    same shape, because a reader that has to understand two shapes will
+    eventually understand neither: the reader takes the LAST binding for
+    a task and uses it.
+
+    This is the one place that shape is written.
+
+    The id it names is the session the dispatch runs under. A handle
+    carries two ids, because it may be handed out before the session
+    exists: ``session_id`` names a session that exists and is
+    re-opened, ``pinned_session_id`` names the id the dispatch will
+    CREATE the session under. Either one is an id the next process has
+    to be able to re-open, so either one is what this event records.
+
+    ``stage`` says where the id came from — ``"pinned"`` (the id is
+    derived and the dispatch creates the session under it) or
+    ``"resumed"`` (the id names a session that exists and is re-opened).
+    A handle that does not say is recorded as ``"unknown"``: those two
+    name a specific way the id was produced, and guessing one would be
+    a lie the reader would act on.
+
+    Nothing here may cost a task. This is a *record*: a missing logger,
+    a handle with no id at all, or a logger that raises while writing
+    all cost the record and nothing else.
+    """
+    if logger is None:
+        # A run without an execution log is a normal run; the binding
+        # simply has nowhere to be written.
+        return
+    if session is None:
+        # No handle names no session.
+        return
+
+    session_id = session.session_id or session.pinned_session_id
+    if not session_id:
+        # Neither id is set: nothing was bound, and an event here would
+        # be a binding the reader would take for one.
+        return
+
+    try:
+        logger.info(
+            "task_session_bound",
+            f"Task [{task_id}] attempt {attempt} bound to session "
+            f"{session_id}",
+            task_id=task_id,
+            data={
+                "session_id": session_id,
+                "attempt": attempt,
+                "stage": session.stage or "unknown",
+            },
+        )
+    except Exception:  # noqa: BLE001 — a bad logger is not a bad task
+        pass
 
 
 def _persist_task_session(
@@ -6133,6 +6211,35 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                 # Determine if we should use background execution
                 previous_timeout = self.executor.had_previous_timeout(task.id)
 
+                # 2026-10-26 — record the binding BEFORE the dispatch
+                # starts, not after it returns.
+                #
+                # Why: the binding is the only durable record of which
+                # session this task is bound to, and the stop path
+                # reads it out of the execution log
+                # (``pause_state.collect_task_sessions``) to re-open
+                # that session on a resume. When the record was only
+                # written after ``query_in_session`` returned, a
+                # dispatch that BLOCKED — a provider that hangs, a CLI
+                # that waits — left the log with no binding at all: the
+                # stop could only answer ``no_session_id`` and fell
+                # back to a full re-run of the plan.
+                #
+                # Written here, one line above the dispatch, so BOTH
+                # dispatch branches (the background one a previous
+                # timeout selects, and the normal one) are covered by
+                # the same record. The record written after the
+                # dispatch returns is still written — a provider
+                # fallback may have switched the id — and the reader
+                # takes the LAST binding for a task, so the two records
+                # agree on which id the task ended up in.
+                #
+                # A missing logger costs the record and nothing else:
+                # ``_log_task_session_bound`` never raises.
+                _log_task_session_bound(
+                    self.logger, task.id, task_session, attempt + 1
+                )
+
                 try:
                     if previous_timeout:
                         print("Previous timeout detected, using background execution...")
@@ -6175,33 +6282,26 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                             task,
                             (attempt + 1, attempt_bound),
                         )
-                    if task_session.session_id and self.logger:
-                        # Observable proof that the retry re-opened the same
-                        # conversation: one session id per task, carried
-                        # across attempts.
-                        self.logger.info(
-                            "task_session_bound",
-                            f"Task [{task.id}] attempt {attempt + 1} ran in "
-                            f"session {task_session.session_id}",
-                            task_id=task.id,
-                            data={
-                                "attempt": attempt + 1,
-                                "session_id": task_session.session_id,
-                                "reused": attempt > 0,
-                            },
-                        )
+                    # Observable proof that the retry re-opened the same
+                    # conversation: one session id per task, carried
+                    # across attempts. The helper writes the shape, so
+                    # the binding recorded before a dispatch and the one
+                    # recorded after it are the same record.
+                    _log_task_session_bound(
+                        self.logger, task.id, task_session, attempt + 1
+                    )
                     # 2026-10-22 — write the id the dispatch ACTUALLY used
                     # back to the plan's sidecar, so the next process
                     # re-opens the session that produced the answer rather
                     # than the one that was merely asked for. A provider
                     # fallback may have switched it.
                     #
-                    # This sits OUTSIDE the ``if ... and self.logger:``
-                    # block above on purpose: the write is not a log
-                    # line, and a run with no execution logger must still
-                    # record the id it just used. It is best-effort —
-                    # ``_persist_task_session`` never raises, so an
-                    # unwritable sidecar costs the record, not the task.
+                    # This is NOT guarded by the logger on purpose: the
+                    # write is not a log line, and a run with no execution
+                    # logger must still record the id it just used. It is
+                    # best-effort — ``_persist_task_session`` never
+                    # raises, so an unwritable sidecar costs the record,
+                    # not the task.
                     _persist_task_session(
                         plan_dir, task.id, task_session, self.logger
                     )
