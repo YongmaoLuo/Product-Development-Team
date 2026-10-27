@@ -1,0 +1,68 @@
+{
+  "plan_id": "vp-fixture-001",
+  "verification_points": [
+    {
+      "id": "VP-001",
+      "title": "读取条目列表接口返回 200 且条目带 id",
+      "related_prd_criteria": ["AC-001"],
+      "verification_method": "api_test",
+      "verification_phase": 1,
+      "priority": "high",
+      "expected_result": "GET /api/items 返回 200，响应体里有 id 字段",
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:8080/api/items?limit=10",
+        "headers": {"Accept": "application/json"},
+        "body": null,
+        "timeout_seconds": 30
+      },
+      "assertions": [
+        {"name": "状态码", "status": 200},
+        {"name": "资源 id 存在", "json_path": "$.id", "exists": true}
+      ]
+    },
+    {
+      "id": "VP-002",
+      "title": "创建条目接口返回 201 且至少写入一条记录",
+      "related_prd_criteria": ["AC-002"],
+      "verification_method": "api_test",
+      "verification_phase": 1,
+      "priority": "high",
+      "expected_result": "POST /api/items 返回 201，响应体里的 items 至少有一条",
+      "request": {
+        "method": "POST",
+        "url": "http://127.0.0.1:8080/api/items",
+        "headers": {"Accept": "application/json", "Content-Type": "application/json"},
+        "body": {"name": "sample-entry", "quantity": 1},
+        "timeout_seconds": 30
+      },
+      "assertions": [
+        {"name": "状态码", "status": 201},
+        {"name": "至少写入一条记录", "json_path": "$.items", "length_gte": 1}
+      ]
+    },
+    {
+      "id": "VP-003",
+      "title": "【全量】整仓门禁：CI 入口与全部测试",
+      "related_prd_criteria": ["AC-003"],
+      "verification_method": "full_ci",
+      "verification_phase": 2,
+      "phase_order": 1,
+      "priority": "high",
+      "ci_entry": "python scripts/ci_local.py",
+      "ci_timeout_seconds": 3600,
+      "expected_result": "整仓门禁与全部测试通过，退出码 0"
+    },
+    {
+      "id": "VP-004",
+      "title": "【全量】E2E：从列表页走到结算页的整条链路",
+      "related_prd_criteria": ["AC-004"],
+      "verification_method": "e2e",
+      "verification_phase": 2,
+      "phase_order": 2,
+      "priority": "high",
+      "target_url": "http://127.0.0.1:5173/checkout",
+      "expected_result": "浏览器里从列表页走到结算页，结算完成页出现确认文案"
+    }
+  ]
+}

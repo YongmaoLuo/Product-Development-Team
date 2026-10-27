@@ -299,6 +299,44 @@ def _day_of(created_at: Optional[int]) -> str:
         return "unknown"
 
 
+class _AttributionGroups(dict):
+    """Group payloads keyed by attribution key (VP id / round number).
+
+    The report is read in two shapes: in memory, where a round is the
+    ``int`` the caller bound, and from ``usage_report.json``, where
+    every JSON object key is a string. A reader must be able to ask
+    for a round either way, so a lookup that misses falls back to the
+    string form of the key.
+    """
+
+    def _resolve(self, key):
+        try:
+            return dict.__getitem__(self, key)
+        except KeyError:
+            return dict.__getitem__(self, str(key))
+
+    def __getitem__(self, key):
+        return self._resolve(key)
+
+    def get(self, key, default=None):
+        try:
+            return self._resolve(key)
+        except KeyError:
+            return default
+
+
+def _groups_by_key(groups: Dict[str, Dict[str, Any]]) -> _AttributionGroups:
+    """The finalized groups as a key-addressable mapping.
+
+    Same payloads as :func:`_finalize_groups` (and the same order —
+    biggest bucket first), reachable by their key instead of by a scan.
+    """
+    out = _AttributionGroups()
+    for item in _finalize_groups(groups):
+        out[item["key"]] = item
+    return out
+
+
 def _pdt_side_account(entries: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     """the backend's own first-hand numbers, from the stream-json result events."""
     account = {
@@ -346,7 +384,15 @@ def _pdt_side_account(entries: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
 def build_usage_report(
     plan_id: str, *, db_path: Optional[Path] = None
 ) -> Dict[str, Any]:
-    """Aggregate one plan's LLM usage. Never raises on missing data."""
+    """Aggregate one plan's LLM usage. Never raises on missing data.
+
+    The report carries two extra splits — ``by_vp`` and ``by_round`` —
+    keyed by the attribution coordinates the registry records
+    (``vp_id`` / ``round``). They are the answer to "which verification
+    point, and which round of it, burned the budget"; an entry written
+    before those coordinates existed lands in ``(unattributed)``, which
+    is a bucket, not an error.
+    """
     entries = read_llm_calls(plan_id)
     sessions: List[str] = []
     session_meta: Dict[str, Dict[str, Any]] = {}
@@ -356,12 +402,26 @@ def build_usage_report(
             continue
         if sid not in session_meta:
             sessions.append(sid)
-            session_meta[sid] = {"scenes": set(), "tasks": set()}
+            session_meta[sid] = {
+                "scenes": set(),
+                "tasks": set(),
+                "vps": set(),
+                "rounds": set(),
+            }
         meta = session_meta[sid]
         if entry.get("scene"):
             meta["scenes"].add(entry["scene"])
         if entry.get("task_id"):
             meta["tasks"].add(entry["task_id"])
+        vp_id = entry.get("vp_id")
+        if vp_id:
+            meta["vps"].add(vp_id)
+        rnd = entry.get("round")
+        if rnd is not None:
+            # The round is a number; the key is its string form, so the
+            # bucket survives the JSON round-trip and sorts like every
+            # other key in the report.
+            meta["rounds"].add(str(rnd))
 
     report: Dict[str, Any] = {
         "plan_id": plan_id,
@@ -391,6 +451,11 @@ def build_usage_report(
         "by_scene": [],
         "by_task": [],
         "by_day": [],
+        # Key-addressable (a mapping, not the list shape the sections
+        # above use): the reader asks "what did VP-7 cost?" directly.
+        # Empty on every early return, so the shape is stable.
+        "by_vp": _AttributionGroups(),
+        "by_round": _AttributionGroups(),
         "pricing": {
             "source": "cc_switch.model_pricing",
             "currency": "USD",
@@ -449,6 +514,8 @@ def build_usage_report(
     by_scene: Dict[str, Dict[str, Any]] = {}
     by_task: Dict[str, Dict[str, Any]] = {}
     by_day: Dict[str, Dict[str, Any]] = {}
+    by_vp: Dict[str, Dict[str, Any]] = {}
+    by_round: Dict[str, Dict[str, Any]] = {}
     total_cost = 0.0
 
     for row in rows:
@@ -468,6 +535,10 @@ def build_usage_report(
             _bump(by_scene, scene, row)
         for task in meta.get("tasks") or {"(unattributed)"}:
             _bump(by_task, task, row)
+        for vp in meta.get("vps") or {"(unattributed)"}:
+            _bump(by_vp, vp, row)
+        for rnd in meta.get("rounds") or {"(unattributed)"}:
+            _bump(by_round, rnd, row)
 
     untracked = []
     for sid in sessions:
@@ -497,6 +568,8 @@ def build_usage_report(
     report["by_day"] = sorted(
         _finalize_groups(by_day), key=lambda item: item["key"]
     )
+    report["by_vp"] = _groups_by_key(by_vp)
+    report["by_round"] = _groups_by_key(by_round)
     report["sessions"]["tracked"] = len(seen_sessions)
     report["sessions"]["untracked"] = len(untracked)
 

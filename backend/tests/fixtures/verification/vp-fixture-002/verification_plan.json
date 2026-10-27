@@ -1,0 +1,52 @@
+{
+  "plan_id": "vp-fixture-002",
+  "verification_points": [
+    {
+      "id": "VP-900",
+      "title": "主题外验证点：引用的验收标准不在本计划的 PRD 里",
+      "related_prd_criteria": ["AC-NOT-IN-PRD"],
+      "verification_method": "api_test",
+      "verification_phase": 1,
+      "priority": "medium",
+      "expected_result": "这条验证点引用的验收标准不属于本计划的主题，主题相关性判定应当把它判为主题外",
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:8080/api/off-topic",
+        "headers": {"Accept": "application/json"},
+        "body": null,
+        "timeout_seconds": 30
+      },
+      "assertions": [
+        {"name": "状态码", "status": 200}
+      ]
+    },
+    {
+      "id": "VP-901",
+      "title": "代码评审验证点：框架不执行，判定要靠评审",
+      "related_prd_criteria": ["AC-001"],
+      "verification_method": "code_review",
+      "verification_phase": 1,
+      "priority": "medium",
+      "expected_result": "评审意见里逐条对上 AC-001，评审结论写明通过或不通过"
+    },
+    {
+      "id": "VP-902",
+      "title": "孤儿验证点：没有任何验收标准支撑它",
+      "related_prd_criteria": [],
+      "verification_method": "api_test",
+      "verification_phase": 1,
+      "priority": "low",
+      "expected_result": "这条验证点没有判据支撑，裁决它等于对着一份不存在的标准打分",
+      "request": {
+        "method": "GET",
+        "url": "http://127.0.0.1:8080/api/orphan",
+        "headers": {"Accept": "application/json"},
+        "body": null,
+        "timeout_seconds": 30
+      },
+      "assertions": [
+        {"name": "状态码", "status": 200}
+      ]
+    }
+  ]
+}

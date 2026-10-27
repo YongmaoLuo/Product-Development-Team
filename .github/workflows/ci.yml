@@ -85,6 +85,11 @@ name: CI
 #   - New code line coverage             -> gate ≥ 80% (--cov-fail-under=80,
 #                                           via coverage-gate on the combined
 #                                           shard data)
+#   - New-kernel module coverage         -> gate per module path (coverage-gate:
+#                                           one --fail-under per module over the
+#                                           same combined shard data — a module is
+#                                           judged on its own number, not on the
+#                                           repository's average)
 #   - secrets/permissions                -> least-privilege defaults (contents:read)
 
 on:
@@ -1287,10 +1292,21 @@ jobs:
           fi
 
           set +e
+          # The marker expression is the lane's contract about WHERE a
+          # case runs, and it is the only place that contract is
+          # written. ``observational`` / ``real_model`` /
+          # ``needs_real_process`` are the three markers the
+          # verification work brought: each one says the case needs
+          # something this shard cannot give it — a quiet machine, a
+          # live provider, a real process — and this shard runs eight
+          # workers beside each other with a 60-second per-test
+          # ceiling. Excluding a marker here is only safe because a
+          # lane elsewhere collects it; the gate that says so is
+          # ``tests/static_gates/test_verification_lane_registered.py``.
           COVERAGE_FILE=.coverage.${{ matrix.shard }} \
           timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
             ./.venv/bin/python3 -m pytest $EXEC_ORDER \
-              -m "not e2e and not integration and not time_sensitive and not perf" \
+              -m "not e2e and not integration and not time_sensitive and not perf and not observational and not real_model and not needs_real_process" \
               -n 8 \
               --cov=. \
               --cov-report= \
@@ -1609,7 +1625,7 @@ jobs:
           COVERAGE_FILE=.coverage.staircase-${{ matrix.shard }} \
           timeout --foreground --signal=USR1 --kill-after=30s "$WATCHDOG_SECONDS" \
             ./.venv/bin/python3 -m pytest $TARGETS \
-              -m "not e2e and not integration and not time_sensitive and not perf" \
+              -m "not e2e and not integration and not time_sensitive and not perf and not observational and not real_model and not needs_real_process" \
               -n 8 \
               --cov=. \
               --cov-report= \
@@ -1723,6 +1739,76 @@ jobs:
         run: |
           ./.venv/bin/python3 -m coverage combine
           ./.venv/bin/python3 -m coverage report --fail-under=80
+
+      # The new kernel is judged ONE MODULE AT A TIME.
+      #
+      # The floor above is one number for the whole tree, and a whole-tree
+      # number is diluted by the directories that were already here: the
+      # seven modules this feature added are ~1400 statements against a
+      # repository of tens of thousands, so one of them can sit far below
+      # the floor while the union still reads above it — and the union
+      # says nothing about WHICH module is the weak one.
+      # `root_cause_task.py` is the clearest case: a brand-new module that
+      # the whole-tree number never mentions.
+      #
+      # The measurement is the shards' union — the same combined data the
+      # floor above reads — sliced down to one module per command. The
+      # mechanism is `coverage report --include=<module> --fail-under=N`
+      # rather than pytest-cov's `--cov` / `--cov-fail-under`, because:
+      #   * `--cov` takes a DIRECTORY or an importable module NAME. A
+      #     file path is read as a module name, comes back "never
+      #     imported", and collects no data at all;
+      #   * `--cov-fail-under` is a TOTAL over every source given to
+      #     pytest, so it can only ever express the repository-wide
+      #     number this gate exists to replace;
+      #   * `coverage report --include` slices the combined data by path,
+      #     so a module is judged on its own number.
+      # A module that is missing from the data fails the step ("No data
+      # to report."), so this gate cannot pass vacuously.
+      #
+      # WHAT THE RUNNER ACTUALLY MEASURES. The shards collect LINE
+      # coverage: their pytest-cov flags are `--cov=.` with no
+      # `--cov-branch`, and `backend/pyproject.toml` carries no
+      # `[tool.coverage]` section, so the numbers this step reads are
+      # line percentages. The floors below were taken from each
+      # module's BRANCH-coverage level (the metric decision point 12
+      # talks about) minus a 5-point margin. Branch coverage is never
+      # higher than line coverage for the same module, so a floor
+      # derived from the branch level is conservative against the line
+      # number the runner reports: the gate is green today with 6 to 14
+      # points of headroom, and it still fires the moment a module
+      # loses real coverage.
+      #
+      # The target is decision point 12's 95% branch coverage per module
+      # (and 100% on the tri-state and fail-open branches). It becomes
+      # enforceable the day the shards collect branch data; collecting
+      # it is not a one-line change, because the repository-wide floor
+      # above is read from the same data and would move with it.
+      #
+      # The floors are a RATCHET in the sense that they are set below
+      # where the modules stand and are meant to be raised as the tests
+      # catch up — raising one is a one-line edit here. Nothing
+      # enforces that direction mechanically; a floor that walks
+      # downwards shows up as a diff on this file.
+      #
+      # WHERE THE FLOORS ARE PINNED. The seven numbers below are
+      # mirrored in
+      # `backend/tests/static_gates/test_new_kernel_coverage_targets.py`
+      # as `NEW_KERNEL_COVERAGE_FLOORS`, and that file's
+      # `test_fail_under_is_module_level` fails the build when the two
+      # copies disagree. A floor is a ratchet, and every step of one is
+      # a decision somebody has to look at — so moving a floor here
+      # without moving it there is a red build, not a quiet change.
+      - name: Enforce the new-kernel module coverage gate
+        working-directory: backend
+        run: |
+          ./.venv/bin/python3 -m coverage report --include="verification/topic_relevance.py" --fail-under=64
+          ./.venv/bin/python3 -m coverage report --include="verification/failure_fingerprint.py" --fail-under=87
+          ./.venv/bin/python3 -m coverage report --include="verification/scan.py" --fail-under=80
+          ./.venv/bin/python3 -m coverage report --include="verification/vp_removal_audit.py" --fail-under=69
+          ./.venv/bin/python3 -m coverage report --include="context_pack.py" --fail-under=80
+          ./.venv/bin/python3 -m coverage report --include="effect_report.py" --fail-under=72
+          ./.venv/bin/python3 -m coverage report --include="root_cause_task.py" --fail-under=55
 
       - name: Upload combined coverage report
         if: always()
@@ -1913,9 +1999,17 @@ jobs:
       # this step; the full 1482-test suite moves to the
       # nightly-regression job (which already runs once a day on a
       # cron and is not blocking).
+      #
+      # ``--ignore=tests/e2e/verification`` moves the verification
+      # end-to-end cases into the ``e2e-verification`` shard, which is
+      # where they belong. They used to be swept up here, which meant a
+      # case that starts a real server stretched the lane that everything
+      # else in it also had to wait for, and a flaky one among them
+      # failed a job named after a hundred unrelated cases. A case runs
+      # in exactly one lane or the feedback time is paid twice.
       - name: Run E2E tests
         working-directory: backend
-        run: ./.venv/bin/python3 -m pytest tests/ -m "e2e and not time_sensitive" --tb=short --timeout=600 -v
+        run: ./.venv/bin/python3 -m pytest tests/ --ignore=tests/e2e/verification -m "e2e and not time_sensitive" --tb=short --timeout=600 -v
 
       - name: Upload E2E logs
         if: always()
@@ -2899,10 +2993,18 @@ jobs:
       # assertion measured beside other workers is a measurement of the
       # workers. The perf file takes the fastest of several runs, which
       # is what makes a single process enough.
+      #
+      # ``test_kernel_scale.py`` joined this lane with the verification
+      # kernel's scale budgets: it measures the three pure functions
+      # between a plan and its verdict — the topic judgement, the failure
+      # fingerprint and the whole-library scan — and they are budgets on
+      # the same hot path the scaling file above measures, so they are
+      # read on the same machine (four pinned CPUs) rather than on
+      # whichever one the serial lane happened to get.
       - name: Run the verification-mode perf tests (serial)
         working-directory: backend
         timeout-minutes: 8
-        run: ${TASKSET_PREFIX} ./.venv/bin/python3 -m pytest tests/perf/test_verification_mode_scaling.py --tb=short --timeout=1800 -v
+        run: ${TASKSET_PREFIX} ./.venv/bin/python3 -m pytest tests/perf/test_verification_mode_scaling.py tests/perf/test_kernel_scale.py --tb=short --timeout=1800 -v
 
       - name: Upload the perf logs
         if: always()
@@ -2912,6 +3014,113 @@ jobs:
           path: |
             backend/logs/
             backend/.pytest_cache/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # STAGE 4b — VERIFICATION E2E (PR gate, one shard of its own)
+  # ---------------------------------------------------------------------------
+  #
+  # The verification subsystem's end-to-end cases get a lane of their own.
+  # They used to be swept up by ``e2e-on-demand``, which collects the
+  # whole ``tests/`` tree's ``e2e`` set under one 600-second per-test
+  # ceiling: the CLI contract, the deterministic full-chain flow and the
+  # real-model attribution file all landed in the same job as the
+  # browser-shaped E2E, so a slow one among them stretched the lane
+  # everything else had to wait for, and a flaky one failed a job named
+  # after a hundred unrelated cases.
+  #
+  # Two properties, and neither is negotiable:
+  #
+  #   * **Serial.** These cases start real servers, real git worktrees and
+  #     real subprocesses. Two of them at once contend for the same ports
+  #     and the same repository, so a parallelised run is not faster — it
+  #     is two halves of the same contract arguing with each other.
+  #   * **Chained after the shards.** ``needs: unit-tests`` means the
+  #     machine is quiet before the first case starts, which is what makes
+  #     a reproduction here mean the same thing twice.
+  #
+  # The ``-m`` expression is the marker contract, and it names all three
+  # markers the plan registered:
+  #
+  #   * ``e2e`` — the CLI contract and the deterministic flow. Both carry
+  #     it, and ``e2e-on-demand`` now ignores this directory so that each
+  #     of these cases runs in exactly one lane.
+  #   * ``observational`` / ``real_model`` / ``needs_real_process`` — the
+  #     three markers the fast shards drop. A marker every lane drops is
+  #     a case that runs nowhere, so the lane that owns this directory
+  #     names them: a case carrying one of them is collected here rather
+  #     than nowhere. The gate that keeps that true is
+  #     ``tests/static_gates/test_verification_lane_registered.py``.
+  #
+  # ``real_model`` cases are skipped under ``CI=true`` (see
+  # ``backend/tests/conftest.py``) — the local nightly is what really runs
+  # them, against a live provider.
+  e2e-verification:
+    name: Verification E2E (serial shard)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    # Chained after the unit shards, for the reason the sibling lanes
+    # above give: the machine has to be quiet before a number is read off
+    # it or a reproduction is read.
+    needs: unit-tests
+    # Ten minutes is the ceiling for the WHOLE job. The cases in this
+    # directory finish in seconds locally; the ceiling is here so a
+    # wedged one cannot hold a runner for the hour GitHub would
+    # otherwise allow.
+    timeout-minutes: 10
+    env:
+      # The plan directory and the state database are redirected into the
+      # workspace, so the failure upload below can find them. The
+      # hermetic test environment otherwise puts them in a per-session
+      # scratch directory whose path only the pytest process knows — and
+      # an artifact that cannot name its own evidence is no evidence.
+      PDT_PLANS_DIR: ${{ github.workspace }}/backend/e2e-verification-state/plans
+      PDT_STATE_DB_PATH: ${{ github.workspace }}/backend/e2e-verification-state/state.db
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/uv.lock
+
+      - name: Restore the uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv==0.11.6
+          uv sync --project backend --locked
+
+      # No ``-n``, and no ``timeout`` wrapper either: the cases here
+      # start their own processes and are meant to be run one at a time,
+      # so the job's own ceiling is the budget that has to hold.
+      - name: Run the verification E2E (serial)
+        working-directory: backend
+        timeout-minutes: 8
+        run: ./.venv/bin/python3 -m pytest tests/e2e/verification -m "e2e or observational or real_model or needs_real_process" --tb=short --timeout=600 -v
+
+      - name: Upload the verification E2E logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-verification-logs-${{ github.sha }}
+          path: |
+            backend/logs/
+            backend/.pytest_cache/
+            backend/e2e-verification-state/
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 30
@@ -2992,6 +3201,7 @@ jobs:
       - negctl
       - verification-e2e
       - verification-perf
+      - e2e-verification
     runs-on: ubuntu-latest
     steps:
       - name: Fail unless every upstream job succeeded

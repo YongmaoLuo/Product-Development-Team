@@ -33,12 +33,14 @@ import functools
 import json
 import logging
 import os
+import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 # 2026-09-08: HardTimeoutError is raised by coding_tool when
 # the inner adaptive timer SIGKILLs a silent subprocess. The
@@ -61,6 +63,112 @@ from utils.secret_files import private_dir, write_private_json
 # ``BLOCKED — `` 前缀 —— 读报告的人要一眼看出「验不下去」而不是「验了没过」。
 # 前缀由 :mod:`verification_buckets` 统一给出，四个 BLOCKED 产出点共用同一份。
 from verification_buckets import blocked_reason
+from config_paths import resolve_plans_dir
+# 2026-10-27（归因绑定点 · 验证点侧）：台账认 ``vp_id`` / ``round`` 两个
+# 归因坐标（``usage_registry``）。子 agent 是**验证会话的发起者** —— 它
+# 知道这次会话属于哪条验证点，所以验证点号由它绑。
+from usage_registry import (
+    current_plan_id,
+    current_round,
+    current_task_id,
+    plan_usage_context,
+)
+
+
+# ---------------------------------------------------------------------------
+# The context-pack reference contract (shared with the execution brief)
+# ---------------------------------------------------------------------------
+#
+# 2026-10-27 — A5.  The eight environment facts a round runs on live in
+# ONE file per round: ``<plan_dir>/context/round-<n>.json``, written by
+# :mod:`context_pack`.  Both briefs — the verification brief built below
+# and the execution brief in ``agent.py`` — hand out that file's ABSOLUTE
+# PATH and nothing else, so a sub-agent that would otherwise spend its
+# tool calls on ``ls`` / ``find`` / ``git log`` reads one JSON file
+# instead.
+#
+# The contract lives in this leaf module and ``agent.py`` imports it: a
+# leaf must not import the orchestrator (that is how import cycles are
+# born), and the two briefs have to say exactly the same thing — two
+# copies of the sentence drift, and a drifted instruction is one
+# sub-agent that still goes exploring.
+
+#: The fixed instruction.  ``{pack_path}`` is the pack's absolute path.
+CONTEXT_PACK_REFERENCE_INSTRUCTION = (
+    "环境事实见 {pack_path}，不要再运行 ls / find / git log 重新探索环境"
+)
+
+#: The directory the packs live in, under the plan's own directory.
+CONTEXT_PACK_DIRNAME = "context"
+
+#: The pack file name for one round.
+CONTEXT_PACK_FILENAME_TEMPLATE = "round-{round_no}.json"
+
+#: The shape a file name has to have to count as a pack.
+_CONTEXT_PACK_FILENAME_RE = re.compile(r"^round-(\d+)\.json$")
+
+
+def absolute_path(path: Path) -> Path:
+    """The path as an absolute one, WITHOUT resolving symlinks.
+
+    ``Path.resolve()`` follows symlinks, and on macOS ``/tmp`` is a
+    symlink to ``/private/tmp`` — so a resolved path and an unresolved
+    one are two different strings for the same file.  The two briefs
+    have to name the SAME file, so neither of them may resolve: they
+    only make the path absolute.
+    """
+    path = Path(path).expanduser()
+    if path.is_absolute():
+        return path
+    return Path.cwd() / path
+
+
+def context_pack_dir(plan_dir: Path) -> Path:
+    """The directory this plan's packs live in."""
+    return Path(plan_dir) / CONTEXT_PACK_DIRNAME
+
+
+def context_pack_path(plan_dir: Path, round_no: int) -> Path:
+    """Where the pack for ``round_no`` lives."""
+    return context_pack_dir(plan_dir) / CONTEXT_PACK_FILENAME_TEMPLATE.format(
+        round_no=round_no
+    )
+
+
+def existing_context_pack_rounds(plan_dir: Path) -> List[int]:
+    """The rounds whose pack is already on disk, ascending.
+
+    A missing directory is not an error: it means the round has not
+    written its pack yet.
+    """
+    try:
+        names = os.listdir(context_pack_dir(plan_dir))
+    except OSError:
+        return []
+    rounds: List[int] = []
+    for name in names:
+        match = _CONTEXT_PACK_FILENAME_RE.match(name)
+        if match and context_pack_path(plan_dir, int(match.group(1))).is_file():
+            rounds.append(int(match.group(1)))
+    return sorted(rounds)
+
+
+def latest_context_pack(plan_dir: Path) -> Optional[Path]:
+    """The newest pack in the plan's context directory, or ``None``.
+
+    "Newest" is the highest ROUND NUMBER, not the newest mtime: the
+    number is what the file is named after, so it is the one ordering
+    two processes agree on.
+    """
+    rounds = existing_context_pack_rounds(plan_dir)
+    if not rounds:
+        return None
+    return context_pack_path(plan_dir, rounds[-1])
+
+
+def context_pack_reference_line(pack_path: Path) -> str:
+    """The one line a brief uses to point at the context pack."""
+    return CONTEXT_PACK_REFERENCE_INSTRUCTION.format(pack_path=str(pack_path))
 
 
 def _marshal_safe_on_worker_thread(func: Any) -> Any:
@@ -462,6 +570,40 @@ class MethodTemplateRegistry:
         return tuple(cls._TEMPLATES.keys())
 
 
+@contextmanager
+def _session_attribution_scope(vp_id: str) -> Iterator[None]:
+    """把这条验证点的**会话**绑定到它自己身上。
+
+    2026-10-27（归因绑定点）：台账早就认 ``vp_id`` / ``round`` 两个归因
+    坐标（任务 6），但验证会话发起时没人绑定 —— 于是验证的每一次 LLM 往返
+    都落进 ``(unattributed)`` 桶。桶能说「验证很贵」，却说不出「**哪条**
+    验证点贵」—— 一个不能点名的桶没法优化。
+
+    绑定点选在**会话发起处**，不是台账写出来之后：写出来再猜，就只能猜。
+
+    三个坐标各自的来源：
+
+    * ``vp_id`` —— 这条验证点自己的号（这里绑定）；
+    * ``round`` —— 轮次由执行器在分派处交给分派（``verification_executor``
+      的 ``run``），这里**继承**它：``plan_usage_context`` 的继承规则是
+      「内层不点名就保住外层的值」，所以这一层不必知道轮次是几；
+    * ``plan_id`` / ``task_id`` —— 原样带过来，不因为这次绑定而丢（台账里
+      既有字段的值必须与绑定之前一模一样）。
+
+    作用域是**会话级**的：``with`` 退出时 ContextVar 复位，下一条验证点
+    拿不到这一条的号。会话跑在派生 worker（``asyncio.to_thread``）里，
+    worker 拿到的是这次绑定的**副本** —— 绑定进得去，也出不来：worker 里
+    改的值不会流回主线程，主线程的值也不会流进下一个 worker。
+    """
+    with plan_usage_context(
+        plan_id=current_plan_id(),
+        task_id=current_task_id(),
+        vp_id=vp_id,
+        round=current_round(),
+    ):
+        yield
+
+
 @dataclass
 class VerificationSubAgent:
     """Skeleton for a single verification sub-agent invocation.
@@ -835,6 +977,17 @@ class VerificationSubAgent:
             security net (the LLM never emits it).
         """
         vp_id = str(vp_node.get("id", "unknown"))
+
+        # 2026-10-27（分派表）：先问分派表。这条验证点的判据如果本来就是
+        # 可机械执行的，就**不要**起 LLM 会话 —— 判定住在 runner 里，
+        # 跨轮可复跑；子会话的自报不可复跑。分派表说「判不了」时，才走
+        # 下面的 LLM 子会话。
+        route, mode = resolve(vp_node)
+        if mode == DETERMINISTIC_MODE:
+            return await self._run_deterministic_vp(
+                vp_node, log_dir, project_dir,
+            )
+
         builder = SettingsJsonBuilder(vp_id=vp_id, plan_id=plan_id or "default")
         settings_path: Optional[str] = None
         log_path: Optional[Path] = None
@@ -857,21 +1010,22 @@ class VerificationSubAgent:
             # and trip the assertion. Shelve attempt logs into
             # ``logs/vp_attempts/`` so the unsorted glob at the parent
             # level only sees round logs.
-            if log_dir is None:
-                log_dir = Path("logs") / "vp_attempts"
-            else:
-                log_dir = Path(log_dir) / "vp_attempts"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_path = log_dir / f"vp_attempt_{vp_id}_{int(time.time() * 1000)}.log"
+            log_path = self._attempt_log_path(log_dir, vp_id)
 
-            # Step 3 — run the self-heal loop
-            return await self._self_heal_loop(
-                vp_node=vp_node,
-                coding_tool=coding_tool,
-                settings_path=settings_path,
-                log_path=log_path,
-                project_dir=project_dir,
-            )
+            # Step 3 — run the self-heal loop.
+            #
+            # 2026-10-27（归因绑定点）：这条验证点的会话在这里绑定归因
+            # —— 会话属于哪条验证点，只有发起的这一层知道。作用域包住整条
+            # 自愈回路：重试发起的还是这条验证点的会话，卡住后那个「读日志
+            # 总结」的会话也是。
+            with _session_attribution_scope(vp_id):
+                return await self._self_heal_loop(
+                    vp_node=vp_node,
+                    coding_tool=coding_tool,
+                    settings_path=settings_path,
+                    log_path=log_path,
+                    project_dir=project_dir,
+                )
         except BlockedPathError as e:
             # Security net intercepted an action; surface as a BLOCKED
             # verdict (per spec input example: {verdict: BLOCKED, ...}).
@@ -903,6 +1057,79 @@ class VerificationSubAgent:
                     "reason": last_blocked.reason,
                     "evidence": last_blocked.evidence,
                 })
+
+    @staticmethod
+    def _attempt_log_path(log_dir: Optional[Path], vp_id: str) -> Path:
+        """One attempt's log path.
+
+        Per-VP retry-attempt logs live in ``<log_dir>/vp_attempts/`` so
+        they never collide with the round-level
+        ``verification_{round}_*.log`` files (the VP-006 contract globs
+        ``logs/*.log`` and expects the first entry to be the round log).
+        """
+        base = Path("logs") if log_dir is None else Path(log_dir)
+        attempts_dir = base / "vp_attempts"
+        attempts_dir.mkdir(parents=True, exist_ok=True)
+        return attempts_dir / f"vp_attempt_{vp_id}_{int(time.time() * 1000)}.log"
+
+    async def _run_deterministic_vp(
+        self,
+        vp_node: Dict[str, Any],
+        log_dir: Optional[Path],
+        project_dir: Optional[Path],
+    ) -> "Verdict":
+        """走确定性路径 —— 这条路上一次 LLM 会话都不开。
+
+        分派表说这条验证点的判据是可机械执行的，那它就不该起子会话：
+        判定住在 runner 里（可复跑），子会话的自报不可复跑。判不了的
+        情况在分派层就被拦在外面（见 :func:`resolve`），所以走到这里的
+        验证点一定判得了 —— 真跑崩了也只是「判不了」，落回 LLM 路径。
+        """
+        vp_id = str(vp_node.get("id", "unknown"))
+        artifact_dir: Optional[Path] = None
+        if log_dir is not None:
+            artifact_dir = Path(log_dir).parent / "vp_artifacts"
+        outcome = await asyncio.to_thread(
+            _marshal_safe_on_worker_thread(run_deterministic),
+            vp_node,
+            project_dir=project_dir,
+            artifact_dir=artifact_dir,
+        )
+        self._write_log(
+            self._attempt_log_path(log_dir, vp_id),
+            "deterministic_verdict",
+            {
+                "vp_id": vp_id,
+                "route": outcome.route,
+                "status": outcome.status,
+                "exit_code": outcome.exit_code,
+            },
+        )
+        return self._verdict_from_outcome(outcome)
+
+    def _verdict_from_outcome(
+        self, outcome: DeterministicOutcome,
+    ) -> "Verdict":
+        """把三态结果落成子 agent 契约里的 :class:`Verdict`。"""
+        payload = outcome.verdict or {}
+        status = str(payload.get("status") or "")
+        evidence_lines: List[str] = []
+        if outcome.exit_code is not None:
+            evidence_lines.append(f"exit_code: {outcome.exit_code}")
+        if outcome.stdout:
+            evidence_lines.append(f"stdout: {outcome.stdout[-2000:]}")
+        if outcome.stderr:
+            evidence_lines.append(f"stderr: {outcome.stderr[-2000:]}")
+        if outcome.evidence:
+            evidence_lines.append(
+                json.dumps(outcome.evidence, ensure_ascii=False, default=str)
+            )
+        return Verdict(
+            verdict="PASSED" if status == "PASSED" else "FAILED",
+            reasons=list(outcome.reasons),
+            evidence=evidence_lines,
+            model_complexity=self.model_complexity,
+        )
 
     async def _self_heal_loop(
         self,
@@ -1694,6 +1921,31 @@ class VerificationSubAgent:
         })
         return verdict
 
+    def _context_pack_reference_line(self) -> str:
+        """The line that points this brief at the round's context pack.
+
+        2026-10-27（A5）: the environment facts live in ONE file per
+        round (``<plan_dir>/context/round-<n>.json``), written by the
+        execution side.  The verifier reads that file instead of
+        exploring the environment itself — which is what it used to do,
+        with the same ``ls`` / ``find`` / ``git log`` the coder used.
+
+        Empty when there is no pack to point at: a brief that names a
+        file which is not there is worse than a brief that says nothing,
+        and a missing pack must never stop a verification.
+        """
+        plan_id = str(self.plan_id or "").strip()
+        if not plan_id:
+            return ""
+        try:
+            plan_dir = absolute_path(resolve_plans_dir() / plan_id)
+        except Exception:  # noqa: BLE001 - a missing plan dir is not a failure
+            return ""
+        pack = latest_context_pack(plan_dir)
+        if pack is None:
+            return ""
+        return context_pack_reference_line(pack)
+
     def _build_prompt(self, vp_node: Dict[str, Any], attempt: int) -> str:
         """Build the LLM prompt from a verification point node.
 
@@ -1710,6 +1962,11 @@ class VerificationSubAgent:
         verdict based on the project's overall test state — observed
         once as 21 unrelated test failures plus a 59% coverage number
         reported against a point that verified three specific functions.
+
+        Since 2026-10-27 (A5) it also carries ONE line naming the
+        round's context pack — the file the environment facts live in —
+        so the verifier reads them instead of re-deriving them with
+        ``ls`` / ``find`` / ``git log``.
         """
         parts = [
             f"Verification point: {vp_node.get('id', 'unknown')}",
@@ -1742,6 +1999,13 @@ class VerificationSubAgent:
             )
             for key in sorted(service_env):
                 parts.append(f"  {key}={service_env[key]}")
+        # 2026-10-27（A5）: the environment facts are NOT inlined here and
+        # the verifier is NOT sent out to find them — the round's context
+        # pack holds them, and this line is where the verifier is told so.
+        pack_reference = self._context_pack_reference_line()
+        if pack_reference:
+            parts.append("")
+            parts.append(pack_reference)
         parts.extend([
             "",
             "PROCESS SAFETY (HARD RULE — no exceptions):",
@@ -2702,3 +2966,306 @@ def parse_verdict_to_dataclass(raw_output: str) -> "Verdict":
         failure_class_source=failure_class_source,
         evidence_quote=evidence_quote,
     )
+
+
+# DETERMINISTIC-DISPATCH-BEGIN
+# ---------------------------------------------------------------------------
+# 确定性分派（2026-10-27）
+# ---------------------------------------------------------------------------
+#
+# ``api_test`` / ``full_ci`` / ``e2e`` 的判据是**可机械执行的命令与断言**，
+# 不是「必须问一次模型才知道答案」的问题。以前这些方法一律起 LLM 子会话，
+# 于是同一条判据在两轮里能得出相反结论 —— 判定变成了子 agent 的自报，
+# 而自报不可复跑。
+#
+# 所以「谁执行什么」是一条**显式的契约**，写在这张表里，而不是长在一条
+# if 链里的惯例：审计时一眼能看出哪些方法不进 LLM。
+#
+# 表的**值**是执行该方法的 runner 模块名。两个 runner 都提供同名的
+# ``validate_vp``，所以「这条验证点能不能跑」只有一个答案 —— 问那个将要
+# 执行它的 runner。分派器自己不读验证点的字段（静态门禁：
+# ``tests/static_gates/test_dispatch_reads_no_vp_fields.py``）：判定口径
+# 住在 runner 里，分派器改了口径 runner 不会跟着改，两边就会打架。
+
+#: verification_method → 执行它的确定性 runner 模块名。
+#:
+#: 显式常量，不是运行时拼出来的：这张表是「哪些方法不进 LLM」的契约，
+#: 审计时一眼可读。``e2e`` 指向 CI runner，是因为 e2e 的判定同样是
+#: 「跑一条命令、按退出码判」，机制与整仓门禁同源。
+DETERMINISTIC_RUNNERS: Dict[str, str] = {
+    "api_test": "verification_api_runner",
+    "full_ci": "verification_ci_runner",
+    "e2e": "verification_ci_runner",
+}
+
+#: 分派结论的两种模式。
+#: ``deterministic`` —— 这条验证点由 runner 判定，**不开 LLM 会话**。
+#: ``escalate_path`` —— 这条验证点判不了（或者根本没有对应的 runner），
+#: 落回既有的 LLM 子会话。
+DETERMINISTIC_MODE = "deterministic"
+ESCALATE_PATH_MODE = "escalate_path"
+
+#: LLM 路径的路由名。分派结论的第一项是它时，意思是「走既有的 LLM
+#: 子会话」。
+LLM_ROUTE = "llm"
+
+#: 三态判定的取值。
+OUTCOME_PASS = "PASS"
+OUTCOME_FAIL = "FAIL"
+OUTCOME_ESCALATE = "ESCALATE"
+
+#: runner 模块名 → 执行函数名。两个 runner 的校验函数都叫 ``validate_vp``，
+#: 所以只有执行函数需要一张表。
+_RUNNER_EXECUTORS: Dict[str, str] = {
+    "verification_api_runner": "run_api_verification",
+    "verification_ci_runner": "run_ci_verification",
+}
+
+
+@dataclass(frozen=True)
+class DeterministicOutcome:
+    """一次确定性判定的结果 —— PASS / FAIL / ESCALATE 三态。
+
+    Attributes:
+        status: 三态之一（:data:`OUTCOME_PASS` / :data:`OUTCOME_FAIL` /
+            :data:`OUTCOME_ESCALATE`）。
+        route: 产生这个结果的路由 —— runner 模块名，或 :data:`LLM_ROUTE`。
+        reasons: 人读的原因。ESCALATE 时是**触发原因**。
+        stdout: 进程标准输出。API runner 没有进程，它的原始依据在
+            ``evidence`` 里。
+        stderr: 进程标准错误。
+        exit_code: 进程退出码。
+        evidence: 机器读的证据。ESCALATE 时是**触发这件事的证据**。
+        verdict: runner 自己的裁决。ESCALATE 时是 ``None`` —— 升级不是
+            「判失败」，是「换条路走」。
+    """
+
+    status: str
+    route: str
+    reasons: Tuple[str, ...] = ()
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: Optional[int] = None
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    verdict: Optional[Dict[str, Any]] = None
+
+    @property
+    def is_deterministic(self) -> bool:
+        """这次判定没有开过 LLM 会话（PASS 或 FAIL）。"""
+        return self.status in (OUTCOME_PASS, OUTCOME_FAIL)
+
+    @property
+    def needs_llm(self) -> bool:
+        """这次判定判不了，必须落回 LLM 路径。"""
+        return self.status == OUTCOME_ESCALATE
+
+    def to_verdict_dict(self) -> Dict[str, Any]:
+        """runner 自己的裁决（``status`` / ``reasons`` / ``evidence``）。
+
+        Raises:
+            ValueError: 当这次判定是升级 —— 升级没有裁决，它要的是
+                「换条路走」。
+        """
+        if self.verdict is None:
+            raise ValueError(
+                "an escalation carries no verdict — it asks for the LLM path"
+            )
+        return dict(self.verdict)
+
+
+def _vp_method(vp: Any) -> str:
+    """验证点声明的验证方法（没声明就当没有）。"""
+    if not isinstance(vp, dict):
+        return ""
+    return str(vp.get("verification_method") or "").strip()
+
+
+def _runner_module(name: str) -> Any:
+    """导入分派表点名的 runner 模块。"""
+    import importlib
+
+    return importlib.import_module(name)
+
+
+def _runner_issues(runner_name: str, vp: Any) -> List[Any]:
+    """runner 的校验器给出的全部问题（空列表 = 判得了）。
+
+    校验器问的是「这条验证点你能不能执行」，答案只有它能给：分派器不替
+    runner 做这个判断。抄一份规则进分派器，抄出来的那份一定会和真规则
+    漂移，而漂移的方向是「看起来能跑」。
+    """
+    module = _runner_module(runner_name)
+    validator = getattr(module, "validate_vp", None)
+    if validator is None:
+        return [f"{runner_name} 没有提供校验器，无法判定这条验证点"]
+    return list(validator(vp) or [])
+
+
+def _issue_evidence(issues: List[Any]) -> List[Any]:
+    """把 runner 给的问题渲染成证据。"""
+    out: List[Any] = []
+    for issue in issues:
+        to_dict = getattr(issue, "to_dict", None)
+        out.append(to_dict() if callable(to_dict) else str(issue))
+    return out
+
+
+def _verdict_of(result: Any) -> Dict[str, Any]:
+    """把 runner 的返回值取成裁决字典。"""
+    to_dict = getattr(result, "to_verdict_dict", None)
+    if callable(to_dict):
+        payload = to_dict()
+    elif isinstance(result, dict):
+        payload = result
+    else:
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _evidence_text(evidence: Dict[str, Any], *keys: str) -> str:
+    """从证据里取一段文本（按候选键的顺序取第一个非空的）。"""
+    for key in keys:
+        value = evidence.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def resolve(vp: Any) -> Tuple[str, str]:
+    """决定一条验证点走哪条路：确定性 runner，还是 LLM 路径。
+
+    Returns:
+        ``(route, mode)``：
+
+        * ``("verification_api_runner", "deterministic")`` —— 这条验证点
+          由 runner 判定，跑它，**不要**开 LLM 会话。
+        * ``("llm", "escalate_path")`` —— 这条验证点判不了，落回既有的
+          LLM 子会话。
+
+    「判得了」这件事**只**由那个将要执行它的 runner 的校验器回答。
+    分派器自己不读验证点的字段：判定口径住在 runner 里，两边不会打架。
+    """
+    method = _vp_method(vp)
+    runner_name = DETERMINISTIC_RUNNERS.get(method)
+    if runner_name is None:
+        return (LLM_ROUTE, ESCALATE_PATH_MODE)
+    if _runner_issues(runner_name, vp):
+        return (LLM_ROUTE, ESCALATE_PATH_MODE)
+    return (runner_name, DETERMINISTIC_MODE)
+
+
+def run_deterministic(
+    vp: Any,
+    *,
+    project_dir: Optional[Path] = None,
+    artifact_dir: Optional[Path] = None,
+) -> DeterministicOutcome:
+    """按分派表判定一条验证点，产出 PASS / FAIL / ESCALATE 三态结果。
+
+    * **PASS** —— runner 跑完了，判过。裁决直接来自 runner
+      （``outcome.verdict``），不是任何一次模型往返的自报。
+    * **FAIL** —— runner 跑完了，没判过。裁决同样来自 runner，并带上
+      进程的 stdout / stderr / 退出码：「没判过」必须能被人复现，只有
+      一个 FAILED 是不够的。
+    * **ESCALATE** —— 这条验证点判不了：校验器不通过（入口缺失、判据
+      不齐…），或者 runner 没给出裁决。结果带上**触发原因**与**证据**，
+      交给 LLM 路径接手。
+
+    这条路径**不开任何 LLM 会话**。
+    """
+    method = _vp_method(vp)
+    runner_name = DETERMINISTIC_RUNNERS.get(method)
+    if runner_name is None:
+        return DeterministicOutcome(
+            status=OUTCOME_ESCALATE,
+            route=LLM_ROUTE,
+            reasons=(
+                f"verification_method={method!r} 没有对应的确定性 runner",
+            ),
+            evidence={"method": method},
+        )
+
+    issues = _runner_issues(runner_name, vp)
+    if issues:
+        return DeterministicOutcome(
+            status=OUTCOME_ESCALATE,
+            route=LLM_ROUTE,
+            reasons=tuple(
+                f"runner {runner_name} 判这条验证点不可执行：{issue}"
+                for issue in issues
+            ),
+            evidence={
+                "method": method,
+                "runner": runner_name,
+                "issues": _issue_evidence(issues),
+            },
+        )
+
+    module = _runner_module(runner_name)
+    executor_name = _RUNNER_EXECUTORS.get(runner_name)
+    executor = getattr(module, executor_name, None) if executor_name else None
+    if executor is None:
+        return DeterministicOutcome(
+            status=OUTCOME_ESCALATE,
+            route=LLM_ROUTE,
+            reasons=(
+                f"runner {runner_name} 没有提供执行入口，无法确定性判定",
+            ),
+            evidence={"method": method, "runner": runner_name},
+        )
+
+    kwargs: Dict[str, Any] = {}
+    if artifact_dir is not None:
+        kwargs["artifact_dir"] = artifact_dir
+    if runner_name == "verification_ci_runner":
+        if project_dir is None:
+            return DeterministicOutcome(
+                status=OUTCOME_ESCALATE,
+                route=LLM_ROUTE,
+                reasons=(
+                    "整仓门禁要知道仓库在哪（project_dir），没有它判不了",
+                ),
+                evidence={"method": method, "runner": runner_name},
+            )
+        kwargs["project_dir"] = Path(project_dir)
+
+    try:
+        result = executor(vp, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - runner 崩了也是「判不了」
+        detail = f"{type(exc).__name__}: {exc}"
+        return DeterministicOutcome(
+            status=OUTCOME_ESCALATE,
+            route=LLM_ROUTE,
+            reasons=(f"runner {runner_name} 执行时崩溃：{detail}",),
+            evidence={
+                "method": method,
+                "runner": runner_name,
+                "error": detail,
+            },
+        )
+
+    verdict = _verdict_of(result)
+    status_text = str((verdict or {}).get("status") or "")
+    evidence = dict((verdict or {}).get("evidence") or {})
+    reasons = tuple(str(reason) for reason in ((verdict or {}).get("reasons") or []))
+
+    if status_text not in ("PASSED", "FAILED"):
+        # runner 没给出裁决 —— 它没有判定任何东西，落回 LLM 路径。
+        return DeterministicOutcome(
+            status=OUTCOME_ESCALATE,
+            route=LLM_ROUTE,
+            reasons=reasons or (f"runner {runner_name} 没有给出裁决",),
+            evidence={**evidence, "method": method, "runner": runner_name},
+        )
+
+    return DeterministicOutcome(
+        status=OUTCOME_PASS if status_text == "PASSED" else OUTCOME_FAIL,
+        route=runner_name,
+        reasons=reasons,
+        stdout=_evidence_text(evidence, "stdout", "stdout_tail"),
+        stderr=_evidence_text(evidence, "stderr", "stderr_tail"),
+        exit_code=evidence.get("exit_code"),
+        evidence={**evidence, "method": method, "runner": runner_name},
+        verdict=verdict,
+    )
+# DETERMINISTIC-DISPATCH-END
