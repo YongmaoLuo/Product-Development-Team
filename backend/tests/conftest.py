@@ -294,6 +294,33 @@ def capacity_from_text(tmp_path, monkeypatch):
     provider_capacity.clear_capacity_cache()
 
 # ---------------------------------------------------------------------------
+# Hermetic quota-tier memory
+# ---------------------------------------------------------------------------
+#
+# The quota-tier memory is a file in the configuration directory: it
+# records which quota windows a provider has ever reported, so that a
+# later reading can tell "this provider has no weekly window" from "this
+# provider's weekly window went missing".  The quota reader both reads
+# and writes it, so a suite that ran against the real file would plant
+# the suite's own history in the operator's ``.config`` directory — and
+# the next run on that machine would answer from it.
+#
+# The autouse fixture below points the memory at a path inside
+# ``tmp_path``, which is thrown away with the test.
+@pytest.fixture(autouse=True)
+def _hermetic_quota_tier_memory(tmp_path, monkeypatch):
+    """Keep the developer's own quota-tier memory out of the suite."""
+    import quota_tier_memory
+
+    monkeypatch.setenv(
+        "PDT_QUOTA_TIER_MEMORY_FILE",
+        str(tmp_path / "quota-tier-memory.json"),
+    )
+    quota_tier_memory.reset_cache()
+    yield
+    quota_tier_memory.reset_cache()
+
+# ---------------------------------------------------------------------------
 # Hermetic state DB — the single most important isolation rule in this suite.
 # ---------------------------------------------------------------------------
 #
