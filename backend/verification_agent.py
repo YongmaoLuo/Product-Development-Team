@@ -1330,13 +1330,23 @@ def _is_transport_failure(error_text: str) -> bool:
     return any(marker in lowered for marker in _TRANSPORT_FAILURE_MARKERS)
 
 
+#: The reason code a VP carries when the service behind the port is
+#: serving **another data plane** than the one this round recorded: the
+#: instance was replaced, or the state database it reads is another
+#: file.  The request is never sent — a verdict about somebody else's
+#: data is worse than no verdict — and the block has to say **why** in
+#: a code the accounting layer can match on, not in prose.
+SERVICE_DATA_PLANE_MISMATCH = "service_data_plane_mismatch"
+
+
 #: The reason codes that mean "the environment stopped this, not the
 #: product".  ``service_unreachable`` is the per-point code the
 #: classification layer writes; ``environment_blocked`` is the round's
 #: own code, written when one refused connection takes the whole round
-#: out.
+#: out; ``service_data_plane_mismatch`` is the per-point code for a
+#: service that serves another database than the round's fixture.
 ENVIRONMENT_REASON_CODES = frozenset({
-    SERVICE_UNREACHABLE, ENVIRONMENT_BLOCKED,
+    SERVICE_UNREACHABLE, ENVIRONMENT_BLOCKED, SERVICE_DATA_PLANE_MISMATCH,
 })
 
 
@@ -1413,6 +1423,82 @@ def _is_environment_blocked_result(result: Any) -> bool:
     if str(result.get("status") or "") != "BLOCKED":
         return False
     return _environment_block_reason_code(result) in ENVIRONMENT_REASON_CODES
+
+
+def _entry_is_environment_blocked(entry: Any) -> bool:
+    """Is this entry one the environment took out of the round?
+
+    The **status is not consulted** here, and that is the whole point:
+    the accounting layer rewrites a blocked entry's status before the
+    round's verdict is derived, so a rule that read the status would
+    read a blocked entry as an ordinary skip — and call the round
+    green.  Two things say the environment stopped this entry instead:
+
+      * the entry says so itself (``environment_blocked`` is True);
+      * its evidence carries a reason code the environment owns.
+
+    This is deliberately **not** :func:`_is_environment_blocked_result`:
+    that one insists on the status being ``BLOCKED``, which is exactly
+    the condition the accounting layer does not leave standing.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("environment_blocked") is True:
+        return True
+    evidence = _result_evidence(entry)
+    return str(evidence.get("reason_code") or "") in ENVIRONMENT_REASON_CODES
+
+
+def _derive_overall_status(entries: Any) -> str:
+    """The round's verdict, derived from the round's entries.
+
+    **One** derivation, two call sites: where the report is built, and
+    where the environment-blocked entries are taken out of the failure
+    statistics
+    (:meth:`Orchestrator._exclude_environment_blocked_from_failures`).
+    Both used to answer the same question with an ad-hoc branch of
+    their own, and both read "otherwise" as ``PASSED`` — so a round
+    that judged **nothing** (ten points passed, eleven skipped, two
+    deferred) came back as a verdict about a product nobody asked.
+
+    The order of the decision:
+
+      * a FAILED entry          -> ``FAILED``
+      * a PARTIAL entry         -> ``PARTIAL``
+      * a DEFERRED entry, or an
+        environment-blocked one -> ``SKIPPED``
+      * anything else           -> ``PASSED``
+
+    An entry the round could not judge does not make the round red —
+    it makes the round **unjudged**, and an unjudged round says
+    ``SKIPPED``.  A plain ``SKIPPED`` is not that: it is a point the
+    round did not need to ask, and it leaves the verdict alone.
+
+    A round with no entry at all stays ``PASSED``: a round with no
+    verification point has no verdict to give, and that behaviour is
+    out of scope here.  An entry that is not a dict, or that carries
+    no status, takes part in no tier at all.
+    """
+    if not isinstance(entries, (list, tuple)):
+        return "PASSED"
+    statuses: List[str] = []
+    unjudged = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        status = entry.get("status")
+        if not status:
+            continue
+        statuses.append(str(status))
+        if str(status) == "DEFERRED" or _entry_is_environment_blocked(entry):
+            unjudged = True
+    if any(status == "FAILED" for status in statuses):
+        return "FAILED"
+    if any(status == "PARTIAL" for status in statuses):
+        return "PARTIAL"
+    if unjudged:
+        return "SKIPPED"
+    return "PASSED"
 
 
 # ---------------------------------------------------------------------------
@@ -6470,15 +6556,24 @@ class Orchestrator:
         judgment LLM's report: the executor knows whether the request
         ever reached the service, and the LLM only saw a summary of it.
 
-        The round's verdict is re-derived from what is left:
+        The round's verdict is re-derived by the same derivation the
+        report itself uses (:func:`_derive_overall_status`), so the
+        two places cannot drift apart:
 
           * a genuine failure keeps the round red — this is the whole
             point of the exercise, and the negative control the tests
             pin;
           * a partial verdict stays partial;
-          * a round in which nothing was judged says ``SKIPPED`` —
-            claiming ``PASSED`` there would be a verdict about a
-            product nobody asked.
+          * an entry the environment took out of the round makes it
+            ``SKIPPED`` rather than ``PASSED`` — claiming ``PASSED``
+            for a round that could not judge everything it set out to
+            judge would be a verdict about a product nobody asked.
+
+        A point the round's own evidence refuted (``invalid_env``) is
+        annotated the same way and kept out of the failure statistics,
+        but it is not an environment block — it says nothing about the
+        environment, and on its own it does not take the round's verdict
+        down.
         """
         blocked: Dict[str, Dict[str, Any]] = {}
         invalid_env: Dict[str, Dict[str, Any]] = {}
@@ -6516,23 +6611,10 @@ class Orchestrator:
             entry["actual_result"] = self._invalid_env_entry_annotation(source)
 
         # The FAILED statistics: the entries the round could not judge
-        # are not in them, and the round's verdict is derived from what
-        # is left.
-        unjudged = set(blocked) | set(invalid_env)
-        judged = [
-            entry.get("status")
-            for entry in report_results
-            if isinstance(entry, dict)
-            and str(entry.get("id") or "") not in unjudged
-        ]
-        if any(status == "FAILED" for status in judged):
-            report_data["overall_status"] = "FAILED"
-        elif any(status == "PARTIAL" for status in judged):
-            report_data["overall_status"] = "PARTIAL"
-        elif any(status == "PASSED" for status in judged):
-            report_data["overall_status"] = "PASSED"
-        else:
-            report_data["overall_status"] = "SKIPPED"
+        # are not in them.  The round's verdict comes from the same
+        # derivation the report itself uses (:func:`_derive_overall_status`)
+        # — one derivation, one answer.
+        report_data["overall_status"] = _derive_overall_status(report_results)
 
         if blocked:
             report_data["environment_blocked"] = True
@@ -8915,17 +8997,16 @@ class Orchestrator:
                         d for d in (report_data.get("requirement_deviations") or [])
                         if d.get("verification_point_id") not in deferred_ids
                     ]
-                    # overall_status 只看真正得出过结论的 VP；延后的关卡既不加
-                    # 分也不减分（它上面一定有 Phase 1 的失败在决定结论）。
-                    judged = [
-                        vr.get("status")
-                        for vr in report_data.get("verification_results", [])
-                        if vr.get("status") != "DEFERRED"
-                    ]
-                    if any(s == "FAILED" for s in judged):
-                        report_data["overall_status"] = "FAILED"
-                    elif any(s == "PARTIAL" for s in judged):
-                        report_data["overall_status"] = "PARTIAL"
+                    # The round's verdict comes from the one derivation
+                    # (:func:`_derive_overall_status`, R4).  A deferred
+                    # gate was never asked, so the round did not judge
+                    # it — and a round that did not judge it cannot say
+                    # it passed.  (The verdict is derived from the
+                    # entries, never from the judgment LLM's own
+                    # summary: the entries are the evidence.)
+                    report_data["overall_status"] = _derive_overall_status(
+                        report_data.get("verification_results", [])
+                    )
 
                 if not any(s == "FAILED" for s in execution_verdicts.values()):
                     for vr in report_data.get("verification_results", []):
@@ -8934,18 +9015,11 @@ class Orchestrator:
                             # LLM-emitted subjective PARTIAL on a VP
                             # the executor marked PASSED → restore.
                             vr["status"] = "PASSED"
-                    # Re-derive overall_status from the corrected list
-                    statuses = [
-                        vr.get("status") for vr in report_data.get("verification_results", [])
-                    ]
-                    if statuses and all(s == "PASSED" for s in statuses):
-                        report_data["overall_status"] = "PASSED"
-                    elif any(s == "FAILED" for s in statuses):
-                        report_data["overall_status"] = "FAILED"
-                    elif any(s == "PARTIAL" for s in statuses):
-                        report_data["overall_status"] = "PARTIAL"
-                    else:
-                        report_data["overall_status"] = "PASSED"
+                    # Re-derive overall_status from the corrected list,
+                    # by the same derivation the accounting layer uses.
+                    report_data["overall_status"] = _derive_overall_status(
+                        report_data.get("verification_results", [])
+                    )
 
                 # 2026-10-25 (repair-r1-32): the accounting of the
                 # environment-blocked entries.  It runs **after** every
@@ -10751,6 +10825,17 @@ class Orchestrator:
     # the very same HTTP path an ``api_test`` VP uses, because a probe
     # that took a different road could answer a different question than
     # the VP's request does.
+    #
+    # 2026-10-26 (R2): the fingerprint also has to be **honest**.  The
+    # 2026-10-26 production round recorded a fingerprint that said two
+    # contradictory things at once — ``routing_rows=11`` (what the
+    # instance answered) next to ``expected_rows=49`` (how many rows the
+    # *agent's own* database held).  The two numbers come from two
+    # different databases, so they can never be equal, and the record
+    # phase stored the contradiction silently: every ``api_test`` VP of
+    # the round then rediscovered it on its own, as an opaque
+    # ``data_plane_mismatch`` block.  So the record phase now *says so*,
+    # once, where it is the only place that still knows both numbers.
 
     def _capture_data_plane_fingerprints(self) -> Dict[str, Any]:
         """Record which data plane each declared service is serving.
@@ -10762,17 +10847,38 @@ class Orchestrator:
         gated: not knowing the data plane is not the same as knowing
         it is wrong.
 
+        The record phase is also the only place that knows **both**
+        numbers at once: the count the instance answered with, and the
+        count the round's own fixture holds.  When they disagree, the
+        instance is not serving this round's fixture — so the phase says
+        so, once, in a ``data_plane_fixture_mismatch`` event, instead of
+        storing the contradiction silently and letting every ``api_test``
+        VP of the round rediscover it on its own.
+
         Never raises — a probe that fails is a service that is not
         recorded, not a broken preflight.
         """
         from service_freshness import expected_routing_rows, probe_data_plane
 
+        # The fixture is the state database the round's own service
+        # reads; its row count is what "the right data plane" means.
+        # The path is resolved **here** so that the count and the
+        # database it was read from travel together: "49 rows" means
+        # nothing without "in *this* file", and the mismatch event has
+        # to name the file it read.
+        db_path: Optional[Path] = None
+        try:
+            from config_paths import resolve_state_db_path
+
+            db_path = resolve_state_db_path()
+        except Exception as exc:  # noqa: BLE001 - defensive
+            logger.warning(
+                "[data_plane] could not resolve the fixture's database: %s",
+                exc,
+            )
         expected: Optional[int] = None
         try:
-            # The fixture is the state database the round's own service
-            # reads; its row count is what "the right data plane"
-            # means.
-            expected = expected_routing_rows()
+            expected = expected_routing_rows(db_path)
         except Exception as exc:  # noqa: BLE001 - defensive
             logger.warning(
                 "[data_plane] could not read the fixture's row count: %s", exc,
@@ -10811,6 +10917,41 @@ class Orchestrator:
                     fingerprint.error or fingerprint.status or "no answer",
                 )
                 continue
+            if (
+                expected is not None
+                and fingerprint.routing_rows is not None
+                and fingerprint.routing_rows != expected
+            ):
+                # 2026-10-26 (R2): the instance answered with a count
+                # that is not the fixture's — it is serving another
+                # database.  Say so **once**, here: the record phase is
+                # the only moment that still holds both numbers, and
+                # the round must not make every VP rediscover the same
+                # contradiction on its own.  One event per service, so
+                # the event stays actionable.
+                try:
+                    self._safe_log_freshness_event(
+                        "__preflight__", "data_plane_fixture_mismatch",
+                        {
+                            "service": name,
+                            "db_path": (
+                                str(db_path) if db_path is not None else ""
+                            ),
+                            "expected_rows": expected,
+                            "reported_rows": fingerprint.routing_rows,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001 - a report never raises
+                    logger.warning(
+                        "[data_plane] could not report the fixture mismatch "
+                        "of service %s: %s", name, exc,
+                    )
+                # The fingerprint stops carrying the foreign count: a
+                # count read from another database can never answer "is
+                # this still the data plane I recorded", so every later
+                # comparison falls back to the recorded count — the one
+                # the instance itself reported.
+                fingerprint.expected_rows = None
             fingerprints[name] = fingerprint
             # 2026-10-25: the round now also records **which instance**
             # that is — the ``instance`` block the service publishes
@@ -11900,6 +12041,14 @@ class Orchestrator:
         The observed fingerprint travels with the verdict: without it
         nobody can tell "the instance was replaced" from "the instance
         serves another database".
+
+        The verdict also carries a **reason code** — the code the
+        environment accounting matches on, so that the block is counted
+        as an environment block and the round can be re-run rather than
+        read as a contract violation.  Which code depends on why the
+        block happened: ``service_unreachable`` when the round could not
+        reach the service at all, ``service_data_plane_mismatch`` when
+        the service answered with another data plane.
         """
         recorded_dict = recorded.to_dict() if recorded is not None else None
         observed_dict = observed.to_dict() if observed is not None else None
@@ -11951,6 +12100,13 @@ class Orchestrator:
                 "evidence": evidence,
                 "framework_checks": [],
             }
+        # 2026-10-27 (R3): the block has to say **why** in a code the
+        # accounting layer matches on.  The unreachable branch above
+        # already writes ``service_unreachable``; this branch was the
+        # one that forgot, so its BLOCKED entry was invisible to the
+        # environment accounting: the round was not marked
+        # environment-blocked and the block was not counted as one.
+        evidence["reason_code"] = SERVICE_DATA_PLANE_MISMATCH
         return {
             "status": "BLOCKED",
             "reasons": [

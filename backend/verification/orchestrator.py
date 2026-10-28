@@ -22,7 +22,15 @@ from typing import Optional, List, Dict, Any, Set, Tuple
 from coding_tool import CodingTool, ClaudeCodingTool
 from config_paths import resolve_state_db_path
 from plan_state import PlanState
-from verification_agent import VerificationAgent
+from verification_agent import (
+    VerificationAgent,
+    # 2026-10-27 (R5): "did the environment take this entry out of the
+    # round?" — ONE rule, read by the report builder, by the verdict
+    # derivation (``_derive_overall_status``) and, from here on, by the
+    # criterion layer that decides whether a round judged anything at
+    # all. The orchestrator does not get a second, looser copy of it.
+    _entry_is_environment_blocked,
+)
 from repair_generator import (
     RepairTaskGenerator,
     # 2026-10-23: the plan's own constraints. ``_plan_intent`` reads the
@@ -679,6 +687,57 @@ def _undefined_vp_operator_action(vp_ids: Any) -> Optional[str]:
         f"{', '.join(ids)} 在验证计划里没有定义，"
         "须由计划属主作废或重新表达它的判据"
     )
+
+
+def _round_judged_nothing(report: Mapping, failed_count: int) -> bool:
+    """Did this round judge anything at all?
+
+    A round that could not judge what it set out to judge is **not** a
+    failure of the deliverable.  The report says so in three places:
+
+    * the round itself is flagged ``environment_blocked``;
+    * a point the environment took out carries the reason code the
+      environment owns (``service_data_plane_mismatch`` and friends);
+    * a point that was not judged this round is ``DEFERRED``.
+
+    Before this question existed, such a round fell into the failure
+    path: nothing was broken, so there was nothing to repair — but the
+    round asked the repair model to rework the deliverable for a defect
+    nobody found, and the plan was recorded as a failed verification.
+
+    The question is asked **of the round's own entries**, never of the
+    derived verdict: a round with no entry at all (``PASSED`` + an
+    empty ``verification_results``) has no verdict to give, and it must
+    keep saying so.
+
+    A real failure wins over this one.  ``failed_count`` is checked
+    first, so a round that did find a defect keeps its repair path —
+    the environment-blocked exit only ever applies to a round with
+    nothing to repair.
+
+    Args:
+        report: The round's report.
+        failed_count: The round's failure count (already net of the
+            points the plan voided).
+
+    Returns:
+        ``True`` when the round judged nothing.
+    """
+    if failed_count:
+        return False
+    if report.get("environment_blocked") is True:
+        return True
+    entries = report.get("verification_results")
+    if not isinstance(entries, (list, tuple)):
+        return False
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("status") or "") == "DEFERRED":
+            return True
+        if _entry_is_environment_blocked(entry):
+            return True
+    return False
 
 
 def _state_db_path_for_orchestrator() -> Path:
@@ -3022,6 +3081,57 @@ class VerificationOrchestrator:
         # fingerprint. Empty until the failure path computes it — the
         # pass path has no failure to evolve.
         root_cause_vp_ids: List[str] = []
+
+        # 2026-10-27 (R5): a round that judged **nothing** is not a
+        # failure of the deliverable.
+        #
+        # The environment took some of the points out of this round (the
+        # round is flagged ``environment_blocked``, the points it took
+        # carry its reason code) and the rest were deferred — so the
+        # round produced no verdict about the product at all.  Nothing
+        # was broken, so there is nothing to repair: the repair model
+        # must not be asked to rework a deliverable for a defect nobody
+        # found, and the plan must not be recorded as a failed
+        # verification.
+        #
+        # The round therefore stops the chain, and says what kind of
+        # round it was: ``loop_stopped`` with ``environment_blocked``.
+        # ``stop_reason`` stays ``None`` — the verdict is the status,
+        # and a new reason string would have to enter the state
+        # machine's closed vocabulary.  The caller closes the plan the
+        # way it closes every other terminal round
+        # (``_record_terminal("loop_stopped", ...)``); this branch
+        # writes no failure phase and no repair task.
+        #
+        # The check reads the round's own entries, never the derived
+        # verdict: a round with no entry at all (``PASSED`` + an empty
+        # ``verification_results``) has no verdict to give and must keep
+        # passing.
+        if _round_judged_nothing(report, failed_count):
+            # This round recorded no failure, so it must not leave the
+            # same-cause counter pointing at the previous round's
+            # failures — same bookkeeping as a passing round.
+            self._previous_failed_ids = None
+            self._consecutive_same_failure_rounds = 0
+            self._last_round = round_number
+            self._save_loop_tracking()
+            print(
+                f"[Verification] round {round_number}: the environment "
+                f"took this round out — no verdict, nothing to repair"
+            )
+            return {
+                "should_continue": False,
+                "should_stop": True,
+                # The verdict is the ``status``; the reason vocabulary is
+                # closed, so this stop carries no new word.
+                "stop_reason": None,
+                "repair_tasks": [],
+                "waiting_for_user": False,
+                "status": "loop_stopped",
+                "intent_conflicts": [],
+                "needs_operator_decision": False,
+                "environment_blocked": True,
+            }
 
         # PASSED or PARTIAL with no real failures → treat as passed
         if overall_status == "PASSED" or (overall_status == "PARTIAL" and failed_count == 0 and deviation_count == 0):
