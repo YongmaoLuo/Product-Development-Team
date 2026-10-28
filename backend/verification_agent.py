@@ -10896,22 +10896,37 @@ class Orchestrator:
                 dirs.append(resolved)
         return dirs
 
-    def _expected_state_db_inode(self) -> Optional[int]:
-        """The inode of the state database **this process** has open.
+    def _expected_state_db_inodes(self, name: str) -> List[int]:
+        """The state databases this round's service may be reading.
 
-        The round runs inside the backend, and the backend reads the
-        state database through
-        :func:`config_paths.resolve_state_db_path`.  A service reading
-        a *different* file — the same path with another inode — is a
-        different data plane, and no amount of ``200 OK`` makes the two
-        the same.
+        The **first** entry is the database the round's own service
+        declared about itself when it was started — the same source the
+        plans tree uses, and for the same reason: a plan whose
+        ``start_cmd`` points ``PDT_STATE_DB_PATH`` at a fixture data
+        plane is a legal deployment, and judging it by which database
+        *this backend* happens to have open blocked the whole
+        2026-10-28 round of 20261024-429-plan at ``state_db_inode``.
+
+        The backend's own database follows as a tolerated alternative,
+        so a service that serves the round's own data plane keeps
+        working.  A service the round recorded no declaration for has
+        no first entry; the backend's own inode is then the whole
+        expectation, exactly as before.
         """
+        inodes: List[int] = []
+        recorded = self._service_instance_identity.get(str(name).lower()) or {}
+        declared = _instance_state_db_inode(recorded)
+        if declared is not None:
+            inodes.append(int(declared))
         try:
             from config_paths import resolve_state_db_path
 
-            return int(resolve_state_db_path().stat().st_ino)
-        except Exception:  # noqa: BLE001 - no database, no verdict
-            return None
+            own = int(resolve_state_db_path().stat().st_ino)
+        except Exception:  # noqa: BLE001 - no database, no expectation
+            own = None
+        if own is not None and own not in inodes:
+            inodes.append(own)
+        return inodes
 
     @staticmethod
     def _observed_state_db_inode(instance: Dict[str, Any]) -> Optional[int]:
@@ -11008,12 +11023,18 @@ class Orchestrator:
                 f"{expected_plans_dir!r}"
             )
 
-        expected_inode = self._expected_state_db_inode()
+        expected_inodes = self._expected_state_db_inodes(name)
+        # The first entry is the primary expectation — the database the
+        # round's own service declared (or the backend's own when it
+        # declared none) — and it is the number a mismatch record
+        # reports as "expected", for the same reason the plans tree
+        # reports its own primary entry.
+        expected_inode = expected_inodes[0] if expected_inodes else None
         observed_inode = self._observed_state_db_inode(actual)
         if (
-            expected_inode is not None
+            expected_inodes
             and observed_inode is not None
-            and observed_inode != expected_inode
+            and observed_inode not in expected_inodes
         ):
             mismatched.append("state_db_inode")
             reasons.append(
