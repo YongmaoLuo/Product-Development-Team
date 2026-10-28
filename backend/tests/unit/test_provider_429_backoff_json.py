@@ -4,7 +4,7 @@ What this pins
 --------------
 The text path learned (2026-10-22) that a rate-limited provider is not a
 dead provider: the vendor's ``2062`` refusal clears itself in seconds,
-so the dispatch waits that provider out (10s / 20s / 40s / 80s) and asks
+so the dispatch waits that provider out (5s / 10s / 20s / 40s) and asks
 it again — the same session, the same provider — and only a provider
 that refuses every one of those waits is parked and dropped.
 
@@ -17,7 +17,7 @@ the work — the whole prompt — to a provider that had just refused it.
 The contract these tests hold in place:
 
 1. **A rate limit is waited out on the SAME provider.** The dispatch asks
-   again after 10s, 20s, 40s and 80s — same session, same provider — and
+   again after 5s, 10s, 20s and 40s — same session, same provider — and
    nothing is parked and nothing is excluded while that is working.
 2. **A spent plan is not waited out.** ``2056`` and a live meter that
    says the budget is gone park the provider at once and move on.
@@ -277,7 +277,7 @@ def test_json_2062_backs_off_on_the_same_provider(monkeypatch, backoff):
     tool = _tool(monkeypatch, _failing_then(4))
     assert tool.query_json("produce a verdict", timeout=10) == PAYLOAD
 
-    assert backoff.sleeps == [10.0, 20.0, 40.0, 80.0], (
+    assert backoff.sleeps == [5.0, 10.0, 20.0, 40.0], (
         "the waits grow with the number of refusals already spent: a "
         "provider that answers a refusal after 10s is being asked too fast"
     )
@@ -332,7 +332,7 @@ def test_json_2056_parks_immediately(monkeypatch, backoff, scene):
     assert tool.query_json("produce a verdict", timeout=10) == PAYLOAD
 
     assert backoff.sleeps == [], (
-        "a spent plan does not clear in 10 seconds — waiting for it only "
+        "a spent plan does not clear in 5 seconds — waiting for it only "
         "delays the move to a provider that can serve the work"
     )
     assert get_shared_cooldown().is_parked(PROVIDER)
@@ -381,7 +381,7 @@ def test_json_backoff_exhaustion_switches(monkeypatch, backoff, scene):
         "four refusals answered by four waits, the fifth refused, and "
         "then the switch that succeeded"
     )
-    assert backoff.sleeps == [10.0, 20.0, 40.0, 80.0]
+    assert backoff.sleeps == [5.0, 10.0, 20.0, 40.0]
     assert get_shared_cooldown().is_parked(PROVIDER), (
         "a provider that refused five times in a row is parked, so the "
         "next dispatch does not pick it again"

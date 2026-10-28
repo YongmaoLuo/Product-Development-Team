@@ -89,6 +89,8 @@ from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple, Union
 from urllib.parse import urlsplit, urlunsplit
 
+import quota_tier_memory
+
 log = logging.getLogger("provider_order")
 
 # Project root used to anchor the 5-hour quota file path.
@@ -1012,6 +1014,13 @@ GATED_TIERS: Tuple[str, ...] = ("five_hour", "weekly_limit")
 #: still gates on its own above; it just does not also drag the number.
 _HEADROOM_TIER: str = "five_hour"
 
+#: The window whose *absence* the failover rule cares about.  A reading
+#: that does not carry it is read as an exhausted week -- but only for a
+#: provider that has ever been seen to carry one (see
+#: :attr:`ProviderQuota.weekly_tier_seen`), because a provider on a
+#: metered API product has no week to exhaust in the first place.
+_WEEKLY_TIER: str = "weekly_limit"
+
 #: How long a *readable* quota reading is trusted before it is asked
 #: for again. One number, not a knob: CC Switch answers this endpoint by
 #: asking every provider's own API, so a request here is a fan-out
@@ -1099,6 +1108,17 @@ class ProviderQuota:
         unreadable: True when CC Switch reported no usable meter for
             this provider. The verdict still admits it; what changes is
             how long this reading is trusted (see :func:`probe_floor_sec`).
+        weekly_tier_seen: Whether this provider has ever been seen to
+            carry a ``weekly_limit`` window. ``True`` covers both "this
+            reading carries one" and "an earlier reading did"; ``False``
+            means the provider has no history of a week at all, so the
+            week cannot have run out. This is what separates "this
+            provider has no weekly window" (a metered API product, say)
+            from "this provider's weekly window went missing" — the same
+            absence in :attr:`tiers_missing` means two different things,
+            and only history tells them apart. Read from
+            :mod:`quota_tier_memory`, which carries the fact across
+            processes.
     """
 
     provider: str
@@ -1110,6 +1130,7 @@ class ProviderQuota:
     binding_tier: Optional[str] = None
     tiers_missing: Tuple[str, ...] = ()
     unreadable: bool = False
+    weekly_tier_seen: bool = False
 
 
 def parse_resets_at(value: Any) -> Optional[datetime]:
@@ -1184,7 +1205,9 @@ def _tier_map(record: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
 
 
 def _no_reading(
-    provider: str, tiers_missing: Tuple[str, ...] = ()
+    provider: str,
+    tiers_missing: Tuple[str, ...] = (),
+    weekly_tier_seen: bool = False,
 ) -> ProviderQuota:
     """The verdict for a provider CC Switch could not meter.
 
@@ -1199,11 +1222,52 @@ def _no_reading(
     sites that *did* receive tiers and could not make a number out of
     them: there the reading says which windows it has, and a window it
     left out is worth recording even though the verdict is "no reading".
+
+    ``weekly_tier_seen`` travels the same way: a reading that carried
+    tiers has seen something, so what the memory knows about this
+    provider's week is still worth keeping. The call sites that saw
+    *nothing* leave it ``False``, because they have no history to
+    report.
     """
     return ProviderQuota(
         provider=provider, shape=SHAPE_UNREADABLE, unreadable=True,
-        tiers_missing=tiers_missing,
+        tiers_missing=tiers_missing, weekly_tier_seen=weekly_tier_seen,
     )
+
+
+def _remember_tiers(provider: str, tiers: Mapping[str, Any]) -> bool:
+    """Record the tiers this reading carried; answer the weekly question.
+
+    The tiers a provider has reported are a fact about the provider, not
+    about the reading: the process that observes a weekly window is not
+    the process that later needs to know about it. So the observation is
+    written to :mod:`quota_tier_memory` before it is asked about, and the
+    answer comes back from the memory rather than from this row.
+
+    Recording is skipped for tiers the memory already holds: the memory
+    is re-read and rewritten on every quota poll, and a rewrite that
+    says nothing new is a write per provider per minute for nothing.
+
+    ``False`` is the answer when the memory cannot be reached. The
+    memory is *history*, not evidence — a quota decision that raises
+    because a memory file is unreadable would fail a dispatch over a
+    piece of history, which is not evidence of anything. So the failure
+    is logged and swallowed, and the caller is told "no history", which
+    is the same answer a provider that never had a week gets.
+    """
+    try:
+        known = set(quota_tier_memory.seen_tiers(provider))
+        fresh = [name for name in tiers if name not in known]
+        if fresh:
+            quota_tier_memory.record_seen_tiers(provider, fresh)
+        return quota_tier_memory.has_seen_tier(provider, _WEEKLY_TIER)
+    except Exception as exc:  # noqa: BLE001 — the memory must never block a reading
+        log.warning(
+            "quota_tier_memory_unavailable: cannot remember the tiers of %s "
+            "(%s); the reading says nothing about a weekly window",
+            provider, type(exc).__name__,
+        )
+        return False
 
 
 def _quota_from_record(
@@ -1216,6 +1280,12 @@ def _quota_from_record(
     means no dispatch), while ``remaining_pct`` is the burst window
     alone (:data:`_HEADROOM_TIER`). They are not two views of one
     number and neither is derived from the other.
+
+    The reading also adds to what is known about the provider: the
+    windows it carries are remembered (:func:`_remember_tiers`), so that
+    a later reading which no longer carries the weekly window can be
+    told apart from a provider that never had one
+    (:attr:`ProviderQuota.weekly_tier_seen`).
 
     Never raises. A row this reader cannot make sense of is an *absent*
     reading, which admits the provider — the same verdict a successful
@@ -1242,6 +1312,13 @@ def _quota_from_record(
     tiers_missing: Tuple[str, ...] = tuple(
         name for name in GATED_TIERS if name not in tiers
     )
+
+    # What this reading adds to the provider's history, and what that
+    # history already said. The tier names go in first: a provider that
+    # is carrying a weekly window *now* must be known to carry one, so
+    # that a later reading that stops carrying it is read as a lost
+    # window rather than as a provider that never had one.
+    weekly_tier_seen: bool = _remember_tiers(provider, tiers)
 
     # Every tier is classified by its own ``unit`` rather than by a
     # single shape for the whole row, because a row that carries both a
@@ -1318,7 +1395,7 @@ def _quota_from_record(
 
     if worst is None and balance_funded is None:
         # Tiers exist but none of them carried a usable number.
-        return _no_reading(provider, tiers_missing)
+        return _no_reading(provider, tiers_missing, weekly_tier_seen)
 
     exhausted = (worst is not None and worst >= 100.0) or (
         balance_funded is False
@@ -1389,6 +1466,7 @@ def _quota_from_record(
         exhausted_resets_at=exhausted_resets_at,
         binding_tier=binding_tier,
         tiers_missing=tiers_missing,
+        weekly_tier_seen=weekly_tier_seen,
     )
 
 

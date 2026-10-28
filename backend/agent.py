@@ -5806,6 +5806,13 @@ class AutonomousAgent:
         "no_capacity",
     })
 
+    #: The log event that says the wait budget ran out while the chain
+    #: still had somebody on it.  It is written down because the two
+    #: facts are different — "the wait is over" and "the scene is out
+    #: of providers" — and an operator reading the two of them
+    #: together has to be able to tell which one happened.
+    _CHAIN_NOT_EXHAUSTED_EVENT = "provider_chain_not_exhausted_yet"
+
     def _capacity_wait_providers(self) -> List[str]:
         """The provider the last refused call went to, if we know it.
 
@@ -5819,7 +5826,171 @@ class AutonomousAgent:
         )
         return [name] if name else []
 
-    def _query_with_capacity_wait(self, call, task, attempt_bound):
+    def _capacity_wait_chain(self, scene: Optional[str] = None) -> List[str]:
+        """Every provider the scene could have routed this call to.
+
+        :meth:`_capacity_wait_providers` answers a narrower question:
+        "which provider did the last refused call happen to go to".
+        One name cannot say whether the *chain* ran out. A four
+        provider chain where only the last member refused is one
+        provider out of capacity, not four — only the chain tells
+        those two apart, so the chain is what gets resolved here.
+
+        Args:
+            scene: The scene to resolve the chain for. ``None`` falls
+                back to the coding tool's own scene, which is the
+                scene the call would have been routed through anyway.
+
+        Returns:
+            The provider names in the resolver's order, each name
+            listed once. Empty when there is no scene to resolve, when
+            the scene routes to nobody, or when the resolver fails: a
+            routing answer nobody could give is not a chain we know,
+            and it must never turn a provider's refusal into a crash.
+        """
+        effective_scene = scene or getattr(
+            getattr(self, "coding_tool", None), "scene", None,
+        )
+        if not effective_scene:
+            return []
+        try:
+            from provider_routing import resolve_provider_chain
+
+            resolved = resolve_provider_chain(effective_scene)
+        except Exception:
+            # An unreadable routing table is not a chain of zero
+            # providers — it is a question nobody answered. The caller
+            # owns the policy for an unknown chain; here it is simply
+            # not known.
+            return []
+        chain: List[str] = []
+        for name in list(resolved or []):
+            if not isinstance(name, str):
+                continue
+            name = name.strip()
+            if name and name not in chain:
+                chain.append(name)
+        return chain
+
+    def _capacity_wait_quota_map(self) -> Dict[str, Any]:
+        """The live quota reading, keyed by provider name.
+
+        Fail-open, like the reader beside it in the dispatch path: a
+        meter that cannot be read is an empty map, and an empty map
+        leaves every member of the chain dispatchable.  A verdict
+        built on a meter nobody could read must never claim that
+        everybody is out of capacity.
+        """
+        try:
+            from provider_order import load_provider_quota_map
+
+            return load_provider_quota_map() or {}
+        except Exception:
+            return {}
+
+    def _chain_has_dispatchable_member(self, chain: List[str]) -> bool:
+        """Is anybody on ``chain`` still able to serve a dispatch?
+
+        The whole-chain question, asked with the same predicate the
+        dispatch loop uses (:func:`chain_has_dispatchable_provider`):
+        a member is out of capacity when it is parked, when its live
+        reading says the window is empty, or when its quota-scaled cap
+        comes out at nothing.  One healthy member keeps the whole
+        chain alive — the chain's order says which one is tried first,
+        and this only answers whether there is anybody left to try.
+
+        A chain we could not judge is a chain we do not claim to be
+        exhausted: an unknown verdict answers ``True``, so the caller
+        makes one more call instead of writing "everybody is out" on
+        the strength of a question nobody answered.
+
+        Args:
+            chain: The provider names to ask about, in the resolver's
+                order.
+
+        Returns:
+            ``True`` when some member of the chain could serve.
+        """
+        if not chain:
+            return False
+        try:
+            from dynamic_provider_concurrency import (
+                chain_has_dispatchable_provider,
+                get_shared_cooldown,
+            )
+
+            return bool(chain_has_dispatchable_provider(
+                chain,
+                self._capacity_wait_quota_map(),
+                get_shared_cooldown(),
+            ))
+        except Exception:
+            # A verdict that could not be computed is not a verdict of
+            # "nobody is left".  Answer "somebody might be", and let
+            # the extra call settle it.
+            return True
+
+    def _capacity_wait_exhausted_providers(
+        self, chain: Optional[List[str]] = None,
+    ) -> List[str]:
+        """The providers an exhausted wait names.
+
+        The whole chain when we know it: the chain is what says "the
+        scene ran out of providers", while a single name only says
+        "the last call happened to go there".  The two are different
+        facts, and only the chain tells them apart.
+
+        When the chain is unknown — the routing table could not be
+        read, or the scene routes to nobody — the older answer stands.
+        Reporting an empty chain would say nothing at all, and the
+        provider the call went to at least says where the refusal
+        came from.
+
+        Args:
+            chain: The chain to report, when the caller already has
+                it.  ``None`` resolves it from the coding tool's own
+                scene.
+
+        Returns:
+            The provider names the exhaustion is reported under.
+        """
+        resolved = (
+            list(chain) if chain is not None
+            else self._capacity_wait_chain()
+        )
+        if resolved:
+            return resolved
+        return self._capacity_wait_providers()
+
+    def _log_chain_not_exhausted(
+        self, task, chain: List[str], waited: float,
+    ) -> None:
+        """Say that the budget ran out while the chain still had someone.
+
+        The wait is over but the scene is not out of providers, and
+        those are different facts: the log line is where the second
+        one is written down, so an operator reading the run afterwards
+        can tell "the budget ran out" from "the providers ran out".
+        """
+        if not self.logger:
+            return
+        self.logger.warning(
+            self._CHAIN_NOT_EXHAUSTED_EVENT,
+            (
+                f"Task [{task.id}] ran out of capacity-wait budget but "
+                f"the provider chain still has a dispatchable member — "
+                f"making one more call before deciding the chain is out"
+            ),
+            task_id=task.id,
+            data={
+                "chain": list(chain),
+                "waited_sec": waited,
+            },
+        )
+
+    def _query_with_capacity_wait(
+        self, call, task, attempt_bound, scene: Optional[str] = None,
+    ):
         """``call()`` with a provider-capacity wait in front of it.
 
         A provider that refuses because it is out of budget says
@@ -5849,19 +6020,38 @@ class AutonomousAgent:
           errors. Waiting cannot fix a tier table that approves nobody,
           so they travel up untouched.
 
+        The exhaustion verdict is asked of the chain, not of the last
+        refusal.  When the budget runs out but the chain still has a
+        member that could serve a dispatch, the wait does not give up:
+        it writes the ``provider_chain_not_exhausted_yet`` warning and
+        makes ONE more call, and that call is what settles it.  The
+        extra call is capped at one, so a chain that keeps looking
+        alive still ends in an exhaustion.
+
         Args:
             call: A zero-argument callable that performs the call.
             task: The task being executed — used for the log line.
             attempt_bound: The attempt this call belongs to, as
                 ``(attempt, max_attempts)``. A plain integer is read
                 as ``max_attempts``.
+            scene: The workflow scene the call was routed through.
+                It is what :meth:`_capacity_wait_chain` resolves, so
+                the whole chain the scene routes to is available to
+                whoever reads the wait's outcome — not just the one
+                provider that happened to refuse. ``None`` falls back
+                to the coding tool's own scene.
 
         Returns:
             Whatever ``call()`` returns.
 
         Raises:
             QuotaWaitExhausted: The wait budget ran out before the
-                call succeeded.
+                call succeeded.  The providers it names are the WHOLE
+                chain the scene routes to — the scene running out of
+                providers is a different fact from the provider that
+                happened to refuse last, and only the chain tells them
+                apart.  A chain nobody could resolve falls back to the
+                provider the call went to.
             ApiError: A refusal that is not about capacity — unchanged.
             SceneProviderUnavailable: A routing failure that waiting
                 cannot fix — unchanged.
@@ -5870,6 +6060,11 @@ class AutonomousAgent:
         clock = getattr(self, "_capacity_wait_clock", None) or _capacity_wait_clock
         sleep = getattr(self, "_capacity_wait_sleep", None) or _capacity_wait_sleep
         started = clock()
+        # The chain verdict is allowed to buy exactly ONE more call.
+        # It exists so "the chain still had somebody on it" is answered
+        # by a call rather than by a guess, and it is capped at one so
+        # a chain that keeps looking alive cannot spin forever.
+        supplemented = False
         while True:
             refusal: Optional[BaseException] = None
             try:
@@ -5887,11 +6082,40 @@ class AutonomousAgent:
                     raise
                 refusal = exc
 
+            # The whole chain the scene routes to: every provider that
+            # COULD have served this call, not just the one that
+            # refused. It is resolved before the budget is judged so
+            # that an exhausted wait can answer "did the chain run
+            # out?" with the chain rather than a guess.
+            chain = self._capacity_wait_chain(scene)
+
             waited = clock() - started
             budget = capacity_wait_budget_sec()
-            if budget <= 0 or waited >= budget:
+            if budget <= 0:
+                # No waiting was ever allowed for this run: the answer
+                # is the old one, immediately.  Nothing was waited
+                # out, so there is nothing to re-judge — the chain
+                # verdict belongs to a wait that actually happened.
                 raise QuotaWaitExhausted(
                     providers=self._capacity_wait_providers(),
+                    needs_manual_topup=False,
+                    waited_sec=waited,
+                ) from refusal
+
+            if waited >= budget:
+                if (
+                    not supplemented
+                    and chain
+                    and self._chain_has_dispatchable_member(chain)
+                ):
+                    # Somebody is still on the chain: the wait is over
+                    # but the scene is not out of providers.  Say so,
+                    # and make the one call that decides it.
+                    supplemented = True
+                    self._log_chain_not_exhausted(task, chain, waited)
+                    continue
+                raise QuotaWaitExhausted(
+                    providers=self._capacity_wait_exhausted_providers(chain),
                     needs_manual_topup=False,
                     waited_sec=waited,
                 ) from refusal
@@ -5904,6 +6128,7 @@ class AutonomousAgent:
                     "api_status": getattr(refusal, "status", None),
                     "error": str(refusal)[:300],
                     "waited_sec": waited,
+                    "chain": list(chain),
                 }
                 if isinstance(refusal, SceneProviderUnavailable):
                     # The reason and the candidates are what tell an
@@ -6429,6 +6654,7 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                             ),
                             task,
                             (attempt + 1, attempt_bound),
+                            scene="execution",
                         )
                     else:
                         coder_response = self._query_with_capacity_wait(
@@ -6441,6 +6667,7 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                             ),
                             task,
                             (attempt + 1, attempt_bound),
+                            scene="execution",
                         )
                     # Observable proof that the retry re-opened the same
                     # conversation: one session id per task, carried
@@ -7643,7 +7870,13 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
                     )
                     self._stop_reason_for_quota_wait(
                         QuotaWaitExhausted(
-                            providers=self._capacity_wait_providers(),
+                            # The whole chain when the scene can be
+                            # resolved: the marker says "the scene ran
+                            # out of providers", and one name only
+                            # says "that call went there".  A chain
+                            # nobody could resolve keeps the older
+                            # answer.
+                            providers=self._capacity_wait_exhausted_providers(),
                             needs_manual_topup=False,
                             waited_sec=0.0,
                         ),
