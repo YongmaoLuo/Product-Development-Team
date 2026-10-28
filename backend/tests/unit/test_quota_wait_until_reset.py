@@ -242,10 +242,24 @@ def _run(tool, **kw):
 
 
 def _open_fleet():
-    """Every candidate with budget to spare."""
+    """Every candidate with budget to spare -- in both windows.
+
+    The week is *stated*, not omitted.  A reading that carries the burst
+    window alone means "this provider's week went missing", and the
+    dispatch gate treats a week that stopped being reported as an
+    exhausted one (a provider that once reported a ``weekly_limit`` tier
+    and no longer does is not a provider whose week reopened).  An open
+    week is a week at 0% with a reset still ahead of it, so the fixture
+    says exactly that rather than leaving the tier out and meaning the
+    opposite of what it says.
+    """
     stamp = _now() + timedelta(minutes=180)
+    week = _now() + timedelta(days=7)
     return _payload([
-        _row(name, five_hour_used=4.0, five_hour_resets_at=stamp)
+        _row(
+            name, five_hour_used=4.0, five_hour_resets_at=stamp,
+            weekly_used=0.0, weekly_resets_at=week,
+        )
         for name in CHAIN
     ])
 

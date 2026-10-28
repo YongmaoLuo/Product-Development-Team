@@ -85,7 +85,16 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    Dict,
+    List,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from credentials import _FD_ENV_PREFIX as _SECRET_FD_ENV_PREFIX
 from service_declaration import SERVICE_HOST, ServiceDeclaration
@@ -100,6 +109,13 @@ from service_freshness import (
     probe_port,
     wait_for_ready,
 )
+
+try:  # The reaper's spawn marker.  Optional: the marker is how the
+    # reaper recognises a process as ours, never what makes it run, so
+    # a missing module degrades to "no marker" and not to a failure.
+    import orphan_reaper
+except Exception:  # pragma: no cover - the marker is best-effort
+    orphan_reaper = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -2185,6 +2201,123 @@ def _await_exit(proc: subprocess.Popen, timeout: float) -> tuple:
         time.sleep(0.02)
 
 
+# ---------------------------------------------------------------------------
+# The spawn marker
+# ---------------------------------------------------------------------------
+
+#: The marker keys, spelled out here as well as in :mod:`orphan_reaper`.
+#:
+#: The names are a wire protocol the reaper reads, and they are named
+#: here for one reason: the marker **inherited** from a parent has to
+#: be removed even when the reaper module itself could not be imported.
+#: A marker that names an owner which did not start the service is
+#: worse than no marker at all.
+_SPAWN_MARKER_KEYS = (
+    "PDT_SPAWN_OWNER_PID",
+    "PDT_SPAWN_OWNER_START",
+    "PDT_SPAWN_KIND",
+)
+
+#: The warnings already spoken about the marker, by topic.
+#:
+#: The marker is best-effort, so a broken one must not turn into a log
+#: line for every service a round starts.
+_SPAWN_MARKER_WARNED: Set[str] = set()
+
+
+def _warn_once(topic: str, message: str, *args: Any) -> None:
+    """Say *message* the first time *topic* comes up -- and never again."""
+    if topic in _SPAWN_MARKER_WARNED:
+        return
+    _SPAWN_MARKER_WARNED.add(topic)
+    logger.warning(message, *args)
+
+
+def _spawn_marker_keys() -> Tuple[str, ...]:
+    """The marker keys the reaper reads.
+
+    The reaper's own names when it is importable -- those are the wire
+    protocol -- and the literal names otherwise, so that a marker
+    inherited from a parent can still be removed when the module is
+    not there.
+    """
+    module = orphan_reaper
+    if module is not None:
+        try:
+            return (
+                module.SPAWN_OWNER_PID,
+                module.SPAWN_OWNER_START,
+                module.SPAWN_KIND,
+            )
+        except AttributeError:  # pragma: no cover - defensive
+            pass
+    return _SPAWN_MARKER_KEYS
+
+
+def _spawn_marker_env() -> Dict[str, str]:
+    """The marker a service child inherits from this process.
+
+    The service is started detached, so it outlives whatever started
+    it -- which is exactly the process the reaper has to recognise as
+    an orphan later.  The marker says *who* started it
+    (``OWNER_PID``), *when that owner started* (``OWNER_START``, which
+    is what tells a live owner from a recycled pid) and *what it is*
+    (``KIND``).
+
+    The marker is best-effort and never load-bearing: it is how the
+    reaper finds a process, not what makes the process run.  A missing
+    reaper module, or a probe that could not be read, therefore
+    degrades to a warning and to a marker with an unknown owner start
+    -- "unknown" is not "different" (see
+    :func:`orphan_reaper.process_start_epoch`), so a service whose
+    owner start could not be read is one the reaper recognises and
+    leaves alone.
+    """
+    module = orphan_reaper
+    if module is None:
+        _warn_once(
+            "missing-module",
+            "[service_manager] orphan_reaper is not importable; services "
+            "are started without a spawn marker",
+        )
+        return {}
+    try:
+        return dict(module.spawn_tags(module.KIND_SERVICE))
+    except Exception as exc:  # noqa: BLE001 - a marker never blocks a spawn
+        _warn_once(
+            "spawn-tags",
+            "[service_manager] could not build the spawn marker (%s); the "
+            "service is started with an unknown owner start", exc,
+        )
+    try:
+        return {
+            module.SPAWN_OWNER_PID: str(os.getpid()),
+            module.SPAWN_OWNER_START: "",
+            module.SPAWN_KIND: module.KIND_SERVICE,
+        }
+    except Exception as exc:  # noqa: BLE001 - defensive
+        _warn_once(
+            "marker-keys",
+            "[service_manager] the spawn marker has no readable keys (%s); "
+            "the service is started without one", exc,
+        )
+        return {}
+
+
+def _apply_spawn_marker(env: MutableMapping[str, str]) -> None:
+    """Stamp *env* with this process's spawn marker.
+
+    The marker is **replaced**, never merged.  A child inherits its
+    parent's marker, and a marker that survived a new owner would
+    attribute the service to an ancestor that may long since be gone
+    -- the owner of a process is the process that actually started it,
+    so the marker is stamped at every spawn level.
+    """
+    for key in _spawn_marker_keys():
+        env.pop(key, None)
+    env.update(_spawn_marker_env())
+
+
 def start_service(
     decl: ServiceDeclaration, project_dir: Path,
     *, timeout_seconds: Optional[int] = None,
@@ -2252,6 +2385,12 @@ def start_service(
     try:
         env = dict(os.environ)
         env.update(service_env(decl))
+        # The spawn marker: this service is started detached, so it
+        # outlives this process -- which is exactly the process the
+        # reaper has to recognise as an orphan later.  The marker
+        # replaces any inherited one; the owner is the process that
+        # actually started the service.
+        _apply_spawn_marker(env)
         if preserve_data:
             # A start command that knows the convention can skip its
             # own seed; one that does not is rendered seed-free above.
