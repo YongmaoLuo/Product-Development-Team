@@ -44,8 +44,11 @@ TDD spec (pinned by the task brief):
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import tempfile
 import threading
+from pathlib import Path
 from typing import Iterator
 
 import pytest
@@ -74,6 +77,14 @@ from fastapi.testclient import TestClient
 # plan_routing.current_phase`` (red in the 2026-09-14 full-lane run; the file
 # passes in isolation).  Dropping and recreating makes the bootstrap
 # deterministic regardless of what a concurrent writer did to the file.
+#
+# 2026-10-28: dropping first was only half the answer, because the window
+# was never the schema — it was the *unlink*.  A concurrent writer that
+# lands while the file is being rebuilt leaves a torn image behind and the
+# reader gets ``database disk image is malformed`` (red in the PR #49
+# root-5 shard, 1 in N runs, same 250 tests).  ``_create_state_db`` now
+# builds the database at a staging path and ``os.replace``s it in, so no
+# reader can ever observe a partially built file.
 PLAN_ROUTING_SCHEMA_SQL = """
 DROP TABLE IF EXISTS plan_routing;
 CREATE TABLE plan_routing (
@@ -98,26 +109,57 @@ def _create_state_db(db_path, rows=None):
         schema is created.  ``completed_phases_json_str`` is the
         raw JSON string the helper will store verbatim (use
         ``None`` to insert SQL NULL).
+
+    The file is built at a staging path and swapped in with
+    ``os.replace`` — never assembled in place.  The application keeps
+    resolving ``_state_db_path()`` on every call, so a background
+    worker from an earlier test (or this test's own lifespan) can open
+    *this* path at any moment; a writer that lands between an
+    ``unlink`` and the first ``INSERT`` sees a half-built file, and the
+    endpoint then reads ``database disk image is malformed`` (the
+    variant that survived the 2026-09-14 DROP-first fix — see the
+    flake notes at the bottom of this module).  An ``os.replace``
+    gives every reader either the previous complete database or the
+    new complete one, never a partial one.
+
+    The ``-wal`` / ``-shm`` / ``-journal`` sidecars go with it: the
+    previous database left them behind, and a fresh main file sitting
+    next to another incarnation's WAL is the other way a reader ends
+    up looking at an image it cannot parse.
     """
+    db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    # Remove first so a leftover file from a previous test never
-    # bleeds schema state into this run.
-    if db_path.exists():
-        db_path.unlink()
-    conn = sqlite3.connect(str(db_path))
+
+    fd, staging_name = tempfile.mkstemp(
+        prefix=db_path.name + ".", suffix=".building", dir=str(db_path.parent)
+    )
+    os.close(fd)
+    staging = Path(staging_name)
     try:
-        conn.executescript(PLAN_ROUTING_SCHEMA_SQL)
-        if rows:
-            for plan_id, current_phase, completed_phases in rows:
-                conn.execute(
-                    "INSERT INTO plan_routing "
-                    "(plan_id, current_phase, completed_phases) "
-                    "VALUES (?, ?, ?)",
-                    (plan_id, current_phase, completed_phases),
-                )
-        conn.commit()
+        conn = sqlite3.connect(str(staging))
+        try:
+            conn.executescript(PLAN_ROUTING_SCHEMA_SQL)
+            if rows:
+                for plan_id, current_phase, completed_phases in rows:
+                    conn.execute(
+                        "INSERT INTO plan_routing "
+                        "(plan_id, current_phase, completed_phases) "
+                        "VALUES (?, ?, ?)",
+                        (plan_id, current_phase, completed_phases),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+        for suffix in ("-wal", "-shm", "-journal"):
+            # ``missing_ok``: a live connection can drop these between the
+            # check and the unlink, and that race is the whole subject here.
+            Path(str(db_path) + suffix).unlink(missing_ok=True)
+        os.replace(staging, db_path)
     finally:
-        conn.close()
+        for leftover in [staging] + [
+            Path(str(staging) + s) for s in ("-wal", "-shm", "-journal")
+        ]:
+            leftover.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
