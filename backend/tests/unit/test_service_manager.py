@@ -3129,7 +3129,7 @@ def test_retry_candidates_logged(project, tmp_path, monkeypatch):
 class _DataPlaneServer:
     def __init__(
         self, *, rows: int = 4, health_status: int = 200,
-        data_status: int = 200,
+        data_status: int = 200, state_db_path: str = "",
     ):
         import threading
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -3137,6 +3137,12 @@ class _DataPlaneServer:
         self.rows = rows
         self.health_status = health_status
         self.data_status = data_status
+        #: The ``instance`` block the instance publishes.  It is read
+        #: **per request**, so a test may replace it with a hostile one
+        #: (no block at all, a null path, a path that is not a string).
+        self.instance: Optional[dict] = {
+            "boot_id": "boot-1234", "state_db_path": state_db_path,
+        }
         #: One entry per request: the path that was asked for.
         self.requests: list = []
         server = self
@@ -3148,11 +3154,13 @@ class _DataPlaneServer:
                 server.requests.append(self.path)
                 if self.path.split("?")[0].endswith("/health/data"):
                     status = server.data_status
-                    body = json.dumps({
+                    payload = {
                         "status": "ok",
                         "plan_routing_rows": server.rows,
-                        "instance": {"boot_id": "boot-1234"},
-                    }).encode()
+                    }
+                    if server.instance is not None:
+                        payload["instance"] = server.instance
+                    body = json.dumps(payload).encode()
                 else:
                     status = server.health_status
                     body = b'{"status": "ok"}'
@@ -3210,6 +3218,56 @@ def test_the_data_plane_probe_reads_the_instance_fact_sheet():
     assert evidence.plan_routing_rows == 4
     assert evidence.boot_id == "boot-1234"
     assert evidence.status == "ok"
+
+
+def test_data_plane_evidence_records_the_state_db_the_instance_reports():
+    """The instance names the database it is serving.
+
+    A round has to judge an instance against **its own** database —
+    the one its ``/health/data`` names — and not against the one the
+    prober happens to have open.  The evidence therefore carries the
+    path the instance published, so the reader of the log can see
+    which state database answered.
+    """
+    server = _DataPlaneServer(
+        rows=4, state_db_path="/tmp/p/.pdt/verify/state.db",
+    )
+    try:
+        evidence = sm.data_plane_evidence(server.port)
+    finally:
+        server.close()
+
+    assert evidence.state_db_path == "/tmp/p/.pdt/verify/state.db"
+    assert evidence.to_dict()["state_db_path"] == "/tmp/p/.pdt/verify/state.db"
+
+
+def test_a_missing_or_unusable_state_db_path_leaves_the_evidence_empty():
+    """No instance block, no path, a null path, a number: all the same.
+
+    The probe never raises, and an instance that does not say which
+    database it serves must not be read as saying "the wrong one":
+    the field stays empty and the verdict is untouched.
+    """
+    hostile = (
+        None,                                             # no instance block
+        {"boot_id": "boot-1234"},                         # no path at all
+        {"boot_id": "boot-1234", "state_db_path": None},   # null
+        {"boot_id": "boot-1234", "state_db_path": 17},     # not a string
+    )
+    for instance in hostile:
+        server = _DataPlaneServer(rows=4)
+        server.instance = instance
+        try:
+            evidence = sm.data_plane_evidence(server.port)
+        finally:
+            server.close()
+
+        assert evidence.state_db_path == "", instance
+        assert evidence.to_dict()["state_db_path"] == "", instance
+        assert evidence.verdict == sm.DATA_PLANE_PROVED, instance
+        assert evidence.boot_id == (
+            "boot-1234" if instance else ""
+        ), instance
 
 
 def test_an_empty_data_plane_is_not_a_proof():
@@ -3341,3 +3399,469 @@ def test_the_runtime_carries_the_data_plane(monkeypatch):
     assert recorded["plan_routing_rows"] == 4
     assert recorded["boot_id"] == "boot-1234"
     assert recorded["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# The data-plane gate judges the database the service itself names
+# ---------------------------------------------------------------------------
+#
+# 2026-10-27, fact A: a copy relocated onto a free port, serving the
+# copy's **own** empty state database, was refused for ever.  The gate
+# compared the copy's empty database against the *round's* fixture —
+# a database that holds rows the copy never had and never would have.
+#
+# The judgement now comes from the two statements the service made
+# about its own data: the database its **declaration** names, and the
+# database its **answer** names.
+
+
+def _routing_db(path: Path, rows: int) -> Path:
+    """A state database holding *rows* ``plan_routing`` rows."""
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("CREATE TABLE plan_routing (plan_id TEXT PRIMARY KEY)")
+        for index in range(rows):
+            conn.execute(
+                "INSERT INTO plan_routing (plan_id) VALUES (?)",
+                (f"plan-{index}",),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def _db_decl() -> ServiceDeclaration:
+    """A declaration that names the state database it serves."""
+    return _decl(
+        name="api",
+        start_cmd=(
+            "export PDT_STATE_DB_PATH=$PWD/.pdt/verify/state.db "
+            "&& exec python -m api.server"
+        ),
+    )
+
+
+def test_an_instance_is_judged_by_the_db_its_declaration_names(tmp_path):
+    """The declaration names the database; the instance names the same one.
+
+    The round's own fixture has rows, but the service serves a
+    database it declared for itself, and that database is empty.  An
+    empty instance is therefore exactly what the declaration asks for
+    — refusing it strands the round (2026-10-27, fact A).
+    """
+    db = _routing_db(tmp_path / "project" / ".pdt" / "verify" / "state.db", 0)
+    evidence = sm.DataPlaneEvidence(
+        verdict=sm.DATA_PLANE_EMPTY, plan_routing_rows=0,
+        state_db_path=str(db),
+    )
+
+    assert sm._data_plane_is_acceptable(evidence, 4, _db_decl()) is True
+
+
+def test_an_instance_serving_a_foreign_db_is_refused(tmp_path):
+    """The instance names a database the declaration never named.
+
+    That is a service serving data the round did not ask for, and it
+    is refused whatever the round's own fixture holds.
+    """
+    _routing_db(tmp_path / "project" / ".pdt" / "verify" / "state.db", 0)
+    foreign = _routing_db(tmp_path / "elsewhere" / "state.db", 0)
+    evidence = sm.DataPlaneEvidence(
+        verdict=sm.DATA_PLANE_EMPTY, plan_routing_rows=0,
+        state_db_path=str(foreign),
+    )
+
+    assert sm._data_plane_is_acceptable(evidence, 4, _db_decl()) is False
+
+
+def test_a_declared_db_with_rows_still_refuses_an_empty_instance(tmp_path):
+    """"It should have data and it says it has none" is still a refusal.
+
+    The database the declaration names holds rows, so the instance that
+    reports none of them is not serving that database — whatever the
+    round's own fixture says.
+    """
+    db = _routing_db(tmp_path / "project" / ".pdt" / "verify" / "state.db", 3)
+    evidence = sm.DataPlaneEvidence(
+        verdict=sm.DATA_PLANE_EMPTY, plan_routing_rows=0,
+        state_db_path=str(db),
+    )
+
+    assert sm._data_plane_is_acceptable(evidence, 4, _db_decl()) is False
+
+
+def test_the_declared_state_db_path_is_read_off_the_declaration():
+    """The declaration names the database — in the shape it spells it.
+
+    ``$PWD`` (and ``$(pwd)``, and ``${PWD}``) mean "the directory the
+    service runs in", and the quotes are shell quoting.  What is left
+    is the path *inside* that directory — the tail the instance's own
+    answer carries.
+    """
+    for spelling in (
+        "$PWD/.pdt/verify/state.db",
+        "${PWD}/.pdt/verify/state.db",
+        "$(pwd)/.pdt/verify/state.db",
+        '"$PWD/.pdt/verify/state.db"',
+        "$PWD/./.pdt/verify/state.db",
+    ):
+        decl = _decl(
+            start_cmd=(
+                f"export PDT_STATE_DB_PATH={spelling} "
+                "&& exec python -m api.server"
+            ),
+        )
+        assert sm.declared_state_db_path(decl) == ".pdt/verify/state.db", spelling
+
+    assert sm.declared_state_db_path(
+        _decl(start_cmd="npx next dev -p 3000"),
+    ) == ""
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-27 — the two call sites get the declaration
+# ---------------------------------------------------------------------------
+#
+# The predicate (:func:`_data_plane_is_acceptable`) judges an instance by
+# the database its **declaration** names and the database its **answer**
+# names.  The two call sites were still calling it without the
+# declaration, so the judgement fell back to the round's own fixture — a
+# database that has nothing to do with the one the service serves.
+
+
+def test_a_relocated_copy_is_ready_when_it_serves_its_own_declared_db(
+    tmp_path, monkeypatch,
+):
+    """A copy on a free port, serving the database it declared, is ready.
+
+    The round's own fixture holds rows the copy never had (2026-10-27,
+    fact A): the copy declares the database it is going to serve, and it
+    serves it.  An empty database is exactly what that declaration asks
+    for, so the wait must accept the copy instead of waiting out the
+    timeout.
+
+    The instance does not name its database — that is the shape the
+    failing round recorded (``state_db_path`` was not in the answer
+    then) — so the **declaration** is the only statement about the data
+    plane there is.  The name it carries is relative to the directory
+    the service runs in, so the wait runs in that directory: the round
+    is asking about the copy's database, not about its own.
+    """
+    monkeypatch.setattr(
+        "service_freshness.expected_routing_rows", lambda *a, **k: 4,
+    )
+    project = tmp_path / "project"
+    _routing_db(project / ".pdt" / "verify" / "state.db", 0)
+    monkeypatch.chdir(project)
+    server = _DataPlaneServer(rows=0)
+    try:
+        decl = _decl(
+            port=server.port,
+            health_url=f"http://127.0.0.1:{server.port}/health",
+            start_cmd=(
+                "export PDT_STATE_DB_PATH=$PWD/.pdt/verify/state.db && true"
+            ),
+        )
+        ready = sm.wait_until_ready(decl, timeout_seconds=2)
+    finally:
+        server.close()
+
+    assert ready is True, (
+        "a copy that serves the database it declared must be ready, even "
+        "when the round's own fixture holds rows the copy never had"
+    )
+    evidence = sm._take_data_plane(decl.port)
+    assert evidence.verdict == sm.DATA_PLANE_EMPTY, evidence.to_dict()
+
+
+def test_an_adopted_instance_serving_a_foreign_db_is_refused(tmp_path):
+    """An adopted instance that serves a database the declaration never named.
+
+    The listener was already there when the round arrived: it is
+    adopted, it answers 200 — and it serves somebody else's database.
+    The gate has to refuse it (2026-10-27, fact A), which it can only do
+    if it is given the service's own declaration: the instance's answer
+    names a foreign database, and the declaration says which database
+    this service was supposed to serve.
+    """
+    _routing_db(tmp_path / "project" / ".pdt" / "verify" / "state.db", 0)
+    foreign = _routing_db(tmp_path / "elsewhere" / "state.db", 0)
+    runtime = sm.ServiceRuntime(
+        name="api", port=65001, origin="adopted", ready=True,
+    )
+    runtime.data_plane = sm.DataPlaneEvidence(
+        verdict=sm.DATA_PLANE_EMPTY, plan_routing_rows=0,
+        state_db_path=str(foreign),
+    )
+
+    sm._apply_data_plane_gate(runtime, 4, _db_decl())
+
+    assert runtime.ready is False, (
+        "an adopted instance serving a database the declaration never "
+        "named must not be used as the round's address"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fact A, end to end: a stranger on the declared port, a real relocation,
+# a real readiness verdict
+# ---------------------------------------------------------------------------
+#
+# Everything above stubs the process table: the "stranger" is a probe
+# result and the copy is a stubbed start.  Fact A happened to a **real**
+# round — a real process held the declared port, a real copy was started
+# on a free one, and a real readiness wait decided whether that copy was
+# usable.  No stub can answer that: it cannot hold a port, cannot serve
+# a health URL, cannot name a database, and cannot still be alive after
+# the round walked away from it.
+#
+# So this case runs the whole chain on real processes:
+#
+#   * a stranger — a process this module did not start — holds the
+#     declared port;
+#   * the round relocates: a copy starts on a free port, serving the
+#     database it declared for itself;
+#   * the readiness wait judges that copy by **its own** database and not
+#     by the round's fixture, which holds rows the copy never had;
+#   * the stranger is still alive afterwards — a port held by a process
+#     we cannot positively identify is not ours to kill, so the round
+#     gets out of the way instead (arch decision 4: R4).
+
+
+#: The source of the stand-in service.  A file rather than an inline
+#: ``-c`` script, because the start command has to name a program the
+#: module can recognise (``svc.py``) — a declaration whose identity
+#: tokens are empty matches nothing, and a stranger would then be
+#: adopted instead of relocated around.
+_STANDALONE_SERVICE_SOURCE = '''\
+"""A stand-in for a PDT service.
+
+``/health``      -> 200
+``/health/data`` -> 200, with the number of ``plan_routing`` rows in the
+                    database this process was started on and the path of
+                    that database (the instance fact sheet).
+"""
+import argparse
+import json
+import os
+import sqlite3
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+def _routing_rows(db_path):
+    """How many plan_routing rows the database holds."""
+    try:
+        conn = sqlite3.connect(
+            Path(db_path).resolve().as_uri() + "?mode=ro", uri=True,
+            timeout=2.0,
+        )
+    except Exception:
+        return 0
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM plan_routing").fetchone()
+    except Exception:
+        return 0
+    finally:
+        conn.close()
+    return int(row[0]) if row else 0
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        if self.path.split("?")[0].endswith("/health/data"):
+            rows = _routing_rows(self.server.db_path)
+            payload = {
+                "status": "ok",
+                "plan_routing_rows": rows,
+                "instance": {
+                    "boot_id": "stand-in-%d" % os.getpid(),
+                    "pid": os.getpid(),
+                    "state_db_path": self.server.db_path,
+                    "plan_routing_rows": rows,
+                },
+            }
+        else:
+            payload = {"status": "ok"}
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--db", required=True)
+    args = parser.parse_args()
+    httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    httpd.db_path = os.path.abspath(args.db)
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _wait_for_a_listener(port: int, proc, timeout: float = 20.0) -> None:
+    """Wait until *proc* is listening on *port*.
+
+    Fails loudly when the process died on the way there — a stranger
+    that never came up would make the whole case vacuous.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(
+                f"the stranger on port {port} exited with {proc.returncode} "
+                f"before it started listening"
+            )
+        if sm.probe_port(port).listening:
+            return
+        time.sleep(0.1)
+    raise AssertionError(
+        f"nothing was listening on port {port} after {timeout}s"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.timeout(120)
+def test_end_to_end_relocation_around_a_stranger_ends_ready(
+    tmp_path: Path, monkeypatch,
+):
+    """A real stranger, a real relocation, a real readiness verdict.
+
+    The shape fact A had (2026-10-27): the declared port was held by a
+    process nobody could identify, so the round started a copy on a free
+    port — and the copy serves the database **it** declared, which is
+    empty, while the round's own fixture holds rows the copy never had.
+
+    Three things have to hold at once, and only the real chain can show
+    them holding at once:
+
+      * the copy ends up **ready** — judged by the database it declared
+        and named, not by the round's fixture;
+      * the copy is on a **port of its own** — the stranger's port was
+        not taken from it;
+      * the stranger is **still alive** — the round got out of the way
+        instead of killing a process it could not identify (R4).
+
+    And the address event stream has to say where the port came from:
+    the "relocated" event names the port that was held and the port the
+    copy landed on.
+    """
+    import subprocess
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+
+    # The round's own fixture: four routing rows.  This is the database
+    # the round falls back to when the instance does not say which
+    # database it serves — and it is NOT the database this service
+    # serves.  It is what made the copy look wrong.
+    round_fixture_db = _routing_db(tmp_path / "round_fixture.db", 4)
+    monkeypatch.setenv("PDT_STATE_DB_PATH", str(round_fixture_db))
+    assert sm._expected_routing_rows() == 4, (
+        "the round's own fixture must hold rows for this case to mean "
+        "anything: the copy's database is the empty one"
+    )
+
+    # The database the service declares for itself: the same table, no
+    # rows.  It lives under the directory the service runs in, which is
+    # what ``$PWD/.pdt/verify/state.db`` names.
+    service_db = _routing_db(
+        project_dir / ".pdt" / "verify" / "state.db", 0,
+    )
+    (project_dir / "svc.py").write_text(_STANDALONE_SERVICE_SOURCE)
+
+    # A stranger holds the declared port.  A real process, in its own
+    # session, started by nobody in this module.
+    declared_port = sm.allocate_free_port()
+    assert declared_port, "could not get a free port for the stranger"
+    stranger = subprocess.Popen(
+        [
+            sys.executable, "-c",
+            "import socket,time;s=socket.socket();"
+            "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);"
+            f"s.bind(('127.0.0.1',{declared_port}));s.listen(5);"
+            "time.sleep(300)",
+        ],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    runtime = None
+    try:
+        _wait_for_a_listener(declared_port, stranger)
+        assert str(declared_port) not in str(service_db), (
+            "the declared port must not appear in the database path: the "
+            "relocation rewrites every standalone occurrence of the port"
+        )
+
+        decl = _decl(
+            name="svc",
+            port=declared_port,
+            cwd=".",
+            start_cmd=(
+                "export PDT_STATE_DB_PATH=$PWD/.pdt/verify/state.db && "
+                f"{shlex.quote(sys.executable)} svc.py "
+                f"--port {declared_port} "
+                f"--db {shlex.quote(str(service_db))}"
+            ),
+            health_url=f"http://127.0.0.1:{declared_port}/health",
+            ready_timeout_seconds=30,
+        )
+
+        result = sm.ensure_services(
+            project_dir, {"svc": decl}, plan_dir=plan_dir,
+        )
+        runtime = result.runtimes["svc"]
+
+        # The copy came up, on a port of its own, serving its own
+        # database — the round's fixture never entered into it.
+        assert runtime.ready is True, runtime.detail
+        assert runtime.origin == "spawned"
+        assert runtime.port != declared_port, (
+            "the copy must have moved off the port the stranger holds"
+        )
+        assert runtime.declared_port == declared_port
+        assert runtime.data_plane is not None, (
+            "the readiness wait must have recorded what the copy serves"
+        )
+        assert Path(runtime.data_plane.state_db_path).resolve() == (
+            service_db.resolve()
+        ), (
+            "the copy must serve the database it declared for itself"
+        )
+
+        # The stranger is untouched: the round got out of the way.
+        assert stranger.poll() is None, (
+            "the stranger must still be running: a port held by a process "
+            "we cannot positively identify is not ours to kill"
+        )
+
+        # And the address event stream says where the port came from.
+        events = sm.read_address_events(plan_dir)
+        kinds = [event["event"] for event in events]
+        assert "relocated" in kinds, kinds
+        relocated = [e for e in events if e["event"] == "relocated"][0]
+        assert relocated["old_port"] == declared_port
+        assert relocated["new_port"] == runtime.port
+    finally:
+        if runtime is not None:
+            sm.stop_service(runtime, grace_seconds=5.0)
+        stranger.kill()
+        stranger.wait(timeout=10)

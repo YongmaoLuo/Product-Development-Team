@@ -73,6 +73,7 @@ import logging
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -548,10 +549,11 @@ def _plans_tree() -> Path:
 class DataPlaneEvidence:
     """What the instance answering on a port says about its data.
 
-    ``/health/data`` answers three things: the state of the data plane
+    ``/health/data`` answers four things: the state of the data plane
     (``status``), how many ``plan_routing`` rows it holds
     (``plan_routing_rows``), and — in its ``instance`` block — which
-    process is answering (``boot_id``).
+    process is answering (``boot_id``) and which state database it is
+    serving (``state_db_path``).
 
     The **verdict** is what the round acts on:
 
@@ -574,6 +576,12 @@ class DataPlaneEvidence:
     plan_routing_rows: Optional[int] = None
     #: The boot id of the answering process, when it published one.
     boot_id: str = ""
+    #: The state database the instance says it is serving, when it
+    #: published one.  This is the **instance's own** answer: the
+    #: round has to judge an instance against the database the
+    #: instance names, not against the one the prober happens to
+    #: have open.  Empty when the instance named none.
+    state_db_path: str = ""
     #: One of the ``DATA_PLANE_*`` verdicts.
     verdict: str = DATA_PLANE_ABSENT
     #: Why the verdict came out the way it did.
@@ -599,6 +607,7 @@ class DataPlaneEvidence:
             "status": self.status,
             "plan_routing_rows": self.plan_routing_rows,
             "boot_id": self.boot_id,
+            "state_db_path": self.state_db_path,
             "verdict": self.verdict,
             "error": self.error,
         }
@@ -1631,6 +1640,12 @@ def data_plane_evidence(
         instance = body.get("instance")
         if isinstance(instance, dict):
             evidence.boot_id = str(instance.get("boot_id") or "")
+            # The instance names the database it is serving.  Only a
+            # string is a name: a null or a number is no name at all,
+            # and it leaves the field empty rather than inventing one.
+            reported_db = instance.get("state_db_path")
+            if isinstance(reported_db, str):
+                evidence.state_db_path = reported_db
         rows = body.get("plan_routing_rows")
         if not isinstance(rows, bool) and isinstance(rows, int):
             evidence.plan_routing_rows = int(rows)
@@ -1755,6 +1770,7 @@ def _expected_routing_rows() -> Optional[int]:
 
 def _data_plane_is_acceptable(
     evidence: DataPlaneEvidence, expected_rows: Optional[int],
+    decl: Optional[ServiceDeclaration] = None,
 ) -> bool:
     """May the round use this instance as an address?
 
@@ -1768,18 +1784,210 @@ def _data_plane_is_acceptable(
       * the instance publishes a data plane **with** routing rows — it
         is serving data, and that is what the round needs;
       * the instance publishes an **empty** (or broken) data plane — it
-        is serving nothing.  That is only acceptable when the round's
-        own fixture is empty too: a round that has data to serve must
+        is serving nothing.  That is only acceptable when the database
+        it is serving is empty too: a round that has data to serve must
         not be pointed at an instance that has none, because every
         assertion that follows would be graded against an empty table.
+
+    **Which** database decides that last question is the whole point of
+    this function (2026-10-27, fact A).  It used to be the round's own
+    fixture — a database that has nothing to do with the database *this
+    instance* serves.  A service that declares its own database and
+    serves it (a copy relocated onto a free port, reading the copy's
+    own empty ``state.db``) was therefore refused for ever: the round's
+    fixture held rows the copy never had and never would have.
+
+    The judgement is made against the two statements the service made
+    about its own data — the database its **declaration** names
+    (:func:`declared_state_db_path`) and the database its **answer**
+    names (:attr:`DataPlaneEvidence.state_db_path`):
+
+      * the two name **different** databases → refused: the instance is
+        serving data the round did not ask for;
+      * the two name the **same** database → the rows **that** database
+        holds decide.  An empty one is exactly what an empty service
+        was declared to serve, and a database with rows that the
+        instance reports as empty is refused;
+      * only **one** of the two names anything → that one decides;
+      * **neither** names anything → the round's own count decides, as
+        it did before.
     """
     if evidence.verdict in (DATA_PLANE_ABSENT, DATA_PLANE_UNREACHABLE):
         return True
     if evidence.verdict == DATA_PLANE_BROKEN:
         return False
-    if evidence.verdict == DATA_PLANE_EMPTY:
+    if evidence.verdict != DATA_PLANE_EMPTY:
+        return True
+
+    declared = declared_state_db_path(decl) if decl is not None else ""
+    reported = str(evidence.state_db_path or "").strip()
+    same = _same_state_db(declared, reported)
+    if same is False:
+        # The instance is serving a database its own declaration never
+        # named.  That is the wrong data, whatever the round holds.
+        return False
+
+    rows: Optional[int] = None
+    if same is True:
+        # One file, two spellings: the instance's own answer is the
+        # one that names a path this process can open.
+        rows = _routing_rows_in(reported)
+        if rows is None:
+            rows = _routing_rows_in(declared)
+    elif reported:
+        rows = _routing_rows_in(reported)
+    elif declared:
+        rows = _routing_rows_in(declared)
+    if rows is None:
+        # No count of its own: the round's fixture is the only fact
+        # left, and it is the judgement this module made before.
         return not (expected_rows or 0) > 0
-    return True
+    return rows == 0
+
+
+#: The prefixes a start command uses to spell "the directory the
+#: service runs in".
+_DECLARED_DB_CWD_PREFIXES = ("$(pwd)", "${PWD}", "$PWD")
+
+
+def _normalize_declared_db(raw: str) -> str:
+    """The declared database path, in a shape two names can be compared in.
+
+    The declaration usually spells the path relative to the directory
+    the service runs in (``$PWD/.pdt/state.db``).  That prefix is
+    dropped, and so is the shell quoting around the whole value: what
+    is left is the path **inside** the service's own directory — the
+    tail the instance's own answer carries.
+    """
+    text = str(raw or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1].strip()
+    for prefix in _DECLARED_DB_CWD_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            if text.startswith("/"):
+                text = text[1:]
+            break
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def declared_state_db_path(decl: ServiceDeclaration) -> str:
+    """The state database the service's **own declaration** names.
+
+    ``export PDT_STATE_DB_PATH=$PWD/.pdt/state.db`` is the service
+    saying, before it starts, which database it is going to serve.
+    It is the only statement about the data plane the service made on
+    its own account, and it is therefore the statement an instance has
+    to be judged against — the round's own fixture says nothing about
+    what *this* service serves.
+
+    ``""`` when the declaration names no database: the caller then has
+    only the instance's own answer to go by.
+    """
+    if decl is None:
+        return ""
+    try:
+        raw = start_cmd_env(str(decl.start_cmd or "")).get(
+            "PDT_STATE_DB_PATH", "",
+        )
+    except Exception:  # noqa: BLE001 - a malformed declaration is no name
+        return ""
+    return _normalize_declared_db(raw)
+
+
+def _path_parts(path: str) -> List[str]:
+    """The path's components, without the noise (``""``, ``"."``)."""
+    return [part for part in Path(path).parts if part not in ("", ".")]
+
+
+def _same_state_db(declared: str, reported: str) -> Optional[bool]:
+    """Do the two names point at the same state database?
+
+    ``True`` — the same file.  ``False`` — different files.
+    ``None`` — the question cannot be answered, because one of the two
+    names is missing.
+
+    Two absolute names are compared by their **real** path: the same
+    file reached by two different routes is the same file.  A relative
+    name is compared by its **components**: the declaration says
+    ``$PWD/.pdt/state.db`` and the instance says
+    ``/abs/worktree/.pdt/state.db`` — the same file, spelled two ways,
+    and the relative name is the tail of the absolute one.
+    """
+    left = str(declared or "").strip()
+    right = str(reported or "").strip()
+    if not left or not right:
+        return None
+    if os.path.isabs(left) and os.path.isabs(right):
+        try:
+            return os.path.realpath(left) == os.path.realpath(right)
+        except OSError:  # pragma: no cover - defensive
+            return None
+    left_parts = _path_parts(left)
+    right_parts = _path_parts(right)
+    if not left_parts or not right_parts:
+        return None
+    if len(left_parts) <= len(right_parts):
+        return right_parts[-len(left_parts):] == left_parts
+    return left_parts[-len(right_parts):] == right_parts
+
+
+def _routing_rows_in(db_path: str) -> Optional[int]:
+    """How many ``plan_routing`` rows the database at *db_path* holds.
+
+    Opened **read-only**: the database belongs to a running instance,
+    and a probe must not write to it — not even to switch its journal
+    mode.  ``None`` when the database cannot be read at all; the caller
+    then has no count of its own and falls back to the round's.
+
+    A database with **no** ``plan_routing`` table holds no routing rows
+    and says so with ``0`` rather than with "unknown": that is exactly
+    what the instance serving it reports.
+    """
+    text = str(db_path or "").strip()
+    if not text:
+        return None
+    try:
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+    except Exception:  # noqa: BLE001 - a malformed path is no path
+        return None
+    try:
+        # The operator's live database is off limits to a test run —
+        # the same rule the write path enforces (see
+        # :func:`state_machine.db.connection.open`).
+        from state_machine.db.connection import (
+            _refuse_real_state_db_under_pytest,
+        )
+
+        _refuse_real_state_db_under_pytest(path)
+    except ImportError:
+        pass
+    except RuntimeError:
+        return None
+    try:
+        conn = sqlite3.connect(
+            path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0,
+        )
+    except Exception:  # noqa: BLE001 - an unreadable database is unknown
+        return None
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM plan_routing").fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return 0
+        return None
+    except Exception:  # noqa: BLE001 - an unreadable database is unknown
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 - closing never fails the probe
+            pass
+    return int(row[0]) if row else None
 
 
 def wait_until_ready_with_evidence(
@@ -1819,6 +2027,14 @@ def _wait_ready_with_evidence(
     plane could not be reached at all: that is the absence of an
     answer, not a wrong answer.
 
+    The **declaration** goes into the judgement (2026-10-27, fact A).
+    A copy relocated onto a free port serves the database it declared
+    for itself, and that database is empty where the round's own
+    fixture holds rows — so the round's count is not the count that
+    says anything about this instance.  The declaration is what the
+    service said about its own data before it started, and it is the
+    statement the instance has to be judged against.
+
     A service that answers but proves nothing stays unready and is
     asked again, until the timeout; when the timeout runs out the
     caller fails it exactly as it failed a service that never came up.
@@ -1834,7 +2050,7 @@ def _wait_ready_with_evidence(
     while True:
         if _service_is_answering(decl):
             evidence = data_plane_evidence(decl.port)
-            if _data_plane_is_acceptable(evidence, expected_rows):
+            if _data_plane_is_acceptable(evidence, expected_rows, decl):
                 return True, evidence
         if time.monotonic() >= deadline:
             return False, evidence
@@ -3719,11 +3935,17 @@ def _ensure_services(
     # come up serving data?".  The services the round started were
     # already asked during the readiness wait; the ones it *adopted*
     # are asked here.
+    #
+    # 2026-10-27 (fact A): the gate is given the service's **own
+    # declaration** as well, so an instance is judged by the database
+    # this service said it would serve.  A runtime whose name is not in
+    # ``declarations`` (a service that was renamed on the way in, say)
+    # gets ``None`` — the judgement it had before.
     expected_rows = _expected_routing_rows()
-    for runtime in result.runtimes.values():
+    for name, runtime in result.runtimes.items():
         if runtime.data_plane is None:
             _record_data_plane(runtime)
-        _apply_data_plane_gate(runtime, expected_rows)
+        _apply_data_plane_gate(runtime, expected_rows, declarations.get(name))
 
     result.duration_seconds = time.monotonic() - start
     return result
@@ -3750,6 +3972,7 @@ def _record_data_plane(runtime: ServiceRuntime) -> ServiceRuntime:
 
 def _apply_data_plane_gate(
     runtime: ServiceRuntime, expected_rows: Optional[int],
+    decl: Optional[ServiceDeclaration] = None,
 ) -> None:
     """Refuse a runtime whose instance does not serve usable data.
 
@@ -3760,13 +3983,19 @@ def _apply_data_plane_gate(
     database behind it was empty, so every assertion that followed was
     graded against nothing.
 
+    ``decl`` is the service's own declaration, when the caller has it
+    (2026-10-27, fact A): an adopted instance that serves a database
+    the declaration never named is serving somebody else's data, and
+    the round's own count cannot tell that apart from a service that
+    simply has nothing yet.
+
     A runtime that is not ready is left alone: it already carries a
     reason, and a better one.
     """
     if not runtime.ready or runtime.data_plane is None:
         return
     evidence = runtime.data_plane
-    if _data_plane_is_acceptable(evidence, expected_rows):
+    if _data_plane_is_acceptable(evidence, expected_rows, decl):
         return
     runtime.ready = False
     runtime.detail = (
