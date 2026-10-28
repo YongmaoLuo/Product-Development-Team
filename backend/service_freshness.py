@@ -622,13 +622,26 @@ class DataPlaneFingerprint:
         self, observed: Optional["DataPlaneFingerprint"], *,
         expected_rows: Any = _UNSET,
     ) -> bool:
-        """Is *observed* the round's instance, still serving the fixture?
+        """Is *observed* the round's instance, serving the same data plane?
 
-        The **data plane** decides when the fixture's row count is known
-        — that is the whole point of the fingerprint, and the pid alone
-        could not catch the production round (the same process was
-        answering, with another database behind it).  The instance
-        identity (port + pid) decides when it is not.
+        The comparison object is the count **this fingerprint recorded**
+        (``self.routing_rows``): it is what the instance answered with
+        when the round captured the fingerprint, so it is the only
+        number that says "which data plane is this".  The pid alone
+        could not catch the production round — the same process was
+        answering, with another database behind it.
+
+        The fixture's count belongs to the *agent's* database — a
+        different one, which may have drifted under the round — so it
+        cannot decide the question.  (That is what blocked the
+        production round: the instance answered 11 rows both times,
+        while the agent's own database went from 49 to 52 rows.)
+
+        ``expected_rows`` stays in the signature for the callers that
+        pass it, but it never takes precedence over the recorded value:
+        it is the fallback for a fingerprint that recorded no count at
+        all.  When neither count is known, the instance identity
+        (port + pid) decides.
 
         A same-address observation from a **different** process is never
         the round's instance, whatever it reports: something else took
@@ -636,9 +649,6 @@ class DataPlaneFingerprint:
         """
         if observed is None or not observed.answered:
             return False
-        expected = (
-            self.expected_rows if expected_rows is _UNSET else expected_rows
-        )
         if (
             observed.port == self.port
             and self.pid is not None
@@ -646,6 +656,13 @@ class DataPlaneFingerprint:
             and observed.pid != self.pid
         ):
             return False
+        recorded = self.routing_rows
+        if recorded is not None:
+            return observed.routing_rows == recorded
+        # No recorded count: the fixture's count is all there is.
+        expected = (
+            self.expected_rows if expected_rows is _UNSET else expected_rows
+        )
         if expected is not None:
             return observed.routing_rows == expected
         # No row count to compare: the identity decides.
