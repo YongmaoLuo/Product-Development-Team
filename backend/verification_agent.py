@@ -10856,21 +10856,38 @@ class Orchestrator:
         # instead of making the service answer a second question.
         self._observed_instances[int(port)] = instance
 
-    def _expected_plans_dirs(self) -> List[str]:
+    def _expected_plans_dirs(self, name: str) -> List[str]:
         """The plans trees this round's service may be serving.
 
-        The service publishes the plans **root** it serves; the round
-        lives in ``<root>/<plan_id>``, so the root the round expects is
-        the plan directory's parent.  The plan directory itself is
-        accepted as well — a deployment that serves the round's plan
-        directory as its own root is serving the round's plans either
-        way.
+        The **first** entry is the tree the round's own service declared
+        about itself when it was started: the round records that
+        declaration (the ``instance`` block of ``/health/data``) and a
+        service answering with anything else is a different instance.
 
-        The first entry is the *primary* expectation (the plans root);
-        the second is the tolerated alternative.
+        The declaration leads and the round's own directories follow
+        because the two are not the same question.  A service started
+        against a **fixture data plane** — the plan's ``start_cmd``
+        pointing ``PDT_PLANS_DIR`` at e.g. ``.pdt/vp_quota/plans`` — is
+        a legal deployment: it serves the plans the round gave it,
+        honestly, and it says so.  Judging it by where *this round's*
+        plan directory happens to live blocked every verification point
+        of the 2026-10-27 round at ``identity_mismatch``: the service
+        was the round's own, and the gate did not know it.
+
+        The round's ``plan_dir.parent`` and ``plan_dir`` are still
+        accepted, so a deployment whose service serves the round's own
+        tree keeps working.  A service the round recorded **no**
+        declaration for has no first entry; the round's own directories
+        are then the whole expectation, exactly as before.
         """
         dirs: List[str] = []
-        for candidate in (self.plan_dir.parent, self.plan_dir):
+        recorded = self._service_instance_identity.get(str(name).lower()) or {}
+        candidates: List[Any] = []
+        declared = str(recorded.get("plans_dir") or "")
+        if declared:
+            candidates.append(declared)
+        candidates.extend((self.plan_dir.parent, self.plan_dir))
+        for candidate in candidates:
             try:
                 resolved = str(Path(candidate).resolve())
             except OSError:  # pragma: no cover - defensive
@@ -10879,22 +10896,37 @@ class Orchestrator:
                 dirs.append(resolved)
         return dirs
 
-    def _expected_state_db_inode(self) -> Optional[int]:
-        """The inode of the state database **this process** has open.
+    def _expected_state_db_inodes(self, name: str) -> List[int]:
+        """The state databases this round's service may be reading.
 
-        The round runs inside the backend, and the backend reads the
-        state database through
-        :func:`config_paths.resolve_state_db_path`.  A service reading
-        a *different* file — the same path with another inode — is a
-        different data plane, and no amount of ``200 OK`` makes the two
-        the same.
+        The **first** entry is the database the round's own service
+        declared about itself when it was started — the same source the
+        plans tree uses, and for the same reason: a plan whose
+        ``start_cmd`` points ``PDT_STATE_DB_PATH`` at a fixture data
+        plane is a legal deployment, and judging it by which database
+        *this backend* happens to have open blocked the whole
+        2026-10-28 round of 20261024-429-plan at ``state_db_inode``.
+
+        The backend's own database follows as a tolerated alternative,
+        so a service that serves the round's own data plane keeps
+        working.  A service the round recorded no declaration for has
+        no first entry; the backend's own inode is then the whole
+        expectation, exactly as before.
         """
+        inodes: List[int] = []
+        recorded = self._service_instance_identity.get(str(name).lower()) or {}
+        declared = _instance_state_db_inode(recorded)
+        if declared is not None:
+            inodes.append(int(declared))
         try:
             from config_paths import resolve_state_db_path
 
-            return int(resolve_state_db_path().stat().st_ino)
-        except Exception:  # noqa: BLE001 - no database, no verdict
-            return None
+            own = int(resolve_state_db_path().stat().st_ino)
+        except Exception:  # noqa: BLE001 - no database, no expectation
+            own = None
+        if own is not None and own not in inodes:
+            inodes.append(own)
+        return inodes
 
     @staticmethod
     def _observed_state_db_inode(instance: Dict[str, Any]) -> Optional[int]:
@@ -10961,7 +10993,12 @@ class Orchestrator:
         self._observed_instances[int(port)] = actual
 
         recorded = self._service_instance_identity.get(str(name).lower()) or {}
-        expected_dirs = self._expected_plans_dirs()
+        expected_dirs = self._expected_plans_dirs(name)
+        # The first entry is the primary expectation — the plans tree
+        # the round's own service declared when it was started (or the
+        # round's plans root when it declared none).  That is the value
+        # the mismatch record reports as "expected", because it is the
+        # one a reader is trying to match against.
         expected_plans_dir = expected_dirs[0] if expected_dirs else ""
         actual_plans_dir = str(actual.get("plans_dir") or "")
         expected_boot_id = str(recorded.get("boot_id") or "")
@@ -10986,12 +11023,18 @@ class Orchestrator:
                 f"{expected_plans_dir!r}"
             )
 
-        expected_inode = self._expected_state_db_inode()
+        expected_inodes = self._expected_state_db_inodes(name)
+        # The first entry is the primary expectation — the database the
+        # round's own service declared (or the backend's own when it
+        # declared none) — and it is the number a mismatch record
+        # reports as "expected", for the same reason the plans tree
+        # reports its own primary entry.
+        expected_inode = expected_inodes[0] if expected_inodes else None
         observed_inode = self._observed_state_db_inode(actual)
         if (
-            expected_inode is not None
+            expected_inodes
             and observed_inode is not None
-            and observed_inode != expected_inode
+            and observed_inode not in expected_inodes
         ):
             mismatched.append("state_db_inode")
             reasons.append(
