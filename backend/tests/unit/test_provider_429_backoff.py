@@ -15,7 +15,7 @@ elsewhere from the top.
 The contract these tests hold in place:
 
 1. **A rate limit is waited out on the SAME provider.** The dispatch
-   asks again after 10s, 20s, 40s and 80s — the same session, the same
+   asks again after 5s, 10s, 20s and 40s — the same session, the same
    provider — and nothing is parked and nothing is excluded while that
    is still working.
 2. **A spent plan is not waited out.** ``2056`` and a live meter that
@@ -281,7 +281,7 @@ def test_2062_backs_off_four_times_on_the_same_provider(monkeypatch, backoff):
     tool = _tool(monkeypatch, _failing_then(4))
     assert tool.query("do the task", timeout=10) == "done"
 
-    assert backoff.sleeps == [10.0, 20.0, 40.0, 80.0], (
+    assert backoff.sleeps == [5.0, 10.0, 20.0, 40.0], (
         "the waits grow with the number of refusals already spent: a "
         "provider that answers a refusal after 10s is being asked too "
         "fast"
@@ -331,7 +331,7 @@ def test_2056_parks_immediately_without_backoff(monkeypatch, backoff, scene):
     assert tool.query("do the task", timeout=10) == "done"
 
     assert backoff.sleeps == [], (
-        "a spent plan does not clear in 10 seconds — waiting for it "
+        "a spent plan does not clear in 5 seconds — waiting for it "
         "only delays the move to a provider that can serve the work"
     )
     assert get_shared_cooldown().is_parked(PROVIDER)
@@ -407,7 +407,7 @@ def test_backoff_exhaustion_switches_provider_and_parks(
         "four refusals answered by four waits, the fifth refused, and "
         "then the switch that succeeded"
     )
-    assert backoff.sleeps == [10.0, 20.0, 40.0, 80.0]
+    assert backoff.sleeps == [5.0, 10.0, 20.0, 40.0]
     assert get_shared_cooldown().is_parked(PROVIDER), (
         "a provider that refused five times in a row is parked, so the "
         "next dispatch does not pick it again"

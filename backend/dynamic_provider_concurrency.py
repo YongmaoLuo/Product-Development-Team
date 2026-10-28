@@ -22,6 +22,10 @@ The selection contract is decoupled from the slot bookkeeping:
   * :func:`provider_is_eligible` — the single "may this be dispatched
     to right now" predicate every walk shares: live quota verdict, park
     list, local capacity.
+  * :func:`provider_has_capacity` — the "could this provider serve at
+    all" predicate: live quota verdict, park list, quota-scaled cap.
+  * :func:`chain_has_dispatchable_provider` — the whole-chain question,
+    asked member by member: is anybody left to dispatch to?
   * :func:`select_provider_with_dynamic_capacity` — walks the fallback
     chain and returns the first provider with spare capacity, or ``None``.
   * :func:`acquired_provider_slot` — context manager that increments the
@@ -83,10 +87,10 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import provider_capacity
-from provider_order import ProviderQuota
+from provider_order import ProviderQuota, _WEEKLY_TIER
 
 
 #: Re-exported so the default has one definition. A provider no rule in
@@ -357,6 +361,36 @@ class ActiveConcurrencyTracker:
 # not a preference order: all three must hold. Nothing here ranks.
 
 
+def _weekly_window_lost(quota: Any) -> bool:
+    """True when the reading is missing a weekly window the provider has had.
+
+    A reading that does not carry the weekly window means two different
+    things, and only the provider's history tells them apart:
+
+    * the provider has never been seen to carry one — it is on a metered
+      API product and has no week to exhaust in the first place, so
+      there is nothing to lose and the gate must stay open;
+    * the provider *was* seen to carry one and this reading stopped
+      reporting it — the week has gone missing, which is treated as an
+      exhausted week.
+
+    The second case is the one this function answers for. History comes
+    from :attr:`provider_order.ProviderQuota.weekly_tier_seen`, which
+    :mod:`quota_tier_memory` carries across processes.
+
+    Every field is read with :func:`getattr` and a default: the quota
+    map is not typed, and a stand-in reading from before these fields
+    existed must be read as "no week to lose" rather than raising.
+    """
+    if not getattr(quota, "weekly_tier_seen", False):
+        return False
+    missing = getattr(quota, "tiers_missing", ()) or ()
+    try:
+        return _WEEKLY_TIER in missing
+    except TypeError:  # pragma: no cover - defensive
+        return False
+
+
 def quota_allows_dispatch(quota: Optional[ProviderQuota]) -> bool:
     """True unless the reading *affirmatively* shows no budget left.
 
@@ -369,10 +403,24 @@ def quota_allows_dispatch(quota: Optional[ProviderQuota]) -> bool:
     genuinely uncallable is caught by its own refusal at dispatch time,
     which is an observation rather than an inference from a gap in a
     payload.
+
+    Two things count as "no budget left":
+
+    * the reading says the provider is exhausted, and
+    * the reading's weekly window went missing on a provider that is
+      known to have one (:func:`_weekly_window_lost`) — a week that
+      stopped being reported is a week that cannot be dispatched to,
+      and treating it as "the burst window is fine, keep going" is how
+      a provider with an exhausted account stays on the rotation.
+
+    The second is checked *after* the first, so an exhausted reading is
+    refused either way.
     """
     if quota is None:
         return True
-    return not getattr(quota, "exhausted", False)
+    if getattr(quota, "exhausted", False):
+        return False
+    return not _weekly_window_lost(quota)
 
 
 def quota_remaining_pct(quota: Optional[ProviderQuota]) -> Optional[float]:
@@ -382,9 +430,18 @@ def quota_remaining_pct(quota: Optional[ProviderQuota]) -> Optional[float]:
     caller decides what to do without it. Keeping the two apart is what
     stops a meter-less provider from being scaled to a full cap by
     accident while still being eligible.
+
+    A reading whose weekly window went missing reports ``0.0``, the
+    same answer :func:`quota_allows_dispatch` gives it: the provider is
+    out of week, so it has no room to offer. ``0.0`` rather than
+    ``None`` is what makes the cap scaling follow — ``None`` would let
+    the caller fall back to another source and hand the provider slots
+    it may not use.
     """
     if quota is None:
         return None
+    if _weekly_window_lost(quota):
+        return 0.0
     pct = getattr(quota, "remaining_pct", None)
     if pct is None or isinstance(pct, bool) or not isinstance(pct, (int, float)):
         return None
@@ -405,10 +462,13 @@ def provider_headroom_pct(
     weekly window: the week is an independent budget that decides
     eligibility (:attr:`ProviderQuota.exhausted`, checked by
     :func:`quota_allows_dispatch`), and scaling the cap by it as well
-    would hold a provider down twice for the same seven days. The legacy
-    map is the fallback for callers that still pass it and for providers
-    the live reading does not cover, and 100 is the last resort, because
-    an unknown budget is not a zero budget.
+    would hold a provider down twice for the same seven days. The one
+    exception is a week that went *missing*
+    (:func:`_weekly_window_lost`): there is no week left to scale by,
+    so the reading answers ``0`` and the cap goes to zero with it. The
+    legacy map is the fallback for callers that still pass it and for
+    providers the live reading does not cover, and 100 is the last
+    resort, because an unknown budget is not a zero budget.
     """
     if quota_map is not None:
         live = quota_remaining_pct(quota_map.get(provider))
@@ -465,6 +525,117 @@ def provider_is_eligible(
         provider, provider_headroom_pct(provider, usage_map, quota_map)
     )
     return tracker.current(provider) < limit
+
+
+def provider_has_capacity(
+    provider: str,
+    quota: Optional[ProviderQuota],
+    *,
+    parked: bool = False,
+) -> bool:
+    """True when this provider could serve a dispatch *at all*.
+
+    A provider stops being able to serve for three separate reasons, and
+    this function asks all three of them, in the order that is cheapest
+    and most decisive first:
+
+    1. it is **parked** — a refusal earlier in this run put it on hold;
+    2. it has **no budget** — the live reading says the window is empty
+       (:func:`quota_allows_dispatch`);
+    3. its **cap is zero** — the quota-scaled cap it would serve under
+       comes out at nothing (:func:`compute_dynamic_limit`).
+
+    This is the "could this provider ever take work?" half of
+    :func:`provider_is_eligible`. The other half — "does it have a free
+    slot *right now*" — is a fact about in-flight work, and it changes
+    second to second; this one changes when the provider's budget or its
+    park changes, which is what an "is the chain finished?" question is
+    actually about.
+
+    The fail-open half of the contract is kept: a provider with **no
+    reading** is admitted, because a missing reading is not evidence of
+    an empty window. CC Switch cannot meter every provider, and those
+    providers serve traffic perfectly well. Only an affirmative
+    reading, an affirmative park, or a zero cap refuses a dispatch.
+
+    Args:
+        provider: The provider reference. ``"parent"`` is never a
+            provider: it is the caller's own fallback and has no row,
+            no reading and no cap of its own.
+        quota: The live reading for this provider, or ``None`` when
+            there is none.
+        parked: Whether the provider is currently on the park list.
+            The caller resolves the park itself, so this function stays
+            a pure question about one provider.
+
+    Returns:
+        ``True`` when the provider could serve a dispatch.
+    """
+    if not isinstance(provider, str) or not provider.strip():
+        return False
+    if provider == "parent":
+        return False
+    if parked:
+        return False
+    if not quota_allows_dispatch(quota):
+        return False
+    headroom = quota_remaining_pct(quota)
+    if headroom is None:
+        # The reading carries no number for the window. An unknown
+        # budget is not a zero budget, so the provider keeps its full
+        # cap rather than being scaled to nothing.
+        headroom = 100.0
+    return compute_dynamic_limit(provider, headroom) > 0
+
+
+def chain_has_dispatchable_provider(
+    chain: Sequence[str],
+    quota_map: Optional[Mapping[str, ProviderQuota]] = None,
+    cooldown: Optional["ProviderCooldown"] = None,
+) -> bool:
+    """True when at least one member of ``chain`` could serve a dispatch.
+
+    The whole-chain question, asked member by member: every name in
+    ``chain`` is put to :func:`provider_has_capacity`, and the chain is
+    dispatchable as soon as one member survives. Nothing here ranks the
+    members — the chain's own order says which one is tried first, and
+    this function only answers whether the chain still has anybody left
+    to try.
+
+    The empty chain is not dispatchable. "Nobody to dispatch to" and
+    "everybody is out of budget" are different answers, and only the
+    second one is a reason to go and wait for a window to reopen.
+
+    Args:
+        chain: The provider names to ask about, in the order the
+            dispatcher would try them.
+        quota_map: The live reading, provider name → quota row.
+            ``None`` or an absent entry means "no reading", which is
+            fail-open: the park list is then the only thing that can
+            refuse a dispatch.
+        cooldown: The park list. ``None`` consults the shared instance.
+
+    Returns:
+        ``True`` when some member of the chain could serve.
+    """
+    if not chain:
+        return False
+    park = cooldown if cooldown is not None else get_shared_cooldown()
+    for name in chain:
+        if not isinstance(name, str) or not name.strip():
+            continue
+        quota = None
+        if quota_map is not None:
+            try:
+                quota = quota_map.get(name)
+            except Exception:
+                # A quota map that cannot be read must not turn into a
+                # refusal: an unreadable reading is not evidence of an
+                # empty window.
+                quota = None
+        if provider_has_capacity(name, quota, parked=park.is_parked(name)):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -834,6 +1005,13 @@ DEFAULT_QUOTA_COOLDOWN_SEC: float = 1800.0
 #: so the plan name cannot tell the two apart. What separates them is
 #: the wording the vendor puts next to it, and that wording is what
 #: this set and :data:`RATE_LIMIT_ERROR_MARKERS` hold.
+#:
+#: ``plan 用量`` is that kind of wording rather than a plan name: it
+#: says the plan's *usage* is gone, and it does so without any code.
+#: A refusal that only says this used to fall through both text checks
+#: and land on the status check, where a ``429`` reads as a rate limit
+#: — a refusal that clears itself in seconds. The wording is the
+#: verdict, so a spent plan that names no code is still a spent plan.
 EXHAUSTION_ERROR_MARKERS: tuple[str, ...] = (
     "用量上限",
     "2056",
@@ -845,6 +1023,7 @@ EXHAUSTION_ERROR_MARKERS: tuple[str, ...] = (
     "credit",
     "plan limit",
     "exceeded your current quota",
+    "plan 用量",
 )
 
 #: Substrings that mark a failure as "slow down, ask again shortly".
@@ -1149,12 +1328,14 @@ __all__ = [
     "acquire_provider_with_dynamic_capacity",
     "acquired_provider_slot",
     "canonical_capacity_key",
+    "chain_has_dispatchable_provider",
     "classify_capacity_failure",
     "compute_dynamic_limit",
     "get_shared_cooldown",
     "get_shared_tracker",
     "looks_like_quota_exhaustion",
     "provider_headroom_pct",
+    "provider_has_capacity",
     "provider_is_eligible",
     "quota_allows_dispatch",
     "quota_remaining_pct",

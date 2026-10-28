@@ -23,7 +23,7 @@ import uuid
 import contextvars
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 # 2026-10-26 (merge): 本分支删掉了这一行 —— 它原来只服务于
 # ``_quota_reset_seconds_for``，而那个函数被本分支删了。main 那边保留了它，
@@ -46,8 +46,11 @@ import claude_sandbox
 from dynamic_provider_concurrency import (
     DEFAULT_COOLDOWN_SEC,
     DEFAULT_QUOTA_COOLDOWN_SEC,
+    compute_dynamic_limit,
     get_shared_tracker,
     looks_like_quota_exhaustion,
+    quota_allows_dispatch,
+    quota_remaining_pct,
 )
 from quota_watchdog import get_shared_quota_watchdog as _shared_quota_watchdog
 # How long to park a provider that just refused (2026-10-24). The module
@@ -2299,6 +2302,70 @@ def _provider_quota_for(provider: str):
         return None
 
 
+def _retry_blocked_by_quota(provider: str) -> bool:
+    """True when the live reading says ``provider`` must not be asked again.
+
+    A rate limit is waited out on the SAME provider — but only when that
+    provider still has something to wait with. A provider whose meter
+    says nothing is left, or whose week has gone missing, is not slow:
+    it is empty. Four waits (5s / 10s / 20s / 40s) on an empty provider
+    buy nothing, and every one of them delays the move to a provider
+    that can serve the work. So the reading is asked BEFORE the first
+    wait, not after the last one.
+
+    Three answers block the retry, and they are three readings of two
+    facts:
+
+    * :func:`quota_allows_dispatch` says no — the provider is
+      exhausted, or its weekly window went missing on a provider known
+      to carry one;
+    * :func:`quota_remaining_pct` reports ``0.0`` — the burst window is
+      empty; and
+    * :func:`compute_dynamic_limit` therefore computes ``0`` — there is
+      no capacity left to dispatch into.
+
+    The last two are the same fact read twice, and both are asked
+    because the cap is what the dispatch layer would honour: a provider
+    the cap calls empty must not be asked again.
+
+    The answer is deliberately **fail-open**. No reading at all means
+    "nothing is known", and nothing known is not evidence of an empty
+    budget: CC Switch cannot meter every provider, and a provider it
+    cannot meter serves traffic perfectly well. Only an affirmative
+    reading blocks the retry, so a provider with no row keeps the old
+    behaviour byte for byte.
+
+    Args:
+        provider: The provider a retry would ask. Empty means the
+            retry cannot be attributed to one, and nothing is known
+            about one.
+
+    Returns:
+        ``True`` when the reading says the provider is out of budget;
+        ``False`` when it says otherwise — including when there is no
+        reading at all.
+    """
+    if not provider:
+        return False
+    quota = _provider_quota_for(provider)
+    if quota is None:
+        # No reading. Not evidence of an empty budget.
+        return False
+    if not quota_allows_dispatch(quota):
+        return True
+    headroom = quota_remaining_pct(quota)
+    if headroom is None:
+        # The reading exists but says nothing about the burst window.
+        # An unknown budget is not a zero budget.
+        return False
+    try:
+        limit = compute_dynamic_limit(provider, headroom)
+    except Exception:
+        # A cap that cannot be computed is not a cap of zero.
+        return False
+    return limit <= 0
+
+
 def _cooldown_seconds_for(exc: BaseException, provider: str = "") -> float:
     """Park duration for ``exc``; env-overridable for operators/tests.
 
@@ -2685,6 +2752,222 @@ def _classify_provider_failure(
     return bucket
 
 
+# ---------------------------------------------------------------------------
+# The 429 stream-level stall breaker (2026-10-27)
+# ---------------------------------------------------------------------------
+#
+# The incident this exists for: a sub-agent's stream emitted
+# ``api_error`` lines and nothing else for 38 minutes. The CLI was
+# retrying the 429 internally, so the process was alive and every line
+# it wrote refreshed ``last_line_time`` — the exact quantity the idle
+# watchdog measures. The watchdog therefore never fired, and the
+# dispatch sat there for the better part of an hour.
+#
+# Silence is not the only way a stream can be dead, and it was not the
+# shape this failure had: the stream was LOUD. What it lacked was
+# PRODUCTION. So the breaker asks a different question from the
+# watchdog's — not "has it gone quiet?" but "has it been erroring for a
+# long time without producing anything?".
+#
+# The state machine below is deliberately pure: it takes an event, a
+# subtype and a timestamp, and answers a question. No thread, no clock,
+# no subprocess — so it can be tested without a subprocess and without a
+# clock, and so that the decision it makes is reproducible from the
+# event stream alone.
+#
+# What it must NOT be is a "kill on 429" switch. A 429 is not one
+# failure but four (the CLI retries it internally), so three of them
+# inside a minute is a provider that is busy — not a stream that is
+# wedged. Hence the two thresholds: a COUNT of consecutive errors and a
+# WINDOW they have to span. Both are the operator's to set.
+
+#: The operator's window: how long a stream may keep erroring without
+#: producing anything before the breaker trips. Zero (or less) switches
+#: the breaker off.
+ENV_BREAKER_WINDOW_SEC = "PDT_429_BREAKER_SEC"
+
+#: The operator's count: how many consecutive errors the breaker needs
+#: before it may trip.
+ENV_BREAKER_STREAK = "PDT_429_BREAKER_STREAK"
+
+#: The operator's scene list: the scenes the breaker is armed for.
+ENV_BREAKER_SCENES = "PDT_429_BREAKER_SCENES"
+
+#: The default window — a minute of nothing but errors is a stall.
+_BREAKER_WINDOW_SEC_DEFAULT = 60.0
+
+#: The default count — one 429 is a busy provider, three is a pattern.
+_BREAKER_STREAK_DEFAULT = 3
+
+#: The default scenes. ``execution`` is the scene whose dispatch is a
+#: long unattended run, so it is the one whose stream nobody watches.
+_BREAKER_SCENES_DEFAULT: FrozenSet[str] = frozenset({"execution"})
+
+
+def breaker_window_sec() -> float:
+    """The operator's stall window, in seconds.
+
+    ``PDT_429_BREAKER_SEC`` — how long a stream may error without
+    producing anything before the breaker trips.
+
+    Unset, blank or unreadable falls back to a minute rather than to
+    "trip on the next error": a knob set to a word is a typo, and a
+    typo that breaks every stream is worse than a typo that is ignored.
+    A value of zero (or less) is obeyed — it is how the operator turns
+    the breaker off without removing it.
+    """
+    raw = os.environ.get(ENV_BREAKER_WINDOW_SEC)
+    if raw is None or not raw.strip():
+        return _BREAKER_WINDOW_SEC_DEFAULT
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return _BREAKER_WINDOW_SEC_DEFAULT
+
+
+def breaker_streak() -> int:
+    """How many consecutive errors the breaker needs before it trips.
+
+    ``PDT_429_BREAKER_STREAK`` — unset, blank or unreadable falls back
+    to three. A value below one is raised to one: a breaker that needs
+    zero errors is not a breaker, it is a switch.
+    """
+    raw = os.environ.get(ENV_BREAKER_STREAK)
+    if raw is None or not raw.strip():
+        return _BREAKER_STREAK_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _BREAKER_STREAK_DEFAULT
+    return max(1, value)
+
+
+def breaker_scenes() -> FrozenSet[str]:
+    """The scenes the breaker is armed for.
+
+    ``PDT_429_BREAKER_SCENES`` — a comma- or space-separated list of
+    scene names. Unset falls back to ``{"execution"}``; a list that
+    names nothing also falls back, because "no scene" is not a
+    configuration — it is a typo that would silently disarm the
+    breaker everywhere.
+    """
+    raw = os.environ.get(ENV_BREAKER_SCENES)
+    if raw is None:
+        return _BREAKER_SCENES_DEFAULT
+    names = frozenset(name for name in raw.replace(",", " ").split() if name)
+    return names or _BREAKER_SCENES_DEFAULT
+
+
+class _StreamStallBreaker:
+    """Has this stream been erroring for a long time without producing?
+
+    The rule, in one sentence: a stall is ``streak`` consecutive
+    ``api_error`` events that span at least ``window_sec`` seconds
+    without a production line in between.
+
+    The three kinds of event the stream carries, and what each does to
+    the state:
+
+    * a **production** line (``assistant`` / ``user``) ends the streak
+      and restarts the window. The stream is alive, and everything the
+      breaker was counting is stale;
+    * an **error** (``system`` with subtype ``api_error``) counts
+      towards the streak and starts the window if this is the first
+      error of the run;
+    * anything else (``system/init``, ``result``, ...) is neither. It
+      must not count towards the streak and it must not clear it
+      either — a stream event that says nothing about production is not
+      evidence of production.
+
+    The window is measured from the FIRST error of the current streak,
+    not from the last production line. That choice matters: a stream
+    that produced something a while ago and then answered three rate
+    limits in three seconds is busy, not wedged, and measuring from the
+    old production line would break it on the strength of a silence
+    that had nothing to do with the errors.
+
+    Args:
+        window_sec: How long the errors must span. Zero or less
+            disables the breaker entirely.
+        streak: How many consecutive errors are needed.
+    """
+
+    def __init__(self, window_sec: float, streak: int):
+        self.window_sec = float(window_sec)
+        self.streak_required = max(1, int(streak))
+        #: How many errors in the current run.
+        self._streak = 0
+        #: When the current run started, i.e. when its first error
+        #: arrived. ``None`` until there is one.
+        self._base: Optional[float] = None
+
+    def observe(self, event_type: str, subtype: str, now: float) -> bool:
+        """Feed one stream event in; ``True`` means "break this stream".
+
+        Args:
+            event_type: The stream-json event type (``"system"``,
+                ``"assistant"``, ``"user"``, ...).
+            subtype: The event's subtype. For a ``"system"`` event this
+                is what says ``api_error`` from ``init``.
+            now: The current time on the caller's clock
+                (``time.monotonic()`` in production). It is passed in
+                rather than read here so the state machine stays pure
+                and testable without a clock.
+
+        Returns:
+            ``True`` when this event completes a stall — at least
+            ``streak`` consecutive errors spanning at least
+            ``window_sec`` seconds.
+        """
+        if self.window_sec <= 0:
+            # Disabled by the operator. Nothing is counted and nothing
+            # is reported: a breaker that is off must not even keep
+            # state, or turning it back on would resume a stale
+            # streak.
+            return False
+
+        if event_type in ("assistant", "user"):
+            # A production line. The streak ends here and the window
+            # starts over: the next error is measured against the last
+            # thing the stream actually produced.
+            self._streak = 0
+            self._base = None
+            return False
+
+        if event_type == "system" and subtype == "api_error":
+            self._streak += 1
+            if self._base is None:
+                self._base = float(now)
+            if (
+                self._streak >= self.streak_required
+                and (float(now) - self._base) >= self.window_sec
+            ):
+                return True
+            return False
+
+        # Everything else is neither production nor an error.
+        return False
+
+
+#: The message the stall breaker raises as.
+#:
+#: The wording is load-bearing: it carries 「用量上限」, which is one of
+#: the exhaustion markers in
+#: ``dynamic_provider_concurrency.EXHAUSTION_ERROR_MARKERS``. The
+#: classification reads the PROSE before the status, so this ApiError —
+#: whose status is ``429`` — is classified as ``exhausted`` rather than
+#: as a rate limit. That is the bucket that parks the provider and moves
+#: the dispatch on to the next one, which is exactly what a stream that
+#: has been erroring for minutes without producing anything needs. A
+#: plain ``429`` would have earned the short rate-limit park and a retry
+#: against the same dead stream.
+STREAM_BREAKER_TEXT = (
+    "Provider stream stalled on repeated 429 api_error events with no "
+    "output inside the stall window (用量上限 reached). The child process "
+    "was terminated gracefully; the dispatch moves on to another provider."
+)
+
+
 class ClaudeCodingTool(CodingTool):
     """Claude Code CLI tool using stdin/stdout stream-json protocol.
 
@@ -2710,13 +2993,22 @@ class ClaudeCodingTool(CodingTool):
     # it and re-dispatch elsewhere — threw away a healthy provider
     # over a refusal that a coffee break would have cleared. So the
     # wait comes first, on the SAME provider, growing as the provider
-    # keeps saying no: 10s, 20s, 40s, 80s. Only when the last of those
+    # keeps saying no: 5s, 10s, 20s, 40s. Only when the last of those
     # is also refused does the provider get parked and swapped.
     #
     # The growing figures are the point: a provider that answers a
     # refusal after 10 seconds is being asked too fast, and the wait
     # that clears it grows with the number of refusals already spent.
-    RATE_LIMIT_BACKOFF_SEC = (10.0, 20.0, 40.0, 80.0)
+    #
+    # 2026-10-27 — the ladder was cut in half: 5s, 10s, 20s, 40s. The
+    # old one (10s, 20s, 40s, 80s) cost 150 seconds to give up on ONE
+    # provider, and the incident that prompted this change had a
+    # sub-agent sitting on a single refusal for 38 minutes while a
+    # healthy provider sat idle behind it in the chain. The chain comes
+    # first: a refusal that clears itself in seconds is worth a short
+    # wait, and a wait measured in minutes is just a slow way of not
+    # trying the next provider.
+    RATE_LIMIT_BACKOFF_SEC = (5.0, 10.0, 20.0, 40.0)
     # 2026-09-17 — an empty reply (subprocess exited, no assistant text)
     # is retried on a FRESH session, not with ``--resume``: the session
     # id we asked for was never created, so resuming it can only fail
@@ -5089,6 +5381,129 @@ class ClaudeCodingTool(CodingTool):
         result_meta: Dict[str, Any] = {}
         resolved_session_id: Optional[str] = session_id
         read_error = None
+        # ------------------------------------------------------------------
+        # 2026-10-27 — the 429 stream-level stall breaker.
+        #
+        # The incident this is wired for: a sub-agent's stream emitted
+        # ``api_error`` lines and nothing else for 38 minutes. The CLI
+        # retries the 429 internally, so the child stayed alive and every
+        # error line refreshed ``last_line_time`` — the exact quantity the
+        # idle watchdog measures. The watchdog therefore never fired, and
+        # the dispatch sat there for the better part of an hour.
+        #
+        # The breaker asks a different question from the watchdog's: not
+        # "has it gone quiet?" but "has it been erroring for a long time
+        # WITHOUT producing anything?". The state machine is the one from
+        # the same change (see :class:`_StreamStallBreaker`): a streak of
+        # consecutive ``api_error`` events that span a window, with a
+        # production line (``assistant`` / ``user``) clearing both.
+        #
+        # The breaker is ARMED per scene. ``execution`` is the default
+        # (the scene whose dispatch is a long unattended run, and the one
+        # nobody is watching); the operator can name others through
+        # ``PDT_429_BREAKER_SCENES``. A scene that is not armed still
+        # REPORTS the stall — the observation is worth having anywhere —
+        # but it is not broken, because a stall in a scene whose
+        # dispatch somebody is watching is not the same emergency.
+        # ------------------------------------------------------------------
+        breaker = _StreamStallBreaker(
+            window_sec=breaker_window_sec(),
+            streak=breaker_streak(),
+        )
+        # The scene this dispatch belongs to. Resolved the way ``query()``
+        # resolves it: a per-call scene wins over the instance's.
+        breaker_scene = scene if scene is not None else self.scene
+        # When the stream last produced something. The breaker's own
+        # window starts at the FIRST error of a streak; this one starts
+        # at the last production line, and it is what the report below
+        # calls "no output for N seconds".
+        last_production_ts = [time.monotonic()]
+        # Consecutive ``api_error`` events in this stream. Tracked here
+        # so the report can name the retry count without reaching into
+        # the breaker's private state; the rules are the breaker's own
+        # (an error counts, a production line clears, anything else is
+        # neither), so the two counts always agree.
+        api_error_streak = [0]
+
+        def _break_stalled_stream(now: float) -> None:
+            """The stall condition is met — report it, and break the stream.
+
+            The break is the graceful one: the child is shut down through
+            :meth:`_graceful_shutdown` (stdin EOF, wait, SIGTERM the
+            group, SIGKILL the group as a last resort) and never killed
+            outright. A SIGKILL here would leave the child's own children
+            running and the process group orphaned — the thing the
+            graceful path exists to prevent.
+
+            Both watchers are cancelled BEFORE the shutdown: the total
+            watcher escalates to SIGKILL, and a SIGKILL racing our own
+            shutdown would both violate the contract above and make the
+            report describe a kill that the breaker did not ask for.
+
+            Raises:
+                ApiError: When the scene is armed. The message is
+                    :data:`STREAM_BREAKER_TEXT`, which classifies as an
+                    exhausted provider, so the caller parks this provider
+                    and moves on to the next one.
+            """
+            silent_sec = max(0.0, float(now) - float(last_production_ts[0]))
+            armed = breaker_scene in breaker_scenes()
+            data = {
+                "scene": breaker_scene,
+                "armed": armed,
+                "retries": api_error_streak[0],
+                "streak_required": breaker.streak_required,
+                "window_sec": breaker.window_sec,
+                "silent_sec": round(silent_sec, 3),
+                "provider": getattr(self, "current_call_provider", None),
+            }
+            message = (
+                "Provider stream stalled: {retries} consecutive api_error "
+                "event(s) and no output for {silent:.1f}s "
+                "(window {window:.0f}s, scene {scene!r}, armed={armed})"
+            ).format(
+                retries=data["retries"],
+                silent=silent_sec,
+                window=breaker.window_sec,
+                scene=breaker_scene,
+                armed=armed,
+            )
+            # Two sinks on purpose: the structured logger is what the
+            # plan's execution log reads, and the module logger is what
+            # a console tail shows. Both carry the event name, so
+            # "was this stall seen?" is one grep either way.
+            if self.logger:
+                self.logger.warning(
+                    "provider_429_stream_breaker_observed", message, data=data,
+                )
+            logger.warning(
+                "[PROVIDER 429 STREAM BREAKER] provider_429_stream_breaker_observed %s",
+                message,
+            )
+            if not armed:
+                # This scene is not armed for the breaker. The stall is
+                # reported and the stream keeps being read — the caller
+                # may still get an answer out of it.
+                return
+            if self.logger:
+                self.logger.error(
+                    "provider_429_stream_breaker_tripped",
+                    "Breaking the stalled provider stream: " + message,
+                    data=data,
+                )
+            logger.error(
+                "[PROVIDER 429 STREAM BREAKER] provider_429_stream_breaker_tripped %s",
+                message,
+            )
+            idle_fired.set()
+            total_fired.set()
+            self._graceful_shutdown(process)
+            raise ApiError(
+                message=STREAM_BREAKER_TEXT,
+                status="429",
+                retry_after=None,
+            )
+
         try:
             for line in process.stdout:
                 last_line_time[0] = time.monotonic()
@@ -5108,6 +5523,31 @@ class ClaudeCodingTool(CodingTool):
                 try:
                     event = json.loads(line)
                     event_type = event.get("type", "")
+                    event_subtype = str(event.get("subtype") or "")
+
+                    # 2026-10-27 — feed the stream to the 429 stall
+                    # breaker. This has to happen for EVERY event and
+                    # BEFORE the per-type branches below, because two of
+                    # them ``continue``: an ``api_error`` used to be read
+                    # as an ordinary stdout line and thrown away, which
+                    # is exactly what let the incident's stream refresh
+                    # the idle watchdog for 38 minutes.
+                    #
+                    # ``now`` is the moment the line was read (the loop
+                    # stamps ``last_line_time`` at the top of every
+                    # iteration), so the breaker's window is measured
+                    # against the stream's own clock rather than a
+                    # second, slightly later reading of it.
+                    now = last_line_time[0]
+                    if event_type in ("assistant", "user"):
+                        # A production line: the stream is alive, and
+                        # everything the breaker was counting is stale.
+                        last_production_ts[0] = now
+                        api_error_streak[0] = 0
+                    elif event_type == "system" and event_subtype == "api_error":
+                        api_error_streak[0] += 1
+                    if breaker.observe(event_type, event_subtype, now):
+                        _break_stalled_stream(now)
 
                     if event_type == "system":
                         # The init subtype carries the session_id and
@@ -6396,7 +6836,7 @@ class ClaudeCodingTool(CodingTool):
                 #     provider and no wait will fix it, so the error
                 #     goes straight back to the caller.
                 #   * ``rate_limited`` — slow down. The SAME provider is
-                #     waited out (10s / 20s / 40s / 80s) and asked
+                #     waited out (5s / 10s / 20s / 40s) and asked
                 #     again; nothing is parked and nothing is excluded
                 #     until the last wait is refused too.
                 #   * ``exhausted`` — the budget is gone. Park for the
@@ -6423,6 +6863,32 @@ class ClaudeCodingTool(CodingTool):
                         kind == "rate_limited"
                         and round_no < len(self.RATE_LIMIT_BACKOFF_SEC)
                     ):
+                        # 2026-10-27 — a rate limit is waited out only
+                        # while there is budget to wait with. The live
+                        # reading is asked BEFORE the first wait,
+                        # because a provider whose meter says nothing
+                        # is left is not a provider that is slow:
+                        # waiting it out four times (5s / 10s / 20s /
+                        # 40s) buys nothing and delays the move to a
+                        # provider that can serve the work. The reading
+                        # may be absent — no reading is not evidence of
+                        # an empty budget — so a provider CC Switch
+                        # cannot meter keeps the old behaviour.
+                        if _retry_blocked_by_quota(failed_provider):
+                            if self.logger:
+                                self.logger.warning(
+                                    "provider_retry_blocked_by_quota",
+                                    f"{failed_provider} has no budget "
+                                    f"left; not waiting it out, moving to "
+                                    f"the next provider",
+                                    data={
+                                        "from_provider": failed_provider,
+                                        "error_status": exc.status,
+                                        "failure_kind": kind,
+                                        "round": round_no,
+                                    },
+                                )
+                            break
                         delay = self.RATE_LIMIT_BACKOFF_SEC[round_no]
                         round_no += 1
                         # The wait is not work: the provider is being
@@ -7072,7 +7538,7 @@ class ClaudeCodingTool(CodingTool):
                 #     provider and no wait will fix it, so the error
                 #     goes straight back to the caller.
                 #   * ``rate_limited`` — slow down. The SAME provider is
-                #     waited out (10s / 20s / 40s / 80s) and asked
+                #     waited out (5s / 10s / 20s / 40s) and asked
                 #     again; nothing is parked and nothing is excluded
                 #     until the last wait is refused too.
                 #   * ``exhausted`` — the budget is gone. Park for the
@@ -7099,6 +7565,32 @@ class ClaudeCodingTool(CodingTool):
                         kind == "rate_limited"
                         and round_no < len(self.RATE_LIMIT_BACKOFF_SEC)
                     ):
+                        # 2026-10-27 — a rate limit is waited out only
+                        # while there is budget to wait with. The live
+                        # reading is asked BEFORE the first wait,
+                        # because a provider whose meter says nothing
+                        # is left is not a provider that is slow:
+                        # waiting it out four times (5s / 10s / 20s /
+                        # 40s) buys nothing and delays the move to a
+                        # provider that can serve the work. The reading
+                        # may be absent — no reading is not evidence of
+                        # an empty budget — so a provider CC Switch
+                        # cannot meter keeps the old behaviour.
+                        if _retry_blocked_by_quota(failed_provider):
+                            if self.logger:
+                                self.logger.warning(
+                                    "provider_retry_blocked_by_quota",
+                                    f"{failed_provider} has no budget "
+                                    f"left; not waiting it out, moving to "
+                                    f"the next provider",
+                                    data={
+                                        "from_provider": failed_provider,
+                                        "error_status": exc.status,
+                                        "failure_kind": kind,
+                                        "round": round_no,
+                                    },
+                                )
+                            break
                         delay = self.RATE_LIMIT_BACKOFF_SEC[round_no]
                         round_no += 1
                         # The wait is not work: the provider is being
