@@ -724,23 +724,38 @@ _PLAN_ID = "20261023-service-spawn"
 #: import time the only moment the live path is still visible.
 _PLANS_DIR = os.environ.get("PDT_PLANS_DIR")
 
-#: A copy of the plan under test's ``services[0]`` — the ``pdt``
-#: declaration.  It stands in for the plan when the plan is not on this
-#: machine, so the case still starts a real server there.
-_PDT_SERVICE_MIRROR = {
-    "name": "pdt",
-    "port": 18090,
-    "start_cmd": (
-        "source backend/.venv/bin/activate && mkdir -p .pdt/verify/plans && "
-        "export PDT_PORT=18090 PDT_STATE_DB_PATH=$PWD/.pdt/verify/state.db "
-        "PDT_PLANS_DIR=$PWD/.pdt/verify/plans && exec python -m backend.server"
-    ),
-    "cwd": ".",
-    "health_url": "http://127.0.0.1:18090/health",
-    "ready_timeout_seconds": 120,
-    "log_path": ".pdt/verify/pdt_server.log",
-    "reap_on_exit": True,
-}
+# A copy of the plan under test's ``services[0]`` — the ``pdt``
+# declaration.  It stands in for the plan when the plan is not on this
+# machine, so the case still starts a real server there.
+#
+# It is a *function*, not a constant: the port is allocated when the
+# mirror is built.  A written-down port is a port another checkout may
+# already hold, and the case would then fail for a reason that has
+# nothing to do with what it is about.
+def _pdt_service_mirror() -> dict:
+    """The ``pdt`` declaration, mirrored around a free port."""
+    import service_manager
+
+    port = service_manager.allocate_free_port()
+    if port is None:
+        raise RuntimeError(
+            "no free port for the pdt service mirror; the mirror does "
+            "not fall back to a fixed one"
+        )
+    return {
+        "name": "pdt",
+        "port": port,
+        "start_cmd": (
+            "source backend/.venv/bin/activate && mkdir -p .pdt/verify/plans && "
+            f"export PDT_PORT={port} PDT_STATE_DB_PATH=$PWD/.pdt/verify/state.db "
+            "PDT_PLANS_DIR=$PWD/.pdt/verify/plans && exec python -m backend.server"
+        ),
+        "cwd": ".",
+        "health_url": f"http://127.0.0.1:{port}/health",
+        "ready_timeout_seconds": 120,
+        "log_path": ".pdt/verify/pdt_server.log",
+        "reap_on_exit": True,
+    }
 
 #: A stand-in for a project's own ``service_manager``.
 #:
@@ -1034,7 +1049,7 @@ def _pdt_declaration(project_dir: Path):
             return declared["pdt"]
 
     mirrored = parse_declarations(
-        {"services": [_PDT_SERVICE_MIRROR]}, project_dir,
+        {"services": [_pdt_service_mirror()]}, project_dir,
     ).by_name()
     return mirrored["pdt"]
 
@@ -1115,9 +1130,19 @@ def _env_probe_service_mirror() -> dict:
     failure shape the point exists to catch.
 
     It stands in for the plan when the plan is not on this machine, so
-    the case still starts a real service there.
+    the case still starts a real service there.  The port is allocated
+    when the mirror is built: a written-down port is a port another
+    checkout may already hold.
     """
     import credentials
+    import service_manager
+
+    port = service_manager.allocate_free_port()
+    if port is None:
+        raise RuntimeError(
+            "no free port for the env-probe service mirror; the mirror "
+            "does not fall back to a fixed one"
+        )
 
     prefix = credentials._FD_ENV_PREFIX
     check = (
@@ -1128,14 +1153,15 @@ def _env_probe_service_mirror() -> dict:
     )
     return {
         "name": "env-probe",
-        "port": 18091,
+        "port": port,
         "start_cmd": (
             "source backend/.venv/bin/activate && "
             f"python -c '{check}' && "
-            "exec python backend/tests/manual/tiny_service.py --port 18091"
+            "exec python backend/tests/manual/tiny_service.py "
+            f"--port {port}"
         ),
         "cwd": ".",
-        "health_url": "http://127.0.0.1:18091/health",
+        "health_url": f"http://127.0.0.1:{port}/health",
         "ready_timeout_seconds": 60,
         "log_path": ".pdt/verify/env_probe.log",
         "reap_on_exit": True,
@@ -1164,6 +1190,58 @@ def _env_probe_declaration(project_dir: Path):
         {"services": [_env_probe_service_mirror()]}, project_dir,
     ).by_name()
     return mirrored["env-probe"]
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-27 — the mirrored declarations take their port when they are built
+# ---------------------------------------------------------------------------
+#
+# A hard-coded port is a port another checkout may already hold: the
+# case then fails for a reason that has nothing to do with what it is
+# about (a second run of the same suite, another worktree, a leftover
+# service).  So the mirrors ask the framework for a free port when they
+# are built — and every port-bearing field of a mirror carries that one
+# port, so the command, the URL and the declaration cannot disagree.
+
+
+def test_service_fixtures_take_their_port_at_runtime(monkeypatch):
+    """Both mirrored declarations are built around one free port."""
+    import service_manager
+
+    monkeypatch.setattr(
+        service_manager, "allocate_free_port", lambda: 45999,
+    )
+
+    mirrors = [_pdt_service_mirror(), _env_probe_service_mirror()]
+
+    for mirror in mirrors:
+        assert "45999" in str(mirror["port"]), mirror
+        assert "45999" in mirror["health_url"], mirror
+        assert "45999" in mirror["start_cmd"], mirror
+        # The ports that used to be written into the file are gone.
+        for stale in ("18090", "18091"):
+            assert stale not in mirror["health_url"], mirror
+            assert stale not in mirror["start_cmd"], mirror
+
+
+def test_service_mirror_refuses_to_invent_a_port(monkeypatch):
+    """No free port → the mirror refuses, rather than using a fixed one.
+
+    Falling back to a written-down port is exactly the failure this
+    change removes: two runs would share it and the second would fail
+    for a reason that has nothing to do with the case.
+    """
+    import service_manager
+
+    monkeypatch.setattr(
+        service_manager, "allocate_free_port", lambda: None,
+    )
+
+    with pytest.raises(RuntimeError):
+        _pdt_service_mirror()
+
+    with pytest.raises(RuntimeError):
+        _env_probe_service_mirror()
 
 
 def _process_environment(pid: int) -> Dict[str, str]:
