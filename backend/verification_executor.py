@@ -2851,6 +2851,12 @@ class VerificationExecutor(BaseExecutor):
         for vp in self._plan_points():
             if not isinstance(vp, dict) or is_final_gate(vp):
                 continue
+            # 门禁只能向**执行器真会跑**的验证点要结论：计划自己作废的
+            # （obsolete / superseded_by）或被移除的验证点根本不会被派发，永远
+            # 产生不了结论——要了就把 Phase 2 永久锁死。判据与
+            # :meth:`_build_items_from_plan` 一致。
+            if self._vp_retired_marker(vp) or self._is_removed_vp(vp):
+                continue
             vp_id = vp.get("id")
             status = self._terminal_status_of(vp_id)
             if status is None:
