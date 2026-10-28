@@ -195,6 +195,25 @@ try:  # pragma: no cover - the repo always ships utils/secret_sweep.py
 except Exception:  # noqa: BLE001 - a missing module must not break startup
     _sweep_credential_residue = None
 
+# ---------------------------------------------------------------------------
+# orphan_reaper (orphan-process reaping) — resolved once, at import time
+# ---------------------------------------------------------------------------
+# The same reasoning as the service_manager imports above: the module is
+# resolved once so that the lifespan, the shutdown path and the tests all
+# see one object, and a module that cannot be imported degrades to a
+# no-op instead of taking the backend down with it.  ``None`` means the
+# module is missing.
+#
+# What must NOT happen here is *running* anything.  The reaper's marker
+# is written into ``os.environ`` in the lifespan, never at import time:
+# a module that stamped the environment on import would mark every
+# process the importer spawns — every pytest subprocess, every tool the
+# suite runs — as a child of whoever imported it.
+try:  # pragma: no cover - the repo always ships orphan_reaper.py
+    import orphan_reaper
+except Exception:  # noqa: BLE001 - a missing module must not break startup
+    orphan_reaper = None
+
 # 2026-09-13: optional env override (PDT_PLANS_DIR) so test / perf
 # harnesses can point the server at an empty scratch plans root.
 # Without this, the startup-perf comparison measures the working
@@ -1012,6 +1031,139 @@ heartbeat_monitor = HeartbeatMonitor(interval=HEARTBEAT_INTERVAL)
 
 
 
+def _orphan_reaper_may_act() -> bool:
+    """Whether this process may let the reaper act on the machine.
+
+    The reaper looks at every process on the box and signals the ones it
+    judges to be orphans.  A **test** process must not do that: the suite
+    boots the app — the lifespan tests enter ``_lifespan`` directly, and
+    the state tests enter it through ``TestClient`` — and a boot that
+    reaped the developer's own processes, or left a detached daemon
+    behind, would be a test suite with side effects on the machine it
+    runs on.
+
+    ``PDT_ORPHAN_REAPER=0`` is the deployment's answer to the same
+    question ("this machine is not the reaper's to touch").  This is the
+    test suite's answer, and it is asked here — at the point where the
+    lifespan decides to act — rather than in the environment, so that
+    the decision is visible in the same file as the decision itself.
+
+    The same signal guards the live state database in
+    ``state_machine/db/connection.py``: outside pytest the backend and
+    the executor open it legitimately.
+    """
+    return not os.environ.get("PYTEST_CURRENT_TEST")
+
+
+def _install_orphan_reaper_marks() -> Optional[Dict[str, str]]:
+    """Mark this process as the owner of whatever it spawns.
+
+    The backend is the process that spawns everything else PDT runs —
+    executors, sub-agents, test runs.  Writing the owner marker into
+    this process' own ``os.environ`` means every one of those children
+    inherits it, so a spawn point that was never taught about the reaper
+    still leaves a traceable child behind.  A child that outlives the
+    backend is then recognisable as an orphan instead of being
+    indistinguishable from an unrelated process.
+
+    Three rules make this safe to call from the lifespan:
+
+    * **Never at import time.**  The marker is written here, in the
+      lifespan, and not by the module body: a marker written on import
+      would mark every process the importer spawns.
+    * **Never fatally.**  A reaper that cannot be installed costs the
+      backend its marker and nothing else — the boot continues.
+    * **Idempotently.**  Calling it twice writes the same marks.
+
+    A reaper that is switched off (``PDT_ORPHAN_REAPER=0``) writes
+    nothing at all: a deployment that turned the reaper off must not
+    get a marked environment anyway.
+    """
+    if orphan_reaper is None:
+        logger.warning(
+            "[orphan_reaper] unavailable; the owner marker was not installed"
+        )
+        return None
+
+    try:
+        config = orphan_reaper.config_from_env()
+    except Exception:
+        logger.warning(
+            "[orphan_reaper] could not read its configuration; "
+            "the owner marker was not installed",
+            exc_info=True,
+        )
+        return None
+
+    if not getattr(config, "enabled", True):
+        return None
+
+    try:
+        return orphan_reaper.install_owner_marks()
+    except Exception:
+        logger.warning(
+            "[orphan_reaper] could not install the owner marker; continuing",
+            exc_info=True,
+        )
+        return None
+
+
+def _start_orphan_reaper() -> Optional[int]:
+    """Scan once for orphans, then make sure the resident reaper is running.
+
+    Two halves, each with a different job:
+
+    * the **scan** answers "what is on this machine right now" — the
+      orphans a previous life left behind, which is exactly what a
+      backend that boots onto a busy box should reclaim first;
+    * the **daemon** answers "what will be on this machine in a minute".
+      It is a separate, detached process because it has to outlive the
+      backend: a daemon that died with the backend would leave the
+      orphans behind again and the next backend would have to notice
+      them from scratch.
+
+    Neither half may cost the backend its boot.  A scan that raises
+    costs the scan; the daemon is still started, because the daemon is
+    the part that keeps working after this backend is gone.  A daemon
+    that cannot be started costs the daemon and nothing else.
+
+    A reaper that is switched off does nothing at all.
+    """
+    if orphan_reaper is None:
+        logger.warning("[orphan_reaper] unavailable; the startup scan is skipped")
+        return None
+
+    try:
+        config = orphan_reaper.config_from_env()
+    except Exception:
+        logger.warning(
+            "[orphan_reaper] could not read its configuration; "
+            "the startup scan is skipped",
+            exc_info=True,
+        )
+        return None
+
+    if not getattr(config, "enabled", True):
+        return None
+
+    try:
+        orphan_reaper.run_once(config)
+    except Exception:
+        logger.warning(
+            "[orphan_reaper] the startup scan failed; continuing",
+            exc_info=True,
+        )
+
+    try:
+        return orphan_reaper.ensure_daemon(config)
+    except Exception:
+        logger.warning(
+            "[orphan_reaper] could not start the daemon; continuing",
+            exc_info=True,
+        )
+        return None
+
+
 @asynccontextmanager
 async def _lifespan(app):
     """FastAPI lifespan handler — replaces deprecated @app.on_event decorators.
@@ -1029,6 +1181,19 @@ async def _lifespan(app):
     On shutdown: stop the heartbeat monitor and kill any in-flight
     execution subprocesses.
     """
+    # 2026-10-27 (T8): the orphan reaper's owner marker — first thing
+    # the boot does, before anything that could spawn a child.
+    #
+    # The marker lives in this process' own environment, so every child
+    # the backend spawns inherits it.  It has to be in place before the
+    # first spawn happens, or the children spawned before this line
+    # would be the only ones the reaper cannot trace.
+    #
+    # It is deliberately *not* written at import time: a marker written
+    # by the module body would mark every process the importer spawns.
+    if _orphan_reaper_may_act():
+        _install_orphan_reaper_marks()
+
     # The request guard's self-check, before this instance serves
     # anything.  uvicorn runs the lifespan BEFORE it binds the socket,
     # so a guard that does not refuse stops the boot right here: the
@@ -1134,6 +1299,18 @@ async def _lifespan(app):
             logger.exception(
                 "[service_manager] startup orphan sweep failed; continuing"
         )
+
+    # 2026-10-27 (T8): the orphan reaper's own startup pass, and the
+    # resident daemon that keeps it running.
+    #
+    # The ledger sweep above is the *ledger* layer: it stops the
+    # processes a plan declared and can still identify.  The reaper is
+    # the *bottom* layer underneath it: it reclaims the processes nobody
+    # declared any more.  Neither replaces the other, and the reaper
+    # runs after the ledger sweep so that the processes the ledger knows
+    # about are dealt with by the layer that knows about them.
+    if _orphan_reaper_may_act():
+        _start_orphan_reaper()
 
     # 2026-09-28 C4: credential-residue sweep. Same boot-time argument as
     # the orphan sweep above — nothing of ours can legitimately be running

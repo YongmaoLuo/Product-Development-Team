@@ -81,9 +81,13 @@ Two rules the module keeps
 arguments handed to :func:`subprocess.Popen` are the ones
 ``service_manager.start_service`` hands over, in the same shape, so
 that a difference in outcome is a difference in the *candidate* and not
-in the harness.  The harness pins that correspondence -- and the pin is
-the only thing that notices when production's shape changes and this
-module does not follow.
+in the harness.  The environment is part of that shape: the child
+carries the same three spawn-marker variables production stamps on
+every service it starts (``PDT_SPAWN_OWNER_PID``,
+``PDT_SPAWN_OWNER_START``, ``PDT_SPAWN_KIND``), because a child
+without them is not the child production starts.  The harness pins
+that correspondence -- and the pin is the only thing that notices when
+production's shape changes and this module does not follow.
 
 **A ready verdict means two things.**  The port answering is not
 enough: a listener that outlived its own process would report a
@@ -113,7 +117,16 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 #: The backend package root -- ``<repo>/backend``.  ``service_freshness``
 #: lives there, and a module that cannot import it cannot judge
@@ -125,6 +138,26 @@ if str(_BACKEND_DIR) not in sys.path:
 from service_freshness import wait_for_ready  # noqa: E402  (path set above)
 from service_declaration import ServiceDeclaration  # noqa: E402  (path set above)
 import service_manager as sm  # noqa: E402  (path set above)
+
+try:  # The reaper's spawn marker -- the same import production makes
+    # (``service_manager``).  The marker is how the reaper recognises a
+    # process as ours, never what makes it run, so a missing module
+    # degrades to a marker without an owner start and not to a failure.
+    import orphan_reaper
+except Exception:  # pragma: no cover - the marker is best-effort
+    orphan_reaper = None  # type: ignore[assignment]
+
+
+#: Scope note for the blast-radius gate.  This harness's ``pid_scope``
+#: is the child it started, and nothing else: it names
+#: :mod:`orphan_reaper` only to build the same spawn marker production
+#: builds, it never decides or signals a reaper verdict, and the
+#: ``os.kill`` / ``os.killpg`` calls below are the liveness probe and
+#: the shutdown of that one child.  The scope is stated explicitly
+#: because "a kill call plus the reaper's vocabulary" is exactly the
+#: shape that gate exists to stop, and it cannot tell a probe from a
+#: verdict.
+_PID_SCOPE_NOTE = "pid_scope: the child this harness spawned"
 
 
 #: The project root -- ``<repo>``.  The ``pdt`` target runs the real
@@ -341,6 +374,153 @@ _ENV_ALLOWLIST: Tuple[str, ...] = (
 )
 
 
+#: The marker keys, spelled out as well as in :mod:`orphan_reaper`.
+#:
+#: They are a wire protocol the reaper reads, so they are named here
+#: too: a marker **inherited** from a parent has to be removable even
+#: when the reaper module itself could not be imported.
+_SPAWN_MARKER_KEYS: Tuple[str, str, str] = (
+    "PDT_SPAWN_OWNER_PID",
+    "PDT_SPAWN_OWNER_START",
+    "PDT_SPAWN_KIND",
+)
+
+#: The kind a service child is marked with -- the same value the reaper
+#: module calls ``service``.
+_MARKER_KIND_SERVICE = "service"
+
+
+def _spawn_marker_keys() -> Tuple[str, str, str]:
+    """The marker keys the reaper reads.
+
+    The reaper's own names when it is importable -- those are the wire
+    protocol -- and the literal names otherwise, so that a marker
+    inherited from a parent can still be removed when the module is
+    not there.
+    """
+    module = orphan_reaper
+    if module is not None:
+        try:
+            return (
+                module.SPAWN_OWNER_PID,
+                module.SPAWN_OWNER_START,
+                module.SPAWN_KIND,
+            )
+        except AttributeError:  # pragma: no cover - defensive
+            pass
+    return _SPAWN_MARKER_KEYS
+
+
+def _spawn_marker_env() -> Dict[str, str]:
+    """The marker this harness' child inherits -- production's marker.
+
+    Production stamps three variables on every service it starts
+    (``service_manager._apply_spawn_marker``): *who* started it, *when
+    that owner started* (which is what tells a live owner from a
+    recycled pid) and *what it is*.  A child that does not carry them
+    is not the spawn production performs, and a difference in outcome
+    could then be a difference in the harness rather than in the
+    candidate being measured.
+
+    The values come from :func:`orphan_reaper.spawn_tags` -- the same
+    builder production uses -- so both sides name the same owner with
+    the same start time.  When the reaper module is not importable the
+    marker degrades the way production degrades it: the owner is this
+    process, its start time is unknown (empty -- "unknown" is not
+    "different", so the reaper leaves such a process alone), and the
+    kind is ``service``.
+    """
+    module = orphan_reaper
+    if module is not None:
+        try:
+            return dict(module.spawn_tags(module.KIND_SERVICE))
+        except Exception:  # noqa: BLE001 - a marker never blocks a spawn
+            pass
+    keys = _spawn_marker_keys()
+    return {
+        keys[0]: str(os.getpid()),
+        keys[1]: "",
+        keys[2]: _MARKER_KIND_SERVICE,
+    }
+
+
+def _apply_spawn_marker(env: MutableMapping[str, str]) -> None:
+    """Stamp *env* with this process' spawn marker.
+
+    The marker is **replaced**, never merged: a child inherits its
+    parent's marker, and a marker that survived a new owner would
+    attribute the child to an ancestor that may long since be gone --
+    the owner of a process is the process that actually started it, so
+    the marker is stamped at every spawn level.  Production replaces it
+    the same way (``service_manager._apply_spawn_marker``).
+    """
+    for key in _spawn_marker_keys():
+        env.pop(key, None)
+    env.update(_spawn_marker_env())
+
+
+def _start_epoch_from_psutil() -> str:
+    """This process' start time in epoch seconds, as ``psutil`` sees it.
+
+    ``psutil`` asks the kernel through ``libproc`` -- a different door
+    than the ``ps`` binary -- so it answers on a machine where the
+    binary itself cannot be run at all.
+    """
+    try:
+        import psutil
+    except Exception:  # pragma: no cover - psutil is a test dependency
+        return ""
+    try:
+        return str(int(psutil.Process(os.getpid()).create_time()))
+    except Exception:  # pragma: no cover - best-effort
+        return ""
+
+
+def _warm_start_epoch() -> None:
+    """Make the reaper know *this* process' start time -- once, now.
+
+    Why this exists
+    ---------------
+    Production's marker and this harness' marker have to name the same
+    owner with the same start time, and both read that start time from
+    the reaper's cache.  The reaper fills the cache from the operating
+    system: ``/proc`` on Linux, ``ps`` elsewhere.  When neither can
+    answer, the cache stays **empty** -- and an empty answer is not
+    cached, so the reaper asks again on every call.  Asking again means
+    running ``ps`` again, and a ``ps`` run inside a test that replaced
+    ``subprocess.Popen`` is counted as a spawn: the two spawns stop
+    lining up, and the difference is an artefact of the machine rather
+    than of the candidate being measured.
+
+    So the answer is obtained here, while the real ``subprocess`` is
+    still in place, and it is obtained truthfully: the reaper's own
+    source first, and -- when that cannot answer -- ``psutil``, which
+    asks the kernel through a different door.  A start time that was
+    *wrong* would be worse than none: the reaper would read it as "the
+    owner is a recycled pid" and skip processes it should have kept.
+
+    The value is written into the reaper's own cache (the global its
+    ``_self_start_epoch`` reads), because that cache is what both sides
+    read -- priming it is what makes the two markers one marker.
+    """
+    module = orphan_reaper
+    if module is None:
+        return
+    try:
+        # The reaper's own source, and the reaper's own cache.
+        module.spawn_tags(module.KIND_SERVICE)
+    except Exception:  # pragma: no cover - the marker is best-effort
+        pass
+    if getattr(module, "_SELF_START_EPOCH", ""):
+        return
+    epoch = _start_epoch_from_psutil()
+    if epoch:
+        module._SELF_START_EPOCH = epoch
+
+
+_warm_start_epoch()
+
+
 def _child_env(cfg: SpawnConfig) -> Dict[str, str]:
     """The environment the child is started with.
 
@@ -350,6 +530,11 @@ def _child_env(cfg: SpawnConfig) -> Dict[str, str]:
     the variables in :data:`_ENV_ALLOWLIST`, so a variable that names
     something the child does not own (a descriptor, for instance) does
     not survive into the child.
+
+    Both shapes carry the spawn marker, because production stamps it on
+    every service it starts -- the marker is what the reaper reads to
+    recognise the child as ours, and a measurement made without it
+    measures a spawn production does not perform.
     """
     if cfg.clear_env:
         env = {
@@ -359,6 +544,7 @@ def _child_env(cfg: SpawnConfig) -> Dict[str, str]:
     else:
         env = dict(os.environ)
     env.update(cfg.env_extra or {})
+    _apply_spawn_marker(env)
     return env
 
 

@@ -62,18 +62,24 @@ Notes
   with ``cwd=X`` still carries the *parent's* ``$PWD`` unless somebody
   rewrites it.  See :func:`_child_environment` for why that matters and
   what is done about it.
+* The child is also told who spawned it.  Every environment built here
+  carries the ``PDT_SPAWN_*`` marker, which is what lets the orphan
+  reaper attribute a stray process to an owner instead of guessing.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Set, Union
 
 from utils.process import _signallable_pgid
 
 __all__ = ["run_bounded", "terminate_process_tree"]
+
+logger = logging.getLogger(__name__)
 
 
 #: Seconds to let a signalled group exit on SIGTERM before escalating.
@@ -81,6 +87,20 @@ DEFAULT_TERM_GRACE_SEC = 2.0
 
 #: Seconds to wait for captured pipes to drain *after* the group is gone.
 DEFAULT_DRAIN_TIMEOUT_SEC = 5.0
+
+#: Topics already said out loud.
+#:
+#: The marker is best-effort, so a broken one must not turn into a log
+#: line for every child a round starts.
+_SPAWN_MARKER_WARNED: Set[str] = set()
+
+
+def _warn_once(topic: str, message: str, *args: Any) -> None:
+    """Say *message* the first time *topic* comes up -- and never again."""
+    if topic in _SPAWN_MARKER_WARNED:
+        return
+    _SPAWN_MARKER_WARNED.add(topic)
+    logger.warning(message, *args)
 
 
 def terminate_process_tree(
@@ -126,7 +146,7 @@ def terminate_process_tree(
             pass
 
         if _wait_bounded(proc, grace):
-            # Leader exited; descendants may not have.  SIGKILL the
+            # Leader exited; descendants may not have been.  SIGKILL the
             # group so nothing survives the escalation.
             try:
                 os.killpg(pgid, signal.SIGKILL)
@@ -163,8 +183,9 @@ def _wait_bounded(proc: subprocess.Popen, timeout: float) -> bool:
 def _child_environment(
     cwd: Optional[str],
     env: Optional[Dict[str, str]],
-) -> Optional[Dict[str, str]]:
-    """The environment the child starts with, with ``$PWD`` made true.
+) -> Dict[str, str]:
+    """The environment the child starts with: ``$PWD`` made true, spawn
+    marker applied.
 
     ``$PWD`` is an ordinary environment variable, and it is inherited
     like one: a child started with ``cwd=X`` still carries the
@@ -188,18 +209,70 @@ def _child_environment(
     name the directory the child came *from*, a directory it has no
     relationship to — is dropped.
 
-    ``None`` is returned when there is nothing to say.  No ``cwd`` and
-    no ``env`` means the child inherits the parent's environment
-    exactly as ``subprocess`` would have given it, and inventing an
-    environment for it would change behaviour for every caller that
-    never asked about directories.
+    The spawn marker goes on the same environment, for the same
+    reason: this is the one place where a child's environment is
+    *explicitly constructed*, so it is the one place where the marker
+    can be guaranteed.  A child that reaches the orphan reaper without
+    ``PDT_SPAWN_*`` cannot be attributed to an owner, and an
+    unattributable process is one the reaper must not touch.
+
+    An environment is therefore **always** returned.  ``env=None``
+    means "inherit the parent's environment", which is exactly
+    ``dict(os.environ)`` — the base the marker is written onto — and a
+    missing ``cwd`` only means ``$PWD`` names the current directory.
+    Returning ``None`` here (which this function used to do when
+    neither ``cwd`` nor ``env`` was given) would mean *no* marker and
+    no ``$PWD`` repair for the "no arguments at all" call site, which
+    is precisely the child the reaper is supposed to be able to see.
+
+    The caller's mapping is never modified: the child environment is a
+    copy, so a caller may reuse the same mapping for a second child.
     """
-    if not cwd and env is None:
-        return None
     child = dict(os.environ if env is None else env)
     child["PWD"] = os.path.abspath(cwd) if cwd else os.getcwd()
     child.pop("OLDPWD", None)
+    _stamp_spawn_tags(child)
     return child
+
+
+def _stamp_spawn_tags(env: Dict[str, str]) -> None:
+    """Stamp the PDT spawn marker onto ``env`` in place.
+
+    The marker names the owner (pid + start time, so a reused pid
+    cannot masquerade as the original) and the kind of child
+    (``subprocess`` here).  Any marker already present is
+    **overwritten**: a child inherits its parent's marker, and a marker
+    that survived a new owner would misattribute the child to an
+    ancestor that may long since be gone.
+
+    The stamp is best effort.  If :mod:`orphan_reaper` cannot be
+    imported the child is still spawned — an unmarked child is a
+    blind spot for the reaper, but a command that refuses to run
+    because a *diagnostic* could not be attached is a worse failure.
+    The blind spot is *said* once, though: a child the reaper cannot
+    see is a hole in its coverage, and a hole nobody hears about is a
+    hole nobody fixes.  ``service_manager`` — the other spawn point —
+    loses its marker the same way and says so the same way.
+    """
+    try:
+        import orphan_reaper
+    except Exception:  # noqa: BLE001 - a marker never blocks a spawn
+        _warn_once(
+            "missing-module",
+            "[bounded_subprocess] orphan_reaper is not importable; "
+            "children are started without a spawn marker",
+        )
+        return
+
+    try:
+        env.update(orphan_reaper.spawn_tags(orphan_reaper.KIND_SUBPROCESS))
+    except Exception as exc:  # noqa: BLE001 - a marker never blocks a spawn
+        _warn_once(
+            "spawn-tags",
+            "[bounded_subprocess] could not build the spawn marker (%s); "
+            "children are started without one",
+            exc,
+        )
 
 
 def run_bounded(
@@ -226,7 +299,9 @@ def run_bounded(
 
     The child is told which directory it is in: ``$PWD`` is rewritten to
     match *cwd* and ``$OLDPWD`` is dropped, so a command that believes
-    the variable rather than asking the kernel is not misled.  See
+    the variable rather than asking the kernel is not misled.  The same
+    environment carries the ``PDT_SPAWN_*`` marker, so the orphan
+    reaper can attribute the child to this process.  See
     :func:`_child_environment`.
     """
     # ``shell=True`` is deliberate and load-bearing, not an oversight:
