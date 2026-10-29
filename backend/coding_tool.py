@@ -3850,6 +3850,13 @@ class ClaudeCodingTool(CodingTool):
         # as it always has.
         effective_scene = scene if scene is not None else self.scene
         scene_chain: List[str] = []
+        # The reasoning effort the scene's tier pins for the provider
+        # this dispatch ends up on. ``None`` means "nothing pinned", and
+        # the key is then written nowhere — neither in the child env
+        # nor in the ``--settings`` payload. It is filled in by the
+        # override block below and read once, where the settings
+        # payload is assembled.
+        _scene_effort: Optional[str] = None
         # Skipped entirely in inherit mode: both branches below read CC
         # Switch display names, so with no database they can only return
         # an empty chain while logging "CC Switch database unavailable" —
@@ -4709,6 +4716,76 @@ class ClaudeCodingTool(CodingTool):
                     env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = provider_models.get("haiku", "")
                     env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = provider_models.get("opus", "")
                     env["ANTHROPIC_MODEL"] = provider_models.get("default", "")
+
+                    # ---- Scene → tier MODEL / EFFORT overrides.
+                    #
+                    # A tier entry may pin a ``model`` and an ``effort``
+                    # for the providers it names. That pin is
+                    # CONFIGURATION, read through
+                    # ``provider_routing.resolve_provider_overrides`` —
+                    # and it is asked HERE, and only here, because this
+                    # is the one place where a scene, a tier and the
+                    # provider that was actually selected meet.
+                    #
+                    # The lookup goes through the MODULE OBJECT on
+                    # purpose. A ``from provider_routing import
+                    # resolve_provider_overrides`` would take a
+                    # by-value snapshot of the function, and anything
+                    # that later swaps the attribute on the module
+                    # would silently keep hitting the original — which
+                    # is exactly the kind of seam that makes a test
+                    # pass without testing anything.
+                    #
+                    # An EMPTY answer means "nothing is pinned", and
+                    # then not one byte is written: the CC Switch row's
+                    # own model values stay exactly as they were. A
+                    # resolver that raises degrades the same way — an
+                    # override picks the MODEL of a call, and is never
+                    # a reason to fail one.
+                    _scene_overrides: Dict[str, str] = {}
+                    try:
+                        import provider_routing
+                        _scene_overrides = (
+                            provider_routing.resolve_provider_overrides(
+                                effective_scene, chosen
+                            ) or {}
+                        )
+                    except Exception as exc:
+                        if self.logger:
+                            self.logger.warning(
+                                "scene_tier_override_error",
+                                f"scene tier override lookup failed for "
+                                f"scene={effective_scene!r} "
+                                f"provider={chosen!r}: {exc}",
+                                data={
+                                    "scene": effective_scene,
+                                    "provider": chosen,
+                                    "error": str(exc),
+                                },
+                            )
+                        _scene_overrides = {}
+
+                    # The pinned model replaces ALL FOUR model variables.
+                    # Leaving any of the three per-role ones on the CC
+                    # Switch row's value would hand the CLI two
+                    # different answers about which model this call
+                    # runs on.
+                    _override_model = _scene_overrides.get("model")
+                    if _override_model:
+                        env["ANTHROPIC_MODEL"] = _override_model
+                        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = _override_model
+                        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = _override_model
+                        env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = _override_model
+
+                    # The pinned effort rides in the child env. Its
+                    # second landing place — the ``--settings``
+                    # payload — is written further down, once that
+                    # payload is assembled.
+                    _override_effort = _scene_overrides.get("effort")
+                    if _override_effort:
+                        env["CLAUDE_CODE_EFFORT_LEVEL"] = _override_effort
+                        _scene_effort = _override_effort
+
                     if self.logger:
                         self.logger.info(
                             "provider_selected",
@@ -5047,6 +5124,17 @@ class ClaudeCodingTool(CodingTool):
                 # ``/tmp/subagent_settings_<uuid>.json`` was written with
                 # the default mode (world-readable). See
                 # ``utils.secret_files``.
+                #
+                # The pinned effort is stamped here, as the TOP-LEVEL
+                # ``effortLevel`` key: the CLI reads the reasoning effort
+                # from the settings FILE as well as from the process
+                # env, and the file outranks the machine's own
+                # settings. It is deliberately NOT written into
+                # ``settings_data["env"]`` — that block is the
+                # ANTHROPIC_* endpoint/credential channel, and the
+                # effort has a key of its own.
+                if _scene_effort:
+                    settings_data["effortLevel"] = _scene_effort
                 effective_settings_path = (
                     private_dir() / f"subagent_settings_{subagent_uuid}.json"
                 )
