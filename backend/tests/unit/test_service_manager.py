@@ -695,7 +695,12 @@ class _StubServer(NamedTuple):
     port: int
 
 
-def _spawn_http_server(port: int, *, ignore_sigterm: bool = False) -> _StubServer:
+def _spawn_http_server(
+    port: int,
+    *,
+    ignore_sigterm: bool = False,
+    bind_delay: float = 0.0,
+) -> _StubServer:
     """Start a detached `python -m http.server`; return a :class:`_StubServer`
     holding **the port it actually bound** plus its pid.
 
@@ -715,6 +720,12 @@ def _spawn_http_server(port: int, *, ignore_sigterm: bool = False) -> _StubServe
     alongside the pid is what closes that; the bind itself still races,
     but the caller is now told the truth about where it landed.
 
+    *bind_delay* makes the child wait that many seconds before it binds.
+    It exists so a test can pin the difference between **the port is
+    taken** (the child dies of ``EADDRINUSE``) and **the child is not
+    listening yet** (it is still starting up) — the helper used to read
+    the second as the first, and killed its own child over it.
+
     See :func:`_free_port` for why the window cannot be closed from that
     side.
     """
@@ -723,91 +734,66 @@ def _spawn_http_server(port: int, *, ignore_sigterm: bool = False) -> _StubServe
     import sys as _sys
     import time as _time
 
-    script = (
-        "import http.server,socketserver;"
-        f"socketserver.TCPServer(('127.0.0.1',{port}),"
-        "http.server.SimpleHTTPRequestHandler).serve_forever()"
-    )
-    if ignore_sigterm:
-        # A shell that ignores TERM and execs python: forces the
-        # escalation branch.
-        argv = [
-            "/bin/bash", "-c",
-            f"trap '' TERM; exec {shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
-        ]
-    else:
-        argv = [_sys.executable, "-c", script]
-
-    deadline = _time.monotonic() + 10.0
-    while True:
-        proc = subprocess.Popen(
-            argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL, start_new_session=True,
-        )
-        # Give the child a moment to either bind or die on EADDRINUSE.
-        _time.sleep(0.3)
-        if proc.poll() is not None:
-            # it exited — EADDRINUSE, most likely
-            pass
-        elif proc.pid in sm.probe_port(port).pids:
-            # Our child is the listener. This is the same check the
-            # production `start_service` does, and it was missing here:
-            # without it the helper handed back the pid of a dead child
-            # for a port something else was answering on, and every
-            # assertion downstream was reasoning from that.
-            break
-        else:
-            # Still running, but not the listener. Something else got
-            # there first, so treat it like a bind failure and retry.
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
-            if _time.monotonic() >= deadline:
-                raise AssertionError(
-                    f"port {port} is held by a process that is not the "
-                    f"server this helper started (pid {proc.pid}); gave up "
-                    f"after 10s of retries"
-                )
-            port = _free_port()
-            script = (
-                "import http.server,socketserver;"
-                f"socketserver.TCPServer(('127.0.0.1',{port}),"
-                "http.server.SimpleHTTPRequestHandler).serve_forever()"
-            )
-            if ignore_sigterm:
-                argv = [
-                    "/bin/bash", "-c",
-                    f"trap '' TERM; exec {shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
-                ]
-            else:
-                argv = [_sys.executable, "-c", script]
-            continue
-        if _time.monotonic() >= deadline:
-            raise AssertionError(
-                f"could not bind port {port} for the test server after "
-                f"retrying for 10s; something else is holding it"
-            )
-        port = _free_port()  # taken in the meantime; try another
+    def _argv_for(bound_port: int):
+        """The command line for a child that binds *bound_port*."""
+        delay = f"import time; time.sleep({bind_delay});" if bind_delay else ""
         script = (
-            "import http.server,socketserver;"
-            f"socketserver.TCPServer(('127.0.0.1',{port}),"
+            f"{delay}import http.server,socketserver;"
+            f"socketserver.TCPServer(('127.0.0.1',{bound_port}),"
             "http.server.SimpleHTTPRequestHandler).serve_forever()"
         )
         if ignore_sigterm:
-            argv = [
+            # A shell that ignores TERM and execs python: forces the
+            # escalation branch.
+            return [
                 "/bin/bash", "-c",
                 f"trap '' TERM; exec {shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
             ]
-        else:
-            argv = [_sys.executable, "-c", script]
-    deadline = _time.monotonic() + 20
-    while _time.monotonic() < deadline:
-        if sm.probe_port(port).listening:
+        return [_sys.executable, "-c", script]
+
+    def _became_the_listener(proc, bound_port: int, deadline: float) -> bool:
+        """Wait for *proc* to bind *bound_port*.
+
+        Returns ``True`` when the child is the listener, and ``False``
+        when it died — a bind failure, which is the only reason to move
+        to another port.
+
+        A child that is alive and has not bound *yet* is **starting up**,
+        not squatting: the interpreter has to load before it can reach
+        its ``bind``.  Reading that as "somebody else holds this port"
+        is what made this helper fail on a loaded machine, where the
+        child never binds within the 0.3 s the old single snapshot
+        allowed.
+        """
+        while _time.monotonic() < deadline:
+            if proc.poll() is not None:
+                # It exited — EADDRINUSE, most likely.
+                return False
+            # This is the same check the production `start_service`
+            # does, and it was missing here: without it the helper
+            # handed back the pid of a dead child for a port something
+            # else was answering on, and every assertion downstream was
+            # reasoning from that.
+            if proc.pid in sm.probe_port(bound_port).pids:
+                return True
+            _time.sleep(0.05)
+        return False
+
+    deadline = _time.monotonic() + 30.0
+    while True:
+        proc = subprocess.Popen(
+            _argv_for(port), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+        if _became_the_listener(proc, port, deadline):
             return _StubServer(proc.pid, port)
-        _time.sleep(0.2)
-    _force_cleanup(proc.pid)
-    raise AssertionError(f"stub server on {port} never came up")
+        # The child died: the port was held by somebody else. Move.
+        if _time.monotonic() >= deadline:
+            raise AssertionError(
+                f"could not bind port {port} for the test server after "
+                f"retrying for 30s; something else is holding it"
+            )
+        port = _free_port()  # taken in the meantime; try another
 
 
 def _force_cleanup(pid: int) -> None:
@@ -858,6 +844,35 @@ def test_spawn_http_server_reports_the_port_it_actually_bound():
             _force_cleanup(stub.pid)
     finally:
         holder.close()
+
+
+@pytest.mark.timeout(120)
+def test_spawn_http_server_waits_for_a_child_that_is_slow_to_bind():
+    """A child that has not finished booting has not lost the port.
+
+    The helper used to take **one** snapshot 0.3 s after the spawn: if
+    the port had no listener *yet*, it concluded somebody else held it,
+    killed its own child and moved on.  On a loaded machine the child
+    needs longer than that to reach its bind — the interpreter alone
+    takes a while to start — so the helper killed a perfectly good
+    server, retried, and eventually gave up.  That failure had nothing
+    to do with the service-manager code under test; it was the helper
+    mistaking "not listening yet" for "taken".
+
+    The distinction it has to make is between **the port is taken** (the
+    child died of ``EADDRINUSE``) and **the child is not listening yet**
+    (it is still starting up).  Only the first is a reason to move.
+    """
+    stub = _spawn_http_server(_free_port(), bind_delay=1.0)
+    try:
+        probe = sm.probe_port(stub.port)
+        assert probe.listening, f"nothing is listening on {stub.port}: {probe!r}"
+        assert stub.pid in probe.pids, (
+            f"the helper reported port {stub.port}, but its own pid "
+            f"{stub.pid} is not among the listeners {probe.pids}"
+        )
+    finally:
+        _force_cleanup(stub.pid)
 
 
 @pytest.mark.timeout(120)

@@ -80,6 +80,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -129,7 +130,26 @@ IMPORT_CONTENT = "把报表页的折线图换成按天分组的柱状图"
 INTERVIEW_REQUIREMENT = "给运营后台加一个按天分组的柱状图"
 
 #: The title the imported plan is filed under (it becomes the plan id).
-IMPORT_TITLE = "e2e-lifecycle-ui"
+#:
+#: It carries a per-flow token, and it has to: the suite runs this module
+#: on several workers at once, and two flows that share a plan id share
+#: everything that is keyed by that id.  The teardown kills "this plan's"
+#: leftover executor by matching the id in the command line -- which is
+#: also the *other* flow's executor and its browser driver, so one copy
+#: of this module used to kill the other copy mid-flight.  The artifacts
+#: directory is keyed by the plan id too, so the two copies also wrote
+#: each other's screenshots.
+#:
+#: The token is short enough that the derived slug still fits the
+#: 20-character limit ``derive_plan_id`` enforces -- a longer one would
+#: be truncated and could collide again.
+IMPORT_TITLE_PREFIX = "e2e-ui"
+
+
+def _flow_title() -> str:
+    """A title that derives a plan id unique to this flow."""
+    return f"{IMPORT_TITLE_PREFIX}-{uuid.uuid4().hex[:12]}"
+
 
 #: The home the run was *launched* with.  ``install_hermetic_env()``
 #: redirects ``$HOME`` to a temp dir, and Playwright resolves the browser
@@ -201,7 +221,22 @@ def _http(
         return exc.code, _decode(exc.read())
 
 
-def _wait_for_api(base_url: str, path: str, timeout: float = 60.0) -> int:
+#: How long a real server gets to answer.  The budget is a *wait*, not
+#: a threshold on the product: what has to hold is "the service comes
+#: up", and the child either answers or dies — it never answers
+#: slowly.  The server binds its port only after its lifespan has run,
+#: and the lifespan walks the machine (a state migration, a startup
+#: sweep, a credential sweep).  On a loaded runner — the gate runs
+#: ``-n 8``, so seven other workers boot their own servers at the same
+#: time — that walk is tens of seconds rather than the couple a quiet
+#: machine needs.  The larger budget costs time only in the case that
+#: is already red.
+_SERVER_READY_TIMEOUT = 120.0
+
+
+def _wait_for_api(
+    base_url: str, path: str, timeout: float = _SERVER_READY_TIMEOUT
+) -> int:
     """Poll ``GET base_url + path`` until it answers 200; return the status.
 
     The brief's first step: the backend is up when the API answers, not
@@ -453,7 +488,7 @@ def _boot_server(work: Path, script_dir: Path) -> Tuple[str, subprocess.Popen]:
     )
     base_url = f"http://127.0.0.1:{port}"
     try:
-        _wait_for_api(base_url, "/api/plans", timeout=60.0)
+        _wait_for_api(base_url, "/api/plans", timeout=_SERVER_READY_TIMEOUT)
     except Exception:
         proc.kill()
         proc.wait(timeout=5)
@@ -726,9 +761,19 @@ with sync_playwright() as driver:
         page.screenshot(path=str(Path(artifacts_dir) / "stopped.png"), full_page=True)
 
     elif mode == "requeued":
-        wait_for_card(page, card)
+        # ``wait_for_card`` reloads while the served list is stale and
+        # answers whether the card ever showed up.  Its answer used to be
+        # thrown away, and the next line then asked Playwright for the
+        # text of an element that was not there -- a 30 s timeout that
+        # said nothing about the plan.  The answer is the report now,
+        # and a card that never showed up reads as an empty label rather
+        # than as a timeout.
+        card_found = wait_for_card(page, card)
+        report["requeued_card_found"] = card_found
         page.wait_for_timeout(300)
-        report["requeued_label"] = page.inner_text(card + " .plan-status")
+        report["requeued_label"] = (
+            page.inner_text(card + " .plan-status") if card_found else ""
+        )
         report["cards"] = card_labels(page)
         report["requeued_card_count"] = page.locator(card).count()
 
@@ -830,7 +875,7 @@ def lifecycle_ui_flow(tmp_path_factory) -> Dict[str, Any]:
             {
                 "project_dir": str(checkout),
                 "content": IMPORT_CONTENT,
-                "title": IMPORT_TITLE,
+                "title": _flow_title(),
             },
             timeout=300,
         )
@@ -925,6 +970,15 @@ def lifecycle_ui_flow(tmp_path_factory) -> Dict[str, Any]:
             "current_phase"
         )
         observations["listed_after_requeue"] = _wait_for_plan_in_list(base_url, plan_id)
+        # The card can only be on the page if the plan is in the listing
+        # the page reads.  Asserting that here makes the failure say
+        # *the plan did not come back*; asserted only at the end, it
+        # said nothing, because the browser step below timed out first
+        # -- ninety seconds of Playwright waiting for a card that was
+        # never going to be there.
+        assert observations["listed_after_requeue"] is True, (
+            "the requeued plan did not come back to the listing"
+        )
 
         # --- step 8: the card is back ------------------------------------
         observations["browser_requeued"] = _run_driver(

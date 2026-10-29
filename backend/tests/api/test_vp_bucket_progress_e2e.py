@@ -404,6 +404,22 @@ def test_live_server_endpoint_ignores_stale_list(tmp_path: Path) -> None:
         "PYTHONPATH": str(_BACKEND_DIR.parent),
         "PDT_PLANS_DIR": str(plans_root),
         "PDT_STATE_DB_PATH": str(state_db),
+        # 白名单里唯一**要带**进去的一个开关：真服务一启动就会扫全机进程
+        # （macOS 上每个进程两次 ``ps``，~2500 次 spawn），还要留一个脱离
+        # 本进程的常驻 reaper。一次真启动因此要 ~13 秒，而这条用例的
+        # 健康等待只有 90 秒 —— 挤一点的机器上就等不到了。一次性服务，
+        # 没有资格去动跑它的这台机器。
+        "PDT_ORPHAN_REAPER": "0",
+        # 第二个开关，同一个理由的另一半：服务启动时还会扫一遍机器上的
+        # 临时目录，把还带着凭证的载荷改写掉（``utils.secret_sweep``）。
+        # 那也是一次机器级遍历 —— 临时根里每多一个上一次跑剩下的
+        # basetemp，扫描就多走一遍。而服务在 lifespan 走完之前不会开始
+        # 监听端口，lifespan 里又带着这次扫描：扫描一慢，服务就来不及在
+        # 自己的 60 秒自检期限里上线，于是子进程在启动途中自杀 ——
+        # 症状是「服务没起来」，根因是这次遍历。白名单里带上这个开关，
+        # 子进程就只扫自己的 tmp 目录（父进程的扫描开关本来就在环境里，
+        # 只是白名单把它筛掉了）。
+        "PDT_DISABLE_TEMP_SWEEP": "1",
     }
 
     server_log_path = tmp_path / "uvicorn.log"
