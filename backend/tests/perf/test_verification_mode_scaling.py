@@ -108,6 +108,11 @@ SCALE_LARGE = 500
 #: without ever letting a quadratic through.
 MAX_GROWTH_FACTOR = 8.0
 
+#: The deliberate stall injected inside a timed parse, in seconds.  Long
+#: enough that a clock which counted it would blow past every bound in
+#: this file by orders of magnitude, short enough to keep the lane quick.
+STALL_SECONDS = 0.25
+
 #: The budget for parsing + validating a 200-VP plan, in milliseconds.
 PARSE_VALIDATE_BUDGET_MS = 300.0
 
@@ -270,6 +275,20 @@ def build_plan_items(vp_count: int) -> Dict[str, str]:
 # =============================================================================
 
 
+#: The clock the measurements run on.
+#:
+#: ``time.process_time`` counts the CPU time **this process** consumed, and
+#: it does not advance while the process is waiting for the CPU.  The
+#: budgets in this file are claims about the work the production code does
+#: — "500 VPs must not cost 25x the work of 100 VPs" — and a wall clock
+#: cannot keep that claim on a busy machine: the scheduler hands the
+#: longer measurement away more often than the shorter one, and the ratio
+#: then reports a complexity that is not there.  A genuinely quadratic
+#: comparison shows its 25x on this clock as well, so the bounds still
+#: catch one; what they stop catching is the scheduler.
+_CLOCK = time.process_time
+
+
 def measure_parse_and_validate(vp_count: int) -> Tuple[float, List[Any]]:
     """Parse a plan document and compare it with its machine plan.
 
@@ -282,10 +301,10 @@ def measure_parse_and_validate(vp_count: int) -> Tuple[float, List[Any]]:
     fastest = float("inf")
     divergences: List[Any] = []
     for _ in range(_REPEATS):
-        started = time.perf_counter()
+        started = _CLOCK()
         parsed = parse_plan_doc(document)
         divergences = validate_equivalence(parsed, plan)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        elapsed_ms = (_CLOCK() - started) * 1000.0
         fastest = min(fastest, elapsed_ms)
     return fastest, divergences
 
@@ -305,9 +324,9 @@ def measure_render(vp_count: int) -> Tuple[float, int]:
     fastest = float("inf")
     size = 0
     for _ in range(_REPEATS):
-        started = time.perf_counter()
+        started = _CLOCK()
         rendered = render(report, plan_items, plan_json=plan, parsed=parsed)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        elapsed_ms = (_CLOCK() - started) * 1000.0
         fastest = min(fastest, elapsed_ms)
         size = len(rendered.encode("utf-8"))
     return fastest, size
@@ -396,6 +415,63 @@ def test_scaling_is_not_quadratic() -> None:
         f"{SCALE_LARGE} VPs took {large_ms:.1f} ms against {base_ms:.1f} ms for "
         f"{SCALE_BASE} VPs — {growth:.1f}× for 5× the plan. The bound is "
         f"{MAX_GROWTH_FACTOR:.0f}×; quadratic work would be 25×. "
+        f"Measurements: {_measurements()}"
+    )
+
+
+def test_a_descheduled_process_has_not_done_more_work(monkeypatch) -> None:
+    """A process that was descheduled has not done more work.
+
+    The clock these measurements use is the process's own CPU clock, and
+    the property under test is exactly that: time spent *off* the CPU is
+    not work.  Wall-clock time cannot carry that claim on a busy
+    machine — a comparison that holds the CPU for twenty-five
+    milliseconds may be descheduled for a second, while one that holds
+    it for two milliseconds usually is not.
+
+    The module docstring already says it: *a wall-clock assertion
+    measured beside seven other workers is a measurement of the workers,
+    not of the code*.  This lane is also run by the whole-repo gate with
+    ``-n 8``, so the sentence has to hold there too, and not only in the
+    serial CI lane.
+
+    The comparison is the same plan measured twice: once uninterrupted,
+    once with a deliberate stall inside every parse.  If the clock
+    counted the stall, the stalled run would be seconds and the control
+    run milliseconds; on the CPU clock the two must stay in the same
+    neighbourhood.  Comparing a workload against *itself* is what makes
+    the bound immune to the size of the plan and to the speed of the
+    machine — the earlier shape of this test compared two plan sizes and
+    read millisecond-scale cache effects as growth.
+    """
+    real_parse = parse_plan_doc
+    state = {"stall": False}
+
+    def _parse_with_a_stall(document):
+        if state["stall"]:
+            time.sleep(STALL_SECONDS)
+        return real_parse(document)
+
+    monkeypatch.setattr(
+        sys.modules[__name__], "parse_plan_doc", _parse_with_a_stall
+    )
+
+    control_ms, _ = measure_parse_and_validate(SCALE_LARGE)
+
+    state["stall"] = True
+    started = time.perf_counter()
+    stalled_ms, _ = measure_parse_and_validate(SCALE_LARGE)
+    stalled_wall = time.perf_counter() - started
+
+    assert stalled_wall >= STALL_SECONDS * _REPEATS * 0.5, (
+        "the stall never happened, so this test proves nothing: "
+        f"{stalled_wall:.2f}s of wall time for {_REPEATS} stalled parses"
+    )
+    assert stalled_ms < control_ms * 3 + 2.0, (
+        f"the same {SCALE_LARGE}-VP plan measured {stalled_ms:.1f} ms with "
+        f"{stalled_wall:.1f}s of deliberate stall against {control_ms:.1f} ms "
+        "without it. The bound is about the work the comparison does, and "
+        "waiting for the CPU is not work. "
         f"Measurements: {_measurements()}"
     )
 

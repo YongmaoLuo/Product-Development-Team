@@ -2,16 +2,42 @@
 
 User-pinned contract:
 
-  * The backend manages PROVIDERS only. Model management is delegated entirely to
-    CC Switch — each provider row in the CC Switch database carries its
-    own complete ``ANTHROPIC_*`` env block, which the dispatch layer
-    forwards verbatim. This module deliberately has no model knowledge.
+  * The backend manages PROVIDERS; the MODEL and the REASONING EFFORT
+    come from the routing yaml whenever a tier entry pins them. A tier
+    entry's ``model`` / ``effort`` pins are CONFIGURATION the operator
+    wrote (see the override bullet below) — this module has no model
+    catalogue of its own and never guesses. A field the entry does not
+    pin is left ALONE: the provider row's own complete ``ANTHROPIC_*``
+    env block is forwarded verbatim to the sub-agent subprocess, byte
+    for byte, exactly as CC Switch configured it.
 
   * ``backend/configs/provider_routing.yaml`` maps workflow scenes to
     tiers and tiers to regex patterns over CC Switch provider display
-    names. The dispatch caller may ONLY pick providers from the chain
-    this module returns, so cross-tier fallback is structurally
-    impossible.
+    names. A tier entry is either a bare regex string (legacy) or a
+    MAPPING whose ``pattern`` key carries the regex; both spellings may
+    be mixed in one tier and mean the same thing. The dispatch caller
+    may ONLY pick providers from the chain this module returns, so
+    cross-tier fallback is structurally impossible.
+
+  * A tier entry may ALSO pin a ``model`` / ``effort`` for the providers
+    its pattern matches. That pin is CONFIGURATION, read through
+    :func:`resolve_provider_overrides` — a pure lookup answering "does
+    this scene pin a model or a reasoning effort for this provider?"
+    with an EMPTY mapping when nothing is pinned. The function changes no
+    provider's env block by itself; the dispatch layer owns what to do
+    with the answer — and it lands a pinned effort in BOTH places at
+    once: the sub-agent subprocess env variable
+    ``CLAUDE_CODE_EFFORT_LEVEL`` AND the top-level ``effortLevel`` key
+    of the per-call settings payload, i.e. the settings file the CLI is
+    handed through ``--settings``. Writing only one of the two would let
+    the other channel overwrite it. The effort is deliberately NOT written
+    into the settings file's ``env`` block, which is the ``ANTHROPIC_*``
+    endpoint/credential channel. A pinned ``model`` fills all FOUR model
+    variables of the subprocess env — ``ANTHROPIC_MODEL``,
+    ``ANTHROPIC_DEFAULT_SONNET_MODEL``,
+    ``ANTHROPIC_DEFAULT_HAIKU_MODEL`` and
+    ``ANTHROPIC_DEFAULT_OPUS_MODEL`` — so the CLI cannot hold two
+    different answers about which model the call runs on.
 
   * A TIER IS A POOL, and a pool is not a suggestion to look
     elsewhere. Inside the scene's own tier the caller may move between
@@ -81,6 +107,11 @@ from config_paths import resolve_provider_routing_file as _resolve_routing_file
 # Mirrors the "至少都用 medium" : no scene silently routes
 # to ``low``.
 _DEFAULT_TIER = "medium"
+
+#: The reasoning-effort levels a tier entry may pin. The vocabulary is
+#: closed and case-SENSITIVE: ``MAX`` is not ``max``, and an unknown
+#: level is dropped with a WARNING rather than passed through.
+EFFORT_LEVELS = frozenset({'low', 'medium', 'high', 'xhigh', 'max'})
 
 # Cache discipline: one entry keyed by resolved config path, invalidated
 # when the file's (mtime_ns, size) fingerprint changes. A lock guards the
@@ -371,6 +402,47 @@ def resolve_provider_chain(
     return _resolve_tier_chain(scene, tier, tiers, db_names)
 
 
+def _tier_entry_pattern(entry: object, tier: str) -> Optional[str]:
+    """Return the regex source carried by ONE tier entry, or None.
+
+    A tier entry is either a legacy bare regex string, or a MAPPING
+    whose ``pattern`` key carries the regex. The mapping form exists so a
+    tier can pin per-provider settings (model / effort) alongside the
+    pattern; THIS layer reads only ``pattern`` — the other keys are
+    ignored, so membership is decided by the regex alone.
+
+    The returned string is the pattern verbatim (not stripped, not
+    rewritten): the regex keeps its original semantics.
+
+    None means "this entry carries no usable pattern" — a mapping
+    without ``pattern``, a non-string ``pattern``, a blank one, or an
+    entry that is neither a string nor a mapping. The caller skips such
+    an entry with a WARNING; the remaining entries of the tier still
+    resolve. Nothing here raises.
+    """
+    if isinstance(entry, dict):
+        pattern = entry.get("pattern")
+        if isinstance(pattern, str) and pattern.strip():
+            return pattern
+        log.warning(
+            "tier=%r contains a mapping entry without a usable 'pattern' "
+            "value %r — skipped",
+            tier, entry,
+        )
+        return None
+
+    if isinstance(entry, str) and entry.strip():
+        return entry
+
+    # Legacy shapes: a bare blank string and any non-string entry were
+    # both skipped before the mapping form existed — keep that wording.
+    log.warning(
+        "tier=%r contains a non-string pattern %r — skipped",
+        tier, entry,
+    )
+    return None
+
+
 def _resolve_tier_chain(
     scene: str,
     tier: str,
@@ -402,20 +474,19 @@ def _resolve_tier_chain(
     optimizer_set = set(optimizer)
 
     # Compile once; a bad regex is skipped with a warning, never fatal.
+    # An entry is either a bare pattern string or a mapping carrying a
+    # ``pattern`` key — both resolve to the same regex source here.
     compiled: List[re.Pattern] = []
     for raw in patterns:
-        if not isinstance(raw, str) or not raw.strip():
-            log.warning(
-                "tier=%r contains a non-string pattern %r — skipped",
-                tier, raw,
-            )
+        pattern = _tier_entry_pattern(raw, tier)
+        if pattern is None:
             continue
         try:
-            compiled.append(re.compile(raw))
+            compiled.append(re.compile(pattern))
         except re.error as exc:
             log.warning(
                 "tier=%r has invalid regex %r (%s) — skipped",
-                tier, raw, exc,
+                tier, pattern, exc,
             )
     if not compiled:
         return []
@@ -449,13 +520,171 @@ def _resolve_tier_chain(
     return ranked + unranked
 
 
+def _scene_tier_for_overrides(scene: str, config: Dict) -> Optional[str]:
+    """Resolve ``scene`` → tier for the override lookup.
+
+    Mirrors :func:`resolve_provider_chain`'s rule: an explicit scene
+    mapping wins, and an explicit-but-invalid one (``prd: 42``) is a
+    configuration error for THAT scene — ``None`` means "no overrides at
+    all", not "fall back to the default tier". A scene that is simply
+    absent falls back to ``default_tier`` and then to the module-level
+    ``_DEFAULT_TIER``.
+    """
+    scenes = config.get("scenes")
+    if isinstance(scenes, dict) and scene in scenes:
+        raw = scenes.get(scene)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        log.warning(
+            "scene=%s has a non-string tier mapping %r in "
+            "provider_routing.yaml; overrides empty", scene, raw,
+        )
+        return None
+
+    default = config.get("default_tier")
+    if isinstance(default, str) and default.strip():
+        return default.strip()
+    return _DEFAULT_TIER
+
+
+def _apply_entry_overrides(
+    overrides: Dict[str, str],
+    entry: Dict,
+    tier: str,
+    provider_name: str,
+) -> None:
+    """Fold ONE matching tier entry's ``model`` / ``effort`` into ``overrides``.
+
+    A field already present keeps its value — the first matching entry
+    wins it — so only a still-missing field is considered here. An
+    illegal value is dropped with a WARNING and leaves the OTHER field
+    of the same entry untouched: one bad key never voids the entry.
+    """
+    if "model" not in overrides and "model" in entry:
+        raw_model = entry.get("model")
+        if isinstance(raw_model, str) and raw_model.strip():
+            overrides["model"] = raw_model.strip()
+        else:
+            log.warning(
+                "tier=%r entry matching provider %r has an invalid 'model' "
+                "value %r — ignored", tier, provider_name, raw_model,
+            )
+
+    if "effort" not in overrides and "effort" in entry:
+        raw_effort = entry.get("effort")
+        if isinstance(raw_effort, str) and raw_effort.strip() in EFFORT_LEVELS:
+            overrides["effort"] = raw_effort.strip()
+        else:
+            log.warning(
+                "tier=%r entry matching provider %r has an invalid 'effort' "
+                "value %r — ignored (expected one of %s)",
+                tier, provider_name, raw_effort, ", ".join(sorted(EFFORT_LEVELS)),
+            )
+
+
+def resolve_provider_overrides(
+    scene: str,
+    provider_name: str,
+    config_path: Optional[Path] = None,
+) -> Dict[str, str]:
+    """Return the ``model`` / ``effort`` this scene pins for a provider.
+
+    A PURE configuration read — it never touches CC Switch and never
+    writes anything. The lookup is:
+
+      1. ``scene`` → tier via the ``scenes`` map (missing scene →
+         ``default_tier``, then the module-level ``_DEFAULT_TIER``).
+      2. tier → its entry list, walked in DOCUMENT order. Every entry
+         whose ``pattern`` matches ``provider_name`` may contribute the
+         ``model`` / ``effort`` it carries.
+      3. The FIRST matching entry that supplies a field wins that field;
+         a later matching entry may only fill a field that is still
+         missing. A legacy bare-string entry declares MEMBERSHIP only —
+         it never contributes a field.
+
+    An empty mapping means "nothing is configured for this provider" —
+    the caller then writes not one byte. Config-level failures (missing
+    file, invalid yaml, unknown tier, bad regex, an illegal ``model`` /
+    ``effort`` value) degrade to that same empty mapping, with a
+    WARNING where the operator can act on it, and never raise: a broken
+    yaml must not crash a workflow phase from inside a dispatcher.
+
+    The config is read through the module's ``(mtime_ns, size)``
+    fingerprint, so an edited yaml is honoured by the very next call.
+    """
+    if not isinstance(provider_name, str) or not provider_name.strip():
+        return {}
+    if not isinstance(scene, str) or not scene.strip():
+        log.warning(
+            "resolve_provider_overrides called with a non-string scene %r; "
+            "no overrides", scene,
+        )
+        return {}
+
+    config = _load_config(_config_path(config_path))
+    if not config:
+        return {}
+
+    tier = _scene_tier_for_overrides(scene.strip(), config)
+    if tier is None:
+        return {}
+
+    tiers = config.get("tiers")
+    if not isinstance(tiers, dict):
+        log.warning(
+            "provider_routing.yaml has no valid 'tiers' mapping; "
+            "scene=%s overrides empty", scene,
+        )
+        return {}
+    if tier not in tiers:
+        log.warning(
+            "scene=%s resolved to tier=%r which is not declared in "
+            "provider_routing.yaml tiers; overrides empty", scene, tier,
+        )
+        return {}
+
+    entries = tiers.get(tier)
+    if isinstance(entries, str):
+        entries = [entries]
+    if not isinstance(entries, list) or not entries:
+        log.warning(
+            "tier=%r has an empty or invalid pattern list; overrides empty",
+            tier,
+        )
+        return {}
+
+    overrides: Dict[str, str] = {}
+    for entry in entries:
+        pattern = _tier_entry_pattern(entry, tier)
+        if pattern is None:
+            continue
+        try:
+            compiled = re.compile(pattern)
+        except re.error as exc:
+            log.warning(
+                "tier=%r has invalid regex %r (%s) — skipped",
+                tier, pattern, exc,
+            )
+            continue
+        if not compiled.search(provider_name):
+            continue
+        if isinstance(entry, dict):
+            _apply_entry_overrides(overrides, entry, tier, provider_name)
+        if len(overrides) >= 2:
+            # Both fields are settled — no later entry can change them.
+            break
+    return overrides
+
+
 # Public aliases kept minimal on purpose — this module's surface is the
-# two resolve functions, the cache clear, and the error type. One tier
-# resolves one chain; there is no second entry point that answers for
-# a different tier.
+# two resolve functions, the override lookup, the cache clear, and the
+# error type. One tier resolves one chain; there is no second entry
+# point that answers for a different tier.
 __all__ = [
+    "EFFORT_LEVELS",
     "ProviderRoutingError",
     "clear_routing_cache",
     "resolve_provider_chain",
+    "resolve_provider_overrides",
     "resolve_scene_tier",
 ]

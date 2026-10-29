@@ -56,7 +56,7 @@ The equivalent command lines, for a reader who wants to run them by hand
 
     cd backend || exit 1
     .venv/bin/python3 tests/manual/spawn_repro.py --profile service-manager \
-        --target pdt --runs 3 --ready-timeout 12 --assert-failure-rate 0
+        --target pdt --runs 3 --ready-timeout 60 --assert-failure-rate 0
     .venv/bin/python3 tests/manual/spawn_repro.py --profile service-manager \
         --target tiny --runs 3 --ready-timeout 8 --assert-failure-rate 0
 
@@ -146,7 +146,16 @@ _LIGHT_TARGET = "tiny"
 #: database and a watchdog to start, so it needs more room than the
 #: one-route service; a service that is going to die dies at once, so
 #: the larger budget costs time only in the case that is already red.
-_BACKEND_READY_TIMEOUT = 12
+#:
+#: The budget is a *wait*, not a threshold on the product: what has to
+#: hold is "the service comes up", and the child either answers or dies
+#: — it never answers slowly.  12 s was sized on an idle machine; the
+#: gate runs ``-n 8``, and a backend that boots while seven other
+#: backends boot needs more room than that on a busy one.  The reproducer
+#: clears the child's environment, so the backend also runs its boot-time
+#: credential sweep over the machine's temp roots — a walk whose length
+#: is the machine's, not the code's.
+_BACKEND_READY_TIMEOUT = 120
 
 #: How long the one-route service gets to answer.
 _LIGHT_READY_TIMEOUT = 8
@@ -257,6 +266,26 @@ def _can_bind(port: int) -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_provider_fleet_to_wait_for(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The spawned backend must not wait for a CC Switch that is not there.
+
+    ``server.load_providers`` asks CC Switch for the provider chain when
+    the mode says ``cc-switch``, and the hermetic suite pins that mode
+    because the *provider-contract* tests need it.  On a machine without
+    CC Switch the spawned backend therefore asks ``127.0.0.1:4000`` for
+    a chain nobody serves, and the answer is a connect timeout: the
+    service is up but not *ready* yet, and the reproducer's readiness
+    budget runs out before the boot does.
+
+    This file is about the spawn, not about provider routing, so it pins
+    the mode to ``inherit`` — the configuration this codebase itself
+    provides for "there is no provider fleet here" — the same way the
+    other live-server tests do.
+    """
+    monkeypatch.setenv("PDT_PROVIDER_MODE", "inherit")
 
 
 @pytest.fixture

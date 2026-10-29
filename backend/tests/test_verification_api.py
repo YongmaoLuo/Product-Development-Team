@@ -56,6 +56,26 @@ def _delete_plan_rows(plan_id: str) -> None:
 
 client = TestClient(app)
 
+
+def _stub_auto_loop(monkeypatch) -> None:
+    """Keep the auto-verification round out of an endpoint-contract test.
+
+    ``FakeThread`` runs the round's target INLINE, so ``/start`` only
+    answers after the whole round finished.  In production the round
+    runs in a background thread and the endpoint answers immediately.
+    Without this stub the endpoint's wall-clock cost became the round's
+    cost: with ``max_rounds=1000`` the loop retried a failed
+    repair-generation 1000 times — ~50 s inside one request — which is
+    what turned this file into a timeout under ``-n 8``.
+
+    What these tests are about is the ENDPOINT's contract: the status
+    code, the response schema, and which ``max_rounds`` values are
+    accepted.  Every one of those is decided BEFORE the round starts,
+    so the round is stubbed and the assertions stay exactly as they
+    are.  The round itself has its own tests.
+    """
+    monkeypatch.setattr("server._run_auto_verification_loop", MagicMock())
+
 # ---------------------------------------------------------------------------
 # JSON Schema definitions
 # ---------------------------------------------------------------------------
@@ -278,6 +298,7 @@ class TestResponseStructure:
         self._setup_executing_plan(sample_plan_factory)
         monkeypatch.setattr("server.threading.Thread", FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
+        _stub_auto_loop(monkeypatch)
 
         resp = client.post("/api/verification/test-plan/start")
         assert resp.status_code == 200
@@ -381,6 +402,7 @@ class TestStatusCodes:
         )
         monkeypatch.setattr("server.threading.Thread", FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
+        _stub_auto_loop(monkeypatch)
 
         resp = client.post("/api/verification/test-plan/start")
         assert resp.status_code == 200
@@ -688,6 +710,7 @@ class TestBoundaryValues:
         self._setup_start_ready_plan(sample_plan_factory)
         monkeypatch.setattr("server.threading.Thread", FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
+        _stub_auto_loop(monkeypatch)
 
         resp = client.post("/api/verification/boundary-plan/start", json={"max_rounds": 1})
         assert resp.status_code == 200
@@ -763,8 +786,29 @@ class SlowDict(dict):
         return super().get(key, default)
 
 
+#: The real ``threading.Thread`` class, captured at import time.
+#:
+#: ``monkeypatch.setattr("server.threading.Thread", FakeThread)`` replaces
+#: the attribute on the *shared* ``threading`` module, so EVERY module in
+#: the process sees the fake — not just the one that starts the
+#: verification round.  A helper thread spawned from inside that round
+#: (the verification workflow lease's heartbeat, for one) was therefore
+#: faked too, and a helper that loops until it is told to stop ran its
+#: loop INLINE on the request thread — forever, so ``/start`` never
+#: returned.
+#:
+#: The fake now only swallows the thread it was installed for: a thread
+#: constructed *while a fake thread's target is running* is a HELPER, and
+#: helpers get the real class, so they run concurrently and can be
+#: stopped and joined.
+_REAL_THREAD = threading.Thread
+
+
 class FakeThread:
     """Thread replacement that immediately executes target on start()."""
+
+    #: How many fake threads are currently running their target inline.
+    _inline_depth = 0
 
     def __init__(self, target=None, daemon=None, *args, **kwargs):
         self._target = target
@@ -772,13 +816,33 @@ class FakeThread:
         # as keywords and must be forwarded to the target on start().
         self._target_args = kwargs.pop("args", ())
         self._target_kwargs = kwargs.pop("kwargs", {})
+        # A thread born while a fake thread's target runs is a helper,
+        # not the thread under test: hand it the real class so it can
+        # run concurrently — and so a "loop until told to stop" helper
+        # does not deadlock the request thread that started it.
+        self._real = None
+        if FakeThread._inline_depth and self._target is not None:
+            self._real = _REAL_THREAD(
+                target=self._target,
+                args=self._target_args,
+                kwargs=self._target_kwargs,
+                daemon=daemon,
+            )
 
     def start(self):
+        if self._real is not None:
+            self._real.start()
+            return
         if self._target:
-            self._target(*self._target_args, **self._target_kwargs)
+            FakeThread._inline_depth += 1
+            try:
+                self._target(*self._target_args, **self._target_kwargs)
+            finally:
+                FakeThread._inline_depth -= 1
 
     def join(self, timeout=None):
-        pass
+        if self._real is not None:
+            self._real.join(timeout)
 
 
 class NoOpFakeThread:

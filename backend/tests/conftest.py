@@ -12,7 +12,9 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -184,6 +186,119 @@ def _killpg_tripwire_report() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# The resident reaper daemons this suite leaks.
+# ---------------------------------------------------------------------------
+#
+# The backend starts a resident reaper daemon when it boots, and a test
+# that boots a real backend leaves one behind: a **detached** process,
+# still running after the test that made it is over.  It is not idle,
+# either -- it scans the whole machine every 30 seconds, forking ``ps``
+# once per process on it -- so a suite that leaks a dozen of them turns
+# a quiet runner into a busy one, and the boot of the *next* server
+# waits behind the fork storm of the daemons the previous tests left
+# behind.  That is how a green suite starts failing on the second run
+# on the same machine.
+#
+# Which daemons are "ours" is not a guess: the daemon's plans root
+# names the session that started it, and a session may clean up its own
+# temporary directory and nothing else.  A daemon of a concurrent run,
+# of the developer's own backend, or of any other tool is left strictly
+# alone.
+
+#: What tells a resident reaper daemon apart from any other process.
+_REAPER_DAEMON_MARKER = "backend.orphan_reaper"
+
+#: The flag that tells a resident daemon from a one-shot reaper run.
+_REAPER_DAEMON_FLAG = "--daemon"
+
+#: The flag that names the directory a daemon works in.
+_REAPER_PLANS_ROOT_FLAG = "--plans-root"
+
+
+def _resident_reaper_daemon_pids_under(root) -> list:
+    """The pids of the resident reaper daemons that work under *root*.
+
+    The daemon is found by its command line, because that is the only
+    thing that says whose it is.  The paths are resolved before they are
+    compared: macOS hands out ``/var/...`` and ``/private/var/...`` for
+    the same directory, and a prefix comparison that ignores that
+    would either miss a daemon or -- worse -- match one that lives
+    somewhere else entirely.
+    """
+    try:
+        listing = subprocess.run(
+            # ``-ww`` is not cosmetic: without it the ``command`` column is
+            # clipped to the terminal width (80 under pytest, which sets
+            # ``COLUMNS``), and a daemon's ``--plans-root`` sits past that
+            # cutoff on every line long enough to carry a venv interpreter
+            # path. A clipped line then reads as "no daemon here".
+            ["ps", "-Aww", "-o", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    try:
+        root = str(Path(root).resolve())
+    except OSError:
+        return []
+    pids = []
+    for line in listing.splitlines():
+        line = line.strip()
+        if not line or _REAPER_DAEMON_MARKER not in line:
+            continue
+        if _REAPER_DAEMON_FLAG not in line:
+            continue
+        pid_text, _, command = line.partition(" ")
+        if _REAPER_PLANS_ROOT_FLAG not in command:
+            continue
+        raw = command.split(_REAPER_PLANS_ROOT_FLAG, 1)[1].strip()
+        if raw.startswith("="):
+            raw = raw[1:].strip()
+        plans_root = raw.split(" ")[0]
+        if not plans_root:
+            continue
+        try:
+            resolved = str(Path(plans_root).resolve())
+        except OSError:
+            continue
+        if resolved != root and not resolved.startswith(root + os.sep):
+            continue
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        pids.append(pid)
+    return pids
+
+
+def _stop_reaper_daemons_under(root) -> list:
+    """Stop the resident reaper daemons that work under *root*.
+
+    Returns the pids that were signalled.  A daemon whose plans root
+    lives under *root* belongs to the session that owns *root*; every
+    other daemon on the machine is left alone.
+
+    The scope is **named**, not implied: ``pid_scope`` below is the
+    whole set of pids this file is allowed to signal, and it is exactly
+    the daemons that work under *root*.  A file that signals has to say
+    which processes it may touch, in the same breath as the signal.
+    """
+    pid_scope = _resident_reaper_daemon_pids_under(root)
+    stopped = []
+    for pid in pid_scope:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        stopped.append(pid)
+    return stopped
+
+
+@pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus) -> None:
     _killpg_tripwire_report()
     # The controller's own scratch roots. A serial run has already had both
@@ -209,6 +324,17 @@ def pytest_sessionfinish(session, exitstatus) -> None:
         # out from under the run that created it.
         if os.getpid() == _HOME_ROOT_OWNER_PID:
             shutil.rmtree(_HOME_ROOT, ignore_errors=True)
+        # The resident reaper daemons this run leaked.  Only the
+        # controller does this, and only once the workers are done --
+        # the hook is ``trylast`` for exactly that reason: a daemon
+        # stopped while a worker is still testing is a daemon a test
+        # was relying on.  The base temp directory is the run's own, so
+        # "whose daemon is this" is answered by the directory rather
+        # than by a guess about the machine.
+        factory = getattr(session.config, "_tmp_path_factory", None)
+        basetemp = getattr(factory, "_basetemp", None)
+        if basetemp is not None:
+            _stop_reaper_daemons_under(basetemp)
 
 
 _install_killpg_tripwire()

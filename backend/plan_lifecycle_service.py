@@ -256,6 +256,12 @@ class PlanLifecycleService:
             detail = f"{detail}+requeue"
             if self._requeue_to_queued(plan_dir):
                 final_phase = "queued"
+                # 迁回成功 = 这个计划又要排队了。上一轮运行的终局裁决
+                # 到此作废：留着 ``stopped`` 不动，列表会把它当成终局
+                # 计划滤掉（``routes/plans.py`` 的 ``_plan_is_terminal``），
+                # 于是它既不在列表里、也等不到调度器 —— ``queued`` 是
+                # 调度器唯一的收件箱。
+                self._retire_execution_verdict(plan_id)
 
         return LifecycleResult(
             plan_id=plan_id,
@@ -292,6 +298,50 @@ class PlanLifecycleService:
             )
             return False
         return True
+
+    @staticmethod
+    def _retire_execution_verdict(plan_id: str) -> None:
+        """把上一轮运行的终局裁决作废：计划又要排队了。
+
+        ``plan_execution`` 记的是**这一轮运行**的裁决。停掉之后又被迁回
+        等待相位的计划没有终局裁决 —— 它在等下一个位置，不是结束了。
+        留着 ``stopped`` 不动，列表会按那条裁决把它当成终局计划滤掉
+        （``routes/plans.py`` 的 ``_plan_is_terminal``）：计划不在列表里，
+        调度器（``queued`` 是它唯一的收件箱）也就再也看不到它。
+
+        写 ``not_started`` 而不是删行：行还在，pid 也已经由 stop 清空，
+        只是这一轮不再是终局。
+
+        写失败不外抛：迁移本身已经成功，裁决作废失败只该留一条 warning
+        —— 让它冒泡会把一次成功的 requeue 变成 500。
+        """
+        import server as _server
+        from state_machine.db.connection import open as open_db
+        from state_machine.db.schema import migrate
+        from state_machine.repositories.execution_repository import (
+            ExecutionRepository,
+            PlanNotFoundError as ExecPlanNotFoundError,
+        )
+
+        try:
+            conn = open_db(_server._state_db_path())
+            try:
+                migrate(conn)
+                ExecutionRepository(conn).update_fields(
+                    plan_id, exec_status="not_started",
+                )
+            finally:
+                conn.close()
+        except ExecPlanNotFoundError:
+            # 没有执行行就没有裁决要作废。
+            pass
+        except Exception:  # noqa: BLE001 — 迁移成功就够了
+            logger.warning(
+                "plan_lifecycle_requeue_verdict_not_retired: plan=%s could "
+                "not clear the stopped execution verdict; the plan is queued "
+                "but a listing that reads the old verdict still hides it",
+                plan_id,
+            )
 
     # ------------------------------------------------------------------
     # start

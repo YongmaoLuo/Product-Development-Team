@@ -61,7 +61,13 @@ _PLAN_ID = "20261023-e2e-progress"
 _REQUEST_HEADERS = {"X-PDT-Request": "1"}
 
 #: 服务就绪的等待上限（秒）。超时即断言失败，并把服务日志的尾巴打出来。
-_READY_TIMEOUT = 30.0
+#:
+#: 这个上限不是「服务该有多快」的断言，而是「这台机器还挤不挤」的余量：
+#: 一次真启动要导入整个后端（``lark_oapi`` 一个 import 就 ~5s），
+#: 而门禁是 ``-n 8``，八个 worker 同时起服务。30 秒在闲机器上够用，
+#: 在挤着的机器上不够 —— 于是「服务没起来」和「服务起得慢」分不开。
+#: 放宽的是等待余量，不是判据：起不来照样失败，日志照样打出来。
+_READY_TIMEOUT = 90.0
 
 #: 进程回收的等待上限（秒）。
 _STOP_TIMEOUT = 10.0
@@ -249,6 +255,12 @@ def _child_env(plans_root: Path, state_db: Path, port: int) -> Dict[str, str]:
       时，服务在启动期就死在 ``api_unreachable`` 上，端口永远不监听。
       inherit 模式是这套代码自己留的「没有 provider 集群」的配置，与
       ``/progress`` 读的是哪张表毫无关系，却决定了服务能不能起来。
+    * **不带 ``PDT_ORPHAN_REAPER`` 的开关。** 白名单是「不带就出事」，
+      所以这里**要**带着 ``PDT_ORPHAN_REAPER=0`` 进去：真服务一启动
+      就会扫全机进程（macOS 上每个进程两次 ``ps``，~2500 次 spawn），
+      还要留一个脱离本进程的常驻 reaper。一次真启动因此要 ~13 秒，
+      而这条用例的服务只等 30 秒 —— 挤一点的机器上就等不到了。
+      这是一次性服务，它没有资格去动跑它的这台机器。
     """
     return {
         "PATH": os.environ.get("PATH", ""),
@@ -263,6 +275,7 @@ def _child_env(plans_root: Path, state_db: Path, port: int) -> Dict[str, str]:
         "PDT_HOST": "127.0.0.1",
         "PDT_ALLOWED_HOSTS": "127.0.0.1,localhost",
         "PDT_PROVIDER_MODE": "inherit",
+        "PDT_ORPHAN_REAPER": "0",
     }
 
 
