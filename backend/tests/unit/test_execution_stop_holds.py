@@ -620,7 +620,7 @@ def test_a_clean_stop_does_not_report_a_phase_transition_error(
     assert resp.status_code == 200, resp.text
     assert "phase_transition_error" not in resp.json(), resp.json()
     assert set(resp.json()) == {
-        "status", "paused", "paused_at", "interrupted_task_count",
+        "status", "paused", "paused_at", "interrupted_task_count", "stop_report",
     }, resp.json()
 
 

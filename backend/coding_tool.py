@@ -306,6 +306,30 @@ _STOP_BUDGET_DEFAULT_SECONDS = 10.0
 _STOP_BUDGET_MIN_SECONDS = 2.0
 _STOP_BUDGET_MAX_SECONDS = 60.0
 
+#: The fraction of the server's grace window the executor's own stop
+#: budget may use.  The server treats ``PDT_STOP_GRACE_SECONDS`` as the
+#: window between its SIGTERM and its own SIGKILL, so the executor's
+#: sequence has to finish *inside* that window — with room to spare,
+#: because a cascade that runs a little slow would otherwise get the
+#: whole process group hard-killed, which is exactly the outcome the
+#: cooperative stop exists to prevent.  Half the window leaves the other
+#: half as slack for the escalation.
+EXECUTOR_STOP_BUDGET_FRACTION = 0.5
+
+#: The smallest server grace window that still leaves the executor a
+#: usable budget.  Derived from the budget's own lower bound, not
+#: written down as a second number, so the two cannot drift apart.
+MIN_SERVER_STOP_GRACE_SECONDS = (
+    _STOP_BUDGET_MIN_SECONDS / EXECUTOR_STOP_BUDGET_FRACTION
+)
+
+#: The server grace window assumed when the environment says nothing
+#: usable.  The same value the server itself falls back to
+#: (``server._STOP_GRACE_DEFAULT_SECONDS``): the two layers have to
+#: agree on what "unset" means, or the executor's budget could exceed
+#: the window it has to fit into.
+DEFAULT_SERVER_STOP_GRACE_SECONDS = _STOP_BUDGET_DEFAULT_SECONDS
+
 #: How the budget is split between the three stages. They add up to
 #: 0.70 — deliberately below 1.0, because the budget itself is derived
 #: from the server's grace window (``PDT_STOP_GRACE_SECONDS``, default
@@ -315,6 +339,26 @@ _STOP_BUDGET_MAX_SECONDS = 60.0
 _STOP_STAGE_CLOSE_FRACTION = 0.35
 _STOP_STAGE_TERM_FRACTION = 0.25
 _STOP_STAGE_KILL_FRACTION = 0.10
+
+#: Stage names in the per-process stop report. ``already_gone`` means the
+#: child was already dead when the stop started; the other three are the
+#: stages of the cooperative sequence, in escalation order.
+_STOP_STAGE_ALREADY_GONE = "already_gone"
+_STOP_STAGE_STDOUT = "stdout"
+_STOP_STAGE_SIGTERM = "SIGTERM"
+_STOP_STAGE_SIGKILL = "SIGKILL"
+
+#: How long one round of the *group* wait gives each child before the
+#: whole group is re-examined. The group wait as a whole is bounded by a
+#: shared deadline; this only decides how quickly a child that leaves
+#: early is noticed — and therefore spared the next stage's signal.
+_STOP_GROUP_WAIT_SLICE = 0.02
+
+#: How many rounds the group wait cuts the time it has left into. The
+#: slice shrinks with the remaining time, so the **last** wait of a
+#: stage is short: a wait that starts near the deadline must not be the
+#: one that runs past it.
+_STOP_GROUP_WAIT_ROUNDS = 8
 
 
 def register_live_dispatch(tool) -> None:
@@ -375,6 +419,65 @@ def _normalize_stop_budget(total_seconds) -> float:
     return min(max(budget, _STOP_BUDGET_MIN_SECONDS), _STOP_BUDGET_MAX_SECONDS)
 
 
+def _resolve_server_stop_grace_seconds(server_grace_seconds) -> float:
+    """Return the server's grace window in seconds, or the default.
+
+    A missing, empty, non-numeric, non-finite or non-positive value
+    falls back to :data:`DEFAULT_SERVER_STOP_GRACE_SECONDS` — the same
+    window the server itself falls back to.  The two layers have to
+    agree on what "unset" means: if the executor assumed a *shorter*
+    window than the server waits, its budget could outgrow the window
+    it has to fit into.
+    """
+    if server_grace_seconds is None:
+        return DEFAULT_SERVER_STOP_GRACE_SECONDS
+    try:
+        grace = float(server_grace_seconds)
+    except (TypeError, ValueError):
+        return DEFAULT_SERVER_STOP_GRACE_SECONDS
+    # NaN fails every comparison, so it has to be excluded explicitly.
+    if not math.isfinite(grace) or grace <= 0:
+        return DEFAULT_SERVER_STOP_GRACE_SECONDS
+    return grace
+
+
+def executor_stop_budget(server_grace_seconds=None) -> float:
+    """Return the executor's stop budget for a server grace window.
+
+    The budget is *half* the server's grace window
+    (:data:`EXECUTOR_STOP_BUDGET_FRACTION`), so the executor's stop
+    sequence always fits inside the window the server gives it before
+    the server escalates to SIGKILL.  The two budgets used to be equal
+    (the executor simply reused the server's window), which left no
+    room for a cascade that ran a little slow — the process group got
+    hard-killed instead of being stopped cleanly.
+
+    This is the single place the relation is derived: the executor's
+    CLI reads the same environment variable the server does and hands
+    it straight to this function, so the inequality cannot drift.
+
+    The window arrives as a raw environment value, so it is defended
+    here:
+
+    * a missing, empty, non-numeric, non-finite or non-positive value
+      falls back to :data:`DEFAULT_SERVER_STOP_GRACE_SECONDS` — "don't
+      wait at all" is the opposite of what the cooperative stop is for;
+    * a window below :data:`MIN_SERVER_STOP_GRACE_SECONDS` is raised to
+      that floor first, so the budget never drops under
+      :data:`_STOP_BUDGET_MIN_SECONDS`;
+    * the budget is capped at :data:`_STOP_BUDGET_MAX_SECONDS`, so a
+      fat-fingered window cannot park the stop path for minutes.
+
+    With all of that the budget is always strictly smaller than the
+    window it has to fit into.
+    """
+    grace = _resolve_server_stop_grace_seconds(server_grace_seconds)
+    budget = (
+        max(grace, MIN_SERVER_STOP_GRACE_SECONDS) * EXECUTOR_STOP_BUDGET_FRACTION
+    )
+    return min(budget, _STOP_BUDGET_MAX_SECONDS)
+
+
 def _wait_for_exit(process, timeout: float) -> bool:
     """True when ``process`` is gone within ``timeout`` seconds.
 
@@ -393,11 +496,154 @@ def _wait_for_exit(process, timeout: float) -> bool:
     return True
 
 
-def _cooperative_stop_process(
+def _process_has_exited(process) -> bool:
+    """True when ``process`` is already dead.
+
+    Never raises. A process that cannot be polled (no ``poll`` at all, or
+    a ``poll`` that blows up) counts as *alive*: the stop sequence then
+    runs its normal stages, which is the safe answer — we would rather
+    signal a corpse than leave a live child behind.
+    """
+    poll = getattr(process, "poll", None)
+    if not callable(poll):
+        return False
+    try:
+        return poll() is not None
+    except Exception:  # noqa: BLE001 — an unpolleable process is "alive"
+        return False
+
+
+def _break_child_stdout_pipe(process) -> bool:
+    """Break the child's stdout pipe **without** taking Python's buffer lock.
+
+    The child's stdout is read by the dispatch's reader thread, and
+    CPython's buffered reader holds its lock for as long as a read is
+    outstanding — i.e. for as long as the reader waits for the child to
+    write.  Closing the pipe *through the file object*
+    (``stdout.close()``) needs that very lock, so a stop running on
+    another thread deadlocks: the reader waits for the child, the stop
+    waits for the reader's lock, and the child waits for the pipe.  The
+    stop sequence then ran out of its budget without reporting
+    anything, and the stop report came back with an empty ``children``
+    list while the child was in fact running.
+
+    Closing the descriptor underneath the file object is the same thing
+    as far as the pipe is concerned — the read end is gone, so the
+    child's next write gets EPIPE — and it takes no Python lock at all.
+    The descriptor is pointed at ``/dev/null`` instead of being closed,
+    so the number stays valid (a later close cannot land on somebody
+    else's descriptor) and a reader that comes back for more gets EOF
+    rather than EBADF.
+
+    Returns True when the pipe was broken.
+    """
+    stdout = getattr(process, "stdout", None)
+    if stdout is None:
+        return False
+    try:
+        fd = stdout.fileno()
+    except Exception:  # noqa: BLE001 — no descriptor (or already closed)
+        return False
+    if not isinstance(fd, int) or fd < 0:
+        return False
+    try:
+        devnull = os.open(os.devnull, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.dup2(devnull, fd)
+    except OSError:
+        return False
+    finally:
+        try:
+            os.close(devnull)
+        except OSError:
+            pass
+    return True
+
+
+def _stop_stage_close_stdout(
+    process,
+    timeout: Optional[float] = None,
+) -> bool:
+    """Stage 1 — close the child's stdout; True when the child exited.
+
+    The child writes to that pipe; with the read end gone it gets EPIPE
+    and stops on its own. This is the cheapest possible stop and it needs
+    no signal at all.
+
+    The pipe is broken at the descriptor level (see
+    :func:`_break_child_stdout_pipe`): a Python-level ``close()`` needs
+    the buffered reader's lock, and the thread that is reading the pipe
+    holds that lock for as long as its read is outstanding — so the
+    close would block until the child said something, which is exactly
+    the wait the stop cannot afford.
+
+    A missing stdout, or a close that fails, means the child never
+    saw a broken pipe — so this stage did **not** win, whatever the wait
+    says, and the caller escalates to SIGTERM.
+    """
+    if timeout is None:
+        timeout = _STOP_BUDGET_DEFAULT_SECONDS * _STOP_STAGE_CLOSE_FRACTION
+    closed = _break_child_stdout_pipe(process)
+    if not closed:
+        # No descriptor to break (a test double, or a stdout that is
+        # already gone): fall back to the plain close.  A real pipe
+        # always has a descriptor, and the plain close is the one that
+        # can deadlock against the reader thread.
+        try:
+            stdout = getattr(process, "stdout", None)
+            if stdout is not None:
+                stdout.close()
+                closed = True
+        except Exception:  # noqa: BLE001 — a closed/absent stdout is fine
+            closed = False
+    exited = _wait_for_exit(process, timeout)
+    return bool(closed and exited)
+
+
+def _stop_stage_sigterm(
+    process,
+    timeout: Optional[float] = None,
+) -> bool:
+    """Stage 2 — SIGTERM the child's process group; True when it exited.
+
+    The child leads its own group (``start_new_session=True``), so the
+    group signal reaches its descendants too; a direct
+    ``process.terminate()`` would leave them behind.
+    """
+    if timeout is None:
+        timeout = _STOP_BUDGET_DEFAULT_SECONDS * _STOP_STAGE_TERM_FRACTION
+    try:
+        kill_process_group(process, sig=signal.SIGTERM, wait_timeout=0)
+    except Exception:  # noqa: BLE001 — the escalation below still runs
+        pass
+    return _wait_for_exit(process, timeout)
+
+
+def _stop_stage_sigkill(
+    process,
+    timeout: Optional[float] = None,
+) -> bool:
+    """Stage 3 — SIGKILL the child's process group; True when it exited.
+
+    The child ignored SIGTERM, so there is nothing left to be polite
+    about.
+    """
+    if timeout is None:
+        timeout = _STOP_BUDGET_DEFAULT_SECONDS * _STOP_STAGE_KILL_FRACTION
+    try:
+        kill_process_group(process, sig=signal.SIGKILL, wait_timeout=0)
+    except Exception:  # noqa: BLE001 — best-effort, never raises
+        pass
+    return _wait_for_exit(process, timeout)
+
+
+def _cooperative_stop_process_report(
     process,
     total_seconds: float = _STOP_BUDGET_DEFAULT_SECONDS,
-) -> bool:
-    """Stop one dispatch subprocess cooperatively.
+) -> Dict[str, Any]:
+    """Stop one dispatch subprocess cooperatively; report *where* it stopped.
 
     The sequence is three stages inside one budget:
 
@@ -408,65 +654,87 @@ def _cooperative_stop_process(
     3. SIGKILL the group and wait ``0.10 × budget`` — the corpse is
        reaped.
 
-    Returns ``False`` when the child left without needing a SIGKILL
-    (a cooperative stop) and ``True`` when it had to be killed (the
-    caller needs to know: a hard-killed child is not a clean stop).
+    The returned dict is what a caller has to persist when the process
+    dies, so it answers "which stage did this child stop at?"::
+
+        {"pid": 1234, "stage": "SIGTERM", "forced": False, "elapsed_s": 0.831}
+
+    * ``pid`` — the child's pid, or ``None`` when it cannot be read;
+    * ``stage`` — ``already_gone`` (it was dead before we started),
+      ``stdout``, ``SIGTERM`` or ``SIGKILL``;
+    * ``forced`` — True only when the child had to be SIGKILLed, i.e.
+      when the stop was *not* clean;
+    * ``elapsed_s`` — seconds spent on the whole sequence, measured on
+      the monotonic clock and rounded to 3 decimals.
     """
+    started = time.monotonic()
     budget = _normalize_stop_budget(total_seconds)
     close_wait = budget * _STOP_STAGE_CLOSE_FRACTION
     term_wait = budget * _STOP_STAGE_TERM_FRACTION
     kill_wait = budget * _STOP_STAGE_KILL_FRACTION
+    pid = getattr(process, "pid", None)
 
-    # Stage 1 — close stdout. The child writes to it; with the read end
-    # gone it gets EPIPE and stops. This is the cheapest possible stop
-    # and it needs no signal at all.
-    try:
-        stdout = getattr(process, "stdout", None)
-        if stdout is not None:
-            stdout.close()
-    except Exception:  # noqa: BLE001 — a closed/absent stdout is fine
-        pass
+    def _report(stage: str, forced: bool) -> Dict[str, Any]:
+        return {
+            "pid": pid,
+            "stage": stage,
+            "forced": forced,
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
 
-    if _wait_for_exit(process, close_wait):
-        return False
+    # Already dead before we started: nothing to signal, nothing to close.
+    if _process_has_exited(process):
+        return _report(_STOP_STAGE_ALREADY_GONE, False)
 
-    # Stage 2 — SIGTERM the whole group. The child leads its own group
-    # (``start_new_session=True``), so the group signal reaches its
-    # descendants too; a direct ``process.terminate()`` would leave
-    # them behind.
-    try:
-        kill_process_group(process, sig=signal.SIGTERM, wait_timeout=0)
-    except Exception:  # noqa: BLE001 — the escalation below still runs
-        pass
-    if _wait_for_exit(process, term_wait):
-        return False
+    if _stop_stage_close_stdout(process, close_wait):
+        return _report(_STOP_STAGE_STDOUT, False)
 
-    # Stage 3 — SIGKILL the group. The child ignored SIGTERM, so there
-    # is nothing left to be polite about.
-    try:
-        kill_process_group(process, sig=signal.SIGKILL, wait_timeout=0)
-    except Exception:  # noqa: BLE001 — best-effort, never raises
-        pass
-    _wait_for_exit(process, kill_wait)
-    return True
+    if _stop_stage_sigterm(process, term_wait):
+        return _report(_STOP_STAGE_SIGTERM, False)
+
+    # Stage 3 — SIGKILL. Whether the corpse was reaped in time or not,
+    # this stop was forced: the child ignored SIGTERM.
+    _stop_stage_sigkill(process, kill_wait)
+    return _report(_STOP_STAGE_SIGKILL, True)
 
 
-def stop_all_live_dispatches(
+def _cooperative_stop_process(
+    process,
     total_seconds: float = _STOP_BUDGET_DEFAULT_SECONDS,
-) -> int:
-    """Stop every live dispatch's subprocess; return how many were handled.
+) -> bool:
+    """Stop one dispatch subprocess cooperatively.
 
-    This is the entry point a signal handler calls: it walks the
-    registry, stops each registered tool's ``_current_process``
-    cooperatively, and reports how many processes it took on. It never
-    raises — a stop path that crashes leaves the child running, which
-    is the failure mode this whole mechanism exists to prevent.
+    Returns ``False`` when the child left without needing a SIGKILL
+    (a cooperative stop) and ``True`` when it had to be killed (the
+    caller needs to know: a hard-killed child is not a clean stop).
+
+    This is the legacy bool contract, kept because callers (and
+    ``tests/unit/test_cooperative_stop_sequence.py``) depend on it. It is
+    now derived from :func:`_cooperative_stop_process_report`, whose
+    ``forced`` flag carries exactly that meaning — True when the child
+    had to be SIGKILLed. The two must never drift apart: the bool *is*
+    the report's ``forced`` flag.
     """
-    budget = _normalize_stop_budget(total_seconds)
+    report = _cooperative_stop_process_report(process, total_seconds)
+    return bool(report["forced"])
+
+
+def _live_dispatch_entries() -> List[Dict[str, Any]]:
+    """One-shot snapshot of the live-dispatch registry.
+
+    The registry is read **once**, under its lock, and never re-read: a
+    stop has to see the same set of children from the first stage to
+    the last, or the "who is still alive" bookkeeping drifts.
+
+    Each entry carries the tool, the child process it owns, and the
+    stop bookkeeping (``exited`` / ``stage`` / ``elapsed_s``). A tool
+    whose ``_current_process`` cannot be read is skipped — one broken
+    tool must not keep the other children from being stopped.
+    """
     with _LIVE_DISPATCH_LOCK:
         tools = list(_LIVE_DISPATCH_TOOLS.values())
 
-    stopped = 0
+    entries: List[Dict[str, Any]] = []
     for tool in tools:
         try:
             with tool._process_lock:
@@ -475,12 +743,195 @@ def stop_all_live_dispatches(
             continue
         if process is None:
             continue
-        try:
-            _cooperative_stop_process(process, budget)
-        except Exception:  # noqa: BLE001 — one bad process must not stop the rest
+        entries.append({
+            "tool": tool,
+            "process": process,
+            "exited": False,
+            "stage": None,
+            "elapsed_s": None,
+        })
+    return entries
+
+
+def _elapsed_since(entry: Dict[str, Any]) -> float:
+    """Seconds since the stop that owns ``entry`` started."""
+    started = entry.get("started")
+    if started is None:
+        return 0.0
+    return round(time.monotonic() - started, 3)
+
+
+def _survivors(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The entries whose child is still alive.
+
+    A child counts as alive unless we *know* it is gone: a process that
+    cannot be polled counts as alive, because signalling a corpse is
+    harmless while leaving a live child behind is not.
+    """
+    alive: List[Dict[str, Any]] = []
+    for entry in entries:
+        if entry.get("exited"):
             continue
-        stopped += 1
-    return stopped
+        if _process_has_exited(entry["process"]):
+            entry["exited"] = True
+            entry["elapsed_s"] = _elapsed_since(entry)
+            continue
+        alive.append(entry)
+    return alive
+
+
+def _act_on_child(entry: Dict[str, Any], action: Callable[[Any], Any]) -> None:
+    """Run one stage action against one child; never raises.
+
+    A child that cannot be signalled is still carried into the next
+    stage — dropping it would leave it running, and the escalation is
+    what actually stops it.
+    """
+    try:
+        action(entry["process"])
+    except Exception:  # noqa: BLE001 — one bad process must not stop the rest
+        logger.warning(
+            "[live-dispatch] a stop stage failed for pid %s; escalating anyway",
+            getattr(entry["process"], "pid", None),
+            exc_info=True,
+        )
+
+
+def _await_group_exit(
+    entries: List[Dict[str, Any]],
+    deadline: float,
+) -> List[Dict[str, Any]]:
+    """Wait until every child in ``entries`` has exited, or ``deadline``.
+
+    The wait is **shared**: every child waits against the same
+    deadline, so a stage costs one slice of the budget no matter how
+    many children are in it — not one slice per child. The children are
+    re-examined round-robin, so a child that leaves early is noticed
+    early and is spared the next stage's signal.
+
+    Returns the entries that were still alive when the deadline hit.
+    """
+    pending = [entry for entry in entries if not entry.get("exited")]
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # The slice is shared between the children that are still
+        # pending, and it shrinks with the time that is left — so one
+        # round can never outlive the deadline.
+        slice_s = min(
+            _STOP_GROUP_WAIT_SLICE,
+            remaining / (len(pending) * _STOP_GROUP_WAIT_ROUNDS),
+        )
+        still_pending: List[Dict[str, Any]] = []
+        for entry in pending:
+            # Re-read the clock per child: a wait that starts near the
+            # deadline must not be allowed to run past it.
+            left = deadline - time.monotonic()
+            if left <= 0:
+                still_pending.append(entry)
+                continue
+            if _wait_for_exit(entry["process"], min(slice_s, left)):
+                entry["exited"] = True
+                entry["elapsed_s"] = _elapsed_since(entry)
+            else:
+                still_pending.append(entry)
+        pending = still_pending
+        if pending:
+            time.sleep(min(0.005, max(0.0, deadline - time.monotonic())))
+    return pending
+
+
+def stop_all_live_dispatches(
+    total_seconds: float = _STOP_BUDGET_DEFAULT_SECONDS,
+    records: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """Stop every live dispatch's subprocess **in parallel**; return how many.
+
+    This is the entry point a signal handler calls. It takes one
+    snapshot of the registry, then runs the three stop stages over
+    *all* the children at the same time:
+
+    1. close every child's stdout and wait ``0.35 × budget`` — the CLI
+       sees the broken pipe and exits on its own;
+    2. SIGTERM every child's process group and wait ``0.25 × budget``;
+    3. SIGKILL whoever is left and wait ``0.10 × budget``.
+
+    The stages are what the budget is split into, and **each stage waits
+    once for the whole group** — so the stop costs 0.7 × budget no
+    matter how many children are running. The old per-child loop spent
+    the whole budget once per child: two concurrent Claude Code runs
+    cost 2 × budget, which is longer than the caller's grace window, so
+    the second child was never stopped at all.
+
+    ``records``, when given, collects one dict per child — the same
+    shape the single-process report produces::
+
+        {"pid": 1234, "stage": "SIGTERM", "forced": False, "elapsed_s": 0.83}
+
+    It never raises — a stop path that crashes leaves the child running,
+    which is the failure mode this whole mechanism exists to prevent.
+    """
+    budget = _normalize_stop_budget(total_seconds)
+    started = time.monotonic()
+    entries = _live_dispatch_entries()
+    if not entries:
+        return 0
+    for entry in entries:
+        entry["started"] = started
+
+    # One shared schedule: every stage's deadline is measured from the
+    # start of the stop, so a stage that runs long eats into the next
+    # one instead of pushing the whole stop past the budget.
+    close_deadline = started + budget * _STOP_STAGE_CLOSE_FRACTION
+    term_deadline = close_deadline + budget * _STOP_STAGE_TERM_FRACTION
+    kill_deadline = term_deadline + budget * _STOP_STAGE_KILL_FRACTION
+
+    # Stage 1 — close every child's stdout, then wait for the group.
+    # The stage primitive is asked to *act* only (``timeout=0``): the
+    # wait belongs to the group, not to the child.
+    stage: List[Dict[str, Any]] = []
+    for entry in entries:
+        if _process_has_exited(entry["process"]):
+            entry["exited"] = True
+            entry["stage"] = _STOP_STAGE_ALREADY_GONE
+            entry["elapsed_s"] = _elapsed_since(entry)
+            continue
+        _act_on_child(entry, lambda proc: _stop_stage_close_stdout(proc, 0))
+        entry["stage"] = _STOP_STAGE_STDOUT
+        stage.append(entry)
+    _await_group_exit(stage, close_deadline)
+
+    # Stage 2 — SIGTERM every survivor, then wait for the group.
+    stage = _survivors(stage)
+    for entry in stage:
+        _act_on_child(entry, lambda proc: _stop_stage_sigterm(proc, 0))
+        entry["stage"] = _STOP_STAGE_SIGTERM
+    _await_group_exit(stage, term_deadline)
+
+    # Stage 3 — SIGKILL whoever is left. Whether the corpse was reaped
+    # in time or not, this stop was forced: the child ignored SIGTERM.
+    stage = _survivors(stage)
+    for entry in stage:
+        _act_on_child(entry, lambda proc: _stop_stage_sigkill(proc, 0))
+        entry["stage"] = _STOP_STAGE_SIGKILL
+        entry["forced"] = True
+    _await_group_exit(stage, kill_deadline)
+
+    if records is not None:
+        elapsed = round(time.monotonic() - started, 3)
+        for entry in entries:
+            records.append({
+                "pid": getattr(entry["process"], "pid", None),
+                "stage": entry["stage"],
+                "forced": bool(entry.get("forced", False)),
+                "elapsed_s": (
+                    entry["elapsed_s"]
+                    if entry.get("elapsed_s") is not None
+                    else elapsed
+                ),
+            })
+    return len(entries)
 
 
 # ---------------------------------------------------------------------------

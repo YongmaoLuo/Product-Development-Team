@@ -18,7 +18,10 @@ SIGTERM **打不到它**。而 executor（``backend/cli.py``）此前没有任�
 * **幂等** —— ``install_stop_handler()`` 装两次不能叠成两层 handler；
 * **第二次信号立刻退出** —— 停止过程中再来一个 SIGTERM 不重入序列，
   直接退：序列已经跑过一遍，再跑一遍只会把 executor 挂在原地；
-* **预算有界** —— 环境变量缺失 / 非法 / 非正 → 10s，任何值夹在 [2, 60]；
+* **预算有界** —— 环境变量是服务端给的那个 **grace 窗口**，执行器的
+  预算是它的**一半**（``coding_tool.executor_stop_budget``）：缺失 /
+  非法 / 非正 → grace 10s → 预算 5s；grace 低于 4s 先抬到 4s；预算
+  夹在 [2, 60]；
 * **序列抛异常也必须退出** —— 收尾路径崩了不能变成 executor 挂死。
 
 测试不碰真实进程：``stop_all_live_dispatches`` 换成记录器，``_exit_now``
@@ -36,9 +39,14 @@ import pytest
 import cli
 
 
+#: 环境变量里配置的**服务端 grace 窗口**（秒）。执行器的停止预算由它
+#: 推导 —— 预算是 grace 的一半（``coding_tool.executor_stop_budget``），
+#: 所以 6s 的 grace 给序列留 3s。
+STOP_GRACE = "6"
+
 #: 停止序列拿到的是「总预算」，由它自己按 0.35 / 0.25 / 0.10 切成三段。
 #: 测试里出现的这个数字是**总预算**，不是某一段的等待时间。
-BUDGET = 6.0
+BUDGET = 3.0
 
 
 @pytest.fixture
@@ -71,7 +79,7 @@ def test_install_is_idempotent(monkeypatch, sigterm_slot):
 
 def test_handler_stops_dispatches_then_exits(monkeypatch):
     """SIGTERM → 停 dispatch（拿到 env 预算）→ 退出码 143。"""
-    monkeypatch.setenv("PDT_STOP_GRACE_SECONDS", "6")
+    monkeypatch.setenv("PDT_STOP_GRACE_SECONDS", STOP_GRACE)
     monkeypatch.setattr(cli, "_stop_in_progress", False)
 
     events = []
@@ -89,27 +97,29 @@ def test_handler_stops_dispatches_then_exits(monkeypatch):
 
 
 def test_budget_defaults_and_clamps(monkeypatch):
-    """缺失 / 非法 / 非正 → 10.0；任何值夹在 [2, 60]。"""
+    """缺失 / 非法 / 非正 → grace 10.0 → 预算 5.0；预算夹在 [2, 60]。"""
     monkeypatch.delenv("PDT_STOP_GRACE_SECONDS", raising=False)
-    assert cli._stop_grace_seconds() == 10.0
+    assert cli._stop_grace_seconds() == 5.0
 
     for bad in ("abc", "0", "-5", "nan", "inf"):
         monkeypatch.setenv("PDT_STOP_GRACE_SECONDS", bad)
-        assert cli._stop_grace_seconds() == 10.0, bad
+        assert cli._stop_grace_seconds() == 5.0, bad
 
+    # grace 3s 低于下限 4s → 先抬到 4s → 预算 2s。
     monkeypatch.setenv("PDT_STOP_GRACE_SECONDS", "3")
-    assert cli._stop_grace_seconds() == 3.0
+    assert cli._stop_grace_seconds() == 2.0
 
     monkeypatch.setenv("PDT_STOP_GRACE_SECONDS", "1")
     assert cli._stop_grace_seconds() == 2.0
 
+    # grace 600s → 预算 300s → 被预算上限夹回 60s。
     monkeypatch.setenv("PDT_STOP_GRACE_SECONDS", "600")
     assert cli._stop_grace_seconds() == 60.0
 
 
 def test_second_signal_exits_immediately(monkeypatch):
     """停止过程中再来一个 SIGTERM：不重入序列，直接退出。"""
-    monkeypatch.setenv("PDT_STOP_GRACE_SECONDS", "6")
+    monkeypatch.setenv("PDT_STOP_GRACE_SECONDS", STOP_GRACE)
     monkeypatch.setattr(cli, "_stop_in_progress", False)
 
     stop_calls = []
@@ -145,7 +155,7 @@ def test_second_signal_exits_immediately(monkeypatch):
 
 def test_stop_sequence_failure_still_exits(monkeypatch):
     """停止序列抛异常：记下来，然后照样退出 —— 绝不把 executor 挂住。"""
-    monkeypatch.setenv("PDT_STOP_GRACE_SECONDS", "6")
+    monkeypatch.setenv("PDT_STOP_GRACE_SECONDS", STOP_GRACE)
     monkeypatch.setattr(cli, "_stop_in_progress", False)
 
     exit_calls = []
