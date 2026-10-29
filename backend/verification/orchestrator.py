@@ -797,6 +797,48 @@ def _accepts_plan_intent(generator: Any) -> bool:
     )
 
 
+def _attach_round_run_output(
+    candidates: List[Dict[str, Any]],
+    round_evidence: Mapping[str, Mapping[str, Any]],
+) -> int:
+    """Attach the round's own run output to the failed-VP records.
+
+    Returns how many records got one.
+
+    2026-10-29 — a repair task's criterion has to select the cases that
+    failed, and the ids of those cases are only in the run output. The
+    path-based failed-VP records deliberately carry summaries and
+    pointers instead of the output (that is what keeps the prompt
+    bounded), so the output is attached here — where the round's report
+    still has it — and the generator reads the ids out of it. Without
+    this the narrowing has nothing to narrow towards and every round
+    keeps the wide command.
+
+    It goes under ``run_output`` and not under ``actual_result`` /
+    ``evidence``: those two are read by the file-derivation rule, and
+    handing that rule the whole output would change which files a repair
+    task is allowed to touch — a different change, with a different
+    reason.
+    """
+    attached = 0
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        entry = round_evidence.get(str(candidate.get("id") or ""))
+        if not isinstance(entry, Mapping):
+            continue
+        text = "\n".join(
+            str(entry.get(key) or "")
+            for key in ("actual_result", "evidence")
+            if entry.get(key)
+        )
+        if not text.strip():
+            continue
+        candidate["run_output"] = text
+        attached += 1
+    return attached
+
+
 class VerificationOrchestrator:
     """Manages the verification loop and state transitions."""
 
@@ -3725,6 +3767,22 @@ class VerificationOrchestrator:
         # contributes no constraints, it is never an error.
         plan_intent = _plan_intent(self.plan_dir)
         if repair_candidates:
+            # 2026-10-29 — the round's own run output goes to the
+            # generator. The narrowing of a repair task's criterion needs
+            # the ids of the cases that failed, and those are in the
+            # output; the path-based failed-VP records carry summaries
+            # instead (that is what keeps the prompt bounded), so the
+            # output is attached here. Only the ids reach the prompt.
+            attached_output = _attach_round_run_output(
+                repair_candidates, round_failed_vps,
+            )
+            if attached_output:
+                print(
+                    f"[Repair] round {round_number}: run output attached for "
+                    f"{attached_output}/{len(repair_candidates)} failed VP(s) "
+                    f"— the criterion will be narrowed to the cases that "
+                    f"failed"
+                )
             # 2026-10-23 — the plan's constraints go into the prompt so
             # the model can steer clear of the conflict. A generator
             # that predates the parameter is called without it: the

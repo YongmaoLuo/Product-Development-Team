@@ -54,7 +54,12 @@ from coding_tool import CodingTool, JsonSession, query_json_in_session
 # path needs it without importing this module's verification stack. The
 # name stays importable from here for the callers that already use it.
 from plan_sessions import stable_session_id
-from test_command_quality import check_falsifiable, inspect_command
+from test_command_quality import (
+    check_falsifiable,
+    covers_failing_cases,
+    failing_case_ids,
+    inspect_command,
+)
 from verification_cancel import VerificationCancelled
 from test_command_rules import derive_files_to_modify
 from verification_persistence import VerificationPersistenceManager
@@ -175,6 +180,67 @@ def _clamp_for_prompt(text: Any, limit: int = _MAX_REPAIR_PROMPT_CHARS,
         f"此处保留前 {limit}]"
     )
     return rendered[:limit] + notice
+
+
+def _run_output_text(items: Any) -> str:
+    """Every string field of every item, concatenated.
+
+    The round's run output is spread over several fields of the
+    evidence — the verdict's own message, the captured output, the
+    failure text — and *which* field carries pytest's short summary
+    depends on the runner. So there is no field whitelist here: every
+    string is thrown together and the failing case ids are read off the
+    lot. A whitelist would silently miss the runner that puts its
+    summary somewhere else, and the narrowing would then never fire.
+
+    A pure function: no I/O, no exception, no output.
+    """
+    parts: List[str] = []
+    for item in items or ():
+        if not isinstance(item, dict):
+            continue
+        for value in item.values():
+            if isinstance(value, str) and value:
+                parts.append(value)
+    return "\n".join(parts)
+
+
+#: The narrowing rule, carried by **both** prompts that can end up
+#: producing a criterion: the one that writes the repair task and the one
+#: that re-asks for its command. Same words in both places — a rule that
+#: reads differently in two prompts is a rule that gets obeyed in one of
+#: them.
+#:
+#: The wording is about cost, not about taste: a criterion that runs the
+#: whole repository is 45-70 minutes a round, and a repair needs 5-10
+#: rounds, so the width of the criterion is the width of the whole repair
+#: loop. A narrow criterion is also a *sharper* one — it is red only when
+#: the thing that was fixed is still broken.
+NARROW_CRITERION_RULE = (
+    "判据只覆盖你改的那一处：`test_command` 只能选中**这次失败的那些用例**"
+    "（上面给了 node id 就用它们，或者至少选中它们所在的测试文件）。"
+    "**不许**写整仓门禁、**不许**写 VP 自己的入口命令。"
+    "窄命令一轮 2 分钟，宽命令一轮 1 小时 —— 判据写宽了，等于每轮修复都要"
+    "把整个仓库重跑一遍。"
+)
+
+
+def _narrow_criterion_section(case_ids: Sequence[str]) -> List[str]:
+    """The failing case ids and the rule that goes with them.
+
+    The ids come first: the rule says "上面给了 node id 就用它们", so they
+    have to be above it. Without ids the rule alone is still worth saying
+    — "select the cases that failed" is actionable even when the output
+    named none.
+    """
+    parts: List[str] = []
+    if case_ids:
+        parts.append("本轮失败用例（pytest node id）：")
+        parts.extend(f"  - {case_id}" for case_id in case_ids)
+        parts.append("")
+    parts.append(NARROW_CRITERION_RULE)
+    parts.append("")
+    return parts
 
 
 class RepairGenerationError(RuntimeError):
@@ -639,22 +705,54 @@ class RepairTaskGenerator:
         needs. The structural check is different on both counts — it
         executes nothing, and the false-failure argument above holds just
         as well for an author-declared command.
+
+        A candidate that does not **select the cases that failed** is
+        treated the same way, and for the same reason. The round's own
+        output names them (``FAILED backend/tests/a.py::test_b``), and a
+        command that selects neither those cases nor their files cannot
+        tell a fixed repair from unrelated breakage somewhere else in
+        the tree. For a ``full_ci`` verification point that command is
+        the whole-repository gate, so the price is not only a weak
+        signal — it is 45-70 minutes a round, and a repair needs 5-10
+        rounds. A wide command has the same shape of defect as a
+        structurally broken one: it guarantees a FALSE failure every
+        time it is issued (the gate is red for reasons that have nothing
+        to do with the fix), whereas no command degrades to the audit
+        second pass, which can actually pass. So a wide candidate is
+        discarded and resolution continues to the next path, ending at
+        ``missing`` — where the existing re-ask loop
+        (``_fill_missing_test_commands``) asks the model, which knows the
+        runner, for a command that selects the failed cases.
+
+        The cases come out of the round's own output, so the framework
+        never has to know how the other side runs its tests: it reads
+        the ids pytest printed and matches them against the command's
+        text. When the output names no case at all — a build error, a
+        service that never came up — there is nothing to narrow towards
+        and the behaviour is exactly what it was.
         """
+        case_ids = failing_case_ids(_run_output_text(evidence_items))
         command = str(task.get("test_command") or "").strip()
         if command:
             issues = inspect_command(command)
+            narrowed = ""
             if issues:
                 print(
                     f"[Repair] Discarding unusable test_command from the LLM "
                     f"({issues[0].code}): {command[:120]}"
                 )
-            elif not self._passes_falsifiability(command):
+            else:
+                narrowed = self._selects_failing_cases(
+                    command, case_ids, "the LLM",
+                )
+            if narrowed and not self._passes_falsifiability(narrowed):
                 print(
                     f"[Repair] Discarding vacuous test_command from the LLM "
-                    f"(it already passes before the repair): {command[:120]}"
+                    f"(it already passes before the repair): {narrowed[:120]}"
                 )
-            else:
-                return command, "llm"
+                narrowed = ""
+            if narrowed:
+                return narrowed, "llm"
 
         by_vp = {
             str(e.get("vp_id")): str(e.get("test_command") or "").strip()
@@ -668,7 +766,11 @@ class RepairTaskGenerator:
                 by_vp.get(vp_id, ""), f"vp {vp_id}",
             )
             if derived:
-                return derived, "vp"
+                narrowed = self._selects_failing_cases(
+                    derived, case_ids, f"vp {vp_id}",
+                )
+                if narrowed:
+                    return narrowed, "vp"
 
         usable = [c for c in by_vp.values() if c]
         if len(usable) == 1:
@@ -676,9 +778,48 @@ class RepairTaskGenerator:
                 usable[0], "the round's only evidence command",
             )
             if derived:
-                return derived, "single_evidence"
+                narrowed = self._selects_failing_cases(
+                    derived, case_ids, "the round's only evidence command",
+                )
+                if narrowed:
+                    return narrowed, "single_evidence"
 
         return "", "missing"
+
+    @staticmethod
+    def _selects_failing_cases(
+        command: str, case_ids: Sequence[str], origin: str,
+    ) -> str:
+        """``command`` when it selects the failed cases, else ``""``.
+
+        The narrowing half of the rule :meth:`_structurally_runnable`
+        enforces: a command that runs the whole repository cannot tell a
+        fixed repair from unrelated breakage, and it costs 45-70 minutes
+        a round. The verdict is the same as a structural rejection — the
+        caller reads ``""`` as "this source had nothing to offer" and
+        carries on to the next derivation — so a wide command ends up
+        dropped rather than shipped.
+
+        An empty ``case_ids`` means the round's output named no case, so
+        there is nothing to measure the command against and it is kept:
+        the old behaviour, unchanged.
+
+        Like :meth:`_structurally_runnable` this is a pure text
+        comparison — it runs nothing, which matters precisely because the
+        commands it rejects are the expensive ones.
+        """
+        command = str(command or "").strip()
+        if not command:
+            return ""
+        if not case_ids:
+            return command
+        if covers_failing_cases(command, case_ids):
+            return command
+        print(
+            f"[Repair] Discarding wide test_command from {origin} "
+            f"(it does not select the cases that failed): {command[:120]}"
+        )
+        return ""
 
     @staticmethod
     def _structurally_runnable(command: str, origin: str) -> str:
@@ -2335,6 +2476,11 @@ def _evidence_items_from_failed_vps(
     derivation paths, their order and their rejection rules stay exactly
     as they were, and the retry is judged against the same bar as the
     first answer.
+
+    ``run_output`` (2026-10-29) carries the round's own run output when
+    the caller attached it — the path-based records hold summaries and
+    pointers, and the ids of the cases that failed live in the output.
+    The resolver reads every string field, so the ids come out of it.
     """
     items: List[Dict[str, Any]] = []
     for vp in failed_vps:
@@ -2345,6 +2491,7 @@ def _evidence_items_from_failed_vps(
             "test_command": str(vp.get("test_command") or "").strip(),
             "actual_result": str(vp.get("actual_result") or ""),
             "evidence": str(vp.get("evidence") or ""),
+            "run_output": str(vp.get("run_output") or ""),
         })
     return items
 
@@ -2428,6 +2575,9 @@ def _build_test_command_fill_prompt(
         "每条命令必须在**修复正确**时退出 0、在**未修复**时非 0。",
         "",
     ]
+    parts.extend(_narrow_criterion_section(
+        failing_case_ids(_run_output_text(failed_vps)),
+    ))
     for vp in failed_vps:
         vp_id = str(vp.get("id", "") or "")
         plan_point = plan_vps.get(vp_id) or {}
@@ -2601,6 +2751,20 @@ def _build_repair_contents_prompt(
                         f"{_clamp_for_prompt(h.get('evidence'), label='evidence')}"
                     )
                 parts.append("")
+    # 2026-10-29 — the narrowing rule, and the cases it applies to. The
+    # content prompt does not ask for a ``test_command`` (the system
+    # prompt says so), but the model often volunteers one, and the task
+    # description it writes is what reaches the executor — a description
+    # that demands the whole-repository gate turns every repair round
+    # into an hour. So the rule goes here as well as on the re-ask.
+    parts.extend(_narrow_criterion_section(
+        failing_case_ids(_run_output_text(failed_vps)),
+    ))
+    parts.append(
+        "任务描述与验收标准里**不要**要求把整仓门禁整轮跑完 —— "
+        "验收以 `test_command` 的退出码为准。"
+    )
+    parts.append("")
     parts.append(f"共 {len(failed_vps)} 个失败 VP：")
     parts.append("")
     for i, vp in enumerate(failed_vps, start=1):
