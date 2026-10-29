@@ -428,10 +428,11 @@ def test_the_pre_dispatch_identity_check_fills_the_answering_boot_id(
         url = f"http://127.0.0.1:{service.port}/items"
 
         # The round's own gate: it reads the instance block of the
-        # service the VP is about to talk to, and compares it with what
-        # the round expects.  The state database of this test is not
-        # the round's, so that comparison is switched off.
-        monkeypatch.setattr(agent, "_expected_state_db_inodes", lambda name: [])
+        # The round's own gate: it reads the instance block of the
+        # service the VP is about to talk to, and compares it with the
+        # instance the round **recorded**.  This round recorded no
+        # instance block for the service, so there is nothing to
+        # compare — and nothing to compare carries no verdict.
         declaration = SimpleNamespace(port=service.port)
         mismatch = agent._service_instance_mismatch("api", declaration)
         assert mismatch is None, mismatch

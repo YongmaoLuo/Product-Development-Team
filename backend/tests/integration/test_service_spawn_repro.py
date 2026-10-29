@@ -56,7 +56,7 @@ The equivalent command lines, for a reader who wants to run them by hand
 
     cd backend || exit 1
     .venv/bin/python3 tests/manual/spawn_repro.py --profile service-manager \
-        --target pdt --runs 3 --ready-timeout 60 --assert-failure-rate 0
+        --target pdt --runs 3 --ready-timeout 90 --assert-failure-rate 0
     .venv/bin/python3 tests/manual/spawn_repro.py --profile service-manager \
         --target tiny --runs 3 --ready-timeout 8 --assert-failure-rate 0
 
@@ -147,15 +147,24 @@ _LIGHT_TARGET = "tiny"
 #: one-route service; a service that is going to die dies at once, so
 #: the larger budget costs time only in the case that is already red.
 #:
-#: The budget is a *wait*, not a threshold on the product: what has to
-#: hold is "the service comes up", and the child either answers or dies
-#: — it never answers slowly.  12 s was sized on an idle machine; the
-#: gate runs ``-n 8``, and a backend that boots while seven other
-#: backends boot needs more room than that on a busy one.  The reproducer
-#: clears the child's environment, so the backend also runs its boot-time
-#: credential sweep over the machine's temp roots — a walk whose length
-#: is the machine's, not the code's.
-_BACKEND_READY_TIMEOUT = 120
+#: The budget is a wall-clock ceiling, not a sleep: a spawn that comes
+#: up in 7s is measured as 7s however large the ceiling is.  It used to
+#: be 12 -- a figure taken from an idle runner -- and on a loaded host
+#: that made this suite red for a reason that has nothing to do with
+#: the defect it guards: the backend's time-to-ready drifts with the
+#: host's load (measured here: 6.9s on a quiet run, 27.8s for the
+#: first spawn of a batch on a loaded one, 40s+ under heavier load
+#: still).  The budget is now 90s, which is more than twice the
+#: slowest measurement and comfortably above the backend's own
+#: 60s self-check ceiling (``server._start_request_guard_selfcheck``
+#: stops an instance that has not begun listening by then).  Above that
+#: ceiling a spawn that is going to come up always gets the chance,
+#: and one that is not going to come up dies on its own -- the
+#: reproducer records a non-``None`` return code, and the assertion
+#: below still fails.  What this suite guards is "the child does not
+#: die before it is ready" (the EBADF defect), not how fast the host
+#: starts a process.
+_BACKEND_READY_TIMEOUT = 90
 
 #: How long the one-route service gets to answer.
 _LIGHT_READY_TIMEOUT = 8
@@ -268,26 +277,6 @@ def _can_bind(port: int) -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _no_provider_fleet_to_wait_for(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The spawned backend must not wait for a CC Switch that is not there.
-
-    ``server.load_providers`` asks CC Switch for the provider chain when
-    the mode says ``cc-switch``, and the hermetic suite pins that mode
-    because the *provider-contract* tests need it.  On a machine without
-    CC Switch the spawned backend therefore asks ``127.0.0.1:4000`` for
-    a chain nobody serves, and the answer is a connect timeout: the
-    service is up but not *ready* yet, and the reproducer's readiness
-    budget runs out before the boot does.
-
-    This file is about the spawn, not about provider routing, so it pins
-    the mode to ``inherit`` — the configuration this codebase itself
-    provides for "there is no provider fleet here" — the same way the
-    other live-server tests do.
-    """
-    monkeypatch.setenv("PDT_PROVIDER_MODE", "inherit")
-
-
 @pytest.fixture
 def spawned_groups() -> Iterator[List[Tuple[Optional[int], Optional[int]]]]:
     """Kill the process groups the batch started, whatever happened.
@@ -343,6 +332,13 @@ def descriptor_hazard(monkeypatch: pytest.MonkeyPatch) -> Iterator[int]:
 
 
 @requires_macos_spawn
+# The watchdog this test needs is not the suite default.  Nine backend
+# spawns at the per-spawn ceiling above is 810s of worst case, and the
+# default 300s watchdog would kill the test on a loaded host -- turning
+# "the host is slow" into a red suite, which is the very thing the
+# budget above exists to stop.  The budget guards against a hung
+# pytest; it is not one of the criteria this suite asserts.
+@pytest.mark.timeout(1800)
 def test_three_consecutive_spawns_all_ready(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

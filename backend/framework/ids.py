@@ -58,7 +58,11 @@ from typing import Final
 __all__ = [
     "InvalidPlanIdError",
     "MAX_PLAN_ID_LEN",
+    "PLAN_ID_PLACEHOLDER",
+    "PLAN_ID_SHAPE",
     "derive_plan_id",
+    "find_plan_ids",
+    "scrub_plan_ids",
     "slugify_plan_id",
     "validate_plan_id",
 ]
@@ -226,3 +230,72 @@ def derive_plan_id(
     """
     stamp = (when or dt.datetime.now()).strftime("%Y%m%d")
     return f"{stamp}-{slugify_plan_id(requirement, max_len=max_len)}"
+
+
+# ---------------------------------------------------------------------------
+# Plan-id shape: the production half of "what a plan id is"
+# ---------------------------------------------------------------------------
+
+#: The shape of a plan id: a date stamp and a slug, hyphen-separated.
+#:
+#: This is the SAME pattern the repository's static gate uses
+#: (``backend/tests/static_gates/test_no_plan_ids_in_non_test_source.py``).
+#: The two live in different layers -- the gate has to stay importable by a
+#: bare ``python3`` from the ``commit-msg`` hook, so it cannot import
+#: production code -- which means the shape is stated twice. A test pins the
+#: two patterns together (``tests/unit/test_plan_id_scrubber.py``) so the
+#: copies cannot drift apart silently.
+#:
+#: The date is ``20`` plus six digits rather than a bare eight-digit number
+#: so a plain number with no tail cannot match, and so a hyphenated ISO
+#: date (``2026-10-14``) is not a match: that is eight digits split by two
+#: hyphens, and this shape requires six digits immediately followed by one.
+PLAN_ID_SHAPE: Final[re.Pattern[str]] = re.compile(
+    r"20[0-9]{6}-[A-Za-z][A-Za-z0-9._-]*"
+)
+
+#: What a plan id is replaced with when it is scrubbed out of a text.
+#:
+#: A placeholder rather than an empty string: the reader of a scrubbed text
+#: still learns that something private was here, without learning what it
+#: was. It deliberately does NOT match :data:`PLAN_ID_SHAPE` -- a date-free
+#: placeholder cannot be mistaken for an id, so scrubbing cannot leave the
+#: shape behind.
+PLAN_ID_PLACEHOLDER: Final[str] = "<plan-id>"
+
+
+def find_plan_ids(text: str) -> list[str]:
+    """Return every plan-id-shaped span in *text*, in the order they appear.
+
+    "Shaped" is the operative word: this matches the *form* of a plan id,
+    not a known id. A caller that wants to know whether a text leaks a
+    private identifier asks this; a caller that wants to know whether a
+    *particular* id is present compares against the result.
+
+    One id can produce more than one span when a slug contains characters
+    the shape allows (a dot or a hyphen), so the same id may appear twice
+    in the result. The result is a list rather than a set because the
+    order carries information: a caller that rewrites text span by span
+    needs to know which came first.
+    """
+    if not text:
+        return []
+    return [match.group(0) for match in PLAN_ID_SHAPE.finditer(text)]
+
+
+def scrub_plan_ids(text: str, placeholder: str = PLAN_ID_PLACEHOLDER) -> str:
+    """Return *text* with every plan-id-shaped span replaced by *placeholder*.
+
+    The rewrite is **lossy on purpose**: the id is gone, not shortened and
+    not masked, because a partially-redacted id is still an id. Callers
+    that need to know whether anything was removed compare the result with
+    the input, or call :func:`find_plan_ids` first.
+
+    Text with no plan-id shape is returned byte-identical, so this is a
+    no-op on the overwhelming majority of inputs -- which matters because
+    the caller is a commit-message builder, and a commit message that
+    rewrites itself for no reason is harder to read than one that does not.
+    """
+    if not text:
+        return text
+    return PLAN_ID_SHAPE.sub(placeholder, text)

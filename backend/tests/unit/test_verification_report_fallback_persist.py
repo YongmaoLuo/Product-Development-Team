@@ -176,3 +176,38 @@ def test_fallback_write_failure_does_not_raise(plan_dir, monkeypatch):
     )
     assert report["overall_status"] == "FAILED"
     assert report["verification_results"], "fallback must still carry results"
+
+
+def test_fallback_report_never_calls_a_deferred_round_passed(plan_dir):
+    """A round that could not judge some of its points is not a pass.
+
+    The fallback used to derive a verdict of its own from
+    PASSED/FAILED/SKIPPED/PARTIAL counts, and DEFERRED had no tier in
+    that arithmetic — the points the round could not judge simply
+    vanished, so ten passed points plus two deferred ones came back as
+    ``PASSED``.  The round has one derivation,
+    :func:`verification_agent._derive_overall_status`, and under it an
+    unjudged point makes the round unjudged: ``SKIPPED``, never
+    ``PASSED``.
+    """
+    agent = _agent(plan_dir, _FailingTool())
+
+    results = {
+        "execution_results": [
+            {"id": f"VP-{index:03d}", "status": "PASSED"}
+            for index in range(1, 11)
+        ]
+        + [
+            {"id": "VP-011", "status": "DEFERRED"},
+            {"id": "VP-012", "status": "DEFERRED"},
+        ]
+    }
+
+    report = agent.generate_verification_report(
+        execution_results=results, retry_llm=1
+    )
+
+    assert report["overall_status"] == "SKIPPED", (
+        "a round with deferred points was published as "
+        f"{report['overall_status']!r}"
+    )

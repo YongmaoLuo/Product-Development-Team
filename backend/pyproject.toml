@@ -135,6 +135,24 @@ dev = [
     "pytest-xdist>=3.0",
     # Static security scan for the lint lane.
     "bandit>=1.7",
+    # Drives the real browser in the E2E lane (``tests/e2e/``): the
+    # browser replay asserts on what the **rendered** page shows, so a
+    # test double of the page would prove nothing.
+    #
+    # It is a dev dependency rather than a runtime one because the
+    # browser is a test instrument, not something the server needs.
+    # Declaring it here is what lets the e2e lane be reproducible: the
+    # CI e2e job installs it from this lockfile and runs
+    # ``playwright install chromium`` next to it, so the driver runs on
+    # the same package version the lockfile pins.
+    #
+    # The upper bound is load-bearing for the same reason ``filelock``'s
+    # is: the driver launches a Chromium it finds under the Playwright
+    # cache with an explicit ``executable_path``, and the Chromium
+    # revision that package expects has to be one it can actually
+    # drive.  A minor bump moves that revision, so the minor is pinned
+    # until the lane's browser matrix is re-measured.
+    "playwright>=1.62.0,<1.63.0",
 ]
 
 [tool.uv]

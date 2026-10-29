@@ -14,6 +14,10 @@
    回来；门面**不消费、不删除**它（消费是恢复路径的事）。
 5. **requeue 的迁移是 ``stopped → queued``** —— 那条边由状态机承担，门面
    只发起迁移，不自己改相位。
+6. **requeue 之后执行行的终态裁决被清掉** —— 迁回只动了路由相位；执行行
+   上那条 ``stopped`` 是 stop 写的。计划列表的终态判定读**两个**裁决
+   （``routes/plans.py`` 的 ``_plan_is_terminal``），两个裁决互相矛盾时
+   计划被列表过滤掉 —— 用户点了「重新排队」，卡片却从页面上消失了。
 
 被测的是门面的**相位语义**。既有 stop 端点在这里被换成记录器，外加它真实
 会做的两件事（写下 pause checkpoint、把相位停到 ``stopped``）—— 门面的
@@ -25,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Any, Dict
 
 import pytest
 
@@ -79,6 +84,48 @@ def _persisted_phase(plan_dir: Path) -> str:
     from plan_state import PlanState
 
     return PlanState(plan_dir).get_current_phase()
+
+
+def _write_exec_verdict(plan_id: str, **fields: Any) -> None:
+    """把执行行的裁决写进状态库。
+
+    真实 stop 走 ``routes/execution.py`` 的 ``_stop_running_execution``，
+    它落下的正是这条 ``exec_status='stopped'`` —— requeue 那条路径没有碰
+    它。这里把那次写入摆到门面前面，模拟「停已经发生」的现场。
+    """
+    import server
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+    )
+
+    conn = open_db(server._state_db_path(None))
+    try:
+        migrate(conn)
+        repo = ExecutionRepository(conn)
+        if repo.summary(plan_id) is None:
+            repo.insert(plan_id, **fields)
+        else:
+            repo.update_fields(plan_id, **fields)
+    finally:
+        conn.close()
+
+
+def _exec_row(plan_id: str) -> Dict[str, Any]:
+    """读回执行行（读不到就是空 dict）。"""
+    import server
+    from state_machine.db.connection import open as open_db
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+    )
+
+    conn = open_db(server._state_db_path(None))
+    try:
+        row = ExecutionRepository(conn).summary(plan_id)
+    finally:
+        conn.close()
+    return row or {}
 
 
 # ---------------------------------------------------------------------------
@@ -265,3 +312,59 @@ def test_requeue_transition_failure_keeps_stopped(
     assert any("requeue" in r.getMessage() for r in warnings), [
         r.getMessage() for r in warnings
     ]
+
+
+def test_requeue_clears_the_terminal_execution_verdict(
+    plans_dir, clean_state, stop_handlers,
+):
+    """requeue 之后，执行行上的终态裁决必须被清掉。
+
+    为什么这是必须的：计划列表的终态判定读**两个**裁决
+    （``routes/plans.py`` 的 ``_plan_is_terminal``）—— 路由相位不在终态
+    相位里时，执行裁决 ``stopped`` / ``failed`` **仍然是**终态。
+
+    两条裁决不同步：stop 把 ``stopped`` 写进执行行
+    （``routes/execution.py`` 的 ``_stop_running_execution``），requeue 只
+    迁回路由相位（``stopped → queued``）—— 它没有碰执行行。于是被迁回
+    队列的计划**不进列表**：用户点了「重新排队」，卡片却从页面上消失了。
+
+    终态判据本身不能动（它的第二个判据是为了兜住「进程崩了但路由相位
+    没跟上」那条路径），要修的是 requeue 这条路径 —— 把执行行的终态裁决
+    清掉，让两个裁决重新一致。
+    """
+    from plan_lifecycle_service import PlanLifecycleService
+    from routes.plans import _plan_is_terminal
+
+    plan_id = "requeue-verdict-p1"
+    _make_plan_dir(plans_dir, plan_id, phase="queued")
+    _mark_execution_alive(plan_id)
+    # 真实 stop 留下的那条执行行裁决。
+    _write_exec_verdict(
+        plan_id,
+        exec_status="stopped",
+        exec_pid=None,
+        stop_reason="user_requested",
+    )
+    assert _exec_row(plan_id).get("exec_status") == "stopped"
+
+    result = PlanLifecycleService().stop_plan(plan_id, requeue=True)
+
+    assert result.final_phase == "queued"
+    row = _exec_row(plan_id)
+    # 执行裁决不再是终态 —— 计划的两个裁决一致了，它因此能回到列表里。
+    assert not _plan_is_terminal(
+        _persisted_phase(plans_dir / plan_id), row.get("exec_status")
+    ), (
+        f"the requeued plan is still terminal: phase="
+        f"{_persisted_phase(plans_dir / plan_id)!r}, exec_status="
+        f"{row.get('exec_status')!r}"
+    )
+    # 执行进程已经没了，pid 不能留在行上（accident B 的形状）。
+    assert row.get("exec_pid") is None, (
+        f"the requeued plan still carries a pid: {row.get('exec_pid')!r}"
+    )
+    # 上一次运行留下的停止理由属于那一轮，不属于排队中的计划。
+    assert row.get("stop_reason") is None, (
+        f"the requeued plan still carries a stop reason: "
+        f"{row.get('stop_reason')!r}"
+    )

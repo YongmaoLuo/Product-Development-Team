@@ -494,8 +494,14 @@ def _relative(path: Path) -> str:
 #: The declared dependency set, frozen. A third-party dependency added
 #: to ``backend/pyproject.toml`` changes this value, and the gate says
 #: so instead of leaving it to a reviewer to notice.
+#:
+#: The set now carries ``playwright`` -- the browser the E2E lane drives
+#: -- with its lockfile entry beside it (the manifest/lock agreement gate
+#: holds).  The freeze moves to the branch's approved state: the
+#: dependency was added on purpose, and the rule stays "the dependency
+#: set changes once, and only that way".
 FROZEN_REQUIREMENTS_HASH: str = (
-    "a0bf3bba5487fe7aa35de6340476f231caa58f1baea5cdccbc917d15766165eb"
+    "57edf48275e05eb0eea55cbc9a5db2a946298df3eedaf854045d63a3271626eb"
 )
 
 #: The state db schema, frozen. A new table, a new column or a new
@@ -523,9 +529,19 @@ FROZEN_SCHEMA_DDL_HASH: str = (
 #: stays "these files change once, and only that way" — the approved
 #: change being the rename plus the capacity work, not the rename
 #: alone.
+#:
+#: ``frontend/app.js`` carries one more approved change on top of the
+#: rename: the legacy ``esc()`` helper now coerces its argument to a
+#: string before escaping it.  A task id in ``tasks.json`` is allowed to
+#: be a **number**, and ``(1).replace`` is a ``TypeError`` -- the page
+#: caught it and painted the empty state over a plan that *had* tasks,
+#: silently.  The freeze moves to the branch's approved state for the
+#: same reason it moved for the capacity work: the file changed once, on
+#: purpose, and the rule stays "these files change once, and only that
+#: way".
 FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     "frontend/app.js": (
-        "65e064074b3e4d9950508c550bb4ea1a492e04a936d9d26fe3eb39524b619b0c"
+        "ab889cde68f214b08e51d07910b2a45c890f01995577032c127580913e143e92"
     ),
     "frontend/style.css": (
         "4c38a1f0d1a661a9b0a48159e2db997974d4fa9e57c1b7af57d8e8812ea23a06"

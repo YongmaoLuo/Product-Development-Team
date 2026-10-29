@@ -8,6 +8,7 @@ Main orchestrator for autonomous software development.
 import asyncio
 import os
 import subprocess
+import sys
 import re
 import json
 import time
@@ -107,6 +108,7 @@ from hitl import service as hitl_service
 from utils.atomic_io import atomic_write_json
 from framework.task_graph import DanglingTaskDependency, find_dangling_references
 from framework.prompts import INLINE_SPEC_CODE_REVIEW_PROMPT
+from framework.ids import find_plan_ids, scrub_plan_ids
 # 2026-10-27（A5）: the round's environment facts live in ONE file —
 # ``<plan_dir>/context/round-<n>.json`` — written by ``context_pack``.
 # The briefs hand out that file's path instead of the facts, so a
@@ -8989,6 +8991,50 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
             )
         return True, inconclusive
 
+    #: Where the repository's commit-message rule lives, relative to the
+    #: project directory. The same file the ``commit-msg`` hook runs.
+    _COMMIT_MSG_CHECK_REL: tuple = ("scripts", "check_commit_msg.py")
+
+    def _commit_message_violation(self, message: str) -> str | None:
+        """Return why *message* breaks the repository's commit rules, or ``None``.
+
+        The rule lives in ``scripts/check_commit_msg.py`` -- the script
+        the ``commit-msg`` hook runs, stdlib-only so the hook works from
+        a bare ``python3`` with no venv. This runs that script rather
+        than restating the rule, because a second copy of a rule is a
+        second copy to keep in sync, and the whole point of the rule is
+        that it is the same rule everywhere.
+
+        Returns the checker's own diagnostics (which redact the offending
+        text), or ``None`` when the message is acceptable -- including
+        when the rule could not be evaluated at all. A check that cannot
+        run is not a violation: blocking every commit because the
+        checker is missing would be a worse failure than the one this
+        prevents.
+        """
+        project_dir = getattr(self, "project_dir", None)
+        if not project_dir:
+            return None
+        script = Path(project_dir).joinpath(*self._COMMIT_MSG_CHECK_REL)
+        if not script.is_file():
+            return None
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(script), "--stdin"],
+                input=message,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if proc.returncode == 0:
+            return None
+        if proc.returncode != 1:
+            # 2 is a setup error: the rule could not be evaluated.
+            return None
+        return (proc.stderr or proc.stdout or "").strip()
+
     def _commit_task_changes(self, task: SubTask, changed_files: List[str]):
         """
         Commit changes with task checkpoint format.
@@ -9016,6 +9062,82 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
             test_command=task.test_command,
             changed_files=changed_files
         )
+        # A task's description is free text written by the planning and
+        # repair loops, and it routinely names the plan the task belongs
+        # to -- the report path it has to write lives under the plan
+        # directory. ``create_task_commit`` pastes that text into the
+        # message verbatim, so the id would land in a COMMIT MESSAGE.
+        #
+        # That surface is the one place the repository's own gates cannot
+        # be argued with: ``scripts/check_commit_msg.py`` refuses any
+        # message carrying a date-prefixed plan id, and a commit message
+        # is public history that a force-push cannot take back (deleting
+        # a ref does not delete objects, and GitHub keeps
+        # ``refs/pull/<n>/head`` forever). So the id is removed here, at
+        # the one place every task commit passes through, rather than
+        # being left to whoever happens to write the next message.
+        #
+        # The rewrite is reported rather than silent: it loses
+        # information, and a loss nobody can see is a loss nobody can
+        # fix.
+        scrubbed_message = scrub_plan_ids(commit_message)
+        if scrubbed_message != commit_message:
+            scrubbed_count = len(find_plan_ids(commit_message))
+            commit_message = scrubbed_message
+            if self.logger:
+                self.logger.info(
+                    "task_commit_message_plan_id_scrubbed",
+                    (
+                        f"Removed {scrubbed_count} plan id(s) from the "
+                        f"checkpoint commit message for task [{task.id}]"
+                    ),
+                    task_id=task.id,
+                    data={"scrubbed_count": scrubbed_count},
+                )
+
+        # The scrub above removes the one violation the executor's own
+        # messages are realistically prone to. This is the backstop for
+        # every OTHER rule the repository has -- and it is the backstop
+        # that was missing.
+        #
+        # ``scripts/check_commit_msg.py`` is the repository's rule, and it
+        # is installed as a ``commit-msg`` hook. The hook does not run
+        # for the executor's commits: ``GitManager.commit`` is
+        # ``git add -A`` + ``repo.index.commit(message)``, and GitPython
+        # writes the object and updates the ref itself. So the rule
+        # guarded every commit a person made and every commit CI
+        # inspected, and guarded none of the commits the executor made on
+        # its own -- the commits whose message is assembled out of a
+        # task's free-text description.
+        #
+        # The executor is therefore held to the SAME rule, by running the
+        # SAME script: no second copy of the rule, so no second copy to
+        # drift. A rejected message is not committed -- the changes stay
+        # in the working tree and the next commit picks them up, so
+        # nothing is lost -- and the refusal is logged, because a
+        # refusal nobody can see is indistinguishable from a hang.
+        # The limitation belongs next to the code, not only in a report:
+        # this guard covers the one call site every task commit passes
+        # through today. A second call site of ``GitManager.commit`` —
+        # anything that assembles a message somewhere else — would
+        # bypass both the scrub above and this check. What makes the
+        # guard complete is that the commit happens in one place; a new
+        # caller has to repeat it.
+        violation = self._commit_message_violation(commit_message)
+        if violation is not None:
+            if self.logger:
+                self.logger.error(
+                    "task_commit_message_rejected",
+                    (
+                        f"Refused to create the checkpoint commit for task "
+                        f"[{task.id}]: the repository's commit-message rule "
+                        f"rejects it. The changes stay in the working tree."
+                    ),
+                    task_id=task.id,
+                    data={"violation": violation[:1000]},
+                )
+            return False
+
         self.git_manager.commit(commit_message)
         # Write back the resulting commit SHA so the per-task row in
         # ``plan_tasks`` (and ``runtime_overrides``) reflects the git

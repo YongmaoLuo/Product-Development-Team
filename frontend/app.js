@@ -95,7 +95,16 @@ async function api(path, options = {}) {
 
 function $(sel) { return document.querySelector(sel); }
 function $$(sel) { return document.querySelectorAll(sel); }
-function esc(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+// The legacy escaping helper — the renderers that predate escapeHtml()
+// still call this one.  It must never throw: a task id in tasks.json is
+// allowed to be a **number**, and `s.replace` on a Number is a TypeError
+// that used to blank the whole task list (loadTasks catches it and paints
+// 「任务尚未生成」 over a plan that *has* tasks — silently, with a clean
+// console).  Coerce first, escape second.
+//
+// The escaped set is deliberately unchanged: escapeHtml() also escapes the
+// apostrophe, and adding it here would change what the page renders.
+function esc(s) { return String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 
 // HTML-escape for innerHTML template interpolation. Used by every plan/task
 // view renderer so server-supplied fields (plan id, status, title, etc.) cannot
