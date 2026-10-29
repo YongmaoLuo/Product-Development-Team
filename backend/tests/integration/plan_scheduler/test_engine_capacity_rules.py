@@ -410,6 +410,7 @@ def _world(
     ledger = CapacityLedger(store, facts, clock)
     lifecycle = FakeLifecycle(conn, facts)
     config_loader = StaticConfigLoader(
+        enabled=True,
         capacity=capacity,
         min_runtime_seconds=min_runtime_seconds,
         tick_seconds=0.01,

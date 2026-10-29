@@ -331,10 +331,15 @@ def _run_action(request: Request, plan_id: str, action: str) -> JSONResponse:
         running.  It is the answer of the thing that raised it.
     """
     engine = getattr(request.app.state, "scheduler_engine", None)
-    if engine is None:
+    if engine is None or not engine.enabled:
         # The scheduler is switched off, or it could not be started.
         # There is no command to make, so there is no outcome to
         # report: what the caller gets is the reason there is none.
+        #
+        # A scheduler that is switched off still has its worker thread —
+        # the switch is read on every tick, so it can be turned on
+        # without a restart — but it carries out nothing, and an action
+        # it carries out nothing with is an action it refuses.
         raise HTTPException(
             503,
             {

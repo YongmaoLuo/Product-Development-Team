@@ -343,6 +343,7 @@ def _world(
 
     engine = _probe_engine(
         config_loader=StaticConfigLoader(
+            enabled=True,
             capacity=capacity,
             min_runtime_seconds=min_runtime_seconds,
             tick_seconds=tick_seconds,

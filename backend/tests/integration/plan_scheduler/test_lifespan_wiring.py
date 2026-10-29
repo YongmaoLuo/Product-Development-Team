@@ -10,9 +10,11 @@ in:
 * it is hung on ``app.state.scheduler_engine``;
 * on the way out it is stopped and joined **before** the application
   state is taken apart;
-* ``enabled: false`` starts no worker at all — "not running" has to
-  mean "no thread", or "there is exactly one scheduler at any moment"
-  is a claim about a thread that is still running.
+* ``enabled: false`` starts no **decision** at all — the worker is
+  there and it ticks, but the tick does nothing, and it does not even
+  open the database: "not running" has to mean "nothing happens", or
+  "there is exactly one scheduler at any moment" is a claim about a
+  thread that is still running.
 
 The cases drive the real ``server._lifespan`` against a fake app and
 watch the worker thread it leaves behind.  The engine itself is the
@@ -26,6 +28,7 @@ import asyncio
 import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from unittest.mock import MagicMock
@@ -201,36 +204,66 @@ def _drive(server_module: Any, app: Any, inside: Callable[[], None]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_disabled_does_not_start_thread(
+def test_disabled_starts_a_worker_that_does_nothing(
     server_module, startup, settings, recording_engine
 ) -> None:
-    """``enabled: false`` — no worker thread, and no engine on the app.
+    """``enabled: false`` — the worker runs, and it does nothing at all.
 
-    A scheduler that is switched off must leave no thread behind.  The
-    thread is the scheduler as far as the rest of the system is
-    concerned, and a thread that is still running is a scheduler that is
-    still running.
+    The switch is read on every tick, so the worker exists whether the
+    scheduler may run or not: a switch that is read can be turned
+    without a restart.  What the switch decides is what the tick does,
+    and a tick that may not schedule does nothing at all — it does not
+    even open the database, because "may not run" has to mean "nothing
+    happens".
     """
-    settings(enabled=False)
+    settings(
+        enabled=False,
+        dry_run=True,
+        capacity=1,
+        min_runtime_seconds=0,
+        tick_seconds=0.05,
+        command_timeout_seconds=1,
+    )
 
     app = _FakeApp()
-    _drive(server_module, app, lambda: None)
+    observed: Dict[str, Any] = {}
 
-    assert hasattr(app.state, "scheduler_engine"), (
+    def _inside() -> None:
+        engine = getattr(app.state, "scheduler_engine", None)
+        observed["engine"] = engine
+        observed["threads"] = _engine_threads()
+        deadline = time.monotonic() + 5.0
+        while (
+            engine is not None
+            and engine.ticks < 1
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        observed["ticks"] = engine.ticks if engine is not None else 0
+        observed["bound"] = getattr(engine, "bound", None)
+
+    _drive(server_module, app, _inside)
+
+    assert observed["engine"] is not None, (
         "the lifespan must publish the engine handle even when the "
-        "scheduler is off — a reader must be able to tell 'off' from "
-        "'not wired yet'"
+        "scheduler is off — the switch is read on every tick, so the "
+        "worker is there and it is the worker that decides"
     )
-    assert app.state.scheduler_engine is None, (
-        "a disabled scheduler must leave no engine on the app"
+    assert len(observed["threads"]) == 1, (
+        "a disabled scheduler must leave exactly one worker behind: "
+        f"{[t.name for t in observed['threads']]!r}"
     )
-    assert _engine_threads() == [], (
-        "a disabled scheduler started a worker thread: "
-        f"{[t.name for t in _engine_threads()]!r}"
+    assert observed["ticks"] >= 1, (
+        "the worker never ticked — a worker that does not tick cannot "
+        "notice that the switch was turned on"
     )
-    assert "engine" not in startup, (
-        "the engine was constructed even though the configuration "
-        "switched the scheduler off"
+    assert observed["bound"] is False, (
+        "a scheduler that may not run must not open the database: "
+        "opening it is something that happens, and nothing may happen"
+    )
+    assert "engine" in startup, (
+        "the engine was never constructed — the worker that watches the "
+        "switch is the engine"
     )
 
 
@@ -367,10 +400,11 @@ def test_construction_failure_is_logged_and_cleaned_up(
 ) -> None:
     """An engine that cannot be built does not take the API down.
 
-    The failure is logged, the app carries no engine, and the resources
-    that were created before the failure are given back — a connection
-    that was opened and never closed is a file descriptor that is never
-    returned.
+    The failure is logged, the app carries no engine, and nothing was
+    opened: the database is opened when the scheduler may run, and a
+    scheduler that could not be built never gets that far.  A
+    connection that was opened and never closed is a file descriptor
+    that is never returned — and here there is none to return.
     """
     settings(
         enabled=True,
@@ -416,7 +450,9 @@ def test_construction_failure_is_logged_and_cleaned_up(
         "not start has to say so: "
         f"{[r.getMessage() for r in caplog.records]!r}"
     )
-    assert opened, "the database was never opened — nothing was cleaned up"
-    for conn in opened:
-        with pytest.raises(sqlite3.ProgrammingError):
-            conn.execute("SELECT 1")
+    assert opened == [], (
+        "the database was opened although the engine was never built: "
+        f"{len(opened)} connection(s). The database is opened when the "
+        "scheduler may run, and a scheduler that could not be built "
+        "never runs."
+    )

@@ -35,7 +35,7 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import yaml
 
@@ -240,16 +240,25 @@ class SchedulerConfigLoader:
     that was complete when it was handed over.
     """
 
-    def __init__(self, path: os.PathLike[str] | str) -> None:
-        self._path = Path(path)
+    def __init__(self, path: os.PathLike[str] | str | None) -> None:
+        """Bind the loader to a file.
+
+        Args:
+            path: the file the settings are read from.  ``None`` means
+                "there is no file": the loader answers the defaults and
+                never touches the disk — a scheduler whose settings were
+                not found still starts, and it starts with the
+                defaults.
+        """
+        self._path = Path(path) if path is not None else None
         self._lock = threading.Lock()
         self._snapshot: SchedulerConfig = SchedulerConfig()
         self._fingerprint: Optional[Tuple[int, int]] = None
         self._seen = False
 
     @property
-    def path(self) -> Path:
-        """The file this loader reads."""
+    def path(self) -> Optional[Path]:
+        """The file this loader reads, or ``None`` when it reads none."""
         return self._path
 
     def current(self) -> SchedulerConfig:
@@ -278,6 +287,8 @@ class SchedulerConfigLoader:
 
     def _fingerprint_of(self) -> Optional[Tuple[int, int]]:
         """The file's ``(mtime_ns, size)``, or ``None`` when it is not there."""
+        if self._path is None:
+            return None
         try:
             stat = self._path.stat()
         except OSError:
@@ -292,6 +303,11 @@ class SchedulerConfigLoader:
         value the scheduler cannot act on.  The caller keeps the
         snapshot it already had.
         """
+        if self._path is None:
+            # There is no file: the defaults are the answer, and there
+            # is nothing to complain about.
+            return None
+
         try:
             with open(self._path, "r", encoding="utf-8") as handle:
                 raw = handle.read()
@@ -322,3 +338,83 @@ class SchedulerConfigLoader:
                 SECTION,
             )
         return snapshot
+
+
+# ---------------------------------------------------------------------------
+# Where the settings come from
+# ---------------------------------------------------------------------------
+
+#: The levels of the chain, in the order they are tried.  The name is
+#: what the log says, so the log says where the file came from.
+SOURCE_ENV = "env"
+SOURCE_CONFIG_DIR = "config-dir"
+SOURCE_BACKEND = "backend"
+SOURCE_DEFAULT = "default"
+
+
+@dataclass(frozen=True)
+class SchedulerConfigSource:
+    """Where the scheduler's settings are read from.
+
+    Attributes:
+        path: the file the settings are read from, or ``None`` when
+            there is no file at all and the defaults apply.
+        level: which level of the chain the file came from — one of
+            :data:`SOURCE_ENV`, :data:`SOURCE_CONFIG_DIR`,
+            :data:`SOURCE_BACKEND` or :data:`SOURCE_DEFAULT`.
+    """
+
+    path: Optional[Path]
+    level: str
+
+
+def _is_readable_settings_file(path: Path) -> bool:
+    """Whether the file is there and can be read as settings.
+
+    A file that is not there is not a file.  A file that is there but
+    cannot be read — not YAML, or YAML that is not a mapping — is a
+    file the chain steps over: the next level is tried, and the
+    scheduler ends up with a file it can use.
+
+    A file that *is* readable is not judged any further here.  Whether
+    the settings inside it are usable is the loader's business, and the
+    loader's rule is the stricter one: a value it cannot act on leaves
+    the previous snapshot in place.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    try:
+        document = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        return False
+    return isinstance(document, dict)
+
+
+def resolve_scheduler_config_source(
+    candidates: Sequence[Tuple[str, Path]],
+) -> SchedulerConfigSource:
+    """The first candidate that can be read, or the defaults.
+
+    The chain is tried in order, and the first candidate that is there
+    — and that can be read as settings — is the file the loader reads.
+    A candidate that is missing or broken does not stop the chain: the
+    next one is tried, and the last level of all is the loader's own
+    defaults.
+
+    Nothing here raises.  A scheduler that cannot find its settings
+    still starts, and it starts with the defaults — which say
+    ``enabled: false``, so a scheduler nobody configured does not
+    schedule anything.
+
+    The chain is resolved **once**, when the scheduler is built.  A file
+    that is broken at that moment is stepped over for the life of the
+    process; the loader's own rule — a file that breaks *later* leaves
+    the previous snapshot in place — covers the other half.
+    """
+    for level, path in candidates:
+        candidate = Path(path)
+        if _is_readable_settings_file(candidate):
+            return SchedulerConfigSource(path=candidate, level=level)
+    return SchedulerConfigSource(path=None, level=SOURCE_DEFAULT)

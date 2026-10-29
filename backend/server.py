@@ -121,10 +121,15 @@ from dynamic_provider_concurrency import (
     set_shared_tracker,
 )
 from config_paths import (
+    BACKEND_CONFIG_YAML,
     ENV_FILE,
     PROJECT_ROOT,
+    SCHEDULER_FILE_ENV,
+    SCHEDULER_FILE_NAME,
     STATE_DB,
     STATE_DB_ENV,
+    resolve_config_dir,
+    resolve_scheduler_file,
     resolve_server_host,
     resolve_state_db_path,
 )
@@ -1114,13 +1119,58 @@ class _SchedulerRuntime(NamedTuple):
     owned: bool
 
 
-def _scheduler_settings_path() -> Path:
+def _scheduler_settings_candidates() -> List[Tuple[str, Path]]:
+    """The chain the scheduler's settings are read from, in order.
+
+    1. the file ``PDT_SCHEDULER_FILE`` names — the operator's escape
+       hatch for a deployment that keeps its settings elsewhere;
+    2. ``<config dir>/scheduler.yaml`` — the operator's own file, in the
+       gitignored directory the provider tables live in;
+    3. the backend's own ``config.yaml`` — the file that ships with the
+       repository, and the one the deployments that know nothing about
+       this setting rely on.
+
+    The chain is tried in order and the first file that is there — and
+    that can be read as settings — is the file.  When no file is there
+    at all, the loader's own defaults apply.
+    """
+    from plan_scheduler.config import (
+        SOURCE_BACKEND,
+        SOURCE_CONFIG_DIR,
+        SOURCE_ENV,
+    )
+
+    candidates: List[Tuple[str, Path]] = []
+    if (os.environ.get(SCHEDULER_FILE_ENV) or "").strip():
+        candidates.append((SOURCE_ENV, resolve_scheduler_file()))
+    candidates.append(
+        (SOURCE_CONFIG_DIR, resolve_config_dir() / SCHEDULER_FILE_NAME)
+    )
+    candidates.append((SOURCE_BACKEND, BACKEND_CONFIG_YAML))
+    return candidates
+
+
+def _scheduler_settings_source() -> Any:
+    """Where the scheduler's settings come from: the file and its level.
+
+    The level is what the log says, so the log says whether the
+    settings came from the operator's own file, from the environment,
+    from the backend's configuration, or from nowhere at all.
+    """
+    from plan_scheduler.config import resolve_scheduler_config_source
+
+    return resolve_scheduler_config_source(_scheduler_settings_candidates())
+
+
+def _scheduler_settings_path() -> Optional[Path]:
     """The YAML file the scheduler's settings are read from.
 
-    The scheduler reads the ``scheduler:`` section of the backend's own
-    ``config.yaml`` — the file the runtime state is built from too.
+    The chain is in :func:`_scheduler_settings_candidates`, and the
+    file it settles on is the one the loader watches.  ``None`` means
+    there is no file at all: the loader then answers with its own
+    defaults, and the scheduler runs with ``enabled: false``.
     """
-    return Path(__file__).parent / "config.yaml"
+    return _scheduler_settings_source().path
 
 
 def _scheduler_sink(
@@ -1243,14 +1293,19 @@ def _release_scheduler_engine(engine: Any, conn: Any) -> None:
 def _build_scheduler_engine() -> _SchedulerRuntime:
     """Build the scheduler engine, start its worker, and hand it back.
 
-    An engine of ``None`` means the scheduler is not running:
+    The worker starts **whatever the configuration says**.  ``enabled`` is
+    read on every tick and not once at boot, so the scheduler can be
+    switched on and off without a restart — and the switch is the same
+    switch the rollback uses.
 
-    * ``enabled: false`` — the worker thread is never started at all.  A
-      scheduler that is switched off must leave no thread behind, or
-      "there is exactly one scheduler" would be a claim about a thread
-      that is still running.
-    * the engine could not be built — the failure is logged and
-      everything that was created before it is given back.
+    The database is opened the first time the scheduler may run.  A
+    scheduler that may not run must not touch the database: "may not
+    run" has to mean "nothing happens", and opening the database is
+    something that happens.
+
+    An engine of ``None`` means the scheduler is not running at all:
+    the engine could not be built — the failure is logged and
+    everything that was created before it is given back.
 
     The worker is a daemon thread, so it is never the reason the
     process stays alive; the shutdown path stops it and joins it.
@@ -1259,53 +1314,78 @@ def _build_scheduler_engine() -> _SchedulerRuntime:
     from plan_scheduler.capacity import CapacityLedger
     from plan_scheduler.commands import CommandExecutor
     from plan_scheduler.config import SchedulerConfigLoader
-    from plan_scheduler.engine import PlanSchedulerEngine
+    from plan_scheduler.engine import EngineParts, PlanSchedulerEngine
     from plan_scheduler.facts import PlanFactsReader
     from plan_scheduler.store import SqliteSchedulerStore
     from state_machine.db.connection import open as open_db
     from state_machine.db.schema import migrate
 
-    config_loader = SchedulerConfigLoader(_scheduler_settings_path())
-    snapshot = config_loader.current()
-    if not snapshot.enabled:
-        logger.warning(
-            "[scheduler] disabled by the configuration; the worker thread "
-            "is not started"
-        )
-        return _SchedulerRuntime(None, None, False)
+    path = _scheduler_settings_path()
+    source = _scheduler_settings_source()
+    logger.warning(
+        "[scheduler] settings: %s (source: %s)",
+        path if path is not None else "the built-in defaults",
+        source.level,
+    )
 
-    conn = None
+    config_loader = SchedulerConfigLoader(path)
+    snapshot = config_loader.current()
+
+    def _bind() -> EngineParts:
+        """Open the database and build the scheduler's collaborators.
+
+        This runs the first time the configuration says the scheduler may
+        run, and not before.  A connection that was opened and never
+        given back is a file descriptor that is never returned, so a
+        failure here closes it again.
+        """
+        conn = None
+        try:
+            conn = open_db(_state_db_path())
+            migrate(conn)
+            current = config_loader.current()
+            store = SqliteSchedulerStore()
+            facts = PlanFactsReader(conn, PLANS_DIR)
+            ledger = CapacityLedger(store, facts, conn=conn)
+            lifecycle = PlanLifecycleService()
+            commands = CommandExecutor(
+                store,
+                ledger,
+                lifecycle,
+                facts=facts,
+                conn=conn,
+                capacity=current.capacity,
+                min_runtime_seconds=current.min_runtime_seconds,
+                # The same loader the engine reads.  The tick and the
+                # explicit start are the two triggers that may interrupt
+                # somebody, and they have to read the same snapshot at
+                # the same moment — otherwise they pick their victim out
+                # of two different candidate sets.
+                config_provider=config_loader,
+            )
+            return EngineParts(
+                store=store,
+                facts=facts,
+                ledger=ledger,
+                commands=commands,
+                sink=_scheduler_sink(current, lifecycle, facts, store, conn),
+                conn=conn,
+            )
+        except Exception:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001 — the teardown must not raise
+                    logger.exception(
+                        "[scheduler] the scheduler's connection could not be closed"
+                    )
+            raise
+
     engine = None
     try:
-        conn = open_db(_state_db_path())
-        migrate(conn)
-        store = SqliteSchedulerStore()
-        facts = PlanFactsReader(conn, PLANS_DIR)
-        ledger = CapacityLedger(store, facts, conn=conn)
-        lifecycle = PlanLifecycleService()
-        commands = CommandExecutor(
-            store,
-            ledger,
-            lifecycle,
-            facts=facts,
-            conn=conn,
-            capacity=snapshot.capacity,
-            min_runtime_seconds=snapshot.min_runtime_seconds,
-            # The same loader the engine reads.  The tick and the
-            # explicit start are the two triggers that may interrupt
-            # somebody, and they have to read the same snapshot at the
-            # same moment — otherwise they pick their victim out of two
-            # different candidate sets.
-            config_provider=config_loader,
-        )
         engine = PlanSchedulerEngine(
             config_loader,
-            store,
-            facts,
-            ledger,
-            commands,
-            _scheduler_sink(snapshot, lifecycle, facts, store, conn),
-            conn=conn,
+            binder=_bind,
             # The engine reads one file out of the plans tree: the plan's
             # own artifact, which carries the priority the caller gave
             # when it asked for the plan.  The queue row is the
@@ -1322,14 +1402,16 @@ def _build_scheduler_engine() -> _SchedulerRuntime:
         logger.exception(
             "[scheduler] the engine could not be built; continuing without it"
         )
-        _release_scheduler_engine(engine, conn)
+        _release_scheduler_engine(engine, None)
         return _SchedulerRuntime(None, None, False)
 
     logger.warning(
-        "[scheduler] started: capacity=%d dry_run=%s tick_seconds=%.1fs",
+        "[scheduler] started: capacity=%d dry_run=%s tick_seconds=%.1fs "
+        "enabled=%s",
         snapshot.capacity, snapshot.dry_run, snapshot.tick_seconds,
+        "yes" if snapshot.enabled else "no",
     )
-    return _SchedulerRuntime(engine, conn, True)
+    return _SchedulerRuntime(engine, None, True)
 
 
 def _start_scheduler(app: Any) -> _SchedulerRuntime:

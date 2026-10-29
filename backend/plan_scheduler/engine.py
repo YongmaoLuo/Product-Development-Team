@@ -197,8 +197,38 @@ __all__ = [
     "TICK_PHASES",
     "THREAD_NAME",
     "EngineCommandResult",
+    "EngineParts",
     "PlanSchedulerEngine",
 ]
+
+
+@dataclass(frozen=True)
+class EngineParts:
+    """What the engine is bound to while it runs.
+
+    The engine is built before it knows whether it may run: the
+    configuration says so, and the configuration is read on every tick.
+    The parts are therefore bound **when the scheduler may run**, not
+    when the engine is constructed — a scheduler that may not run must
+    not open the database, because "may not run" has to mean "nothing
+    happens", and opening the database is something that happens.
+
+    Attributes:
+        store: the scheduler's own store — the only writer of the queue,
+            the slots and the command log.
+        facts: the reader that derives the plan facts.
+        ledger: the capacity ledger.
+        commands: the command executor.
+        sink: where the tick's decisions go.
+        conn: the connection the engine writes on.
+    """
+
+    store: Any
+    facts: Any
+    ledger: Any
+    commands: Any
+    sink: Any
+    conn: Any
 
 
 #: The file in a plan's own directory that carries the intent the
@@ -235,6 +265,11 @@ TICK_PHASES: Tuple[str, ...] = (
     "execute",
     "record",
 )
+
+#: The phase that reads the configuration.  It is the one phase that
+#: always runs: the switch it reads is what decides whether the rest of
+#: the tick runs at all.
+TICK_PHASE_REFRESH_CONFIG = "refresh_config"
 
 #: The outcome of a command that is still in flight — the word the
 #: command's record carries between being accepted and being finished.
@@ -431,16 +466,17 @@ class PlanSchedulerEngine:
     def __init__(
         self,
         config_loader: Any,
-        store: Any,
-        facts: Any,
-        ledger: Any,
-        commands: Any,
-        sink: Any,
+        store: Any = None,
+        facts: Any = None,
+        ledger: Any = None,
+        commands: Any = None,
+        sink: Any = None,
         clock: Optional[Callable[[], float]] = None,
         *,
         conn: Optional[sqlite3.Connection] = None,
         thread_name: str = THREAD_NAME,
         plans_dir: Optional[Any] = None,
+        binder: Optional[Callable[[], EngineParts]] = None,
     ) -> None:
         """Bind the engine to its collaborators.
 
@@ -468,6 +504,13 @@ class PlanSchedulerEngine:
                 when it asked for the plan.  It is the plan's fact and
                 not the scheduler's, which is why it lives beside the
                 plan rather than in a ``scheduler_*`` table.
+            binder: how the engine gets its collaborators **later**.  It
+                is called once, the first time the configuration says
+                the scheduler may run, and it hands back the parts the
+                engine works with.  A binder is what lets the worker
+                thread exist while the scheduler is switched off: the
+                thread is there, it ticks, and it does nothing at all —
+                and it does not even open the database.
         """
         self._config_loader = config_loader
         self._store = store
@@ -482,11 +525,24 @@ class PlanSchedulerEngine:
         self._conn = conn if conn is not None else _connection_of(
             commands, ledger, facts
         )
-        if self._conn is None:
+        if self._conn is None and binder is None:
             raise ValueError(
                 "the scheduler engine needs a connection to write the "
                 "queue, the slots and the command log on"
             )
+
+        self._binder = binder
+        #: Whether the engine is bound to its collaborators.  An engine
+        #: with a binder starts unbound and binds itself the first time
+        #: the configuration says it may run.
+        self._bound = binder is None
+        #: Whether the engine opened the connection itself.  A connection
+        #: the engine was given belongs to whoever made it; a connection
+        #: the engine opened is the engine's to give back.
+        self._owns_conn = False
+        #: The switch as the last tick saw it.  ``None`` means "the
+        #: scheduler has not said yet", so the first tick says it.
+        self._enabled_state: Optional[bool] = None
 
         self._mailbox: "queue.Queue[Any]" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
@@ -521,6 +577,27 @@ class PlanSchedulerEngine:
     def thread(self) -> Optional[threading.Thread]:
         """The worker thread, or ``None`` before it is started."""
         return self._thread
+
+    @property
+    def enabled(self) -> bool:
+        """Whether the scheduler may run right now.
+
+        The configuration is read here, not remembered: the switch is
+        read on every tick, and a reader that is told "off" while the
+        scheduler is on would be told a lie.  A configuration that
+        cannot be read keeps the snapshot the last tick had.
+        """
+        return bool(getattr(self._read_config(), "enabled", False))
+
+    @property
+    def bound(self) -> bool:
+        """Whether the engine is bound to its collaborators.
+
+        An unbound engine has not opened the database yet: it is a
+        scheduler that may not run, and it is waiting for the
+        configuration to say that it may.
+        """
+        return self._bound
 
     # ------------------------------------------------------------------
     # The lifecycle
@@ -573,19 +650,29 @@ class PlanSchedulerEngine:
         them, and only then stops.  A command that is dropped on the
         floor is a command the operator was told nothing about.
 
+        The connection the engine opened itself is given back here: a
+        connection that was opened and never closed is a file descriptor
+        that is never returned.  A connection the engine was *given* is
+        not the engine's to close — it belongs to whoever made it.
+
         Args:
             timeout: how long to wait for the worker to finish.
         """
         thread = self._thread
-        if thread is None:
-            return
-        self._mailbox.put(_SHUTDOWN)
-        if thread.is_alive():
-            thread.join(timeout)
-        if thread.is_alive():
-            log.error(
-                "the scheduler engine did not stop within %s seconds", timeout
-            )
+        if thread is not None:
+            self._mailbox.put(_SHUTDOWN)
+            if thread.is_alive():
+                thread.join(timeout)
+            if thread.is_alive():
+                log.error(
+                    "the scheduler engine did not stop within %s seconds", timeout
+                )
+        if self._owns_conn and self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:  # noqa: BLE001 — the teardown must not raise
+                log.exception("the scheduler's connection could not be closed")
+            self._conn = None
 
     # ------------------------------------------------------------------
     # The recovery
@@ -816,6 +903,15 @@ class PlanSchedulerEngine:
                 "the scheduler engine is not running: a command needs the "
                 "worker that carries it out"
             )
+        if not self.enabled:
+            # The scheduler is switched off: it carries out nothing.  The
+            # refusal is the caller's answer, and it is raised here, in
+            # the caller's thread, for the same reason the route refuses
+            # the action before it reaches the mailbox.
+            raise RuntimeError(
+                "the scheduler is switched off: it carries out no commands "
+                "until the configuration says it may run"
+            )
         if threading.current_thread() is self._thread:
             # The worker cannot wait for itself: the command it is
             # waiting for is the command it has to carry out.
@@ -927,6 +1023,12 @@ class PlanSchedulerEngine:
         """
         if self._thread is None or not self._thread.is_alive():
             return False
+        if not self.enabled:
+            # The scheduler is switched off: it writes nothing, and the
+            # queue is one of the things it writes.  The plan is not
+            # lost — the tick reconciles the queue when the scheduler is
+            # switched on again.
+            return False
 
         request = _EnqueueRequest(plan_id=plan_id, priority=int(priority))
         self._mailbox.put(request)
@@ -1001,12 +1103,65 @@ class PlanSchedulerEngine:
         The snapshot is assembled by the same read path and the same
         comparator the tick uses, so the panel cannot show one order
         while the scheduler runs another.
+
+        A scheduler that has never been bound has no state to read:
+        it answers with the idle document, which is what the panel
+        shows for a scheduler that is not running.
         """
+        if not self._bound:
+            return build({})
         return build(self._read_state())
 
     # ------------------------------------------------------------------
     # The worker
     # ------------------------------------------------------------------
+
+    def _bind(self) -> bool:
+        """Bind the engine to its collaborators, once.
+
+        The binder is called the first time the configuration says the
+        scheduler may run.  It opens the database and builds the
+        collaborators; a binder that raises is recorded and the engine
+        stays unbound, and the next tick tries again.
+
+        Returns whether the engine is bound afterwards.
+        """
+        if self._bound:
+            return True
+        if self._binder is None:  # pragma: no cover - defensive
+            return False
+        try:
+            parts = self._binder()
+        except Exception as exc:  # noqa: BLE001 — the tick tries again
+            self._record_error("bind", exc)
+            log.exception("the scheduler could not be bound to the database")
+            return False
+        self._store = parts.store
+        self._facts = parts.facts
+        self._ledger = parts.ledger
+        self._commands = parts.commands
+        self._sink = parts.sink
+        self._conn = parts.conn
+        self._bound = True
+        self._owns_conn = True
+        # The recovery is the worker's first job, and it can only run
+        # once the engine knows the world it is recovering.
+        self._recover_safely()
+        return True
+
+    def _may_schedule(self) -> bool:
+        """Whether this tick may schedule anything.
+
+        The configuration decides, and it is read on every tick: a
+        scheduler that is switched off does nothing at all — it starts
+        no plan, moves no phase, writes no row.
+
+        A scheduler that may run binds itself first: until it is bound
+        it has no database to write on.
+        """
+        if not bool(getattr(self._config, "enabled", False)):
+            return False
+        return self._bind()
 
     def _run(self) -> None:
         """Take the mailbox's items until the engine is stopped.
@@ -1043,7 +1198,13 @@ class PlanSchedulerEngine:
         tick reconciles the queue and the slots on every turn, so a
         recovery that failed is a bookkeeping problem the next tick
         fixes by itself.
+
+        An engine that is not bound has no state to recover: the
+        recovery runs when the scheduler is bound, which is when it may
+        run at all.
         """
+        if not self._bound:
+            return
         try:
             self._recover()
         except Exception as exc:  # noqa: BLE001 — the tick reconciles too
@@ -1074,6 +1235,13 @@ class PlanSchedulerEngine:
         The job is answered whatever happens: a job that raised must not
         leave its caller waiting for an answer that is not coming.
         """
+        if not self._bound:
+            # The scheduler may not run: there is no queue to write on.
+            # The plan is not lost — the tick reconciles the queue when
+            # the scheduler is switched on again.
+            request.done = False
+            request.done_event.set()
+            return
         try:
             intended = self._intended_priority(request.plan_id)
             priority = request.priority if intended is None else intended
@@ -1112,9 +1280,23 @@ class PlanSchedulerEngine:
     # ------------------------------------------------------------------
 
     def _run_tick(self) -> None:
-        """Run the tick's phases, in order."""
+        """Run the tick's phases, in order.
+
+        The tick reads the configuration first, and the switch in it
+        decides what the rest of the tick does: a scheduler that is
+        switched off does **nothing** this tick.  It starts no plan, it
+        moves no phase, it writes no row — and it leaves the plans that
+        are running exactly as it found them.
+
+        A tick that did nothing is still a tick: it is counted, and the
+        next one is due the usual number of seconds later.
+        """
         self._tick_decisions = []
         for name in TICK_PHASES:
+            if name != TICK_PHASE_REFRESH_CONFIG and not self._may_schedule():
+                # The scheduler is off: this tick is over, and the rest
+                # of its phases are not run.
+                break
             self._run_phase(name)
         self._ticks += 1
         self._next_tick_at = time.monotonic() + self._tick_seconds()
@@ -1136,6 +1318,29 @@ class PlanSchedulerEngine:
     def _phase_refresh_config(self) -> None:
         """Read the configuration snapshot this tick runs with."""
         self._config = self._read_config()
+        self._note_enabled_state()
+
+    def _note_enabled_state(self) -> None:
+        """Say once that the switch moved, and nothing at all when it did not.
+
+        The switch is read on every tick.  A line per tick would be a
+        flood nobody reads, and a switch that is read is a switch whose
+        change has to be visible — a scheduler that was switched off
+        and switched on again has to say so.
+        """
+        enabled = bool(getattr(self._config, "enabled", False))
+        if enabled == self._enabled_state:
+            return
+        self._enabled_state = enabled
+        if enabled:
+            log.warning(
+                "the scheduler is enabled; it may schedule plans again"
+            )
+        else:
+            log.warning(
+                "the scheduler is disabled; it schedules nothing and "
+                "writes nothing until it is enabled again"
+            )
 
     def _phase_read_state(self) -> None:
         """Read the state this tick decides on."""
@@ -1634,6 +1839,26 @@ class PlanSchedulerEngine:
         only once: a command that is somehow handled twice changes
         nothing the second time.
         """
+        if not self._bound:
+            # The scheduler may not run: it carries out nothing.  The
+            # command is answered as failed, so that it is neither lost
+            # nor mistaken for an action that was carried out — and
+            # nothing is written, because there is no database to write
+            # on.
+            request.recorded_event.set()
+            request.result = EngineCommandResult(
+                outcome=FAILED,
+                command_id=None,
+                detail=(
+                    "the scheduler is switched off: it carries out no "
+                    "commands until the configuration says it may run"
+                ),
+                plan_id=request.plan_id,
+                action=request.action,
+            )
+            request.result_event.set()
+            return
+
         command_id = request.command_id
         if command_id is None:
             # The command could not be written down when it was
