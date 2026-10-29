@@ -82,6 +82,37 @@ def runtime_state_class(server_module):
     return server_module.RuntimeState
 
 
+#: The modules the two boot sweeps are defined in.  A stand-in that a
+#: test installs itself lives in the test module, so the defining
+#: module is what tells "nobody has replaced this yet" from "a test
+#: has".
+_REAL_REAP_MODULE = "service_manager"
+_REAL_SWEEP_MODULE = "utils.secret_sweep"
+
+
+def _stub_boot_sweeps(server_module, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neutralize the two boot sweeps for the duration of one test.
+
+    The sweeps run on a background thread now — they must not sit on
+    the readiness path — so a test that entered the lifespan without
+    replacing them would have that thread really sweep this machine.
+
+    A test that has installed its own stand-in keeps it: the real
+    sweeps live in ``service_manager`` / ``utils.secret_sweep``, the
+    stand-ins in this file live in this module.  That is what lets the
+    contract tests below still observe *how* the sweep was called.
+    """
+    if getattr(server_module._reap_all_plans, "__module__", "") == _REAL_REAP_MODULE:
+        monkeypatch.setattr(server_module, "_reap_all_plans", lambda *a, **k: [])
+    if (
+        getattr(server_module._sweep_credential_residue, "__module__", "")
+        == _REAL_SWEEP_MODULE
+    ):
+        monkeypatch.setattr(
+            server_module, "_sweep_credential_residue", lambda apply=True: ([], 0, 0)
+        )
+
+
 def _drive_lifespan(server_module, monkeypatch: pytest.MonkeyPatch) -> Any:
     """Enter ``server._lifespan`` against a fake app and return the
     injected ``app.state.runtime_state``.
@@ -90,12 +121,30 @@ def _drive_lifespan(server_module, monkeypatch: pytest.MonkeyPatch) -> Any:
     does not depend on the live state-machine SQLite database; the
     contract under test is purely the injection, not the recovery
     semantics.
+
+    The two boot sweeps are stubbed too, and the thread they now run
+    on is captured and joined before this returns: the sweeps must not
+    sit on the readiness path, so they run in the background — and a
+    test that left that thread running would be a test that left a
+    background sweep of the developer's machine running.
     """
     monkeypatch.setattr(server_module, "_recover_execution_states", lambda plans_dir: None)
     monkeypatch.setattr(server_module, "_recover_verification_states", lambda plans_dir: None)
     monkeypatch.setattr(server_module, "load_providers", lambda: [])
     fake_heartbeat = MagicMock()
     monkeypatch.setattr(server_module, "heartbeat_monitor", fake_heartbeat)
+
+    _stub_boot_sweeps(server_module, monkeypatch)
+
+    sweep_threads: list[Any] = []
+    original_start = server_module._start_boot_sweeps
+
+    def _capture() -> Any:
+        thread = original_start()
+        sweep_threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(server_module, "_start_boot_sweeps", _capture)
 
     fake_app = MagicMock()
     fake_app.state = MagicMock()
@@ -104,7 +153,15 @@ def _drive_lifespan(server_module, monkeypatch: pytest.MonkeyPatch) -> Any:
         async with server_module._lifespan(fake_app):
             return fake_app.state.runtime_state
 
-    return asyncio.run(_enter())
+    injected = asyncio.run(_enter())
+
+    for thread in sweep_threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive(), (
+            "the boot-sweep thread outlived the test — it must be joined"
+        )
+
+    return injected
 
 
 # ---------------------------------------------------------------------------

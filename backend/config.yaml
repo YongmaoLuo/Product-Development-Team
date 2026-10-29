@@ -18,8 +18,8 @@
 #   by default: this repository ships the mechanism, not any particular
 #   fleet. Operators add their own entries.
 #
-#   Two properties of the mechanism are load-bearing and worth keeping
-#   in mind when adding entries:
+#   Two properties of the mechanism are load-bearing and worth keeping in
+#   mind when adding entries:
 #     - a failed start aborts uvicorn startup (strong-consistency
 #       guarantee), unless the entry is marked ``optional: true``;
 #     - entries start in list order, so a producer must precede anything
@@ -40,3 +40,30 @@
 #
 # Empty here by design.
 subsidiary_processes: []
+
+# The scheduler's own settings.
+#
+# The scheduler reads this section and keeps it as one snapshot, taking a
+# new one when the file changes (see backend/plan_scheduler/config.py).
+# The section is deliberately absent from every API and from the
+# frontend: the rollback switch lives here and nowhere else.
+#
+#   scheduler:
+#     enabled: false               # the rollback switch — false stops scheduling
+#     dry_run: false               # decide only: write nothing, start nothing
+#     capacity: 4                  # how many plans may run at the same time
+#     min_runtime_seconds: 600     # how long a young run is left alone
+#     tick_seconds: 5              # how long one tick waits before the next
+#     command_timeout_seconds: 30  # how long a single command may take
+#
+# `enabled` is false so that a fresh checkout never runs the new
+# scheduler next to the old cron: turning the scheduler on is a
+# deliberate act, and turning it off is the way back.  A missing section
+# or a missing key leaves that setting on the loader's own default.
+scheduler:
+  enabled: false
+  dry_run: false
+  capacity: 4
+  min_runtime_seconds: 600
+  tick_seconds: 5
+  command_timeout_seconds: 30

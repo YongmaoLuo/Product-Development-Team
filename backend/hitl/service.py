@@ -122,6 +122,28 @@ must not schedule while a decision is open: the task the question is
 about and everything downstream of it.  No task status changes, so
 answering the question opens the gate again by itself, and a plan with
 no open decision behaves exactly as it did before.
+
+The answer and the schedule
+---------------------------
+An answer is also the signal that a plan may go back to work, and that
+signal belongs to the **scheduler**: the plan facts — is the process
+still alive? — are the scheduler's to read, and only the scheduler can
+say whether a plan is parked or working.  So the answer path hands the
+plan back to the scheduler through the engine it is given
+(:func:`_submit_resume`), and the engine answers with what it did:
+the plan was put back at the head of the queue, or it was already
+working and there was nothing to do.
+
+Two rules make that safe:
+
+* **the answer is written down first, and the hook never raises.**  The
+  answer is an answer whatever the scheduler does with it afterwards: a
+  scheduler that is switched off, or that cannot be reached, must not
+  turn an answer into a 500 — a 500 invites a retry, and a retry is a
+  second answer.
+* **only a taken answer reaches the hook.**  A decision that does not
+  exist, or one that is already settled, is refused before anything is
+  submitted: a refused answer must not start a plan.
 """
 
 from __future__ import annotations
@@ -144,7 +166,12 @@ from hooks.config import load_for_plan
 from hooks.dispatcher import deliverable_hooks, dispatch
 
 __all__ = [
+    "ALREADY_RUNNING",
     "DecisionRejected",
+    "FAILED",
+    "NO_ENGINE",
+    "RESUMED",
+    "UNKNOWN",
     "answer_decision",
     "blocked_task_ids",
     "create_decision",
@@ -189,6 +216,37 @@ BLOCKING_STATUSES = (
     DecisionStatus.PENDING.value,
     DecisionStatus.PAUSED.value,
 )
+
+# ---------------------------------------------------------------------------
+# The words of the answer hook
+# ---------------------------------------------------------------------------
+#
+# The hook is what the *answer* does to the *schedule*.  Its words are
+# its own: they say what happened to the plan, not what a command did —
+# the command's own vocabulary belongs to the scheduler and is not
+# repeated here.  The set is closed, because a word nobody can
+# interpret is a word nobody can act on.
+
+#: The plan was parked and is waiting again — at the head of the queue.
+RESUMED = "resumed"
+
+#: The plan's execution process is still alive.  It was blocked on the
+#: answer and the answer woke it up, so it is working: there is
+#: nothing to put back in the queue and nothing to start again.
+ALREADY_RUNNING = "already_running"
+
+#: There is no scheduler to ask — it is not enabled, or it is not
+#: started.  The answer stands; the scheduling action is skipped.
+NO_ENGINE = "no_engine"
+
+#: The command could not be submitted.  The answer stands; the failure
+#: is written down in the log.
+FAILED = "failed"
+
+#: The engine said something the hook has no word for.  It is not a
+#: failure — the answer stands either way — but it is not one of the
+#: hook's own words, and saying so is better than inventing one.
+UNKNOWN = "unknown"
 
 #: How many times an answer re-reads the row before giving up.  Each
 #: round is one attempt at the compare-and-set; more than one round is
@@ -639,6 +697,7 @@ def answer_decision(
     *,
     plan_id: Optional[str] = None,
     store: Optional[HitlStore] = None,
+    engine: Optional[Any] = None,
 ) -> Tuple[str, int]:
     """Record a human's answer and report what happened.
 
@@ -673,6 +732,18 @@ def answer_decision(
     store:
         The store to write through.  One is opened for the call when
         not given.
+    engine:
+        The scheduler engine, when there is one.  An answer that was
+        taken hands the plan back to the scheduler through it — see
+        :func:`_submit_resume`.  Without it the answer is still an
+        answer and the scheduling action is skipped.
+
+    Notes
+    -----
+    The answer is written down **first** and the hook runs afterwards.
+    That order is the whole contract: a scheduler that cannot be
+    reached must not turn an answer into a failure, and the hook never
+    raises.
     """
     with _store_of(store) as opened:
         for _ in range(_MAX_ANSWER_ATTEMPTS):
@@ -686,6 +757,7 @@ def answer_decision(
                 if opened.answer_if_pending(
                     decision_id, option, answered_by, note
                 ):
+                    _submit_resume(decision.plan_id, engine)
                     return (DecisionStatus.ANSWERED.value, 200)
                 # Somebody else moved it first; look again.
                 continue
@@ -693,6 +765,7 @@ def answer_decision(
                 if _answer_paused(
                     opened, decision, option, answered_by, note
                 ):
+                    _submit_resume(decision.plan_id, engine)
                     return (DecisionStatus.ANSWERED.value, 200)
                 continue
             return (decision.status, 409)
@@ -702,6 +775,96 @@ def answer_decision(
         if decision is None:
             return ("not_found", 404)
         return (decision.status, 409)
+
+
+# ---------------------------------------------------------------------------
+# The answer hook
+# ---------------------------------------------------------------------------
+
+
+def _submit_resume(plan_id: str, engine: Any) -> str:
+    """Ask the scheduler to put a parked plan back at the head of the queue.
+
+    An answer is the signal that a plan which was waiting for a human
+    may go back to work — but only a plan that is **not** working any
+    more.  A plan whose process is still alive was blocked on the
+    answer, and the answer woke it up: it holds its slot and it is not
+    waiting, so putting it back in the queue would be a lie and starting
+    it again would run it twice.
+
+    Which of the two it is, is **not** this module's question: the plan
+    facts are the scheduler's, and the scheduler is the one that reads
+    them.  So the hook asks the engine and takes the answer it gets.
+
+    Three things are true whatever the engine says:
+
+    * **the answer is not a failure.**  The answer was written down
+      before the hook ran, and the hook never raises: a scheduler that
+      cannot be reached must not turn an answer into a 500, because a
+      500 invites a retry and a retry is a second answer.
+    * **there may be no engine.**  The scheduler can be switched off
+      (``enabled = false``) or not started; then there is nobody to ask,
+      the answer stands, and the skipped action is written down.
+    * **the words are the hook's own** — :data:`RESUMED`,
+      :data:`ALREADY_RUNNING`, :data:`NO_ENGINE`, :data:`FAILED` and
+      :data:`UNKNOWN`.  They say what the *answer* did to the schedule;
+      the command's own vocabulary belongs to the scheduler.
+
+    Args:
+        plan_id: the plan the answer belongs to.
+        engine: the scheduler engine, or ``None`` when there is none.
+
+    Returns:
+        The hook's word.
+    """
+    if engine is None:
+        logger.info(
+            "hitl answer hook: plan=%s outcome=%s (there is no scheduler)",
+            plan_id,
+            NO_ENGINE,
+        )
+        return NO_ENGINE
+
+    try:
+        result = engine.submit_command("resume", plan_id)
+    except Exception as exc:  # noqa: BLE001 — an answer must not fail
+        logger.exception(
+            "hitl answer hook: plan=%s outcome=%s (%s)",
+            plan_id,
+            FAILED,
+            exc,
+        )
+        return FAILED
+
+    outcome = _resume_outcome(result)
+    logger.info("hitl answer hook: plan=%s outcome=%s", plan_id, outcome)
+    return outcome
+
+
+def _resume_outcome(result: Any) -> str:
+    """Name what the resume did, in the hook's own vocabulary.
+
+    The engine answers with the **command's** vocabulary: ``applied``
+    when the action was carried out, ``conflict`` when it does not
+    apply to the plan as it is — and the detail says which of the
+    conflicts it was.  A plan that is working is the one this hook has
+    a word for: ``already_running``, because there is nothing to put
+    back in the queue and nothing to start again.
+
+    Args:
+        result: what the engine answered.
+
+    Returns:
+        One of the hook's words, or the engine's own outcome when it
+        said something the hook has no word for.
+    """
+    outcome = str(getattr(result, "outcome", "") or "")
+    detail = str(getattr(result, "detail", "") or "")
+    if outcome == "applied":
+        return RESUMED
+    if outcome == "conflict" and detail.split(":", 1)[0].strip() == "running":
+        return ALREADY_RUNNING
+    return outcome or UNKNOWN
 
 
 def _answer_paused(

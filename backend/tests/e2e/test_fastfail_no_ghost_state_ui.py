@@ -150,20 +150,7 @@ def _utcnow_iso() -> str:
     )
 
 
-#: How long a real server gets to answer.  The budget is a *wait*, not
-#: a threshold on the product: what has to hold is "the service comes
-#: up", and the child either answers or dies — it never answers
-#: slowly.  The server binds its port only after its lifespan has run,
-#: and the lifespan walks the machine (a state migration, a startup
-#: sweep, a credential sweep).  On a loaded runner — the gate runs
-#: ``-n 8``, so seven other workers boot their own servers at the same
-#: time — that walk is tens of seconds rather than the couple a quiet
-#: machine needs.  The larger budget costs time only in the case that
-#: is already red.
-_SERVER_READY_TIMEOUT = 120.0
-
-
-def _wait_for_server(base_url: str, timeout: float = _SERVER_READY_TIMEOUT) -> None:
+def _wait_for_server(base_url: str, timeout: float = 30.0) -> None:
     """Block until ``GET /health`` on ``base_url`` returns 2xx."""
     deadline = time.time() + timeout
     last_exc: Exception | None = None

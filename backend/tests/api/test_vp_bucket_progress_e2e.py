@@ -265,6 +265,37 @@ def _http_get_json(url: str) -> Dict[str, Any]:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _child_env(plans_root: Path, state_db: Path) -> Dict[str, str]:
+    """子进程的环境：白名单，不是父进程环境的拷贝。
+
+    这不是洁癖。父进程里可能带着 ``PDT_SECRET_FD_*``（密钥以文件描述符
+    的形式交给子进程读），而那些描述符的编号在子进程里指向的是别的东
+    西 —— asyncio 的事件循环把自己的 self-pipe 放在最低的两个可用 fd
+    上，正好撞上。子进程于是死在 ``select()`` 的 ``EBADF`` 上，而且死在
+    启动之后（凭据那套代码先把 fd 关了），所以健康检查只看到一句「没起
+    来」。少传这两个变量，子进程就干净了。
+
+    ``HOME`` 也不传：没有它就没有钥匙串，通知器直接判定「未配置」，免
+    得这条用例去动操作者的真实密钥链。
+
+    ``PDT_DISABLE_TEMP_SWEEP`` 是清扫开关（``utils.secret_sweep`` 读它）：
+    服务启动时的凭据清扫是**机器级**的 —— 它走真实的临时目录，把认出来
+    的凭据改写掉。pytest 进程自己带着这个开关（``_pytest_hermetic_env``
+    里的 ``setdefault``），但那是**进程内**的：白名单 env 不继承父进程环
+    境，于是子 server 照样做机器级清扫，lifespan 被拖到 18~21s。父进程已
+    经有值就原样透传 —— 父进程说 ``"0"`` 就让子进程扫，谁定的谁说了算。
+    """
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        # ``prompts.py`` 要 ``backend.framework.prompts``，所以仓库根要
+        # 在 sys.path 上；只放 backend/ 的话子进程在 import 期就死了。
+        "PYTHONPATH": str(_BACKEND_DIR.parent),
+        "PDT_PLANS_DIR": str(plans_root),
+        "PDT_STATE_DB_PATH": str(state_db),
+        "PDT_DISABLE_TEMP_SWEEP": os.environ.get("PDT_DISABLE_TEMP_SWEEP", "1"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 1. 接口层：坏行 → 干净 payload
 # ---------------------------------------------------------------------------
@@ -387,40 +418,9 @@ def test_live_server_endpoint_ignores_stale_list(tmp_path: Path) -> None:
 
     port = _LIVE_PORT if _port_is_free(_LIVE_PORT) else _free_port()
 
-    # 子进程的环境是**白名单**，不是父进程环境的拷贝。这不是洁癖：
-    # 父进程里可能带着 ``PDT_SECRET_FD_*``（密钥以文件描述符的形式
-    # 交给子进程读），而那些描述符的编号在子进程里指向的是别的东西 ——
-    # asyncio 的事件循环把自己的 self-pipe 放在最低的两个可用 fd 上，
-    # 正好撞上。子进程于是死在 ``select()`` 的 ``EBADF`` 上，而且死在
-    # 启动之后（凭据那套代码先把 fd 关了），所以健康检查只看到一句
-    # 「没起来」。少传这两个变量，子进程就干净了。
-    #
-    # ``HOME`` 也不传：没有它就没有钥匙串，通知器直接判定「未配置」，
-    # 免得这条用例去动操作者的真实密钥链。
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        # ``prompts.py`` 要 ``backend.framework.prompts``，所以仓库根要
-        # 在 sys.path 上；只放 backend/ 的话子进程在 import 期就死了。
-        "PYTHONPATH": str(_BACKEND_DIR.parent),
-        "PDT_PLANS_DIR": str(plans_root),
-        "PDT_STATE_DB_PATH": str(state_db),
-        # 白名单里唯一**要带**进去的一个开关：真服务一启动就会扫全机进程
-        # （macOS 上每个进程两次 ``ps``，~2500 次 spawn），还要留一个脱离
-        # 本进程的常驻 reaper。一次真启动因此要 ~13 秒，而这条用例的
-        # 健康等待只有 90 秒 —— 挤一点的机器上就等不到了。一次性服务，
-        # 没有资格去动跑它的这台机器。
-        "PDT_ORPHAN_REAPER": "0",
-        # 第二个开关，同一个理由的另一半：服务启动时还会扫一遍机器上的
-        # 临时目录，把还带着凭证的载荷改写掉（``utils.secret_sweep``）。
-        # 那也是一次机器级遍历 —— 临时根里每多一个上一次跑剩下的
-        # basetemp，扫描就多走一遍。而服务在 lifespan 走完之前不会开始
-        # 监听端口，lifespan 里又带着这次扫描：扫描一慢，服务就来不及在
-        # 自己的 60 秒自检期限里上线，于是子进程在启动途中自杀 ——
-        # 症状是「服务没起来」，根因是这次遍历。白名单里带上这个开关，
-        # 子进程就只扫自己的 tmp 目录（父进程的扫描开关本来就在环境里，
-        # 只是白名单把它筛掉了）。
-        "PDT_DISABLE_TEMP_SWEEP": "1",
-    }
+    # 子进程的环境是**白名单**，不是父进程环境的拷贝 —— 理由见
+    # ``_child_env`` 的 docstring。
+    env = _child_env(plans_root, state_db)
 
     server_log_path = tmp_path / "uvicorn.log"
     server_log = open(server_log_path, "w+b")  # noqa: SIM115

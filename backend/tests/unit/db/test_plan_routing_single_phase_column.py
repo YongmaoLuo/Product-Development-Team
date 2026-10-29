@@ -35,7 +35,7 @@ data-preservation guarantee.
 Contract pinned here
 --------------------
 1. A fresh database has no ``stage`` column and reports the current
-   schema version (6 as of the ``plan_execution`` phase-column drop).
+   schema version (7 as of the native scheduler's three tables).
 2. Collapsing a v4 database preserves every non-``stage`` column
    byte-for-byte and rewrites ``current_phase`` under the documented
    rule (non-empty kept verbatim; NULL/empty derived from ``stage``).
@@ -209,7 +209,7 @@ def test_fresh_database_has_a_single_phase_column(tmp_path: Path) -> None:
         )
         assert "current_phase" in _columns(conn)
         version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        assert version == CURRENT_SCHEMA_VERSION == 6
+        assert version == CURRENT_SCHEMA_VERSION == 7
     finally:
         conn.close()
 
@@ -319,12 +319,40 @@ def test_migration_is_idempotent(tmp_path: Path) -> None:
     try:
         migrate(conn)
         first = sorted(conn.execute("SELECT * FROM plan_routing"))
+        version_after_first = conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0]
+        columns_after_first = _columns(conn)
         migrate(conn)
         migrate(conn)
         second = sorted(conn.execute("SELECT * FROM plan_routing"))
         assert first == second
         assert "stage" not in _columns(conn)
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 6
+        # Two more runs must leave the version exactly where the first
+        # one put it — a re-run that moved the logbook would mean the
+        # migration is not idempotent.
+        assert conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0] == version_after_first
+        assert version_after_first == CURRENT_SCHEMA_VERSION == 7
+        # ...and the logbook must still hold exactly one row: a second
+        # version row is the same defect seen from the other side.
+        version_rows = conn.execute("SELECT version FROM schema_version").fetchall()
+        assert version_rows == [(version_after_first,)], (
+            f"migrate left {version_rows!r} in schema_version; the logbook "
+            f"holds exactly one row"
+        )
+        # ...and no column may be added twice. A re-run has to be a
+        # no-op on the table's shape, not a second copy of a column.
+        columns = _columns(conn)
+        assert len(columns) == len(set(columns)), (
+            f"migrate duplicated a column: {columns!r} (first run had "
+            f"{columns_after_first!r})"
+        )
+        assert columns == columns_after_first, (
+            f"migrate changed the column set: {columns_after_first!r} -> "
+            f"{columns!r}"
+        )
     finally:
         conn.close()
 

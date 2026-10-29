@@ -6,9 +6,9 @@ CLI for autonomous coding skill.
 """
 
 import argparse
-import inspect
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -16,15 +16,15 @@ import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from agent import autonomous_coding
 import credentials
 from rollback_manager import RollbackManager
 from config_registry import ConfigRegistry
 from config_loader import load_config_by_name
-from coding_tool import executor_stop_budget, stop_all_live_dispatches
-import execution_logger
+from coding_tool import stop_all_live_dispatches
+from execution_logger import get_logger
 from request_guard import REQUEST_HEADER, REQUEST_HEADER_VALUE
 
 #: What ``secrets show`` prints in place of a keychain index the
@@ -304,7 +304,7 @@ Examples:
 # process group, splitting its budget 0.35 / 0.25 / 0.10 — 0.7 of the
 # budget in total.
 #
-# The budget is derived from the server's own grace window
+# The budget is the server's own grace window
 # (``PDT_STOP_GRACE_SECONDS``, default 10s), inherited through the
 # environment: the server spawns the executor with
 # ``env={**os.environ, ...}``.  The sequence has to finish *inside*
@@ -312,13 +312,6 @@ Examples:
 # group SIGKILLed by the server — and that hard kill is exactly the
 # outcome (a forced stop instead of a clean one) this mechanism exists
 # to avoid.
-#
-# The budget is **half** that window
-# (:func:`coding_tool.executor_stop_budget`): the two layers used to
-# use the same number for the same thing, which left the executor no
-# room at all for a cascade that ran a little slow.  The relation is
-# derived in one place — the executor's entry point hands the raw
-# environment value to that function — so it cannot drift apart.
 #
 # This is a deliberate deviation from the upstream wording ("wait the
 # grace, then SIGTERM, then wait 5 more seconds, then SIGKILL"): taken
@@ -332,6 +325,15 @@ Examples:
 
 #: The env var carrying the server's grace window into the executor.
 _STOP_GRACE_ENV = "PDT_STOP_GRACE_SECONDS"
+
+#: The budget used when the environment says nothing usable.
+_STOP_GRACE_DEFAULT_SECONDS = 10.0
+
+#: Bounds for the budget.  The floor keeps each stage of the sequence
+#: long enough to mean something; the ceiling keeps a fat-fingered
+#: configuration from parking the stop path for a minute.
+_STOP_GRACE_MIN_SECONDS = 2.0
+_STOP_GRACE_MAX_SECONDS = 60.0
 
 #: How much of the budget the handler waits for the stop sequence.
 #: Below 1.0, so the executor is always gone before the server's own
@@ -355,18 +357,6 @@ _stop_in_progress = False
 #: logger) so the two cannot be confused for one another.
 _stop_logger = logging.getLogger(__name__)
 
-#: The plan-stream event that carries one child's stop result, and the
-#: prefix it renders with.  Registered here — at import, which is the
-#: executor's start — because the executor is the only producer of it,
-#: and it produces it at the very end of a plan's life, long after the
-#: plan's other event types were registered.
-_STOP_RESULT_EVENT = "dispatch_stop_result"
-_STOP_RESULT_RENDER_PREFIX = "[DISPATCH_STOP_RESULT]"
-
-execution_logger.register_event_type(
-    _STOP_RESULT_EVENT, _STOP_RESULT_RENDER_PREFIX
-)
-
 
 def _stop_grace_seconds() -> float:
     """Return the stop budget in seconds: how long the whole stop may take.
@@ -375,18 +365,25 @@ def _stop_grace_seconds() -> float:
     so the executor sees the value the server was configured with and a
     test can change it without reimporting the module.
 
-    The environment carries the server's **grace window**; the budget
-    handed to the stop sequence is derived from it — half of it — by
-    :func:`coding_tool.executor_stop_budget`.  The derivation lives
-    there and nowhere else, so the executor's budget is always
-    strictly smaller than the window the server will wait before it
-    SIGKILLs the process group.  A missing, empty, non-numeric or
-    non-positive value falls back to the default window rather than to
-    something smaller: "don't wait at all" is the opposite of what the
-    cooperative stop is for, and a zero budget would skip the grace the
-    children need to leave on their own.
+    A missing, empty, non-numeric or non-positive value falls back to
+    the default rather than to something smaller: "don't wait at all" is
+    the opposite of what the cooperative stop is for, and a zero budget
+    would skip the grace the children need to leave on their own.  Every
+    usable value is clamped into ``[2, 60]`` seconds — the same bounds
+    the sequence itself applies, so a fat-fingered configuration cannot
+    park the executor in a stop path for a minute.
     """
-    return executor_stop_budget(os.environ.get(_STOP_GRACE_ENV))
+    raw = os.environ.get(_STOP_GRACE_ENV)
+    if raw is None or not raw.strip():
+        return _STOP_GRACE_DEFAULT_SECONDS
+    try:
+        budget = float(raw)
+    except (TypeError, ValueError):
+        return _STOP_GRACE_DEFAULT_SECONDS
+    # NaN fails every comparison, so it has to be excluded explicitly.
+    if not math.isfinite(budget) or budget <= 0:
+        return _STOP_GRACE_DEFAULT_SECONDS
+    return min(max(budget, _STOP_GRACE_MIN_SECONDS), _STOP_GRACE_MAX_SECONDS)
 
 
 def _exit_now(code: int) -> None:
@@ -410,108 +407,22 @@ def _exit_now(code: int) -> None:
     os._exit(code)
 
 
-def _accepts_records(stopper) -> bool:
-    """Whether ``stopper`` takes the ``records`` out-parameter.
-
-    The records are part of the stop sequence's contract, but the
-    callable is *asked* whether it takes them instead of being called
-    and having a ``TypeError`` tell us.  Two reasons: the exception
-    could equally well come from inside the sequence, and the sequence
-    has to run exactly once over the children — a call that failed on
-    its way in and had to be made again would signal the same children
-    a second time, out of budget the first pass already spent.
-    """
-    try:
-        inspect.signature(stopper).bind(0.0, records=[])
-    except TypeError:
-        return False
-    except ValueError:
-        # No introspectable signature — assume the documented form.
-        return True
-    return True
-
-
-def _collect_stop_records(budget: float) -> List[Dict[str, Any]]:
-    """Run the stop sequence and return one record per stopped child.
-
-    The record says which child it was (``pid``), which stage finally
-    stopped it (``stage``), whether that stage was a forced kill
-    (``forced``) and how long it took (``elapsed_s``).  A callable
-    that does not know the out-parameter is still stopped — it just
-    cannot report per-child detail, and the list comes back empty.
-    """
-    records: List[Dict[str, Any]] = []
-    if _accepts_records(stop_all_live_dispatches):
-        stop_all_live_dispatches(budget, records=records)
-    else:
-        stop_all_live_dispatches(budget)
-    return records
-
-
-def _write_stop_result(record: Dict[str, Any]) -> None:
-    """Write one child's stop result to the module log and the plan stream.
-
-    The plan stream is the durable one: it is the only place the
-    result survives the executor's exit, and it is what the server
-    reads back when it answers "which child stopped where".
-
-    A record without a pid (the process was already gone before the
-    registry was read) carries no pid in the data either — a ``null``
-    there would read as "a child whose pid we failed to record",
-    which is a different thing from "no child".
-    """
-    pid = record.get("pid")
-    stage = record.get("stage")
-    message = (
-        f"child pid={pid} stopped at {stage}"
-        if pid is not None
-        else f"child stopped at {stage}"
-    )
-
-    data = dict(record)
-    if data.get("pid") is None:
-        data.pop("pid", None)
-
-    _stop_logger.info(message)
-
-    logger = execution_logger.get_logger()
-    if logger is None:
-        # No plan id in the environment: there is no plan stream to
-        # write to.  The module log above still has the result.
-        return
-    logger.info(_STOP_RESULT_EVENT, message, data=data)
-
-
 def _stop_live_dispatches(budget: float) -> None:
-    """Run the cooperative stop sequence, then report what it stopped.
+    """Run the cooperative stop sequence.  Never raises.
 
     This runs on the stop thread, where an escaping exception would be
     printed by the threading machinery and the executor would carry on
     as if nothing had happened.  It has to be logged and swallowed: the
     handler's job is to make the executor go away, and children it
     failed to stop are the server's business to reap.
-
-    The reporting comes *after* the sequence, and each record is
-    written on its own: one child whose result cannot be logged must
-    not cost the other children their results.
     """
     try:
-        records = _collect_stop_records(budget)
+        stop_all_live_dispatches(budget)
     except Exception:  # noqa: BLE001 — the exit below must still happen
         _stop_logger.warning(
             "[stop] the cooperative stop sequence failed; exiting anyway",
             exc_info=True,
         )
-        return
-
-    for record in records:
-        try:
-            _write_stop_result(record)
-        except Exception:  # noqa: BLE001 — a failed log must not stop the exit
-            _stop_logger.warning(
-                "[stop] could not write one child's stop result",
-                exc_info=True,
-            )
 
 
 def _on_sigterm(signum, frame) -> None:
@@ -623,7 +534,7 @@ def main():
     if args.dir:
         workspace_dir = args.dir
 
-    logger = execution_logger.get_logger()
+    logger = get_logger()
 
     tasks_file = Path(args.tasks_file) if args.tasks_file else None
 

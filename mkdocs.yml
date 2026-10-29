@@ -66,6 +66,7 @@ nav:
       - Running it: operations/running.md
       - Configuration: operations/configuration.md
       - Keychain migration: operations/keychain-migration.md
+      - Scheduler cutover: operations/scheduler-cutover.md
       - Orphan reaper: operations/orphan-reaper.md
   - Development:
       - Tests: development/testing.md
@@ -131,6 +132,7 @@ plugins:
             Operations: 运维
             Running it: 运行它
             Configuration: 配置
+            Scheduler cutover: 调度器切换
             Development: 开发
             Tests: 测试
             Contributing: 贡献

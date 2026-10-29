@@ -93,6 +93,38 @@ start
   ``start_execution`` 说，门面原样透传。
 * **拒绝也要说出来** —— start 侧的处理器对冲突（409 / 410）是**返回**一个
   错误响应而不是抛异常；门面把它还原成异常，免得对外谎报「已派发」。
+
+pause 与 requeue
+----------------
+调度器要的两件事也收在这个门面上，而它们走的都是**既有**的合法边 ——
+不新增相位、不新增边、不改 CAS 语义：
+
+* ``pause_plan`` —— **在跑** → 既有 ``stop_plan(requeue=False)``；
+  **排队中** → 既有合法边 ``queued → stopped``（``plan_state`` 的边表
+  里那一行），并且把队列行删掉。
+* ``requeue_plan`` —— **停住** → 既有合法边 ``stopped → queued``（复用
+  ``_requeue_to_queued``）。
+
+两条边都由状态机承担，门面只发起迁移：合法性查的是状态机那两张边表，
+门面不自己判断「这条边存不存在」——自己判断就是一份会漂移的边表副本。
+
+冲突
+----
+两件不同的事都叫「冲突」，这里把它们分开：
+
+* **相位前提不成立**（这个操作对这个相位没有边）—— 是**返回**，不是抛
+  异常：调用方要的是「没成」加上「它现在在哪儿」，而不是一个 500。
+  结果的 ``detail`` 是 ``'conflict'``、``ok`` 是 ``False``，两个相位都
+  还是计划原来所在的那个相位 —— 冲突不改相位。
+* **CAS 冲突**（行在读与写之间被别的手改了）—— 照既有语义往外抛
+  ``ConflictError``：调用方按既有说法报成 409，而且**不重试** —— 重试
+  就是拿自己的写入盖掉别人的。
+
+结果类型的形状是**冻住的**：``LifecycleResult`` 恰好六个字段，因为两个
+生命周期端点原样拿它当响应体，仓库另一侧的消费者按那六个键解析
+（``docs/development/cross-repo-contract.md`` §1.3）。``ok`` 与 ``phase``
+是那六个字段的**只读视图**，不是两个新字段 —— 多一个字段就是响应体里
+多一个别人没准备过的键。
 """
 
 from __future__ import annotations
@@ -114,12 +146,22 @@ from state_machine.repositories.routing_repository import PlanNotFoundError
 # 模块，门面读相位不需要把整个应用拖进来。
 from plan_state import PlanState
 
+# 「在等人」的相位只有一套说法（``queued``，``ready`` 是它的历史别名）。
+# 读哪一行是等待相位由这个模块说了算 —— 门面不自己判一次「ready 算不算」。
+from phase_vocabulary import is_waiting_phase
+
 # checkpoint 只读回显，不消费（见模块 docstring）。
 from pause_state import read_pause_checkpoint
 
 logger = logging.getLogger(__name__)
 
+#: 冲突结果的 ``detail`` 取值：相位前提不成立，操作没有发生，相位原样
+#: 不动。沿用既有结果里 ``'idle'`` 那一种形状 —— 不是动作，是「没做成
+#: 什么」。
+CONFLICT_DETAIL = "conflict"
+
 __all__ = [
+    "CONFLICT_DETAIL",
     "LifecycleResult",
     "PlanLifecycleService",
     "PlanNotFoundError",
@@ -171,9 +213,21 @@ class LifecycleResult:
     * ``detail`` —— 这次分派的具体动作（``'stop_verification'`` /
       ``'stop_execution'`` / ``'both'`` / ``'idle'``；start 侧是
       ``'start_verification(resume)'`` / ``'start_execution(resume)'`` /
-      ``'start_execution(fresh)'``）。请求了 requeue 时追加
-      ``'+requeue'``（如 ``'stop_execution+requeue'``）——它说的是
-      **动作**，最终相位落在哪儿看 ``final_phase``。
+      ``'start_execution(fresh)'``；pause / requeue 侧是
+      ``'pause_queued'`` / ``'requeue'`` / ``'conflict'``）。请求了
+      requeue 时追加 ``'+requeue'``（如 ``'stop_execution+requeue'``）——
+      它说的是**动作**，最终相位落在哪儿看 ``final_phase``。
+
+    **字段恰好六个**：两个生命周期端点原样拿这个 dataclass 当响应体，
+    仓库另一侧的消费者按那六个键解析
+    （``docs/development/cross-repo-contract.md`` §1.3）。多一个字段就是
+    响应体里多一个别人没准备过的键。
+
+    两个**只读视图**（不是字段，不进响应体）：
+
+    * ``phase`` —— ``final_phase`` 的另一个名字。
+    * ``ok`` —— 这次操作做成了没有。冲突（``detail`` 是 ``'conflict'``）
+      时是 ``False``，其余是 ``True``。
     """
 
     plan_id: str
@@ -182,6 +236,27 @@ class LifecycleResult:
     final_phase: str
     checkpoint: Optional[Dict[str, Any]]
     detail: str
+
+    @property
+    def phase(self) -> str:
+        """调用方最终看到的相位 —— ``final_phase`` 的另一个名字。
+
+        两个名字说的是同一件事，所以这里给的是**只读别名**而不是第二个
+        字段：两个可以各写各的字段，就是两份会漂移的真相。
+        """
+        return self.final_phase
+
+    @property
+    def ok(self) -> bool:
+        """这次操作**做成了没有**。
+
+        冲突（相位前提不成立）时是 ``False`` —— 那时两个相位都还是计划
+        原来所在的那个相位（冲突不改相位）。
+
+        这是**视图**不是字段：``detail`` 已经说了是不是冲突，再加一个
+        字段就是给响应体多加一个键。
+        """
+        return not self.detail.startswith(CONFLICT_DETAIL)
 
 
 class PlanLifecycleService:
@@ -285,18 +360,41 @@ class PlanLifecycleService:
         不是 stop 的失败 —— 让它冒泡会把一次成功的停变成 500。失败时记
         一条 warning，最终相位回落 ``'stopped'``。
         """
+        return PlanLifecycleService._transition_to_phase(
+            plan_dir, "queued", label="requeue",
+        )
+
+    @staticmethod
+    def _transition_to_phase(plan_dir, phase: str, *, label: str) -> bool:
+        """按状态机的边表把计划迁到 ``phase``；返回迁移是否成功。
+
+        合法性**由状态机说了算**：``PlanState.transition_to`` 查的是
+        ``PHASE_TRANSITIONS`` 与 ``VERIFICATION_PHASE_TRANSITIONS`` 那
+        两张表。门面不自己判断哪条边存在 —— 自己判断就是一份会漂移的
+        边表副本，而漂移的那一份正好是「多出一条状态机不认的边」。
+
+        ``ValueError``（非法迁移）**不外抛**：迁移没成不是整个操作失败
+        —— 调用方要的是「冲突」这个答案，不是 500。失败时记一条 warning。
+
+        ``ConflictError``（CAS 冲突）**照旧往外抛**：那不是「这条边不
+        合法」，而是「行在读与写之间被别的手改了」。调用方要按既有语义
+        把它报成冲突，而且**不许重试** —— 重试就是拿自己的写入盖掉别人
+        的。
+        """
         try:
             state = PlanState(plan_dir)
             # 处理器刚刚改过相位；reload 拿最新的那份，免得拿缓存里的旧
             # 相位去迁移（plan_state 的 docstring 明确要求 transition 前
             # 先 reload）。
             state.reload()
-            state.transition_to("queued")
+            state.transition_to(phase)
         except ValueError as exc:
             logger.warning(
-                "plan_lifecycle_requeue_failed: plan=%s could not be moved "
-                "back to the waiting phase 'queued' (%s); it stays stopped",
+                "plan_lifecycle_%s_failed: plan=%s could not be moved to "
+                "the phase %r (%s); it stays where it was",
+                label,
                 getattr(plan_dir, "name", plan_dir),
+                phase,
                 exc,
             )
             return False
@@ -376,6 +474,162 @@ class PlanLifecycleService:
             )
 
     # ------------------------------------------------------------------
+    # pause / requeue
+    # ------------------------------------------------------------------
+
+    def pause_plan(self, plan_id: str) -> LifecycleResult:
+        """暂停一个计划 —— 在跑的停掉，排队的从队里摘出来停掉。
+
+        两种来源，两条**既有**合法边（不新增相位、不新增边）：
+
+        * **在跑**（执行轮次或验证轮次在飞）→ 既有
+          :meth:`stop_plan`（``requeue=False``）。处理器负责停到
+          ``stopped``、负责写检查点；门面不自己改相位。
+        * **排队中**（相位 ``queued``）→ 既有合法边 ``queued → stopped``
+          （``plan_state.PHASE_TRANSITIONS``），并且把队列行删掉 ——
+          停住的计划不该还排在队里等着被启动。
+
+        其余相位 → **冲突**：结果原样返回，相位一个字节都不动。
+
+        :param plan_id: 目标计划。
+        :return: :class:`LifecycleResult`；冲突时 ``ok`` 是 ``False``，
+            两个相位都还是计划原来所在的那个相位。
+        :raises PlanNotFoundError: 计划不存在。
+        :raises ConflictError: CAS 冲突（行在读与写之间被别的手改了）——
+            照既有语义往外抛，调用方按既有说法报成 409；**不重试**。
+        """
+        import server as _server
+
+        plan_dir = _server._plan_dir(plan_id)
+        if not plan_dir.exists():
+            raise PlanNotFoundError(plan_id)
+
+        # 在跑 → 既有 stop 路径，而且明确**不**迁回队列：暂停不是恢复。
+        # 这一步同时回答了「有没有在跑」——idle 时 ``dispatched`` 是 None。
+        stopped = self.stop_plan(plan_id, requeue=False)
+        if stopped.dispatched is not None:
+            return stopped
+
+        # idle：没有在跑的东西可停。相位决定这条边走不走得通。
+        phase = self._current_phase(plan_dir)
+        if not is_waiting_phase(phase):
+            logger.info(
+                "plan_lifecycle_pause_conflict: plan=%s cannot be paused "
+                "from the phase %r", plan_id, phase,
+            )
+            return self._conflict(plan_id, phase)
+
+        # 排队中 → 既有合法边 queued → stopped。
+        #
+        # 队列行**先**摘：摘完之后这个计划不再有资格被准入，所以相位迁移
+        # 失败时它至多是一个「排队但没有队列行」的计划 —— 启动恢复会把
+        # 这种计划按顺序补回队尾。反过来（先迁相位后摘行）留下的是
+        # 「停了却还排在队里」：调度器捡起它，暂停就白做了。
+        #
+        # CAS 冲突（``ConflictError``）**不接**：它照既有语义往外抛，
+        # 调用方按既有说法报成 409，而且不重试 —— 重试就是拿自己的写入
+        # 盖掉别人的。那一刻队列行已经摘掉了：这个计划是「排队但没有队列
+        # 行」，启动恢复会把它按顺序补回队尾。
+        self._remove_from_queue(plan_id)
+        if not self._transition_to_phase(plan_dir, "stopped", label="pause"):
+            # 迁移被拒（相位在读与写之间变了，或那条边不合法）：冲突。
+            # 相位原样不动。
+            return self._conflict(plan_id, self._current_phase(plan_dir))
+
+        return LifecycleResult(
+            plan_id=plan_id,
+            dispatched=None,
+            berth_phase="stopped",
+            final_phase="stopped",
+            checkpoint=None,
+            detail="pause_queued",
+        )
+
+    def requeue_plan(self, plan_id: str) -> LifecycleResult:
+        """把一个停住的计划放回等待相位 —— 既有合法边 ``stopped → queued``。
+
+        **只接受 ``stopped``**：别的相位一律冲突（相位原样不动）。在跑
+        的计划没有「放回等待相位」这回事 —— 那是一次停止加一次入队，两
+        件事，不能用一个名字糊过去。
+
+        :param plan_id: 目标计划。
+        :return: :class:`LifecycleResult`；冲突时 ``ok`` 是 ``False``。
+        :raises PlanNotFoundError: 计划不存在。
+        :raises ConflictError: CAS 冲突 —— 照既有语义往外抛，**不重试**。
+        """
+        import server as _server
+
+        plan_dir = _server._plan_dir(plan_id)
+        if not plan_dir.exists():
+            raise PlanNotFoundError(plan_id)
+
+        phase = self._current_phase(plan_dir)
+        if phase != "stopped":
+            logger.info(
+                "plan_lifecycle_requeue_conflict: plan=%s cannot be requeued "
+                "from the phase %r", plan_id, phase,
+            )
+            return self._conflict(plan_id, phase)
+
+        # ``stopped → queued`` 那条边由状态机承担，门面只发起迁移。
+        # CAS 冲突（``ConflictError``）照既有语义往外抛，不重试。
+        if not self._requeue_to_queued(plan_dir):
+            # 迁移被拒（相位在读与写之间变了，或那条边不合法）：冲突。
+            return self._conflict(plan_id, self._current_phase(plan_dir))
+
+        return LifecycleResult(
+            plan_id=plan_id,
+            dispatched=None,
+            berth_phase="queued",
+            final_phase="queued",
+            checkpoint=None,
+            detail="requeue",
+        )
+
+    @staticmethod
+    def _conflict(plan_id: str, phase: str) -> LifecycleResult:
+        """一个冲突结果：相位原样不动，操作没有发生。
+
+        冲突**不是**一次成功的操作 —— ``ok`` 是 ``False``。两个相位都
+        还是计划原来所在的那个相位：冲突不改相位，调用方拿到的就是
+        「没成」加上「它现在在哪儿」。
+        """
+        return LifecycleResult(
+            plan_id=plan_id,
+            dispatched=None,
+            berth_phase=phase,
+            final_phase=phase,
+            checkpoint=None,
+            detail=CONFLICT_DETAIL,
+        )
+
+    @staticmethod
+    def _remove_from_queue(plan_id: str) -> bool:
+        """把这个计划从调度队列里摘出来；返回它本来在不在队列里。
+
+        队列行是**调度事实**，相位是**plan 事实**：一个停住的计划留在
+        队列里，调度器迟早会把它捡起来 —— 那就等于暂停没生效。
+
+        队列行没有就是没有（``remove`` 对不存在的行静默返回），所以这不是一个会失败的操作：调用方不必为「这个计划本来就没排队」做
+        任何判断。
+
+        队列行摘不掉时（数据库打不开、锁着）异常照旧往外抛：那一刻相位
+        还没动，调用方看到的是一次失败，而不是一个「停住了却还排在队
+        里」的计划。
+        """
+        import server as _server
+        from plan_scheduler.queue import remove as _queue_remove
+        from state_machine.db.connection import open as _open_db
+        from state_machine.db.schema import migrate as _migrate
+
+        conn = _open_db(_server._state_db_path())
+        try:
+            _migrate(conn)
+            return _queue_remove(conn, plan_id)
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
     # start
     # ------------------------------------------------------------------
 
@@ -384,18 +638,17 @@ class PlanLifecycleService:
     ) -> LifecycleResult:
         """按检查点的 kind 把「启动这个计划」派给验证或执行。
 
-        恢复启动要回到**被打断的那一侧**：检查点的 ``kind`` 是
-        ``'verification'`` 就继续验证，是 ``'execution'``（或者没有
-        ``kind`` —— 那份检查点是执行侧的老格式）就继续执行。**没有检查点
-        就是全新执行**，全新执行必须带 ``project_dir``。
+        恢复启动要回到**被打断的那一侧**：执行被打断就继续执行，验证被打断
+        就继续验证。这件事由 pause 检查点的 ``kind`` 决定（``execution`` /
+        ``verification``；没有 ``kind`` 视为 ``execution`` —— 与
+        ``routes/execution.py`` 的既有语义一致）。
 
         ``kind`` 只有 ``'verification'`` 这一种走验证，其余一律走执行：
         执行侧自己只认 ``'execution'``，别的 kind 在那边等于「没有检查
         点」，所以门面也不该把它派给执行以外的任何一侧。
 
         :param plan_id: 目标计划。
-        :param spec: 启动参数；``None`` 等价于一个全空的
-            :class:`StartPlanSpec`。
+        :param spec: 启动参数；``None`` 等价于一个全空的 :class:`StartPlanSpec`。
         :return: :class:`LifecycleResult`。
         :raises PlanNotFoundError: 计划不存在。
         :raises fastapi.HTTPException: 处理器抛出的异常原样透传；处理器
@@ -410,8 +663,7 @@ class PlanLifecycleService:
             raise PlanNotFoundError(plan_id)
 
         # 检查点必须在派发**之前**读：被派发的那一侧启动成功后会把检查点
-        # 退休掉（验证 / 执行各自 retire 自己写的那份），派发之后再读就
-        # 只剩 None，回显里也就没有「恢复了什么」。
+        # 退休掉（验证 / 执行各自 retire 自己写的那份），派发之后再读就        # 只剩 None，回显里也就没有「恢复了什么」。
         checkpoint = read_pause_checkpoint(plan_dir)
         kind = (checkpoint or {}).get("kind")
 

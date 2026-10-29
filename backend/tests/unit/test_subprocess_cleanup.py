@@ -300,14 +300,7 @@ class TestServerShutdownAllExecutions:
 
         with patch("server._kill_process_tree") as mock_kill:
             server._shutdown_all_executions()
-            # The sweep hands every executor the batch's one shared grace
-            # window, derived by the same function the execution stop path
-            # uses — so the assertion pins the value to that derivation
-            # rather than to a number written down here.
-            mock_kill.assert_called_once_with(
-                mock_proc,
-                grace_seconds=server._execution_stop_grace_seconds(),
-            )
+            mock_kill.assert_called_once_with(mock_proc)
 
         # Cleanup
         server._execution_state.clear()

@@ -23,6 +23,7 @@
                     </div>
                 </div>
                 <div class="sidebar-actions">
+                    <button id="btn-open-scheduler" class="btn btn-outline btn-nav" title="调度">调度</button>
                     <button id="btn-new-plan" class="btn-icon" title="新建计划">+</button>
                 </div>
             </div>
@@ -40,7 +41,106 @@
                 <div class="view-header">
                     <h2>项目计划</h2>
                 </div>
+
+                <!-- Scheduler capacity: the same read model the scheduler
+                     view renders, so the home page answers "how full is
+                     it" before the operator opens anything. -->
+                <div id="scheduler-capacity" class="scheduler-capacity">
+                    <span class="scheduler-capacity-label">已用</span>
+                    <span id="scheduler-capacity-used" class="scheduler-capacity-value">0</span>
+                    <span class="scheduler-capacity-label">共</span>
+                    <span id="scheduler-capacity-total" class="scheduler-capacity-value">0</span>
+                    <span class="scheduler-capacity-divider">·</span>
+                    <span class="scheduler-capacity-label">队列</span>
+                    <span id="scheduler-capacity-queue" class="scheduler-capacity-value">0</span>
+                    <span id="scheduler-capacity-over" class="scheduler-capacity-flag hidden">over-capacity</span>
+                </div>
+
                 <div id="plans-list" class="plans-list"></div>
+            </section>
+
+            <!-- Scheduler view: the queue, the running plans, and the
+                 four operator actions. The order of the queue and the
+                 words on the reasons are the server's — see renderScheduler(). -->
+            <section id="scheduler-view" class="view hidden">
+                <div class="view-header">
+                    <h2>调度</h2>
+                    <div class="view-header-actions">
+                        <button id="btn-refresh-scheduler" class="btn btn-outline">刷新</button>
+                        <button id="btn-scheduler-back-home" class="btn">返回计划列表</button>
+                    </div>
+                </div>
+
+                <div id="scheduler-view-capacity" class="scheduler-capacity">
+                    <span class="scheduler-capacity-label">已用</span>
+                    <span id="scheduler-view-capacity-used" class="scheduler-capacity-value">0</span>
+                    <span class="scheduler-capacity-label">共</span>
+                    <span id="scheduler-view-capacity-total" class="scheduler-capacity-value">0</span>
+                    <span class="scheduler-capacity-divider">·</span>
+                    <span class="scheduler-capacity-label">队列</span>
+                    <span id="scheduler-view-capacity-queue" class="scheduler-capacity-value">0</span>
+                    <span id="scheduler-view-capacity-over" class="scheduler-capacity-flag hidden">over-capacity</span>
+                    <span class="scheduler-capacity-stamp">
+                        <span class="scheduler-capacity-label">快照</span>
+                        <span id="scheduler-view-generated-at" class="scheduler-capacity-value">—</span>
+                    </span>
+                </div>
+
+                <div id="scheduler-action-result" class="scheduler-action-result hidden">
+                    <span id="scheduler-action-outcome" class="scheduler-action-outcome"></span>
+                    <span id="scheduler-action-detail" class="scheduler-action-detail"></span>
+                </div>
+
+                <h3 class="scheduler-subtitle">队列</h3>
+                <div id="scheduler-queue-empty" class="empty-state">
+                    <p>队列为空</p>
+                </div>
+                <table id="scheduler-queue-table" class="scheduler-table hidden">
+                    <thead>
+                        <tr>
+                            <th>位置</th>
+                            <th>计划</th>
+                            <th>序号</th>
+                            <th>优先级</th>
+                            <th>提升</th>
+                            <th>原因</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="scheduler-queue-list"></tbody>
+                </table>
+
+                <h3 class="scheduler-subtitle">在跑</h3>
+                <div id="scheduler-running-empty" class="empty-state">
+                    <p>没有在跑的计划</p>
+                </div>
+                <table id="scheduler-running-table" class="scheduler-table hidden">
+                    <thead>
+                        <tr>
+                            <th>计划</th>
+                            <th>已运行(秒)</th>
+                            <th>可驱逐</th>
+                            <th>工作区</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="scheduler-running-list"></tbody>
+                </table>
+
+                <h3 class="scheduler-subtitle">可操作的计划</h3>
+                <div id="scheduler-plans-empty" class="empty-state">
+                    <p>没有可操作的计划</p>
+                </div>
+                <table id="scheduler-plans-table" class="scheduler-table hidden">
+                    <thead>
+                        <tr>
+                            <th>计划</th>
+                            <th>相位</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="scheduler-plans-list"></tbody>
+                </table>
             </section>
 
             <!-- Interview view -->

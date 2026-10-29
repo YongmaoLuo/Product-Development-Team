@@ -9,12 +9,13 @@ for plan-level state.  The ``sqlite_master`` table name set for the
 state-machine database MUST be EXACTLY::
 
     {plan_routing, plan_execution, plan_verification, plan_artifacts,
-     plan_tasks, plan_decisions, schema_version}
+     plan_tasks, plan_decisions, scheduler_queue, scheduler_slot,
+     scheduler_command, schema_version}
 
-i.e. the ``plan_*`` "concern" tables plus one ``schema_version``
-migration logbook table.  No legacy ``plans``, ``plan_meta``, or
-``plan_activity`` tables are allowed; no extra ``plan_*`` tables are
-allowed either.
+i.e. the ``plan_*`` "concern" tables, the three ``scheduler_*`` tables
+and one ``schema_version`` migration logbook table.  No legacy
+``plans``, ``plan_meta``, or ``plan_activity`` tables are allowed; no
+extra ``plan_*`` or ``scheduler_*`` tables are allowed either.
 
 The brief calls this out as:
 
@@ -29,6 +30,10 @@ was written -- ``plan_tasks`` (the per-task runtime table lifted out of
 ``tasks.json``) and ``plan_decisions`` (the human-in-the-loop store) --
 and the file name and the test name were kept rather than renamed, so
 that the anchor this file provides keeps pointing at the same gate.
+Schema v7 (2026-10-28) added three more: ``scheduler_queue``,
+``scheduler_slot`` and ``scheduler_command`` -- the native scheduler's
+own three facts (who runs next, who holds a slot, which command was
+issued), created by the same ``migrate`` call as the tables above.
 The *expectation* is the set below, and the set is what the schema has
 to equal.
 
@@ -73,9 +78,11 @@ from state_machine.db.schema import migrate  # noqa: E402
 # ``plan_tasks`` table (per-task runtime status lifted out of
 # tasks.json by the task #v4 split — see
 # ``state_machine/db/schema.py`` and ``task_manager``'s
-# ``_persist_status_to_sqlite``), and the v7 ``plan_decisions`` table
+# ``_persist_status_to_sqlite``), the v7 ``plan_decisions`` table
 # (the human-in-the-loop decision store — see the same schema module's
-# ``_ensure_plan_decisions``).
+# ``_ensure_plan_decisions``), and the three v7 ``scheduler_*`` tables
+# (the native scheduler's queue order, slot occupancy and operator
+# commands — see the same schema module's ``_SCHEDULER_OBJECTS``).
 EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
     {
         "plan_routing",
@@ -84,6 +91,9 @@ EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
         "plan_artifacts",
         "plan_tasks",
         "plan_decisions",
+        "scheduler_queue",
+        "scheduler_slot",
+        "scheduler_command",
         "schema_version",
     }
 )

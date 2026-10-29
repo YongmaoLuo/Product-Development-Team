@@ -53,6 +53,18 @@ reads ``body["error"]`` for the rule that refused the request and
 403 already has, and the same shape a 409 uses for the ``status`` the
 decision is actually in.
 
+An answer is also a scheduling signal
+-------------------------------------
+The plan that asked the question may have been waiting for it, and the
+answer is the signal that it may go back to work.  This route does not
+decide that: it reads the engine off the application
+(``app.state.scheduler_engine`` — the same handle the lifespan hangs
+the engine on, and ``None`` while the scheduler is not running) and
+hands it to the service, which submits the ``resume`` that puts a
+parked plan back at the head of the queue.  A plan that is still
+working is left alone, and a scheduler that is not there is not a
+reason to refuse an answer.
+
 What this file deliberately does not do
 ---------------------------------------
 * **It does not bypass the request guard.**  The guard is middleware
@@ -73,7 +85,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from hitl.models import Decision, DecisionMode, DecisionRequest
@@ -292,7 +304,10 @@ def list_hitl_decisions(
 
 @router.post("/api/hitl/{plan_id}/decisions/{decision_id}/answer")
 def answer_hitl_decision(
-    plan_id: str, decision_id: str, payload: AnswerDecisionRequest
+    plan_id: str,
+    decision_id: str,
+    payload: AnswerDecisionRequest,
+    request: Request,
 ) -> Dict[str, Any]:
     """Record a human's answer to one of the plan's decisions.
 
@@ -303,8 +318,19 @@ def answer_hitl_decision(
     The first answer wins.  A decision that is already settled answers
     with a 409 and keeps what it had — a second answer is a conflict,
     never an overwrite.
+
+    An answer is also the signal that the plan may go back to work, so
+    the route hands the scheduler the engine it is running with
+    (``app.state.scheduler_engine`` — the same handle the lifespan
+    hangs the engine on, and ``None`` while the scheduler is not
+    running).  The service submits the ``resume`` that puts a parked
+    plan back at the head of the queue; a plan that is still working is
+    left alone, and a scheduler that is not there is not a reason to
+    refuse the answer.
     """
     _server._validated_plan_id(plan_id)   # uniform contract — see that function
+
+    engine = getattr(request.app.state, "scheduler_engine", None)
 
     status, code = answer_decision(
         decision_id,
@@ -312,6 +338,7 @@ def answer_hitl_decision(
         payload.answered_by,
         payload.note,
         plan_id=plan_id,
+        engine=engine,
     )
 
     if code == 404:

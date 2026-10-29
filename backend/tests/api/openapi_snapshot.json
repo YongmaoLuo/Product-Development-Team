@@ -254,6 +254,11 @@
             ],
             "title": "Hook Session Id"
           },
+          "priority": {
+            "default": 0,
+            "title": "Priority",
+            "type": "integer"
+          },
           "project_dir": {
             "anyOf": [
               {
@@ -1819,7 +1824,7 @@
     },
     "/api/hitl/{plan_id}/decisions/{decision_id}/answer": {
       "post": {
-        "description": "Record a human's answer to one of the plan's decisions.\n\nThe answer is scoped to the plan in the path: a decision of another\nplan is reported as not found, so a stale card cannot answer\nsomebody else's question.\n\nThe first answer wins.  A decision that is already settled answers\nwith a 409 and keeps what it had \u2014 a second answer is a conflict,\nnever an overwrite.",
+        "description": "Record a human's answer to one of the plan's decisions.\n\nThe answer is scoped to the plan in the path: a decision of another\nplan is reported as not found, so a stale card cannot answer\nsomebody else's question.\n\nThe first answer wins.  A decision that is already settled answers\nwith a 409 and keeps what it had \u2014 a second answer is a conflict,\nnever an overwrite.\n\nAn answer is also the signal that the plan may go back to work, so\nthe route hands the scheduler the engine it is running with\n(``app.state.scheduler_engine`` \u2014 the same handle the lifespan\nhangs the engine on, and ``None`` while the scheduler is not\nrunning).  The service submits the ``resume`` that puts a parked\nplan back at the head of the queue; a plan that is still working is\nleft alone, and a scheduler that is not there is not a reason to\nrefuse the answer.",
         "operationId": "answer_hitl_decision_api_hitl__plan_id__decisions__decision_id__answer_post",
         "parameters": [
           {
@@ -2298,6 +2303,205 @@
           }
         },
         "summary": "Revise Plan"
+      }
+    },
+    "/api/plan/{plan_id}/scheduler/pause": {
+      "post": {
+        "description": "Park a plan: stop it, and let it give its slot back.\n\nA working plan is stopped through the lifecycle's existing stop\npath, and a waiting one is taken out of the queue and parked.  In\nboth cases the plan ends up in ``stopped`` and it stops holding\ncompute.",
+        "operationId": "pause_plan_api_plan__plan_id__scheduler_pause_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pause Plan"
+      }
+    },
+    "/api/plan/{plan_id}/scheduler/promote": {
+      "post": {
+        "description": "Move a plan ahead in the queue \u2014 and nothing else.\n\nA promotion is a change of order: it evicts nobody and it takes no\nslot, so a plan that is already working cannot be promoted \u2014 it is\nnot waiting in the queue, and there is no order to move it in.  That\nis a conflict.",
+        "operationId": "promote_plan_api_plan__plan_id__scheduler_promote_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Promote Plan"
+      }
+    },
+    "/api/plan/{plan_id}/scheduler/resume": {
+      "post": {
+        "description": "Put a stopped plan back at the head of the queue.\n\nA resume is a **wait**, not a take: the plan comes back first, it\nwaits for a slot, and it interrupts nobody.",
+        "operationId": "resume_plan_api_plan__plan_id__scheduler_resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resume Plan"
+      }
+    },
+    "/api/plan/{plan_id}/scheduler/start": {
+      "post": {
+        "description": "Make a plan the next one to run.\n\nA start is the **only** action that may interrupt somebody, and it\ndoes so only when the capacity is full and there is a victim the\nrules allow.  With no such victim the plan waits at the head of the\nqueue and the answer is ``blocked_by_capacity``.",
+        "operationId": "start_plan_api_plan__plan_id__scheduler_start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Plan"
+      }
+    },
+    "/api/plan/{plan_id}/scheduler/{action}": {
+      "post": {
+        "description": "Refuse what the four fixed endpoints cannot answer.\n\nThe four actions are **fixed paths**, and nothing outside them runs:\nthe vocabulary is closed, so an action that is not one of the four\nhas no command, no plan and no effect \u2014 it is refused with a 404\nthat says exactly that.\n\nThis route exists because the four fixed endpoints **cannot match**\nevery malformed request, and a request that matches no route at all\nis answered by the frontend's catch-all \u2014 whose answer is a 405\n(\"this method is not allowed here\"), a sentence about the *method*\nwhen the real problem is the *URL*.  Two shapes fall through:\n\n* an **empty** plan id \u2014 ``/api/plan//scheduler/promote``.  The\n  router's ``{plan_id}`` needs at least one character, so the\n  segment is simply not there;\n* a plan id that carries a **path separator** \u2014 a traversal such as\n  ``../../etc/passwd``.  The router splits the path on ``/`` before\n  the handler ever sees it, so such an id arrives as *several*\n  segments and the fixed route stops matching.\n\nBoth are refusals, and both are answered here:\n\n* an action **outside** the closed four \u2192 404: there is no such\n  endpoint, and nothing is executed;\n* an action **inside** it, with a plan id the router could not\n  carry \u2192 the shared guard's own 400, unchanged.  The guard is\n  ``server._plan_dir``, the one place a request-supplied id may\n  become a path, and it refuses an empty id and an id with a\n  separator alike.\n\nThe route is registered **after** the four fixed ones, so a request\nthat one of them matches is answered by that one: the four fixed\npaths stay the only paths that carry out an action.",
+        "operationId": "scheduler_action_outside_the_vocabulary_api_plan__plan_id__scheduler__action__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "title": "Plan Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action",
+            "required": true,
+            "schema": {
+              "title": "Action",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Scheduler Action Outside The Vocabulary"
       }
     },
     "/api/plan/{plan_id}/state": {
@@ -3010,6 +3214,27 @@
           }
         },
         "summary": "Get Review Items"
+      }
+    },
+    "/api/scheduler/state": {
+      "get": {
+        "description": "Answer with the scheduler's read model.\n\nThe engine's own snapshot: the six keys, the queue in the\nproduction order, the numbers the panel shows beside the flags\nthat describe them.\n\nA scheduler that is not running answers the empty document rather\nthan an error \u2014 the endpoint is what the panel polls, and an\nendpoint that fails when there is nothing to report leaves the\noperator with a broken panel and no way to tell an idle scheduler\nfrom a broken one.",
+        "operationId": "get_scheduler_state_api_scheduler_state_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Scheduler State Api Scheduler State Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Scheduler State"
       }
     },
     "/api/system/active": {

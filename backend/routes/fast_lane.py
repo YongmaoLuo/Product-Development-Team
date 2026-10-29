@@ -56,6 +56,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 from fastapi import HTTPException
+from fastapi import Request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
@@ -73,6 +74,7 @@ from coding_tool import JsonSession
 from framework.ids import derive_plan_id
 from framework.task_graph import DanglingTaskDependency
 from hooks.config import write_for_plan
+from plan_scheduler.engine import SCHEDULER_INTENT_FILE
 from task import SubTask
 from task_manager import CycleInTaskGraph, TaskManager
 from tasks_generator import TasksGenerationError, TasksGenerator
@@ -119,6 +121,17 @@ class ImportPlanRequest(BaseModel):
     #: :func:`bind_hook_for_plan`.
     hook_destination: Optional[str] = None
     hook_session_id: Optional[str] = None
+    #: How urgent this plan is, as the caller sees it **right now**: the
+    #: smaller the number, the earlier the plan runs.  It is the
+    #: caller's own expression of intent, offered once, with this
+    #: request — so it is written into the queue row when the plan
+    #: joins the scheduler's line and is fixed there.  It is not read
+    #: from the configuration and not read from the environment: a
+    #: priority that came from a setting would put the same plan in a
+    #: different place on another machine and after a restart, and the
+    #: queue would no longer be the caller's queue.  A request that
+    #: says nothing gets ``0``.
+    priority: int = 0
 
 
 class RevisePlanRequest(BaseModel):
@@ -251,6 +264,60 @@ def _mark_queued(plan_id: str, plan_dir: Path) -> None:
         )
 
 
+def _record_scheduler_intent(plan_dir: Path, priority: int) -> int:
+    """Record the priority the caller asked for, in the plan's own files.
+
+    The number is the **caller's**, and it is written once, here, in the
+    plan's own directory.  It is the plan's artifact rather than the
+    scheduler's, because the queue row — which is the scheduler's own
+    fact, and which only the scheduler's worker may write — is the
+    scheduler's *copy* of it.  The copy has to have something to copy
+    from, and it has to be able to copy it long after the import: a
+    plan imported while the scheduler was switched off still has to
+    join the line with the priority the caller asked for.
+
+    The number is *fixed* at the moment the plan is asked for.  A plan
+    that is already in the line keeps the number it was given: the
+    caller's intent was expressed once, and a repeated import of the
+    same plan is not a new intent — it is the same plan.  Changing the
+    order of a waiting plan is the operator's business, and the
+    operator's business is the promotion.
+
+    Nothing here reads a configuration file and nothing here reads the
+    environment.  The number came from the request; that is the whole
+    of its provenance.
+
+    Args:
+        plan_dir: the plan's own directory.
+        priority: the number the caller sent with the request.
+
+    Returns:
+        The priority the plan is fixed at — the one that was already
+        written, or the one that was just written.
+
+    Raises:
+        OSError: when the artifact cannot be written.  The caller is
+            told, because a caller that asked for a priority deserves
+            to know it did not get one.
+    """
+    path = plan_dir / SCHEDULER_INTENT_FILE
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        existing = None
+    if isinstance(existing, dict):
+        recorded = existing.get("priority")
+        if isinstance(recorded, int) and not isinstance(recorded, bool):
+            # Already fixed: a repeated import is not a new intent.
+            return int(recorded)
+
+    path.write_text(
+        json.dumps({"priority": int(priority)}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return int(priority)
+
+
 def bind_hook_for_plan(
     plan_dir: Path,
     destination: Optional[str] = None,
@@ -314,7 +381,7 @@ def bind_hook_for_plan(
 
 
 @router.post("/api/plan/import")
-def import_plan(req: ImportPlanRequest):
+def import_plan(req: ImportPlanRequest, request: Request):
     """Import external upstream material as a new plan, parked in ``queued``.
 
     Skips interview / PRD / architecture / test-design generation — the
@@ -460,6 +527,61 @@ def import_plan(req: ImportPlanRequest):
 
     written = _persist_tasks(plan_dir, seed, tasks_data)
     _mark_queued(plan_id, plan_dir)
+    # The plan's place in the scheduler's line, and the priority the
+    # caller asked for when it asked for the plan.  The number is the
+    # caller's, so it is written into the plan's own artifact — and the
+    # **worker** writes the queue row, because the queue is the
+    # scheduler's own fact and it has one writer.  The route only hands
+    # the job over.
+    #
+    # An artifact that could not be written does not undo the import:
+    # the plan is on disk, its task list is written and it is parked in
+    # the phase the scheduler collects from.  The scheduler reconciles a
+    # waiting plan that has no queue row at its next tick, so the plan
+    # still runs - at the default priority, because the number the
+    # caller gave is gone.  The failure is logged loudly and the caller
+    # is told, because a caller that asked for a priority deserves to
+    # know it did not get one.
+    try:
+        priority = _record_scheduler_intent(plan_dir, req.priority)
+    except Exception as exc:  # noqa: BLE001 - logged, never swallowed
+        _server.logger.error(
+            "scheduler_intent_write_failed: the priority of plan %s could "
+            "not be recorded (%s: %s); the scheduler will pick it up at "
+            "the default priority",
+            plan_id,
+            type(exc).__name__,
+            exc,
+        )
+        warnings.append(
+            "the plan's priority could not be recorded "
+            f"({type(exc).__name__}); it will be scheduled at the default "
+            "priority"
+        )
+        priority = int(req.priority)
+
+    # The hand-over.  A scheduler that is not running has no worker to
+    # take the job, and that is not a failure: the plan's own artifact
+    # carries the priority, and the worker reads it from there when it
+    # builds the queue row.
+    engine = getattr(request.app.state, "scheduler_engine", None)
+    if engine is not None:
+        try:
+            engine.submit_enqueue(plan_id, priority, timeout=0.0)
+        except Exception as exc:  # noqa: BLE001 - logged, never swallowed
+            _server.logger.error(
+                "scheduler_enqueue_failed: plan %s could not be handed to "
+                "the scheduler (%s: %s); the scheduler will pick it up at "
+                "the priority the caller asked for",
+                plan_id,
+                type(exc).__name__,
+                exc,
+            )
+            warnings.append(
+                "the plan could not be handed to the scheduler "
+                f"({type(exc).__name__}); it will be scheduled at the "
+                "priority you asked for"
+            )
     # The plan's hook binding: the session it was created in, and where a
     # human-in-the-loop question about it goes.  Recorded once the plan
     # exists — a plan that never reached ``queued`` is not a plan, and
@@ -544,7 +666,7 @@ def _persist_revised_tasks(
     the in-memory models, for the same reason the import route reads it
     back: ``save_tasks`` strips the runtime fields on its way out, and
     rebuilding that strip list here would be a second copy of a rule
-    that already lives in the writer.
+    that lives in the writer.
     """
     manager = TaskManager(plan_dir)
     manager.tasks = [SubTask(**item) for item in tasks_data.get("tasks", [])]

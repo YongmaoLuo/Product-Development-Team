@@ -1,11 +1,11 @@
 """Schema management for the state-machine WAL base layer.
 
-The :func:`migrate` factory creates the six ``plan_*`` tables plus
-the ``schema_version`` bootstrap table the state-machine refactor
-relies on.  Every ``CREATE TABLE`` uses ``IF NOT EXISTS`` so the
-function is safe to call repeatedly — calling ``migrate`` on an
-already-migrated database is a no-op (the second call still returns
-without raising).
+The :func:`migrate` factory creates the six ``plan_*`` tables, the
+three ``scheduler_*`` tables and the ``schema_version`` bootstrap
+table the state-machine refactor relies on.  Every ``CREATE TABLE``
+uses ``IF NOT EXISTS`` so the function is safe to call repeatedly —
+calling ``migrate`` on an already-migrated database is a no-op (the
+second call still returns without raising).
 
 The six ``plan_*`` tables
 -------------------------
@@ -49,7 +49,7 @@ it gone there is exactly one workflow-state column in the database.
 Like v5 the drop is a full table rebuild and is one-way — take a copy
 of ``state.db`` before the first v6 boot.
 
-v7 (2026-10-21) adds ``plan_decisions`` — the storage for
+The HITL table (2026-10-21) adds ``plan_decisions`` — the storage for
 human-in-the-loop decisions.  A decision is asked by one actor (an
 executor thread, a verification thread, a route handler) and answered
 by another (a human, on another thread and possibly on another
@@ -65,21 +65,43 @@ COLUMN``, which leaves every existing row exactly as it was — so they
 need no version bump either.
 
 Unlike v5 and v6 this table is NOT applied through the version-gated
-schema step, and :data:`CURRENT_SCHEMA_VERSION` stays at 6.  The
+schema step: it is created by :func:`_ensure_plan_decisions`, which
+guards on the table itself and runs on every ``migrate`` call.  The
 reason is that the version number is a *cache* of "the shape-changing
 migrations have been applied", and the shape-changing migrations are
 exactly the ones that need a rebuild (v5, v6) or a data lift (v4).
 A new table is neither: ``CREATE TABLE IF NOT EXISTS`` is safe to
 re-run, and the table's presence is a better logbook than a version
-row — which is why :func:`_ensure_plan_decisions` guards on the table
-itself and runs on every ``migrate`` call.  Bumping the version would
-instead re-run the v5 and v6 rebuilds (each of which takes a write
-lock) on every existing database, to no end: neither rebuild has
-anything to do.  The presence guard is what makes the table appear on
+row.  The presence guard is what makes the table appear on
 a database that was created before it existed, and it is why a
 database that somehow reached the current version without the table
 heals itself on the next ``migrate`` instead of failing every later
 read with *"no such table: plan_decisions"*.
+
+v7 (2026-10-27) adds the three scheduler tables —
+``scheduler_queue`` / ``scheduler_slot`` / ``scheduler_command``.  The
+scheduler keeps three facts of its own: the queue order (which plan
+runs next), the slot occupancy (when a plan took a concurrency slot)
+and the manual commands (a promote / pause / resume / start an
+operator asked for).  Everything else the scheduler needs — the
+phase, the running process, a pending human decision — is *derived*
+from the ``plan_*`` tables on every tick, so the scheduler never
+copies a plan fact and there is no second source of truth.
+
+The three tables live in this database, not in a side-car file or a
+second SQLite file: scheduling facts and plan facts must be readable
+in one transaction, otherwise "is this plan running?" and "is this
+plan in the queue?" are two facts that can disagree.  That is why the
+DDL goes through the same :func:`migrate` entry point as everything
+else rather than through a migration path of its own, and why
+:data:`CURRENT_SCHEMA_VERSION` is bumped to 7 — the version number
+is what tells an existing database that it needs the new tables.
+
+Like the HITL table, the scheduler tables are a pure addition: no
+existing table changes shape and no existing row is touched.  They
+are created with ``CREATE TABLE IF NOT EXISTS`` and their indexes with
+``CREATE [UNIQUE] INDEX IF NOT EXISTS``, so re-running the migration
+is a no-op.
 
 The ``schema_version`` table is the migration-logbook: a single
 INTEGER column primary key recording which schema version is live.
@@ -95,12 +117,13 @@ import sqlite3
 __all__ = ["migrate", "CURRENT_SCHEMA_VERSION"]
 
 #: Schema version this module produces.  Bumped in tandem with any
-#: DDL change so the upgrade script can branch on it.  The v7
-#: ``plan_decisions`` table is the documented exception: it is a pure
-#: addition applied by the unconditional, presence-guarded
-#: :func:`_ensure_plan_decisions` step rather than by the
-#: version-gated schema pass — see the module docstring for why.
-CURRENT_SCHEMA_VERSION = 6
+#: DDL change so the upgrade script can branch on it.  v7 is the
+#: scheduler migration: the three ``scheduler_*`` tables.  The
+#: ``plan_decisions`` table is applied by the unconditional,
+#: presence-guarded :func:`_ensure_plan_decisions` step rather than
+#: by the version-gated schema pass — see the module docstring for
+#: why.
+CURRENT_SCHEMA_VERSION = 7
 
 
 # Each CREATE TABLE statement is kept as a top-level string constant
@@ -376,6 +399,94 @@ CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER PRIMARY KEY
 )
 """
+
+# ---------------------------------------------------------------------------
+# Schema v7 — the scheduler's own facts (2026-10-27)
+# ---------------------------------------------------------------------------
+#
+# The scheduler derives every plan fact (phase, running process, pending
+# human decision) from the ``plan_*`` tables on every tick.  What it
+# cannot derive is its own bookkeeping, and that is exactly what these
+# three tables hold:
+#
+#   * ``scheduler_queue``   — the order in which queued plans may run.
+#   * ``scheduler_slot``    — when a plan took a concurrency slot.
+#   * ``scheduler_command`` — the manual commands an operator issued.
+#
+# They live in the same database as the plan facts on purpose: "is this
+# plan running?" and "is this plan in the queue?" have to be readable
+# in one transaction, otherwise they are two facts that can disagree.
+
+#: The queue.  ``plan_id`` is the primary key (one row per queued plan);
+#: ``seq`` is the monotonic tie-breaker that makes the order a total
+#: order — it is UNIQUE so two plans can never claim the same place in
+#: the queue, which would make "who runs next" ambiguous.  The order is
+#: ``(promote_order IS NULL), promote_order, priority, seq``: a promoted
+#: plan runs first (most recently promoted first), then by priority,
+#: then by arrival.  ``promote_order`` is NULL for a plan that was
+#: never promoted.
+_DDL_SCHEDULER_QUEUE = """
+CREATE TABLE IF NOT EXISTS scheduler_queue (
+  plan_id       TEXT PRIMARY KEY,
+  seq           INTEGER NOT NULL,
+  priority      INTEGER NOT NULL DEFAULT 0,
+  promote_order INTEGER,
+  enqueued_at   TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+)
+"""
+
+_DDL_SCHEDULER_QUEUE_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduler_queue_seq
+  ON scheduler_queue(seq)
+"""
+
+#: The concurrency slots.  The row records *when* the slot was taken
+#: and nothing else: which plan is running is a plan fact, derived
+#: from ``plan_routing`` / ``plan_execution``.  ``acquired_at`` is the
+#: only time source the eviction rule (a plan that has been running
+#: long enough may be evicted) is allowed to use.
+_DDL_SCHEDULER_SLOT = """
+CREATE TABLE IF NOT EXISTS scheduler_slot (
+  plan_id     TEXT PRIMARY KEY,
+  acquired_at TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+)
+"""
+
+#: The manual commands (promote / pause / resume / start).  This table
+#: is append-only and is *never* read back to make a scheduling
+#: decision — the decision lives in the queue and the slots.  It exists
+#: so a command survives a backend restart instead of living in the
+#: memory of the process that received it.  ``command_id`` is
+#: AUTOINCREMENT so the id space is never reused, which keeps "the
+#: command the operator issued at 14:03" unambiguous forever.
+_DDL_SCHEDULER_COMMAND = """
+CREATE TABLE IF NOT EXISTS scheduler_command (
+  command_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id    TEXT NOT NULL,
+  action     TEXT NOT NULL,
+  outcome    TEXT NOT NULL,
+  detail     TEXT,
+  created_at TEXT NOT NULL
+)
+"""
+
+#: The lookup a reader needs: "this plan's commands, oldest first".
+_DDL_SCHEDULER_COMMAND_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_scheduler_command_plan
+  ON scheduler_command(plan_id, created_at)
+"""
+
+#: Every object the v7 migration owns, with the DDL that creates it.
+#: The name is the presence key: an object that exists needs no DDL.
+_SCHEDULER_OBJECTS: tuple[tuple[str, str], ...] = (
+    ("scheduler_queue", _DDL_SCHEDULER_QUEUE),
+    ("idx_scheduler_queue_seq", _DDL_SCHEDULER_QUEUE_INDEX),
+    ("scheduler_slot", _DDL_SCHEDULER_SLOT),
+    ("scheduler_command", _DDL_SCHEDULER_COMMAND),
+    ("idx_scheduler_command_plan", _DDL_SCHEDULER_COMMAND_INDEX),
+)
 
 # Order matters: the six ``plan_*`` tables come first, then the
 # ``schema_version`` bootstrap table.  The order is pinned so the
@@ -765,8 +876,43 @@ def _add_missing_plan_decision_columns(conn: sqlite3.Connection) -> None:
             pass
 
 
+def _ensure_scheduler_tables(conn: sqlite3.Connection) -> None:
+    """Create the three scheduler tables and their indexes when missing.
+
+    The scheduler's own facts — queue order, slot occupancy, manual
+    commands — live next to the plan facts, in this database, so the
+    scheduler can read "is this plan running?" and "is this plan in
+    the queue?" in one transaction.
+
+    Guarded by the *presence of the objects* rather than by the version
+    row, for the same reason as :func:`_ensure_plan_decisions`: the
+    presence check is self-describing and idempotent, and a database
+    that somehow reached the current version without the tables heals
+    itself on the next ``migrate`` instead of failing every later read
+    with *"no such table: scheduler_queue"*.
+
+    One read of ``sqlite_master`` answers "is anything missing?".  When
+    nothing is missing the step costs that single read and issues no
+    DDL — which is what keeps the hot path (a fresh connection per
+    request) free of write locks.  When something *is* missing the
+    whole DDL set is replayed: every statement is ``IF NOT EXISTS``, so
+    the objects that were already there are left exactly as they are.
+    """
+    present = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+        )
+    }
+    if all(name in present for name, _ddl in _SCHEDULER_OBJECTS):
+        return
+    for _name, ddl in _SCHEDULER_OBJECTS:
+        conn.execute(ddl)
+
+
 def migrate(conn: sqlite3.Connection) -> None:
-    """Create the six ``plan_*`` tables and the ``schema_version`` row.
+    """Create the six ``plan_*`` tables, the three ``scheduler_*``
+    tables and the ``schema_version`` row.
 
     Idempotent: uses ``CREATE TABLE IF NOT EXISTS`` for every DDL
     statement.  Calling ``migrate`` repeatedly on the same database
@@ -831,6 +977,16 @@ def migrate(conn: sqlite3.Connection) -> None:
     # (the context columns are added to it), so an operator's database
     # written by an older backend is upgraded rather than left behind.
     _ensure_plan_decisions(conn)
+
+    # The three scheduler tables are ensured on EVERY call, for the same
+    # reason the HITL table is: the scheduler's own facts (queue order,
+    # slot occupancy, manual commands) must sit next to the plan facts
+    # in this database, and the objects' presence is a better logbook
+    # than the version row.  The version bump to 7 is what tells an
+    # existing database that the migration ran; the presence guard is
+    # what makes a database that somehow missed the tables heal itself
+    # instead of failing every later read.
+    _ensure_scheduler_tables(conn)
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:

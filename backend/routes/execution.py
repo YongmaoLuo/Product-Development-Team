@@ -17,11 +17,11 @@ from datetime import datetime, timezone
 from collections import deque
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
 import threading
-import time
 
 # Late binding into the application module: ``server`` owns the shared
 # helpers, request models and module globals, and the suite monkeypatches
@@ -46,24 +46,6 @@ from project_dir_guard import ProjectDirInvalidError, validate_project_dir
 from capacity_wait import WAIT_KIND_FIELD, quota_wait_event_data
 
 router = APIRouter()
-
-#: How often the recovery watcher re-probes a recovered executor's pid.
-#:
-#: Half a second is short enough that a run whose executor has just
-#: exited is settled long before the next watchdog tick (30 s), and long
-#: enough that a boot-time scan over many plans does not turn into a
-#: busy loop.
-_RECOVERY_POLL_INTERVAL_SECONDS = 0.5
-
-#: How long a settle waits for the verification hand-off to be picked up.
-#:
-#: The hand-off itself is a thread (the verification round is a long
-#: job), but the settle waits a bounded moment for it: a caller that
-#: reads the outcome right after the settle should see the round that
-#: was started, not a race it has to lose.  The wait is bounded on
-#: purpose — the real round runs for minutes, and it keeps running in
-#: the background either way.
-_RECOVERY_VERIFICATION_HANDOFF_TIMEOUT_SECONDS = 0.25
 
 
 def _restore_execution_state_from_row(
@@ -165,455 +147,18 @@ def _recover_execution_states(plans_dir: Path) -> None:
                 if not pid:
                     _judge_process_dead(plan_id, row)
                     continue
-                alive = False
                 try:
                     os.kill(pid, 0)
-                    alive = True
                 except ProcessLookupError:
                     _judge_process_dead(plan_id, row)
                 except PermissionError:
-                    # The process exists but is not ours to signal —
-                    # that is still a live executor.
-                    alive = True
-                if alive:
-                    # The executor is still running, so hand it to a
-                    # watcher that can say when it is gone.  Without
-                    # one the restored run has no watcher, no process
-                    # handle and no completion marker: the watchdog's
-                    # probe is then the only voice, and it reads a
-                    # clean exit as a crash.
-                    _start_recovery_watcher(plan_id, pid)
+                    pass
     finally:
         # 2026-09-23: this connection is opened once for the whole scan
         # and must be released even if the traversal raises. Its sibling
         # _recover_verification_states used to leak one handle per plan;
         # see tests/unit/test_recovery_closes_its_connections.py.
         _server._close_state_machine(sm)
-
-
-def _recovered_plan_dir(plan_id: str) -> Path:
-    """Where a recovered plan's artifacts live (``<plans>/<plan_id>/``).
-
-    The plan directory is the one place that outlives the process that
-    started the run: the log, the task list and the row all live under
-    it.  It is resolved through the framework's own resolver, so every
-    reader of a plan agrees on which tree it is looking at.
-    """
-    from config_paths import resolve_plans_dir
-
-    return resolve_plans_dir() / plan_id
-
-
-def _recovered_completion_marker(
-    plan_id: str, plan_dir: Path
-) -> Optional[Dict[str, Any]]:
-    """The executor's completion marker, or ``None`` when there is none.
-
-    The marker is the executor's own statement that it finished: the
-    ``execution_completed`` event the agent writes when the dispatcher
-    has nothing left to run.  It is read from the plan's
-    ``execution.log`` — the artifact that outlives the process, and the
-    only place a restart can still read the run's ending from.
-
-    A line that names the event but cannot be parsed is NOT a marker:
-    its payload is unavailable, so it cannot say whether the run
-    finished.  "The log could not be read" and "the run finished" are
-    different answers, and only one of them may settle a run.
-    """
-    try:
-        entries = _server.ExecutionLogger.read_logs(
-            plan_id,
-            plans_dir=plan_dir.parent,
-            event="execution_completed",
-            limit=5,
-        )
-    except Exception:  # noqa: BLE001 — an unreadable log is not a marker
-        return None
-    for entry in entries or []:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("event") != "execution_completed":
-            continue
-        data = entry.get("data")
-        if isinstance(data, dict) and data.get("unparsable"):
-            # The line names the event, but its payload is gone.
-            continue
-        return entry
-    return None
-
-
-def _recovered_unfinished_count(
-    plan_id: str, tasks_file: Path
-) -> Optional[int]:
-    """How many tasks the plan still owes — or ``None`` when unknowable.
-
-    ``None`` is not zero.  Zero means "nothing is left to do"; ``None``
-    means "the count could not be established", and a settle that
-    cannot tell whether work is left must not report success.
-
-    The count itself comes from the framework's own cross-check of
-    ``tasks.json`` against the runtime task overlay — the same source
-    the executor's own success path reads.
-    """
-    try:
-        counts = _server._count_unfinished_tasks(plan_id, tasks_file)
-    except Exception:  # noqa: BLE001 — an unknown count is not a zero
-        return None
-    if not isinstance(counts, dict):
-        return None
-    try:
-        return int(counts.get("pending_or_unstarted") or 0)
-    except (TypeError, ValueError):
-        return None
-
-
-def _recovered_execution_outcome(
-    plan_id: str, plan_dir: Path, tasks_file: Path
-) -> str:
-    """Judge a recovered run whose executor process is gone.
-
-    Returns ``"completed"`` when the plan's log carries the executor's
-    completion marker AND no task is left unfinished; ``"crashed"``
-    otherwise.
-
-    The marker alone is not enough.  The marker says the executor
-    stopped; the task list says whether it stopped because it was
-    done.  A run that stopped with work still owed is a crash, and
-    stamping it ``completed`` would hand a half-finished plan to the
-    verification round.
-
-    The asymmetry is deliberate: reading a crash as a success is the
-    expensive mistake (a plan whose tasks are half done must never be
-    stamped ``completed``), while reading a success as a crash costs
-    the operator a re-run.
-    """
-    if _recovered_completion_marker(plan_id, plan_dir) is None:
-        return "crashed"
-    unfinished = _recovered_unfinished_count(plan_id, tasks_file)
-    if unfinished is None or unfinished > 0:
-        return "crashed"
-    return "completed"
-
-
-def _recovered_settle_is_due(plan_id: str) -> bool:
-    """Whether this run still needs a verdict — and clears the watcher.
-
-    The watcher hands the run over exactly once, and the hand-over is
-    recorded by the watcher it hangs on the run's record.  Clearing it
-    here is what makes a second settle a no-op: no watcher is left to
-    hand the run over, and a run that already carries a verdict is
-    never judged again.
-    """
-    state = _server._execution_state.get(plan_id)
-    if not isinstance(state, dict):
-        # No in-memory record: the row is all that is left, and
-        # ``_mark_failed_dead`` judges the row idempotently.
-        return True
-    with _server._execution_state_lock:
-        state.pop("recovery_watcher", None)
-        status = state.get("status")
-    return status in (None, "running")
-
-
-def _start_recovered_verification(
-    plan_id: str, plan_dir: Path, project_dir: Path
-) -> None:
-    """Hand the settled plan to the auto-verification round.
-
-    The round is a long job — it dispatches verification points, runs
-    their tests, may dispatch a repair — and the settle that hands it
-    over runs on the recovery watcher thread.  So the hand-off is a
-    thread of its own, rather than the settle becoming the round.
-
-    The settle waits a bounded moment for the hand-off to be picked up,
-    so a caller that reads the outcome right after the settle sees the
-    round that was started instead of a race it has to lose.  The wait
-    is bounded on purpose: the real round runs for minutes, and it
-    keeps running in the background either way.
-    """
-    finished = threading.Event()
-
-    def _target() -> None:
-        try:
-            _server._run_auto_verification_loop(plan_id, plan_dir, project_dir)
-        except Exception:  # noqa: BLE001 — a failed round must not raise here
-            _server.logger.exception(
-                "auto_verification_launch_failed plan=%s", plan_id
-            )
-        finally:
-            finished.set()
-
-    thread = threading.Thread(
-        target=_target,
-        name=f"recovery-verification-{plan_id}",
-        daemon=True,
-    )
-    thread.start()
-    finished.wait(timeout=_RECOVERY_VERIFICATION_HANDOFF_TIMEOUT_SECONDS)
-
-
-def _settle_recovered_as_completed(
-    plan_id: str, plan_dir: Path, state: Optional[Dict[str, Any]]
-) -> None:
-    """Settle a recovered run that finished — the success path.
-
-    This mirrors what the executor's own success path does, because a
-    recovered run that finished *is* that run: the state says
-    ``completed``, the row says ``completed``, the usage is
-    re-aggregated, and the auto-verification round is handed the plan.
-
-    Completing the tasks is not the end of a plan — the verification
-    round is what decides whether the work is actually good.
-    """
-    with _server._execution_state_lock:
-        if isinstance(state, dict):
-            state["status"] = "completed"
-            state["stop_reason"] = None
-            state["ended_at"] = datetime.now().isoformat()
-
-    try:
-        from state_machine.db.connection import open as open_db
-        from state_machine.db.schema import migrate
-        from state_machine.repositories.execution_repository import (
-            ExecutionRepository,
-            PlanNotFoundError as ExecPlanNotFoundError,
-        )
-
-        conn = open_db(_server._state_db_path())
-        try:
-            migrate(conn)
-            ExecutionRepository(conn).update_fields(
-                plan_id,
-                exec_status="completed",
-                stop_reason=None,
-            )
-        finally:
-            conn.close()
-    except ExecPlanNotFoundError:
-        # No row: there is no run to record the verdict on.
-        pass
-    except Exception:
-        # Best-effort, like the executor's own success path: the
-        # verdict in memory is the one the caller reads, and a locked
-        # database must not skip the hand-off below.
-        _server.logger.exception(
-            "execution_status_persist_failed plan=%s", plan_id
-        )
-
-    # --- Usage accounting ---
-    # The run is over, so the plan's LLM sessions are complete:
-    # re-aggregate them now.  Backgrounded and best-effort by contract
-    # — accounting must never break the workflow.
-    try:
-        _server._refresh_usage_report(plan_id)
-    except Exception:  # noqa: BLE001
-        _server.logger.exception(
-            "usage_report_refresh_failed plan=%s", plan_id
-        )
-
-    # --- Auto verification loop ---
-    project_dir = state.get("project_dir") if isinstance(state, dict) else None
-    _start_recovered_verification(
-        plan_id,
-        plan_dir,
-        Path(project_dir) if project_dir else plan_dir,
-    )
-
-
-def _record_recovery_settled(
-    plan_id: str,
-    plan_dir: Path,
-    outcome: str,
-    unfinished: Optional[int],
-    pid: Any,
-) -> None:
-    """Write the settlement into the plan's own log.
-
-    The settlement answers "how did this recovered run end?", and the
-    answer has to outlive the process that gave it: the log is the one
-    artifact a later reader — an operator, a restart, another process
-    — can consult.
-    """
-    try:
-        _server.ExecutionLogger(plan_id, plans_dir=plan_dir.parent).info(
-            "execution_recovery_settled",
-            f"Recovered execution settled as {outcome}",
-            data={
-                "outcome": outcome,
-                "unfinished": unfinished,
-                "pid": pid,
-            },
-        )
-    except Exception:  # noqa: BLE001 — a log that cannot be written is not a verdict
-        _server.logger.exception(
-            "[execution_recovery] could not record the settlement plan=%s",
-            plan_id,
-        )
-
-
-def _settle_recovered_execution(plan_id: str) -> None:
-    """Settle a recovered run whose executor process is gone.
-
-    Two endings, one reading of the evidence.
-
-    A run whose executor is gone after a restart is not necessarily a
-    crash: the executor may have finished its work and exited cleanly
-    in the window between the last checkpoint and the restart.  The
-    evidence for that is the plan's own ``execution.log`` — the
-    ``execution_completed`` marker the agent writes when the dispatcher
-    has nothing left to run — cross-checked against the task list.
-
-    * marker + no unfinished task → the success path: the state and the
-      row say ``completed``, the usage is re-aggregated and the
-      auto-verification round is handed the plan.
-    * anything else → the crash path: ``_mark_failed_dead``, exactly as
-      the watchdog judges a run whose process died.
-
-    The settlement happens once: the watcher hands the run over exactly
-    once, and a run that already carries a verdict is never judged
-    again.
-    """
-    plan_dir = _recovered_plan_dir(plan_id)
-    tasks_file = plan_dir / "tasks.json"
-
-    if not _recovered_settle_is_due(plan_id):
-        # The run already carries a verdict — a settle is never judged
-        # twice.
-        return
-
-    outcome = _recovered_execution_outcome(plan_id, plan_dir, tasks_file)
-    unfinished = _recovered_unfinished_count(plan_id, tasks_file)
-
-    state = _server._execution_state.get(plan_id)
-    pid = state.get("pid") if isinstance(state, dict) else None
-
-    if outcome == "completed":
-        _settle_recovered_as_completed(plan_id, plan_dir, state)
-    else:
-        _server._mark_failed_dead(plan_id)
-
-    _record_recovery_settled(plan_id, plan_dir, outcome, unfinished, pid)
-
-
-def _watch_recovered_pid(plan_id: str, pid: int) -> None:
-    """Poll a recovered executor's pid until the process disappears.
-
-    The only probe that works on a process this process did not spawn
-    is ``os.kill(pid, 0)``: it succeeds while the process lives and
-    raises ``ProcessLookupError`` once it is gone.  ``PermissionError``
-    means the process exists but belongs to another user — alive, so
-    the poll goes on.
-
-    There is deliberately no ``Popen.wait`` here.  The recovered
-    executor is not this process's child: there is no handle to wait
-    on, and waiting on one would block forever.
-    """
-    while True:
-        state = _server._execution_state.get(plan_id)
-        if not state or state.get("status") != "running":
-            # The run is over — it finished, failed, or was reaped.
-            # There is nothing left to wait for.
-            return
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            # The executor is gone: settle the run.
-            try:
-                _settle_recovered_execution(plan_id)
-            except Exception:  # noqa: BLE001
-                # A failed settle must not kill the watcher without a
-                # word in the log.
-                _server.logger.exception(
-                    "[execution_recovery] could not settle the recovered run "
-                    "plan=%s",
-                    plan_id,
-                )
-            return
-        except PermissionError:
-            # Alive, just not ours to signal.
-            pass
-        except OSError:
-            # Any other signal error is not proof of death.  Keep
-            # waiting rather than judging the run on a bad probe.
-            pass
-        time.sleep(_RECOVERY_POLL_INTERVAL_SECONDS)
-
-
-def _start_recovery_watcher(plan_id: str, pid: Any) -> Optional[threading.Thread]:
-    """Watch a recovered executor until its pid disappears.
-
-    A run restored from the ``plan_execution`` row has no handle: this
-    process did not spawn that executor, so there is nothing to
-    ``wait()`` on.  What there is is a pid, and a pid can be probed —
-    which is what the watcher does.
-
-    One watcher per plan: a second call returns the thread that is
-    already watching, so two callers cannot settle the same run twice.
-
-    Args:
-        plan_id: the plan whose restored row says ``running``.
-        pid: the executor's pid.  ``None``, a value that is not a
-            number, or a pid of 1 or less is not an executor this
-            process may ever own, so no watcher is started.
-
-    Returns:
-        The watching thread, or ``None`` when there is nothing to
-        watch.
-    """
-    if pid is None:
-        return None
-    try:
-        pid_value = int(pid)
-    except (TypeError, ValueError):
-        # Not a pid at all — a handle, or a string that is not a
-        # number.  There is nothing to probe.
-        return None
-    if pid_value <= 1:
-        # pid 1 is init and pid 0 means "every process in my group";
-        # neither is an executor of this plan.
-        return None
-
-    with _server._execution_state_lock:
-        state = _server._execution_state.setdefault(
-            plan_id,
-            # The boot scan always restores the record first, so this
-            # fallback is only reached by a direct call — and it keeps
-            # the call total: a caller that hands over a pid gets a
-            # watcher, not an exception.
-            {
-                "status": "running",
-                "pid": pid_value,
-                "ended_at": None,
-                "stop_reason": None,
-                "process": None,
-            },
-        )
-        existing = state.get("recovery_watcher")
-        if isinstance(existing, threading.Thread) and existing.is_alive():
-            return existing
-        watcher = threading.Thread(
-            target=_watch_recovered_pid,
-            args=(plan_id, pid_value),
-            name=f"recovery-watcher-{plan_id}",
-            daemon=True,
-        )
-        # The thread hangs on the record so a test can join it, and so
-        # the next caller finds the watcher that is already running.
-        state["recovery_watcher"] = watcher
-        try:
-            watcher.start()
-        except RuntimeError:
-            # The process is out of threads.  A watcher that could not
-            # start is not a watcher: drop it and let the watchdog
-            # judge the run as it does today.
-            state.pop("recovery_watcher", None)
-            _server.logger.exception(
-                "[execution_recovery] could not start the recovery watcher "
-                "plan=%s",
-                plan_id,
-            )
-            return None
-    return watcher
 
 
 def _adopt_run_project_dir(
@@ -689,6 +234,72 @@ def _adopt_run_project_dir(
         return None
 
 
+#: The environment variable that replaces the executor's command line.
+#:
+#: It exists so that a deterministic stand-in can be put where the real
+#: executor would run — by a test, or by an operator reproducing a run
+#: by hand — without editing production code.  It is read at *spawn*
+#: time and never at import time: a value frozen when the module was
+#: first imported would answer a different question than the one an
+#: operator setting it for one run is asking.
+_EXECUTOR_CMD_ENV = "PDT_EXECUTOR_CMD"
+
+
+def _executor_command(
+    backend_dir: Path,
+    project_dir: Path,
+    tasks_file: Path,
+    tool: Optional[str],
+    extra_args: Optional[List[str]],
+) -> List[str]:
+    """The command line the executor is started with.
+
+    Two paths, one envelope:
+
+    * **The override** — ``PDT_EXECUTOR_CMD`` names the *whole*
+      command.  It is split with :func:`shlex.split` and used verbatim:
+      nothing is appended to it.  A stand-in for the executor is given
+      the arguments it needs in the value itself, and appending the
+      production arguments behind its back would hand it flags it does
+      not understand.
+    * **The default** — the production command line, unchanged.  A
+      value that is unset, empty, or nothing but whitespace means
+      "there is no override", and this path builds exactly the list it
+      always built — byte for byte, because every existing run depends
+      on it.
+
+    A value that cannot be run is not caught here.  The ``OSError``
+    from ``Popen`` reaches the caller, which records the run as
+    failed; falling back to the real executor would be worse than
+    failing, because the caller would then believe a stand-in ran when
+    the production body ran instead.
+
+    A value that is not a command line at all — an unclosed quote, say
+    — fails the same way: it reaches the caller as an ``OSError``, so
+    every spawn call site records the run as failed rather than
+    leaving a plan half-started with an executor that never came up.
+    """
+    override = os.environ.get(_EXECUTOR_CMD_ENV, "")
+    if override.strip():
+        try:
+            return shlex.split(override)
+        except ValueError as exc:
+            raise OSError(
+                f"{_EXECUTOR_CMD_ENV} is not a valid command line: {exc}"
+            ) from exc
+
+    cmd = [
+        sys.executable, "-u", str(backend_dir / "cli.py"),
+        "--recover", "-w", str(project_dir),
+        "--tasks-file", str(tasks_file),
+    ]
+    if tool:
+        cmd.extend(["--tool", tool])
+    if extra_args:
+        cmd.extend(extra_args)
+    return cmd
+
+
 def _spawn_executor_subprocess(
     plan_id: str,
     backend_dir: Path,
@@ -730,6 +341,16 @@ def _spawn_executor_subprocess(
     through this helper so they share one spawn pattern, one
     drain strategy, and one log-file naming convention.
 
+    2026-10-27:
+
+    The command line comes from :func:`_executor_command`, which
+    honours the ``PDT_EXECUTOR_CMD`` environment variable: when it is
+    set, it names the whole command and replaces the production one
+    verbatim (see that function for the full contract).  The override
+    changes *what* runs and nothing else — the working directory, the
+    session, the log file and the environment below are the same on
+    both paths.
+
     Args:
         plan_id: identifies the plan — used for log file naming and
             the ``PDT_PLAN_ID`` env var that the executor reads.
@@ -739,7 +360,7 @@ def _spawn_executor_subprocess(
         tool: optional ``--tool <claude|...>`` arg.
         extra_args: extra CLI args appended before spawn (e.g.
             ``["--verification-tasks", str(...)]`` from the repair
-            path).
+            path).  Neither is appended to an overridden command.
         log_path: where to write subprocess stdout+stderr. Defaults
             to ``plan_dir/logs/executor_<timestamp>.log`` so the
             existing log rotation convention is preserved. Parent
@@ -759,15 +380,13 @@ def _spawn_executor_subprocess(
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"executor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-    cmd = [
-        sys.executable, "-u", str(backend_dir / "cli.py"),
-        "--recover", "-w", str(project_dir),
-        "--tasks-file", str(tasks_file),
-    ]
-    if tool:
-        cmd.extend(["--tool", tool])
-    if extra_args:
-        cmd.extend(extra_args)
+    cmd = _executor_command(
+        backend_dir=backend_dir,
+        project_dir=project_dir,
+        tasks_file=tasks_file,
+        tool=tool,
+        extra_args=extra_args,
+    )
 
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PDT_PLAN_ID": plan_id}
     venv_bin = str(backend_dir / ".venv" / "bin")
@@ -1341,6 +960,81 @@ def _write_crash_verdict(plan_id: str) -> Optional[Dict[str, Any]]:
     return _persisted_execution_row(plan_id)
 
 
+def _park_shutdown_interrupted(plan_id: str) -> None:
+    """Park a run the shutdown interrupted: ``stopped``, and phase ``queued``.
+
+    A dead executor is not one thing.  It is one thing when the *work*
+    died — the run crashed, the plan is over, and ``failed`` is the
+    honest verdict.  It is another thing when the *server* went down
+    under a live run: the work was interrupted, not broken, and the
+    honest verdict is a parked run that somebody may pick up again.
+
+    Parking means two writes:
+
+    * the row says ``stopped`` with ``stop_reason='server_shutdown'``
+      and no pid — the run is over for this process, but it did not
+      fail, and a pid left behind would read as a live execution;
+    * the plan's phase becomes ``queued`` — the phase the scheduler
+      waits on.  ``failed`` is a terminal phase and is in nobody's
+      waiting set, so a plan parked as ``failed`` is never resumed;
+      ``queued`` is what makes the recovery visible to the scheduler.
+
+    The task rows the dead executor owned are handed back to
+    ``pending`` **before** the phase write: a phase write that fails
+    must not leave the plan claiming to be running a task whose owner
+    is gone.
+
+    Nothing here raises.  This runs on the recovery path, where one
+    plan's failure must not cost every other plan its recovery.
+    """
+    from shutdown_checkpoint import SHUTDOWN_STOP_REASON
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+    )
+    from verification_loop import _reap_orphaned_in_progress_tasks
+
+    state = _server._execution_state.get(plan_id)
+    if state:
+        state.update(
+            status="stopped",
+            stop_reason=SHUTDOWN_STOP_REASON,
+            # The executor is gone; a pid left in memory belongs to a
+            # dead process, and every "is this execution alive?" reader
+            # believes a pid means alive.
+            pid=None,
+            ended_at=datetime.now().isoformat(),
+        )
+
+    try:
+        conn = open_db(_server._state_db_path())
+        try:
+            migrate(conn)
+            ExecutionRepository(conn).update_fields(
+                plan_id,
+                exec_status="stopped",
+                stop_reason=SHUTDOWN_STOP_REASON,
+                exec_pid=None,
+            )
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — a failed verdict write is not a failed scan
+        _server.logger.exception("park: row write failed plan=%s", plan_id)
+
+    # The task rows still have to go back — before the phase write, so
+    # a failing phase write cannot leave the plan stuck in_progress.
+    _reap_orphaned_in_progress_tasks(plan_id)
+
+    plan_dir = _server._plan_dir(plan_id)
+    if not plan_dir.exists():
+        return
+    try:
+        _server.PlanState(plan_dir).force_set_phase("queued")
+    except Exception:  # noqa: BLE001 — a failed phase write is not a failed scan
+        _server.logger.exception("park: phase write failed plan=%s", plan_id)
+
+
 def _judge_process_dead(
     plan_id: str, row: Optional[Dict[str, Any]]
 ) -> bool:
@@ -1359,6 +1053,13 @@ def _judge_process_dead(
     reader — the next boot, another process, a poller that never saw
     the run — replays the same verdict instead of re-deriving it.
 
+    A dead executor is not automatically a crash, though.  When the
+    shutdown checkpoint says the *server* went down under this run, the
+    work was interrupted rather than broken: the plan is parked in
+    ``queued`` instead of being failed, so the scheduler can see it
+    again.  The checkpoint is the only evidence that may say so — every
+    other dead executor stays a crash, unchanged.
+
     Returns whether the run was judged.
     """
     if not row or str(row.get("exec_status") or "") != "running":
@@ -1369,6 +1070,16 @@ def _judge_process_dead(
     state = _server._execution_state.get(plan_id)
     if not state or state.get("status") != "running":
         return False
+    # The server went down under this run?  Then it is not a crash.
+    from shutdown_checkpoint import is_shutdown_interrupted
+
+    if is_shutdown_interrupted(
+        _server._plan_dir(plan_id),
+        kind="execution",
+        run_started_at=(row or {}).get("started_at"),
+    ):
+        _park_shutdown_interrupted(plan_id)
+        return True
     # The shared helper flips this process's memory, writes the row and
     # syncs the plan state.
     _server._mark_failed_dead(plan_id)
@@ -3120,6 +2831,24 @@ _EXECUTION_IN_PROGRESS_TASK_STATUSES = frozenset({
 })
 
 
+def _resolve_stop_grace() -> Optional[float]:
+    """The SIGTERM grace window this stop gets.
+
+    Read through ``server`` so the deployment's
+    ``PDT_STOP_GRACE_SECONDS`` applies — the window is configurable
+    (task 3), and a stop that hard-coded it would ignore the
+    operator's setting. ``None`` means "let the killer decide", which
+    is the same default the killer would have picked.
+    """
+    resolver = getattr(_server, "_resolve_stop_grace_seconds", None)
+    if resolver is None:
+        return None
+    try:
+        return float(resolver(None))
+    except Exception:  # noqa: BLE001 — a bad grace must not stop the stop
+        return None
+
+
 def _execution_log_paths(plan_id: str, plan_dir: Path) -> List[Path]:
     """Where the executor's log may live.
 
@@ -3296,320 +3025,6 @@ def _stop_response(
     return body
 
 
-#: The plan-stream event the server writes about the **executor's** own
-#: stop: ``{"pid": ..., "hard_killed": ..., "elapsed_s": ...}``.  It is
-#: the verdict on the executor — did it leave on its own, or did the
-#: grace window expire and it had to be SIGKILLed.
-_STOP_EXECUTOR_RESULT_EVENT = "execution_stop_result"
-
-#: The plan-stream event the **executor** writes about each child it
-#: stopped: ``{"pid": ..., "stage": ..., "forced": ..., "elapsed_s": ...}``.
-#: One per child, and the stage is that child's own (``stdout`` /
-#: ``SIGTERM`` / ``SIGKILL``).
-_STOP_CHILD_RESULT_EVENT = "dispatch_stop_result"
-
-#: How long the stop report waits for a child that is still alive, and
-#: how often it looks.  A child that has not gone away yet may be a
-#: moment away from going away, so the check waits — but it does not
-#: wait forever: a child that is still there when the wait is over is a
-#: leftover, and the operator has to be told about it.
-_STOP_LEFTOVER_WAIT_SECONDS = 2.0
-_STOP_LEFTOVER_POLL_SECONDS = 0.1
-
-
-def _plan_log_roots(plan_id: str, plan_dir: Path) -> List[Path]:
-    """The roots the plan's execution log may live under.
-
-    The executor writes its log under the *resolved* plans directory
-    (``PDT_PLANS_DIR`` wins), while this route resolves the plan
-    directory through ``server.PLANS_DIR``.  The two are the same in a
-    normal deployment, but a deployment that exports only one of them
-    would otherwise lose the stop results — and with them the answer to
-    "which stage did each child stop at".
-    """
-    roots: List[Path] = []
-    try:
-        from config_paths import resolve_plans_dir
-
-        roots.append(Path(resolve_plans_dir()))
-    except Exception:  # noqa: BLE001 — the plan dir is still worth a look
-        pass
-    try:
-        if plan_dir is not None:
-            roots.append(Path(plan_dir).parent)
-    except Exception:  # noqa: BLE001 — ditto
-        pass
-    unique: List[Path] = []
-    for root in roots:
-        if root not in unique:
-            unique.append(root)
-    return unique
-
-
-def _read_plan_events(
-    plan_id: str,
-    plan_dir: Path,
-    event: str,
-    since_ts: Optional[str],
-    limit: int = 50,
-) -> List[Dict[str, Any]]:
-    """The plan's own entries for *event*, written since *since_ts*.
-
-    A log that cannot be read is not a stop that fails: the caller gets
-    an empty list and the stop carries on.  The entries come from the
-    plan's own event stream — the same file the executor wrote its stop
-    results into — so the report is assembled from evidence that
-    outlives the stop rather than from state this request is holding in
-    memory.
-    """
-    from execution_logger import ExecutionLogger
-
-    for root in _plan_log_roots(plan_id, plan_dir):
-        try:
-            entries = ExecutionLogger.read_logs(
-                plan_id,
-                plans_dir=root,
-                event=event,
-                since=since_ts,
-                limit=limit,
-            )
-        except Exception:  # noqa: BLE001 — an unreadable log is not a failure
-            _server.logger.exception(
-                "stop_execution: could not read %s from the plan's log "
-                "plan=%s", event, plan_id,
-            )
-            continue
-        if entries:
-            return [entry for entry in entries if isinstance(entry, dict)]
-    return []
-
-
-def _process_gone(proc: Any) -> bool:
-    """Is the process behind this handle gone?"""
-    poll = getattr(proc, "poll", None)
-    if poll is None:
-        return True
-    try:
-        return poll() is not None
-    except Exception:  # noqa: BLE001 — a handle that cannot answer is gone
-        return True
-
-
-def _executor_stop_stage(
-    plan_id: str, plan_dir: Path, proc: Any, since_ts: Optional[str]
-) -> Dict[str, Any]:
-    """Where the executor's own stop reached.
-
-    The server writes its verdict into the plan's event stream while the
-    stop is running (``execution_stop_result``: the executor left on
-    its own, or the grace window expired and it was SIGKILLed).  That
-    verdict is the answer; the process handle is only the fallback for
-    the case where there is no verdict at all.
-    """
-    pid = getattr(proc, "pid", None)
-    hard_killed = False
-    recorded = False
-    for entry in _read_plan_events(
-        plan_id, plan_dir, _STOP_EXECUTOR_RESULT_EVENT, since_ts
-    ):
-        data = entry.get("data")
-        if not isinstance(data, dict) or data.get("unparsable"):
-            continue
-        recorded = True
-        hard_killed = bool(data.get("hard_killed"))
-        if data.get("pid") is not None:
-            pid = data.get("pid")
-
-    if recorded:
-        return {
-            "pid": pid,
-            "stage": "SIGKILL" if hard_killed else "SIGTERM",
-            "hard_killed": hard_killed,
-        }
-
-    # No verdict on the event stream: either there was no executor to
-    # stop, or the plan's log could not be written.  What can still be
-    # said is what is visible now.
-    if proc is None or _process_gone(proc):
-        return {"pid": pid, "stage": "already_gone", "hard_killed": False}
-    return {"pid": pid, "stage": "SIGTERM", "hard_killed": False}
-
-
-def _child_stop_results(
-    plan_id: str, plan_dir: Path, since_ts: Optional[str]
-) -> List[Dict[str, Any]]:
-    """One entry per child the executor stopped.
-
-    The stage is the child's own, verbatim — the executor wrote it, and
-    the report does not reinterpret it.
-    """
-    children: List[Dict[str, Any]] = []
-    for entry in _read_plan_events(
-        plan_id, plan_dir, _STOP_CHILD_RESULT_EVENT, since_ts
-    ):
-        data = entry.get("data")
-        if not isinstance(data, dict) or data.get("unparsable"):
-            continue
-        children.append({
-            "pid": data.get("pid"),
-            "stage": data.get("stage"),
-            "forced": bool(data.get("forced")),
-        })
-    return children
-
-
-def _pid_alive(pid: int) -> bool:
-    """Is there still a process with this pid?"""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # It exists — it is just not ours to signal.
-        return True
-    except OSError:
-        return False
-    return True
-
-
-def _leftover_pids(
-    children: List[Dict[str, Any]],
-    *,
-    wait_seconds: float = _STOP_LEFTOVER_WAIT_SECONDS,
-    poll_seconds: float = _STOP_LEFTOVER_POLL_SECONDS,
-) -> List[int]:
-    """The children that are still alive after the stop.
-
-    A child that has not gone away yet may be a moment away from going
-    away, so the check waits — but it does not wait forever: a child
-    that is still there when the wait is over is a leftover, and the
-    operator has to know about it.
-    """
-    leftovers: List[int] = []
-    for child in children:
-        raw_pid = child.get("pid")
-        if raw_pid is None:
-            continue
-        try:
-            pid = int(raw_pid)
-        except (TypeError, ValueError):
-            continue
-        deadline = time.monotonic() + wait_seconds
-        while _pid_alive(pid):
-            if time.monotonic() >= deadline:
-                leftovers.append(pid)
-                break
-            time.sleep(poll_seconds)
-    return leftovers
-
-
-def _collect_stop_report(
-    plan_id: str, plan_dir: Path, proc: Any, since_ts: Optional[str]
-) -> Dict[str, Any]:
-    """What the stop did, in three parts.
-
-    ``executor``
-        Where the executor's own stop reached (``SIGTERM`` /
-        ``SIGKILL`` / ``already_gone``) and whether it was hard-killed.
-    ``children``
-        One entry per child the executor stopped, with the stage that
-        child stopped at.
-    ``leftover_pids``
-        The children that are still alive after the stop — the ones the
-        stop did not get.
-
-    The two event streams it reads are the ones the stop itself
-    produced: the server's verdict on the executor, and the executor's
-    verdict on each of its children.  Only the records written since
-    ``since_ts`` — the stamp taken before the signal went out — count,
-    so the report is about THIS stop and not about every stop the
-    plan's log remembers.
-
-    This never raises: the stop already worked (the work is killed and
-    the checkpoint is written), and a missing report must not undo that.
-    """
-    try:
-        executor = _executor_stop_stage(plan_id, plan_dir, proc, since_ts)
-        children = _child_stop_results(plan_id, plan_dir, since_ts)
-        leftovers = _leftover_pids(children)
-    except Exception:  # noqa: BLE001 — a missing report must not fail a stop
-        _server.logger.exception(
-            "stop_execution: could not collect the stop report plan=%s",
-            plan_id,
-        )
-        return {
-            "executor": {
-                "pid": getattr(proc, "pid", None),
-                "stage": "unknown",
-                "hard_killed": False,
-            },
-            "children": [],
-            "leftover_pids": [],
-        }
-    return {
-        "executor": executor,
-        "children": children,
-        "leftover_pids": leftovers,
-    }
-
-
-def _file_stop_report(
-    plan_dir: Path, stop_report: Dict[str, Any]
-) -> Optional[Dict[str, Any]]:
-    """Record ``stop_report`` inside the checkpoint that is already there.
-
-    The stop report is the answer to "what did this stop actually do
-    to the process tree" — the executor's stage, the stage of each
-    child it stopped, and the children that were still alive
-    afterwards. It is collected **once**, by the stop that actually
-    signalled the processes; a repeat of that stop has no processes
-    left to report on, so it reads back the copy the first stop left
-    behind rather than inventing a second, different answer.
-
-    The checkpoint is **not** rewritten. Writing a fresh one would move
-    ``paused_at`` to now and lose the record of when the interruption
-    actually happened — which is the one thing a repeat stop must not
-    do. Every other field is kept exactly as it was found, and only the
-    report key is added.
-
-    Returns ``None`` when there is no checkpoint to attach to. The
-    document is never *created* here: a checkpoint that was never
-    written is not this function's to invent, and a stop that was
-    discarded left none behind on purpose.
-
-    A write that fails is logged and swallowed — a stop that worked
-    must not be undone because the report could not be filed.
-    """
-    from pause_state import checkpoint_path, read_pause_checkpoint
-
-    checkpoint = read_pause_checkpoint(plan_dir)
-    if not isinstance(checkpoint, dict):
-        return None
-
-    checkpoint["stop_report"] = stop_report
-
-    path = checkpoint_path(plan_dir)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        _server.logger.warning(
-            "stop_execution_stop_report_unwritable: cannot write %s (%s); "
-            "the stop report will not be recorded",
-            path, type(exc).__name__,
-        )
-        return checkpoint
-
-    try:
-        atomic_write_json(path, checkpoint, logger=_server.logger)
-    except Exception:  # noqa: BLE001 — a lost report must not fail a stop
-        _server.logger.exception(
-            "stop_execution_stop_report_write_failed: could not write %s; "
-            "the stop report will not be recorded",
-            path,
-        )
-    return checkpoint
-
-
 def _park_plan_in_stopped_phase(
     plan_id: str, plan_dir: Path, *, skip_terminal: bool = True
 ) -> Optional[str]:
@@ -3661,10 +3076,7 @@ def _stop_running_execution(
         ExecutionRepository,
         PlanNotFoundError as ExecPlanNotFoundError,
     )
-    from pause_state import (
-        clear_pause_checkpoint,
-        write_pause_checkpoint,
-    )
+    from pause_state import clear_pause_checkpoint, write_pause_checkpoint
 
     # --- 1. mark ------------------------------------------------------
     # The plan is marked BEFORE anything is killed. The executor's
@@ -3750,23 +3162,12 @@ def _stop_running_execution(
     # --- 2. terminate -------------------------------------------------
     # Only THIS plan's process group. Another plan's executor is none
     # of this stop's business.
-    #
-    # The grace window is the one the execution stop path uses
-    # (``server._execution_stop_grace_seconds``): the same window the
-    # executor's own stop budget is derived from, so the budget can
-    # never outgrow the window it has to fit into.
-    #
-    # The stamp is taken BEFORE the signal goes out, because the report
-    # is about THIS stop: the executor writes its own children's stop
-    # results while it is being terminated, and only the records from
-    # here on belong to the stop being answered.
-    since_ts = datetime.utcnow().isoformat()
     hard_killed = False
     if proc is not None and proc.poll() is None:
         try:
             hard_killed = bool(
                 _server._kill_process_tree(
-                    proc, grace_seconds=_server._execution_stop_grace_seconds()
+                    proc, grace_seconds=_resolve_stop_grace()
                 )
             )
         except Exception:  # noqa: BLE001 — a failed kill still pauses
@@ -3811,38 +3212,17 @@ def _stop_running_execution(
     # progress" but the stop that was asked for.
     state["stop_reason"] = "user_requested"
 
-    # --- 5. report ----------------------------------------------------
-    # What the stop did, read back from the plan's own event streams:
-    # where the executor's stop reached, which stage each child stopped
-    # at, and which children are still alive.
-    #
-    # It is an ADDITION.  The four keys of the stop response are the
-    # contract other code already reads — they do not change, and the
-    # report does not move any of them inside itself.
-    stop_report = _collect_stop_report(plan_id, plan_dir, proc, since_ts)
-
-    if checkpoint is not None:
-        # The report is filed INSIDE the checkpoint, so a repeat of this
-        # stop — which has no processes left to report on — can answer
-        # with the report the FIRST stop collected, the same way it
-        # answers with the first stop's ``paused_at``. The checkpoint
-        # is not rewritten: only the report key is added.
-        _file_stop_report(plan_dir, stop_report)
-
     if checkpoint is None:
-        response = _stop_response(
+        return _stop_response(
             paused=False, paused_at=None, interrupted=0,
             phase_transition_error=phase_transition_error,
         )
-    else:
-        response = _stop_response(
-            paused=True,
-            paused_at=checkpoint.get("paused_at"),
-            interrupted=len(interrupted),
-            phase_transition_error=phase_transition_error,
-        )
-    response["stop_report"] = stop_report
-    return response
+    return _stop_response(
+        paused=True,
+        paused_at=checkpoint.get("paused_at"),
+        interrupted=len(interrupted),
+        phase_transition_error=phase_transition_error,
+    )
 
 
 def _stop_idle_execution(
@@ -3850,24 +3230,15 @@ def _stop_idle_execution(
 ) -> Dict[str, Any]:
     """A stop against a plan that is not running.
 
-    Three cases, one answer shape:
+    Two cases, one answer shape:
 
     * the plan already has a checkpoint — a previous stop paused it
       and this is a repeat of that stop. The checkpoint on disk IS the
       answer, so it is returned unchanged. Rewriting it would move
       ``paused_at`` and lose the record of when the interruption
-      actually happened. The stop report comes out of the same place:
-      the copy the FIRST stop filed there — and only if it filed one.
-    * the stop is a discard — the resume point goes with the work, so
-      there is nothing left to report on.
+      actually happened.
     * there is no checkpoint — nothing was interrupted, so there is
       nothing to pause and nothing to record.
-
-    None of these three cases stopped a process, so none of them
-    carries a ``stop_report``: the key shows up only when there really
-    is a report. A synthesised one would be shaped exactly like a real
-    one, and "the stop found nothing to report" would answer the same
-    way as "the stop found nothing to stop".
 
     2026-10-23: the idle path used to leave the phase completely
     alone. A plan sitting in ``verification_repairing`` (or ``ready``,
@@ -3888,32 +3259,21 @@ def _stop_idle_execution(
     existing = read_pause_checkpoint(plan_dir)
     if discard:
         clear_pause_checkpoint(plan_dir)
-        response = _stop_response(
+        return _stop_response(
             paused=False, paused_at=None, interrupted=0,
             phase_transition_error=phase_transition_error,
         )
-        return response
     if existing is not None:
-        response = _stop_response(
+        return _stop_response(
             paused=True,
             paused_at=existing.get("paused_at"),
             interrupted=len(existing.get("interrupted_tasks") or []),
             phase_transition_error=phase_transition_error,
         )
-        # The report the FIRST stop filed in this checkpoint — and only
-        # if it filed one. A checkpoint written before the report
-        # existed carries none, and a missing report stays missing: an
-        # empty one would claim the stop found an executor that never
-        # existed.
-        stored_report = existing.get("stop_report")
-        if stored_report is not None:
-            response["stop_report"] = stored_report
-        return response
-    response = _stop_response(
+    return _stop_response(
         paused=False, paused_at=None, interrupted=0,
         phase_transition_error=phase_transition_error,
     )
-    return response
 
 
 @router.post("/api/execution/{plan_id}/stop")

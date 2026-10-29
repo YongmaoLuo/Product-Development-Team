@@ -91,6 +91,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import socket
 import sqlite3
@@ -99,7 +100,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import NamedTuple
+from typing import Dict, NamedTuple
 
 import pytest
 
@@ -842,50 +843,12 @@ def exec_instance_setup(tmp_path, monkeypatch):
         )
 
     # Spawn the FastAPI app on an ephemeral port.
-    # ``PDT_STATE_DB_PATH`` redirects ``server._state_db_path`` to a
-    # per-test tmp file so the schema/API contract tests inspect only
-    # the fixture's own state.db (no cross-run leakage onto the
-    # project-level state.db).  The env var propagates into the
-    # spawned uvicorn subprocess via ``env=...`` below.
+    # The child's environment is a whitelist; the reasoning behind every
+    # key lives in ``_child_env``'s docstring.  The env var propagates
+    # into the spawned uvicorn subprocess via ``env=...`` below.
     tmp_state_db = tmp_path / "state.db"
     server_log = open(tmp_path / "uvicorn.log", "w+b")  # noqa: SIM115
-    env = {
-        "PDT_STATE_DB_PATH": str(tmp_state_db),
-        # The monkeypatch above redirects PLANS_DIR in THIS process. The
-        # spawned uvicorn is a separate process with its own PLANS_DIR
-        # pointing at the real repository one, so without this it never
-        # finds the plan planted above, the start request 404s, and the
-        # schema migration that would create the database never runs --
-        # leaving the schema assertions to report an empty sqlite_master
-        # that looks like a regression and is not one. ``server.py``
-        # reads this override at import (see the ``_PLANS_DIR_OVERRIDE``
-        # block), which is why it has to be in the child's environment
-        # rather than patched in afterwards.
-        "PDT_PLANS_DIR": str(plans_root),
-        # Extend the parent's PATH, do not replace it. It used to be a
-        # hard-coded macOS list, which meant the spawned server had no
-        # venv on its PATH: on CI the uvicorn that `which()` found a
-        # moment earlier lives in backend/.venv/bin, and the child could
-        # not resolve it. The server then died at startup, the health
-        # poll timed out, the fixture swallowed it, and the test carried
-        # on to assert against a database that had never been created —
-        # "sqlite_master 含 []", which is the exact symptom the comment
-        # above already documents for the stale-listener case. The local
-        # machine hid this: its uvicorn is outside the venv too, but it
-        # happened to start anyway.
-        "PATH": _child_path(),
-        # 2026-09-14: prompts.py does ``from backend.framework.prompts
-        # import ...``, which requires the REPO ROOT on sys.path.
-        # ``uvicorn server:app`` with cwd=backend/ only puts backend/
-        # on sys.path, so the spawned subprocess crashed at import
-        # time and every e2e test silently SKIPped after the 30 s
-        # health-timeout (masking the layer as "0 failed").  Without
-        # this, a stale listener on :8001 (e.g. a SIGTERM-swallowing
-        # zombie from an earlier run) instead made health succeed
-        # instantly against the WRONG server, and these tests FAILed
-        # with "sqlite_master 含 []".
-        "PYTHONPATH": str(_BACKEND_ROOT.parent),
-    }
+    env = _child_env(plans_root, tmp_state_db)
     def _server_log_tail() -> str:
         try:
             server_log.flush()
@@ -1107,9 +1070,12 @@ def test_e2e_teardown_guard(exec_instance_setup) -> None:
 # Two related contracts that the task brief pins:
 #
 #   test_sqlite_master_whitelist
-#     ``state.db.sqlite_master`` must contain the four core
-#     Repository tables (``plan_routing``, ``plan_execution``,
-#     ``plan_verification``, ``plan_artifacts``) plus the
+#     ``state.db.sqlite_master`` must contain every core table in
+#     ``_CORE_SCHEMA_TABLES`` — the Repository tables
+#     (``plan_routing``, ``plan_execution``, ``plan_verification``,
+#     ``plan_artifacts``, ``plan_tasks``, ``plan_decisions``), the
+#     native scheduler's own three (``scheduler_queue``,
+#     ``scheduler_slot``, ``scheduler_command``) and the
 #     ``schema_version`` bootstrap table.
 #
 #     Migration metadata tables (``_migration_*`` and
@@ -1165,6 +1131,14 @@ _CORE_SCHEMA_TABLES: frozenset[str] = frozenset(
         # state_machine/db/schema.py "_ensure_plan_decisions" on every
         # migrate() call — the same call that creates the tables above.
         "plan_decisions",
+        # v7 (2026-10-28) native scheduler
+        # the scheduler's own three facts — the queue order, the slot
+        # occupancy and the operator commands — created by
+        # state_machine/db/schema.py "_SCHEDULER_OBJECTS" on every
+        # migrate() call, the same call that creates the tables above.
+        "scheduler_queue",
+        "scheduler_slot",
+        "scheduler_command",
         "schema_version",
     }
 )
@@ -1259,7 +1233,7 @@ def test_sqlite_master_whitelist(exec_instance_setup) -> None:
             f"缺失核心表: {sorted(missing)!r}。 "
             f"state.db 必须包含 {sorted(_CORE_SCHEMA_TABLES)!r} 这 {len(_CORE_SCHEMA_TABLES)} 张表; "
             f"当前 sqlite_master 含 {sorted(actual)!r}. "
-            f"schema_version 是引导表, 必须随四张 plan_* Repository 表一起存在。"
+            f"schema_version 是引导表, 必须随其余核心表一起存在。"
         )
 
     stale = _STALE_BUSINESS_TABLES & actual
@@ -1291,7 +1265,7 @@ def test_e2e_sqlite_master(exec_instance_setup) -> None:
         actual \ (core ∪ migration) == ∅
 
     VP-003 (state.db sqlite_master 表集合符合白名单规则):
-      * (1) 核心集合 5 表全部存在,缺失即 FAIL;
+      * (1) 核心集合 (_CORE_SCHEMA_TABLES) 全部存在,缺失即 FAIL;
       * (2) 实际表名集合减去核心集合减去迁移元数据正则
             (_migration_.* 或 schema_version_v\d+)后为空,
             残留旧业务表(plans / plan_meta / plan_activity 等)即 FAIL.
@@ -1322,7 +1296,7 @@ def test_e2e_sqlite_master(exec_instance_setup) -> None:
             f"缺失核心表: {sorted(missing)!r}。 "
             f"state.db 必须包含 {sorted(_CORE_SCHEMA_TABLES)!r} 这 {len(_CORE_SCHEMA_TABLES)} 张表; "
             f"当前 sqlite_master 含 {sorted(actual)!r}. "
-            f"schema_version 是引导表, 必须随四张 plan_* Repository 表一起存在。"
+            f"schema_version 是引导表, 必须随其余核心表一起存在。"
         )
 
     stale = _STALE_BUSINESS_TABLES & actual
@@ -2048,6 +2022,64 @@ def _child_path() -> str:
         p for p in _os.environ.get("PATH", "").split(_os.pathsep) if p
     ]
     return _os.pathsep.join(parts)
+
+
+def _child_env(plans_root: Path, state_db: Path) -> Dict[str, str]:
+    """The environment a spawned server runs with.
+
+    One place, so every spawn site in this module hands the child the
+    same set of keys.  The keys are a **whitelist**, not a copy of the
+    parent environment: ``PDT_SECRET_FD_*`` and ``HOME`` must not reach
+    the child (see the reasoning at the call sites).
+
+    ``PDT_STATE_DB_PATH`` redirects ``server._state_db_path`` to a
+    per-test tmp file so the schema/API contract tests inspect only the
+    fixture's own ``state.db`` (no cross-run leakage onto the
+    project-level ``state.db``).
+
+    ``PDT_PLANS_DIR`` has to be in the child's environment rather than
+    patched in afterwards: ``server.py`` reads the override **at import**
+    (see the ``_PLANS_DIR_OVERRIDE`` block).  The monkeypatch above
+    redirects ``PLANS_DIR`` in THIS process; the spawned uvicorn is a
+    separate process with its own ``PLANS_DIR`` pointing at the real
+    repository one, so without the key it never finds the planted plan,
+    the start request 404s, and the schema migration that would create
+    the database never runs -- leaving the schema assertions to report
+    an empty ``sqlite_master`` that looks like a regression and is not
+    one.
+
+    ``PATH`` comes from ``_child_path()`` (see its docstring): it is the
+    parent's PATH **extended** with the venv, never a replacement, and
+    never a hard-coded list.
+
+    ``PYTHONPATH`` carries the repo root: ``prompts.py`` does ``from
+    backend.framework.prompts import ...``, which requires the REPO ROOT
+    on sys.path.  ``uvicorn server:app`` with cwd=backend/ only puts
+    backend/ on sys.path, so the spawned subprocess crashed at import
+    time and every e2e test silently SKIPped after the 30 s
+    health-timeout (masking the layer as "0 failed").  Without this, a
+    stale listener on :8001 (e.g. a SIGTERM-swallowing zombie from an
+    earlier run) instead made health succeed instantly against the
+    WRONG server, and these tests FAILed with "sqlite_master 含 []".
+
+    ``PDT_DISABLE_TEMP_SWEEP`` is the credential-sweep switch
+    (``utils.secret_sweep`` reads it).  The startup sweep is a
+    **machine-wide** rewrite -- it walks the real temp roots and
+    overwrites credentials in the settings payloads it recognises.  The
+    pytest process carries the switch itself (``_pytest_hermetic_env``
+    does a ``setdefault``), but that is *process-local*: a whitelist
+    environment does not inherit the parent's, so the spawned server ran
+    the machine-wide sweep anyway and its lifespan took 18-21 s.  A value
+    the parent already holds is passed through unchanged -- whoever set
+    it decides, and ``"0"`` (do sweep) is as legitimate as ``"1"``.
+    """
+    return {
+        "PDT_STATE_DB_PATH": str(state_db),
+        "PDT_PLANS_DIR": str(plans_root),
+        "PATH": _child_path(),
+        "PYTHONPATH": str(_BACKEND_ROOT.parent),
+        "PDT_DISABLE_TEMP_SWEEP": os.environ.get("PDT_DISABLE_TEMP_SWEEP", "1"),
+    }
 
 
 def _find_uvicorn_path() -> str | None:

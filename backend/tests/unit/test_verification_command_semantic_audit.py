@@ -2,7 +2,7 @@
 
 静态护栏只能认形态，有些情况它无从判断：当测试是自定义脚本时，命令的
 语义是什么、有没有真正界定范围，只能读懂它才知道。这类判断要求高，所以
-走 ultra 档。
+走 high 档。
 
 有一类命令形态完全正常、语义上却什么都没验：
 
@@ -12,7 +12,7 @@
   码 2 被 ``|| echo CLEAN`` 吞掉，看起来"干净"。
 
 两者都不是"无界"，是"看起来跑了、其实什么都没验"。判这个要读懂命令和它断言
-的语义，所以走 ``verification_command_audit`` 场景（配置里映射到 **ultra** 档）。
+的语义，所以走 ``verification_command_audit`` 场景（配置里映射到 **high** 档）。
 
 **实现上有一条踩过的坑，值得留在测试里**：初版另起一个
 ``create_coding_tool(scene=...)`` 来做审计，结果在单测里建出了**真实**工具、
@@ -96,8 +96,8 @@ def test_a_custom_script_triggers_the_audit(tmp_path) -> None:
     assert tool.query_json.call_count == 1
 
 
-def test_the_audit_uses_the_ultra_tier_scene(tmp_path) -> None:
-    """走 ultra 档 —— 必须通过 per-call 场景覆盖请求该场景。
+def test_the_audit_uses_the_high_tier_scene(tmp_path) -> None:
+    """走 high 档 —— 必须通过 per-call 场景覆盖请求 high 档。
 
     这也锁住实现方式：审计走 agent 自己的 ``coding_tool``（mock 吸收），
     不是另起一个工具。
@@ -111,8 +111,8 @@ def test_the_audit_uses_the_ultra_tier_scene(tmp_path) -> None:
     )
 
 
-def test_the_audit_scene_is_configured_as_ultra() -> None:
-    """The SHIPPED routing template must route the audit at ``ultra``.
+def test_the_audit_scene_is_configured_as_high() -> None:
+    """The SHIPPED routing template must route the audit at ``high``.
 
     The live routing file is per-user: it lives in ``.config/``
     (gitignored) and is seeded by copying ``example/provider_routing.yaml.example``.
@@ -131,10 +131,10 @@ def test_the_audit_scene_is_configured_as_ultra() -> None:
         "seeds .config/provider_routing.yaml from it."
     )
     data = yaml.safe_load(cfg.read_text(encoding="utf-8"))
-    assert data["scenes"]["verification_command_audit"] == "ultra", (
-        "该判断按约定走 ultra 档"
+    assert data["scenes"]["verification_command_audit"] == "high", (
+        "该判断按约定走 high 档"
     )
-    assert "ultra" in data["tiers"]
+    assert "high" in data["tiers"]
 
 
 def test_the_live_routing_file_is_not_shipped_in_the_repo() -> None:
