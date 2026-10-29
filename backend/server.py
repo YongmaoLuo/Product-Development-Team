@@ -114,6 +114,7 @@ from dynamic_provider_concurrency import (
 )
 from config_paths import (
     ENV_FILE,
+    PROJECT_ROOT,
     STATE_DB,
     STATE_DB_ENV,
     resolve_plans_dir,
@@ -319,7 +320,19 @@ def _is_renderable_plan_id(plan_id: object) -> bool:
 # declared in backend/config.yaml as project-relative without
 # depending on the current working directory the server happens to
 # launch from.
-_PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+#
+# 2026-10-28: this used to be spelled
+# ``Path(__file__).parent.parent.resolve()`` here — a SECOND spelling
+# of the repository root, next to the ``config_paths.PROJECT_ROOT``
+# imported above.  Two spellings of one fact is how the ``.env`` file
+# came to be read from two different places (see the note below).  It
+# is now an alias of the single source of truth, so
+# ``server._PROJECT_ROOT`` and ``config_paths.PROJECT_ROOT`` are the
+# same object by construction rather than by coincidence.  The name
+# stays: the extracted modules reach the app root through it
+# (``_server._PROJECT_ROOT`` — see
+# ``tests/static_gates/test_extracted_modules_use_app_root.py``).
+_PROJECT_ROOT = PROJECT_ROOT
 #: ``backend/`` itself — the directory this application's code lives in.
 #: Defined here, and only here: a module extracted out of this file cannot
 #: derive it from its own ``__file__`` any more (``routes/execution.py``
@@ -2107,6 +2120,9 @@ def health_check():
 #   * ``pid`` / ``pgid`` — the process and its process group.
 #   * ``cwd`` — the directory the process was started from.
 #   * ``started_at`` — when the process started (ISO-8601, UTC).
+#   * ``project_dir`` — the repository root this process belongs to.
+#     Not the plans tree: ``PDT_PLANS_DIR`` moves that one, and a field
+#     that moved with it would name a configuration, not a workspace.
 #   * ``plans_dir`` — the plans root this process is serving.
 #   * ``state_db_path`` / ``state_db_inode`` — the database this
 #     process reads, and the inode of that file.  The inode matters:
@@ -2190,6 +2206,16 @@ def _instance_identity(
     startup.  The process facts beside them (boot id, pid, group, cwd,
     start time) are frozen at startup because they describe the
     process, not its configuration.
+
+    2026-10-28: the block publishes ``project_dir`` beside
+    ``plans_dir``.  ``plans_dir`` names the plans TREE this process
+    reads and writes, and it is relocatable — ``PDT_PLANS_DIR`` moves
+    it, and so does the per-test fixture.  It therefore cannot answer
+    "which checkout is this?", which is the question two answers to
+    ``/health/data`` are compared on.  ``project_dir`` answers it: the
+    repository root this process belongs to, anchored on
+    :data:`config_paths.PROJECT_ROOT`, which is resolved once at import
+    time and is NOT affected by the plans-dir override.
     """
     if db_path is None:
         try:
@@ -2208,6 +2234,7 @@ def _instance_identity(
         "pgid": _PROCESS_PGID,
         "cwd": _PROCESS_CWD,
         "started_at": _PROCESS_STARTED_AT,
+        "project_dir": str(Path(PROJECT_ROOT).resolve()),
         "plans_dir": str(Path(PLANS_DIR)),
         "state_db_path": str(db_path) if db_path is not None else None,
         "state_db_inode": inode,

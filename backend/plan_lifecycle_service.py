@@ -57,6 +57,11 @@ requeue
   不是 stop 的失败：让它冒泡会把一次成功的停变成 500。
 * **checkpoint 只读回显** —— 读 ``read_pause_checkpoint(plan_dir)`` 把它
   带回来，但**不消费、不删除**：恢复是恢复路径的事。
+* **迁回之后清掉执行行的终态裁决** —— 迁回只动了**路由相位**；执行行上
+  那条 ``stopped`` 是 stop 写的，没有跟着清。计划列表的终态判定读**两个**
+  裁决，于是两个裁决互相矛盾：相位是 ``queued``（非终态），执行裁决是
+  ``stopped``（终态）—— 计划被列表过滤掉，用户点了「重新排队」，卡片却
+  从页面上消失了。见 ``_clear_terminal_exec_verdict``。
 
 requeue 的前提是**处理器把计划停在了 ``'stopped'``**（执行 stop 是这样
 的）。处理器停在别处时（验证 stop 把相位停在 ``'verification'``），迁移
@@ -256,12 +261,10 @@ class PlanLifecycleService:
             detail = f"{detail}+requeue"
             if self._requeue_to_queued(plan_dir):
                 final_phase = "queued"
-                # 迁回成功 = 这个计划又要排队了。上一轮运行的终局裁决
-                # 到此作废：留着 ``stopped`` 不动，列表会把它当成终局
-                # 计划滤掉（``routes/plans.py`` 的 ``_plan_is_terminal``），
-                # 于是它既不在列表里、也等不到调度器 —— ``queued`` 是
-                # 调度器唯一的收件箱。
-                self._retire_execution_verdict(plan_id)
+                # 迁回队列之后，执行行上那条终态裁决必须一起清掉 ——
+                # 否则两个裁决互相矛盾，计划会从列表里消失（见
+                # ``_clear_terminal_exec_verdict``）。
+                self._clear_terminal_exec_verdict(plan_id)
 
         return LifecycleResult(
             plan_id=plan_id,
@@ -300,47 +303,76 @@ class PlanLifecycleService:
         return True
 
     @staticmethod
-    def _retire_execution_verdict(plan_id: str) -> None:
-        """把上一轮运行的终局裁决作废：计划又要排队了。
+    def _clear_terminal_exec_verdict(plan_id: str) -> None:
+        """把执行行上的终态裁决清掉（requeue 迁回队列之后）。
 
-        ``plan_execution`` 记的是**这一轮运行**的裁决。停掉之后又被迁回
-        等待相位的计划没有终局裁决 —— 它在等下一个位置，不是结束了。
-        留着 ``stopped`` 不动，列表会按那条裁决把它当成终局计划滤掉
-        （``routes/plans.py`` 的 ``_plan_is_terminal``）：计划不在列表里，
-        调度器（``queued`` 是它唯一的收件箱）也就再也看不到它。
+        为什么必须清
+        ------------
+        计划列表的终态判定读**两个**裁决（``routes/plans.py`` 的
+        ``_plan_is_terminal``）：路由相位不在终态相位里时，执行裁决
+        ``stopped`` / ``failed`` **仍然是**终态，计划因此被列表过滤掉。
 
-        写 ``not_started`` 而不是删行：行还在，pid 也已经由 stop 清空，
-        只是这一轮不再是终局。
+        两条裁决由两个写者分别落下：stop 把 ``stopped`` 写进执行行
+        （``routes/execution.py`` 的 ``_stop_running_execution``），requeue
+        只迁回路由相位（``stopped → queued``）—— 它没有碰执行行。于是被
+        迁回队列的计划**不进列表**：用户点了「重新排队」，卡片却从页面
+        上消失了（E2E ``test_plan_lifecycle_ui_e2e`` 的最后一步）。
 
-        写失败不外抛：迁移本身已经成功，裁决作废失败只该留一条 warning
-        —— 让它冒泡会把一次成功的 requeue 变成 500。
+        终态判据本身**不动**：它的第二个判据是为了兜住「进程崩了但路由
+        相位没跟上」那条路径（崩溃只把 ``failed`` 写进执行行）。要修的是
+        requeue 这条路径 —— 把执行行的终态裁决清掉，让两个裁决重新一致。
+
+        写什么
+        ------
+        * ``exec_status='not_started'`` —— 计划在队列里等着下一次执行，
+          此刻它确实「还没开始」。那是仓库里既有的 resting 状态（执行
+          状态接口把读不到的状态就答成它，``routes/execution.py`` 的
+          ``_row_has_verdict`` 也把它算成「没有裁决」）。
+        * ``exec_pid=None`` —— 执行进程已经不在了，行上留着 pid 会让
+          「这个执行还活着吗」的读者相信它还活着（accident B, 2026-10-23）。
+        * ``stop_reason=None`` —— 那是上一轮运行的停止理由，不属于排队中
+          的计划。
+
+        只在**当前裁决是终态**时写：不是终态的裁决（``running`` /
+        ``completed`` / ``not_started``）本来就不会把计划藏起来，动它只会
+        毁掉别的东西。执行行不存在时无事可做；写失败只记一条 warning ——
+        stop 与迁回都已经成功了，不该因为这一次附带写入变成 500。
         """
         import server as _server
+        from routes.plans import TERMINAL_EXEC_STATUSES
         from state_machine.db.connection import open as open_db
         from state_machine.db.schema import migrate
         from state_machine.repositories.execution_repository import (
             ExecutionRepository,
-            PlanNotFoundError as ExecPlanNotFoundError,
         )
 
         try:
             conn = open_db(_server._state_db_path())
             try:
                 migrate(conn)
-                ExecutionRepository(conn).update_fields(
-                    plan_id, exec_status="not_started",
+                repo = ExecutionRepository(conn)
+                row = repo.summary(plan_id)
+                if not row:
+                    # 没有执行行 = 没有执行裁决 = 没有东西要清。
+                    return
+                current = str(row.get("exec_status") or "").strip()
+                if current not in TERMINAL_EXEC_STATUSES:
+                    return
+                repo.update_fields(
+                    plan_id,
+                    exec_status="not_started",
+                    stop_reason=None,
+                    exec_pid=None,
                 )
             finally:
                 conn.close()
-        except ExecPlanNotFoundError:
-            # 没有执行行就没有裁决要作废。
-            pass
-        except Exception:  # noqa: BLE001 — 迁移成功就够了
+        except Exception:  # noqa: BLE001 — 附带写入不该让 stop 变成 500
             logger.warning(
-                "plan_lifecycle_requeue_verdict_not_retired: plan=%s could "
-                "not clear the stopped execution verdict; the plan is queued "
-                "but a listing that reads the old verdict still hides it",
+                "plan_lifecycle_requeue_verdict_clear_failed: plan=%s could "
+                "not clear the terminal execution verdict; the plan is "
+                "queued but the listing may hide it",
                 plan_id,
+                exc_info=True,
             )
 
     # ------------------------------------------------------------------

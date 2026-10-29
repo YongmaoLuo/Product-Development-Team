@@ -1498,6 +1498,11 @@ def _derive_overall_status(entries: Any) -> str:
         return "PARTIAL"
     if unjudged:
         return "SKIPPED"
+    if statuses and not any(status == "PASSED" for status in statuses):
+        # Nothing passed and nothing failed: every point was skipped.
+        # A round where no point was judged is not a pass either — the
+        # same reason DEFERRED does not make one.
+        return "SKIPPED"
     return "PASSED"
 
 
@@ -9169,15 +9174,15 @@ class Orchestrator:
             if status in status_counts:
                 status_counts[status] += 1
 
-        # Determine overall status
-        if status_counts["FAILED"] > 0:
-            overall_status = "FAILED"
-        elif status_counts["PARTIAL"] > 0:
-            overall_status = "PARTIAL"
-        elif status_counts["PASSED"] > 0:
-            overall_status = "PASSED"
-        else:
-            overall_status = "SKIPPED"
+        # The verdict is the round's one derivation, not a second one
+        # written here.  A fallback report that decides for itself is how
+        # a round carrying DEFERRED points used to be published as
+        # PASSED: ``status_counts`` has no tier for DEFERRED, so the
+        # points the round could not judge simply vanished from the
+        # arithmetic.  ``_derive_overall_status`` reads a DEFERRED entry —
+        # or an environment-blocked one — as "unjudged", which is
+        # SKIPPED, never PASSED.
+        overall_status = _derive_overall_status(execution_results_list)
 
         return {
             "overall_status": overall_status,
@@ -10998,44 +11003,67 @@ class Orchestrator:
         self._observed_instances[int(port)] = instance
 
     def _expected_plans_dirs(self, name: str) -> List[str]:
-        """The plans trees this round's service may be serving.
+        """The plans tree the round **recorded** for *name* — and only that.
 
-        The **first** entry is the tree the round's own service declared
-        about itself when it was started: the round records that
-        declaration (the ``instance`` block of ``/health/data``) and a
-        service answering with anything else is a different instance.
+        The declaration is the tree the service published about itself
+        when the round recorded it: a service started against a
+        **fixture data plane** — the plan's ``start_cmd`` pointing
+        ``PDT_PLANS_DIR`` at e.g. ``.pdt/vp_quota/plans`` — is a legal
+        deployment, it serves the plans the round gave it, honestly, and
+        it says so.
 
-        The declaration leads and the round's own directories follow
-        because the two are not the same question.  A service started
-        against a **fixture data plane** — the plan's ``start_cmd``
-        pointing ``PDT_PLANS_DIR`` at e.g. ``.pdt/vp_quota/plans`` — is
-        a legal deployment: it serves the plans the round gave it,
-        honestly, and it says so.  Judging it by where *this round's*
-        plan directory happens to live blocked every verification point
-        of the 2026-10-27 round at ``identity_mismatch``: the service
-        was the round's own, and the gate did not know it.
+        2026-10-28: the round's own directories are **not** appended any
+        more.  The comparison is a question about the *instance*, not
+        about the round: the tree the instance declared when the round
+        recorded it is the tree it must still be serving, and a tree
+        nobody recorded is a tree nobody may be compared against.  The
+        workspace (``project_dir``) is the primary comparison now; this
+        list is the **fallback** for an instance that publishes no
+        workspace at all, and it is a fallback to the recorded value,
+        never to the round's own directories.
 
-        The round's ``plan_dir.parent`` and ``plan_dir`` are still
-        accepted, so a deployment whose service serves the round's own
-        tree keeps working.  A service the round recorded **no**
-        declaration for has no first entry; the round's own directories
-        are then the whole expectation, exactly as before.
+        The list is empty when the round recorded no declaration: there
+        is no baseline, and "not comparable" is not "wrong".
         """
-        dirs: List[str] = []
         recorded = self._service_instance_identity.get(str(name).lower()) or {}
-        candidates: List[Any] = []
         declared = str(recorded.get("plans_dir") or "")
-        if declared:
-            candidates.append(declared)
-        candidates.extend((self.plan_dir.parent, self.plan_dir))
-        for candidate in candidates:
-            try:
-                resolved = str(Path(candidate).resolve())
-            except OSError:  # pragma: no cover - defensive
-                resolved = str(candidate)
-            if resolved not in dirs:
-                dirs.append(resolved)
-        return dirs
+        if not declared:
+            return []
+        try:
+            return [str(Path(declared).resolve())]
+        except OSError:  # pragma: no cover - defensive
+            return [declared]
+
+    def _recorded_project_dir(self, name: str) -> str:
+        """The workspace the round **recorded** for *name*.
+
+        The repository root the instance named about itself — the field
+        that answers "is this still the instance of the same
+        workspace?".  It is anchored on the project root, so it does not
+        move when the plans tree is relocated.
+
+        Empty when the round recorded no instance, or when the recorded
+        instance was an old process that published no workspace at all.
+        """
+        recorded = self._service_instance_identity.get(str(name).lower()) or {}
+        return str(recorded.get("project_dir") or "")
+
+    def _expected_state_db_inode(self) -> Optional[int]:
+        """The inode of the state database **this process** has open.
+
+        The round runs inside the backend, and the backend reads the
+        state database through
+        :func:`config_paths.resolve_state_db_path`.  A service reading
+        a *different* file — the same path with another inode — is a
+        different data plane, and no amount of ``200 OK`` makes the two
+        the same.
+        """
+        try:
+            from config_paths import resolve_state_db_path
+
+            return int(resolve_state_db_path().stat().st_ino)
+        except Exception:  # noqa: BLE001 - no database, no verdict
+            return None
 
     def _expected_state_db_inodes(self, name: str) -> List[int]:
         """The state databases this round's service may be reading.
@@ -11095,14 +11123,18 @@ class Orchestrator:
         is not "wrong".
 
         The three comparisons catch three different ways of being on
-        the wrong instance:
+        the wrong instance — each of them against the instance the
+        round **recorded**, not against the round's own tree:
 
           * **boot id** — the round's ``ensure`` recorded the instance
             it started; a different boot id is a different process
             (something restarted the service behind the round's back,
             or a stranger took the port);
-          * **plans tree** — the instance serves another tree, so what
-            it answers about is not this round's plan;
+          * **workspace** — the instance belongs to another checkout,
+            so what it answers about is not what it answered about
+            before.  An instance that publishes no workspace falls
+            back to the **plans tree** it served when the round
+            recorded it;
           * **state database inode** — the same path with another
             inode is another file, i.e. another data plane.
         """
@@ -11120,12 +11152,46 @@ class Orchestrator:
     def _compare_service_instance(
         self, name: str, actual: Dict[str, Any], port: int,
     ) -> Optional[Dict[str, Any]]:
-        """Compare the instance that answered with the round's own.
+        """Compare the instance that answered with the one the round recorded.
 
         The body of the comparison, split out of
         :meth:`_service_instance_mismatch` so the round's service
         preflight asks **exactly** the question the dispatch asks and
         gets exactly the same answer — one comparison, one meaning.
+
+        The baseline is the **recorded** instance — the block the round
+        fetched over the very road a verification point's request
+        travels, when it recorded who was answering.  The service under
+        test is usually **not** this round's own process: it serves the
+        product's own plans tree and reads the product's own database.
+        Asking "does the answer match *this round's* tree / *this
+        process's* database" is a question about the round, not about
+        the service, and it blocks every service that is somebody else
+        for being somebody else.
+
+        So all three comparisons are **recorded value against observed
+        value**:
+
+          * the **boot id** the round recorded;
+          * the **workspace** the recorded instance named — its
+            ``project_dir``, the repository root it belongs to.  The
+            plans tree is not an identity: it says "which tree is this
+            process pointed at right now", it is relocatable through
+            ``PDT_PLANS_DIR``, and the per-test fixture redirects it on
+            every test.  The workspace is what the instance *is*, and
+            two processes of the same checkout serving two different
+            trees are the same instance;
+          * the **inode of the database** the recorded instance reads
+            (its published inode, or the inode of the path it named).
+
+        An instance that publishes no workspace at all — an old
+        process, or one rolled back to an old build — falls back to the
+        **plans tree**, still compared against the recorded tree and
+        against nothing else.
+
+        A service the round **never recorded** is not gated at all:
+        not knowing who it is is not knowing that it is not ours, and a
+        verdict the round cannot back is worse than no verdict.
         """
         # 2026-10-25 (repair-r1-31): this block was read **right before
         # the request** — it is the freshest statement about who is
@@ -11134,16 +11200,34 @@ class Orchestrator:
         self._observed_instances[int(port)] = actual
 
         recorded = self._service_instance_identity.get(str(name).lower()) or {}
+        if not recorded:
+            # R2: the round has no baseline for this service, so it has
+            # no verdict to hand out.  The observation above is still
+            # kept — "who is listening here" is a fact worth having
+            # even when it cannot be compared.
+            return None
+
+        # The workspace: what the instance is identified by.  Both sides
+        # are read from the block each of them published, and the
+        # baseline is the value the round **recorded**.
+        expected_project_dir = self._recorded_project_dir(name)
+        actual_project_dir = str(actual.get("project_dir") or "")
+        # The plans tree: the fallback for an instance that publishes no
+        # workspace, and the **only** expectation — the recorded tree,
+        # never the round's own directories.
         expected_dirs = self._expected_plans_dirs(name)
-        # The first entry is the primary expectation — the plans tree
-        # the round's own service declared when it was started (or the
-        # round's plans root when it declared none).  That is the value
-        # the mismatch record reports as "expected", because it is the
-        # one a reader is trying to match against.
         expected_plans_dir = expected_dirs[0] if expected_dirs else ""
         actual_plans_dir = str(actual.get("plans_dir") or "")
         expected_boot_id = str(recorded.get("boot_id") or "")
         actual_boot_id = str(actual.get("boot_id") or "")
+        # The recorded block names the database the instance really
+        # reads: its published inode, or — when it published none — the
+        # inode of the path it named.  The backend's own database is
+        # tolerated as an alternative, so a deployment that serves the
+        # round's own data plane keeps working.
+        expected_inodes = self._expected_state_db_inodes(name)
+        expected_inode = expected_inodes[0] if expected_inodes else None
+        observed_inode = self._observed_state_db_inode(actual)
 
         mismatched: List[str] = []
         reasons: List[str] = []
@@ -11154,24 +11238,33 @@ class Orchestrator:
                 f"boot id {actual_boot_id!r} instead of {expected_boot_id!r}"
             )
 
-        if actual_plans_dir and not any(
-            self._same_path(actual_plans_dir, candidate)
-            for candidate in expected_dirs
-        ):
-            mismatched.append("plans_dir")
-            reasons.append(
-                f"plans tree {actual_plans_dir!r} instead of "
-                f"{expected_plans_dir!r}"
-            )
+        if expected_project_dir and actual_project_dir:
+            # Both sides name a workspace: that is the comparison, and
+            # it is the **only** one.  A service of the same workspace
+            # serving another tree is still the same instance — which is
+            # exactly what the workspace is for.
+            if not self._same_path(actual_project_dir, expected_project_dir):
+                mismatched.append("project_dir")
+                reasons.append(
+                    f"workspace {actual_project_dir!r} instead of "
+                    f"{expected_project_dir!r}"
+                )
+        elif expected_dirs and actual_plans_dir:
+            # One of the two sides names no workspace: the recorded
+            # instance is an old process, or the answering one is a
+            # rolled-back old process.  The comparison falls back to the
+            # plans tree — against the **recorded** tree, and against
+            # nothing else.  A round that recorded no tree at all has no
+            # baseline here either, and judges nothing.
+            if not any(
+                self._same_path(actual_plans_dir, d) for d in expected_dirs
+            ):
+                mismatched.append("plans_dir")
+                reasons.append(
+                    f"plans tree {actual_plans_dir!r} instead of "
+                    f"{expected_plans_dir!r}"
+                )
 
-        expected_inodes = self._expected_state_db_inodes(name)
-        # The first entry is the primary expectation — the database the
-        # round's own service declared (or the backend's own when it
-        # declared none) — and it is the number a mismatch record
-        # reports as "expected", for the same reason the plans tree
-        # reports its own primary entry.
-        expected_inode = expected_inodes[0] if expected_inodes else None
-        observed_inode = self._observed_state_db_inode(actual)
         if (
             expected_inodes
             and observed_inode is not None
@@ -11185,6 +11278,15 @@ class Orchestrator:
 
         if not mismatched:
             return None
+        # The round's own tree and database are **evidence**, not the
+        # baseline: they say what this round was about, so a reader can
+        # tell "the service serves another tree" from "the round ran
+        # somewhere else entirely".
+        round_plans_dir = ""
+        try:
+            round_plans_dir = str(Path(self.plan_dir.parent).resolve())
+        except OSError:  # pragma: no cover - defensive
+            round_plans_dir = str(self.plan_dir.parent)
         return {
             "service": str(name).lower(),
             "port": port,
@@ -11194,8 +11296,12 @@ class Orchestrator:
             "actual_boot_id": actual_boot_id,
             "expected_plans_dir": expected_plans_dir,
             "actual_plans_dir": actual_plans_dir,
+            "expected_project_dir": expected_project_dir,
+            "actual_project_dir": actual_project_dir,
             "expected_state_db_inode": expected_inode,
             "actual_state_db_inode": observed_inode,
+            "round_plans_dir": round_plans_dir,
+            "round_state_db_inode": self._expected_state_db_inode(),
         }
 
     # ------------------------------------------------------------------
@@ -11770,6 +11876,8 @@ class Orchestrator:
             "actual_boot_id": mismatch.get("actual_boot_id"),
             "expected_plans_dir": mismatch.get("expected_plans_dir"),
             "actual_plans_dir": mismatch.get("actual_plans_dir"),
+            "expected_project_dir": mismatch.get("expected_project_dir"),
+            "actual_project_dir": mismatch.get("actual_project_dir"),
             "mismatched_fields": list(mismatch.get("mismatched_fields") or []),
         }
         return {
@@ -11882,6 +11990,12 @@ class Orchestrator:
                             ),
                             "actual_plans_dir": mismatch.get(
                                 "actual_plans_dir",
+                            ),
+                            "expected_project_dir": mismatch.get(
+                                "expected_project_dir",
+                            ),
+                            "actual_project_dir": mismatch.get(
+                                "actual_project_dir",
                             ),
                             "mismatched_fields": list(
                                 mismatch.get("mismatched_fields") or [],

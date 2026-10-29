@@ -1990,6 +1990,27 @@ jobs:
           pip install uv==0.11.6
           uv sync --project backend --locked
 
+      # The browser replay in this lane drives a **real** Chromium:
+      # ``tests/e2e/test_plan_lifecycle_ui_e2e.py`` and
+      # ``tests/e2e/test_data_plane_identity_verdict_e2e.py`` assert on
+      # what the **rendered** page shows, so a test double of the page
+      # would prove nothing.
+      #
+      # The driver is the ``playwright`` package — declared in backend's
+      # dev group and installed by the step above — but the package does
+      # not carry the browser binaries: they are a separate download
+      # into Playwright's own cache.  Without this step the driver dies
+      # with "Executable doesn't exist", which reads as a product
+      # failure rather than as a missing instrument.
+      #
+      # ``--with-deps`` installs the system libraries Chromium needs
+      # (libnss3, libatk, …).  They are not on a bare runner image, and
+      # a Chromium that cannot start is the same missing-instrument
+      # failure wearing a different hat.
+      - name: Install the Chromium the browser replay drives
+        working-directory: backend
+        run: ./.venv/bin/playwright install --with-deps chromium
+
       # E2E exercises the full pipeline: agent → executor → LLM (stub) →
       # verifier → report. The full pytest suite (1482 tests) used
       # to also run here as a "regression" step, but it pushed the

@@ -71,10 +71,12 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -85,6 +87,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
+
+from framework.ids import derive_plan_id
 
 pytestmark = [pytest.mark.e2e]
 
@@ -151,6 +155,28 @@ def _flow_title() -> str:
     return f"{IMPORT_TITLE_PREFIX}-{uuid.uuid4().hex[:12]}"
 
 
+
+def _import_title() -> str:
+    """The title this run's import is filed under.
+
+    The title becomes the plan id (``framework.ids.derive_plan_id``),
+    and the plan id reaches outside the run: it is an argument of the
+    browser driver, and it is the needle the teardown uses to find an
+    executor that outlived the server.  A title that is the same on
+    every run gives every run on the machine the same id -- and two runs
+    that share an id have one run's teardown killing the other run's
+    driver (pytest-xdist gives every worker its own server and its own
+    import, so this happened *inside* one run of this file: the second
+    worker's teardown SIGTERMed the first worker's driver, which is the
+    ``exit -15`` with an empty stdout and a node ``EPIPE``).
+
+    The token keeps the id unique per run.  It has to survive the
+    backend's slug rule -- the id is ``<date>-<slug truncated to 20
+    characters>`` -- so it goes in front of the title.
+    """
+    return f"{os.getpid()}-{uuid.uuid4().hex[:6]}-{IMPORT_TITLE_PREFIX}"
+
+
 #: The home the run was *launched* with.  ``install_hermetic_env()``
 #: redirects ``$HOME`` to a temp dir, and Playwright resolves the browser
 #: binaries it launches under the home it is handed -- so the driver
@@ -168,10 +194,15 @@ def _load_reused_helpers():
 
     Two helpers are reused as they are: ``_free_port()`` (the kernel picks
     a free port) and ``_playwright_interpreter()`` (the interpreter that
-    can import playwright).  ``backend/tests/e2e/`` has no ``__init__.py``,
-    so a plain cross-module import would depend on pytest's rootdir-based
-    ``sys.path`` juggling; loading by **file path** avoids that without
-    copying a single line of it.
+    can import playwright).  ``backend/tests/e2e/`` **is** a package now
+    (``backend/tests/__init__.py`` and ``backend/tests/e2e/__init__.py``
+    are tracked since 720ceb5), so a sibling could be imported as
+    ``tests.e2e.<module>`` -- but that name is only resolvable from the
+    paths pytest happens to put on ``sys.path`` (the repository root and
+    ``backend/``), and this file is also imported *as* a module by the
+    sibling files that reuse it.  Loading by **file path** keeps the
+    dependency independent of both: the helper module is read once, under
+    a name of its own, without copying a single line of it.
     """
     path = Path(__file__).with_name("test_fastfail_no_ghost_state_ui.py")
     spec = importlib.util.spec_from_file_location("pdt_reused_ui_helpers", path)
@@ -264,6 +295,42 @@ def _plan_state(base_url: str, plan_id: str) -> Dict[str, Any]:
     if status != 200 or not isinstance(body, dict):
         raise RuntimeError(f"plan status for {plan_id} answered {status}: {body!r}")
     return body
+
+
+#: The run verdicts that end a plan, whatever the workflow's phase says.
+#: The listing filters on both answers (``routes/plans.py``,
+#: ``_plan_is_terminal``): the phase is the workflow's own verdict, and
+#: this is the run's.  Kept in step with ``TERMINAL_EXEC_STATUSES``
+#: there -- a run that failed or was stopped is over.
+TERMINAL_EXEC_VERDICTS = frozenset({"failed", "stopped"})
+
+
+def _persisted_exec_verdict(state_db_path: str, plan_id: str) -> Optional[str]:
+    """The run verdict **as persisted** (``plan_execution.exec_status``).
+
+    This is the surface the listing filters on (``routes/plans.py``,
+    ``_persisted_exec_status``), and it is not the same as what
+    ``/api/plan/{id}/summary`` reports: that endpoint prefers the
+    server's in-memory record of the process, which keeps saying
+    "stopped" after a requeue while the row no longer does.
+
+    Read straight from the SQLite file the server was given
+    (``PDT_STATE_DB_PATH``), because there is no endpoint that reports
+    the row.
+    """
+    conn = sqlite3.connect(state_db_path, timeout=15)
+    try:
+        row = conn.execute(
+            "SELECT exec_status FROM plan_execution WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise RuntimeError(
+            f"no plan_execution row for {plan_id} in {state_db_path}"
+        )
+    return str(row[0]) if row[0] is not None else None
 
 
 def _listed_plan_ids(base_url: str) -> List[str]:
@@ -503,8 +570,8 @@ def _teardown_server(proc: subprocess.Popen, base_url: str, plan_id: str) -> Non
 
     The executor runs in its own session, so terminating the server does
     not reach it -- it is stopped through the same facade the test used,
-    and anything that survived is killed by its plan id (the id is in its
-    command line).
+    and anything that survived is killed by the shape of its own command
+    line (see :func:`_kill_leftover_executors`).
     """
     if plan_id:
         try:
@@ -535,12 +602,30 @@ def _teardown_server(proc: subprocess.Popen, base_url: str, plan_id: str) -> Non
 
 
 def _kill_leftover_executors(plan_id: str) -> None:
-    """Kill an executor that outlived the server (it is found by its id)."""
+    """Kill the plan's executor if it outlived the server -- and only it.
+
+    The executor is the ``cli.py --recover`` subprocess the plan owns,
+    and the plan id is in its command line (it was given the plan's
+    ``--tasks-file``).  It used to be found with ``pgrep -f <plan id>``,
+    which matches *every* command line that mentions the id -- and the
+    browser driver takes the id as an argument.  Two workers of the
+    same run shared the id (it was derived from a constant title), so
+    one worker's teardown killed the other worker's driver: the driver
+    was SIGTERMed (``exit -15``) while the playwright node driver was
+    still writing to it (the node ``EPIPE``).
+
+    So the executor is found by *its own* shape -- the recovery CLI and
+    the plan's tasks file -- and not by "mentions the plan id".
+
+    ``ps -ax`` and not a bare ``ps``: the executor is started in its own
+    session (no controlling terminal), so a bare ``ps`` does not even
+    list it.
+    """
     if not plan_id:
         return
     try:
         listing = subprocess.run(
-            ["pgrep", "-f", plan_id],
+            ["ps", "-ax", "-ww", "-o", "pid=,command="],
             capture_output=True,
             text=True,
             timeout=15,
@@ -548,9 +633,18 @@ def _kill_leftover_executors(plan_id: str) -> None:
         )
     except (OSError, subprocess.SubprocessError):
         return
-    for line in listing.stdout.split():
+    if listing.returncode != 0:
+        return
+    for line in listing.stdout.splitlines():
+        pid_text, _, command = line.strip().partition(" ")
+        if not command:
+            continue
+        if "cli.py" not in command or "--recover" not in command:
+            continue
+        if plan_id not in command:
+            continue
         try:
-            pid = int(line)
+            pid = int(pid_text)
         except ValueError:
             continue
         if pid == os.getpid():
@@ -864,6 +958,7 @@ def lifecycle_ui_flow(tmp_path_factory) -> Dict[str, Any]:
     base_url, proc = _boot_server(work, script_dir)
     plan_id = ""
     observations: Dict[str, Any] = {}
+    observations["state_db_path"] = str(work / "state.db")
     try:
         # --- step 1: the backend answers -------------------------------
         observations["plans_list_status"] = _wait_for_api(base_url, "/api/plans")
@@ -936,6 +1031,9 @@ def lifecycle_ui_flow(tmp_path_factory) -> Dict[str, Any]:
         observations["phase_after_stop"] = _plan_state(base_url, plan_id).get(
             "current_phase"
         )
+        observations["exec_verdict_after_stop"] = _persisted_exec_verdict(
+            observations["state_db_path"], plan_id
+        )
         observations["listed_after_stop"] = _wait_for_plan_absent_from_list(
             base_url, plan_id
         )
@@ -968,6 +1066,9 @@ def lifecycle_ui_flow(tmp_path_factory) -> Dict[str, Any]:
         observations["facade_requeue_stop_body"] = body
         observations["phase_after_requeue"] = _plan_state(base_url, plan_id).get(
             "current_phase"
+        )
+        observations["exec_verdict_after_requeue"] = _persisted_exec_verdict(
+            observations["state_db_path"], plan_id
         )
         observations["listed_after_requeue"] = _wait_for_plan_in_list(base_url, plan_id)
         # The card can only be on the page if the plan is in the listing
@@ -1163,6 +1264,44 @@ def test_end_to_end_queued_then_stop_and_requeue(lifecycle_ui_flow):
     )
 
 
+def test_the_requeue_retires_the_stopped_execution_verdict(lifecycle_ui_flow):
+    """A plan that waits again has no terminal verdict left over.
+
+    The run's verdict and the workflow's phase are two different
+    answers, and the listing filters on **both** (``routes/plans.py``,
+    ``_plan_is_terminal``): a run that was **stopped** ends the plan,
+    whatever the phase says.  The verdict it reads is the **persisted**
+    one (``plan_execution.exec_status``) -- not the in-memory record
+    ``/api/plan/{id}/summary`` reports, which keeps saying "stopped"
+    after a requeue while the row no longer does.
+
+    That is right for a plan that is over.  It is wrong for a plan that
+    was stopped and then **queued again**: such a plan has no verdict
+    left -- it is waiting for the next slot, not finished.  Leaving the
+    stopped verdict on the row kept the requeued plan out of the
+    listing, so its card never appeared and the page showed no
+    "排队中" label for it at all.
+
+    So the requeue retires the verdict, and this pins that fact: the
+    verdict is terminal before the requeue, and is not afterwards.  The
+    browser test above pins the consequence (the card is back and says
+    "排队中"); this pins the cause.
+    """
+    obs = lifecycle_ui_flow
+
+    assert obs["exec_verdict_after_stop"] in TERMINAL_EXEC_VERDICTS, (
+        f"the stopped plan's verdict is {obs['exec_verdict_after_stop']!r}, "
+        f"which is not one of the terminal verdicts "
+        f"{sorted(TERMINAL_EXEC_VERDICTS)} -- the run was stopped, so its "
+        f"verdict should be"
+    )
+    assert obs["exec_verdict_after_requeue"] not in TERMINAL_EXEC_VERDICTS, (
+        f"the requeued plan still carries the terminal verdict "
+        f"{obs['exec_verdict_after_requeue']!r} -- the listing filters it "
+        f"out, so its card never appears and no '排队中' label is shown"
+    )
+
+
 def test_screenshots_are_written(lifecycle_ui_flow):
     """Both screenshots are on disk, and neither of them is empty."""
     artifacts_dir = Path(lifecycle_ui_flow["artifacts_dir"])
@@ -1170,3 +1309,273 @@ def test_screenshots_are_written(lifecycle_ui_flow):
         path = artifacts_dir / name
         assert path.exists(), f"{path} was not written"
         assert path.stat().st_size > 0, f"{path} is empty"
+
+
+# ---------------------------------------------------------------------------
+# The isolation of one run from another
+# ---------------------------------------------------------------------------
+#
+# The plan id of this run reaches outside the run: it is an argument of
+# the browser driver, and it is the needle the teardown uses to find the
+# executor that outlived the server.  Two things follow from that, and
+# both of them are asserted below -- on a machine that runs two copies
+# of this file at once (a CI shard next to a developer's own run), the
+# old arrangement had one run kill the other run's driver.
+
+
+def test_two_runs_do_not_share_a_plan_id():
+    """The import title carries a token, so two runs get two plan ids.
+
+    The plan id is derived from the import title, and the plans
+    directory is per-run -- so a constant title gave every run on the
+    machine the very same id, and the id is what the teardown (and the
+    driver command line) is keyed on.
+    """
+    first = _import_title()
+    second = _import_title()
+    assert first != second, "two runs got the same import title"
+    assert derive_plan_id(first) != derive_plan_id(second), (
+        f"two runs got the same plan id: {derive_plan_id(first)!r}"
+    )
+
+
+def test_the_teardown_kills_the_executor_and_nothing_else(tmp_path):
+    """The teardown signals the plan's executor -- and only the executor.
+
+    The leftover executor used to be found with ``pgrep -f <plan id>``,
+    which matches *every* command line that mentions the id: the browser
+    driver of this run (it takes the id as an argument) and the driver
+    of every other run on the machine.  A teardown that kills a
+    stranger's driver fails a test it did not run -- and it did, with
+    ``exit -15`` and an empty stdout.
+    """
+    plan_id = "20260101-teardown-probe"
+    # A process that merely *mentions* the plan id -- what the browser
+    # driver of another run looks like.
+    bystander = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)", plan_id],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # The plan's own executor: ``cli.py --recover`` with the plan's
+    # tasks file (the plan id is in that path).
+    executor = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(120)",
+            "cli.py",
+            "--recover",
+            "-w",
+            str(tmp_path),
+            "--tasks-file",
+            str(tmp_path / "plans" / plan_id / "tasks.json"),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _kill_leftover_executors(plan_id)
+        deadline = time.time() + 15.0
+        while time.time() < deadline and executor.poll() is None:
+            time.sleep(0.2)
+        assert executor.poll() is not None, (
+            "the executor that outlived the server was not killed"
+        )
+        assert executor.returncode == -signal.SIGTERM, (
+            f"the leftover executor was not stopped with SIGTERM; got "
+            f"{executor.returncode}"
+        )
+        time.sleep(1.0)
+        assert bystander.poll() is None, (
+            "the teardown killed a process that only mentioned the plan id "
+            f"(exit {bystander.returncode})"
+        )
+    finally:
+        for proc in (bystander, executor):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# How a sibling module is imported
+# ---------------------------------------------------------------------------
+#
+# ``backend/tests/e2e/`` **is** a package: ``backend/tests/__init__.py`` and
+# ``backend/tests/e2e/__init__.py`` have been tracked since 720ceb5.  A
+# sibling is therefore imported as ``tests.e2e.<name>``.
+#
+# A **bare** name -- ``from test_plan_lifecycle_ui_e2e import ...`` -- is
+# the spelling that only resolves while pytest happens to put this
+# directory on ``sys.path``.  The moment the directory is a package, that
+# spelling stops resolving: the collection dies with an ``ImportError``
+# before a single case runs, and the whole E2E lane goes red for a reason
+# that has nothing to do with the code under test.
+#
+# The import *mode* is not the thing to change: pytest's ``pythonpath``
+# and ``importmode`` are left exactly as they are, and the spelling of
+# the import is what carries the fix.  This check reads the source, so it
+# keeps the spelling honest no matter which pytest is doing the collecting.
+
+
+#: The directory the E2E modules live in.
+E2E_DIR = Path(__file__).resolve().parent
+
+#: The prefix a sibling's **bare** name carries.  A package-qualified
+#: import starts with ``tests.``, so only a name whose *first* component
+#: starts with this prefix is a bare import of a sibling module.
+_BARE_MODULE_PREFIX = "test_"
+
+
+def _bare_sibling_imports(e2e_dir: Path) -> List[str]:
+    """Every bare ``from test_... import ...`` in the E2E modules.
+
+    The modules are read as **source** and parsed, rather than imported:
+    the question is what the file says, and a file that cannot be
+    imported is exactly the file whose spelling is in doubt.  Parsing
+    also keeps the strings that *mention* an import -- the synthetic
+    scripts some of these modules write out -- out of the answer: a
+    script that is handed its own directory on ``sys.path`` imports by
+    bare name on purpose.
+
+    One line per offence, ``file:line`` and the import that is wrong, so
+    the message of a failure names the line to change.
+    """
+    offenders: List[str] = []
+    for module_path in sorted(e2e_dir.glob("test_*.py")):
+        source = module_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(module_path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                # A relative import (``from . import x``) names something
+                # inside the package: it is spelled correctly already.
+                if node.level:
+                    continue
+                module = node.module or ""
+                if not module.split(".")[0].startswith(_BARE_MODULE_PREFIX):
+                    continue
+                offenders.append(
+                    f"{module_path.name}:{node.lineno}: from {module} import ..."
+                )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if not alias.name.split(".")[0].startswith(_BARE_MODULE_PREFIX):
+                        continue
+                    offenders.append(
+                        f"{module_path.name}:{node.lineno}: import {alias.name}"
+                    )
+    return offenders
+
+
+def test_the_sibling_modules_are_imported_by_package_name():
+    """A sibling is imported as ``tests.e2e.<name>`` -- never by bare name.
+
+    The E2E modules used to import their siblings by bare name, which
+    only resolves while pytest happens to put this directory on
+    ``sys.path``.  With ``backend/tests/e2e/`` being a package, that
+    spelling dies at collection time with an ``ImportError`` -- and the
+    lane that carries the browser replay goes red before a single case
+    runs.
+
+    So the spelling is pinned here: a bare sibling import in this
+    directory is a failure, and it says which line to change.  The
+    import mode is not touched -- the modules are read as source, so the
+    check does not depend on which pytest is doing the collecting.
+    """
+    offenders = _bare_sibling_imports(E2E_DIR)
+    assert not offenders, (
+        "these E2E modules import a sibling by its bare name, which only "
+        "resolves while pytest happens to put the directory on sys.path:\n"
+        + "\n".join(offenders)
+        + "\nA sibling is imported as ``tests.e2e.<name>`` -- "
+        "``backend/tests/e2e`` is a package."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Which sibling actually gets imported
+# ---------------------------------------------------------------------------
+#
+# ``tests.e2e.<name>`` is resolved through ``sys.path``, and ``sys.path``
+# can carry more than one ``backend/``: a shared virtualenv, a
+# ``PYTHONPATH`` left over from another checkout, an editable install.
+# When it carries two, the sibling that gets imported may be the *other*
+# tree's copy -- and then these modules run against a file that is not
+# the one next to them.  The symptom is a missing helper, which reads
+# like a broken module rather than like a wrong import.
+#
+# So the import is pinned to the directory the importing module lives in:
+# the sibling that is loaded has to be the file next to it.
+
+
+def _loaded_module_path(module_name: str) -> Path:
+    """Where ``module_name`` was actually loaded from."""
+    module = importlib.import_module(module_name)
+    return Path(module.__file__).resolve()
+
+
+def test_the_sibling_module_is_loaded_from_this_directory():
+    """The imported sibling is the file that sits next to this one.
+
+    The E2E modules import each other by package name, and that name is
+    resolved through ``sys.path``.  A machine that has two checkouts of
+    this repository on ``sys.path`` at once -- which a shared
+    virtualenv plus a leftover ``PYTHONPATH`` produces -- resolves the
+    name to whichever ``backend/`` comes first, not necessarily to this
+    tree.
+
+    So the loaded file is checked against this directory: the sibling
+    that these modules run has to be the one beside them.
+    """
+    loaded = _loaded_module_path("tests.e2e.test_plan_lifecycle_ui_e2e")
+    assert loaded.parent == E2E_DIR, (
+        f"``tests.e2e.test_plan_lifecycle_ui_e2e`` was loaded from "
+        f"{loaded}, which is not inside {E2E_DIR}. Another checkout of this "
+        "repository is ahead of this one on sys.path, so these modules "
+        "would run against a file that is not the one next to them."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The modules in this directory are Python
+# ---------------------------------------------------------------------------
+#
+# A module that cannot be parsed takes the whole lane down at collection
+# time, before a single case runs: the failure is reported as a
+# collection error on four modules at once, and nothing in the output
+# says that the file was overwritten.  So the modules in this directory
+# are parsed here, and a file that is not valid Python is named.
+
+
+def _modules_that_do_not_parse(e2e_dir: Path) -> List[str]:
+    """Every module in ``e2e_dir`` that is not valid Python.
+
+    :param e2e_dir: The directory to scan.
+    :return: One line per broken module -- ``name:line: message``.
+    """
+    broken: List[str] = []
+    for module_path in sorted(e2e_dir.glob("test_*.py")):
+        try:
+            ast.parse(
+                module_path.read_text(encoding="utf-8"), filename=str(module_path)
+            )
+        except SyntaxError as exc:
+            broken.append(f"{module_path.name}:{exc.lineno}: {exc.msg}")
+    return broken
+
+
+def test_the_e2e_modules_are_valid_python():
+    """Every module in this directory is valid Python.
+
+    A file that is not valid Python cannot be collected, so the failure
+    lands on the lane rather than on the file that caused it.  Reading
+    the sources here names the file instead.
+    """
+    broken = _modules_that_do_not_parse(E2E_DIR)
+    assert not broken, (
+        "these E2E modules are not valid Python:\n"
+        + "\n".join(broken)
+        + "\nA module that cannot be parsed takes the whole lane down at "
+        "collection time, before a single case runs."
+    )

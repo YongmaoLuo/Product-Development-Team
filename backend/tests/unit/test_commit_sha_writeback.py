@@ -48,6 +48,13 @@ def _make_agent_skeleton():
     agent.task_manager = MagicMock()
     agent.logger = MagicMock()
     agent.rollback_manager = MagicMock()
+    # ``create_task_commit`` returns the message that the commit path
+    # scrubs and hands to the repository's commit-message rule. A bare
+    # mock returns a MagicMock, which the scrub cannot read as a string
+    # — the production method always returns the assembled message.
+    agent.rollback_manager.create_task_commit.return_value = (
+        "task 11-4: example"
+    )
     return agent
 
 

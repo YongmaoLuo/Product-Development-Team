@@ -40,9 +40,10 @@ Test contract:
      the boot id of the instance it replaced.
   7. The expected plans tree is the one the round's service
      **declared** when it was started — a fixture data plane is a
-     legal deployment, and the round's own directories stay accepted.
-     A tree that is neither declared nor the round's own is still a
-     stranger (see the negative control at the end of this file).
+     legal deployment.  A tree that is neither declared nor recorded
+     at all is not a stranger either: with no recorded tree there is
+     no baseline to compare against (see the negative control at the
+     end of this file).
 """
 
 from __future__ import annotations
@@ -574,8 +575,9 @@ def test_a_re_ensured_service_is_not_blocked_against_its_old_boot_id(
 # knew the round's own directories, so every verification point of the
 # round stopped dead at ``identity_mismatch`` before one request went
 # out.  The expectation now follows the declaration the round recorded
-# from the service itself, the round's own directories stay tolerated,
-# and the comparisons that catch a swapped instance keep their teeth.
+# from the service itself, the round's own directories are **not** a
+# baseline any more, and the comparisons that catch a swapped instance
+# keep their teeth.
 
 
 def _recorded_agent(tmp_path: Path, plans_dir: Optional[Path]):
@@ -666,14 +668,16 @@ def test_a_third_plans_tree_is_still_a_mismatch(tmp_path: Path):
     ), mismatch
 
 
-def test_without_a_declaration_the_rounds_own_tree_is_expected(
+def test_without_a_recorded_tree_the_tree_carries_no_verdict(
     tmp_path: Path,
 ):
-    """No recorded plans tree → the round's own directories, as before.
+    """No recorded tree → no baseline → no verdict about any tree.
 
-    A service that never published a plans tree is still gated against
-    where the round lives: its own plans root passes, a third tree does
-    not.  The fallback is the behaviour every earlier round relied on.
+    The round's own directories used to be accepted when the round
+    recorded no tree, and a third party's tree was a mismatch.  Both
+    halves of that are gone: the comparison is a question about the
+    **instance**, and a round that recorded no tree has nothing to ask
+    it.  "Not comparable" is not "wrong".
     """
     agent = _recorded_agent(tmp_path, None)
     own_root = agent.plan_dir.parent
@@ -681,15 +685,15 @@ def test_without_a_declaration_the_rounds_own_tree_is_expected(
     actual_own = {"boot_id": "boot-1", "plans_dir": str(own_root)}
     assert agent._compare_service_instance(
         "api", actual_own, 12345,
-    ) is None
+    ) is None, "the round's own tree is not a baseline any more"
 
     actual_foreign = {
         "boot_id": "boot-1",
         "plans_dir": str(tmp_path / "a-third-tree" / "plans"),
     }
-    mismatch = agent._compare_service_instance("api", actual_foreign, 12345)
-    assert mismatch is not None, "a foreign tree was let through"
-    assert mismatch["mismatched_fields"] == ["plans_dir"], mismatch
+    assert agent._compare_service_instance(
+        "api", actual_foreign, 12345,
+    ) is None, "with no recorded tree there is no baseline to judge by"
 
 
 # ---------------------------------------------------------------------------
