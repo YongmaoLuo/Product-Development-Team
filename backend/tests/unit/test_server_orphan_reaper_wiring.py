@@ -38,6 +38,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -94,11 +95,32 @@ def _drive_lifespan(monkeypatch: pytest.MonkeyPatch) -> None:
     The recovery helpers and the heartbeat are stubbed so the lifespan
     body does not depend on the live state database; what is under test
     is the wiring, not the recovery semantics.
+
+    The two boot sweeps are stubbed as well.  They run on a background
+    thread now — they must not sit on the readiness path — so without
+    a stand-in this machine's own temp roots and service ledger would
+    be swept for real by every test in this file.  The thread is
+    captured and joined before the helper returns, so no test leaves a
+    sweep running behind it.
     """
     monkeypatch.setattr(server_mod, "_recover_execution_states", lambda plans_dir: None)
     monkeypatch.setattr(server_mod, "_recover_verification_states", lambda plans_dir: None)
     monkeypatch.setattr(server_mod, "load_providers", lambda: [])
     monkeypatch.setattr(server_mod, "heartbeat_monitor", MagicMock())
+    monkeypatch.setattr(server_mod, "_reap_all_plans", lambda *a, **k: [])
+    monkeypatch.setattr(
+        server_mod, "_sweep_credential_residue", lambda apply=True: ([], 0, 0)
+    )
+
+    sweep_threads: list[threading.Thread] = []
+    original_start = server_mod._start_boot_sweeps
+
+    def _capture() -> threading.Thread:
+        thread = original_start()
+        sweep_threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(server_mod, "_start_boot_sweeps", _capture)
 
     fake_app = MagicMock()
     fake_app.state = MagicMock()
@@ -108,6 +130,12 @@ def _drive_lifespan(monkeypatch: pytest.MonkeyPatch) -> None:
             pass
 
     asyncio.run(_enter())
+
+    for thread in sweep_threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive(), (
+            "the boot-sweep thread outlived the test — it must be joined"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -119,9 +147,12 @@ def test_lifespan_calls_both_hooks_in_order(monkeypatch):
     """The boot marks the process first, and starts the reaper after.
 
     The order is the whole contract: the marker has to be in place
-    before anything spawns a child, and the reaper's scan belongs after
-    the ledger sweep, so that the processes the ledger knows about are
-    dealt with by the layer that knows about them.
+    before anything spawns a child.  The reaper's scan no longer has
+    an order against the ledger sweep — the sweeps run concurrently on
+    their own thread, so that the boot does not wait for them — and it
+    does not need one: the ledger layer stops the processes a plan
+    declared and can still identify, the reaper reclaims the ones
+    nobody declared any more, and each judges by its own record.
     """
     calls = []
 

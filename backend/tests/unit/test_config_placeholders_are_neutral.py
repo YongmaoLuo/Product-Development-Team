@@ -12,13 +12,11 @@ content would not look like a credential to any scanner.
 
 The gate pins the rule at three layers:
 
-1. **Templates carry placeholders only.** Every regex carried by a
-   ``tiers.*`` entry in the routing example (the entry is either a
-   bare string or a mapping whose ``pattern`` key holds the regex) and
-   every ``providers.*.pattern`` entry in the capacity example is a
-   ``^Example `` prefixed name. A concrete deployment name (e.g.
-   ``^Vendor A``, ``^Vendor B``) inside the template would compile one
-   install's providers into every checkout.
+1. **Templates carry placeholders only.** Every ``tiers.*`` entry in
+   the routing example and every ``providers.*.pattern`` entry in the
+   capacity example is a ``^Example `` prefixed name. A concrete
+   deployment name (e.g. ``^Vendor A``, ``^Vendor B``) inside the
+   template would compile one install's providers into every checkout.
 
 2. **Templates cannot accidentally match a live deployment.** When the
    operator's ``.config/provider_routing.yaml`` is present, the test
@@ -84,40 +82,17 @@ def _load_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
-def _tier_patterns(tiers: dict) -> list[str]:
-    """Flatten every regex pattern carried by a ``tiers`` section.
-
-    A tier entry has two legal shapes, and both carry exactly one
-    regex:
-
-    * a bare regex STRING — membership only (the legacy spelling);
-    * a MAPPING whose ``pattern`` key carries the regex — the same
-      membership plus optional ``model`` / ``effort`` pins.
-
-    Any other shape carries no pattern at all and is skipped: the
-    loader skips it too (with a WARNING), so there is nothing for
-    this gate to inspect. The pattern itself is returned VERBATIM —
-    whether it carries the placeholder prefix is the gate's question,
-    not this helper's.
-    """
-    patterns: list[str] = []
-    for tier_patterns in (tiers or {}).values():
-        if not tier_patterns:
-            continue
-        for entry in tier_patterns:
-            if isinstance(entry, str):
-                patterns.append(entry)
-            elif isinstance(entry, dict):
-                pattern = entry.get("pattern")
-                if isinstance(pattern, str) and pattern.strip():
-                    patterns.append(pattern)
-    return patterns
-
-
 def _routing_template_patterns() -> list[str]:
     """Flatten every regex pattern from the routing example's tiers."""
     data = _load_yaml(_ROUTING_TEMPLATE)
-    return _tier_patterns(data.get("tiers") or {})
+    tiers = data.get("tiers") or {}
+    patterns: list[str] = []
+    for tier_patterns in tiers.values():
+        if not tier_patterns:
+            continue
+        for pattern in tier_patterns:
+            patterns.append(pattern)
+    return patterns
 
 
 def _capacity_template_patterns() -> list[str]:
@@ -145,7 +120,14 @@ def read_live_config_names() -> Optional[list[str]]:
     if not _LIVE_ROUTING.exists():
         return None
     data = _load_yaml(_LIVE_ROUTING)
-    return _tier_patterns(data.get("tiers") or {})
+    tiers = data.get("tiers") or {}
+    patterns: list[str] = []
+    for tier_patterns in tiers.values():
+        if not tier_patterns:
+            continue
+        for pattern in tier_patterns:
+            patterns.append(pattern)
+    return patterns
 
 
 # ---------------------------------------------------------------------------

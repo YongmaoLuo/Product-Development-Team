@@ -659,6 +659,38 @@ def _init_verification_state(
         }
 
 
+def _requeue_shutdown_interrupted_verification(plan_id: str, plan_dir: Path) -> None:
+    """Put a plan whose verification the shutdown interrupted back in the queue.
+
+    The plan's phase is what the scheduler reads, so a plan the server
+    took down with it -- still parked at ``verification_running`` (or
+    ``verification_repairing``) -- is invisible to the scheduler and to
+    every operator looking at the plan list.  Moving it to ``queued``
+    says "this is work that is waiting to be picked up again", which is
+    what it is: the round is not lost, it is waiting.
+
+    The phase is moved with ``force_set_phase`` because the transition
+    tables do not know about this edge (the plan is coming *back* from
+    a verification phase, not moving forward inside it) and because a
+    plan that crashed mid-round has to be recoverable at all.
+
+    The ``plan_verification`` row is deliberately NOT touched: it is the
+    record of the round, and the round is still there -- the checkpoint
+    is what a resume reads to pick it up again.
+
+    A failure to write the phase is logged and swallowed: one plan that
+    cannot be requeued must not cost every other plan its recovery.
+    """
+    entry = _server._verification_state.get(plan_id)
+    if isinstance(entry, dict):
+        entry["resumed_from_shutdown"] = True
+    try:
+        _server.PlanState(plan_dir).force_set_phase("queued")
+    except Exception:
+        _server.logger.exception(
+            "[verification_recovery] requeue failed plan=%s", plan_id)
+
+
 def _recover_verification_states(plans_dir: Path) -> None:
     """Restore ``_verification_state[plan_id]`` from disk on startup.
 
@@ -666,16 +698,54 @@ def _recover_verification_states(plans_dir: Path) -> None:
     (a terminal-state file is left on disk for audit but the
     in-memory entry is intentionally left empty so the API reflects
     the real state, not stale disk artifacts).
+
+    2026-10-29: a plan whose verification was interrupted by the
+    server going down is put back in the queue instead.  The shutdown
+    path writes a checkpoint for every plan that was still in flight
+    (``backend/shutdown_checkpoint.py``) and the writer covers the three
+    in-flight statuses -- ``running``, ``repairing`` and ``rerunning``
+    (the same three words as ``server._VERIFICATION_IN_FLIGHT_STATUSES``)
+    -- so the reader has to cover the same three.  Without this a plan
+    whose round was interrupted stayed at ``verification_running`` for
+    ever: the scheduler never saw it, and nothing could pick it up.
+
+    The checkpoint is the *evidence* that the server went down under
+    this work -- as opposed to the work having died -- so it is only
+    honoured when it is fresh (see
+    :func:`shutdown_checkpoint.is_shutdown_interrupted`).  A plan with
+    no checkpoint, or with one from an earlier run, keeps the recovery
+    it had before: its phase stays where it is, and only a ``running``
+    round is loaded into memory.
     """
     if not plans_dir.exists():
         return
+    from shutdown_checkpoint import is_shutdown_interrupted
+
     for plan_dir in plans_dir.iterdir():
         if not plan_dir.is_dir():
             continue
         data = _server._load_verification_runtime_state(plan_dir.name)
         if data is None:
             continue
-        if data.get("verification_status") != "running":
+        status = data.get("verification_status")
+        # The same three words the writer side stamps a checkpoint for.
+        # A status outside them says nothing about a verification round
+        # that was in flight, so it is not a shutdown candidate.
+        shutdown_interrupted = (
+            status in {"running", "repairing", "rerunning"}
+            and is_shutdown_interrupted(
+                plan_dir,
+                kind="verification",
+                run_started_at=data.get("started_at"),
+            )
+        )
+        if shutdown_interrupted:
+            _requeue_shutdown_interrupted_verification(plan_dir.name, plan_dir)
+            if status != "running":
+                # A non-running round never had an in-memory entry, so
+                # the requeue is the whole recovery action for it.
+                continue
+        if status != "running":
             continue
         # In-memory state always carries the orchestrator + thread
         # keys (the start handler creates them), but a recovered plan
@@ -711,6 +781,14 @@ def _recover_verification_states(plans_dir: Path) -> None:
             # itself is the guard.
             "recovered": True,
         }
+        if shutdown_interrupted:
+            # The requeue above ran before this entry existed, so the
+            # helper had no entry to mark. The marker is set here, on
+            # the one construction the recovery has always had: it says
+            # "this round was resumed after the server went down", which
+            # is not the same thing as "this round was recovered from
+            # disk because it crashed".
+            _server._verification_state[plan_dir.name]["resumed_from_shutdown"] = True
         _server.logger.info(
             "Recovered verification runtime state for plan %s (round=%s, status=%s)",
             plan_dir.name, data.get("verification_round"), data.get("verification_status"),

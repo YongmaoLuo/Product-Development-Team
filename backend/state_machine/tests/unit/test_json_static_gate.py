@@ -31,7 +31,9 @@ Defense 2: SQL schema gate (test_sqlite_schema_tables_exactly_four_plus_version)
   ``sqlite_master`` table name set must be EXACTLY::
 
     {"plan_routing", "plan_execution", "plan_verification",
-     "plan_artifacts", "schema_version"}
+     "plan_artifacts", "plan_tasks", "plan_decisions",
+     "scheduler_queue", "scheduler_slot", "scheduler_command",
+     "schema_version"}
 
   No ``plans``, ``plan_meta``, or ``plan_activity`` legacy tables.
 
@@ -126,9 +128,12 @@ LEGACY_TABLE_NAMES: tuple[str, ...] = (
 #: per-task state lives in its own table rather than inside
 #: ``plan_execution.task_progress`` JSON.  Schema v7 (2026-10-21) added
 #: ``plan_decisions``, the human-in-the-loop decision store (see
-#: ``state_machine/db/schema.py``'s ``_ensure_plan_decisions``).  This
-#: list is where the state-machine side says so; the backend's own
-#: copy of the same gate lives in
+#: ``state_machine/db/schema.py``'s ``_ensure_plan_decisions``).
+#: Schema v7 (2026-10-28) added the three ``scheduler_*`` tables — the
+#: native scheduler's queue order, slot occupancy and operator commands
+#: (see the same schema module's ``_SCHEDULER_OBJECTS``).  This list is
+#: where the state-machine side says so; the backend's own copy of the
+#: same gate lives in
 #: ``backend/tests/static_gates/test_sqlite_schema_tables_exactly_four_plus_version.py``.
 EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
     {
@@ -138,6 +143,9 @@ EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
         "plan_artifacts",
         "plan_tasks",
         "plan_decisions",
+        "scheduler_queue",
+        "scheduler_slot",
+        "scheduler_command",
         "schema_version",
     }
 )

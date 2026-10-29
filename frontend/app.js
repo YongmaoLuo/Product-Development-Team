@@ -1934,6 +1934,393 @@ function renderTaskCard(t) {
         </div>`;
 }
 
+// --- Scheduler View ---
+//
+// The scheduler's read model comes from ONE endpoint
+// (GET /api/scheduler/state) and the panel renders it the way it
+// arrives: the order of the queue and the words on the reasons are
+// the server's, not ours.  The panel never sorts the queue and never
+// composes a reason of its own — a second order and a second
+// vocabulary would be two answers to "who runs next" and "why not",
+// and the operator would have no way of telling which of the two the
+// scheduler is using.
+//
+// The four actions are the four the API has (promote / pause / resume
+// / start).  Each one is a command: the answer says what the command
+// did, not that it was accepted.  There is no global on/off switch
+// here on purpose — the operator's rollback lever is a configuration
+// key and it stays in the configuration, because a button that stops
+// every plan at once is one mis-click away from an outage.
+
+/** The reason vocabulary is closed on the server side
+    (plan_scheduler.policy.REASONS); this maps each of the server's
+    words to the text the panel draws.  A word that is not in the map
+    is drawn as the word itself — never as an empty cell, and never as
+    a guess. */
+const SCHEDULER_REASON_TEXT = {
+    running: "运行中",
+    waiting_for_slot: "等待名额",
+    blocked_by_capacity: "名额已满",
+    workspace_busy: "工作区占用",
+    due_later: "尚未到点",
+    hitl_pending: "等待人工回答",
+    paused: "已暂停",
+    over_capacity: "超出名额",
+};
+
+/** The label each action's button carries. */
+const SCHEDULER_ACTION_LABELS = {
+    promote: "提升",
+    pause: "暂停",
+    resume: "恢复",
+    start: "启动",
+};
+
+/** Which actions may be offered for a plan in a given phase.  This is
+    the action matrix from the design: the panel offers what the server
+    accepts, so a button that is on screen is a button the command will
+    carry out.  A phase that is not in the table gets no buttons. */
+const SCHEDULER_ACTIONS_BY_PHASE = {
+    queued: ["promote", "pause", "start"],
+    executing: ["pause"],
+    stopped: ["resume", "start"],
+    failed: ["start"],
+    waiting_for_quota: ["start"],
+};
+
+/** The reason the server gave, as the text the panel draws. */
+function schedulerReasonText(reason) {
+    if (reason === null || reason === undefined) return "";
+    const word = String(reason);
+    return SCHEDULER_REASON_TEXT[word] || word;
+}
+
+function schedulerSetText(selector, text) {
+    const el = $(selector);
+    if (el) el.textContent = text;
+}
+
+function schedulerToggle(el, visible) {
+    if (el) el.classList.toggle("hidden", !visible);
+}
+
+/** Render the capacity widget — used / total and the queue length.
+    The home widget and the scheduler view carry the same numbers: they
+    are read out of one read model, so they cannot disagree. */
+function renderSchedulerCapacity(snapshot) {
+    const capacity = (snapshot && snapshot.capacity) || {};
+    const total = Number(capacity.total) || 0;
+    const used = Number(capacity.used) || 0;
+    const queued = Number(snapshot && snapshot.queue_length) || 0;
+    const over = Boolean(snapshot && snapshot.over_capacity);
+
+    const numbers = [
+        ["#scheduler-capacity-used", used],
+        ["#scheduler-view-capacity-used", used],
+        ["#scheduler-capacity-total", total],
+        ["#scheduler-view-capacity-total", total],
+        ["#scheduler-capacity-queue", queued],
+        ["#scheduler-view-capacity-queue", queued],
+    ];
+    numbers.forEach(([selector, value]) => schedulerSetText(selector, String(value)));
+
+    const flags = [
+        ["#scheduler-capacity-over", over],
+        ["#scheduler-view-capacity-over", over],
+    ];
+    flags.forEach(([selector, flagged]) => {
+        const el = $(selector);
+        if (!el) return;
+        el.classList.toggle("hidden", !flagged);
+        el.textContent = flagged ? "over-capacity" : "";
+    });
+
+    schedulerSetText("#scheduler-view-generated-at", (snapshot && snapshot.generated_at) || "—");
+}
+
+/** The action buttons of one row.  A row that names no plan gets no
+    button: a button that acts on nothing is worse than no button. */
+function schedulerActionButtons(planId, actions) {
+    if (!planId || !actions || !actions.length) {
+        return '<span class="scheduler-action-none">—</span>';
+    }
+    return actions
+        .map((action) =>
+            `<button class="btn btn-outline scheduler-action" data-action="${escapeHtml(action)}" data-plan="${escapeHtml(planId)}">${escapeHtml(SCHEDULER_ACTION_LABELS[action] || action)}</button>`
+        )
+        .join(" ");
+}
+
+/** The queue, in the order the server gave it.  An empty queue is an
+    empty state, not an error: "nothing is waiting" is a normal thing to
+    look at. */
+function renderSchedulerQueue(snapshot) {
+    const rows = snapshot && Array.isArray(snapshot.queue) ? snapshot.queue : [];
+    const body = $("#scheduler-queue-list");
+    if (!body) return;
+
+    if (!rows.length) {
+        body.innerHTML = "";
+        schedulerToggle($("#scheduler-queue-table"), false);
+        schedulerToggle($("#scheduler-queue-empty"), true);
+        return;
+    }
+
+    body.innerHTML = rows
+        .map((row) => {
+            const item = row || {};
+            const planId = item.plan_id ? String(item.plan_id) : "";
+            const promoted = item.promote_order === null || item.promote_order === undefined ? "—" : item.promote_order;
+            return `<tr>
+                <td>${escapeHtml(item.position)}</td>
+                <td>${escapeHtml(planId || "—")}</td>
+                <td>${escapeHtml(item.seq)}</td>
+                <td>${escapeHtml(item.priority)}</td>
+                <td>${escapeHtml(promoted)}</td>
+                <td>${escapeHtml(schedulerReasonText(item.reason))}</td>
+                <td class="scheduler-row-actions">${schedulerActionButtons(planId, ["promote", "start"])}</td>
+            </tr>`;
+        })
+        .join("");
+
+    schedulerToggle($("#scheduler-queue-table"), true);
+    schedulerToggle($("#scheduler-queue-empty"), false);
+}
+
+/** The plans that hold a slot, with the time they have been running and
+    whether they may be interrupted. */
+function renderSchedulerRunning(snapshot) {
+    const rows = snapshot && Array.isArray(snapshot.running) ? snapshot.running : [];
+    const body = $("#scheduler-running-list");
+    if (!body) return;
+
+    if (!rows.length) {
+        body.innerHTML = "";
+        schedulerToggle($("#scheduler-running-table"), false);
+        schedulerToggle($("#scheduler-running-empty"), true);
+        return;
+    }
+
+    body.innerHTML = rows
+        .map((row) => {
+            const item = row || {};
+            const planId = item.plan_id ? String(item.plan_id) : "";
+            return `<tr>
+                <td>${escapeHtml(planId || "—")}</td>
+                <td>${escapeHtml(item.elapsed_sec)}</td>
+                <td>${escapeHtml(item.evictable ? "是" : "否")}</td>
+                <td>${escapeHtml(item.workspace || "—")}</td>
+                <td class="scheduler-row-actions">${schedulerActionButtons(planId, ["pause"])}</td>
+            </tr>`;
+        })
+        .join("");
+
+    schedulerToggle($("#scheduler-running-table"), true);
+    schedulerToggle($("#scheduler-running-empty"), false);
+}
+
+/** The phase a plan is in: the routing phase when the listing carries
+    one, and the listing's own bucket otherwise. */
+function schedulerPlanPhase(plan) {
+    if (!plan) return "";
+    return String(plan.current_phase || plan.status || "");
+}
+
+/** The plans an operator can act on, with the actions their phase
+    allows.  The order is the listing's own — the panel does not sort
+    the plans either. */
+function renderSchedulerPlans(plans) {
+    const rows = Array.isArray(plans) ? plans : [];
+    const body = $("#scheduler-plans-list");
+    if (!body) return;
+
+    const actionable = rows.filter((plan) => {
+        const phase = schedulerPlanPhase(plan);
+        return (SCHEDULER_ACTIONS_BY_PHASE[phase] || []).length > 0;
+    });
+
+    if (!actionable.length) {
+        body.innerHTML = "";
+        schedulerToggle($("#scheduler-plans-table"), false);
+        schedulerToggle($("#scheduler-plans-empty"), true);
+        return;
+    }
+
+    body.innerHTML = actionable
+        .map((plan) => {
+            const planId = plan && plan.id ? String(plan.id) : "";
+            const phase = schedulerPlanPhase(plan);
+            const actions = SCHEDULER_ACTIONS_BY_PHASE[phase] || [];
+            return `<tr>
+                <td>${escapeHtml(planId)}</td>
+                <td>${escapeHtml(phase || "—")}</td>
+                <td class="scheduler-row-actions">${schedulerActionButtons(planId, actions)}</td>
+            </tr>`;
+        })
+        .join("");
+
+    schedulerToggle($("#scheduler-plans-table"), true);
+    schedulerToggle($("#scheduler-plans-empty"), false);
+}
+
+/** Render the scheduler's read model.  The panel draws what it is
+    given: the order of the queue, the numbers of the capacity and the
+    words on the reasons are all the server's. */
+function renderScheduler(snapshot) {
+    const data = snapshot && typeof snapshot === "object" ? snapshot : {};
+    renderSchedulerCapacity(data);
+    renderSchedulerQueue(data);
+    renderSchedulerRunning(data);
+}
+
+/** Read the read model.  A scheduler that is not running answers an
+    empty document, so there is nothing to catch here but a transport
+    failure — and that one is shown rather than thrown away. */
+async function loadSchedulerState() {
+    try {
+        const snapshot = await api("/scheduler/state");
+        renderScheduler(snapshot);
+        return snapshot;
+    } catch (err) {
+        renderSchedulerError(err);
+        return null;
+    }
+}
+
+/** Read the plans the operator can act on.  The terminal plans are
+    included on purpose: a stopped plan is the one that can be
+    resumed. */
+async function loadSchedulerPlans() {
+    try {
+        const data = await api("/plans?include_terminal=true");
+        const plans = Array.isArray(data) ? data : (data.plans || []);
+        renderSchedulerPlans(plans);
+        return plans;
+    } catch {
+        renderSchedulerPlans([]);
+        return [];
+    }
+}
+
+/** What a command did, in the command's own words. */
+function renderSchedulerOutcome(result) {
+    const outcome = result && result.outcome ? String(result.outcome) : "";
+    const detail = result && result.detail !== undefined && result.detail !== null
+        ? schedulerDetailText(result.detail)
+        : "";
+    schedulerSetText("#scheduler-action-outcome", outcome);
+    schedulerSetText("#scheduler-action-detail", detail);
+    const box = $("#scheduler-action-result");
+    if (box) box.classList.remove("error");
+    schedulerToggle($("#scheduler-action-result"), true);
+}
+
+function schedulerDetailText(detail) {
+    if (typeof detail === "object") {
+        try {
+            return JSON.stringify(detail);
+        } catch {
+            return "";
+        }
+    }
+    return String(detail);
+}
+
+function renderSchedulerError(err) {
+    const message = err && err.message ? String(err.message) : "调度请求失败";
+    schedulerSetText("#scheduler-action-outcome", "");
+    schedulerSetText("#scheduler-action-detail", message);
+    const box = $("#scheduler-action-result");
+    if (box) box.classList.add("error");
+    schedulerToggle($("#scheduler-action-result"), true);
+}
+
+/** An action has been carried out: show what it did and read the read
+    model again, so the panel shows the state the command produced. */
+async function schedulerActionDone(result) {
+    renderSchedulerOutcome(result);
+    await loadSchedulerState();
+    await loadSchedulerPlans();
+}
+
+/** The four actions.  Each one is a command, and each one goes through
+    api() — which is what carries the request guard's X-PDT-Request
+    header. */
+async function schedulerPromote(planId) {
+    try {
+        const result = await api(`/plan/${encodeURIComponent(planId)}/scheduler/promote`, { method: "POST" });
+        await schedulerActionDone(result);
+        return result;
+    } catch (err) {
+        renderSchedulerError(err);
+        throw err;
+    }
+}
+
+async function schedulerPause(planId) {
+    try {
+        const result = await api(`/plan/${encodeURIComponent(planId)}/scheduler/pause`, { method: "POST" });
+        await schedulerActionDone(result);
+        return result;
+    } catch (err) {
+        renderSchedulerError(err);
+        throw err;
+    }
+}
+
+async function schedulerResume(planId) {
+    try {
+        const result = await api(`/plan/${encodeURIComponent(planId)}/scheduler/resume`, { method: "POST" });
+        await schedulerActionDone(result);
+        return result;
+    } catch (err) {
+        renderSchedulerError(err);
+        throw err;
+    }
+}
+
+async function schedulerStart(planId) {
+    try {
+        const result = await api(`/plan/${encodeURIComponent(planId)}/scheduler/start`, { method: "POST" });
+        await schedulerActionDone(result);
+        return result;
+    } catch (err) {
+        renderSchedulerError(err);
+        throw err;
+    }
+}
+
+/** Carry out the action a button asks for. */
+async function schedulerRunAction(action, planId) {
+    try {
+        if (action === "promote") {
+            await schedulerPromote(planId);
+        } else if (action === "pause") {
+            await schedulerPause(planId);
+        } else if (action === "resume") {
+            await schedulerResume(planId);
+        } else if (action === "start") {
+            await schedulerStart(planId);
+        }
+    } catch {
+        // The failure is already on screen in the action-result box.
+    }
+}
+
+/** One listener for every action button: the buttons are drawn by the
+    renderers, so they are bound by delegation rather than one by one. */
+function bindSchedulerActions() {
+    const root = $("#scheduler-view");
+    if (!root) return;
+    root.addEventListener("click", (event) => {
+        const target = event.target;
+        const button = target && target.closest ? target.closest(".scheduler-action") : null;
+        if (!button) return;
+        event.preventDefault();
+        schedulerRunAction(button.dataset.action, button.dataset.plan);
+    });
+}
+
 // --- Event Bindings ---
 
 function goHome() {
@@ -1944,6 +2331,7 @@ function goHome() {
     setStep("interview");
     show("plans-view");
     loadPlans();
+    loadSchedulerState();
     updateSidebarActiveItem(null);
 }
 
@@ -2202,10 +2590,24 @@ function init() {
     });
     $("#btn-to-home").addEventListener("click", goHome);
 
+    // Scheduler view
+    safeBind("#btn-open-scheduler", "click", () => {
+        show("scheduler-view");
+        loadSchedulerState();
+        loadSchedulerPlans();
+    });
+    safeBind("#btn-refresh-scheduler", "click", () => {
+        loadSchedulerState();
+        loadSchedulerPlans();
+    });
+    safeBind("#btn-scheduler-back-home", "click", goHome);
+    bindSchedulerActions();
+
     // Initial load
     renderSteps(false, false);
     loadPlans();
     loadSidebar();
+    loadSchedulerState();
 }
 
 document.addEventListener("DOMContentLoaded", init);

@@ -1,45 +1,9 @@
-# Provider Routing Configuration (2026-10-28: five tiers + model/effort pins)
+# Provider Routing Configuration (2026-09-13, ordering revised 2026-09-14)
 # =============================================================================
-# Scene → tier → regex patterns over CC Switch provider DISPLAY names.
-#
-# A tier entry is EITHER a bare regex string (membership only) OR a
-# MAPPING that pins settings for the providers its pattern matches:
-#
-#   - pattern: '^Example Strong$'      # regex over the CC Switch display name
-#     model:   'example-model-premium'  # optional: pin the model
-#     effort:  'high'                   # optional: pin the reasoning effort
-#
-# The two spellings are the SAME contract: they may be MIXED inside one
-# tier, they mean exactly the same thing, and a bare string simply pins
-# nothing.
-#
-# The pins are OPTIONAL and PER-FIELD. A field the entry does not carry
-# is left ALONE: the provider row's own ``ANTHROPIC_*`` env block is
-# forwarded VERBATIM to the sub-agent subprocess — byte for byte, exactly
-# as CC Switch configured it. Pinning ``effort`` alone does not touch the
-# model, and pinning ``model`` alone does not touch the effort.
-#
-# WHERE A PINNED EFFORT LANDS — BOTH PLACES, NEVER ONE:
-#
-#   A pinned ``effort`` reaches the CLI through TWO landing points, and
-#   BOTH of them are written on every dispatch:
-#
-#     1. the sub-agent subprocess env variable ``CLAUDE_CODE_EFFORT_LEVEL``
-#     2. the per-call settings payload — the top-level ``effortLevel``
-#        key of the settings file the CLI is handed through ``--settings``
-#
-#   Writing only one of them is not enough: the other channel would
-#   overwrite it with the machine's own value. The effort is deliberately
-#   NOT written into the settings file's ``env`` block — that block is
-#   the ``ANTHROPIC_*`` endpoint/credential channel, and the effort has a
-#   key of its own.
-#
-#   A pinned ``model`` is a different shape: it fills ALL FOUR model
-#   variables of the subprocess env — ``ANTHROPIC_MODEL``,
-#   ``ANTHROPIC_DEFAULT_SONNET_MODEL``,
-#   ``ANTHROPIC_DEFAULT_HAIKU_MODEL`` and
-#   ``ANTHROPIC_DEFAULT_OPUS_MODEL`` — so the CLI cannot end up with two
-#   different answers about which model the call runs on.
+# Scene → tier → regex patterns over CC Switch provider DISPLAY names. The backend
+# manages PROVIDERS only — model selection is delegated entirely to CC
+# Switch (each provider row carries its own ANTHROPIC_* env block,
+# forwarded verbatim to the sub-agent subprocess).
 #
 # Matching semantics:
 #   * Patterns are Python regexes matched with re.search() against the
@@ -78,79 +42,53 @@ version: 1
 default_tier: medium
 
 tiers:
-  # Put the CC Switch DISPLAY NAMES of your providers into the tiers.
+  # Put the CC Switch DISPLAY NAMES of your providers into the three tiers.
   # Patterns are Python regexes matched with re.search() against the name
   # CC Switch shows, so "^Example Strong" is a prefix match and
   # "^Example Strong$" is exact.
   #
-  # Five tiers, weakest to strongest: low → medium → high → ultra → max.
-  # The two entry spellings below are EXAMPLES of the two legal shapes,
-  # NOT a per-tier choice. A bare regex string means membership only (the
-  # CC Switch row's own model is used verbatim); the
-  # {pattern, model, effort} mapping pins a model and a reasoning effort
-  # per entry. The two spellings may be MIXED inside one tier and mean
-  # exactly the same thing, so a real config may well carry both of them
-  # in a single tier.
-  #
   # Replace the examples below with your own provider names.
-  max:
-    - '^Example Strong'
-  ultra:
-    - pattern: '^Example Strong$'
-      model: 'example-model-premium'
-      effort: 'max'
   high:
-    - pattern: '^Example Strong$'
-      model: 'example-model-premium'
-      effort: 'high'
+    - "^Example Strong"
   medium:
-    - pattern: '^Example Balanced'
-      model: 'example-model-standard'
-      effort: 'medium'
+    - "^Example Balanced"
   low:
-    - pattern: '^Example Cheap'
-      model: 'example-model-standard'
-      effort: 'low'
+    - "^Example Cheap"
 
 scenes:
-  # --- Document / planning phases: max tier ---
-  interview: max
-  prd: max
-  prd_refine: max
-  arch: max
-  arch_refine: max
-  test_design: max
-  test_refine: max
-  tasks_generation: max
-  planning: max
-  # --- Verification / refinement: ultra tier ---
-  # 验收本身（2026-10-28 提到 ultra 档）：结论要可信，推理不能省。
-  verification: ultra
+  # --- Document / planning phases: strongest tier ---
+  interview: high
+  prd: high
+  prd_refine: high
+  arch: high
+  arch_refine: high
+  test_design: high
+  test_refine: high
+  tasks_generation: high
+  planning: high
+  # Refiner (post-failure replanning) must be stronger than execution.
+  refiner: high
+  breakdown: high
+  # Verification failure → repair-task generation: strong tier.
+  repair_generation: high
   # 验收命令的**语义**审计（2026-09-15）。
   #
   # 静态护栏只能认出"形态"（有没有界定范围、点名的测试是否存在）；像
   # VP-020 那种自定义脚本"exit 0 但采样 0 个 fixture"、VP-017 那种
   # "grep 一个不存在的目录再 `|| echo CLEAN`"，只能靠读懂命令的语义来判。
-  # 这个判断的要求高，所以走 ultra 档。
-  verification_command_audit: ultra
+  # 这个判断的要求高，所以走 high 档。
+  verification_command_audit: high
+  # --- Execution: medium (cost control) ---
+  execution: medium
+  repair_execution: medium
+  verification: medium
+  # 服务新鲜度预检的进程重启发现（2026-09-16）。走 medium 档：
+  # 这是 discovery + kill/relaunch，不需要 high 档推理；且每轮只跑一次。
+  service_restart: medium
   # 每轮开始前的验证计划增量评估（2026-09-16）：判断 VP 要不要增减。
   # 是覆盖度判断（依据是否成立、有没有重复覆盖），不是高难语义推理，
   # 口径同"至少都用 medium"。
-  verification_plan_delta: ultra
-  # Refiner (post-failure replanning) must be stronger than execution.
-  refiner: ultra
-  # Verification failure → repair-task generation（2026-10-28 提到 ultra 档）：
-  # 它写出来的任务决定下一轮往哪修，和验收本身一样不能省推理。
-  repair_generation: ultra
-  # --- Second-pass audit: high tier ---
-  # 第二遍独立审计（2026-10-28 提到 high 档）：它的结论能否决交付，
-  # 不能像辅助调用那样按低成本档处理。
-  audit_second_pass: high
-  # --- Execution: medium tier (cost control) ---
-  execution: medium
-  repair_execution: medium
-  # 服务新鲜度预检的进程重启发现（2026-09-16）。走 medium 档：
-  # 这是 discovery + kill/relaunch，不需要高难推理；且每轮只跑一次。
-  service_restart: medium
+  verification_plan_delta: medium
   # --- Low-stakes auxiliary calls ---
+  audit_second_pass: low
   summarizer: low

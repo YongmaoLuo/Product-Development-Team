@@ -14,11 +14,18 @@ contracts are pinned by the tests below:
         - isolation_level = None  (autocommit-style control)
      The PRAGMAs are visible on the returned Connection immediately.
 
-  2. ``migrate(conn)`` creates five tables in this exact order:
+  2. ``migrate(conn)`` creates these tables (the count in the list
+     below is what the schema holds today, not the count the file was
+     written with):
         plan_routing
         plan_execution
         plan_verification
         plan_artifacts
+        plan_tasks
+        plan_decisions
+        scheduler_queue
+        scheduler_slot
+        scheduler_command
         schema_version
      Idempotent: calling ``migrate`` twice does not raise and does not
      duplicate the tables.
@@ -199,8 +206,14 @@ def test_migrate_creates_five_tables_and_version(tmp_path: Path) -> None:
 
     Schema v7 (2026-10-21) adds a sixth: ``plan_decisions``, the
     human-in-the-loop decision store (see
-    ``state_machine/db/schema.py``'s ``_ensure_plan_decisions``).  The
-    test's name keeps the count it was written with, the way the
+    ``state_machine/db/schema.py``'s ``_ensure_plan_decisions``).
+
+    Schema v7 (2026-10-28) adds three more: ``scheduler_queue``,
+    ``scheduler_slot`` and ``scheduler_command`` — the native
+    scheduler's own three facts (see the same schema module's
+    ``_SCHEDULER_OBJECTS``).
+
+    The test's name keeps the count it was written with, the way the
     backend's copy of the same gate keeps its own name: the anchor
     should keep pointing at the same gate.
     """
@@ -219,6 +232,9 @@ def test_migrate_creates_five_tables_and_version(tmp_path: Path) -> None:
             "plan_routing",
             "plan_tasks",
             "plan_verification",
+            "scheduler_command",
+            "scheduler_queue",
+            "scheduler_slot",
             "schema_version",
         ]
     finally:

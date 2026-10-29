@@ -56,26 +56,6 @@ def _delete_plan_rows(plan_id: str) -> None:
 
 client = TestClient(app)
 
-
-def _stub_auto_loop(monkeypatch) -> None:
-    """Keep the auto-verification round out of an endpoint-contract test.
-
-    ``FakeThread`` runs the round's target INLINE, so ``/start`` only
-    answers after the whole round finished.  In production the round
-    runs in a background thread and the endpoint answers immediately.
-    Without this stub the endpoint's wall-clock cost became the round's
-    cost: with ``max_rounds=1000`` the loop retried a failed
-    repair-generation 1000 times — ~50 s inside one request — which is
-    what turned this file into a timeout under ``-n 8``.
-
-    What these tests are about is the ENDPOINT's contract: the status
-    code, the response schema, and which ``max_rounds`` values are
-    accepted.  Every one of those is decided BEFORE the round starts,
-    so the round is stubbed and the assertions stay exactly as they
-    are.  The round itself has its own tests.
-    """
-    monkeypatch.setattr("server._run_auto_verification_loop", MagicMock())
-
 # ---------------------------------------------------------------------------
 # JSON Schema definitions
 # ---------------------------------------------------------------------------
@@ -296,13 +276,58 @@ class TestResponseStructure:
     def test_start_response_schema(self, sample_plan_factory, monkeypatch):
         """POST /start response matches START_RESPONSE_SCHEMA."""
         self._setup_executing_plan(sample_plan_factory)
-        _patch_verification_worker_thread(monkeypatch, FakeThread)
+        monkeypatch.setattr("server.threading.Thread", FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
-        _stub_auto_loop(monkeypatch)
 
         resp = client.post("/api/verification/test-plan/start")
         assert resp.status_code == 200
         validate(instance=resp.json(), schema=START_RESPONSE_SCHEMA)
+
+    def test_start_inlines_only_the_verification_loop_thread(
+        self, sample_plan_factory, monkeypatch
+    ):
+        """The thread double runs the verification loop inline — and only it.
+
+        A background daemon thread's semantics are "run concurrently".
+        Executing such a body synchronously on the calling thread
+        deadlocks whenever the body waits for an event that only a later
+        step of the *caller* can set — and the lease heartbeats are
+        exactly that case: ``_beat`` waits on ``self._stop``, and
+        ``_stop`` is only set by ``lease.release()``, which the caller
+        cannot reach until ``start_heartbeat()`` returns, i.e. until the
+        inlined heartbeat returns. Inlining it hung ``POST /start``
+        forever.
+
+        So the double runs the verification loop inline (these tests
+        need the loop to have progressed before the response is
+        asserted) and turns every other thread into a no-op. This test
+        pins that contract in both directions: the loop really ran
+        inline (exactly once) and no lease heartbeat was inlined. It
+        fails if the double is ever widened back to "inline everything",
+        and it fails if the double is ever narrowed to "inline nothing".
+        """
+        self._setup_executing_plan(sample_plan_factory)
+        FakeThread.reset()
+        monkeypatch.setattr("server.threading.Thread", FakeThread)
+        monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
+
+        resp = client.post("/api/verification/test-plan/start")
+        assert resp.status_code == 200
+
+        inlined = list(FakeThread.inlined_names)
+        # (a) the verification loop ran inline — exactly once.
+        assert [n for n in inlined if n.startswith("verification-loop-")] == [
+            "verification-loop-test-plan"
+        ]
+        # (b) no lease heartbeat was inlined.
+        assert not [n for n in inlined if n.startswith("verification-workflow-lease-")]
+        assert not [n for n in inlined if n.startswith("verification-round-lease-")]
+        # The heartbeat the deadlock came from was reached and skipped,
+        # not avoided: the double saw the thread and chose not to run it.
+        assert any(
+            n.startswith("verification-workflow-lease-")
+            for n in FakeThread.created_names
+        ), FakeThread.created_names
 
     def test_status_response_schema(self, sample_plan_factory):
         """GET /status response matches VERIFICATION_STATUS_SCHEMA."""
@@ -400,9 +425,8 @@ class TestStatusCodes:
         (plan_dir / "execution.json").write_text(
             json.dumps({"project_dir": str(project_dir)}), encoding="utf-8"
         )
-        _patch_verification_worker_thread(monkeypatch, FakeThread)
+        monkeypatch.setattr("server.threading.Thread", FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
-        _stub_auto_loop(monkeypatch)
 
         resp = client.post("/api/verification/test-plan/start")
         assert resp.status_code == 200
@@ -680,7 +704,7 @@ class TestBoundaryValues:
     def test_boundary_max_rounds_less_than_one(self, sample_plan_factory, monkeypatch):
         """max_rounds < 1 returns 400."""
         self._setup_start_ready_plan(sample_plan_factory)
-        _patch_verification_worker_thread(monkeypatch, FakeThread)
+        monkeypatch.setattr("server.threading.Thread", FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
 
         resp = client.post("/api/verification/boundary-plan/start", json={"max_rounds": 0})
@@ -694,7 +718,7 @@ class TestBoundaryValues:
     def test_boundary_max_rounds_greater_than_one_thousand(self, sample_plan_factory, monkeypatch):
         """max_rounds > 1000 returns 400."""
         self._setup_start_ready_plan(sample_plan_factory)
-        _patch_verification_worker_thread(monkeypatch, FakeThread)
+        monkeypatch.setattr("server.threading.Thread", FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
 
         resp = client.post("/api/verification/boundary-plan/start", json={"max_rounds": 1001})
@@ -708,9 +732,8 @@ class TestBoundaryValues:
     def test_boundary_max_rounds_at_limits(self, sample_plan_factory, monkeypatch):
         """max_rounds at boundaries 1 and 1000 returns 200."""
         self._setup_start_ready_plan(sample_plan_factory)
-        _patch_verification_worker_thread(monkeypatch, FakeThread)
+        monkeypatch.setattr("server.threading.Thread", FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
-        _stub_auto_loop(monkeypatch)
 
         resp = client.post("/api/verification/boundary-plan/start", json={"max_rounds": 1})
         assert resp.status_code == 200
@@ -786,63 +809,67 @@ class SlowDict(dict):
         return super().get(key, default)
 
 
-#: The real ``threading.Thread`` class, captured at import time.
-#:
-#: ``monkeypatch.setattr("server.threading.Thread", FakeThread)`` replaces
-#: the attribute on the *shared* ``threading`` module, so EVERY module in
-#: the process sees the fake — not just the one that starts the
-#: verification round.  A helper thread spawned from inside that round
-#: (the verification workflow lease's heartbeat, for one) was therefore
-#: faked too, and a helper that loops until it is told to stop ran its
-#: loop INLINE on the request thread — forever, so ``/start`` never
-#: returned.
-#:
-#: The fake now only swallows the thread it was installed for: a thread
-#: constructed *while a fake thread's target is running* is a HELPER, and
-#: helpers get the real class, so they run concurrently and can be
-#: stopped and joined.
-_REAL_THREAD = threading.Thread
-
-
 class FakeThread:
-    """Thread replacement that immediately executes target on start()."""
+    """Thread replacement that runs ONLY the verification loop inline.
 
-    #: How many fake threads are currently running their target inline.
-    _inline_depth = 0
+    A background daemon thread's semantics are "run concurrently".
+    Executing such a body synchronously on the calling thread
+    deadlocks whenever the body waits for an event that only a later
+    step of the *caller* can set — and the lease heartbeats are exactly
+    that case: ``_beat`` waits on ``self._stop``, and ``_stop`` is
+    only set by ``lease.release()``, which the caller cannot reach
+    until ``start_heartbeat()`` has returned, i.e. until the inlined
+    heartbeat has returned. Inlining the heartbeat made
+    ``POST /api/verification/{id}/start`` hang forever.
+
+    So this double runs the verification loop thread inline (these
+    tests need the loop to have progressed before the response is
+    asserted) and turns every other thread into a no-op — the "it ran
+    and finished" stand-in for a background worker.
+
+    ``created_names`` / ``inlined_names`` record what the double saw,
+    so a test can assert that the loop really ran inline and that no
+    lease heartbeat was inlined (see
+    ``test_start_inlines_only_the_verification_loop_thread``).
+    """
+
+    #: Name prefix of the one thread this double runs inline — the
+    #: verification loop thread created in ``backend/routes/verification.py``.
+    INLINE_NAME_PREFIX = "verification-loop-"
+
+    #: Names of every thread this double was asked to start.
+    created_names: list = []
+
+    #: Names of the threads this double actually ran inline.
+    inlined_names: list = []
+
+    @classmethod
+    def reset(cls) -> None:
+        """Forget the threads seen so far (call at the start of a test)."""
+        cls.created_names = []
+        cls.inlined_names = []
 
     def __init__(self, target=None, daemon=None, *args, **kwargs):
         self._target = target
-        # Mirror ``threading.Thread``: ``args=`` / ``kwargs=`` are passed
-        # as keywords and must be forwarded to the target on start().
+        # Mirror ``threading.Thread``: ``name=`` / ``args=`` / ``kwargs=``
+        # are passed as keywords and must be honoured.
+        self._name = kwargs.pop("name", None) or ""
         self._target_args = kwargs.pop("args", ())
         self._target_kwargs = kwargs.pop("kwargs", {})
-        # A thread born while a fake thread's target runs is a helper,
-        # not the thread under test: hand it the real class so it can
-        # run concurrently — and so a "loop until told to stop" helper
-        # does not deadlock the request thread that started it.
-        self._real = None
-        if FakeThread._inline_depth and self._target is not None:
-            self._real = _REAL_THREAD(
-                target=self._target,
-                args=self._target_args,
-                kwargs=self._target_kwargs,
-                daemon=daemon,
-            )
 
     def start(self):
-        if self._real is not None:
-            self._real.start()
+        FakeThread.created_names.append(self._name)
+        if not self._name.startswith(FakeThread.INLINE_NAME_PREFIX):
+            # Not the verification loop: a background worker this double
+            # does not run. Returning immediately stands in for "it ran
+            # and finished".
             return
+        FakeThread.inlined_names.append(self._name)
         if self._target:
-            FakeThread._inline_depth += 1
-            try:
-                self._target(*self._target_args, **self._target_kwargs)
-            finally:
-                FakeThread._inline_depth -= 1
+            self._target(*self._target_args, **self._target_kwargs)
 
     def join(self, timeout=None):
-        if self._real is not None:
-            self._real.join(timeout)
+        pass
 
 
 class NoOpFakeThread:
@@ -860,66 +887,6 @@ class NoOpFakeThread:
 
     def join(self, timeout=None):
         pass
-
-
-class _ThreadingShim:
-    """A ``threading`` stand-in whose ``Thread`` is a test double.
-
-    Same shape as the shim in
-    ``tests/api/test_start_execution_project_dir_guard.py``: the route
-    module gets its own ``threading`` namespace so only **its** worker
-    is replaced.  Everything that is not ``Thread`` is forwarded to the
-    real module, so the patched module keeps working normally if it
-    ever needs another attribute.
-    """
-
-    def __init__(self, thread_cls):
-        self.Thread = thread_cls
-
-    def __getattr__(self, name):
-        return getattr(threading, name)
-
-
-def _patch_verification_worker_thread(monkeypatch, thread_cls) -> None:
-    """Swap the **verification worker** thread for ``thread_cls``.
-
-    ``server.threading`` IS the global ``threading`` module, so
-    ``monkeypatch.setattr("server.threading.Thread", ...)`` replaced the
-    thread class for the **whole process**: every thread created while
-    the patch was live became a test double — including the lease
-    heartbeat threads ``verification_loop.py`` starts (commit 94c14a9).
-
-    ``FakeThread`` runs its target *synchronously*, so the heartbeat's
-    ``while not self._stop.wait(interval)`` loop ran inside the request
-    thread and never returned: ``POST /api/verification/{id}/start``
-    never produced a response and the test hung until pytest-timeout
-    killed it.
-
-    The double is scoped to ``routes.verification`` — the module that
-    creates the verification worker — so the worker still runs
-    synchronously (that is what these tests are about) while the
-    heartbeat keeps using the real ``threading.Thread``.
-    """
-    monkeypatch.setattr(
-        "routes.verification.threading", _ThreadingShim(thread_cls)
-    )
-
-
-def test_worker_thread_double_does_not_replace_global_threading(monkeypatch):
-    """The verification worker double must stay scoped to the route module.
-
-    ``threading.Thread`` is process-global: replacing it made the lease
-    heartbeat threads test doubles too, and ``FakeThread`` runs its
-    target synchronously — so the heartbeat's infinite loop ran inside
-    the request thread and ``POST /start`` never answered.
-    """
-    import routes.verification as routes_verification
-
-    real_thread = threading.Thread
-    _patch_verification_worker_thread(monkeypatch, FakeThread)
-
-    assert threading.Thread is real_thread
-    assert routes_verification.threading.Thread is FakeThread
 
 
 @pytest.mark.integration

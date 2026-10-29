@@ -1463,3 +1463,127 @@ main#app > .loading {
     font-size: 12px;
     color: var(--text-dim);
 }
+
+/* ─── Scheduler (调度) ─── */
+
+/* The capacity widget: used / total, and the queue length. It appears
+   on the home page and at the top of the scheduler view, and both read
+   the same snapshot — so the two cannot disagree. */
+.scheduler-capacity {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 13px;
+}
+
+.scheduler-capacity-label { color: var(--text-dim); }
+
+.scheduler-capacity-value {
+    color: var(--text);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.scheduler-capacity-divider { color: var(--text-dim); }
+
+.scheduler-capacity-flag {
+    padding: 2px 8px;
+    border-radius: var(--radius-sm);
+    background: var(--warning-bg);
+    color: var(--warning);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.scheduler-capacity-stamp {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+/* The scheduler view's tables. */
+.scheduler-subtitle {
+    margin: 20px 0 8px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-dim);
+}
+
+.scheduler-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    font-size: 13px;
+}
+
+.scheduler-table th,
+.scheduler-table td {
+    padding: 8px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+}
+
+.scheduler-table th {
+    color: var(--text-dim);
+    font-weight: 600;
+    font-size: 12px;
+}
+
+.scheduler-table tbody tr:last-child td { border-bottom: none; }
+
+.scheduler-row-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.scheduler-action {
+    padding: 4px 10px;
+    font-size: 12px;
+}
+
+.scheduler-action-none { color: var(--text-dim); }
+
+/* What the last command did, in the command's own words. */
+.scheduler-action-result {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    margin-bottom: 16px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 13px;
+}
+
+.scheduler-action-outcome {
+    font-weight: 600;
+    color: var(--info);
+}
+
+.scheduler-action-detail { color: var(--text-dim); }
+
+.scheduler-action-result.error .scheduler-action-outcome { color: var(--danger); }
+.scheduler-action-result.error .scheduler-action-detail { color: var(--danger); }
+
+/* The scheduler's nav button in the sidebar. */
+.btn-nav {
+    padding: 6px 12px;
+    font-size: 13px;
+}
+
+.view-header-actions {
+    display: flex;
+    gap: 8px;
+}

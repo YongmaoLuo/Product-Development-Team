@@ -1604,8 +1604,17 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
 
     # Usage-registry attribution: the verification worker makes LLM
     # calls (VP audits, repair generation) — bind plan_id for its thread.
+    # The thread is named so the thread can be told apart in a log and
+    # in a thread dump — and so a test double that runs threads inline
+    # can tell THIS thread (the verification loop) apart from the
+    # background workers the loop itself starts (the lease heartbeats):
+    # running a heartbeat inline deadlocks, because its body waits for
+    # an event only the caller can set.
     verification_thread = threading.Thread(
-        target=_server._run_in_plan_ctx, args=(plan_id, _run), daemon=True
+        target=_server._run_in_plan_ctx,
+        args=(plan_id, _run),
+        name=f"verification-loop-{plan_id}",
+        daemon=True,
     )
     verification_thread.start()
     _server._verification_state[plan_id]["thread"] = verification_thread

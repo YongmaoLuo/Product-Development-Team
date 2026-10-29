@@ -4,7 +4,6 @@ FastAPI Web Server for Spec-Driven Development System
 
 import json
 import logging
-import math
 import os
 import os as _os  # module-level alias: _signal_handler (line ~3549) uses
                   # _os.getpid(); the previous function-local import left
@@ -22,7 +21,18 @@ from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple, Any, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import anyio
 import yaml
@@ -64,7 +74,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-import coding_tool
 from coding_tool import ClaudeCodingTool, create_coding_tool
 from usage_registry import plan_usage_context
 import plan_usage
@@ -100,7 +109,6 @@ from decision_point_adder import (
 from tasks_generator import TasksGenerator, TasksGenerationError
 from preflight_review import PreFlightReviewer
 from verification import VerificationOrchestrator
-import execution_logger
 from execution_logger import ExecutionLogger
 from utils.atomic_io import atomic_write_json
 from utils.process import _signallable_pgid, kill_process_group
@@ -117,7 +125,6 @@ from config_paths import (
     PROJECT_ROOT,
     STATE_DB,
     STATE_DB_ENV,
-    resolve_plans_dir,
     resolve_server_host,
     resolve_state_db_path,
 )
@@ -184,6 +191,29 @@ except Exception:  # noqa: BLE001
     _new_owner_token = None
     _register_owner = None
     _release_owner = None
+
+# ---------------------------------------------------------------------------
+# shutdown_checkpoint (the shutdown checkpoint writer) — resolved once, at
+# import time
+# ---------------------------------------------------------------------------
+# Same reasoning as the service_manager imports above: the shutdown path
+# runs from an ``atexit`` hook, after the interpreter has begun tearing
+# down — under pytest, after the ``pythonpath`` plugin has removed the
+# entries it injected — so an import *there* raises ``ModuleNotFoundError``,
+# and reporting that failure hits a logger whose stream is already closed
+# ("I/O operation on closed file").  The only trace was an error block
+# printed after an otherwise green run.
+#
+# The import is here; the *call* is not.  ``_shutdown_all_executions``
+# re-reads ``shutdown_checkpoint.write_shutdown_checkpoints`` at call time
+# (a function-level ``from ... import``), so a writer that has been
+# swapped out is the one that runs.  What this import buys is that the
+# module is already in ``sys.modules`` when the atexit hook fires, so
+# that function-level import can no longer fail.
+try:  # pragma: no cover - the repo always ships shutdown_checkpoint.py
+    import shutdown_checkpoint  # noqa: F401
+except Exception:  # noqa: BLE001 - a missing module must not break startup
+    shutdown_checkpoint = None
 
 # ---------------------------------------------------------------------------
 # secret_sweep (credential-residue reaping) — resolved once, at import time
@@ -1046,6 +1076,319 @@ class HeartbeatMonitor:
 heartbeat_monitor = HeartbeatMonitor(interval=HEARTBEAT_INTERVAL)
 
 
+# ---------------------------------------------------------------------------
+# The scheduler engine
+# ---------------------------------------------------------------------------
+#
+# The PDT-native scheduler is one worker thread: a tick, a mailbox and a
+# configuration snapshot (architecture decision point 1).  It is built
+# here, in the lifespan, because the lifespan is the only place that
+# knows when the process is really up — and because the engine must not
+# tick before the migration and the recovery have finished, or its first
+# tick would decide on a half-recovered world.
+#
+# The handle lives on ``app.state.scheduler_engine``; the read model in
+# ``routes/scheduler.py`` reads it and nothing else.
+
+#: How long the shutdown waits for the scheduler's worker to finish.
+#: The engine's own ``stop()`` waits this long; the join that follows
+#: it is the belt to its braces — a thread that was asked to stop but
+#: is still running would tick into a world that is being taken apart.
+_SCHEDULER_JOIN_TIMEOUT = 30.0
+
+
+class _SchedulerRuntime(NamedTuple):
+    """What the scheduler leaves behind on the app.
+
+    Attributes:
+        engine: the worker, or ``None`` when the scheduler is off.
+        conn: the database connection the worker was built on.  It is
+            given back once the worker has been stopped.
+        owned: whether *this* call started the worker.  A lifespan that
+            finds a worker already running does not own it, and must
+            neither stop it nor take it off the app.
+    """
+
+    engine: Optional[Any]
+    conn: Optional[sqlite3.Connection]
+    owned: bool
+
+
+def _scheduler_settings_path() -> Path:
+    """The YAML file the scheduler's settings are read from.
+
+    The scheduler reads the ``scheduler:`` section of the backend's own
+    ``config.yaml`` — the file the runtime state is built from too.
+    """
+    return Path(__file__).parent / "config.yaml"
+
+
+def _scheduler_sink(
+    snapshot: Any,
+    lifecycle: Any,
+    facts: Any,
+    store: Any = None,
+    conn: Any = None,
+) -> Any:
+    """The exit the tick's decisions go through.
+
+    A dry run writes the decisions down and touches nothing else.  A
+    live run carries them out through the lifecycle — the one place
+    that is allowed to move a plan's phase.
+
+    The dry run's exit is the **writer**: it leaves the three
+    artifacts the cutover gate is replayed against behind — the tick
+    decisions, the windows and the report.  A dry run that only wrote
+    a decision log would leave the gate with nothing to read, and the
+    gate would exit 2 on every run.
+    """
+    from plan_lifecycle_service import StartPlanSpec
+    from plan_scheduler.dryrun import (
+        DEFAULT_DRYRUN_ROOT,
+        DryRunWriter,
+        ExecuteSink,
+    )
+
+    if snapshot.dry_run:
+        return DryRunWriter(
+            DEFAULT_DRYRUN_ROOT,
+            store=store,
+            conn=conn,
+            reference=_dryrun_reference(),
+            workspace_of=getattr(facts, "workspace_key", None),
+        )
+
+    def _execute(decision: Dict[str, Any]) -> Dict[str, Any]:
+        """Carry one decision out."""
+        action = str(decision.get("action") or "")
+        plan_id = str(decision.get("plan_id") or "")
+        if action == "admit":
+            # A fresh execution has to be given the directory it works
+            # in; the facts reader is the one that knows it.
+            spec = facts.start_spec(plan_id)
+            lifecycle.start_plan(
+                plan_id,
+                StartPlanSpec(project_dir=spec.get("project_dir")),
+            )
+        elif action == "stop":
+            # The plan is over the capacity: it is stopped **and** put
+            # back into the queue, so it keeps its place in the line.
+            lifecycle.stop_plan(plan_id, requeue=True)
+        return decision
+
+    return ExecuteSink(_execute)
+
+
+#: The environment variable that names the comparison side of a dry
+#: run: the old engine's recorded windows.  It is read once, when the
+#: scheduler is built, and it is only read — the file it points at is
+#: evidence, and evidence the comparison writes is not evidence.
+DRYRUN_REFERENCE_ENV = "PDT_DRYRUN_REFERENCE"
+
+
+def _dryrun_reference() -> Any:
+    """The old engine's recorded windows — the comparison side, read only.
+
+    The dry run holds the new engine's side of the comparison.  The
+    other side is what the old engine wrote down while it was running,
+    and it comes from the file ``PDT_DRYRUN_REFERENCE`` names.
+
+    Without it there is no comparison, and every window the dry run
+    records says so — a run that compared nothing may not let the
+    switch happen.  A file that cannot be read is the same thing: the
+    dry run goes on, and the windows stay uncompared rather than
+    pretending otherwise.
+    """
+    from plan_scheduler.dryrun import ReferenceWindows
+
+    raw = (os.environ.get(DRYRUN_REFERENCE_ENV) or "").strip()
+    if not raw:
+        return None
+
+    path = Path(raw).expanduser()
+    try:
+        return ReferenceWindows.from_file(path)
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "[scheduler] the dry run's comparison side (%s) could not be "
+            "read: %s; every window stays uncompared",
+            path,
+            exc,
+        )
+        return None
+
+
+def _release_scheduler_engine(engine: Any, conn: Any) -> None:
+    """Give back what a half-built engine left behind.
+
+    An engine that was constructed but never started has no thread to
+    stop; a connection that was opened has to be closed either way —
+    a descriptor that is never returned is a descriptor that is never
+    given back.
+    """
+    if engine is not None:
+        try:
+            engine.stop()
+        except Exception:  # noqa: BLE001 — the teardown must not raise
+            logger.exception("[scheduler] the engine did not stop cleanly")
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 — the teardown must not raise
+            logger.exception(
+                "[scheduler] the engine's connection could not be closed"
+            )
+
+
+def _build_scheduler_engine() -> _SchedulerRuntime:
+    """Build the scheduler engine, start its worker, and hand it back.
+
+    An engine of ``None`` means the scheduler is not running:
+
+    * ``enabled: false`` — the worker thread is never started at all.  A
+      scheduler that is switched off must leave no thread behind, or
+      "there is exactly one scheduler" would be a claim about a thread
+      that is still running.
+    * the engine could not be built — the failure is logged and
+      everything that was created before it is given back.
+
+    The worker is a daemon thread, so it is never the reason the
+    process stays alive; the shutdown path stops it and joins it.
+    """
+    from plan_lifecycle_service import PlanLifecycleService
+    from plan_scheduler.capacity import CapacityLedger
+    from plan_scheduler.commands import CommandExecutor
+    from plan_scheduler.config import SchedulerConfigLoader
+    from plan_scheduler.engine import PlanSchedulerEngine
+    from plan_scheduler.facts import PlanFactsReader
+    from plan_scheduler.store import SqliteSchedulerStore
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+
+    config_loader = SchedulerConfigLoader(_scheduler_settings_path())
+    snapshot = config_loader.current()
+    if not snapshot.enabled:
+        logger.warning(
+            "[scheduler] disabled by the configuration; the worker thread "
+            "is not started"
+        )
+        return _SchedulerRuntime(None, None, False)
+
+    conn = None
+    engine = None
+    try:
+        conn = open_db(_state_db_path())
+        migrate(conn)
+        store = SqliteSchedulerStore()
+        facts = PlanFactsReader(conn, PLANS_DIR)
+        ledger = CapacityLedger(store, facts, conn=conn)
+        lifecycle = PlanLifecycleService()
+        commands = CommandExecutor(
+            store,
+            ledger,
+            lifecycle,
+            facts=facts,
+            conn=conn,
+            capacity=snapshot.capacity,
+            min_runtime_seconds=snapshot.min_runtime_seconds,
+            # The same loader the engine reads.  The tick and the
+            # explicit start are the two triggers that may interrupt
+            # somebody, and they have to read the same snapshot at the
+            # same moment — otherwise they pick their victim out of two
+            # different candidate sets.
+            config_provider=config_loader,
+        )
+        engine = PlanSchedulerEngine(
+            config_loader,
+            store,
+            facts,
+            ledger,
+            commands,
+            _scheduler_sink(snapshot, lifecycle, facts, store, conn),
+            conn=conn,
+            # The engine reads one file out of the plans tree: the plan's
+            # own artifact, which carries the priority the caller gave
+            # when it asked for the plan.  The queue row is the
+            # scheduler's copy of that number, and the copy is made by
+            # the worker — so the number has to outlive the import, even
+            # when the scheduler was switched off at the time.
+            plans_dir=PLANS_DIR,
+        )
+        engine.start()
+    except Exception:
+        # A scheduler that cannot start must not take the API down with
+        # it: the failure is logged and everything that was created
+        # before it is given back.
+        logger.exception(
+            "[scheduler] the engine could not be built; continuing without it"
+        )
+        _release_scheduler_engine(engine, conn)
+        return _SchedulerRuntime(None, None, False)
+
+    logger.warning(
+        "[scheduler] started: capacity=%d dry_run=%s tick_seconds=%.1fs",
+        snapshot.capacity, snapshot.dry_run, snapshot.tick_seconds,
+    )
+    return _SchedulerRuntime(engine, conn, True)
+
+
+def _start_scheduler(app: Any) -> _SchedulerRuntime:
+    """Start the scheduler engine and hang it on ``app.state``.
+
+    A second call on an app that already carries an engine does **not**
+    start a second worker: two workers are two schedulers, and "at any
+    moment there is exactly one scheduler" is an invariant rather than
+    a preference.
+    """
+    existing = getattr(app.state, "scheduler_engine", None)
+    if existing is not None:
+        logger.warning(
+            "[scheduler] already running; no second worker is started"
+        )
+        return _SchedulerRuntime(existing, None, False)
+
+    try:
+        runtime = _build_scheduler_engine()
+    except Exception:
+        # The builder logs and cleans up after itself; this guard is
+        # for the case where it could not even be called.
+        logger.exception(
+            "[scheduler] the engine could not be started; continuing "
+            "without it"
+        )
+        return _SchedulerRuntime(None, None, False)
+
+    app.state.scheduler_engine = runtime.engine
+    return runtime
+
+
+def _stop_scheduler_engine(runtime: _SchedulerRuntime) -> None:
+    """Stop the worker, join it, and give the connection back.
+
+    The order is the contract: stopping is a request and joining is the
+    guarantee, and only a thread that has finished may be followed by
+    the teardown of what it was using.
+    """
+    engine = runtime.engine
+    if engine is None:
+        return
+    thread = getattr(engine, "thread", None)
+    try:
+        engine.stop(timeout=_SCHEDULER_JOIN_TIMEOUT)
+    except Exception:  # noqa: BLE001 — the teardown must not raise
+        logger.exception("[scheduler] the engine did not stop cleanly")
+    if thread is not None:
+        try:
+            thread.join(_SCHEDULER_JOIN_TIMEOUT)
+        except Exception:  # noqa: BLE001 — the teardown must not raise
+            logger.exception("[scheduler] the engine thread could not be joined")
+    if runtime.conn is not None:
+        try:
+            runtime.conn.close()
+        except Exception:  # noqa: BLE001 — the teardown must not raise
+            logger.exception(
+                "[scheduler] the engine's connection could not be closed"
+            )
 
 
 def _orphan_reaper_may_act() -> bool:
@@ -1181,6 +1524,124 @@ def _start_orphan_reaper() -> Optional[int]:
         return None
 
 
+def _run_boot_sweeps() -> None:
+    """The two boot-time sweeps, as one unit of work.
+
+    Both of them are housekeeping.  They clean up after a *previous*
+    life of the backend — the services a plan declared but never reaped,
+    and the payloads that still hold a live credential — and neither of
+    them is on the readiness path.
+
+    That is the whole reason they live in their own function (and, one
+    level up, on their own thread): the credential sweep shells out to
+    ``ps`` and waits for it, which took 18-21 s on a machine with many
+    processes, and uvicorn binds the socket only after the lifespan
+    returns — every one of those seconds was a second in which the API
+    did not answer.
+
+    The sweeps below are the ones that used to sit inline in the
+    lifespan, unchanged: the log lines, their levels, and the "a failed
+    sweep costs the sweep and nothing else" behaviour are all exactly
+    what they were.
+    """
+    # 2026-09-18 C3: orphan sweep. A verification round that started a
+    # declared service records it in the plan's ``managed_services.json``;
+    # every workflow exit reaps it. A backend that was killed mid-round
+    # never got that far, so the ledger survives on disk and the orphan
+    # keeps holding its port. Booting is the one moment when nothing of
+    # ours can legitimately be running, which makes it the safe place to
+    # clean up after a previous life. Only ledger-recorded, still
+    # identifiable processes are stopped — see ``service_manager``.
+    if _reap_all_plans is None:
+        logger.warning(
+            "[service_manager] unavailable; startup orphan sweep skipped"
+        )
+    else:
+        try:
+            _swept = _reap_all_plans(
+                PLANS_DIR, reason="startup_sweep",
+                caller="server.startup_sweep",
+            )
+            _swept_reaped = [r for r in _swept if r.reaped or not r.clean]
+            if _swept_reaped:
+                logger.warning(
+                    "[service_manager] startup sweep: %s",
+                    [r.to_dict() for r in _swept_reaped],
+                )
+        except Exception:
+            logger.exception(
+                "[service_manager] startup orphan sweep failed; continuing"
+        )
+
+    # 2026-09-28 C4: credential-residue sweep. Same boot-time argument as
+    # the orphan sweep above — nothing of ours can legitimately be running
+    # yet, so any settings payload still holding a live credential belongs
+    # to a previous life that died before its own cleanup. The sweep
+    # refuses files a running process names after ``--settings``, so a
+    # second backend on this machine is not a hazard to it.
+    if _sweep_credential_residue is None:
+        logger.warning(
+            "[secret_sweep] unavailable; startup credential sweep skipped"
+        )
+    else:
+        try:
+            _sweep_findings, _sweep_failed, _sweep_pruned = (
+                _sweep_credential_residue(apply=True)
+            )
+            _sweep_redacted = [f for f in _sweep_findings if f.status == "redacted"]
+            if _sweep_redacted:
+                logger.warning(
+                    "[secret_sweep] startup sweep redacted %d credential-"
+                    "bearing file(s) left by a previous life",
+                    len(_sweep_redacted),
+                )
+            if _sweep_failed:
+                logger.warning(
+                    "[secret_sweep] startup sweep could not redact %d file(s): %s",
+                    _sweep_failed,
+                    [str(f.path) for f in _sweep_findings if f.status == "failed"],
+                )
+            # The other half of keeping the population bounded: every
+            # dispatch mints a directory, and a dispatch that failed
+            # before writing leaves an empty one behind while a dispatch
+            # that succeeded leaves a non-empty one (the payload is
+            # redacted and kept for post-mortem). Neither is reachable by
+            # the other rule, so ``prune_residue`` runs both — the
+            # settle-window empty prune and the 30-day age prune.
+            if _sweep_pruned:
+                logger.warning(
+                    "[secret_sweep] startup sweep removed %d sweep-owned "
+                    "director%s (empty past the settle window, or aged past "
+                    "the retention gate)",
+                    len(_sweep_pruned),
+                    "y" if len(_sweep_pruned) == 1 else "ies",
+                )
+        except Exception:
+            logger.exception(
+                "[secret_sweep] startup credential sweep failed; continuing"
+            )
+
+
+def _start_boot_sweeps() -> threading.Thread:
+    """Start the boot sweeps on a daemon thread and return that thread.
+
+    The thread is a daemon so that a sweep still running at shutdown
+    cannot keep the interpreter alive, and it is named so that a thread
+    dump says what it is.
+
+    The thread is returned so that a caller *can* wait for it: the boot
+    deliberately does not, but a test that entered the lifespan has to
+    leave no sweep running behind it.
+    """
+    thread = threading.Thread(
+        target=_run_boot_sweeps,
+        name="boot-sweeps",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 @asynccontextmanager
 async def _lifespan(app):
     """FastAPI lifespan handler — replaces deprecated @app.on_event decorators.
@@ -1288,94 +1749,32 @@ async def _lifespan(app):
     )
     app.state.runtime_state = runtime_state
 
-    # 2026-09-18 C3: orphan sweep. A verification round that started a
-    # declared service records it in the plan's ``managed_services.json``;
-    # every workflow exit reaps it. A backend that was killed mid-round
-    # never got that far, so the ledger survives on disk and the orphan
-    # keeps holding its port. Booting is the one moment when nothing of
-    # ours can legitimately be running, which makes it the safe place to
-    # clean up after a previous life. Only ledger-recorded, still
-    # identifiable processes are stopped — see ``service_manager``.
-    if _reap_all_plans is None:
-        logger.warning(
-            "[service_manager] unavailable; startup orphan sweep skipped"
-        )
-    else:
-        try:
-            _swept = _reap_all_plans(
-                PLANS_DIR, reason="startup_sweep",
-                caller="server.startup_sweep",
-            )
-            _swept_reaped = [r for r in _swept if r.reaped or not r.clean]
-            if _swept_reaped:
-                logger.warning(
-                    "[service_manager] startup sweep: %s",
-                    [r.to_dict() for r in _swept_reaped],
-                )
-        except Exception:
-            logger.exception(
-                "[service_manager] startup orphan sweep failed; continuing"
-        )
+    # 2026-10-29: the two boot sweeps — the ledger sweep and the
+    # credential-residue sweep — run on their own thread now.
+    #
+    # They are housekeeping: they clean up after a previous life of the
+    # backend, and the next boot finishes whatever this one did not get
+    # to.  Nothing about serving an API depends on them, and the
+    # credential sweep waits on ``ps``, which held the boot for 18-21 s
+    # on a busy machine — uvicorn binds the socket only after the
+    # lifespan returns, so every one of those seconds was a second in
+    # which the API did not answer.
+    _start_boot_sweeps()
 
     # 2026-10-27 (T8): the orphan reaper's own startup pass, and the
     # resident daemon that keeps it running.
     #
-    # The ledger sweep above is the *ledger* layer: it stops the
-    # processes a plan declared and can still identify.  The reaper is
-    # the *bottom* layer underneath it: it reclaims the processes nobody
-    # declared any more.  Neither replaces the other, and the reaper
-    # runs after the ledger sweep so that the processes the ledger knows
-    # about are dealt with by the layer that knows about them.
+    # The sweeps are concurrent now, so the reaper and the ledger sweep
+    # no longer have an order between them.  They do not need one: the
+    # ledger layer stops the processes a plan declared and can still
+    # identify, the reaper is the *bottom* layer underneath it and
+    # reclaims the processes nobody declared any more, and each of them
+    # judges by its own record — the ledger, or the owner marker.  Both
+    # kill by process identity, and a kill is idempotent, so the two
+    # layers running at the same time cannot make either of them kill
+    # the same process twice.
     if _orphan_reaper_may_act():
         _start_orphan_reaper()
-
-    # 2026-09-28 C4: credential-residue sweep. Same boot-time argument as
-    # the orphan sweep above — nothing of ours can legitimately be running
-    # yet, so any settings payload still holding a live credential belongs
-    # to a previous life that died before its own cleanup. The sweep
-    # refuses files a running process names after ``--settings``, so a
-    # second backend on this machine is not a hazard to it.
-    if _sweep_credential_residue is None:
-        logger.warning(
-            "[secret_sweep] unavailable; startup credential sweep skipped"
-        )
-    else:
-        try:
-            _sweep_findings, _sweep_failed, _sweep_pruned = (
-                _sweep_credential_residue(apply=True)
-            )
-            _sweep_redacted = [f for f in _sweep_findings if f.status == "redacted"]
-            if _sweep_redacted:
-                logger.warning(
-                    "[secret_sweep] startup sweep redacted %d credential-"
-                    "bearing file(s) left by a previous life",
-                    len(_sweep_redacted),
-                )
-            if _sweep_failed:
-                logger.warning(
-                    "[secret_sweep] startup sweep could not redact %d file(s): %s",
-                    _sweep_failed,
-                    [str(f.path) for f in _sweep_findings if f.status == "failed"],
-                )
-            # The other half of keeping the population bounded: every
-            # dispatch mints a directory, and a dispatch that failed
-            # before writing leaves an empty one behind while a dispatch
-            # that succeeded leaves a non-empty one (the payload is
-            # redacted and kept for post-mortem). Neither is reachable by
-            # the other rule, so ``prune_residue`` runs both — the
-            # settle-window empty prune and the 30-day age prune.
-            if _sweep_pruned:
-                logger.warning(
-                    "[secret_sweep] startup sweep removed %d sweep-owned "
-                    "director%s (empty past the settle window, or aged past "
-                    "the retention gate)",
-                    len(_sweep_pruned),
-                    "y" if len(_sweep_pruned) == 1 else "ies",
-                )
-        except Exception:
-            logger.exception(
-                "[secret_sweep] startup credential sweep failed; continuing"
-            )
 
     # 2026-09-17 — publish the same tracker to the scene-routing dispatch
     # path. ``AutonomousAgent`` receives it by DI, but ``ClaudeCodingTool``
@@ -1484,6 +1883,19 @@ async def _lifespan(app):
         )
         app.state.feishu_notifier = None
 
+    # 2026-10-28: the PDT-native scheduler (architecture decision
+    # point 1).  The engine is built **here**, after the phase migration
+    # and the recovery of the plans that were running: its first tick
+    # decides on the plan facts, and facts that have not been recovered
+    # yet are facts the scheduler would decide against — a plan that was
+    # running a moment ago and is not in the facts yet is a plan the
+    # scheduler would start a second time.
+    #
+    # It is built last on purpose.  Everything above can abort the
+    # boot, and an engine that was started before the abort would leave
+    # a worker thread behind that nothing would ever stop.
+    scheduler = _start_scheduler(app)
+
     try:
         yield
     finally:
@@ -1504,6 +1916,16 @@ async def _lifespan(app):
             [k for k, v in _execution_state.items()
              if _is_execution_in_flight(v)],
         )
+        # The scheduler stops **before** the executions are killed: a
+        # worker that is still ticking would start a plan into a world
+        # that is being torn down.  Stopping is a request and joining
+        # is the guarantee, so the application state is only taken
+        # apart once the thread has finished.  A lifespan that did not
+        # start the worker does not stop it either — it is not its
+        # worker to stop.
+        if scheduler.owned:
+            _stop_scheduler_engine(scheduler)
+            app.state.scheduler_engine = None
         heartbeat_monitor.stop()
         if feishu_notifier is not None:
             try:
@@ -3155,222 +3577,35 @@ def _resolve_stop_grace_seconds(grace_seconds: Optional[float]) -> float:
     return _STOP_GRACE_DEFAULT_SECONDS
 
 
-def _execution_stop_grace_seconds() -> float:
-    """The grace window the **execution stop path** gets.
-
-    This is the single entry point for that window (arch decision 3 /
-    R3): the server's window has to be *strictly greater* than the
-    executor's stop budget, and the executor derives its budget from the
-    same environment variable — so a window of 1s would hand the executor
-    a 2s budget (``coding_tool.executor_stop_budget`` floors the window
-    at ``MIN_SERVER_STOP_GRACE_SECONDS`` before halving it) to spend
-    inside a 1s window.  The cascade would then overrun the window and
-    the server would SIGKILL the very process group the cooperative stop
-    exists to save — a resumable stop degraded into a full rerun.
-
-    So the window the environment asks for is raised to
-    ``coding_tool.MIN_SERVER_STOP_GRACE_SECONDS`` before it is used.
-
-    Two things this function deliberately does **not** do:
-
-    * it does not change ``_resolve_stop_grace_seconds`` — an explicit
-      ``grace_seconds=0`` still means "do not wait", because that is a
-      caller-level contract ("I know what I want"), not a
-      deployment-level window;
-    * it does not read the environment itself — the resolution stays in
-      one place (``_resolve_stop_grace_seconds``), so the two layers
-      cannot drift apart.
-    """
-    grace = _resolve_stop_grace_seconds(None)
-    # "Do not wait at all" is not a window a cascade can fit into, and a
-    # non-finite one would park the stop path forever.  Both fall back
-    # to the same default the executor falls back to.
-    if not math.isfinite(grace) or grace <= 0:
-        grace = _STOP_GRACE_DEFAULT_SECONDS
-    return max(grace, coding_tool.MIN_SERVER_STOP_GRACE_SECONDS)
-
-
-def _execution_plan_id(proc: object) -> Optional[str]:
-    """The plan id of the execution that owns *proc*, if any.
+def _execution_plan_dir(proc: object) -> Optional[Path]:
+    """The plan directory of the execution that owns *proc*, if any.
 
     The server knows which plan every running execution belongs to —
-    ``_execution_state`` is the map — but the stop path is handed a bare
-    ``Popen``.  Looking the process up here is what lets a stop record
-    land in the right plan's event stream without changing the signature
-    every call site already uses.
+    ``_execution_state`` is the map — but ``_kill_process_tree`` is
+    handed a bare ``Popen``.  Looking the process up here is what lets
+    the kill request land in the right plan's event stream without
+    changing the signature every call site already uses.
     """
     for plan_id, state in list(_execution_state.items()):
         if not isinstance(state, dict):
             continue
-        if state.get("process") is proc:
-            return str(plan_id)
-    return None
-
-
-def _execution_plan_dir(proc: object) -> Optional[Path]:
-    """The plan directory of the execution that owns *proc*, if any."""
-    plan_id = _execution_plan_id(proc)
-    if plan_id is None:
-        return None
-    try:
-        return _plan_dir(plan_id)
-    except Exception:  # noqa: BLE001 - a bad plan id is not a verdict
-        return None
-
-
-#: The two stop events the server writes into a plan's own event stream.
-#:
-#: ``requested`` goes out **before** the signal and ``result`` once the
-#: executor is gone (or had to be hard-killed), so a reader can tell
-#: "asked to stop" from "stopped" — and see which of the two an executor
-#: that died never reached.
-_EXECUTION_STOP_EVENTS: Dict[str, Tuple[str, str]] = {
-    "requested": ("execution_stop_requested", "execution stop requested"),
-    "result": ("execution_stop_result", "execution stop result"),
-}
-
-# The stop events are registered through the log module's own mutation
-# point (``register_event_type``) instead of by poking ``LOG_EVENT_TYPES``
-# from here: the renderer needs a prefix for every event it may print,
-# and that table belongs to the module that owns it.
-execution_logger.register_event_type(
-    "execution_stop_requested", "[EXECUTION_STOP_REQUESTED]",
-)
-execution_logger.register_event_type(
-    "execution_stop_result", "[EXECUTION_STOP_RESULT]",
-)
-
-
-def _written_entry_ts(
-    log_file: Path, event: str, fields: Dict[str, Any]
-) -> Optional[str]:
-    """The ts the logger stamped on the entry it just wrote.
-
-    The logger builds the entry — and stamps its ``ts`` — itself, so the
-    only way to report *that* timestamp is to read it back.  The tail is
-    enough: the entry just written is the last one, or very nearly.  A
-    log that cannot be read back is not a log that was not written, so
-    this returns ``None`` and the caller falls back to the moment it
-    asked for.
-    """
-    try:
-        with open(log_file, "rb") as fp:
-            fp.seek(0, os.SEEK_END)
-            size = fp.tell()
-            fp.seek(max(0, size - 16 * 1024))
-            tail = fp.read().decode("utf-8", "replace")
-    except OSError:
-        return None
-    for line in reversed(tail.splitlines()):
-        line = line.strip()
-        if not line:
+        if state.get("process") is not proc:
             continue
         try:
-            entry = json.loads(line)
-        except ValueError:
-            # A truncated tail (the read started mid-line) — skip it.
-            continue
-        if entry.get("event") != event:
-            continue
-        if entry.get("data") != fields:
-            continue
-        ts = entry.get("ts")
-        return ts if isinstance(ts, str) else None
+            return _plan_dir(str(plan_id))
+        except Exception:  # noqa: BLE001 - a bad plan id is not a verdict
+            return None
     return None
 
 
-def _record_execution_stop(
-    plan_id: str, phase: str, **fields
-) -> Optional[str]:
-    """Write one stop record for *plan_id* into that plan's event stream.
+def _kill_process_tree(
+    proc: subprocess.Popen, grace_seconds: Optional[float] = None
+) -> bool:
+    """Kill an entire process tree by sending SIGTERM to the process group.
 
-    Returns the UTC timestamp of the record that was written, or ``None``
-    when there is no record to report.  **Never raises.**
-
-    A stop matters more than its evidence.  The plan may be gone (no such
-    directory), the log directory may be unwritable, the logger may blow
-    up on construction — none of that may take the shutdown down with it.
-    Every failure is a warning and a ``None``, and the caller carries on
-    stopping.
-
-    ``phase`` is ``"requested"`` or ``"result"``.  Both carry the same
-    data shape (``pid`` / ``hard_killed`` / ``elapsed_s``) so a reader can
-    pair a request with its result without special-casing: at request
-    time nothing has been hard-killed yet and nothing has elapsed yet,
-    and saying so is cheaper than the reader having to know that.
-    """
-    event, message = _EXECUTION_STOP_EVENTS.get(
-        phase, (f"execution_stop_{phase}", f"execution stop {phase}"),
-    )
-    ts = datetime.utcnow().isoformat()
-    try:
-        plan_dir = resolve_plans_dir() / str(plan_id)
-        if not plan_dir.is_dir():
-            # No such plan: there is no event stream to write into, and
-            # creating the directory would invent a plan that is not there.
-            logger.warning(
-                "[server] execution stop %s for plan %s was not recorded: "
-                "no such plan",
-                phase, plan_id,
-            )
-            return None
-        plan_logger = ExecutionLogger(str(plan_id))
-        plan_logger.info(event, message, data=fields)
-    except Exception:  # noqa: BLE001 - evidence must never break a stop
-        logger.warning(
-            "[server] execution stop %s for plan %s could not be recorded",
-            phase, plan_id, exc_info=True,
-        )
-        return None
-    written = _written_entry_ts(plan_dir / "execution.log", event, fields)
-    return written or ts
-
-
-def _write_stop_result(
-    proc: subprocess.Popen, *, hard_killed: bool, elapsed_s: float
-) -> Optional[str]:
-    """Write the plan's stop **result** for *proc*.
-
-    The result answers the question the request could not: did the
-    executor go away on its own, or did it have to be hard-killed, and
-    how long did it take?  ``hard_killed`` is True when the grace window
-    expired — the same verdict ``_kill_process_tree`` reports to its
-    caller, so the event stream and the stop report cannot disagree.
-    """
-    plan_id = _execution_plan_id(proc)
-    if plan_id is None:
-        logger.warning(
-            "[server] execution stop result for pid=%s was not recorded: "
-            "the process belongs to no known plan",
-            getattr(proc, "pid", "<unknown>"),
-        )
-        return None
-    return _record_execution_stop(
-        plan_id,
-        "result",
-        pid=getattr(proc, "pid", None),
-        hard_killed=bool(hard_killed),
-        elapsed_s=float(elapsed_s),
-    )
-
-
-#: The sweep in progress: ``id(proc) -> the deadline it has to be gone
-#: by``.  A sweep asks every execution to stop **first** and only then
-#: reaps them, and this table is what keeps the two halves honest:
-#:
-#: * an execution in here has already been asked to stop — the reap half
-#:   must not send a second SIGTERM, or the plan's kill-event stream
-#:   would carry two "stop requested" records for one stop;
-#: * an execution in here has to be gone by the same deadline — the
-#:   window is one window for the whole batch, not one per execution.
-#:
-#: Only the executions this sweep signalled are in here, so a stop
-#: request from anywhere else keeps its own window.
-_STOP_SWEEP: Dict[int, float] = {}
-
-
-def _send_stop_signal(proc: subprocess.Popen) -> bool:
-    """Ask the process tree of *proc* to stop, and say whether it went out.
+    Processes started with ``start_new_session=True`` get their own session
+    (and thus process group). Killing the group ensures all descendant
+    processes (shells, child commands, etc.) are terminated together.
 
     The signal goes out through ``service_manager.kill_service``
     (2026-10-26, repair-r1-49), like every other signal aimed at a
@@ -3384,131 +3619,8 @@ def _send_stop_signal(proc: subprocess.Popen) -> bool:
     ``fallback_to_pids=False``: this path has a process **group** it
     trusts, and a pid it cannot — the recorded pid may have been
     recycled by the time the signal goes out, and signalling a stranger
-    is worse than signalling nobody.  The escalation in
-    ``_kill_process_tree`` still reaps the child through ``proc.kill()``,
-    which addresses it directly.
-
-    Returns True when a stop request went out, False when there was
-    nothing to ask (the process is already gone) or when the request
-    itself failed.  A failure is logged and swallowed: one unwritable
-    ledger must not take the rest of the sweep down with it.
-    """
-    if proc.poll() is not None:
-        return False
-    if id(proc) in _STOP_SWEEP:
-        # This sweep already asked this process to stop.  A second
-        # SIGTERM would put a second "stop requested" record on the
-        # plan's event stream for one stop.
-        return True
-    try:
-        pgid = os.getpgid(proc.pid)
-        if _signallable_pgid(pgid) is None:
-            pgid = None
-    except (ProcessLookupError, PermissionError, OSError):
-        # The group is already gone, or we may not signal it. Either way
-        # the child still gets the SIGTERM-shaped chance to exit below via
-        # proc.wait(); we must not turn a signal failure into "give up".
-        pgid = None
-    if pgid is None or _kill_service is None:
-        return False
-    # The request goes on the record **before** the signal goes out: a
-    # signal can take the other side's process (and its log) down with
-    # it, and a request written afterwards may never be written at all.
-    plan_id = _execution_plan_id(proc)
-    if plan_id is None:
-        logger.warning(
-            "[server] execution stop request for pid=%s was not recorded: "
-            "the process belongs to no known plan",
-            getattr(proc, "pid", "<unknown>"),
-        )
-    else:
-        _record_execution_stop(
-            plan_id,
-            "requested",
-            pid=getattr(proc, "pid", None),
-            hard_killed=False,
-            elapsed_s=0.0,
-        )
-    try:
-        _kill_service(
-            _ServiceRuntime(
-                name="execution", port=0, pid=proc.pid, pgid=pgid,
-            ),
-            # The label stays what it always was: the ledger on the plan's
-            # own event stream records who asked for the stop, and the
-            # answer for this path has not changed — a stop request from
-            # the backend. Renaming it would rewrite the provenance of
-            # every stop recorded so far.
-            "server._kill_process_tree",
-            "the execution's process tree is being stopped",
-            plan_dir=_execution_plan_dir(proc),
-            sig=signal.SIGTERM,
-            pgid=pgid,
-            fallback_to_pids=False,
-        )
-    except Exception:  # noqa: BLE001 - a kill must never raise
-        logger.exception(
-            "[service_manager] kill request for pid=%s could not be "
-            "recorded", getattr(proc, "pid", "<unknown>"),
-        )
-        return False
-    return True
-
-
-def _reap_stopped(proc: subprocess.Popen, deadline: float) -> bool:
-    """Wait for *proc* to exit, but no later than *deadline*.
-
-    *deadline* is an absolute ``time.monotonic()`` stamp.  True when the
-    process is gone, False when it is still there when the deadline
-    passes.
-
-    The timeout handed to ``wait()`` is rounded to whole milliseconds:
-    the deadline arithmetic would otherwise hand it a value like
-    1.999997 (or 2.0000000000000004), and a caller that asked for two
-    seconds would be given a number that is not two seconds.
-
-    This is also where the plan's stop **result** is written: the
-    executor is gone (or it was not, and the stop had to be escalated),
-    and that is the half of the stop the request could not answer.
-    """
-    if proc.poll() is not None:
-        # Already gone: there is nothing to wait for, but the stop still
-        # has a result.
-        _write_stop_result(proc, hard_killed=False, elapsed_s=0.0)
-        return True
-    timeout = max(0.0, round(deadline - time.monotonic(), 3))
-    started = time.monotonic()
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        gone = False
-    else:
-        gone = True
-    # The grace window expired: the caller escalates to SIGKILL right
-    # after this returns, so the stop was a hard kill.
-    _write_stop_result(
-        proc, hard_killed=not gone, elapsed_s=time.monotonic() - started
-    )
-    return gone
-
-
-def _kill_process_tree(
-    proc: subprocess.Popen, grace_seconds: Optional[float] = None
-) -> bool:
-    """Kill an entire process tree by sending SIGTERM to the process group.
-
-    Processes started with ``start_new_session=True`` get their own session
-    (and thus process group). Killing the group ensures all descendant
-    processes (shells, child commands, etc.) are terminated together.
-
-    The stop is two steps, and they are the two steps a batch sweep needs
-    separately: :func:`_send_stop_signal` asks the tree to stop,
-    :func:`_reap_stopped` waits for it to go away.  A sweep asks every
-    execution to stop first and only then reaps them — waiting inside
-    the loop hands the signal to one execution at a time, and the last
-    one only hears about it after every earlier one has burnt a full
-    grace window (F1: 8 in-flight executions, 5 of them never signalled
-    at all).
+    is worse than signalling nobody.  The escalation below still reaps
+    the child through ``proc.kill()``, which addresses it directly.
 
     ``grace_seconds`` is how long to wait after SIGTERM before escalating
     to SIGKILL (explicit argument > ``PDT_STOP_GRACE_SECONDS`` > 10s).
@@ -3523,20 +3635,40 @@ def _kill_process_tree(
       hard-killed, and a caller acting on this value must hear about it.
     """
     if proc.poll() is not None:
-        # Already gone: nothing to signal, nothing to wait for — but the
-        # stop still has a result, and the same code that writes every
-        # other result writes it.
-        _reap_stopped(proc, time.monotonic())
         return False
     grace = _resolve_stop_grace_seconds(grace_seconds)
-    _send_stop_signal(proc)
-    deadline = time.monotonic() + grace
-    # A sweep in progress shares one deadline across the whole batch: the
-    # window is one window for all of them, not one each.
-    sweep_deadline = _STOP_SWEEP.get(id(proc))
-    if sweep_deadline is not None:
-        deadline = min(deadline, sweep_deadline)
-    if _reap_stopped(proc, deadline):
+    try:
+        pgid = os.getpgid(proc.pid)
+        if _signallable_pgid(pgid) is None:
+            pgid = None
+    except (ProcessLookupError, PermissionError, OSError):
+        # The group is already gone, or we may not signal it. Either way
+        # the child still gets the SIGTERM-shaped chance to exit below via
+        # proc.wait(); we must not turn a signal failure into "give up".
+        pgid = None
+    if pgid is not None and _kill_service is not None:
+        try:
+            _kill_service(
+                _ServiceRuntime(
+                    name="execution", port=0, pid=proc.pid, pgid=pgid,
+                ),
+                "server._kill_process_tree",
+                "the execution's process tree is being stopped",
+                plan_dir=_execution_plan_dir(proc),
+                sig=signal.SIGTERM,
+                pgid=pgid,
+                fallback_to_pids=False,
+            )
+        except Exception:  # noqa: BLE001 - a kill must never raise
+            logger.exception(
+                "[service_manager] kill request for pid=%s could not be "
+                "recorded", getattr(proc, "pid", "<unknown>"),
+            )
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    else:
         return False
 
     # Grace expired: the child ignored SIGTERM, so escalate.
@@ -3552,72 +3684,46 @@ def _kill_process_tree(
     return True
 
 
-def _shutdown_all_executions() -> Dict[str, Any]:
+def _shutdown_all_executions() -> None:
     """Terminate all running execution and verification subprocesses.
 
     Called during server shutdown (lifespan finally block) and atexit
     to prevent orphaned processes.
 
-    The stop is **two stages**, and the order is the whole point:
+    The checkpoint pass comes **first**, on purpose.  A checkpoint
+    written after the kill would describe a plan whose process tree is
+    already gone, and a resume reading it would restart work that had in
+    fact been torn down mid-flight — so the resume point has to be on
+    disk before the first SIGTERM.
 
-    1. **every execution is asked to stop first** — a sweep that waits
-       inside the loop hands the signal to one execution at a time, so
-       the last one only hears about it after every earlier one has
-       burnt a full grace window (F1: 8 in-flight executions, 5 of them
-       never signalled at all);
-    2. **one shared deadline joins them** — the batch gets a single
-       window, not one window per execution.
-
-    The grace window is the one the execution stop path uses
-    (``_execution_stop_grace_seconds``) — the same value the operator's
-    stop gets, so the two paths cannot wait for different lengths of
-    time.  Resolved once, before the loop: the window does not change
-    while the sweep runs.
-
-    Returns what the sweep did: which executions were asked to stop,
-    which were already gone, which had to be hard-killed, and how long
-    the stop itself took.
+    Nothing here may raise.  The shutdown path is the last code to run
+    before the process goes away: a checkpoint that cannot be written
+    costs one plan its resume point, while an exception would cost the
+    shutdown every remaining plan its SIGTERM.  So the writer's own
+    failures (it reports them in ``report['failed']``) and a writer that
+    raises outright are both logged and stepped over.
     """
-    grace = _execution_stop_grace_seconds()
-    started = time.monotonic()
-    deadline = started + grace
-
-    live: List[Tuple[str, Any]] = []
-    already_gone: List[str] = []
-    for plan_id, state in list(_execution_state.items()):
-        proc = state.get("process") if isinstance(state, dict) else None
-        if not proc:
-            continue
-        if proc.poll() is not None:
-            already_gone.append(str(plan_id))
-            continue
-        live.append((str(plan_id), proc))
-
-    report: Dict[str, Any] = {
-        "signalled": [],
-        "already_gone": already_gone,
-        "hard_killed": {},
-        "elapsed_s": 0.0,
-    }
-
-    global _STOP_SWEEP
-    outer_sweep = _STOP_SWEEP
-    _STOP_SWEEP = {}
     try:
-        # Stage 1 — every execution is asked to stop, before anyone waits.
-        for plan_id, proc in live:
-            logger.info("Shutting down execution subprocess for plan %s (pid=%s)", plan_id, proc.pid)
-            if _send_stop_signal(proc):
-                report["signalled"].append({"plan": plan_id, "pid": proc.pid})
-            _STOP_SWEEP[id(proc)] = deadline
+        from shutdown_checkpoint import write_shutdown_checkpoints
 
-        # Stage 2 — one deadline for the whole batch.
-        for plan_id, proc in live:
-            hard_killed = _kill_process_tree(proc, grace_seconds=grace)
-            report["hard_killed"][plan_id] = bool(hard_killed)
-    finally:
-        _STOP_SWEEP = outer_sweep
-    report["elapsed_s"] = time.monotonic() - started
+        report = write_shutdown_checkpoints(
+            _execution_state, _verification_state, plan_dir_for=_plan_dir
+        )
+        if report["failed"]:
+            logger.warning(
+                "[shutdown_checkpoint] fell back to crash judgement: %s",
+                report["failed"],
+            )
+    except Exception:
+        logger.exception(
+            "[shutdown_checkpoint] checkpoint pass failed; shutdown continues"
+        )
+
+    for plan_id, state in list(_execution_state.items()):
+        proc = state.get("process")
+        if proc and proc.poll() is None:
+            logger.info("Shutting down execution subprocess for plan %s (pid=%s)", plan_id, proc.pid)
+            _kill_process_tree(proc)
     # Clear background manager references held by any in-memory agents
     # (agents are ephemeral per-thread, but the BackgroundManager's
     # cleanup_all is a safety net for any leaked handles).
@@ -3654,8 +3760,6 @@ def _shutdown_all_executions() -> Dict[str, Any]:
             )
         except Exception:  # pragma: no cover - shutdown must never raise
             logger.exception("[service_manager] shutdown service reap failed")
-
-    return report
 
 # Ensure subprocess cleanup even on abrupt process exit (SIGKILL bypasses
 # this, but SIGTERM / unhandled exception / sys.exit all trigger atexit).
@@ -4334,6 +4438,33 @@ from routes.hitl import (  # noqa: E402,F401
 )
 
 app.include_router(_routes_hitl.router)
+
+
+# --- routes/scheduler.py -----------------------------------------
+# The scheduler's read model: ``GET /api/scheduler/state``.  It answers
+# the one document the operator panel, the LUI and the API all read, so
+# that they cannot disagree about what is running and what is waiting.
+#
+# Mounted here for the same reason the routers above are: this block
+# runs before the frontend catch-all at the bottom of the file.  For
+# the routers whose endpoints are POSTs that ordering is belt-and-braces
+# — but this one is a GET, and the catch-all (``@app.get("/{path:path}")``)
+# is a GET too, so the ordering is load-bearing.  Route matching is
+# first-match-wins: registered after the catch-all, this route would
+# never be reached, and the caller would get the catch-all's answer
+# instead — a 404 with the body ``{"detail": "Not found"}``, which reads
+# like a missing asset rather than a missing route.
+#
+# The order is pinned by a test, not by this comment:
+# ``tests/api/plan_scheduler/test_scheduler_state_api.py`` asserts that
+# this route is registered ahead of the catch-all, so moving this block
+# below it turns the suite red rather than turning the endpoint quiet.
+from routes import scheduler as _routes_scheduler  # noqa: E402
+from routes.scheduler import (  # noqa: E402,F401
+    get_scheduler_state,
+)
+
+app.include_router(_routes_scheduler.router)
 
 
 # --- verification_loop.py ----------------------------------------

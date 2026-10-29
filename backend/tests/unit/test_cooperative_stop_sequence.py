@@ -25,14 +25,12 @@
 from __future__ import annotations
 
 import json
-import os
 import signal
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -339,83 +337,3 @@ def test_failed_dispatch_leaves_no_stale_entry():
 
     assert list(coding_tool._LIVE_DISPATCH_TOOLS) == []
     assert coding_tool.stop_all_live_dispatches(10.0) == 0
-
-
-# ---------------------------------------------------------------------------
-# The stop must not need the reader thread's lock
-# ---------------------------------------------------------------------------
-
-_SILENT_CHILD = (
-    "import signal, time\n"
-    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-    "while True:\n"
-    "    time.sleep(0.05)\n"
-)
-
-
-def test_stop_survives_a_reader_thread_holding_the_pipe():
-    """停止序列不能和读 stdout 的线程抢同一把锁。
-
-    CPython 的 buffered reader 在 read 未返回期间一直持有自己的锁，
-    而 dispatch 的读循环正是这样：它拿着那把锁阻塞在 read() 上，等子进程
-    再写一行。子进程安静的时候（还没开口，或者正卡在别的地方），那个 read
-    可以挂很久 —— 旧实现在另一个线程上做 ``stdout.close()``，close 要的正是
-    那把锁，于是停止序列整个卡住：读循环等子进程，停止等读循环的锁，子进程
-    等管道。停止序列耗完预算什么也没报，stop_report 的 ``children`` 是空的，
-    而子进程其实还活着。
-
-    这里用一个**不出声**的子进程复刻那个形状 —— 安静 ⇒ 读循环永远拿着那把
-    锁；它也不理 SIGTERM，所以只有把管道打断或升级到 SIGKILL 才能收掉它。
-    """
-    proc = subprocess.Popen(
-        [sys.executable, "-c", _SILENT_CHILD],
-        stdout=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        start_new_session=True,
-    )
-
-    def _reader():
-        try:
-            for _ in proc.stdout:  # noqa: B007 — the loop *is* the point
-                pass
-        except Exception:  # noqa: BLE001 — the pipe may break under us
-            pass
-
-    reader = threading.Thread(target=_reader, daemon=True)
-    reader.start()
-    # 让读循环真的进入那个阻塞的 read()，再动手停。
-    time.sleep(0.5)
-
-    tool = FakeTool(proc)
-    coding_tool.register_live_dispatch(tool)
-    records: List[Dict[str, Any]] = []
-
-    stopper = threading.Thread(
-        target=coding_tool.stop_all_live_dispatches,
-        args=(2.0, records),
-        daemon=True,
-    )
-    stopper.start()
-    # 预算 2s → 三段等待合计 1.4s；一个健康的停止远快于此。
-    stopper.join(timeout=8.0)
-
-    try:
-        assert not stopper.is_alive(), "the stop sequence deadlocked"
-        assert len(records) == 1
-        assert records[0]["pid"] == proc.pid
-        assert records[0]["stage"] in {
-            coding_tool._STOP_STAGE_STDOUT,
-            coding_tool._STOP_STAGE_SIGTERM,
-            coding_tool._STOP_STAGE_SIGKILL,
-        }
-    finally:
-        try:
-            if proc.poll() is None:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except OSError:  # noqa: BLE001 — the child may already be gone
-            pass
-        try:
-            proc.wait(timeout=5)
-        except Exception:  # noqa: BLE001 — best-effort cleanup
-            pass

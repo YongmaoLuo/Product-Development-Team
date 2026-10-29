@@ -168,6 +168,15 @@ EXCLUDED_SEGMENTS: frozenset[str] = frozenset({
 #: ``test_capacity_wait_status_surface_is_frozen``), so the rest of
 #: ``backend/state_machine/`` stays frozen inside the diff.
 #:
+#: Two more files are excluded for the native scheduler:
+#: ``backend/state_machine/db/schema.py`` (schema v7 adds the three
+#: ``scheduler_*`` tables) and ``frontend/index.html`` (the scheduler
+#: view's markup).  Both are scoped exclusions whose bytes are frozen
+#: by ``FROZEN_SCHEDULER_SURFACE_SHA256`` (checked by
+#: ``test_scheduler_surface_is_frozen``), so the rest of
+#: ``backend/state_machine/`` and ``frontend/`` stays frozen inside the
+#: diff.
+#:
 #: The pathspecs are repository-root-relative: the helper runs
 #: ``git -C ..`` from ``backend/``, so the prefix is the repository
 #: root.
@@ -179,8 +188,10 @@ FORBIDDEN_MODULE_PATHS: tuple[str, ...] = (
     ":(exclude)backend/state_machine/tests",
     ":(exclude)frontend/app.js",
     ":(exclude)frontend/style.css",
+    ":(exclude)frontend/index.html",
     ":(exclude)backend/verification_loop.py",
     ":(exclude)backend/state_machine/repositories/execution_repository.py",
+    ":(exclude)backend/state_machine/db/schema.py",
 )
 
 #: The base ref the change surface is measured against, in preference
@@ -506,8 +517,17 @@ FROZEN_REQUIREMENTS_HASH: str = (
 
 #: The state db schema, frozen. A new table, a new column or a new
 #: index changes this value.
+#:
+#: 2026-10-28 (native scheduler, schema v7): the value below was
+#: re-pinned for the three scheduler tables — ``scheduler_queue``,
+#: ``scheduler_slot``, ``scheduler_command`` — and their two indexes.
+#: That is the whole delta: the previous baseline
+#: (``bc821cabc9b8ec6d629a18aa4d036873478c66773353a97b5bf87e257750dd51``)
+#: was computed against exactly the same ten objects the old schema
+#: held, and the object list printed by the failing assertion shows
+#: the three new tables and the two new indexes as the only additions.
 FROZEN_SCHEMA_DDL_HASH: str = (
-    "bc821cabc9b8ec6d629a18aa4d036873478c66773353a97b5bf87e257750dd51"
+    "4e31487b0ae462e470a54ecd03a5e7c6d1cdf5c90a61975c80519868535ddb23"
 )
 
 #: The phase merge renamed the waiting bucket to ``queued``. The rename
@@ -535,19 +555,43 @@ FROZEN_SCHEMA_DDL_HASH: str = (
 #: string before escaping it.  A task id in ``tasks.json`` is allowed to
 #: be a **number**, and ``(1).replace`` is a ``TypeError`` -- the page
 #: caught it and painted the empty state over a plan that *had* tasks,
-#: silently.  The freeze moves to the branch's approved state for the
-#: same reason it moved for the capacity work: the file changed once, on
-#: purpose, and the rule stays "these files change once, and only that
-#: way".
+#: silently.  On 2026-10-29 the native scheduler's SPA view merged into
+#: the same file (its renderers), so the pin moves once more to the
+#: merged content.
 FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     "frontend/app.js": (
-        "ab889cde68f214b08e51d07910b2a45c890f01995577032c127580913e143e92"
+        "8e13b20f65706d183d3b27cd381b54bf88bd82220845ca2028087d144c9cecce"
     ),
     "frontend/style.css": (
-        "4c38a1f0d1a661a9b0a48159e2db997974d4fa9e57c1b7af57d8e8812ea23a06"
+        "0cab7b66dae8b5b693a9e8e4b5c4cda4f8651ae649512e81d8aa8c18a24f836b"
     ),
+    # 2026-10-29：因「关机检查点恢复」新增 `_requeue_shutdown_interrupted_verification`（+80 行），
+    # 按本 gate 的既定流程重新钉住该文件的哈希。
     "backend/verification_loop.py": (
-        "52de1da58c46ef362e23cbc6e36dcbcfbf1701be26dd45f981bd529531b26962"
+        "5a75c8d24dc663ab043671e6887d3dd51b22c0951b6d6f2a3839ff5b020bbd2e"
+    ),
+}
+
+#: The native scheduler's own surface, frozen the same way.  Two files
+#: under the forbidden paths change on this branch by design:
+#:
+#:   * ``backend/state_machine/db/schema.py`` — schema v7 adds the
+#:     three ``scheduler_*`` tables (and bumps ``CURRENT_SCHEMA_VERSION``
+#:     from 6 to 7).  The state machine is shared with the rest of the
+#:     product, so the change is excluded from the change-surface diff
+#:     and pinned here instead, byte for byte.
+#:   * ``frontend/index.html`` — the scheduler view's markup.
+#:
+#: Both are excluded from the diff pathspecs above and both are held
+#: by the hashes below, so the exclusion does not weaken the gate: a
+#: later edit to either file fails ``test_scheduler_surface_is_frozen``
+#: even though it no longer shows up in the diff.
+FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
+    "backend/state_machine/db/schema.py": (
+        "0e63c6206ca91b48bde1161df21f92c82734ee99ad28293a34131f61a273394d"
+    ),
+    "frontend/index.html": (
+        "355a0267da8f83240053e41e305123c03306c83eee49cbeccadb70bc6d920dcd"
     ),
 }
 
@@ -871,4 +915,32 @@ def test_capacity_wait_status_surface_is_frozen() -> None:
     assert mismatched == [], (
         "a file in the capacity wait's status surface changed outside "
         "the frozen baseline:\n  " + "\n  ".join(mismatched)
+    )
+
+
+def test_scheduler_surface_is_frozen() -> None:
+    """The native scheduler's own surface is frozen byte for byte.
+
+    Two files under the forbidden paths change on this branch by
+    design: the schema module that adds the three ``scheduler_*``
+    tables, and the frontend markup that carries the scheduler view.
+    Both are excluded from the change-surface diff, so something else
+    has to hold them still — this gate does, by pinning every byte of
+    each to the hash of the approved state.  Any *further* edit to
+    either file fails here even though it no longer shows up in the
+    diff.
+
+    The rule does not weaken the change-surface gate; it moves it from
+    "these files never change" to "these files change once, and only
+    that way".
+    """
+    mismatched = [
+        f"{rel}: frozen {expected}, actual "
+        f"{hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest()}"
+        for rel, expected in FROZEN_SCHEDULER_SURFACE_SHA256.items()
+        if hashlib.sha256((REPO_ROOT / rel).read_bytes()).hexdigest() != expected
+    ]
+    assert mismatched == [], (
+        "a file in the native scheduler's surface changed outside the "
+        "frozen baseline:\n  " + "\n  ".join(mismatched)
     )

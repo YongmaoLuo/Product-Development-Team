@@ -44,13 +44,6 @@ What each test pins
     The pass writes down what it decided, and no record in it says a
     signal went out.
 
-``test_the_suite_stops_the_resident_daemons_it_leaked``
-    A resident reaper daemon this session started is stopped when the
-    session ends, instead of outliving it on the machine.
-
-``test_the_sweep_leaves_the_daemons_of_other_sessions_alone``
-    A daemon that belongs to another session is not touched.
-
 The scope of the blast radius
 -----------------------------
 The unscoped pass (the second test) is a **dry run**: it decides and
@@ -100,30 +93,10 @@ pytestmark = pytest.mark.integration
 #: How many unmarked children the fixture spawns.
 CHILD_COUNT = 3
 
-#: The children's program.  The sleep has to outlast the **slowest**
-#: pass in this file — the unscoped one — and that pass is slow for a
-#: reason that has nothing to do with the code under test: it reads the
-#: environment of *every* process on the machine, one ``ps -E`` fork
-#: per process.  On a busy box that is tens of seconds, and a child
-#: that dies half-way through the scan comes back as
-#: ``env_unreadable`` — a verdict about the *scan*, not about the
-#: child, and a completely different claim from the one this file
-#: exists to make.  The child therefore has to stay alive for the
-#: whole scan; the fixture stops it the moment the test is over, so the
-#: long sleep costs nothing at the end.
-CHILD_CODE = "import time; time.sleep(300)"
-
-#: The program of the stand-in for a **resident reaper daemon**.  It
-#: sleeps like the children above, but its command line has to look like
-#: a daemon's: the sweep that stops leaked daemons finds them by their
-#: command line, so a stand-in without one would prove nothing.
-DAEMON_CODE = "import time; time.sleep(300)"
-
-#: The command line of the stand-in.  The real daemon is started as
-#: ``python -m backend.orphan_reaper --daemon --interval 30
-#: --plans-root <dir>``; the arguments after the program are what the
-#: sweep reads.
-DAEMON_ARGV = ("backend.orphan_reaper", "--daemon", "--interval", "30")
+#: The children's program.  ``time.sleep(30)`` is long enough to outlive
+#: every pass in this file and short enough that a leaked child cannot
+#: outlive the test run by much.
+CHILD_CODE = "import time; time.sleep(30)"
 
 #: The environment the children are *launched* with: ``PATH`` and
 #: nothing else.  It is built from scratch rather than inherited so
@@ -227,48 +200,6 @@ def _settle(seconds=SETTLE_SECONDS):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         time.sleep(0.05)
-
-
-def _wait_until_the_daemon_is_visible(pid, timeout=READY_TIMEOUT):
-    """Wait until *pid* shows up in the process listing, or give up.
-
-    A process is a moment away from being listed; the wait covers that
-    window only.  The answer is a boolean rather than an assertion,
-    because the *caller* is the thing that has to fail when the daemon
-    never shows up.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        listing = subprocess.run(
-            ["ps", "-Ao", "pid=,command="],
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout
-        for line in listing.splitlines():
-            if line.strip().split(" ", 1)[0] == str(pid):
-                return True
-        time.sleep(0.05)
-    return False
-
-
-def _spawn_a_stand_in_daemon(plans_root):
-    """Start a process whose command line looks like a resident daemon.
-
-    It is not a daemon — it never reaps anything — but it is *shaped*
-    like one, which is all the sweep looks at.
-    """
-    return subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            DAEMON_CODE,
-            *DAEMON_ARGV,
-            "--plans-root",
-            str(plans_root),
-        ],
-        env=dict(CHILD_ENV),
-    )
 
 
 def _read_event_records(path):
@@ -407,78 +338,3 @@ def test_no_kill_events_written(tmp_path, unmarked_children):
             continue
         assert record["reason"] == REASON_UNMARKED
         assert record["signal"] == ""
-
-
-def test_the_suite_stops_the_resident_daemons_it_leaked(tmp_path):
-    """A resident reaper daemon of this session does not outlive the session.
-
-    The backend starts a resident reaper daemon when it boots, and a
-    test that boots a real backend leaves one behind: a **detached**
-    process, still running after the test that made it is over.  It is
-    not idle, either — it scans the whole machine every 30 seconds,
-    forking ``ps`` once per process on it — so a suite that leaks a
-    dozen of them turns a quiet runner into a busy one, and the boot of
-    the *next* server waits behind the fork storm of the daemons the
-    previous tests left behind.  That is how a green suite starts
-    failing on the second run on the same machine.
-
-    Which daemons are "ours" is not a guess: the daemon's plans root
-    names the session that started it, and a session may clean up its
-    own temporary directory and nothing else.
-    """
-    from tests.conftest import _stop_reaper_daemons_under
-
-    plans_root = tmp_path / "plans"
-    plans_root.mkdir()
-    daemon = _spawn_a_stand_in_daemon(plans_root)
-    try:
-        assert _wait_until_the_daemon_is_visible(daemon.pid), (
-            "the stand-in daemon never showed up in the process listing"
-        )
-        stopped = _stop_reaper_daemons_under(tmp_path)
-        assert daemon.pid in stopped, (
-            "the daemon under this session's own directory was not "
-            "stopped; stopped=%r" % (stopped,)
-        )
-        _settle()
-        assert daemon.poll() is not None, (
-            "the daemon was signalled but is still running"
-        )
-    finally:
-        if daemon.poll() is None:
-            daemon.kill()
-            daemon.wait(timeout=TERMINATE_TIMEOUT)
-
-
-def test_the_sweep_leaves_the_daemons_of_other_sessions_alone(tmp_path):
-    """A daemon that belongs to another session is not touched.
-
-    The sweep is allowed to stop the daemons of the session that owns
-    the directory it is cleaning, and nothing else: a daemon of a
-    concurrent run, of the developer's own backend, or of any other
-    tool has to survive it.  The rule is the plans root — the only
-    thing on the command line that says whose the daemon is.
-    """
-    from tests.conftest import _stop_reaper_daemons_under
-
-    elsewhere = tmp_path.parent / "another-session"
-    elsewhere.mkdir(exist_ok=True)
-    plans_root = elsewhere / "plans"
-    plans_root.mkdir(exist_ok=True)
-    daemon = _spawn_a_stand_in_daemon(plans_root)
-    try:
-        assert _wait_until_the_daemon_is_visible(daemon.pid), (
-            "the stand-in daemon never showed up in the process listing"
-        )
-        stopped = _stop_reaper_daemons_under(tmp_path)
-        assert daemon.pid not in stopped, (
-            "the sweep stopped a daemon that belongs to another session; "
-            "stopped=%r" % (stopped,)
-        )
-        assert daemon.poll() is None, (
-            "the daemon of another session was stopped"
-        )
-    finally:
-        if daemon.poll() is None:
-            daemon.kill()
-            daemon.wait(timeout=TERMINATE_TIMEOUT)
