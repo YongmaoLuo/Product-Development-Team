@@ -4,6 +4,7 @@ FastAPI Web Server for Spec-Driven Development System
 
 import json
 import logging
+import math
 import os
 import os as _os  # module-level alias: _signal_handler (line ~3549) uses
                   # _os.getpid(); the previous function-local import left
@@ -63,6 +64,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+import coding_tool
 from coding_tool import ClaudeCodingTool, create_coding_tool
 from usage_registry import plan_usage_context
 import plan_usage
@@ -98,6 +100,7 @@ from decision_point_adder import (
 from tasks_generator import TasksGenerator, TasksGenerationError
 from preflight_review import PreFlightReviewer
 from verification import VerificationOrchestrator
+import execution_logger
 from execution_logger import ExecutionLogger
 from utils.atomic_io import atomic_write_json
 from utils.process import _signallable_pgid, kill_process_group
@@ -113,6 +116,7 @@ from config_paths import (
     ENV_FILE,
     STATE_DB,
     STATE_DB_ENV,
+    resolve_plans_dir,
     resolve_server_host,
     resolve_state_db_path,
 )
@@ -3124,35 +3128,222 @@ def _resolve_stop_grace_seconds(grace_seconds: Optional[float]) -> float:
     return _STOP_GRACE_DEFAULT_SECONDS
 
 
-def _execution_plan_dir(proc: object) -> Optional[Path]:
-    """The plan directory of the execution that owns *proc*, if any.
+def _execution_stop_grace_seconds() -> float:
+    """The grace window the **execution stop path** gets.
+
+    This is the single entry point for that window (arch decision 3 /
+    R3): the server's window has to be *strictly greater* than the
+    executor's stop budget, and the executor derives its budget from the
+    same environment variable — so a window of 1s would hand the executor
+    a 2s budget (``coding_tool.executor_stop_budget`` floors the window
+    at ``MIN_SERVER_STOP_GRACE_SECONDS`` before halving it) to spend
+    inside a 1s window.  The cascade would then overrun the window and
+    the server would SIGKILL the very process group the cooperative stop
+    exists to save — a resumable stop degraded into a full rerun.
+
+    So the window the environment asks for is raised to
+    ``coding_tool.MIN_SERVER_STOP_GRACE_SECONDS`` before it is used.
+
+    Two things this function deliberately does **not** do:
+
+    * it does not change ``_resolve_stop_grace_seconds`` — an explicit
+      ``grace_seconds=0`` still means "do not wait", because that is a
+      caller-level contract ("I know what I want"), not a
+      deployment-level window;
+    * it does not read the environment itself — the resolution stays in
+      one place (``_resolve_stop_grace_seconds``), so the two layers
+      cannot drift apart.
+    """
+    grace = _resolve_stop_grace_seconds(None)
+    # "Do not wait at all" is not a window a cascade can fit into, and a
+    # non-finite one would park the stop path forever.  Both fall back
+    # to the same default the executor falls back to.
+    if not math.isfinite(grace) or grace <= 0:
+        grace = _STOP_GRACE_DEFAULT_SECONDS
+    return max(grace, coding_tool.MIN_SERVER_STOP_GRACE_SECONDS)
+
+
+def _execution_plan_id(proc: object) -> Optional[str]:
+    """The plan id of the execution that owns *proc*, if any.
 
     The server knows which plan every running execution belongs to —
-    ``_execution_state`` is the map — but ``_kill_process_tree`` is
-    handed a bare ``Popen``.  Looking the process up here is what lets
-    the kill request land in the right plan's event stream without
-    changing the signature every call site already uses.
+    ``_execution_state`` is the map — but the stop path is handed a bare
+    ``Popen``.  Looking the process up here is what lets a stop record
+    land in the right plan's event stream without changing the signature
+    every call site already uses.
     """
     for plan_id, state in list(_execution_state.items()):
         if not isinstance(state, dict):
             continue
-        if state.get("process") is not proc:
-            continue
-        try:
-            return _plan_dir(str(plan_id))
-        except Exception:  # noqa: BLE001 - a bad plan id is not a verdict
-            return None
+        if state.get("process") is proc:
+            return str(plan_id)
     return None
 
 
-def _kill_process_tree(
-    proc: subprocess.Popen, grace_seconds: Optional[float] = None
-) -> bool:
-    """Kill an entire process tree by sending SIGTERM to the process group.
+def _execution_plan_dir(proc: object) -> Optional[Path]:
+    """The plan directory of the execution that owns *proc*, if any."""
+    plan_id = _execution_plan_id(proc)
+    if plan_id is None:
+        return None
+    try:
+        return _plan_dir(plan_id)
+    except Exception:  # noqa: BLE001 - a bad plan id is not a verdict
+        return None
 
-    Processes started with ``start_new_session=True`` get their own session
-    (and thus process group). Killing the group ensures all descendant
-    processes (shells, child commands, etc.) are terminated together.
+
+#: The two stop events the server writes into a plan's own event stream.
+#:
+#: ``requested`` goes out **before** the signal and ``result`` once the
+#: executor is gone (or had to be hard-killed), so a reader can tell
+#: "asked to stop" from "stopped" — and see which of the two an executor
+#: that died never reached.
+_EXECUTION_STOP_EVENTS: Dict[str, Tuple[str, str]] = {
+    "requested": ("execution_stop_requested", "execution stop requested"),
+    "result": ("execution_stop_result", "execution stop result"),
+}
+
+# The stop events are registered through the log module's own mutation
+# point (``register_event_type``) instead of by poking ``LOG_EVENT_TYPES``
+# from here: the renderer needs a prefix for every event it may print,
+# and that table belongs to the module that owns it.
+execution_logger.register_event_type(
+    "execution_stop_requested", "[EXECUTION_STOP_REQUESTED]",
+)
+execution_logger.register_event_type(
+    "execution_stop_result", "[EXECUTION_STOP_RESULT]",
+)
+
+
+def _written_entry_ts(
+    log_file: Path, event: str, fields: Dict[str, Any]
+) -> Optional[str]:
+    """The ts the logger stamped on the entry it just wrote.
+
+    The logger builds the entry — and stamps its ``ts`` — itself, so the
+    only way to report *that* timestamp is to read it back.  The tail is
+    enough: the entry just written is the last one, or very nearly.  A
+    log that cannot be read back is not a log that was not written, so
+    this returns ``None`` and the caller falls back to the moment it
+    asked for.
+    """
+    try:
+        with open(log_file, "rb") as fp:
+            fp.seek(0, os.SEEK_END)
+            size = fp.tell()
+            fp.seek(max(0, size - 16 * 1024))
+            tail = fp.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            # A truncated tail (the read started mid-line) — skip it.
+            continue
+        if entry.get("event") != event:
+            continue
+        if entry.get("data") != fields:
+            continue
+        ts = entry.get("ts")
+        return ts if isinstance(ts, str) else None
+    return None
+
+
+def _record_execution_stop(
+    plan_id: str, phase: str, **fields
+) -> Optional[str]:
+    """Write one stop record for *plan_id* into that plan's event stream.
+
+    Returns the UTC timestamp of the record that was written, or ``None``
+    when there is no record to report.  **Never raises.**
+
+    A stop matters more than its evidence.  The plan may be gone (no such
+    directory), the log directory may be unwritable, the logger may blow
+    up on construction — none of that may take the shutdown down with it.
+    Every failure is a warning and a ``None``, and the caller carries on
+    stopping.
+
+    ``phase`` is ``"requested"`` or ``"result"``.  Both carry the same
+    data shape (``pid`` / ``hard_killed`` / ``elapsed_s``) so a reader can
+    pair a request with its result without special-casing: at request
+    time nothing has been hard-killed yet and nothing has elapsed yet,
+    and saying so is cheaper than the reader having to know that.
+    """
+    event, message = _EXECUTION_STOP_EVENTS.get(
+        phase, (f"execution_stop_{phase}", f"execution stop {phase}"),
+    )
+    ts = datetime.utcnow().isoformat()
+    try:
+        plan_dir = resolve_plans_dir() / str(plan_id)
+        if not plan_dir.is_dir():
+            # No such plan: there is no event stream to write into, and
+            # creating the directory would invent a plan that is not there.
+            logger.warning(
+                "[server] execution stop %s for plan %s was not recorded: "
+                "no such plan",
+                phase, plan_id,
+            )
+            return None
+        plan_logger = ExecutionLogger(str(plan_id))
+        plan_logger.info(event, message, data=fields)
+    except Exception:  # noqa: BLE001 - evidence must never break a stop
+        logger.warning(
+            "[server] execution stop %s for plan %s could not be recorded",
+            phase, plan_id, exc_info=True,
+        )
+        return None
+    written = _written_entry_ts(plan_dir / "execution.log", event, fields)
+    return written or ts
+
+
+def _write_stop_result(
+    proc: subprocess.Popen, *, hard_killed: bool, elapsed_s: float
+) -> Optional[str]:
+    """Write the plan's stop **result** for *proc*.
+
+    The result answers the question the request could not: did the
+    executor go away on its own, or did it have to be hard-killed, and
+    how long did it take?  ``hard_killed`` is True when the grace window
+    expired — the same verdict ``_kill_process_tree`` reports to its
+    caller, so the event stream and the stop report cannot disagree.
+    """
+    plan_id = _execution_plan_id(proc)
+    if plan_id is None:
+        logger.warning(
+            "[server] execution stop result for pid=%s was not recorded: "
+            "the process belongs to no known plan",
+            getattr(proc, "pid", "<unknown>"),
+        )
+        return None
+    return _record_execution_stop(
+        plan_id,
+        "result",
+        pid=getattr(proc, "pid", None),
+        hard_killed=bool(hard_killed),
+        elapsed_s=float(elapsed_s),
+    )
+
+
+#: The sweep in progress: ``id(proc) -> the deadline it has to be gone
+#: by``.  A sweep asks every execution to stop **first** and only then
+#: reaps them, and this table is what keeps the two halves honest:
+#:
+#: * an execution in here has already been asked to stop — the reap half
+#:   must not send a second SIGTERM, or the plan's kill-event stream
+#:   would carry two "stop requested" records for one stop;
+#: * an execution in here has to be gone by the same deadline — the
+#:   window is one window for the whole batch, not one per execution.
+#:
+#: Only the executions this sweep signalled are in here, so a stop
+#: request from anywhere else keeps its own window.
+_STOP_SWEEP: Dict[int, float] = {}
+
+
+def _send_stop_signal(proc: subprocess.Popen) -> bool:
+    """Ask the process tree of *proc* to stop, and say whether it went out.
 
     The signal goes out through ``service_manager.kill_service``
     (2026-10-26, repair-r1-49), like every other signal aimed at a
@@ -3166,8 +3357,131 @@ def _kill_process_tree(
     ``fallback_to_pids=False``: this path has a process **group** it
     trusts, and a pid it cannot — the recorded pid may have been
     recycled by the time the signal goes out, and signalling a stranger
-    is worse than signalling nobody.  The escalation below still reaps
-    the child through ``proc.kill()``, which addresses it directly.
+    is worse than signalling nobody.  The escalation in
+    ``_kill_process_tree`` still reaps the child through ``proc.kill()``,
+    which addresses it directly.
+
+    Returns True when a stop request went out, False when there was
+    nothing to ask (the process is already gone) or when the request
+    itself failed.  A failure is logged and swallowed: one unwritable
+    ledger must not take the rest of the sweep down with it.
+    """
+    if proc.poll() is not None:
+        return False
+    if id(proc) in _STOP_SWEEP:
+        # This sweep already asked this process to stop.  A second
+        # SIGTERM would put a second "stop requested" record on the
+        # plan's event stream for one stop.
+        return True
+    try:
+        pgid = os.getpgid(proc.pid)
+        if _signallable_pgid(pgid) is None:
+            pgid = None
+    except (ProcessLookupError, PermissionError, OSError):
+        # The group is already gone, or we may not signal it. Either way
+        # the child still gets the SIGTERM-shaped chance to exit below via
+        # proc.wait(); we must not turn a signal failure into "give up".
+        pgid = None
+    if pgid is None or _kill_service is None:
+        return False
+    # The request goes on the record **before** the signal goes out: a
+    # signal can take the other side's process (and its log) down with
+    # it, and a request written afterwards may never be written at all.
+    plan_id = _execution_plan_id(proc)
+    if plan_id is None:
+        logger.warning(
+            "[server] execution stop request for pid=%s was not recorded: "
+            "the process belongs to no known plan",
+            getattr(proc, "pid", "<unknown>"),
+        )
+    else:
+        _record_execution_stop(
+            plan_id,
+            "requested",
+            pid=getattr(proc, "pid", None),
+            hard_killed=False,
+            elapsed_s=0.0,
+        )
+    try:
+        _kill_service(
+            _ServiceRuntime(
+                name="execution", port=0, pid=proc.pid, pgid=pgid,
+            ),
+            # The label stays what it always was: the ledger on the plan's
+            # own event stream records who asked for the stop, and the
+            # answer for this path has not changed — a stop request from
+            # the backend. Renaming it would rewrite the provenance of
+            # every stop recorded so far.
+            "server._kill_process_tree",
+            "the execution's process tree is being stopped",
+            plan_dir=_execution_plan_dir(proc),
+            sig=signal.SIGTERM,
+            pgid=pgid,
+            fallback_to_pids=False,
+        )
+    except Exception:  # noqa: BLE001 - a kill must never raise
+        logger.exception(
+            "[service_manager] kill request for pid=%s could not be "
+            "recorded", getattr(proc, "pid", "<unknown>"),
+        )
+        return False
+    return True
+
+
+def _reap_stopped(proc: subprocess.Popen, deadline: float) -> bool:
+    """Wait for *proc* to exit, but no later than *deadline*.
+
+    *deadline* is an absolute ``time.monotonic()`` stamp.  True when the
+    process is gone, False when it is still there when the deadline
+    passes.
+
+    The timeout handed to ``wait()`` is rounded to whole milliseconds:
+    the deadline arithmetic would otherwise hand it a value like
+    1.999997 (or 2.0000000000000004), and a caller that asked for two
+    seconds would be given a number that is not two seconds.
+
+    This is also where the plan's stop **result** is written: the
+    executor is gone (or it was not, and the stop had to be escalated),
+    and that is the half of the stop the request could not answer.
+    """
+    if proc.poll() is not None:
+        # Already gone: there is nothing to wait for, but the stop still
+        # has a result.
+        _write_stop_result(proc, hard_killed=False, elapsed_s=0.0)
+        return True
+    timeout = max(0.0, round(deadline - time.monotonic(), 3))
+    started = time.monotonic()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        gone = False
+    else:
+        gone = True
+    # The grace window expired: the caller escalates to SIGKILL right
+    # after this returns, so the stop was a hard kill.
+    _write_stop_result(
+        proc, hard_killed=not gone, elapsed_s=time.monotonic() - started
+    )
+    return gone
+
+
+def _kill_process_tree(
+    proc: subprocess.Popen, grace_seconds: Optional[float] = None
+) -> bool:
+    """Kill an entire process tree by sending SIGTERM to the process group.
+
+    Processes started with ``start_new_session=True`` get their own session
+    (and thus process group). Killing the group ensures all descendant
+    processes (shells, child commands, etc.) are terminated together.
+
+    The stop is two steps, and they are the two steps a batch sweep needs
+    separately: :func:`_send_stop_signal` asks the tree to stop,
+    :func:`_reap_stopped` waits for it to go away.  A sweep asks every
+    execution to stop first and only then reaps them — waiting inside
+    the loop hands the signal to one execution at a time, and the last
+    one only hears about it after every earlier one has burnt a full
+    grace window (F1: 8 in-flight executions, 5 of them never signalled
+    at all).
 
     ``grace_seconds`` is how long to wait after SIGTERM before escalating
     to SIGKILL (explicit argument > ``PDT_STOP_GRACE_SECONDS`` > 10s).
@@ -3182,40 +3496,20 @@ def _kill_process_tree(
       hard-killed, and a caller acting on this value must hear about it.
     """
     if proc.poll() is not None:
+        # Already gone: nothing to signal, nothing to wait for — but the
+        # stop still has a result, and the same code that writes every
+        # other result writes it.
+        _reap_stopped(proc, time.monotonic())
         return False
     grace = _resolve_stop_grace_seconds(grace_seconds)
-    try:
-        pgid = os.getpgid(proc.pid)
-        if _signallable_pgid(pgid) is None:
-            pgid = None
-    except (ProcessLookupError, PermissionError, OSError):
-        # The group is already gone, or we may not signal it. Either way
-        # the child still gets the SIGTERM-shaped chance to exit below via
-        # proc.wait(); we must not turn a signal failure into "give up".
-        pgid = None
-    if pgid is not None and _kill_service is not None:
-        try:
-            _kill_service(
-                _ServiceRuntime(
-                    name="execution", port=0, pid=proc.pid, pgid=pgid,
-                ),
-                "server._kill_process_tree",
-                "the execution's process tree is being stopped",
-                plan_dir=_execution_plan_dir(proc),
-                sig=signal.SIGTERM,
-                pgid=pgid,
-                fallback_to_pids=False,
-            )
-        except Exception:  # noqa: BLE001 - a kill must never raise
-            logger.exception(
-                "[service_manager] kill request for pid=%s could not be "
-                "recorded", getattr(proc, "pid", "<unknown>"),
-            )
-    try:
-        proc.wait(timeout=grace)
-    except subprocess.TimeoutExpired:
-        pass
-    else:
+    _send_stop_signal(proc)
+    deadline = time.monotonic() + grace
+    # A sweep in progress shares one deadline across the whole batch: the
+    # window is one window for all of them, not one each.
+    sweep_deadline = _STOP_SWEEP.get(id(proc))
+    if sweep_deadline is not None:
+        deadline = min(deadline, sweep_deadline)
+    if _reap_stopped(proc, deadline):
         return False
 
     # Grace expired: the child ignored SIGTERM, so escalate.
@@ -3231,17 +3525,72 @@ def _kill_process_tree(
     return True
 
 
-def _shutdown_all_executions() -> None:
+def _shutdown_all_executions() -> Dict[str, Any]:
     """Terminate all running execution and verification subprocesses.
 
     Called during server shutdown (lifespan finally block) and atexit
     to prevent orphaned processes.
+
+    The stop is **two stages**, and the order is the whole point:
+
+    1. **every execution is asked to stop first** — a sweep that waits
+       inside the loop hands the signal to one execution at a time, so
+       the last one only hears about it after every earlier one has
+       burnt a full grace window (F1: 8 in-flight executions, 5 of them
+       never signalled at all);
+    2. **one shared deadline joins them** — the batch gets a single
+       window, not one window per execution.
+
+    The grace window is the one the execution stop path uses
+    (``_execution_stop_grace_seconds``) — the same value the operator's
+    stop gets, so the two paths cannot wait for different lengths of
+    time.  Resolved once, before the loop: the window does not change
+    while the sweep runs.
+
+    Returns what the sweep did: which executions were asked to stop,
+    which were already gone, which had to be hard-killed, and how long
+    the stop itself took.
     """
+    grace = _execution_stop_grace_seconds()
+    started = time.monotonic()
+    deadline = started + grace
+
+    live: List[Tuple[str, Any]] = []
+    already_gone: List[str] = []
     for plan_id, state in list(_execution_state.items()):
-        proc = state.get("process")
-        if proc and proc.poll() is None:
+        proc = state.get("process") if isinstance(state, dict) else None
+        if not proc:
+            continue
+        if proc.poll() is not None:
+            already_gone.append(str(plan_id))
+            continue
+        live.append((str(plan_id), proc))
+
+    report: Dict[str, Any] = {
+        "signalled": [],
+        "already_gone": already_gone,
+        "hard_killed": {},
+        "elapsed_s": 0.0,
+    }
+
+    global _STOP_SWEEP
+    outer_sweep = _STOP_SWEEP
+    _STOP_SWEEP = {}
+    try:
+        # Stage 1 — every execution is asked to stop, before anyone waits.
+        for plan_id, proc in live:
             logger.info("Shutting down execution subprocess for plan %s (pid=%s)", plan_id, proc.pid)
-            _kill_process_tree(proc)
+            if _send_stop_signal(proc):
+                report["signalled"].append({"plan": plan_id, "pid": proc.pid})
+            _STOP_SWEEP[id(proc)] = deadline
+
+        # Stage 2 — one deadline for the whole batch.
+        for plan_id, proc in live:
+            hard_killed = _kill_process_tree(proc, grace_seconds=grace)
+            report["hard_killed"][plan_id] = bool(hard_killed)
+    finally:
+        _STOP_SWEEP = outer_sweep
+    report["elapsed_s"] = time.monotonic() - started
     # Clear background manager references held by any in-memory agents
     # (agents are ephemeral per-thread, but the BackgroundManager's
     # cleanup_all is a safety net for any leaked handles).
@@ -3278,6 +3627,8 @@ def _shutdown_all_executions() -> None:
             )
         except Exception:  # pragma: no cover - shutdown must never raise
             logger.exception("[service_manager] shutdown service reap failed")
+
+    return report
 
 # Ensure subprocess cleanup even on abrupt process exit (SIGKILL bypasses
 # this, but SIGTERM / unhandled exception / sys.exit all trigger atexit).

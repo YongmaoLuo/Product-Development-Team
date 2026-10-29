@@ -296,7 +296,7 @@ class TestResponseStructure:
     def test_start_response_schema(self, sample_plan_factory, monkeypatch):
         """POST /start response matches START_RESPONSE_SCHEMA."""
         self._setup_executing_plan(sample_plan_factory)
-        monkeypatch.setattr("server.threading.Thread", FakeThread)
+        _patch_verification_worker_thread(monkeypatch, FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
         _stub_auto_loop(monkeypatch)
 
@@ -400,7 +400,7 @@ class TestStatusCodes:
         (plan_dir / "execution.json").write_text(
             json.dumps({"project_dir": str(project_dir)}), encoding="utf-8"
         )
-        monkeypatch.setattr("server.threading.Thread", FakeThread)
+        _patch_verification_worker_thread(monkeypatch, FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
         _stub_auto_loop(monkeypatch)
 
@@ -680,7 +680,7 @@ class TestBoundaryValues:
     def test_boundary_max_rounds_less_than_one(self, sample_plan_factory, monkeypatch):
         """max_rounds < 1 returns 400."""
         self._setup_start_ready_plan(sample_plan_factory)
-        monkeypatch.setattr("server.threading.Thread", FakeThread)
+        _patch_verification_worker_thread(monkeypatch, FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
 
         resp = client.post("/api/verification/boundary-plan/start", json={"max_rounds": 0})
@@ -694,7 +694,7 @@ class TestBoundaryValues:
     def test_boundary_max_rounds_greater_than_one_thousand(self, sample_plan_factory, monkeypatch):
         """max_rounds > 1000 returns 400."""
         self._setup_start_ready_plan(sample_plan_factory)
-        monkeypatch.setattr("server.threading.Thread", FakeThread)
+        _patch_verification_worker_thread(monkeypatch, FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
 
         resp = client.post("/api/verification/boundary-plan/start", json={"max_rounds": 1001})
@@ -708,7 +708,7 @@ class TestBoundaryValues:
     def test_boundary_max_rounds_at_limits(self, sample_plan_factory, monkeypatch):
         """max_rounds at boundaries 1 and 1000 returns 200."""
         self._setup_start_ready_plan(sample_plan_factory)
-        monkeypatch.setattr("server.threading.Thread", FakeThread)
+        _patch_verification_worker_thread(monkeypatch, FakeThread)
         monkeypatch.setattr("server.VerificationOrchestrator", MagicMock())
         _stub_auto_loop(monkeypatch)
 
@@ -860,6 +860,66 @@ class NoOpFakeThread:
 
     def join(self, timeout=None):
         pass
+
+
+class _ThreadingShim:
+    """A ``threading`` stand-in whose ``Thread`` is a test double.
+
+    Same shape as the shim in
+    ``tests/api/test_start_execution_project_dir_guard.py``: the route
+    module gets its own ``threading`` namespace so only **its** worker
+    is replaced.  Everything that is not ``Thread`` is forwarded to the
+    real module, so the patched module keeps working normally if it
+    ever needs another attribute.
+    """
+
+    def __init__(self, thread_cls):
+        self.Thread = thread_cls
+
+    def __getattr__(self, name):
+        return getattr(threading, name)
+
+
+def _patch_verification_worker_thread(monkeypatch, thread_cls) -> None:
+    """Swap the **verification worker** thread for ``thread_cls``.
+
+    ``server.threading`` IS the global ``threading`` module, so
+    ``monkeypatch.setattr("server.threading.Thread", ...)`` replaced the
+    thread class for the **whole process**: every thread created while
+    the patch was live became a test double — including the lease
+    heartbeat threads ``verification_loop.py`` starts (commit 94c14a9).
+
+    ``FakeThread`` runs its target *synchronously*, so the heartbeat's
+    ``while not self._stop.wait(interval)`` loop ran inside the request
+    thread and never returned: ``POST /api/verification/{id}/start``
+    never produced a response and the test hung until pytest-timeout
+    killed it.
+
+    The double is scoped to ``routes.verification`` — the module that
+    creates the verification worker — so the worker still runs
+    synchronously (that is what these tests are about) while the
+    heartbeat keeps using the real ``threading.Thread``.
+    """
+    monkeypatch.setattr(
+        "routes.verification.threading", _ThreadingShim(thread_cls)
+    )
+
+
+def test_worker_thread_double_does_not_replace_global_threading(monkeypatch):
+    """The verification worker double must stay scoped to the route module.
+
+    ``threading.Thread`` is process-global: replacing it made the lease
+    heartbeat threads test doubles too, and ``FakeThread`` runs its
+    target synchronously — so the heartbeat's infinite loop ran inside
+    the request thread and ``POST /start`` never answered.
+    """
+    import routes.verification as routes_verification
+
+    real_thread = threading.Thread
+    _patch_verification_worker_thread(monkeypatch, FakeThread)
+
+    assert threading.Thread is real_thread
+    assert routes_verification.threading.Thread is FakeThread
 
 
 @pytest.mark.integration
