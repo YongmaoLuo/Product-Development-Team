@@ -41,6 +41,11 @@ from repair_generator import (
     normalise_declared_files,
     parse_repair_task_id,
 )
+from test_command_quality import (
+    covers_failing_cases,
+    failing_case_ids,
+    inspect_command,
+)
 
 __all__ = [
     "IMPLEMENTATION_KIND",
@@ -66,7 +71,7 @@ ROOT_CAUSE_DELIVERABLE = (
     "确定性复现步骤",
     "完整因果链",
     "一次覆盖所有层的修复方案",
-    "验收方式",
+    "验收方式（只选中这次失败的用例）",
 )
 
 
@@ -291,6 +296,20 @@ def build_implementation_task(
     if fix_plan:
         description_parts.append(f"修复方案：{fix_plan}")
 
+    test_command = _narrow_test_command(
+        str(report.get("test_command") or ""), evidence, vp,
+    )
+
+    # 2026-10-29 — the criterion is the task's ``test_command`` exit code.
+    # When the command was dropped (it was wide, or it was unusable) there
+    # is no exit code to speak of, and the report's own 验收方式 is what the
+    # task is judged by — so the criteria say so instead of naming a
+    # command the task does not carry.
+    if test_command:
+        acceptance = f"{vp} 的验收命令在改动后退出 0"
+    else:
+        acceptance = f"{vp} 按 {report_path} 里写的验收方式验收"
+
     return {
         "id": _allocate_task_id(
             round_number, existing_task_ids, seq_base, task_id,
@@ -299,12 +318,12 @@ def build_implementation_task(
         "title": f"实现 {vp} 的根因修复方案",
         "description": " ".join(description_parts),
         "acceptance_criteria": (
-            f"{vp} 的验收命令在改动后退出 0，且 {report_path} 里列出的"
+            f"{acceptance}，且 {report_path} 里列出的"
             "每一层根因都有对应的改动或被证明无关。"
         ),
         # 改动范围来自根因报告 —— 报告说改哪里，这里就改哪里。
         "files_to_modify": files,
-        "test_command": str(report.get("test_command") or ""),
+        "test_command": test_command,
         "source_report": report_path,
         "failed_vp_id": vp,
         "round": round_number,
@@ -313,3 +332,78 @@ def build_implementation_task(
         "status": "pending",
         "evidence": _evidence_payload(evidence),
     }
+
+
+def _evidence_text(evidence: Optional[Mapping[str, Any]]) -> str:
+    """Every string in the evidence mapping, concatenated.
+
+    The run output is spread over several fields (the verdict's own
+    message, the captured output) and *which* field carries pytest's
+    short summary depends on the runner — so there is no field
+    whitelist here. A whitelist would silently miss the runner that
+    puts its summary somewhere else, and the narrowing would then never
+    fire.
+    """
+    parts: List[str] = []
+
+    def _collect(value: Any) -> None:
+        if isinstance(value, str):
+            if value:
+                parts.append(value)
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                _collect(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                _collect(item)
+
+    _collect(evidence)
+    return "\n".join(parts)
+
+
+def _narrow_test_command(
+    command: str,
+    evidence: Optional[Mapping[str, Any]],
+    vp_id: str,
+) -> str:
+    """The implementation task's criterion — narrowed to the failed cases.
+
+    The task used to take the verification point's command verbatim, and
+    it did not even run the structural check the ordinary repair path
+    runs. For a ``full_ci`` point that command is the whole-repository
+    gate: one round of this task is then 45-70 minutes, and a fix needs
+    5-10 rounds. The gate is also a bad criterion — it is red for reasons
+    that have nothing to do with this fix.
+
+    So the command is checked twice: it has to be structurally sound (the
+    same check every other command in the codebase gets), and it has to
+    select the cases that actually failed. A command that fails either
+    check is dropped and the task ships without one — the same
+    degradation as a missing command: it falls back to the audit second
+    pass, which can actually pass, whereas a wide command guarantees a
+    false failure every round.
+
+    No case id in the evidence means there is nothing to narrow towards,
+    and the command is kept as it was.
+    """
+    command = str(command or "").strip()
+    if not command:
+        return ""
+
+    issues = inspect_command(command)
+    if issues:
+        print(
+            f"[RootCause] Discarding unusable test_command for {vp_id} "
+            f"({issues[0].code}): {command[:120]}"
+        )
+        return ""
+
+    case_ids = failing_case_ids(_evidence_text(evidence))
+    if case_ids and not covers_failing_cases(command, case_ids):
+        print(
+            f"[RootCause] Discarding wide test_command for {vp_id} "
+            f"(it does not select the cases that failed): {command[:120]}"
+        )
+        return ""
+
+    return command

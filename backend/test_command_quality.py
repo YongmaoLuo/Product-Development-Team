@@ -74,7 +74,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -1223,3 +1223,156 @@ def check_falsifiable(
             f"or the command's path, not the task."
         )
     return True, f"fails as required before the work (exit {completed.returncode})"
+
+
+# ---------------------------------------------------------------------------
+# Narrowing a criterion to the cases that actually failed
+# ---------------------------------------------------------------------------
+#
+# A repair task's criterion says "this is how we know the fix landed". When
+# the failing verification point is a ``full_ci`` point, its own command is
+# the whole-repository gate — and a gate is a bad criterion for a repair:
+# it is red for reasons that have nothing to do with the fix, and it costs
+# 45-70 minutes a round, so a fix that needs 5-10 rounds costs hours.
+#
+# The framework cannot write the narrow command itself: it does not know
+# the other side's runner or venv. What it *can* do is recognise which
+# cases failed, and refuse a candidate command that does not select them.
+# A refused command is dropped, which routes the row into the existing
+# bounded re-ask loop where the model — which does know the runner — writes
+# the narrow command.
+
+#: The short-summary marker: a line that starts with ``FAILED `` or
+#: ``ERROR `` names the case that failed. pytest's *progress* lines put the
+#: marker at the END of the line (``path::case FAILED``) and are not a
+#: summary, so only the leading marker is read.
+_FAILED_CASE_MARKER = re.compile(
+    r"^[ \t]*(?:FAILED|ERROR)[ \t]+(?P<case>\S+)", re.MULTILINE,
+)
+
+#: The pytest-timeout marker. pytest-timeout kills the run at its own
+#: deadline and prints the case it killed, wrapped in a rule of ``+``::
+#:
+#:     backend/tests/a.py::test_b +++++++ Timeout +++++++
+#:
+#: A run killed that way prints **no** short summary — the process is
+#: gone before pytest can write one — so this line is the only place
+#: the case is named, and a reader that only knows the short summary
+#: sees no case at all.
+#:
+#: The node id is the first token of the line and must start with
+#: something that is not ``+``: the same run also prints a bare rule
+#: of ``+`` around ``Timeout`` with no case on it, and that rule is
+#: decoration, not a case. The rule is separated from the id by
+#: blanks — the way pytest-timeout prints it — so the id is read up
+#: to the first blank and cannot swallow a ``+`` that belongs to the
+#: rule.
+_TIMEOUT_CASE_MARKER = re.compile(
+    r"^[ \t]*(?P<case>[^\s+]\S*)[ \t]+\+{2,}[ \t]+Timeout[ \t]+\+{2,}",
+    re.MULTILINE,
+)
+
+
+def _looks_like_case_id(token: str) -> bool:
+    """Whether ``token`` is a node id (or a test file) rather than prose.
+
+    pytest's summary writes ``path/to/test_x.py::test_name`` and, for a
+    collection error, the bare ``path/to/test_x.py``. Anything else — a
+    log line that merely starts with ``ERROR`` — is not a case.
+    """
+    if "::" in token:
+        return True
+    if token.endswith(".py"):
+        return True
+    return "/" in token or "\\" in token
+
+
+def failing_case_ids(run_output: str) -> List[str]:
+    """The case ids a run output names, in order, without repeats.
+
+    ``run_output`` is the raw output of a run — the whole thing, not a
+    field of it. There are two shapes, and a run can contain either or
+    both.
+
+    The first is pytest's own short summary::
+
+        =========================== short test summary info ============
+        FAILED backend/tests/a.py::test_b - AssertionError: assert 1 == 2
+        ERROR backend/tests/a.py::test_d - RuntimeError: boom
+
+    The token after the marker is the node id; the rest of the line is
+    the reason.
+
+    The second is pytest-timeout's own marker, which a run that was
+    killed at the timeout's deadline prints *instead of* a summary::
+
+        backend/tests/a.py::test_b +++++++ Timeout +++++++
+
+    That run never reaches the short summary — the process is gone
+    before pytest writes one — so this line is the only place the case
+    is named. Its node id must contain ``::``: the same run also prints
+    a bare rule of ``+`` around ``Timeout`` with no case on it, and a
+    rule is decoration, not a case.
+
+    A case reported twice is one case, so the ids are deduplicated
+    while keeping the order of first appearance — they go into a prompt,
+    where a duplicate would read as two different failures. The two
+    shapes are merged into that one order, so the ids read in the order
+    the output printed them.
+
+    A pure function: no I/O, no exception, no output. An output that names
+    no case (a build error, a service that never came up) yields ``[]`` —
+    the caller reads that as "there is nothing to narrow towards", not as
+    a failure.
+    """
+    if not run_output:
+        return []
+    found: List[Tuple[int, str]] = []
+    for match in _FAILED_CASE_MARKER.finditer(run_output):
+        token = match.group("case")
+        if not _looks_like_case_id(token):
+            continue
+        found.append((match.start(), token))
+    for match in _TIMEOUT_CASE_MARKER.finditer(run_output):
+        token = match.group("case")
+        if "::" not in token:
+            continue
+        found.append((match.start(), token))
+    found.sort(key=lambda item: item[0])
+    seen: set = set()
+    case_ids: List[str] = []
+    for _, token in found:
+        if token in seen:
+            continue
+        seen.add(token)
+        case_ids.append(token)
+    return case_ids
+
+
+def covers_failing_cases(command: str, case_ids: Sequence[str]) -> bool:
+    """Whether ``command`` selects exactly the cases in ``case_ids``.
+
+    A case counts as selected when the command names it, or names the file
+    it lives in — running the whole failing file still selects the failing
+    case, and it is still a narrow command.
+
+    An empty ``case_ids`` means there is nothing to narrow towards, so the
+    answer is ``True``: a command is not "wide" when there is no narrow
+    target to measure it against.
+
+    A pure function: no I/O, no exception, no output.
+    """
+    if not case_ids:
+        return True
+    text = str(command or "")
+    for case_id in case_ids:
+        candidate = str(case_id or "").strip()
+        if not candidate:
+            continue
+        if candidate in text:
+            continue
+        file_path = candidate.split("::", 1)[0]
+        if file_path and file_path in text:
+            continue
+        return False
+    return True
