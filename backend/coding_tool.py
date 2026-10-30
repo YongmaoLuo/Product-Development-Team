@@ -2579,6 +2579,90 @@ def _provider_is_parked(provider: str) -> bool:
         return False
 
 
+def _readmit_providers_for_quota_wait(
+    excluded: set,
+    scene_chain,
+    quota_map,
+    readmitted: set,
+    is_parked=None,
+):
+    """Let back in the providers that were excluded for no quota reason.
+
+    The exclusion set and the park are two books for one fact, and only
+    one of them can let a provider come back. The park carries its own
+    deadline, so a parked provider returns by itself; the exclusion set
+    does not expire at all — it rides down the retry chain and is only
+    rebuilt when the chain is rebuilt, so a provider written into it
+    stays out of the candidate set until something else rebuilds the
+    set.
+
+    That is what this function is for. The failure handler writes a
+    provider into ``excluded`` for whatever reason the failure
+    carried, and a reason that has nothing to do with quota — a
+    transient API error, say — is over the moment the error is. The
+    exclusion does not know that, and rides on. It is invisible while
+    the fleet still has a candidate, and it is not invisible when the
+    remaining candidates all go into a quota wait: the call then waits
+    for budget to come back with a provider that still has budget
+    sitting outside the pool.
+
+    So before such a wait, the providers that were excluded for a
+    non-quota reason are let back in — once each, and only the ones
+    that can actually serve:
+
+    * a provider whose own reading says it is out of budget stays out.
+      The wait is about that very fact, so reading it back in would
+      make the call wait on the thing it is already waiting for;
+    * a provider whose park has not expired stays out. The park is the
+      ledger of "not to be used right now", and it expires by itself;
+    * a provider with no reading at all comes back. "No reading" is the
+      absence of a fact, not a verdict — a provider dropped out of the
+      pool on no evidence is dropped out for no reason.
+
+    "Once" is load-bearing. The readmission is not a way to keep a
+    provider out and then let it back in indefinitely: a provider that
+    has been readmitted once is not readmitted again, so the exclusion
+    still stands from then on.
+
+    Args:
+        excluded: The exclusion set, read and modified in place. A
+            readmitted provider is discarded from it.
+        scene_chain: The chain the call dispatches along, in the order
+            it wants tried. A provider the chain does not name is
+            never readmitted — it is not in the pool.
+        quota_map: The live reading, provider name → quota row. Its
+            ``exhausted`` flag is the only verdict read; a missing
+            provider or an unreadable map is an unknown, not a
+            verdict.
+        readmitted: The providers already let back in, added to in
+            place. This is what makes the readmission happen once.
+        is_parked: The parked-provider test, defaulting to
+            :func:`_provider_is_parked`. Injected by tests.
+
+    Returns:
+        The providers readmitted by this call, in the chain's order.
+    """
+    parked = is_parked or _provider_is_parked
+    admitted = []
+    for name in scene_chain:
+        if name not in excluded or name in readmitted:
+            continue
+        if parked(name):
+            continue
+        quota = None
+        if quota_map:
+            try:
+                quota = quota_map.get(name)
+            except Exception:
+                quota = None
+        if quota is not None and bool(getattr(quota, "exhausted", False)):
+            continue
+        excluded.discard(name)
+        readmitted.add(name)
+        admitted.append(name)
+    return admitted
+
+
 #: The event an operator greps for when a capacity failure was
 #: classified without a live reading to stand on. It reports *how* the
 #: answer was reached and never changes it: the bucket the caller gets
@@ -2723,6 +2807,25 @@ def _classify_provider_failure(
     The answer itself does not move — the reading is still folded in
     first, and the order of the checks is untouched.
 
+    One answer does move, and only this wrapper moves it: an empty
+    status is read as ``rate_limited``. A provider failure that carries
+    no status code at all — ``status`` is ``None``, ``""`` or
+    whitespace — used to land in ``other``, and ``other`` is the bucket
+    that discards a provider outright, even when that provider still
+    has budget to spend. A missing status is not evidence of a bad
+    request; it is evidence that the provider answered without one,
+    which is what an overloaded upstream looks like from here. So the
+    empty status goes to the existing backoff (5s / 10s / 20s / 40s) on
+    the SAME provider, and only a refusal that survives every wait
+    excludes it. A status that IS present keeps its own bucket, the
+    prose still outranks the status, and the live reading still
+    outranks both.
+
+    The rule lives here and not in
+    :func:`dynamic_provider_concurrency.classify_capacity_failure`
+    because that function has another caller (``capacity_wait``) whose
+    contract must not change.
+
     Args:
         exc: The failure to classify.
         provider: The provider the failure came from. Empty means the
@@ -2740,11 +2843,16 @@ def _classify_provider_failure(
         exhausted = bool(getattr(quota, "exhausted", False))
     except Exception:
         exhausted = False
+    status_text = str(getattr(exc, "status", "") or "").strip()
     bucket = classify_capacity_failure(
         str(exc),
-        str(getattr(exc, "status", "") or ""),
+        status_text,
         live_exhausted=exhausted,
     )
+    if bucket == "other" and not status_text:
+        # An empty status is not a bad request — it is an answer that
+        # carried no code. Wait the provider out before dropping it.
+        bucket = "rate_limited"
     if provider:
         reason = _capacity_read_degradation_reason(provider)
         if reason:
@@ -3216,6 +3324,42 @@ class ClaudeCodingTool(CodingTool):
         # per-call private tracker would count only this tool's own work
         # and the per-provider caps would not bind.
         self._concurrency_tracker = concurrency_tracker or get_shared_tracker()
+        # 2026-10-29 — why each excluded provider was excluded.
+        #
+        # The exclusion set only ever held the provider's NAME, so the
+        # reason was gone by the time the provider came back: the
+        # readmission event could say "Vendor A is back" but not
+        # "Vendor A is back from the 500 that took it out". This is that
+        # memory: provider -> the kind of the failure it was excluded
+        # for (``other`` / ``rate_limited`` / ``exhausted`` / ``fatal``,
+        # or ``timeout`` for the timeout fallback).
+        #
+        # It is written in exactly one place — the moment a provider is
+        # appended to the exclusion set — and it is read for DIAGNOSIS
+        # ONLY. No routing decision reads it: the failure kind still
+        # decides what happens to a provider (park / wait / exclude /
+        # give up) exactly as before. A provider that is missing from
+        # here is read as ``"unknown"``.
+        self._excluded_provider_kinds: Dict[str, str] = {}
+        # 2026-10-29 — the providers already let back in by the quota
+        # wait, and the bound that makes the readmission happen ONCE.
+        #
+        # The readmission undoes an exclusion that has expired: a
+        # provider dropped for a transient error is let back in when
+        # the fleet is about to wait for budget it still has. It is not
+        # a way of keeping a provider out and then letting it in for as
+        # long as the caller keeps failing, so the names that have been
+        # readmitted are kept here and are not readmitted again.
+        #
+        # The ledger lives on the tool, NOT on the dispatch: every
+        # retry builds a fresh ``_run_claude_interactive``, and a
+        # per-dispatch ledger would let a provider that fails again be
+        # let back in on every single retry — "excluded, readmitted,
+        # failed, excluded, readmitted" for as long as the call lasts.
+        # It is cleared once per USER-level dispatch instead (see
+        # ``query`` and ``query_json``), so a provider that failed once
+        # in this call may come back once, and a second failure stands.
+        self._quota_readmitted_providers: set = set()
         # How long a dispatch waits for a free pool slot before giving up
         # and falling back to the parent config. Bounded well inside the
         # 900s default total timeout / 1800s executor task timeout so
@@ -4254,6 +4398,79 @@ class ClaudeCodingTool(CodingTool):
                                     "tracker": self._concurrency_tracker.snapshot(),
                                 },
                             )
+
+                        # 2026-10-29 — before the wait, let back in the
+                        # providers that were excluded for a reason that
+                        # has nothing to do with quota.
+                        #
+                        # The exclusion set holds names and does not
+                        # expire: it rides down the retry chain and is
+                        # only rebuilt when the chain is rebuilt. So a
+                        # provider dropped for a transient error stays
+                        # out of the candidate set for the whole call —
+                        # and the wait below is entered while a
+                        # provider that still has budget sits outside
+                        # the pool. The call would then wait for a
+                        # window that has already ended.
+                        #
+                        # So the excluded providers are offered back
+                        # before the wait, and only the ones that can
+                        # serve: a provider whose own reading says it
+                        # is shut stays out (the wait is about that
+                        # very fact), and a provider whose park has not
+                        # expired stays out (the park expires by
+                        # itself).
+                        #
+                        # The readmission happens ONCE each — the
+                        # ledger of the names already let back in lives
+                        # on the tool and is cleared once per user-level
+                        # dispatch, so a provider that comes back and
+                        # fails again is excluded again and stands.
+                        if _scene_diag.get("reason") == "quota_exhausted":
+                            _readmitted_now = _readmit_providers_for_quota_wait(
+                                excluded, scene_chain, quota_map,
+                                self._quota_readmitted_providers,
+                            )
+                            if _readmitted_now:
+                                if self.logger:
+                                    for _name in _readmitted_now:
+                                        self.logger.warning(
+                                            "provider_readmitted_after_quota_wait",
+                                            f"{_name} was excluded for a "
+                                            f"non-quota reason; readmitting "
+                                            f"it before the wait",
+                                            data={
+                                                "provider": _name,
+                                                "scene": effective_scene,
+                                                "reason": (
+                                                    self._excluded_provider_kinds
+                                                    .get(_name, "unknown")
+                                                ),
+                                                "quota_exhausted": _quota_blocked,
+                                            },
+                                        )
+                                # The candidate set is REBUILT, not
+                                # patched: same chain, same rules, same
+                                # park state read fresh. And the
+                                # selection is asked again the same way
+                                # it was asked the first time, so the
+                                # readmitted provider is picked by the
+                                # same rules that picked every other
+                                # one — not by hand.
+                                _collect_scene_candidates()
+                                _scene_diag["candidates"] = list(
+                                    scene_candidates
+                                )
+                                if scene_candidates:
+                                    chosen = acquire_provider_with_dynamic_capacity(
+                                        scene_candidates,
+                                        self._concurrency_tracker,
+                                        usage_map,
+                                        timeout=wait_sec,
+                                        quota_map=quota_map,
+                                    )
+                                    if chosen is not None:
+                                        continue
 
                         # Which of the two waits this is, asked with the
                         # same arithmetic the poller applied. A pool with
@@ -6844,6 +7061,11 @@ class ClaudeCodingTool(CodingTool):
                 new_excluded = list(excluded_providers or [])
                 if self.current_call_provider and self.current_call_provider not in new_excluded:
                     new_excluded.append(self.current_call_provider)
+                    # 2026-10-29 — why the provider was dropped, for the
+                    # readmission event to report later. A timeout never
+                    # went through the classifier, so the kind is named
+                    # here.
+                    self._excluded_provider_kinds[self.current_call_provider] = "timeout"
                 with self._process_lock:
                     proc = self._current_process
                     self._current_process = None
@@ -7070,6 +7292,14 @@ class ClaudeCodingTool(CodingTool):
                     and failed_provider not in new_excluded
                 ):
                     new_excluded.append(failed_provider)
+                    # 2026-10-29 — why the provider was dropped, for the
+                    # readmission event to report later. It is written
+                    # HERE and only here: this is the one branch that
+                    # puts a provider into the exclusion set, so this is
+                    # the one place the kind can be recorded. A provider
+                    # that was parked is not in the exclusion set, so it
+                    # is not in the ledger either — one book, one fact.
+                    self._excluded_provider_kinds[failed_provider] = kind
                 if self.logger:
                     self.logger.warning(
                         "provider_fallback",
@@ -7156,6 +7386,15 @@ class ClaudeCodingTool(CodingTool):
         if scripted_mode_enabled():
             return _scripted_registry().response(prompt)
 
+        # 2026-10-29 — the readmission ledger is per USER-level
+        # dispatch, and this is the start of one. It is cleared here
+        # rather than inside the dispatch because every retry builds a
+        # fresh ``_run_claude_interactive``: a per-dispatch ledger would
+        # let a provider that fails again be let back in on every
+        # retry, so "excluded, readmitted, failed" would loop for as
+        # long as the call lasts.
+        self._quota_readmitted_providers.clear()
+
         start_time = time.monotonic()
         prompt_len = len(prompt) if prompt else 0
         self._log_query_context(prompt, system_instruction, phase="query")
@@ -7197,6 +7436,11 @@ class ClaudeCodingTool(CodingTool):
         if scripted_mode_enabled():
             from utils.json_repair import parse_llm_json
             return parse_llm_json(_scripted_registry().response(prompt))
+
+        # 2026-10-29 — the readmission ledger is per USER-level
+        # dispatch, and this is the start of one. See ``query`` for why
+        # it is cleared here and not inside the dispatch.
+        self._quota_readmitted_providers.clear()
 
         # 2026-09-13: per-call model_type no longer swaps the model —
         # model management is delegated to CC Switch. The scene kwarg
@@ -7538,6 +7782,10 @@ class ClaudeCodingTool(CodingTool):
                 new_excluded = list(excluded_providers or [])
                 if self.current_call_provider and self.current_call_provider not in new_excluded:
                     new_excluded.append(self.current_call_provider)
+                    # 2026-10-29 — the same ledger the text path writes:
+                    # why the provider was dropped, for the readmission
+                    # event to report later.
+                    self._excluded_provider_kinds[self.current_call_provider] = "timeout"
                 # Kill residual child process before retry to prevent hang
                 with self._process_lock:
                     proc = self._current_process
@@ -7753,6 +8001,14 @@ class ClaudeCodingTool(CodingTool):
                     and failed_provider not in new_excluded
                 ):
                     new_excluded.append(failed_provider)
+                    # 2026-10-29 — why the provider was dropped, for the
+                    # readmission event to report later. It is written
+                    # HERE and only here: this is the one branch that
+                    # puts a provider into the exclusion set, so this is
+                    # the one place the kind can be recorded. A provider
+                    # that was parked is not in the exclusion set, so it
+                    # is not in the ledger either — one book, one fact.
+                    self._excluded_provider_kinds[failed_provider] = kind
                 if self.logger:
                     self.logger.warning(
                         "provider_fallback",
