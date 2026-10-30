@@ -140,6 +140,15 @@ _ROOT_CAUSE_SCOPE_HEADINGS = (
     "files to modify",
 )
 
+#: The event name the "the root-cause report named no file to change"
+#: warning carries. It is the name an operator greps for, so it must not
+#: change with the wording of the message.
+_ROOT_CAUSE_SCOPE_MISSING_EVENT = "root_cause_scope_missing"
+
+#: Why a point went to a human because its root-cause report named no
+#: file to change. It is also the reason the chain's record carries.
+_ROOT_CAUSE_SCOPE_MISSING_REASON = "root_cause_report_without_scope"
+
 
 def _decision_key_str(key: Tuple[str, str]) -> str:
     """The on-disk spelling of one ``(point, failure class)`` pair."""
@@ -1605,6 +1614,11 @@ class VerificationOrchestrator:
 
         actions: List[Dict[str, Any]] = []
         blocked: List[str] = []
+        # 2026-10-30: the points whose root-cause report came back
+        # without saying what to change. They go to a human — and the
+        # round says so, because a stop nobody can see is a stop nobody
+        # can act on.
+        scope_missing: List[str] = []
         for vp_id in sorted(vps):
             entry = vps[vp_id]
             stage = str(entry.get("stage") or _CHAIN_STAGE_ROOT_CAUSE)
@@ -1629,7 +1643,33 @@ class VerificationOrchestrator:
                 # touching the wrong files, so this goes to a human too.
                 entry["stage"] = CHAIN_STAGE_BLOCKED_ON_USER
                 entry["blocked_round"] = int(round_number)
-                entry["blocked_reason"] = "root_cause_report_without_scope"
+                entry["blocked_reason"] = _ROOT_CAUSE_SCOPE_MISSING_REASON
+                scope_missing.append(vp_id)
+                # 2026-10-30: this branch used to change the in-memory
+                # entry only — no log line, no summary field — so "why
+                # did the chain stop here?" was answerable only by
+                # whoever read the chain record on disk. One event per
+                # point: the stage moves to ``BLOCKED_ON_USER``, so the
+                # next round never comes back through this branch.
+                report_path = str(
+                    entry.get("report_path")
+                    or root_cause_report_path(self.plan_dir.name, vp_id)
+                )
+                try:
+                    self._log_audit(
+                        _ROOT_CAUSE_SCOPE_MISSING_EVENT,
+                        f"the root-cause report for {vp_id} names no file "
+                        f"to change — the point goes to a human",
+                        data={
+                            "plan_id": getattr(self.plan_dir, "name", "?"),
+                            "vp_id": vp_id,
+                            "report_path": report_path,
+                            "reason": _ROOT_CAUSE_SCOPE_MISSING_REASON,
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    # A log line is never a reason to fail a round.
+                    pass
                 blocked.append(vp_id)
                 continue
             if scope:
@@ -1658,6 +1698,9 @@ class VerificationOrchestrator:
                 },
                 "actions": [],
                 "blocked": [],
+                # The field is present on every return path, so a
+                # consumer can read it without guarding for its absence.
+                "scope_missing": [],
                 "vp_ids": [],
                 "terminal": False,
                 "active": False,
@@ -1682,6 +1725,11 @@ class VerificationOrchestrator:
             },
             "actions": actions,
             "blocked": blocked,
+            # 2026-10-30: the points whose root-cause report named no
+            # file to change. They are with a human, and the round says
+            # which ones — a stop that is not in the summary is a stop
+            # nobody can see.
+            "scope_missing": list(scope_missing),
             "vp_ids": sorted(vps),
             # The round ends here when every point the chain owns is with
             # a human: there is nothing left to dispatch, and nothing
@@ -3073,6 +3121,10 @@ class VerificationOrchestrator:
           whose repair row was re-scoped to a root-cause task
         - failure_fingerprints: Dict[str, List[Optional[str]]]   2026-10-27:
           the round's fingerprint pairs, as they were persisted
+        - root_cause_scope_missing: List[str]   2026-10-30: the points
+          whose root-cause report named no file to change — the ones the
+          chain handed to a human because nobody could act on the
+          diagnosis
         """
         overall_status = report.get("overall_status", "FAILED")
 
@@ -3173,6 +3225,11 @@ class VerificationOrchestrator:
                 "intent_conflicts": [],
                 "needs_operator_decision": False,
                 "environment_blocked": True,
+                # 2026-10-30: a round that judged nothing has no
+                # root-cause report to read — the field is present on
+                # every return path so a consumer can read it without
+                # guarding for its absence.
+                "root_cause_scope_missing": [],
             }
 
         # PASSED or PARTIAL with no real failures → treat as passed
@@ -3229,6 +3286,11 @@ class VerificationOrchestrator:
                 # them without guarding for their absence.
                 "root_cause_vp_ids": [],
                 "failure_fingerprints": {},
+                # 2026-10-30 — a passing round has no root-cause report
+                # to read. The field is present on every return path so
+                # a consumer can read it without guarding for its
+                # absence.
+                "root_cause_scope_missing": [],
             }
 
         # --- Failure path ---
@@ -3511,6 +3573,13 @@ class VerificationOrchestrator:
                     )
                 },
                 "root_cause_chain": chain_decision["payload"],
+                # 2026-10-30: the points whose root-cause report named
+                # no file to change. They are the reason this round
+                # stopped with a person in the loop — the summary says
+                # which ones, so the stop is not a mystery.
+                "root_cause_scope_missing": list(
+                    chain_decision.get("scope_missing") or []
+                ),
             }
         # Not yet at the cap — log and continue, generating
         # repair tasks again so the executor can try once more.
@@ -4275,6 +4344,13 @@ class VerificationOrchestrator:
             # a person in the loop.
             "root_cause_chain": chain_decision["payload"],
             "blocked_on_user": bool(chain_decision["terminal"]),
+            # 2026-10-30: the points whose root-cause report named no file
+            # to change — the ones the chain handed to a human because
+            # nobody could act on the diagnosis. The round says which
+            # ones, so the summary carries the stop's cause.
+            "root_cause_scope_missing": list(
+                chain_decision.get("scope_missing") or []
+            ),
             # 2026-10-27: the round's fingerprint pairs, exactly as they
             # were persisted. The payload on disk is the record; this is
             # the same record, handed to the caller.

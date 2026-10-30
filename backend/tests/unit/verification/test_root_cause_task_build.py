@@ -104,6 +104,10 @@ def test_root_cause_task_shape():
         # 2026-10-29 — 诊断书写的验收方式必须是「这次失败的那些用例」，
         # 不是整仓门禁：门禁一轮 45-70 分钟，修复要迭代 5-10 轮。
         "验收方式（只选中这次失败的用例）",
+        # 2026-10-30 — 改动范围是根因链的交接面：没有它，下一个实现任务
+        # 的 files_to_modify 就填不出来，根因链停在
+        # root_cause_report_without_scope。
+        "改动范围（要改动的文件，相对仓库根的路径）",
     ]
     # 只读任务不得声明改动范围。
     assert "files_to_modify" not in task

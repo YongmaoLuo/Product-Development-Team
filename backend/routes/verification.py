@@ -13,7 +13,7 @@ from fastapi import APIRouter
 from typing import Dict, List, Optional, Tuple, Any
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from datetime import datetime
 import json
 import os
@@ -1641,6 +1641,146 @@ def start_verification(plan_id: str, req: _server.StartVerificationRequest = Non
     }
 
 
+#: The root-cause chain's ledger file, relative to a plan directory.
+#:
+#: The same name the orchestrator writes it under
+#: (``verification/orchestrator.py`` ``_ROOT_CAUSE_CHAIN_FILENAME``): the
+#: reset has to delete exactly the file a round reads.
+_ROOT_CAUSE_CHAIN_FILENAME = "verification_root_cause_chain.json"
+
+
+def _plan_relative_report_path(
+    plan_id: str, report_path: Any,
+) -> Optional[str]:
+    """The plan-relative path of a report the chain names — or ``None``.
+
+    The chain's ``report_path`` is **repo-relative**: it is the value
+    :func:`root_cause_task.root_cause_report_path` returns, i.e.
+    ``plans/<plan_id>/reports/root-cause-<vp>.md``.
+
+    Three shapes are refused, and the reason is the same for all of them:
+    **the chain is data, and data does not get to name a file anywhere on
+    the disk.**
+
+    * an absolute path (``/etc/passwd``, ``C:\\...``) — it names a file
+      outside the plan tree entirely;
+    * a path with a ``..`` component — the same thing, one level up;
+    * a path that is not under ``plans/<plan_id>/`` — it names some other
+      plan's file, or a file outside the plans tree.
+
+    A refused path is skipped, not an error: one bad entry in the ledger
+    must not stop the reset from clearing the rest of it.
+    """
+    raw = str(report_path or "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw)
+    # ``PureWindowsPath`` catches the drive-letter form that
+    # ``Path.is_absolute`` does not on a POSIX host.
+    if candidate.is_absolute() or PureWindowsPath(raw).is_absolute():
+        return None
+    if ".." in candidate.parts:
+        return None
+    prefix = f"plans/{plan_id}/"
+    if not raw.startswith(prefix):
+        return None
+    relative = raw[len(prefix):]
+    if not relative:
+        return None
+    return relative
+
+
+def _load_root_cause_chain(chain_path: Path) -> Dict[str, Any]:
+    """The chain's ledger — an empty chain when it cannot be read.
+
+    A ledger that is missing, unreadable or malformed is **not** an error:
+    the reset's job is to clear it, and there is nothing to clear when
+    there is nothing there. Raising would turn "the ledger was already
+    gone" into a 500.
+    """
+    try:
+        raw = chain_path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        _server.logger.warning(
+            "[reset] root-cause chain ledger is not valid JSON: %s",
+            chain_path,
+        )
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def _clear_root_cause_chain(plan_id: str, plan_dir: Path) -> List[str]:
+    """Delete the chain's ledger and the reports it names.
+
+    Returns the plan-relative paths that were actually deleted.
+
+    The order is the ledger first: the ledger is the record of *which*
+    reports the chain owned, and once it is gone those reports are
+    orphans. The other order leaves a ledger pointing at files that are
+    already gone, and the next round would re-derive "the diagnosis was
+    delivered" from a file it can no longer read.
+
+    Only the files the ledger names are deleted — **never** a glob of the
+    reports directory: that directory also holds the reports of points
+    that are no longer on the chain, and a reset has no business taking
+    those with it.
+
+    A file that cannot be deleted is logged and skipped: one unwritable
+    file must not turn the whole reset into a 500.
+    """
+    chain_path = plan_dir / _ROOT_CAUSE_CHAIN_FILENAME
+    cleared: List[str] = []
+
+    chain = _load_root_cause_chain(chain_path)
+    vps = chain.get("vps")
+    targets: List[str] = []
+    if isinstance(vps, dict):
+        for vp_id in sorted(vps):
+            entry = vps.get(vp_id)
+            if not isinstance(entry, dict):
+                continue
+            relative = _plan_relative_report_path(
+                plan_id, entry.get("report_path"),
+            )
+            if relative is None:
+                _server.logger.warning(
+                    "[reset] skipping out-of-plan root-cause report_path "
+                    "plan=%s vp=%s path=%s",
+                    plan_id, vp_id, entry.get("report_path"),
+                )
+                continue
+            if relative not in targets:
+                targets.append(relative)
+
+    if chain_path.exists():
+        try:
+            chain_path.unlink()
+            cleared.append(_ROOT_CAUSE_CHAIN_FILENAME)
+        except OSError:
+            _server.logger.exception("[reset] unlink failed %s", chain_path)
+
+    for relative in targets:
+        target = plan_dir / relative
+        # Only *files* are deleted. A ``report_path`` that names a
+        # directory is not a report — and the contract says "delete the
+        # files the ledger names", not "delete what the ledger points at".
+        if not target.exists() or target.is_dir():
+            continue
+        try:
+            target.unlink()
+            cleared.append(relative)
+        except OSError:
+            _server.logger.exception("[reset] unlink failed %s", target)
+
+    return cleared
+
+
 @router.post("/api/verification/{plan_id}/reset")
 def reset_verification(
     plan_id: str,
@@ -1691,7 +1831,10 @@ def reset_verification(
     breaking change for no functional gain.
     ``plans/<id>/`` on disk      per-round verification artifacts, when
                                  ``clear_artifacts``; ``verification_plan.json``
-                                 only when ``clear_verification_plan``
+                                 only when ``clear_verification_plan``;
+                                 the root-cause chain's ledger and the
+                                 reports it names only when
+                                 ``clear_root_cause_chain``
     ===========================  ===============================================
 
     ``max_rounds`` is NOT touched — it is the plan's immutable budget
@@ -1939,6 +2082,16 @@ def reset_verification(
                 removed.append("verification_plan.json")
             except OSError:
                 _server.logger.exception("[reset] unlink failed %s", target)
+
+    # Gated on its own flag, like ``clear_verification_plan``: the chain
+    # is the plan's own history of where each point's root cause stood,
+    # and clearing it is a decision — not a side effect of a reset. The
+    # key is always present so a caller can read it without guarding for
+    # its absence.
+    chain_cleared: List[str] = []
+    if req.clear_root_cause_chain:
+        chain_cleared = _clear_root_cause_chain(plan_id, plan_dir)
+    summary["cleared"]["root_cause_chain"] = chain_cleared
 
     summary["cleared"]["disk_artifacts"] = removed
 

@@ -29,6 +29,12 @@
 ``files_to_modify`` 是**硬要求** —— 根因报告没给出路径时**拒绝生成**并
 报错。宁可这一轮不派任务（人来看一眼），也不要派一个没有改动范围的任务：
 那等于把「改哪里」这个问题原样丢回给执行器，而根因任务刚刚回答过它。
+
+「不带 files_to_modify」说的是**任务自己**不许改代码；它**报告**里却必须
+写清楚要改哪些文件 —— 那是下一个实现任务的唯一依据。所以根因任务的
+description 里带着一份可照抄的改动范围模板（:data:`_SCOPE_CONTRACT_TEMPLATE`），
+读者（``verification.orchestrator._root_cause_scope_from_text``）从报告里
+读出路径集合；读不出来就是 ``root_cause_report_without_scope``。
 """
 
 from __future__ import annotations
@@ -64,15 +70,52 @@ ROOT_CAUSE_KIND = "root_cause"
 IMPLEMENTATION_KIND = "implementation"
 
 
-#: 根因任务必须交付的四件事（arch 决策点 4）。少一件都不算完成根因定位：
+#: 根因任务必须交付的五件事（arch 决策点 4）。少一件都不算完成根因定位：
 #: 没有复现步骤就没法验证「修好了」；没有因果链就会重复上一轮的错；
-#: 没有「一次覆盖所有层」的方案就会又剥一层洋葱。
+#: 没有「一次覆盖所有层」的方案就会又剥一层洋葱；没有改动范围，下一个
+#: 实现任务就没有 ``files_to_modify`` 可填 —— 根因链会停在
+#: ``root_cause_report_without_scope``。
 ROOT_CAUSE_DELIVERABLE = (
     "确定性复现步骤",
     "完整因果链",
     "一次覆盖所有层的修复方案",
     "验收方式（只选中这次失败的用例）",
+    "改动范围（要改动的文件，相对仓库根的路径）",
 )
+
+
+#: 根因报告的改动范围模板（作者侧的契约）。
+#:
+#: 读者（``verification.orchestrator._root_cause_scope_from_text``）只认
+#: 两种形态：``_ROOT_CAUSE_SCOPE_HEADINGS`` 六种标题之一开头的章节，或者
+#: JSON 里的 ``paths`` / ``files_to_modify`` / ``fix_plan``。作者不知道
+#: 这个契约，报告就写成叙事体，读者的路径数为 0，根因链停摆。
+#:
+#: 标题用「改动范围」—— 读者常量表的首项，逐字对齐，不写「改动清单」
+#: 「变更文件」这类变体：读者只按前缀匹配常量表，差一点就整节落空。
+#:
+#: JSON 备选写成围栏块，而读者的 ``_json_body`` 只看全文**第一个**围栏块
+#: —— 所以这段正文里不能出现更早的围栏；「改动范围」这一节也必须自成
+#: 一节，能被原样切片喂回读者（回归钉子就是这么做的）。
+_SCOPE_CONTRACT_TEMPLATE = """
+
+## 改动范围
+
+- `backend/example_scope.py`
+
+报告里必须有一节「改动范围」，逐条列出这次修复要改动的文件（相对仓库根的路径）。
+实现任务允许改动的文件集合**只**取自这一节 —— 范围写漏，实现任务就改不动；
+没有这一节，根因链会停在 root_cause_report_without_scope。
+
+也可以用等价的 JSON 写法（键为 `files_to_modify` 与 `fix_plan`）：
+
+```json
+{
+  "files_to_modify": ["backend/example_scope.py"],
+  "fix_plan": "改哪个文件、怎么改、为什么这样改覆盖了所有层"
+}
+```
+"""
 
 
 def root_cause_report_path(plan_id: str, vp_id: str) -> str:
@@ -217,6 +260,8 @@ def build_root_cause_task(
             "上一轮针对旧根因的修复方案不再适用。先根据本轮证据定位当前"
             "根因，再给出一次覆盖所有层的修复方案，不要重复上一轮的方案。"
             f"根因报告写到 {report_path}。"
+            # 模板自带标题与代码块，逐行拼接反而难读。
+            f"{_SCOPE_CONTRACT_TEMPLATE}"
         ),
         # 只读：诊断任务的产出是报告，不是改动。
         "read_only": True,
