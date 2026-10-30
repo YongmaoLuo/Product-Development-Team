@@ -45,6 +45,12 @@ from project_dir_guard import ProjectDirInvalidError, validate_project_dir
 # described as a window that reopens by itself.
 from capacity_wait import WAIT_KIND_FIELD, quota_wait_event_data
 
+# The reader for the log file on disk — the disk half of the status
+# endpoint's ``logs`` field.  It is reached through its module object
+# rather than by value, following the same late-binding rule the
+# ``server`` import above follows.
+import execution_log_tail
+
 router = APIRouter()
 
 
@@ -689,6 +695,54 @@ class _ExecutionRead(NamedTuple):
 def _utc_now_iso() -> str:
     """This instant, as an ISO-8601 stamp that carries a timezone."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_started_at(value: Optional[str]) -> Optional[str]:
+    """A start time that says which instant it names.
+
+    ``started_at`` was written with ``datetime.now().isoformat()``: a
+    naive string that means the *writer's* local time and carries no
+    offset.  A reader in another timezone — the AC Scheduler — cannot
+    tell which instant such a string names; it reads one as UTC and
+    computes an age that is wrong by the writer's offset.  For an
+    Asia/Shanghai writer that is eight hours, so a plan that started
+    the previous evening reads as ~2386 minutes old and every tick
+    reports it STUCK.
+
+    Two kinds of stamp arrive here, and they are read differently:
+
+    * **A naive stamp is local time.**  It was written by
+      ``datetime.now()``, so it names the writer's wall clock.  It is
+      read as local time and answered with the local offset attached —
+      never as UTC, which would silently move the instant by the
+      writer's offset and re-create the very bug this fixes.
+    * **An aware stamp already says what it means.**  It is kept as it
+      is: its offset is the writer's own statement of the instant, and
+      rewriting it would move a time the writer was precise about.
+
+    A value that is not a stamp at all — ``None``, an empty string, a
+    non-string, a string no parser accepts — is answered unchanged.
+    This is a read path: it must never turn an unreadable field into
+    an error, and it must never invent a time the run did not have.
+    """
+    if not value or not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return value
+    if text.endswith(("Z", "z")):
+        # ``fromisoformat`` only learned to read a trailing ``Z`` in
+        # 3.11; spelling the offset out keeps the answer the same on
+        # every interpreter this code runs on.
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        # A naive stamp is local time, so it is read as local time.
+        parsed = parsed.astimezone()
+    return parsed.isoformat()
 
 
 def _quick_check(conn: sqlite3.Connection) -> Optional[str]:
@@ -1799,7 +1853,12 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
         "logs": logs,
         "project_dir": str(project_dir),
         "process": None,
-        "started_at": datetime.now().isoformat(),
+        # The start time names an instant, so it has to say which one:
+        # a naive local stamp is read as UTC by every reader that is
+        # not on this machine's timezone, and the age computed from it
+        # is wrong by this machine's offset.  ``_utc_now_iso()`` writes
+        # the same instant with its offset attached.
+        "started_at": _utc_now_iso(),
         "ended_at": None,
         "pid": None,
         "stop_reason": None,
@@ -2498,6 +2557,64 @@ class _ExecutionStatusResponse(_server.ExecutionStatusResponse):
     data_source_detail: Optional[Dict[str, Any]] = None
 
 
+def _status_logs(plan_id: str, state: Optional[dict], status: str) -> list[str]:
+    """The log lines a status answer carries.
+
+    The in-process buffer is the freshest view of the run, so it is
+    what the answer is made of whenever it holds anything.  It usually
+    holds nothing: the deque is created on start and never written to,
+    and the state restored from the row carries an empty one as well —
+    so after a restart, in a second process, or for a plan whose
+    directory the boot scan never walked, the answer's ``logs`` was
+    empty while the run was plainly doing something.
+
+    The activity is on disk: ``plans/{plan_id}/execution.log`` is where
+    the execution logger writes every entry.  So a run that says
+    ``running`` and holds no in-process line is answered from the tail
+    of that file.
+
+    Three rules keep the answer honest:
+
+      * **the disk is read only for a run that says it is going.**  A
+        terminal row's answer is the verdict it wrote down; a log tail
+        would only add noise to it.
+      * **the stamps are the log's own.**  The backfill reports what the
+        log says, so a log whose last entry is three hours old is
+        reported as three hours old.  A reader that asks "is this run
+        still making progress?" has to be able to trust the stamp, and
+        a refreshed one would turn a dead run into a live one.
+      * **a plan directory outside the plans root is not read.**  The
+        plan id is a leaf under the configured root, and a leaf that
+        resolves elsewhere belongs to another tree.
+
+    A missing or unreadable log is an empty list, never an error: the
+    endpoint renders a card, and a card must still render when the log
+    is gone.
+    """
+    inline = list(state.get("logs", [])) if state else []
+    if inline:
+        return execution_log_tail.normalize_status_logs(inline)
+    if status != "running":
+        return []
+
+    plans_dir = Path(_server.PLANS_DIR)
+    try:
+        plan_dir = _server._plan_dir(plan_id)
+    except Exception:  # noqa: BLE001 — observability must not 500 a poll
+        return []
+    if not _plan_dir_resolves_inside(plans_dir, plan_dir):
+        # The leaf points out of this instance's tree: it is another
+        # tree's plan, and reading it would answer about a plans root
+        # this process was never asked about.
+        return []
+
+    return execution_log_tail.read_status_log_tail(
+        plan_dir / "execution.log",
+        max_lines=execution_log_tail.MAX_TAIL_LINES,
+        max_bytes=execution_log_tail.MAX_TAIL_BYTES,
+    )
+
+
 @router.get("/api/execution/{plan_id}/status", response_model=_ExecutionStatusResponse)
 def get_execution_status(plan_id: str):
     """Poll execution status and logs.
@@ -2649,10 +2766,14 @@ def get_execution_status(plan_id: str):
         return {
             "plan_id": plan_id,
             "status": status,
-            "logs": list(s.get("logs", [])) if s else [],
+            "logs": _status_logs(plan_id, s, status),
             "project_dir": row.get("project_dir") or "",
             "pid": _row_pid(row, status),
-            "started_at": row.get("started_at"),
+            # The row's start time is normalised on the way out: a row
+            # written before the fix holds a naive local stamp, and a
+            # reader that cannot tell which instant it names computes
+            # a wrong age from it.
+            "started_at": _normalize_started_at(row.get("started_at")),
             "ended_at": _verdict_stamp(row),
             "stop_reason": stop_reason,
             "sync_targets": s.get("sync_targets") if s else None,
@@ -2663,13 +2784,16 @@ def get_execution_status(plan_id: str):
     if s:
         # No row, but this process holds a view of the run: the answer
         # is that view, and it says so — it was not read from the row.
+        status = s.get("status", "not_started")
         return {
             "plan_id": plan_id,
-            "status": s.get("status", "not_started"),
-            "logs": list(s.get("logs", [])),
+            "status": status,
+            "logs": _status_logs(plan_id, s, status),
             "project_dir": s.get("project_dir", ""),
             "pid": s.get("pid"),
-            "started_at": s.get("started_at"),
+            # Same rule as the row branch above: a start time that
+            # names an instant has to say which one.
+            "started_at": _normalize_started_at(s.get("started_at")),
             "ended_at": s.get("ended_at"),
             "stop_reason": s.get("stop_reason"),
             "sync_targets": s.get("sync_targets"),

@@ -135,6 +135,26 @@ _TEST_FILE_SUFFIXES = (
     ".test.ts", ".test.js", ".test.tsx",
 )
 
+#: Shell executables whose ``-c`` flag takes a *command string*.
+#:
+#: The payload of such a flag is a whole command line, not an argument —
+#: it has to be split again before the paths inside it can be read.
+_SHELL_BINARIES = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
+
+#: Letters allowed in a shell flag cluster that carries a command string.
+#: ``-c`` / ``-lc`` / ``-ic`` qualify; ``--norc`` does not (it contains a
+#: ``c`` but is not a command-string flag).
+_SHELL_COMMAND_FLAG_LETTERS = frozenset("cliev")
+
+#: Shell options that take a value of their own (``bash -o pipefail -c …``).
+_SHELL_OPTIONS_WITH_VALUE = frozenset({"-o", "+o"})
+
+#: Characters that end a command inside a compound command line.
+_COMMAND_SEPARATORS = ";&|"
+
+#: An environment assignment in front of a command (``FOO=bar cmd``).
+_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
 
 @dataclass
 class SchemaIssue:
@@ -251,28 +271,149 @@ def looks_narrowed(entry: str) -> Optional[str]:
     return None
 
 
-def _referenced_paths(entry: str, project_dir: Optional[Path]) -> List[str]:
+def _referenced_paths(entry: str, project_dir: Optional[Path] = None) -> List[str]:
     """Path-like tokens in ``entry`` that look repo-local.
 
     Heuristic on purpose, and only used for the *existence* check: a
     token with a ``/`` or a known script suffix that isn't an absolute
     path and isn't a URL.
-    """
-    try:
-        tokens = shlex.split(entry)
-    except ValueError:
-        tokens = entry.split()
 
+    A ``ci_entry`` is a *shell* command line, so the reader has to
+    understand compound commands — otherwise the entry is misread and the
+    gate is rejected before it runs:
+
+    * the payload of a shell's ``-c`` flag (``bash -c 'cd backend && …'``)
+      is a command **string**, not an argument: it is split again, and
+      the paths inside it are read as paths;
+    * a ``cd <dir>`` moves the commands that follow it into ``<dir>``, so
+      a relative path named after it is relative to that directory, not
+      to the repository root (``state_machine/tests`` after
+      ``cd backend`` is ``backend/state_machine/tests``).
+
+    The flag / absolute-path / URL skip rules are unchanged, and the
+    existence check in :func:`validate_vp` is not relaxed: a path that
+    cannot be found is still an issue.
+    """
+    return _collect_referenced_paths(_split_command_text(entry), "")
+
+
+def _split_command_text(text: str) -> List[str]:
+    """Split one command line into tokens, tolerating unbalanced quotes."""
+    try:
+        return shlex.split(text)
+    except ValueError:
+        # Unbalanced quotes — the shell will decide at run time.
+        return text.split()
+
+
+def _shell_command_payload(tokens: List[str], index: int) -> Optional[int]:
+    """Index of the command string a shell invocation carries, if any.
+
+    ``bash -c 'cd backend && …'`` — the payload is a whole command line,
+    so it has to be split again before the paths inside it can be read.
+
+    The flag has to belong to *this* invocation: the scan stops at the
+    first word that is not a flag, so the ``-c`` of a *later* command in
+    the chain is never mistaken for this one's payload.
+    """
+    if os.path.basename(tokens[index]) not in _SHELL_BINARIES:
+        return None
+    offset = index + 1
+    while offset < len(tokens):
+        flag = tokens[offset]
+        if not flag.startswith("-"):
+            # A command word — this shell invocation carries no -c.
+            return None
+        if flag in _SHELL_OPTIONS_WITH_VALUE:
+            offset += 2  # skip the option and its value
+            continue
+        letters = flag[1:]
+        if "c" in letters and set(letters) <= _SHELL_COMMAND_FLAG_LETTERS:
+            return offset + 1 if offset + 1 < len(tokens) else None
+        offset += 1
+    return None
+
+
+def _looks_like_path(token: str) -> bool:
+    """Is this token a repo-local path the gate names?"""
+    if token.startswith("-") or "://" in token or token.startswith("#"):
+        return False
+    if token.startswith("/") or token.startswith("~"):
+        # Absolute paths are outside the repo's contract; the
+        # project root is what a gate must be runnable from.
+        return False
+    return "/" in token or token.endswith((".py", ".sh", ".js", ".cjs", ".mjs", ".ts"))
+
+
+def _resolve_cd_target(base: str, target: str) -> str:
+    """The directory a ``cd <target>`` moves to, relative to the root."""
+    if not target:
+        return base
+    if target.startswith("~"):
+        target = os.path.expanduser(target)
+    if os.path.isabs(target):
+        return os.path.normpath(target)
+    return os.path.normpath(os.path.join(base, target))
+
+
+def _join_base(base: str, token: str) -> str:
+    """The token resolved against the directory the command runs in."""
+    if not base:
+        return token
+    return os.path.normpath(os.path.join(base, token))
+
+
+def _collect_referenced_paths(tokens: List[str], base: str) -> List[str]:
+    """Repo-relative paths named by ``tokens``, given the current ``base``.
+
+    ``base`` is the directory the commands run in — relative to the
+    repository root (``""`` = the root itself), or absolute when a
+    ``cd`` named an absolute directory.
+    """
     out: List[str] = []
-    for token in tokens:
-        if token.startswith("-") or "://" in token or token.startswith("#"):
+    index = 0
+    at_command_start = True
+
+    while index < len(tokens):
+        token = tokens[index].rstrip(_COMMAND_SEPARATORS)
+        if not token:
+            # A separator (``&&`` / ``||`` / ``;`` …): the next token
+            # starts a new command.
+            at_command_start = True
+            index += 1
             continue
-        if token.startswith("/") or token.startswith("~"):
-            # Absolute paths are outside the repo's contract; the
-            # project root is what a gate must be runnable from.
+
+        if at_command_start and _ENV_ASSIGNMENT_RE.match(token):
+            # ``FOO=bar cmd`` — an assignment, not a command word.
+            index += 1
             continue
-        if "/" in token or token.endswith((".py", ".sh", ".js", ".cjs", ".mjs", ".ts")):
-            out.append(token)
+
+        payload_index = _shell_command_payload(tokens, index)
+        if payload_index is not None:
+            # A shell command string: split it again and read the paths
+            # inside it. The payload runs in a subshell, so a ``cd`` in
+            # it does not change the directory of the outer chain.
+            out.extend(_collect_referenced_paths(
+                _split_command_text(tokens[payload_index]), base,
+            ))
+            index = payload_index + 1
+            at_command_start = False
+            continue
+
+        if at_command_start and token == "cd" and index + 1 < len(tokens):
+            base = _resolve_cd_target(
+                base, tokens[index + 1].rstrip(_COMMAND_SEPARATORS),
+            )
+            index += 2
+            at_command_start = False
+            continue
+
+        if _looks_like_path(token):
+            out.append(_join_base(base, token))
+
+        at_command_start = False
+        index += 1
+
     return out
 
 

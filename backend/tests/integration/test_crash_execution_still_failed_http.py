@@ -61,6 +61,7 @@ import os
 import subprocess
 import sys
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -135,6 +136,30 @@ def _seed_execution_row(plan_id: str, **fields: Any) -> None:
         )
     finally:
         conn.close()
+
+
+def _instant(value: str) -> datetime:
+    """The instant a stored start-time stamp names.
+
+    A naive stamp was written by ``datetime.now()`` — local time — so it
+    is read as local time here, exactly as the product reads it
+    (``routes.execution._normalize_started_at``).  Reading it as UTC
+    would move the instant by the writer's offset and answer a
+    different question than the one being asked.
+
+    Two stamps that name the same instant are the same moment; two
+    stamps that spell it differently are not two moments.
+    """
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        # ``fromisoformat`` only learned to read a trailing ``Z`` in
+        # 3.11; spelling the offset out keeps this identical on every
+        # interpreter the suite runs on.
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed
 
 
 def _execution_row(plan_id: str) -> dict:
@@ -970,7 +995,15 @@ def test_the_row_wins_over_a_stale_registry(
     assert body["stop_reason"] == "process_died_unexpectedly", (
         f"the interface did not carry the row's reason over: {body!r}"
     )
-    assert body["started_at"] == row["started_at"], (
+    # The answer has to name the SAME INSTANT as the row's stamp, not
+    # spell it the same way: a row written before the timezone fix holds
+    # a naive local stamp, and the status endpoint answers it with the
+    # offset attached, so the two spell one moment differently.  The
+    # question this test asks is "did the ROW win over the stale
+    # registry?", and comparing instants keeps that question intact —
+    # the stale registry's stamp names a moment months away, so an
+    # answer built from it still fails here.
+    assert _instant(body["started_at"]) == _instant(row["started_at"]), (
         f"the start time ({body['started_at']!r}) is not the row's "
         f"({row['started_at']!r}) — the answer was built from the stale "
         f"registry: {body!r}"
