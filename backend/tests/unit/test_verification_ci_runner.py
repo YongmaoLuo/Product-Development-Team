@@ -28,6 +28,7 @@ from verification_ci_runner import (  # noqa: E402
     DEFAULT_CI_TIMEOUT_SECONDS,
     STATUS_FAILED,
     STATUS_PASSED,
+    _referenced_paths,
     ci_timeout,
     looks_narrowed,
     run_ci_verification,
@@ -223,6 +224,106 @@ class TestValidateVp:
         assert validate_vp(
             _vp("python3 -m pytest backend/tests -q"), project_dir=tmp_path,
         ) == []
+
+
+# ---------------------------------------------------------------------------
+# validate_vp — compound command lines (2026-10-29)
+# ---------------------------------------------------------------------------
+#
+# A ``ci_entry`` is a *shell* command line, not a list of arguments. The
+# old path reader split it with ``shlex`` and stopped there — so the
+# quoted payload of ``bash -c '…'`` came out as ONE token, and the whole
+# string was then looked up as a path relative to the repository root.
+#
+# The consequence was not a nitpick: the gate's own entry
+# (``bash scripts/grep_guard.sh && bash scripts/run_tests.sh && bash -c
+# 'cd backend && ./.venv/bin/python -m pytest state_machine/tests -q'``)
+# was rejected at the schema stage with "path does not exist", the gate
+# never ran a single command, and the whole-repo regression evidence was
+# silently reduced to zero.
+#
+# Two things have to be understood for such an entry to be read
+# correctly: the payload of a shell's ``-c`` flag is a command *string*
+# (split it again), and a path named after a ``cd <dir>`` is relative to
+# the directory the command runs in, not to the repository root.
+
+
+class TestValidateVpCompoundCommands:
+    def test_quoted_bash_c_payload_is_split_not_treated_as_one_path(self):
+        payload = "cd backend && ./.venv/bin/python -m pytest state_machine/tests -q"
+        paths = _referenced_paths(f"bash -c '{payload}'")
+        # The quoted command string must not be looked up as one path …
+        assert payload not in paths
+        # … and the path inside it must be resolved against the ``cd``.
+        assert "backend/state_machine/tests" in paths
+
+    def test_cd_prefix_entry_passes_when_paths_exist(self, tmp_path):
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "grep_guard.sh").write_text("#!/bin/sh\n")
+        (tmp_path / "scripts" / "run_tests.sh").write_text("#!/bin/sh\n")
+        (tmp_path / "backend" / "state_machine" / "tests").mkdir(parents=True)
+        venv_bin = tmp_path / "backend" / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        (venv_bin / "python").write_text("#!/bin/sh\n")
+        entry = (
+            "bash scripts/grep_guard.sh && bash scripts/run_tests.sh && "
+            "bash -c 'cd backend && ./.venv/bin/python -m pytest "
+            "state_machine/tests -q'"
+        )
+        assert validate_vp(_vp(entry), project_dir=tmp_path) == []
+
+    def test_missing_path_after_cd_is_still_an_issue(self, tmp_path):
+        # Negative control: the ``cd`` must resolve the path, not turn the
+        # existence check into a no-op.
+        venv_bin = tmp_path / "backend" / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        (venv_bin / "python").write_text("#!/bin/sh\n")
+        entry = (
+            "bash -c 'cd backend && ./.venv/bin/python -m pytest "
+            "state_machine/tests -q'"
+        )
+        issues = validate_vp(_vp(entry), project_dir=tmp_path)
+        assert len(issues) == 1
+        assert "backend/state_machine/tests" in issues[0].detail
+        assert "不存在" in issues[0].detail
+
+    def test_path_after_cd_is_not_resolved_against_the_root(self, tmp_path):
+        # The same relative path exists at the repository root — it must
+        # still be reported, because the command runs in ``backend/``.
+        (tmp_path / "backend").mkdir()
+        (tmp_path / "state_machine" / "tests").mkdir(parents=True)
+        issues = validate_vp(
+            _vp("bash -c 'cd backend && pytest state_machine/tests -q'"),
+            project_dir=tmp_path,
+        )
+        assert any("backend/state_machine/tests" in i.detail for i in issues)
+
+    def test_cd_prefix_applies_to_the_commands_that_follow_it(self, tmp_path):
+        (tmp_path / "backend" / "scripts").mkdir(parents=True)
+        (tmp_path / "backend" / "scripts" / "run.sh").write_text("#!/bin/sh\n")
+        assert validate_vp(
+            _vp("cd backend && bash scripts/run.sh"), project_dir=tmp_path,
+        ) == []
+
+    def test_flags_urls_and_absolute_paths_are_still_skipped(self, tmp_path):
+        entry = (
+            "bash -c 'cd backend && pytest -q --junit-xml=out/report.xml "
+            "https://example.com/x /opt/bin/tool'"
+        )
+        assert validate_vp(_vp(entry), project_dir=tmp_path) == []
+
+    def test_run_ci_verification_runs_after_cd_resolution(self, tmp_path):
+        backend = tmp_path / "backend"
+        backend.mkdir()
+        stub = backend / "stub.sh"
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(0o755)
+        result = run_ci_verification(
+            _vp("bash -c 'cd backend && ./stub.sh'"), project_dir=tmp_path,
+        )
+        assert result.status == STATUS_PASSED
+        assert result.evidence["exit_code"] == 0
+        assert "schema_issues" not in result.evidence
 
 
 # ---------------------------------------------------------------------------
