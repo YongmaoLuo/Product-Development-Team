@@ -426,17 +426,18 @@ def test_evictable_respects_m_threshold(
 
         ledger = _ledger(conn, tmp_path / "plans", clock)
         candidates = ledger.evictable(clock(), 600)
+        plan_ids = [candidate["plan_id"] for candidate in candidates]
 
-        assert "young" not in candidates, (
+        assert "young" not in plan_ids, (
             f"a plan that ran for M-1 seconds was a candidate: {candidates!r}"
         )
-        assert "exact" in candidates, (
+        assert "exact" in plan_ids, (
             f"a plan that ran for M seconds was not a candidate: {candidates!r}"
         )
-        assert "older" in candidates, (
+        assert "older" in plan_ids, (
             f"a plan that ran for M+1 seconds was not a candidate: {candidates!r}"
         )
-        assert candidates == ["older", "exact"], (
+        assert plan_ids == ["older", "exact"], (
             "the candidates are not in a fixed order: {0!r}".format(candidates)
         )
     finally:
