@@ -65,6 +65,90 @@ def _no_ambient_profile(monkeypatch):
     """No test should inherit a profile from the developer's own setup."""
     monkeypatch.delenv("PDT_SANDBOX_PROFILE", raising=False)
 
+
+# ---------------------------------------------------------------------------
+# The cases that need a real OS sandbox
+# ---------------------------------------------------------------------------
+#
+# Five of the cases below apply a profile and read back what the kernel
+# did with it.  macOS only accepts a *nested* profile when the enclosing
+# sandbox contains it, so a host that is already inside an OS sandbox
+# refuses the application with ``sandbox_apply: Operation not
+# permitted`` — which is what a verification host that runs the whole
+# gate inside a sandbox looks like.
+#
+# That refusal is a fact about the host, not about the code under test,
+# so these cases say so and skip, with the reason, instead of reporting
+# a defect that is not there.  They carry ``needs_real_process`` so the
+# parallel CI shards leave them alone: applying a profile needs a
+# machine that will apply one.
+#
+# The skip is deliberately narrow — it is the *nesting* refusal that
+# skips, not any failure to apply a profile.  A profile that does not
+# parse is a defect and is reported as one (``_BROKEN`` above).
+
+
+def _skip_unless_the_host_can_apply_a_profile() -> None:
+    """Skip the case when this host cannot apply an OS sandbox profile.
+
+    Called from the body of a case rather than requested as a fixture:
+    the case's own signature is part of the file's shape, and a case
+    that changed shape would read as a case that was replaced.
+    """
+    if already_sandboxed():
+        pytest.skip(
+            "this process is already inside an OS sandbox, and macOS only "
+            "accepts a nested profile that the enclosing one contains, so "
+            "the application is refused with 'sandbox_apply: Operation not "
+            "permitted' — the case cannot exercise the sandbox here"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Marker registration
+# ---------------------------------------------------------------------------
+#
+# ``backend/pytest.ini`` — the config a ``backend/tests`` run resolves —
+# runs pytest with ``--strict-markers``, and pytest checks a marker at the
+# moment it is *used* (``pytest.mark.<name>``), so a case that carries a
+# marker the governing config does not declare aborts collection for its
+# whole module: pytest reports "not found in `markers` configuration
+# option", collects nothing from that module, and the run looks green over
+# an empty room.
+#
+# ``needs_real_process`` is declared in the repo-root ``pytest.ini`` and
+# not in ``backend/pytest.ini``, whose marker list is frozen by
+# ``backend/tests/static_gates/test_keychain_macos_job_is_a_merge_gate.py``.
+# The module therefore registers the marker with the live config before it
+# uses it — the pattern
+# ``backend/tests/integration/test_context_pack_reduces_exploration.py``
+# established for ``observational``.
+_NEEDS_REAL_PROCESS_DESCRIPTION = (
+    "needs_real_process: cases that drive a real server / real subprocess / "
+    "real repository rather than a fixture double, so they need a quiet "
+    "machine and a port to themselves."
+)
+
+
+def _register_needs_real_process_marker() -> None:
+    """Declare the ``needs_real_process`` marker with the live pytest config."""
+    config = getattr(pytest.mark, "_config", None)
+    if config is None:  # pragma: no cover - a collection always has a config
+        return
+    known = {
+        line.split(":")[0].split("(")[0].strip()
+        for line in config.getini("markers")
+    }
+    if "needs_real_process" not in known:
+        config.addinivalue_line("markers", _NEEDS_REAL_PROCESS_DESCRIPTION)
+
+
+_register_needs_real_process_marker()
+
+
+#: The five cases that need the kernel, not a mock.
+_NEEDS_OS_SANDBOX = pytest.mark.needs_real_process
+
 #: ``_validate`` checks the platform before it checks anything the tests
 #: below mock out, so a test that never reaches ``sandbox-exec`` still
 #: needs the macOS gate. Without it the whole group fails on a Linux
@@ -108,7 +192,9 @@ def test_unconfigured_does_not_touch_env(monkeypatch):
 
 
 @_REQUIRES_MACOS
+@_NEEDS_OS_SANDBOX
 def test_caller_command_list_is_not_mutated(monkeypatch, tmp_path):
+    _skip_unless_the_host_can_apply_a_profile()
     monkeypatch.setenv("PDT_SANDBOX_PROFILE", str(_write(tmp_path, _APPLICABLE)))
     original = list(CMD)
     wrap_command(CMD)
@@ -121,7 +207,9 @@ def test_caller_command_list_is_not_mutated(monkeypatch, tmp_path):
 
 
 @_REQUIRES_MACOS
+@_NEEDS_OS_SANDBOX
 def test_configured_profile_wraps_the_argv(monkeypatch, tmp_path):
+    _skip_unless_the_host_can_apply_a_profile()
     monkeypatch.setenv("PDT_SANDBOX_PROFILE", str(_write(tmp_path, _APPLICABLE)))
     decision = wrap_command(CMD)
 
@@ -137,7 +225,9 @@ def test_configured_profile_wraps_the_argv(monkeypatch, tmp_path):
 
 
 @_REQUIRES_MACOS
+@_NEEDS_OS_SANDBOX
 def test_wrapped_env_records_the_profile(monkeypatch, tmp_path):
+    _skip_unless_the_host_can_apply_a_profile()
     profile = _write(tmp_path, _APPLICABLE)
     monkeypatch.setenv("PDT_SANDBOX_PROFILE", str(profile))
     env = {"PATH": "/usr/bin"}
@@ -149,7 +239,9 @@ def test_wrapped_env_records_the_profile(monkeypatch, tmp_path):
 
 
 @_REQUIRES_MACOS
+@_NEEDS_OS_SANDBOX
 def test_profile_content_is_left_alone(monkeypatch, tmp_path):
+    _skip_unless_the_host_can_apply_a_profile()
     profile = _write(tmp_path, _APPLICABLE)
     before = profile.read_text(encoding="utf-8")
     monkeypatch.setenv("PDT_SANDBOX_PROFILE", str(profile))
@@ -341,7 +433,9 @@ EXAMPLE = BACKEND_DIR.parent / "example" / "sandbox_profile.sb.example"
 
 
 @_REQUIRES_MACOS
+@_NEEDS_OS_SANDBOX
 def test_the_shipped_example_profile_applies():
+    _skip_unless_the_host_can_apply_a_profile()
     assert EXAMPLE.is_file(), f"missing {EXAMPLE}"
     proc = subprocess.run(
         ["sandbox-exec", "-f", str(EXAMPLE), "/usr/bin/true"],

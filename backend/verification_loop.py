@@ -27,6 +27,13 @@ import threading
 import time
 import uuid
 
+# 2026-10-29: the base-drift check's own vocabulary.  The round the
+# check blocked carries ``stop_reason`` = the check's event name for the
+# ``conflicts`` status, so the loop recognises that round by the same
+# word the event log uses.  The module is stdlib-only and has no
+# import-time side effects, so a top-level import carries no cycle
+# risk.
+import base_drift
 # Late binding into the application module: ``server`` owns the shared
 # helpers, request models and module globals, and the suite monkeypatches
 # them as ``server.<name>``. Reaching them through the module object —
@@ -6066,6 +6073,84 @@ def _service_preflight_blocked_report(
     return failure
 
 
+# ---------------------------------------------------------------------------
+# The base-drift hand-off (2026-10-29)
+# ---------------------------------------------------------------------------
+#
+# A round the base-drift check blocked dispatched nothing: the branch
+# had drifted away from its base and merging the base back left
+# conflicts.  Such a round has no verdict to give — its report is
+# empty, and an empty report that reaches ``check_cycle_conditions``
+# reads as "everything failed", which sends the repair chain after a
+# product nobody ever looked at.
+#
+# What the loop does with such a round depends on what the check left
+# behind:
+#
+#   * no repair task — the conflict was not turned into work, so the
+#     round ends here and says why;
+#   * a repair task — the conflict went through the repair channel that
+#     already exists, so the round hands the plan to the executor, the
+#     way every other repair round does.
+
+#: The ``stop_reason`` a round blocked by a base-drift conflict
+#: carries.  It is the base-drift check's own event name for the
+#: ``conflicts`` status — the stopped round and the event log say the
+#: same word.
+BASE_DRIFT_CONFLICTS_STOP_REASON = base_drift.EVENT_BY_STATUS[
+    base_drift.STATUS_CONFLICTS
+]
+
+#: The base-drift status that blocks a round.
+BASE_DRIFT_CONFLICTS_STATUS = base_drift.STATUS_CONFLICTS
+
+
+def _base_drift_blocked_report(
+    report: Any,
+) -> Optional[Dict[str, Any]]:
+    """The conflict a base-drift-blocked round carries, or ``None``.
+
+    A report whose ``stop_reason`` is ``base_drift_conflicts`` says the
+    round never dispatched a verification point: the branch had drifted
+    away from its base, and merging the base back left conflicts.  The
+    conflict's own evidence travels with the report — which base was
+    merged, at which commit, and which files are in conflict — so the
+    loop can write it down and end the round without a verdict.
+
+    Only that one ``stop_reason`` counts.  A round that ran, a round
+    blocked by its services, a round that simply failed: none of them
+    is this function's business.
+    """
+    if not isinstance(report, dict):
+        return None
+    if str(report.get("stop_reason") or "") != BASE_DRIFT_CONFLICTS_STOP_REASON:
+        return None
+    conflicts = report.get("base_drift_conflicts")
+    blocked = dict(conflicts) if isinstance(conflicts, dict) else {}
+    if not blocked.get("status"):
+        blocked["status"] = BASE_DRIFT_CONFLICTS_STATUS
+    return blocked
+
+
+def _base_drift_round_action(report: Any) -> Optional[str]:
+    """What the loop does with a base-drift-blocked round.
+
+    ``"stop"`` — the conflict was not turned into a repair task, so the
+    round ends here and the reason is written down.  ``"repair"`` — the
+    conflict became a task through the repair channel that already
+    exists, so the round hands the plan to the executor.  ``None`` —
+    this report is not a base-drift report at all.
+
+    A task id that is empty, blank or missing is **no** task: there is
+    nothing to repair with, and a repair dispatch with nothing behind
+    it would send the executor after an empty queue.
+    """
+    if _base_drift_blocked_report(report) is None:
+        return None
+    task_id = (report.get("base_drift_repair_task_id") or "").strip()
+    return "repair" if task_id else "stop"
+
+
 class _VerificationLoopOutcome:
     """Whether the loop ended the workflow or handed it off.
 
@@ -6671,6 +6756,44 @@ def _make_repair_on_complete(
                 # out.  The chain ends here; the refusal was written
                 # down by the dispatch.
                 if _service_preflight_blocked_report(_report) is not None:
+                    return
+                # 2026-10-30 (VP-012): the round was blocked by the
+                # base-drift check — the branch had drifted away from
+                # its base and merging the base back left conflicts.
+                # The round dispatched nothing, so its report is empty:
+                # sending it to ``check_cycle_conditions`` would read
+                # the block as a failure and send the repair chain
+                # after a product nobody ever looked at.  This is the
+                # SECOND judgment point — the auto-loop's own round is
+                # the first — and the blocked round is owed the same
+                # treatment here.
+                _base_drift_blocked = _base_drift_blocked_report(_report)
+                if _base_drift_blocked is not None:
+                    if _base_drift_round_action(_report) == "repair":
+                        # The conflict went through the repair channel
+                        # that already exists, so the round hands the
+                        # plan to the executor the way every other
+                        # repair round does.  The callback is the one
+                        # that is running — this scope has no loop
+                        # outcome to hand over, and a second callback
+                        # would be a second post-repair chain.
+                        _server._run_repair_execution_async(
+                            plan_id, project_dir, tool=tool,
+                            on_complete=_on_repair_complete,
+                        )
+                        return
+                    # No repair task behind the conflict: there is
+                    # nothing to repair with, so the round ends here
+                    # and says why.
+                    _server.logger.warning(
+                        "[Auto-Verification] repair callback: round "
+                        "blocked by base drift — no repair task to run; "
+                        "stopping plan=%s",
+                        plan_id,
+                    )
+                    _record_terminal(
+                        "loop_stopped", BASE_DRIFT_CONFLICTS_STOP_REASON,
+                    )
                     return
                 # The round has run against the addresses the ledger
                 # names — write them down (2026-10-25, repair-r1-25).
@@ -7294,6 +7417,42 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
             if _preflight_blocked is not None:
                 _record_terminal(
                     "loop_stopped", SERVICE_PREFLIGHT_ERROR_KIND,
+                )
+                return
+            # 2026-10-29: the round was blocked by the base-drift check
+            # — the branch had drifted away from its base and merging
+            # the base back left conflicts.  The round dispatched
+            # nothing, so its report is empty: sending it to
+            # ``check_cycle_conditions`` would read the block as a
+            # failure and send the repair chain after a product nobody
+            # ever looked at.
+            _base_drift_blocked = _base_drift_blocked_report(report)
+            if _base_drift_blocked is not None:
+                if _base_drift_round_action(report) == "repair":
+                    # The conflict went through the repair channel that
+                    # already exists, so the round hands the plan to the
+                    # executor the way every other repair round does.
+                    # The callback is built HERE: the loop's own
+                    # ``_on_repair_complete`` is bound further down,
+                    # and this branch runs first.
+                    _base_drift_on_complete = _make_repair_on_complete(
+                        plan_id, project_dir, tool,
+                    )
+                    _server._run_repair_execution_async(
+                        plan_id, project_dir, tool=tool,
+                        on_complete=_base_drift_on_complete,
+                        outcome=outcome,
+                    )
+                    return
+                # No repair task behind the conflict: there is nothing
+                # to repair with, so the round ends here and says why.
+                _server.logger.warning(
+                    "[Auto-Verification] Round %d blocked by base drift "
+                    "— no repair task to run; stopping plan=%s",
+                    round_num, plan_id,
+                )
+                _record_terminal(
+                    "loop_stopped", BASE_DRIFT_CONFLICTS_STOP_REASON,
                 )
                 return
             # The round has run against the addresses the ledger names —
