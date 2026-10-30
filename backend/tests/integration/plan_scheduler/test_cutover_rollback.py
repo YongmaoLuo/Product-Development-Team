@@ -11,18 +11,18 @@ single act, and it has two halves:
   schedulers are two writers, and the whole point of the change is
   that there is one;
 * the **rollback** — ``scheduler.enabled: false`` in the configuration.
-  It stops the whole worker; it is not a pause.  And it lives in the
-  configuration *only*: a button that stops every plan in the system
-  is one misclick away from an outage, so there is no such button,
-  and there is no endpoint that does what it would do.
+  It stops everything the worker does; it is not a pause.  And it lives
+  in the configuration *only*: a button that stops every plan in the
+  system is one misclick away from an outage, so there is no such
+  button, and there is no endpoint that does what it would do.
 
 What is pinned here
 -------------------
-1. **The rollback writes nothing.**  ``enabled: false`` starts no
-   worker and writes no row: not to the queue, not to the slots, not
-   to the commands, and not to a plan's phase.  The rows that are
-   already there stay exactly as they were — a rollback stops the
-   writing, it does not undo the history.
+1. **The rollback writes nothing.**  ``enabled: false`` makes the tick
+   do nothing at all and writes no row: not to the queue, not to the
+   slots, not to the commands, and not to a plan's phase.  The rows
+   that are already there stay exactly as they were — a rollback stops
+   the writing, it does not undo the history.
 2. **The cutover leaves one scheduler.**  While the new engine runs,
    exactly one worker exists, at every moment the case looks, and
    asking for a second one does not produce a second scheduler.
@@ -731,11 +731,13 @@ def engine_probe(monkeypatch) -> List[Any]:
 def test_disabled_rollback_stops_all_writes(
     server_module, startup, settings, world
 ) -> None:
-    """``enabled: false`` — the worker never starts and nothing is written.
+    """``enabled: false`` — the worker ticks and nothing is written.
 
     The rollback switch is a switch, not a pause.  A scheduler that is
-    switched off must leave no thread behind, must write no row of its
-    own, and must not move a plan's phase.
+    switched off must write no row of its own and must not move a
+    plan's phase.  Its worker is still there — the switch is read on
+    every tick, so it can be turned on without a restart — and the tick
+    it runs is a tick that does nothing at all.
 
     The rows that are already there stay exactly as they were.  The
     queue row of a plan that is not waiting is a row a *running*
@@ -776,15 +778,37 @@ def test_disabled_rollback_stops_all_writes(
     )
 
     app = _FakeApp()
-    _drive(server_module, app)
+    observed: Dict[str, Any] = {}
+
+    def _inside() -> None:
+        engine = app.state.scheduler_engine
+        observed["engine"] = engine
+        observed["threads"] = [t.name for t in _engine_threads()]
+        # The worker has to tick: a worker that does not tick cannot
+        # notice that the switch was turned on.
+        deadline = time.monotonic() + 5.0
+        while (
+            engine is not None
+            and engine.ticks < 2
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        observed["ticks"] = engine.ticks if engine is not None else 0
+
+    _drive(server_module, app, _inside)
 
     # -- the worker -------------------------------------------------------
-    assert app.state.scheduler_engine is None, (
-        "a disabled scheduler must leave no engine on the app"
+    assert observed["engine"] is not None, (
+        "the scheduler's worker was not built — the switch is read on "
+        "every tick, so it can be turned on without a restart"
     )
-    assert _engine_threads() == [], (
-        "a disabled scheduler started a worker thread: "
-        f"{[t.name for t in _engine_threads()]!r}"
+    assert observed["threads"] == [THREAD_NAME], (
+        "the scheduler's worker thread is not the one it should be: "
+        f"{observed['threads']!r}"
+    )
+    assert observed["ticks"] >= 1, (
+        "the worker never ticked — a worker that does not tick cannot "
+        "notice that the switch was turned on"
     )
 
     # -- the writes -------------------------------------------------------
@@ -870,15 +894,20 @@ def test_single_scheduler_after_cutover(
     )
 
     before_app = _FakeApp()
-    _drive(server_module, before_app)
+    before_threads: List[threading.Thread] = []
 
-    assert engine_probe == [], (
-        "a scheduler was built before the cutover: "
+    def _before_inside() -> None:
+        before_threads.extend(_engine_threads())
+
+    _drive(server_module, before_app, _before_inside)
+
+    assert len(engine_probe) == 1, (
+        "the scheduler's worker was not built before the cutover: "
         f"{[type(e).__name__ for e in engine_probe]!r}"
     )
-    assert _engine_threads() == [], (
-        "a scheduler was running before the cutover: "
-        f"{[t.name for t in _engine_threads()]!r}"
+    assert len(before_threads) == 1, (
+        "the scheduler's worker was not running before the cutover: "
+        f"{[t.name for t in before_threads]!r}"
     )
     assert _probe_writes(world.db_path) == [], (
         "something wrote before the cutover: "
@@ -921,10 +950,12 @@ def test_single_scheduler_after_cutover(
         observed["after_again"] = len(_engine_threads())
 
     app = _FakeApp()
+    built_before_cutover = len(engine_probe)
     _drive(server_module, app, _inside)
 
-    assert len(engine_probe) == 1, (
-        f"the cutover built {len(engine_probe)} schedulers: "
+    assert len(engine_probe) == built_before_cutover + 1, (
+        f"the cutover built {len(engine_probe) - built_before_cutover} "
+        f"schedulers: "
         f"{[type(e).__name__ for e in engine_probe]!r}. Two schedulers are "
         "two writers."
     )

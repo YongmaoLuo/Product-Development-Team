@@ -1,0 +1,100 @@
+# Scheduler Settings
+# =============================================================================
+# The native scheduler's own settings: whether it may run, how many plans
+# it runs at the same time, and how often it looks.
+#
+# Copy this file to your config directory and edit it for your own setup:
+#
+#     mkdir -p .config && cp example/scheduler.yaml.example \
+#         .config/scheduler.yaml
+#
+# The real file is gitignored (``.config/``). That is deliberate: these are
+# *your* settings — how many plans your machine runs at once — so a table of
+# concrete values in source would compile one deployment's numbers into every
+# install.
+#
+# The file is read at boot, and the settings are re-read whenever the file
+# changes: the scheduler notices a new value on its next tick, so most of
+# them do not need a restart.
+#
+# ``PDT_SCHEDULER_FILE`` overrides the path.
+#
+# -----------------------------------------------------------------------------
+# WHERE THE FILE IS LOOKED FOR
+# -----------------------------------------------------------------------------
+# The first file that is there is the one that is read:
+#
+#   1. the file ``PDT_SCHEDULER_FILE`` names;
+#   2. ``<config dir>/scheduler.yaml`` — this file, once it is copied in;
+#   3. ``backend/config.yaml`` — the section the repository ships with.
+#
+# A file that is not there is skipped, and so is one that cannot be read.
+# When no file is there at all, the built-in defaults apply — and those say
+# ``enabled: false``, so a scheduler nobody configured schedules nothing.
+#
+# -----------------------------------------------------------------------------
+# WHAT EACH SETTING DOES
+# -----------------------------------------------------------------------------
+# ``enabled``
+#     Whether the scheduler may run at all.  ``false`` means it schedules
+#     nothing and writes nothing; it does not stop the plans that are already
+#     running.  The setting is read on every tick, so it can be turned on and
+#     off without a restart.  It is a configuration value and nothing else:
+#     there is no button and no endpoint that flips it.
+#
+# ``dry_run``
+#     Run the whole pipeline and write down what it decided, without
+#     starting, stopping or moving any plan.  This is how the cutover is
+#     rehearsed.
+#
+# ``capacity``
+#     How many plans may run at the same time.  ``0`` is a coherent answer
+#     ("run nothing"); a negative number is not, and a file that carries one
+#     is refused whole.
+#
+# ``min_runtime_seconds``
+#     How long a young run is left alone before it may be interrupted to
+#     make room for another plan.  A plan that has just started is not
+#     interrupted, however far the capacity is exceeded.
+#
+# ``tick_seconds``
+#     How long the scheduler waits between two ticks — that is, how often it
+#     looks at the world and decides.
+#
+# ``command_timeout_seconds``
+#     How long a single operator action may take before the caller is told
+#     that it is still in flight.
+#
+# -----------------------------------------------------------------------------
+# DEFAULTS
+# -----------------------------------------------------------------------------
+# Every key may be left out.  A missing key takes its default, and a missing
+# file takes all of them:
+#
+#   enabled                false
+#   dry_run                false
+#   capacity               4
+#   min_runtime_seconds    600
+#   tick_seconds           5
+#   command_timeout_seconds 30
+# =============================================================================
+
+scheduler:
+  # Whether the scheduler may run at all.  Start with ``false``: the first
+  # thing to do is a dry run, and the second is to watch what it decided.
+  enabled: false
+
+  # Rehearse the whole pipeline without touching a single plan.
+  dry_run: false
+
+  # How many plans may run at the same time.
+  capacity: 4
+
+  # How long a young run is left alone before it may be interrupted.
+  min_runtime_seconds: 600
+
+  # How long the scheduler waits between two ticks.
+  tick_seconds: 5
+
+  # How long a single operator action may take.
+  command_timeout_seconds: 30

@@ -336,6 +336,7 @@ def _world(
 
     engine = engine_class(
         config_loader=StaticConfigLoader(
+            enabled=True,
             capacity=1,
             min_runtime_seconds=0.0,
             tick_seconds=0.01,

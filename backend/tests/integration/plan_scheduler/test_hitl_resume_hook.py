@@ -426,6 +426,7 @@ def _world(db_factory: Any, plan_factory: Any) -> World:
     sink = RecordingSink()
     engine = PlanSchedulerEngine(
         config_loader=StaticConfigLoader(
+            enabled=True,
             capacity=2,
             min_runtime_seconds=0.0,
             tick_seconds=TICK_SECONDS,

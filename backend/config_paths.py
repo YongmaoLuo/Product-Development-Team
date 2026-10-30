@@ -154,6 +154,19 @@ ARCH_PRINCIPLES_YAML: Path = CONFIGS_DIR / "arch_principles.yaml"
 #: Server-level config (supervisor fleet, ``provider_order_file``, ...).
 BACKEND_CONFIG_YAML: Path = BACKEND_DIR / "config.yaml"
 
+#: Environment variable that names the scheduler's own settings file.
+#:
+#: It is the operator's escape hatch: a deployment that keeps the
+#: scheduler's settings somewhere other than the configuration directory
+#: says where they are.  The file it names has to exist — a name that
+#: points at nothing is not a file, and the chain steps over it.
+SCHEDULER_FILE_ENV: str = "PDT_SCHEDULER_FILE"
+
+#: The name of the scheduler's settings file inside the configuration
+#: directory.  It is a file of the operator's own, in the same
+#: gitignored directory as the provider tables.
+SCHEDULER_FILE_NAME: str = "scheduler.yaml"
+
 # ---------------------------------------------------------------------------
 # provider-order contract state
 # ---------------------------------------------------------------------------
@@ -324,6 +337,28 @@ def resolve_provider_capacity_file() -> Path:
             candidate = (PROJECT_ROOT / candidate).resolve()
         return candidate
     return resolve_config_dir() / "provider_capacity.yaml"
+
+
+def resolve_scheduler_file() -> Path:
+    """Return the absolute path to the scheduler's own settings file.
+
+    Precedence (first hit wins):
+
+    1. :data:`SCHEDULER_FILE_ENV` environment variable — absolute, or
+       relative to :data:`PROJECT_ROOT`.
+    2. ``<config dir>/scheduler.yaml``.
+
+    This is the file the scheduler **prefers**.  Which file is actually
+    read is the server's decision: it knows the backend's own
+    ``config.yaml`` as well, and it walks the whole chain.
+    """
+    env_value = os.environ.get(SCHEDULER_FILE_ENV)
+    if env_value:
+        candidate = Path(env_value).expanduser()
+        if not candidate.is_absolute():
+            candidate = (PROJECT_ROOT / candidate).resolve()
+        return candidate
+    return resolve_config_dir() / SCHEDULER_FILE_NAME
 
 
 def resolve_sandbox_profile_file() -> Optional[Path]:
