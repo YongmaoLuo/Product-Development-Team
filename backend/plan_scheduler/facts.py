@@ -17,9 +17,10 @@ A copy would be a second answer to the same question, and two answers
 drift.  The scheduler would keep saying a plan is queued while the plan
 had moved on, and the operator's only way to find out which of the two
 was right would be to watch the wrong plan start.  So this module
-remembers nothing: every call reads the rows again, and every value it
-returns is a value that is in the database at that moment.  Restarting
-the scheduler changes nothing, because there is nothing to lose.
+remembers nothing *about the rows*: every call reads them again, and
+every value it returns is a value that is in the database at that
+moment.  Restarting the scheduler changes nothing, because there is
+nothing to lose.
 
 The five questions
 ------------------
@@ -83,12 +84,28 @@ The key is derived from the plan's own facts, in this order: the
 execution row's ``project_dir``, then the ``project_dir`` the task
 list declares, then the workspace the PRD declares as a constraint.
 The first one that says something wins.
+
+The one thing that is kept
+--------------------------
+``plan_created_at()`` answers from the filesystem rather than from the
+database — the plan's directory is its own record of when it was made
+— and it keeps what it read, so that the directory is stat'ed once per
+plan rather than once per tick.
+
+That is not the copy this module refuses to make.  A copy of a *row*
+is a second answer to a question the row may change; a directory's
+creation time does not change while the directory is there, so the
+second answer would be the first answer, and the reader is not
+answering about something that can move under it.  Every other answer
+is derived again, on every call, from the rows that are in the database
+at that moment.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -299,9 +316,12 @@ def _workspace_from_constraints(constraints: Any) -> Optional[str]:
 class PlanFactsReader:
     """Read the plan facts and derive what the scheduler needs from them.
 
-    The reader holds no state.  It has a connection it reads through
-    and the directory the plans live in, and every answer it gives is
-    derived from the rows that are in the database at that moment.
+    The reader holds no state about the plans it reports.  It has a
+    connection it reads through and the directory the plans live in,
+    and every answer it gives is derived from the rows that are in the
+    database at that moment.  The one thing it keeps is a plan's
+    creation time, which comes from the filesystem and cannot change
+    under it.
 
     Attributes:
         conn: the connection to read on — the one the scheduler opens
@@ -325,6 +345,11 @@ class PlanFactsReader:
         self._conn = conn
         self._project_root = Path(project_root)
         self._clock = clock if clock is not None else time.time
+        #: The creation time of each plan, read once.  It is the only
+        #: thing this reader remembers, and it is a fact about the
+        #: filesystem that cannot drift — a directory's creation time
+        #: does not change while the directory is there.
+        self._created_at_cache: Dict[str, Optional[float]] = {}
 
     # ------------------------------------------------------------------
     # The queued plans
@@ -599,6 +624,72 @@ class PlanFactsReader:
             if candidate.is_dir():
                 return candidate
         return None
+
+    # ------------------------------------------------------------------
+    # The plan's age
+    # ------------------------------------------------------------------
+
+    def plan_created_at(self, plan_id: str) -> Optional[float]:
+        """Return when this plan was created, in epoch seconds.
+
+        The plan's directory is the plan's own record of when it came
+        into existence, so the directory's timestamp is the answer and
+        the plan id is only the fallback.  The timestamp is the
+        directory's *creation* time, because the change time moves
+        every time the plan writes a file; where the filesystem keeps
+        no creation time at all, the change time stands in for it.
+
+        A plan with no directory has no directory to ask, and its id
+        still says when it was made: an id that begins with eight
+        digits names its date, and that date at local midnight is the
+        closest thing to a creation time that is left.
+
+        The answer is read once per plan and kept, because a
+        directory's creation time does not change while the directory
+        is there.  Unlike the rows this reader derives the rest of its
+        answers from, this is a fact about the filesystem that cannot
+        drift, so keeping it cannot make the reader wrong.
+
+        Args:
+            plan_id: the plan to ask about.
+
+        Returns:
+            The creation time in epoch seconds, or ``None`` when
+            neither the directory nor the id says anything.
+        """
+        if plan_id in self._created_at_cache:
+            return self._created_at_cache[plan_id]
+        created = self._read_plan_created_at(plan_id)
+        self._created_at_cache[plan_id] = created
+        return created
+
+    def _read_plan_created_at(self, plan_id: str) -> Optional[float]:
+        """Return the plan's creation time, from its directory or its id."""
+        plan_dir = self._plan_dir(plan_id)
+        if plan_dir is not None:
+            try:
+                stat = plan_dir.stat()
+            except OSError:
+                # The directory went away between the check and the
+                # read; the id is what is left.
+                pass
+            else:
+                birthtime = float(getattr(stat, "st_birthtime", 0.0) or 0.0)
+                return birthtime if birthtime else float(stat.st_ctime)
+        return self._created_at_from_id(plan_id)
+
+    def _created_at_from_id(self, plan_id: str) -> Optional[float]:
+        """Return the creation time the plan's id names, if it names one."""
+        match = re.match(r"^(\d{8})", plan_id)
+        if match is None:
+            return None
+        try:
+            moment = datetime.strptime(match.group(1), "%Y%m%d")
+        except ValueError:
+            # Eight digits that are not a date: the id names no day,
+            # and a plan with no day has no creation time.
+            return None
+        return moment.timestamp()
 
     def _tasks_project_dir(self, plan_dir: Path) -> Optional[str]:
         """Return the working directory the plan's task list declares."""

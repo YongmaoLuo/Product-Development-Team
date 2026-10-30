@@ -114,8 +114,7 @@ import logging
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from .capacity import CapacityLedger
 from .config import DEFAULT_CAPACITY, DEFAULT_MIN_RUNTIME_SECONDS
@@ -295,40 +294,8 @@ class CommandResult:
 
 
 # ---------------------------------------------------------------------------
-# Reading the moments
+# Reading the collaborators
 # ---------------------------------------------------------------------------
-
-
-def _epoch_of(value: Any) -> Optional[float]:
-    """Return a timestamp as epoch seconds, or ``None`` when it is not one.
-
-    Three shapes are understood — epoch seconds, a ``datetime`` and an
-    ISO-8601 string — because the slot rows write the moment in one of
-    them and the clock reads it in another.  A moment that cannot be
-    read cannot be compared, and a plan whose slot cannot be read is a
-    plan the eviction rule cannot judge.
-    """
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, datetime):
-        moment = value if value.tzinfo is not None else value.replace(
-            tzinfo=timezone.utc
-        )
-        return moment.timestamp()
-    text = str(value).strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.timestamp()
 
 
 def _connection_of(source: Any) -> Optional[sqlite3.Connection]:
@@ -663,6 +630,14 @@ class CommandExecutor:
         that may interrupt somebody share one candidate set and one
         choice.
 
+        The candidates are handed to the policy as the ledger gives
+        them.  The executor does not rebuild the running set out of the
+        slot rows: those rows carry no creation time, and the creation
+        time is what tells the youngest plan from the others — so a
+        rebuilt set would pick the victim by when a slot was stamped
+        rather than by when the plan was made.  The slots are read once,
+        by the ledger, and the whole answer comes off that one read.
+
         Args:
             min_runtime: ``M`` — the runtime a plan is protected for.
                 It is handed in rather than read here, so that the
@@ -671,29 +646,7 @@ class CommandExecutor:
         """
         now = self._now()
         candidates = self._ledger.evictable(now, min_runtime)
-        if not candidates:
-            return None
-
-        slots = {
-            str(slot["plan_id"]): slot
-            for slot in self._store.list_slots(self._conn)
-        }
-        running: List[Dict[str, Any]] = []
-        for plan_id in candidates:
-            slot = slots.get(plan_id)
-            if slot is None:
-                continue
-            acquired = _epoch_of(slot.get("acquired_at"))
-            if acquired is None:
-                continue
-            running.append(
-                {
-                    "plan_id": plan_id,
-                    "acquired_at": acquired,
-                    "elapsed": now - acquired,
-                }
-            )
-        return select_victim({"running": running}, min_runtime)
+        return select_victim({"running": candidates}, min_runtime)
 
     def _evict(self, victim: str) -> None:
         """Interrupt a running plan so that the plan that asked may run.

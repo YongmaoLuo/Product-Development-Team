@@ -19,10 +19,13 @@ running; both are derived from the plan tables by
 no copy of them.  That is the whole point: a copy would be a second
 answer to the same question, and the two answers would drift.
 
-**When the plan took the slot** is a *scheduler* fact, and the only
-thing that needs it is the eviction rule — "a plan that has been running
-for at least ``M`` seconds may be interrupted".  That moment lives in
-``scheduler_slot``, one row per plan, and nowhere else.
+**How long the plan has been running** is a *plan* fact, and the only
+thing that needs it is the eviction rule — "a plan that has been
+running for at least ``M`` seconds may be interrupted".  That moment is
+the plan's own: ``plan_execution.started_at``, the moment the plan's
+work began.  The slot row says when the plan took its slot, and that
+timestamp is re-stamped whenever the engine adopts the plan, so it
+cannot say how long the work has been going on.
 
 The ledger is where the two are put back together.  Its reconciliation
 is the authority: every tick it makes ``scheduler_slot`` say what the
@@ -62,6 +65,24 @@ same plan, holding the same slot, for the whole walk.  A timer that
 restarted on every phase change would let a plan that had been running
 for an hour look brand new, and the eviction rule would be satisfied by
 a plan that had not finished anything.
+
+Where the runtime is measured from
+----------------------------------
+The eviction rule asks how long a plan has been running, and the answer
+is the moment the plan's own work began — ``plan_execution``'s
+``started_at``.  The slot's timestamp cannot answer it: the engine
+re-stamps the slots of the plans it adopts, so after a restart every
+plan looks as if it had just taken its slot, and for the next ``M``
+seconds nobody may be interrupted at all — the operator asks for a plan
+to start and is told ``no_eligible_victim`` while the slot sits full of
+work that has been going on for hours.
+
+A plan whose own start is unknown — a row that says nothing, or a
+timestamp that cannot be read — is judged by its slot instead, which is
+the rule the ledger always had.  Each candidate carries the plan's
+creation time as well, so that the policy can tell one plan from
+another; a plan the facts cannot date carries ``None``, and the policy
+falls back to the slot timestamp for it.
 
 The workspace
 -------------
@@ -148,6 +169,48 @@ def _to_epoch(value: Any) -> Optional[float]:
             return None
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    return None
+
+
+def _started_epoch(value: Any) -> Optional[float]:
+    """Return the moment a plan's work began, in epoch seconds.
+
+    ``plan_execution.started_at`` is written by the execution path as a
+    **naive local** ISO-8601 stamp — ``datetime.now().isoformat()`` — so
+    a stamp that names no zone is read as the local time it names.  A
+    stamp that carries a zone, and a plain number of epoch seconds, are
+    read as they say.
+
+    The distinction is the whole rule.  Reading a local stamp as UTC
+    would move the start of every plan into the future by the offset
+    between the two, and a plan that has been working for an hour would
+    look as if it had not started at all.
+
+    ``None`` means "this is not a time I can read", and the caller falls
+    back to the slot's timestamp — the moment the plan took its slot,
+    which is what the ledger always measured from.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, datetime):
+        moment = value if value.tzinfo is not None else value.astimezone()
+        return moment.timestamp()
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            # A stamp with no zone is a local stamp.
+            parsed = parsed.astimezone()
         return parsed.timestamp()
     return None
 
@@ -321,7 +384,7 @@ class CapacityLedger:
         self,
         now: Any,
         min_runtime_seconds: float = DEFAULT_MIN_RUNTIME_SECONDS,
-    ) -> List[str]:
+    ) -> List[Dict[str, Any]]:
         """Return the plans that may be interrupted.
 
         A plan is a candidate when it is **working** and has been
@@ -330,10 +393,24 @@ class CapacityLedger:
         exactly that long, and a rule that is off by one either voids
         the protection or stalls the scheduler for good.
 
-        The order is the ledger's own — oldest acquisition first, ties
-        broken by plan id — so two slots taken in the same second come
-        back in the same order every time, and a caller that walks the
-        list is never at the mercy of how SQLite returned the rows.
+        **The runtime is measured from the plan's own start** — the
+        moment the plan's work began, which is ``plan_execution``'s
+        ``started_at``.  The slot's own timestamp cannot answer it: the
+        engine re-stamps the slots of the plans it adopts, so after a
+        restart every plan looks as if it had just taken its slot, and
+        for the next ``M`` seconds nobody may be interrupted at all.  A
+        plan whose own start is unknown is judged by its slot instead,
+        which is the rule the ledger always had.
+
+        Each candidate carries what the policy needs to choose among
+        them: the plan id, the moment the slot was taken, the moment the
+        plan was created (``None`` when that is unknown) and how long
+        the plan has been running.
+
+        The order is the ledger's own — the runtime start first, ties
+        broken by plan id — so two calls answer in the same order and a
+        caller that walks the list is never at the mercy of how SQLite
+        returned the rows.
 
         Args:
             now: the moment to measure the runtime against.
@@ -341,9 +418,10 @@ class CapacityLedger:
                 ``M``.
 
         Returns:
-            The plan ids that may be interrupted, oldest first.  Empty
-            when there is nobody to interrupt, which is an answer and
-            not an error.
+            The plans that may be interrupted, each a dict of
+            ``plan_id``, ``acquired_at``, ``created_at`` and ``elapsed``.
+            Empty when there is nobody to interrupt, which is an answer
+            and not an error.
         """
         moment = _to_epoch(now)
         if moment is None:
@@ -352,8 +430,9 @@ class CapacityLedger:
 
         conn = self._require_conn()
         active = self._active_ids()
+        starts = self._runtime_starts(conn)
 
-        candidates: List[Tuple[float, str]] = []
+        candidates: List[Tuple[float, str, Dict[str, Any]]] = []
         for slot in self._store.list_slots(conn):
             plan_id = str(_field(slot, "plan_id", ""))
             if plan_id not in active:
@@ -363,11 +442,28 @@ class CapacityLedger:
             acquired = _to_epoch(_field(slot, "acquired_at"))
             if acquired is None:
                 continue
-            if moment - acquired >= threshold:
-                candidates.append((acquired, plan_id))
+            started = starts.get(plan_id)
+            if started is None:
+                # The plan's own start is unknown: the slot's timestamp
+                # is the answer the ledger always had.
+                started = acquired
+            elapsed = moment - started
+            if elapsed >= threshold:
+                candidates.append(
+                    (
+                        started,
+                        plan_id,
+                        {
+                            "plan_id": plan_id,
+                            "acquired_at": acquired,
+                            "created_at": self._facts.plan_created_at(plan_id),
+                            "elapsed": elapsed,
+                        },
+                    )
+                )
 
-        candidates.sort()
-        return [plan_id for _, plan_id in candidates]
+        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+        return [entry for _, _, entry in candidates]
 
     # ------------------------------------------------------------------
     # The workspace
@@ -425,6 +521,43 @@ class CapacityLedger:
             if plan_id and plan_id not in seen:
                 seen.append(plan_id)
         return seen
+
+    def _runtime_starts(self, conn: sqlite3.Connection) -> Dict[str, float]:
+        """Return the moment each plan's own work began.
+
+        ``plan_execution.started_at`` is the moment the plan's work
+        began, and it is the one timestamp in this story that no
+        reconciliation rewrites: the engine re-stamps the slots of the
+        plans it adopts, but it never touches the plan's own start.
+
+        A database that does not carry the execution table cannot
+        answer the question, and the slot's timestamp is the answer the
+        ledger always had — so the ledger falls back to it rather than
+        failing.
+
+        Args:
+            conn: the connection to read on.
+
+        Returns:
+            The start of every plan that has one, by plan id.
+        """
+        try:
+            rows = conn.execute(
+                "SELECT plan_id, started_at FROM plan_execution"
+            ).fetchall()
+        except sqlite3.Error:
+            return {}
+
+        starts: Dict[str, float] = {}
+        for row in rows:
+            plan_id = row[0]
+            if plan_id is None:
+                continue
+            started = _started_epoch(row[1])
+            if started is None:
+                continue
+            starts[str(plan_id)] = started
+        return starts
 
     def _now(self) -> float:
         """The current moment, in epoch seconds."""

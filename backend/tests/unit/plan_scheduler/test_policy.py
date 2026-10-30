@@ -16,9 +16,12 @@ The contracts this file pins:
    ``M - 1`` seconds is not a candidate; ``M`` and ``M + 1`` are.  The
    default 600 seconds of protection is exactly that long — off by one
    and the protection is either void or a stall.
-2. **The victim is the youngest eligible plan.**  The plan that took
-   its slot most recently is the one that goes, not the one closest to
-   finishing.
+2. **The victim is the youngest eligible plan.**  The plan that was
+   created most recently is the one that goes, not the one closest to
+   finishing.  A running entry that carries no creation time is judged
+   by the moment it took its slot — the rule the policy had before the
+   creation times were known.  (The creation-time ordering itself is
+   pinned in ``test_victim_creation_age.py``.)
 3. **No candidate is an answer, not a crash.**  An empty candidate set
    gives ``None``.
 4. **Convergence is bounded.**  The scheduler stops as soon as it fits
@@ -59,7 +62,11 @@ def _queued(plan_id: str = "p1", **flags) -> dict:
 
 
 def _running(plan_id: str, elapsed: float, acquired_at: float) -> dict:
-    """A running plan: how long it has run, and when it took its slot."""
+    """A running plan: how long it has run, and when it took its slot.
+
+    The entry carries no creation time, so the policy falls back to the
+    slot time — which is what these cases are about.
+    """
     return {"plan_id": plan_id, "elapsed": elapsed, "acquired_at": acquired_at}
 
 

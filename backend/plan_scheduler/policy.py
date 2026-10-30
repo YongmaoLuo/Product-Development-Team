@@ -32,10 +32,16 @@ interrupt a running plan — an operator asking for a plan to start now,
 and the tick finding more plans running than there are slots — pick
 their victim from the same candidates, by the same rule: a plan that
 has been running for at least ``M`` seconds, and among those the
-*youngest* one, the plan that took its slot most recently.  Evicting
+*youngest* one, the plan that was created most recently.  Evicting
 the oldest would interrupt the plan that is closest to finishing; the
 youngest is the one least likely to be wrapping up, and the ``M``
 threshold keeps the default 600 seconds of protection intact.
+
+The creation time is the timestamp that survives: the moment a slot
+was taken is rewritten whenever the ledger is reconciled, and after
+that every plan looks as if it had just started.  A running entry that
+carries no creation time is judged by the slot time instead — the
+behaviour the policy had before the creation time was known.
 
 **A plan that is too young is not a candidate at all**, and an empty
 candidate set is an answer rather than an error:
@@ -60,7 +66,8 @@ has a default, so a caller may leave out anything it does not know::
         "running": [                    # the plans holding a slot
             {"plan_id": "r1",
              "elapsed": 600,            # seconds since the slot was taken
-             "acquired_at": 100},        # when the slot was taken
+             "acquired_at": 100,        # when the slot was taken
+             "created_at": 50},         # when the plan was created (optional)
         ],
         "allow_evict": True,            # may a running plan be interrupted?
         "min_runtime_seconds": 600,     # M — the runtime a plan is protected for
@@ -152,6 +159,24 @@ def _elapsed(entry: Any) -> float:
 def _acquired_at(entry: Any) -> float:
     """Return when the entry took its slot, as a number."""
     return _number(_value(entry, "acquired_at", 0), 0.0)
+
+
+def _created_at(entry: Any) -> Optional[float]:
+    """Return when the plan was created, or ``None`` when that is unknown.
+
+    The creation time is what tells one plan from another once the slot
+    timestamps have been rewritten by a reconcile.  A value the policy
+    cannot read — missing, ``NULL``, zero, or not a number at all — is
+    not a creation time: the caller falls back to the moment the slot
+    was taken, which is the rule the policy always had.
+    """
+    value = _value(entry, "created_at", None)
+    if value is None:
+        return None
+    created = _number(value, 0.0)
+    if created <= 0.0:
+        return None
+    return created
 
 
 def _queued_entries(snapshot: Snapshot) -> List[Any]:
@@ -271,18 +296,26 @@ def admission_verdict(snapshot: Snapshot) -> str:
 
 
 def _youngest(entries: Sequence[Any]) -> Optional[Any]:
-    """Return the entry that took its slot most recently.
+    """Return the entry that was created most recently.
 
-    The youngest is the one with the **latest** ``acquired_at`` — the
-    plan that started last, and therefore the one least likely to be
-    wrapping up.  Two plans that took their slot at the same moment are
-    told apart by ``plan_id`` in dictionary order, so the answer never
-    depends on the order the entries happened to arrive in.
+    The youngest is the one with the **latest** ``created_at`` — the
+    plan that was made last, and therefore the one least likely to be
+    wrapping up.  The slot timestamp is not read here: it is rewritten
+    whenever the ledger is reconciled, and a rule built on it stops
+    meaning anything after one of those.  An entry that carries no
+    creation time falls back to ``acquired_at``, so a snapshot that
+    does not know the creation times is judged the way it always was.
+
+    Two plans created at the same moment are told apart by ``plan_id``
+    in dictionary order, so the answer never depends on the order the
+    entries happened to arrive in.
     """
     best: Optional[Any] = None
     best_key: Optional[Tuple[float, str]] = None
     for entry in entries:
-        key = (_acquired_at(entry), _plan_id(entry))
+        created = _created_at(entry)
+        stamp = _acquired_at(entry) if created is None else created
+        key = (stamp, _plan_id(entry))
         if (
             best_key is None
             or key[0] > best_key[0]
@@ -302,8 +335,12 @@ def select_victim(snapshot: Snapshot, min_runtime_seconds: float) -> Optional[st
     scheduler for good.
 
     Among the candidates the **youngest** one is chosen — the plan that
-    took its slot most recently — because interrupting the plan that is
-    closest to finishing is what the operator would not forgive.
+    was created most recently — because interrupting the plan that is
+    closest to finishing is what the operator would not forgive.  The
+    creation time is read from the running entry's ``created_at``; an
+    entry that carries none falls back to the moment it took its slot,
+    which is the rule the policy had before the creation times were
+    known.
 
     ``None`` means there is nobody to interrupt: the running set is
     empty, or every plan in it is still inside its protected window.
