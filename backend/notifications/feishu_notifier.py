@@ -72,7 +72,13 @@ from .cards import (
     build_verification_card,
     drop_terminal_db_orphans,
 )
-from .feishu_client import FeishuClient, FeishuUnavailable
+from .feishu_client import (
+    UPDATE_GONE,
+    UPDATE_OK,
+    UPDATE_TRANSIENT,
+    FeishuClient,
+    FeishuUnavailable,
+)
 from .fingerprint import card_fingerprint
 from .plan_dir_resolver import (
     DEFAULT_BACKEND_BASE,
@@ -1045,12 +1051,9 @@ class FeishuNotifier:
             return
 
         ok = self._push_to_feishu(chat_id, state, card)
-        if not ok:
-            with self._states_lock:
-                # If update failed because the message expired, we
-                # cleared state.message_id and sent a fresh one.
-                # Re-load to capture the new message_id.
-                pass
+        # A failed push keeps ``state.message_id`` as it is: a dead card
+        # is replaced by the self-heal path inside ``_push_to_feishu``
+        # itself, and a transient failure keeps the id it had.
 
         # 2026-09-07: mirror the same card to Telegram on the same
         # tick. Each channel is independently try/except'd in the
@@ -1083,8 +1086,14 @@ class FeishuNotifier:
         )
 
         # Persist updated message_id + fingerprint.
+        #
+        # 2026-10-25: the fingerprint advances only on a SUCCESSFUL
+        # Feishu push. Advancing it on a failed push let the
+        # fingerprint dedup swallow the retry, so a single transient
+        # failure was enough to make the card stop updating for good.
         with self._states_lock:
-            state.last_fingerprint = fp
+            if ok:
+                state.last_fingerprint = fp
             state.last_push_ts = time.time()
         _save_card_state(state)
 
@@ -1421,8 +1430,12 @@ class FeishuNotifier:
 
         Self-heal: if the existing message expired (Feishu caps
         card edits at ~14 days, or the operator deleted the chat),
-        ``update_message`` returns False and we clear
-        ``state.message_id`` and send a fresh card.
+        ``update_message`` returns ``UPDATE_GONE`` and we send a
+        fresh card. A ``UPDATE_TRANSIENT`` result — a rate limit, a
+        server error, an SSL EOF — does NOT mean the card is dead,
+        so the existing card is kept and the next event retries the
+        patch. Replacing the card on a transient failure is what
+        left two same-named cards in the chat on 2026-10-25.
         """
         if self._client is None:
             # Disabled at startup; never reach here normally.
@@ -1453,7 +1466,7 @@ class FeishuNotifier:
             return True
 
         updated = self._client.update_message(state.message_id, payload)
-        if updated:
+        if updated == UPDATE_OK:
             self._pushes_ok += 1
             logger.warning(
                 "[feishu_notifier] patched card %s for plan=%s (pushes_ok=%d)",
@@ -1461,11 +1474,25 @@ class FeishuNotifier:
             )
             return True
 
+        if updated == UPDATE_TRANSIENT:
+            # The card is not known to be dead — keep it, keep the id,
+            # and let the next event retry the patch. Sending a fresh
+            # card here is what duplicated the plan card on
+            # 2026-10-25 (a single SSL EOF was read as "card is dead").
+            logger.warning(
+                "[feishu_notifier] transient failure updating card %s "
+                "for plan=%s (category=%s); keeping the existing card, "
+                "will retry",
+                state.message_id, state.plan_id, updated,
+            )
+            return False
+
         # Self-heal: try a fresh card.
+        old_id = state.message_id
         logger.warning(
             "[feishu_notifier] update_message failed for %s (plan=%s); "
             "sending a fresh card",
-            state.message_id, state.plan_id,
+            old_id, state.plan_id,
         )
         new_id = self._client.send_message(
             receive_id=chat_id,
@@ -1486,7 +1513,7 @@ class FeishuNotifier:
         self._pushes_ok += 1
         logger.info(
             "[feishu_notifier] self-healed: replaced dead card %s with %s (plan=%s)",
-            state.message_id, new_id, state.plan_id,
+            old_id, new_id, state.plan_id,
         )
         return True
 

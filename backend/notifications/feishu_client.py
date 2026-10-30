@@ -32,13 +32,14 @@ Contract
     failure (the notifier records the failure under
     ``pushes_failed`` and falls back to a fresh card next event).
 
-`update_message(message_id, content) -> bool`
+`update_message(message_id, content) -> str`
     PATCHes the existing card in place via
-    ``/open-apis/im/v1/messages/{message_id}``. Returns True on
-    success, False otherwise. A False here is the notifier's
-    signal that the card has expired (Feishu caps card edits at
-    ~14 days, or the message was deleted) and a new card must be
-    sent.
+    ``/open-apis/im/v1/messages/{message_id}``. Returns one of
+    three states — see :data:`UPDATE_OK`, :data:`UPDATE_GONE` and
+    :data:`UPDATE_TRANSIENT`. Only ``UPDATE_GONE`` means the card
+    expired (Feishu caps card edits at ~14 days, or the message was
+    deleted) and a new card must be sent; a transient failure must
+    keep the existing card and be retried.
 
 `get_tenant_access_token(force_refresh=False) -> str`
     Caches the tenant access token and refreshes it 5 minutes
@@ -59,6 +60,23 @@ from credentials import read_secret
 
 
 logger = logging.getLogger(__name__)
+
+
+#: The card was patched in place. Nothing else to do.
+UPDATE_OK = "ok"
+
+#: The card is provably dead — Feishu answered 400 / 403 / 404, so the
+#: message expired, was deleted, or was never there. This is the ONLY
+#: state that justifies replacing the card with a fresh one.
+UPDATE_GONE = "gone"
+
+#: The update did not happen, but the card is NOT known to be dead: a
+#: rate limit (429), a server error (5xx), a network / SSL / timeout
+#: failure, or a non-zero business code. The card is most likely still
+#: alive in the chat, so the caller must keep it and retry later —
+#: replacing it here is what left two same-named cards in the chat on
+#: 2026-10-25 (a single SSL EOF was read as "the card is dead").
+UPDATE_TRANSIENT = "transient"
 
 
 class FeishuApiException(Exception):
@@ -237,15 +255,25 @@ class FeishuClient:
             logger.error("Error sending message: %s", exc)
             return None
 
-    def update_message(self, message_id: str, content: str) -> bool:
+    def update_message(self, message_id: str, content: str) -> str:
         """PATCH an existing IM message in place.
 
         Uses ``/open-apis/im/v1/messages/{message_id}`` (NOT the
         legacy ``/open-apis/interactive/v1/cards/{message_id}`` —
         that endpoint returns 404 for IM-API-sent messages).
 
-        Returns True on success, False otherwise. A False here
-        signals the notifier to fall back to a fresh card.
+        Returns one of three states:
+
+        * ``UPDATE_OK`` — HTTP 200 and ``body["code"] == 0``. The card
+          was patched.
+        * ``UPDATE_GONE`` — Feishu answered 400 / 403 / 404. The card
+          is provably dead (expired, deleted, or never there). **Only
+          this state should replace the card** with a fresh one.
+        * ``UPDATE_TRANSIENT`` — everything else: 429, 5xx, any other
+          4xx, a non-zero business code on an HTTP 200, or a
+          transport failure (URLError / SSL / timeout / unparseable
+          JSON). The card is NOT known to be dead, so the caller keeps
+          it and retries instead of sending a duplicate.
         """
         token = self.get_tenant_access_token()
         try:
@@ -269,16 +297,23 @@ class FeishuClient:
                     body.get("msg"),
                     body.get("code"),
                 )
-                return False
+                return UPDATE_TRANSIENT
 
             logger.info("Updated message %s", message_id)
-            return True
+            return UPDATE_OK
 
         except urllib.error.HTTPError as exc:
+            if exc.code in (400, 403, 404):
+                logger.error(
+                    "HTTP %s updating message %s (card is gone)",
+                    exc.code, message_id,
+                )
+                return UPDATE_GONE
             logger.error(
-                "HTTP %s updating message %s", exc.code, message_id
+                "HTTP %s updating message %s (transient)",
+                exc.code, message_id,
             )
-            return False
+            return UPDATE_TRANSIENT
         except Exception as exc:
             logger.error("Error updating message %s: %s", message_id, exc)
-            return False
+            return UPDATE_TRANSIENT
