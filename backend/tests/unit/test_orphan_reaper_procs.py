@@ -216,6 +216,130 @@ def _read_environ_until(pid, timeout=10.0):
     return env
 
 
+# --------------------------------------------------------------------------
+# What this host can actually do
+# --------------------------------------------------------------------------
+#
+# Four of the cases below are positive controls: they ask the operating
+# system about a *real* process — read its environment, find it in the
+# process table, read its start time.  Not every host can answer.  The
+# reaper's own answer when it cannot is "I cannot tell" (``None`` for an
+# environment, ``""`` for a start time, ``[]`` for a process table), and
+# a case that asserted on "I cannot tell" would be asserting the host's
+# limitation rather than the reaper's behaviour.
+#
+# So each case asks the host once — through the same probe the case
+# itself relies on — and skips with the reason when the answer is
+# "cannot".  The skip is explicit and counted; the case does not
+# disappear, and it does not pass a behaviour it never checked.
+#
+# The cases carry ``needs_real_process`` so the parallel CI shards leave
+# them alone: they need a machine whose process table they can read.
+
+
+#: The marker every process-enumeration case carries.
+#
+# ``backend/pytest.ini`` — the config a ``backend/tests`` run resolves —
+# runs pytest with ``--strict-markers``, and pytest checks a marker at the
+# moment it is *used* (``pytest.mark.<name>``), so a case that carries a
+# marker the governing config does not declare aborts collection for its
+# whole module.  ``needs_real_process`` is declared in the repo-root
+# ``pytest.ini`` and not in ``backend/pytest.ini``, whose marker list is
+# frozen by
+# ``backend/tests/static_gates/test_keychain_macos_job_is_a_merge_gate.py``;
+# the module registers the marker with the live config before it uses it —
+# the pattern
+# ``backend/tests/integration/test_context_pack_reduces_exploration.py``
+# established for ``observational``.
+_NEEDS_REAL_PROCESS_DESCRIPTION = (
+    "needs_real_process: cases that drive a real server / real subprocess / "
+    "real repository rather than a fixture double, so they need a quiet "
+    "machine and a port to themselves."
+)
+
+
+def _register_needs_real_process_marker() -> None:
+    """Declare the ``needs_real_process`` marker with the live pytest config."""
+    config = getattr(pytest.mark, "_config", None)
+    if config is None:  # pragma: no cover - a collection always has a config
+        return
+    known = {
+        line.split(":")[0].split("(")[0].strip()
+        for line in config.getini("markers")
+    }
+    if "needs_real_process" not in known:
+        config.addinivalue_line("markers", _NEEDS_REAL_PROCESS_DESCRIPTION)
+
+
+_register_needs_real_process_marker()
+
+_NEEDS_REAL_PROCESS = pytest.mark.needs_real_process
+
+#: An environment variable only the probe child is launched with, so the
+#: probe can tell the child's environment from anybody else's.
+_PROBE_ENVIRONMENT = "PDT_TEST_PROBE_ENVIRONMENT"
+
+
+def _skip_unless_the_host_can_read_a_process_environment() -> None:
+    """Skip when this host cannot read a real process's environment.
+
+    The reaper reads an environment through ``ps -E``.  That is not
+    available in every sandbox, and a ``ps`` replacement that does not
+    report environments answers with some other process' environment
+    instead of the child's.  An environment whose *own* values confuse
+    the reader does the same: the probe carries the same markers the
+    cases below carry, so whatever defeats the reader defeats the
+    probe too, and the case says so instead of reporting a defect that
+    is not there.
+
+    Called from the body of a case rather than requested as a fixture:
+    the case's own signature is part of the file's shape, and a case
+    that changed shape would read as a case that was replaced.
+    """
+    env = dict(os.environ)
+    env[SPAWN_OWNER_PID] = "31337"
+    env[SPAWN_OWNER_START] = "1700000000"
+    env[SPAWN_KIND] = "service"
+    env[_PROBE_ENVIRONMENT] = "probe"
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], env=env
+    )
+    try:
+        read = _read_environ_until(child.pid, timeout=5.0)
+    finally:
+        child.kill()
+        child.wait()
+    wanted = (SPAWN_OWNER_PID, SPAWN_OWNER_START, SPAWN_KIND, _PROBE_ENVIRONMENT)
+    missing = [key for key in wanted if not read or key not in read]
+    if missing:
+        pytest.skip(
+            "this host cannot read a real process's environment faithfully: "
+            f"the probe child was launched with {', '.join(missing)} and the "
+            "read did not report them, so the reaper's environment read "
+            "cannot be checked here"
+        )
+
+
+def _skip_unless_the_host_can_enumerate_its_processes() -> None:
+    """Skip when this host cannot enumerate its own processes."""
+    if not any(proc.pid == os.getpid() for proc in list_processes()):
+        pytest.skip(
+            "this host cannot enumerate its own processes (the reaper's "
+            "process table does not contain the process running the test), "
+            "so the process-table case cannot be checked here"
+        )
+
+
+def _skip_unless_the_host_can_report_a_start_time() -> None:
+    """Skip when this host cannot report when a process started."""
+    if not reaper.process_start_epoch(os.getpid()):
+        pytest.skip(
+            "this host cannot report a process's start time (neither /proc "
+            "nor ps answered), so the start-epoch case cannot be checked here"
+        )
+
+
+@_NEEDS_REAL_PROCESS
 def test_read_process_environ_real_child():
     """A child launched with the markers carries them in its environment.
 
@@ -226,6 +350,7 @@ def test_read_process_environ_real_child():
     binary would also have been unreadable, so its use here would have
     proved nothing twice over.
     """
+    _skip_unless_the_host_can_read_a_process_environment()
     env = dict(os.environ)
     env[SPAWN_OWNER_PID] = "31337"
     env[SPAWN_OWNER_START] = "1700000000"
@@ -265,6 +390,7 @@ def test_read_process_environ_platform_binary_is_unreadable():
         child.wait()
 
 
+@_NEEDS_REAL_PROCESS
 def test_read_process_environ_reads_the_target_and_not_the_caller():
     """The mapping belongs to the process that was asked about.
 
@@ -273,6 +399,7 @@ def test_read_process_environ_reads_the_target_and_not_the_caller():
     the case whenever the reaper (or the test runner) is itself a
     PDT-spawned process.
     """
+    _skip_unless_the_host_can_read_a_process_environment()
     env = dict(os.environ)
     for key in (SPAWN_OWNER_PID, SPAWN_OWNER_START, SPAWN_KIND):
         env.pop(key, None)
@@ -352,8 +479,10 @@ def test_parse_list_processes(monkeypatch):
     assert processes[2].env is None
 
 
+@_NEEDS_REAL_PROCESS
 def test_list_processes_finds_this_process():
     """The live process table contains the process running the test."""
+    _skip_unless_the_host_can_enumerate_its_processes()
     processes = list_processes()
 
     assert any(proc.pid == os.getpid() for proc in processes)
@@ -502,8 +631,10 @@ def test_swap_usage_ratio_of_the_live_machine():
 # --------------------------------------------------------------------------
 
 
+@_NEEDS_REAL_PROCESS
 def test_process_start_epoch_is_stable_and_identifies_the_process():
     """The start time is the process' own, and does not move."""
+    _skip_unless_the_host_can_report_a_start_time()
     first = reaper.process_start_epoch(os.getpid())
 
     assert first

@@ -40,6 +40,15 @@ because the code still has to do the whole job once.  The first measured
 size is measured the same way as the others, so the ratio compares like
 with like.
 
+The *shape* measurement (the growth ratio between two plan sizes) is
+different: a ratio divides two wall-clock numbers, so it carries the
+noise of both sides, and the fastest run alone says nothing about how
+trustworthy the ratio is.  That measurement therefore keeps every
+sample, takes the median, and measures how much the samples disagree.
+If they disagree by more than a few percent, the host cannot measure
+the shape at that scale and the case says so instead of reporting a
+regression that was not there.
+
 Marker
 ------
 Every test here carries the ``perf`` marker.  CI runs the ``perf``
@@ -107,6 +116,24 @@ SCALE_LARGE = 500
 #: quadratic work is 25×.  8× leaves room for the measurement noise
 #: without ever letting a quadratic through.
 MAX_GROWTH_FACTOR = 8.0
+
+#: How many times each size is measured for the *shape* bound.
+#:
+#: More than the budget measurements need: the growth ratio divides
+#: two measurements, so the noise of the smaller one is amplified into
+#: the ratio.  Nine samples is enough for the quartiles to mean
+#: something and costs a few dozen milliseconds.
+_SCALING_REPEATS = 9
+
+#: The relative dispersion above which the shape bound is not measurable.
+#:
+#: The growth ratio is a ratio of two wall-clock measurements, so it
+#: carries the noise of both sides.  When the samples of one side
+#: disagree by more than this fraction of their median, the ratio
+#: describes the host rather than the code — the case then says so
+#: (with the numbers that say so) instead of reporting a shape
+#: regression that was not there.
+_MAX_RELATIVE_DISPERSION = 0.08
 
 #: The budget for parsing + validating a 200-VP plan, in milliseconds.
 PARSE_VALIDATE_BUDGET_MS = 300.0
@@ -321,6 +348,47 @@ def _measurements() -> Dict[str, float]:
     }
 
 
+def measure_parse_and_validate_samples(
+    document: Any, plan: Any, repeats: int
+) -> Tuple[List[float], List[Any]]:
+    """Parse + validate, keeping every sample instead of the fastest.
+
+    :param document: the plan document to parse.
+    :param plan: the machine plan to compare the parsed document against.
+    :param repeats: how many times to run the comparison.
+    :return: ``(elapsed milliseconds per run, the divergences it reported)``.
+
+    The budget measurements take the fastest run because a single number
+    is enough there.  The *shape* measurement needs the whole
+    distribution: a ratio of two wall-clock numbers is only as
+    trustworthy as the spread of the samples behind them, and the
+    spread is what says whether the host could measure them at all.
+    """
+    samples: List[float] = []
+    divergences: List[Any] = []
+    for _ in range(repeats):
+        started = time.perf_counter()
+        parsed = parse_plan_doc(document)
+        divergences = validate_equivalence(parsed, plan)
+        samples.append((time.perf_counter() - started) * 1000.0)
+    return samples, divergences
+
+
+def relative_dispersion(samples: List[float]) -> float:
+    """How much the samples disagree, as a fraction of their median.
+
+    The interquartile range is used rather than the full range: one
+    sample that caught a scheduling hiccup should not make a whole run
+    look unmeasurable — but a run where the quartiles themselves
+    disagree has a problem the hiccup does not explain.
+    """
+    median = statistics.median(samples)
+    if median <= 0.0:
+        return float("inf")
+    quartiles = statistics.quantiles(samples, n=4)
+    return (quartiles[2] - quartiles[0]) / median
+
+
 def _git_worktree_paths(repo_dir: Path) -> List[Path]:
     """The worktrees git has registered for ``repo_dir``."""
     completed = subprocess.run(
@@ -367,9 +435,39 @@ def test_scaling_is_not_quadratic() -> None:
 
     A linear comparison costs 5× at 5× the size; a quadratic one costs
     25×.  The bound is 8× — above linear, far below quadratic.
+
+    The bound is **noise-aware**.  The ratio divides two wall-clock
+    measurements, so it carries the noise of both sides; on a loaded
+    host the samples of one side disagree by a wide margin and the
+    ratio then describes the host rather than the code.  Two things
+    follow from that:
+
+      * the two sizes are measured *alternately*, so a host that gets
+        busier half-way through charges the same drift to both sides;
+      * when the samples still disagree by more than
+        ``_MAX_RELATIVE_DISPERSION`` of their median, the host cannot
+        measure this shape, and the case says so — with the numbers
+        that say so — instead of reporting a shape regression that was
+        not there, and instead of passing one that was.
     """
-    base_ms, base_divergences = measure_parse_and_validate(SCALE_BASE)
-    large_ms, large_divergences = measure_parse_and_validate(SCALE_LARGE)
+    base_document = build_plan_doc(SCALE_BASE)
+    base_plan = build_plan_json(SCALE_BASE)
+    large_document = build_plan_doc(SCALE_LARGE)
+    large_plan = build_plan_json(SCALE_LARGE)
+
+    base_samples: List[float] = []
+    large_samples: List[float] = []
+    base_divergences: List[Any] = []
+    large_divergences: List[Any] = []
+    for _ in range(_SCALING_REPEATS):
+        round_base, base_divergences = measure_parse_and_validate_samples(
+            base_document, base_plan, 1
+        )
+        round_large, large_divergences = measure_parse_and_validate_samples(
+            large_document, large_plan, 1
+        )
+        base_samples.extend(round_base)
+        large_samples.extend(round_large)
 
     assert base_divergences == [], (
         f"the {SCALE_BASE}-VP fixture must be equivalent to its machine plan: "
@@ -379,19 +477,39 @@ def test_scaling_is_not_quadratic() -> None:
         f"the {SCALE_LARGE}-VP fixture must be equivalent to its machine plan: "
         f"{large_divergences[:3]}"
     )
+
+    base_ms = statistics.median(base_samples)
+    large_ms = statistics.median(large_samples)
     assert base_ms > 0.0, (
         f"the {SCALE_BASE}-VP measurement was {base_ms} ms; a ratio against it "
         "would mean nothing"
     )
 
+    base_dispersion = relative_dispersion(base_samples)
+    large_dispersion = relative_dispersion(large_samples)
+    dispersion = max(base_dispersion, large_dispersion)
     growth = large_ms / base_ms
     print(
         {
             f"{SCALE_BASE}_vp_ms": round(base_ms, 3),
             f"{SCALE_LARGE}_vp_ms": round(large_ms, 3),
             "growth": round(growth, 3),
+            f"{SCALE_BASE}_dispersion": round(base_dispersion, 4),
+            f"{SCALE_LARGE}_dispersion": round(large_dispersion, 4),
+            f"{SCALE_BASE}_samples": [round(value, 2) for value in base_samples],
+            f"{SCALE_LARGE}_samples": [round(value, 2) for value in large_samples],
         }
     )
+
+    if dispersion > _MAX_RELATIVE_DISPERSION:
+        pytest.skip(
+            f"this host cannot measure the shape: the {SCALE_BASE}-VP samples "
+            f"spread {base_dispersion * 100:.0f}% and the {SCALE_LARGE}-VP "
+            f"samples {large_dispersion * 100:.0f}% of their median, above the "
+            f"{_MAX_RELATIVE_DISPERSION * 100:.0f}% this bound needs (the growth "
+            f"measured at {growth:.1f}× is not trustworthy at that dispersion)"
+        )
+
     assert growth < MAX_GROWTH_FACTOR, (
         f"{SCALE_LARGE} VPs took {large_ms:.1f} ms against {base_ms:.1f} ms for "
         f"{SCALE_BASE} VPs — {growth:.1f}× for 5× the plan. The bound is "

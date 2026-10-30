@@ -28,7 +28,7 @@ from dataclasses import dataclass
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional, List, Dict, Any, Set, Tuple
+from typing import Callable, Mapping, Optional, List, Dict, Any, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from coding_tool import (
@@ -39,7 +39,7 @@ from coding_tool import (
     ProviderSlotWaitExpired,
     is_deterministic_local_error,
 )
-from config_paths import resolve_plans_dir
+from config_paths import resolve_plans_dir, resolve_state_db_path
 import provider_capacity
 from verification_config import TimeoutPolicy
 from verification_executor import VerificationExecutor
@@ -115,6 +115,27 @@ from verification_evidence import (  # noqa: E402
     apply_to_verdict,
     tree_fingerprint,
     tree_mutated,
+)
+
+# 2026-10-29（base drift 预检）：漂移检查走 ``base_drift`` **模块本身**
+# —— ``base_drift.check_and_merge_base(...)``，而不是 ``from base_drift
+# import check_and_merge_base``。绑定到本模块的名字会让源模块和本模块各
+# 有一份函数：打在源模块上的桩再也打不中真正被调用的那一份，而桩正是这
+# 条路径唯一的测试手段。
+import base_drift  # noqa: E402
+
+# 2026-10-29（base drift → repair 通道）：冲突修复任务落库走的是既有
+# repair 通道的那扇门 —— ``PlanTaskRepository.add_task``。字段白名单、
+# upsert 语义、初始 ``pending`` 状态都在那一个方法里；这里再写一份
+# SQL 就等于多了一个写者，多了一份会漂移的规则。
+#
+# 模块级导入是刻意的：测试要能 monkeypatch
+# ``PlanTaskRepository.add_task``（无论打在源模块还是本模块上）。
+from state_machine.db.connection import open as _open_state_db  # noqa: E402
+from state_machine.db.schema import migrate as _migrate_state_db  # noqa: E402
+from state_machine.repositories.plan_task_repository import (  # noqa: E402
+    ALLOWED_STATIC_TASK_FIELDS,
+    PlanTaskRepository,
 )
 
 #: 导入那一刻的 ``apply_to_verdict``。留着它才能分辨"源模块被打桩了"和
@@ -206,6 +227,71 @@ def vp_dispatch_gaps(
     from verification_plan_delta import vp_definition_gaps
     gaps.extend(vp_definition_gaps(entry))
     return gaps
+
+
+def persist_conflict_repair_task(
+    plan_id: str,
+    task: Dict[str, Any],
+    *,
+    db_path: Optional[Path] = None,
+) -> bool:
+    """Store one base-drift conflict repair task in ``state.db``.
+
+    :func:`base_drift.build_conflict_repair_task` **builds** the task
+    and stops there; this function **stores** it, through the very
+    entry point the repair channel already uses —
+    :meth:`PlanTaskRepository.add_task`.  Reusing that method is not a
+    convenience: it is where the field allow-list is enforced, where
+    the upsert on ``(plan_id, task_id)`` lives, and where the row's
+    initial ``pending`` status is decided.  A second writer — raw SQL
+    here — would own a second copy of those rules, and the executor's
+    reconcile step reads the rows ``add_task`` wrote.
+
+    The payload is narrowed to :data:`ALLOWED_STATIC_TASK_FIELDS`
+    before the call, because ``add_task`` **rejects** a payload that
+    carries a field it does not know — it does not filter it out.
+    ``status`` is the classic offender: it belongs to
+    ``update_task``'s runtime mirror, not to the static columns.
+
+    ``db_path`` defaults to :func:`config_paths.resolve_state_db_path`
+    — the one resolver the rest of the backend uses, so a test's
+    ``PDT_STATE_DB_PATH`` redirect and the operator's live database
+    resolve to the same path here as they do everywhere else.
+
+    Returns ``True`` when the row was written, ``False`` on any
+    failure.  A task that cannot be stored must not take the whole
+    verification round down with it: the caller decides what a lost
+    row means, this function only refuses to raise.
+    """
+    if not isinstance(task, dict):
+        return False
+    task_id = task.get("id")
+    if not isinstance(task_id, str) or not task_id:
+        return False
+    static_payload = {
+        key: value
+        for key, value in task.items()
+        if key in ALLOWED_STATIC_TASK_FIELDS
+    }
+    try:
+        target = (
+            Path(db_path) if db_path is not None else resolve_state_db_path()
+        )
+        conn = _open_state_db(target)
+        try:
+            _migrate_state_db(conn)
+            PlanTaskRepository(conn).add_task(plan_id, static_payload)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — a lost row must not kill the round
+        logger.warning(
+            "[BaseDrift] conflict repair task %r for plan %r not persisted: %s",
+            task_id,
+            plan_id,
+            exc,
+        )
+        return False
+    return True
 
 
 class ApiTestSchemaViolation(RuntimeError):
@@ -2685,6 +2771,15 @@ class Orchestrator:
         # queue that starved the round. See
         # :class:`_BinaryRebuildCoordinator`.
         self._rebuild_coordinator = _BinaryRebuildCoordinator()
+
+        # 2026-10-29（base drift 预检）：本轮最后一次漂移检查的报告。
+        # ``None`` = 还没查过（或者查的那次没能给出报告）。
+        #
+        # 读它的地方一律用 ``getattr(self, "_last_base_drift_report", None)``：
+        # 有一批测试是用 ``Orchestrator.__new__`` 造实例的，那条路上
+        # ``__init__`` 根本没跑过，直接 ``self._last_base_drift_report``
+        # 会抛 AttributeError。
+        self._last_base_drift_report = None
 
         # 2026-09-16 service-freshness preflight ("VP0") state. The
         # round-start preflight (``_preflight_service_freshness``)
@@ -9396,6 +9491,29 @@ class Orchestrator:
         self._freshness_cache.clear()
         self._rebuild_coordinator.clear()
 
+        # 2026-10-29（base drift 预检）：生成计划**之前**先确认分支没有落后
+        # base。落后的分支验的是自己的陈旧 —— 测试挂掉是因为 base 改了契约，
+        # 不是因为被测功能坏了。
+        #
+        # 冲突是唯一的阻断结果：脏树、git 失败、跳过、关闭都只是这次检查自己
+        # 的家务，不该花掉本轮的验证点。
+        #
+        # 每轮只跑一次，而且不进 VP 循环 —— 跑进循环里会在本轮脚下再合一次
+        # base，本轮的报告也会取决于它碰巧有几个验证点。
+        blocked = self._run_base_drift_preflight()
+        if blocked is not None:
+            try:
+                self.persistence.update_report(blocked)
+            except Exception as exc:  # noqa: BLE001 - a report is a nicety
+                logger.warning(
+                    "[base_drift] could not write the blocked report: %s", exc,
+                )
+            print(
+                f"[Verification] Round blocked by base drift: "
+                f"{blocked.get('summary', '')}"
+            )
+            return blocked
+
         plan_data = self.generate_verification_plan()
 
         # 2026-09-16 service-freshness preflight ("VP0"): before the
@@ -11394,6 +11512,234 @@ class Orchestrator:
                 ),
             }
         return failure
+
+    # ------------------------------------------------------------------
+    # The base-drift preflight (2026-10-29)
+    # ------------------------------------------------------------------
+    #
+    # A verification round answers "does the code on this branch still
+    # work?" — but only with respect to the branch it stands on.  A
+    # branch that has drifted away from its base measures its own
+    # staleness: the test that fails is failing because *the base*
+    # changed the contract it depends on, and the round reports "the
+    # feature is broken" about a feature nobody touched.
+    #
+    # The check is a **gate**, not a step: it runs once per round,
+    # before the plan exists, and only a *conflict* stops the round.
+    # The other outcomes are the check's own housekeeping — a dirty
+    # working tree, a failed git call, a directory that is not a work
+    # tree, a check that is switched off — and none of them is a
+    # statement about the product.
+
+    def _run_base_drift_preflight(self) -> Optional[Dict[str, Any]]:
+        """Check the branch against its base; return a BLOCKED report or
+        ``None``.
+
+        ``None`` means "the round may go on" — the branch was in sync,
+        the base was merged in, the working tree was dirty, a git call
+        failed, the directory is not a work tree, or the check is
+        switched off.  Only a **conflict** stops the round: it is the
+        one outcome that says the tree the round is about to verify is
+        not the tree anybody meant to verify.
+
+        Every call writes an event, including the ones that let the
+        round go on.  A log that only records the problems cannot answer
+        "did the check run?", and "the check silently did not run" and
+        "the branch was in sync" have to be told apart.
+
+        Never raises.  A check that breaks the round it runs in is worse
+        than no check at all — a broken check is reported and the round
+        continues.
+        """
+        project_dir = getattr(self, "project_dir", None)
+        try:
+            report = base_drift.check_and_merge_base(project_dir)
+        except Exception as exc:  # noqa: BLE001 — a broken check never blocks
+            logger.warning(
+                "[base_drift] the base-drift check raised (%s: %s); "
+                "the round continues",
+                type(exc).__name__, exc,
+            )
+            try:
+                self._safe_log_freshness_event(
+                    "__preflight__", "base_drift_failed",
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                )
+            except Exception as log_exc:  # noqa: BLE001 — the log never blocks
+                logger.warning(
+                    "[base_drift] could not write the base_drift_failed "
+                    "event: %s", log_exc,
+                )
+            return None
+
+        # The report is kept before anything else looks at it: it is the
+        # round's drift record, whether or not the round goes on.
+        self._last_base_drift_report = report
+
+        payload = self._base_drift_report_payload(report)
+        status = str(payload.get("status") or "")
+        event = str(
+            self._base_drift_field(report, "event", "") or "base_drift_failed"
+        )
+        try:
+            self._safe_log_freshness_event("__preflight__", event, payload)
+        except Exception as exc:  # noqa: BLE001 — the log never blocks
+            logger.warning(
+                "[base_drift] could not write the %s event: %s", event, exc,
+            )
+
+        if status != base_drift.STATUS_CONFLICTS:
+            return None
+
+        blocked = self._build_base_drift_blocked_report(report)
+        repair_task_id = self._persist_base_drift_repair_task(report)
+        if repair_task_id:
+            blocked["base_drift_repair_task_id"] = repair_task_id
+            blocked["base_drift_conflicts"]["base_drift_repair_task_id"] = (
+                repair_task_id
+            )
+        return blocked
+
+    def _build_base_drift_blocked_report(self, report: Any) -> Dict[str, Any]:
+        """The report of a round that never started.
+
+        A round that dispatched nothing has measured nothing about the
+        product, so it has no verdict to give: the report says
+        ``BLOCKED`` and carries **no** verification results — not an
+        empty ``FAILED``, not a skipped one.  A FAILED verdict would
+        send the repair chain after a product nobody ever looked at.
+
+        The conflict's own evidence travels with the report: which base
+        was merged, at which commit, and which files are in conflict.
+        """
+        if report is None:
+            report = getattr(self, "_last_base_drift_report", None)
+        payload = self._base_drift_report_payload(report)
+        base_ref = str(payload.get("base_ref") or "")
+        base_sha = str(payload.get("base_sha") or "")
+        names = []
+        for entry in payload.get("conflict_files") or []:
+            name = (
+                str(entry.get("path") or "")
+                if isinstance(entry, Mapping)
+                else str(entry or "")
+            )
+            if name:
+                names.append(name)
+        summary = (
+            f"The round dispatched no verification point: merging "
+            f"{base_ref or 'the base'} into the branch left conflicts in "
+            f"{len(names)} file(s) ({', '.join(names[:3])}). The branch has "
+            f"to be reconciled with {base_ref or 'the base'} "
+            f"({base_sha or 'unknown commit'}) before the round can verify "
+            f"anything."
+        )
+        return {
+            "overall_status": "BLOCKED",
+            "verification_results": [],
+            "requirement_deviations": [],
+            "summary": summary,
+            "stop_reason": "base_drift_conflicts",
+            "base_drift_conflicts": payload,
+            "execution_profile": {"mode": "base_drift_blocked"},
+        }
+
+    def _persist_base_drift_repair_task(self, report: Any) -> Optional[str]:
+        """Turn a conflicting report into a repair task and store it.
+
+        Only in ``repair`` mode: the default ``report`` mode is read-only
+        by contract, and a read-only check must not write anything.
+
+        The task is **built** by :func:`base_drift.build_conflict_repair_task`
+        and **stored** by :func:`persist_conflict_repair_task` — the
+        repair channel that already exists.  This method does not touch
+        the database itself: one writer per row, and the writer that
+        already exists is the one that enforces the field allow-list.
+
+        Returns the task id, or ``None`` when there was nothing to
+        repair (the report names no conflicting file) or the task could
+        not be built.
+        """
+        mode = str(self._base_drift_field(report, "mode", "") or "")
+        if mode != base_drift.MODE_REPAIR:
+            return None
+
+        plan_id = str(
+            getattr(getattr(self, "plan_dir", None), "name", "") or ""
+        )
+        try:
+            round_number = int(getattr(self, "_current_round", 0) or 0)
+        except (TypeError, ValueError):
+            round_number = 0
+        try:
+            task = base_drift.build_conflict_repair_task(
+                report,
+                plan_id=plan_id,
+                project_dir=getattr(self, "project_dir", None),
+                round_number=round_number,
+            )
+        except Exception as exc:  # noqa: BLE001 — a lost task never blocks
+            logger.warning(
+                "[base_drift] could not build the conflict repair task: %s",
+                exc,
+            )
+            return None
+
+        if not task:
+            # The report names no conflicting file: there is nothing to
+            # repair, and a task without a change scope sends the
+            # executor off to "fix" files that were never in conflict.
+            return None
+
+        task_id = str(self._base_drift_field(task, "id", "") or "")
+        try:
+            persisted = persist_conflict_repair_task(plan_id, task)
+        except Exception as exc:  # noqa: BLE001 — a lost row never blocks
+            logger.warning(
+                "[base_drift] the conflict repair task %r could not be "
+                "stored: %s", task_id, exc,
+            )
+            persisted = False
+        if not persisted:
+            logger.warning(
+                "[base_drift] the conflict repair task %r was not stored",
+                task_id,
+            )
+        return task_id or None
+
+    @staticmethod
+    def _base_drift_field(report: Any, name: str, default: Any = None) -> Any:
+        """Read one field of a base-drift report — an object or a mapping.
+
+        The report is normally a :class:`base_drift.BaseDriftReport`, but
+        the preflight must not care: a stubbed check may hand back a
+        plain dict, and reading the one field it needs is enough.
+        """
+        if isinstance(report, Mapping):
+            return report.get(name, default)
+        return getattr(report, name, default)
+
+    @classmethod
+    def _base_drift_report_payload(cls, report: Any) -> Dict[str, Any]:
+        """The report as a JSON-safe dict.
+
+        ``to_dict`` is the report's own contract; a report without one
+        (a stub, a mapping) is normalised field by field so the event
+        log and the blocked report always carry the same keys.
+        """
+        to_dict = getattr(report, "to_dict", None)
+        if callable(to_dict):
+            try:
+                data = to_dict()
+            except Exception:  # noqa: BLE001 — a broken report is not fatal
+                data = None
+            if isinstance(data, dict):
+                return dict(data)
+        if isinstance(report, Mapping):
+            return dict(report)
+        return {
+            "status": str(cls._base_drift_field(report, "status", "") or ""),
+        }
 
     def service_preflight_targets(self) -> List[Dict[str, Any]]:
         """The services this round is about to use, and who they must be.

@@ -661,30 +661,113 @@ def test_the_hold_window_ends_before_the_lock_is_released(
     happen.
 
     Slowing ``release`` down makes the difference measurable instead
-    of a race: a window that includes the release is longer than the
-    sleep it is supposed to bound.
+    of a race: a window that includes the release carries the whole
+    release cost.
+
+    The bound is a **same-round baseline differential**, not an
+    absolute one. The old form asserted ``window < sleep_seconds +
+    release_cost / 2``, which is not measurable on a shared runner:
+    the host's timer decides how long ``time.sleep(0.05)`` really
+    takes (on a loaded machine it can be several times the requested
+    duration), so the assertion flipped on the host's load rather
+    than on the lock.
+
+    So each round measures the same path twice:
+
+      * ``base`` — the baseline path: ``sleep=0`` and an ordinary
+        release. It is the fixed cost of the machinery (lock
+        acquisition, the two clock reads, the release).
+      * ``window`` — the hold window of the ``sleep=0.05`` run, whose
+        release is slowed down.
+      * ``slept`` — how long that run's ``time.sleep`` really took,
+        measured around the very same call, so the host's oversleep
+        cancels instead of being charged to the lock.
+
+    What is left is the **excess** — the time the window absorbed
+    beyond the sleep it was supposed to bound::
+
+        excess = window - base - slept
+
+    The baseline's release is the *ordinary* one on purpose. A
+    baseline whose release was slowed down as well would carry the
+    release cost in both halves of the difference and the differential
+    would cancel the very thing it has to detect; with an ordinary
+    release in the baseline, the excess is the release cost the window
+    absorbed, and nothing else. (A negative control pins this down:
+    moving ``end`` after ``release()`` in the helper has to make this
+    test fail.)
+
+    With ``end`` read before the release the excess is only the
+    difference between two clock reads; with ``end`` read after the
+    release it carries the whole release cost. The bound is a fraction
+    of that release cost, so the contract no longer depends on the
+    host's timing at all.
     """
     release_cost = 0.25
+    rounds = 3
+    sleep_seconds = 0.05
+
     real_release = FileLockManager.release
+    real_sleep = time.sleep
 
-    def slow_release(self: FileLockManager) -> None:
+    slow_release_enabled = {"value": False}
+
+    def patched_release(self: FileLockManager) -> None:
         real_release(self)
-        time.sleep(release_cost)
+        if slow_release_enabled["value"]:
+            real_sleep(release_cost)
 
-    monkeypatch.setattr(FileLockManager, "release", slow_release)
+    # ``time.sleep`` is recorded (not replaced) so the duration the host
+    # actually gave the sleep is available: the requested duration is
+    # not what the caller got back. The release's own sleep is not
+    # recorded — it calls the original ``real_sleep`` — so only the
+    # task's sleeps land in the list.
+    slept: List[Tuple[float, float]] = []
+
+    def recording_sleep(seconds: float) -> None:
+        started = time.monotonic()
+        real_sleep(seconds)
+        slept.append((seconds, time.monotonic() - started))
+
+    monkeypatch.setattr(FileLockManager, "release", patched_release)
+    monkeypatch.setattr(time, "sleep", recording_sleep)
 
     project_dir = tmp_path / "project"
     project_dir.mkdir(parents=True, exist_ok=True)
-    sleep_seconds = 0.05
 
-    start, end = _run_task_with_locks(
-        project_dir, ["src/file_0.py"], sleep_seconds
-    )
+    excesses: List[float] = []
+    for _ in range(rounds):
+        # Baseline: no hold, ordinary release.
+        slow_release_enabled["value"] = False
+        base_start, base_end = _run_task_with_locks(
+            project_dir, ["src/file_0.py"], 0.0
+        )
+        # Measured: the hold window, with a release that costs enough to
+        # be visible if the window swallows it.
+        slow_release_enabled["value"] = True
+        slept.clear()
+        start, end = _run_task_with_locks(
+            project_dir, ["src/file_0.py"], sleep_seconds
+        )
+        measured = [d for requested, d in slept if requested == sleep_seconds]
+        assert measured, (
+            "the hold window's sleep was not observed — the differential "
+            "would compare against a baseline that cannot cancel the "
+            "host's oversleep, and would charge the host's timing to the "
+            "lock"
+        )
+        window = end - start
+        base = base_end - base_start
+        excesses.append(window - base - measured[-1])
 
-    window = end - start
-    assert window < sleep_seconds + release_cost / 2, (
-        f"the hold window was {window:.3f}s for a {sleep_seconds}s task; "
-        f"it absorbed part of a {release_cost}s release, so it is being "
+    # The least disturbed round is the honest estimate: a round where
+    # the thread was descheduled between the two clock reads carries
+    # that delay in the excess, and it would be charged to the lock.
+    absorbed = min(excesses)
+    assert absorbed < release_cost / 2, (
+        f"the hold window absorbed {absorbed:.3f}s beyond the sleep it was "
+        f"supposed to bound (release cost {release_cost:.3f}s, per-round "
+        f"excesses {[round(value, 3) for value in excesses]}); it is being "
         f"measured across the point where the lock is already free — "
         f"which is what lets a released task overlap the next task's "
         f"window and report a lock bypass that never happened"

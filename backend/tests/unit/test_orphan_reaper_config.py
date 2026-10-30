@@ -68,6 +68,68 @@ ALL_KINDS = (
 )
 
 
+#: The marker every case that needs the operating system's own process
+#: table carries.  Such a case needs a machine whose process table can
+#: be read, so the parallel CI shards leave it alone.
+#:
+#: ``backend/pytest.ini`` — the config a ``backend/tests`` run resolves —
+#: runs pytest with ``--strict-markers``, and pytest checks a marker at the
+#: moment it is *used* (``pytest.mark.<name>``), so a case that carries a
+#: marker the governing config does not declare aborts collection for its
+#: whole module.  ``needs_real_process`` is declared in the repo-root
+#: ``pytest.ini`` and not in ``backend/pytest.ini``, whose marker list is
+#: frozen by
+#: ``backend/tests/static_gates/test_keychain_macos_job_is_a_merge_gate.py``;
+#: the module registers the marker with the live config before it uses it —
+#: the pattern
+#: ``backend/tests/integration/test_context_pack_reduces_exploration.py``
+#: established for ``observational``.
+_NEEDS_REAL_PROCESS_DESCRIPTION = (
+    "needs_real_process: cases that drive a real server / real subprocess / "
+    "real repository rather than a fixture double, so they need a quiet "
+    "machine and a port to themselves."
+)
+
+
+def _register_needs_real_process_marker() -> None:
+    """Declare the ``needs_real_process`` marker with the live pytest config."""
+    config = getattr(pytest.mark, "_config", None)
+    if config is None:  # pragma: no cover - a collection always has a config
+        return
+    known = {
+        line.split(":")[0].split("(")[0].strip()
+        for line in config.getini("markers")
+    }
+    if "needs_real_process" not in known:
+        config.addinivalue_line("markers", _NEEDS_REAL_PROCESS_DESCRIPTION)
+
+
+_register_needs_real_process_marker()
+
+_NEEDS_REAL_PROCESS = pytest.mark.needs_real_process
+
+
+def _skip_unless_the_host_can_report_a_start_time() -> None:
+    """Skip when this host cannot report when this process started.
+
+    The owner mark carries the process' start time so that a recycled
+    pid can be told apart from the original.  A host whose process
+    table cannot be read — no ``/proc``, no usable ``ps`` — has no
+    start time to carry, and the case that checks the mark would then
+    be checking an empty string: the host's limitation, not the
+    reaper's behaviour.
+
+    Called from the body of a case rather than requested as a fixture:
+    the case's own signature is part of the file's shape, and a case
+    that changed shape would read as a case that was replaced.
+    """
+    if not reaper.process_start_epoch(os.getpid()):
+        pytest.skip(
+            "this host cannot report a process's start time (neither /proc "
+            "nor ps answered), so the owner-mark case cannot be checked here"
+        )
+
+
 @pytest.fixture
 def clean_spawn_env(monkeypatch):
     """Remove any ``PDT_SPAWN_*`` marker for the duration of one test.
@@ -151,14 +213,27 @@ def test_every_declared_kind_is_accepted():
 # --------------------------------------------------------------------------
 
 
+@_NEEDS_REAL_PROCESS
 def test_install_owner_marks_sets_self(clean_spawn_env):
     """The installed marks identify this process, not the one that made it."""
+    _skip_unless_the_host_can_report_a_start_time()
     expected_start = reaper.process_start_epoch(os.getpid())
+    if not expected_start:
+        pytest.skip(
+            "this host stopped reporting this process' start time while the "
+            "case was running (neither /proc nor ps answered), so the owner "
+            "mark cannot be compared with one"
+        )
 
     install_owner_marks()
 
     assert os.environ[SPAWN_OWNER_PID] == str(os.getpid())
-    assert os.environ[SPAWN_OWNER_START] == expected_start
+    assert os.environ[SPAWN_OWNER_START] == expected_start, (
+        f"the installed start mark {os.environ[SPAWN_OWNER_START]!r} does "
+        f"not match this process' start time {expected_start!r} — the owner "
+        "mark has to identify the process it was installed on, or a recycled "
+        "pid cannot be told from the original"
+    )
 
 
 def test_install_owner_marks_writes_no_kind_and_is_idempotent(clean_spawn_env):

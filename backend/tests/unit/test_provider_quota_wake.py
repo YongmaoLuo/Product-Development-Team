@@ -1382,6 +1382,17 @@ class TestTheAttemptAttachesIt:
 
         return _Tool()
 
+    # The case below asserts on WALL-CLOCK time: it parks a 0.1 s budget
+    # for 0.3 s of real time and then requires the budget to be intact.
+    # Under a parallel lane the host is busy enough that the wait IS
+    # charged, so the assertion measures the runner's load rather than
+    # the code - the same class of case as
+    # ``test_backend_startup_latency_within_10ms``. The marker moves it
+    # into the serial lane (``-m "time_sensitive or perf"
+    # --timeout=1800``) where it runs alone and asserts exactly the same
+    # three things. It is NOT skipped, xfailed or deleted: the coverage
+    # is rescheduled, not retired.
+    @pytest.mark.time_sensitive
     @pytest.mark.asyncio
     async def test_a_wait_outlasting_the_whole_cap_still_reaches_a_verdict(
         self, tmp_path,

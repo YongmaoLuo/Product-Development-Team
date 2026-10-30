@@ -550,6 +550,16 @@ FROZEN_SCHEMA_DDL_HASH: str = (
 #: change being the rename plus the capacity work, not the rename
 #: alone.
 #:
+#: 2026-10-29: the same file now also carries the **base-drift
+#: hand-off** — a round whose base-drift preflight found conflicts
+#: never dispatched a verification point, and the loop has to
+#: recognise that round instead of reading its empty report as "every
+#: verification point failed".  The change is additive (+121 lines:
+#: one import, one constant pair, the handler and its call site); no
+#: phase name, no park state and no existing branch of the loop
+#: changed, which is why the freeze moves rather than the gate being
+#: loosened.
+#:
 #: ``frontend/app.js`` carries one more approved change on top of the
 #: rename: the legacy ``esc()`` helper now coerces its argument to a
 #: string before escaping it.  A task id in ``tasks.json`` is allowed to
@@ -568,7 +578,7 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 2026-10-29：因「关机检查点恢复」新增 `_requeue_shutdown_interrupted_verification`（+80 行），
     # 按本 gate 的既定流程重新钉住该文件的哈希。
     "backend/verification_loop.py": (
-        "5a75c8d24dc663ab043671e6887d3dd51b22c0951b6d6f2a3839ff5b020bbd2e"
+        "78caf3bbbf5a8734ed0984eaefa14451b6f78c7701e2a771dd4683bacfe11cbf"
     ),
 }
 
