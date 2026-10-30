@@ -3035,6 +3035,24 @@ class ResetVerificationRequest(BaseModel):
 
             Turn it on when the plan itself was regenerated (PRD revised,
             tasks re-cut) and a fresh VP list is actually what you want.
+        clear_root_cause_chain: also delete the root-cause chain's
+            ledger (``verification_root_cause_chain.json``) and the
+            reports it names (``vps[*].report_path``).
+
+            2026-10-30: the chain outlived every other per-round
+            artefact. A reset clears the verdicts, the repair tasks and
+            the round's disk outputs, but the ledger stayed — so the
+            next round still saw the old ``BLOCKED_ON_USER`` entry and
+            the point stayed occupied by a chain nobody had re-examined.
+            The report is the other half: the ledger says the diagnosis
+            was delivered, and the reader judges that by whether the
+            report file is there.
+
+            Off by default: clearing the chain is a **decision** (the
+            chain is the plan's own history of where each point's root
+            cause stood), not a side effect of a reset. When it is on,
+            only the files the ledger names are deleted — the reports
+            directory is never globbed.
         supersede_repair_tasks: mark pending ``RP-*`` tasks
             ``superseded``. They were generated from the verdicts this
             reset is discarding, so leaving them pending would have the
@@ -3048,6 +3066,7 @@ class ResetVerificationRequest(BaseModel):
     force: bool = False
     clear_artifacts: bool = True
     clear_verification_plan: bool = False
+    clear_root_cause_chain: bool = False
     supersede_repair_tasks: bool = True
     restart_at_round: int = Field(default=1, ge=1, le=1000)
 
