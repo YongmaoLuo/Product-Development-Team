@@ -10086,6 +10086,14 @@ class Orchestrator:
             vp["evidence_artifact_dir"] = str(
                 self.plan_dir / "vp_artifacts" / vp_id
             )
+            # 2026-10-29（引用必须落在计划的 project_dir 上）：code_review 的
+            # 结论靠行号落地，而"项目根"指代不明 —— 计划目录（citations.json
+            # 的所在地）通常在另一个 checkout 里，那里同名文件的行号不是本
+            # VP 的证据（VP-010 第 1 轮的 30 条引用就是这么全被判 unverifiable
+            # 的）。把**这一棵树**的绝对路径告诉子 agent：框架就是拿它来解析
+            # 引用的，子 agent 也必须从它读行号（见 verification_subagent 的
+            # EVIDENCE CONTRACT）。
+            vp["project_root"] = str(self.project_dir)
             # 2026-09-18（端口让路）：把服务实际地址告诉 VP。
             service_env = self._service_env_for_vps()
             if service_env:

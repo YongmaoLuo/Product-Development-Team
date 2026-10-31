@@ -2100,6 +2100,29 @@ class VerificationSubAgent:
             return []
 
         if method == "code_review":
+            # 2026-10-29（引用必须落在计划的 project_dir 上）："项目根"这个词
+            # 指代不明 —— 计划目录（citations.json 的所在地）通常在另一个
+            # checkout 里，那里同名文件的行号不是本 VP 的证据。VP-010 第 1 轮
+            # 的 30 条引用就是这么全被判 unverifiable 的：引用的树不是判据
+            # 的树。所以这里点名**唯一**一棵允许引用的树。
+            project_root = str(vp_node.get("project_root") or "").strip()
+            project_root_rules: List[str] = []
+            if project_root:
+                project_root_rules = [
+                    "- The project root below is the ONLY tree your citations "
+                    "may come from:",
+                    f"    {project_root}",
+                    "- Read every file you cite from THAT tree. The `file` / "
+                    "`line` / `snippet` triple must describe a line of the "
+                    "file as it is there — not as it is in some other copy "
+                    "of the same file name.",
+                    "- The plan directory (where citations.json is written) "
+                    "is a DIFFERENT checkout: the same file name there "
+                    "carries different line numbers, and those numbers are "
+                    "not evidence for this VP. The framework resolves your "
+                    "citations against the project root above and refuses "
+                    "every citation that does not match it.",
+                ]
             return [
                 "",
                 "## EVIDENCE CONTRACT — write citations.json (MANDATORY)",
@@ -2132,6 +2155,7 @@ class VerificationSubAgent:
                 "directory outside this repository are NOT project evidence "
                 "— the framework rejects them as `outside_project` and the "
                 "citation is treated as unverifiable.",
+                *project_root_rules,
                 "- A verdict of PASSED with no citations, or with citations "
                 "that do not resolve, is NOT honoured — it is downgraded to "
                 "FAILED.",
