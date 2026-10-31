@@ -2292,13 +2292,76 @@ function renderScheduler(snapshot) {
     renderSchedulerRunning(data);
 }
 
+/** The failure each read last had, filed under the read that had it.
+
+    Two failures are the same failure when they come from the same read
+    and carry the same message.  The poll runs every five seconds, so a
+    backend that is down would otherwise write the same line every five
+    seconds for as long as the operator sat there watching.
+
+    The read is part of the key, and that is deliberate.  Every read
+    goes through the same api() wrapper, so a backend that is down
+    makes them all fail with the very same message — and they are
+    still separate failures, because separate reads are broken.  A
+    marker shared by every read cannot tell them apart: the second
+    read that fails with the same message is swallowed by the first
+    one's marker, and the console shows one line for two broken reads.
+
+    Because the key is the read, a read that succeeds again forgets
+    only its own failure.  Another read may still be failing with the
+    same message, and that failure must not be written a second time
+    on the next tick.
+
+    The marker is only about the console.  The last good frame on
+    screen is kept by the quiet reads themselves: they simply do not
+    paint over it. */
+const _schedulerPollErrors = {};
+
+/** The key a failure is filed under when it does not say which read it
+    came from.  It is a key of the same map, so a failure that nobody
+    attributes to a read never shares a memory with one that is. */
+const _schedulerPollUnscoped = "unscoped";
+
+/** Write a failed quiet read to the console — once per failure.
+
+    The same read failing the same way is written once.  A different
+    message is a different kind of failure and is written as well: the
+    marker is a memory of the last failure of *this* read, not a mute
+    that silences the console for ever.
+
+    The marker is written before the line, so the tick that follows
+    finds it and stays quiet. */
+function schedulerLogPollError(err, source) {
+    const message = err && err.message ? String(err.message) : String(err || "");
+    if (!message) return;
+    const key = source ? String(source) : _schedulerPollUnscoped;
+    if (_schedulerPollErrors[key] === message) return;
+    _schedulerPollErrors[key] = message;
+    console.warn("scheduler refresh failed:", message);
+}
+
+/** The failure is gone: the read that failed succeeded again.
+
+    Only that read's failure is forgotten.  A read that did not fail
+    must not clear another read's failure, or the very next tick would
+    write that failure a second time. */
+function schedulerClearPollError(source) {
+    const key = source ? String(source) : _schedulerPollUnscoped;
+    delete _schedulerPollErrors[key];
+}
+
 /** Read the read model.  A scheduler that is not running answers an
     empty document, so there is nothing to catch here but a transport
-    failure — and that one is shown rather than thrown away. */
-async function loadSchedulerState() {
+    failure — and that one is shown rather than thrown away.
+
+    A quiet read is the poll's read.  It keeps the last good frame
+    instead of painting over it, and says what went wrong in the
+    console rather than on the operator's screen. */
+async function loadSchedulerState(options = {}) {
     try {
         const snapshot = await api("/scheduler/state");
         renderScheduler(snapshot);
+        if (options.quiet) schedulerClearPollError("state");
         // The parallel-agent count is a second, optional read: it rides
         // along with this refresh instead of owning a timer of its own.
         loadSchedulerAgentCount();
@@ -2307,6 +2370,10 @@ async function loadSchedulerState() {
         await loadSchedulerTerminalPlans();
         return snapshot;
     } catch (err) {
+        if (options.quiet) {
+            schedulerLogPollError(err, "state");
+            return null;
+        }
         renderSchedulerError(err);
         return null;
     }
@@ -2353,6 +2420,80 @@ async function loadSchedulerAgentCount() {
     } catch (err) {
         schedulerSetText("#scheduler-view-agent-count", "—");
     }
+}
+
+/** How often the scheduler view re-reads the read model.  Five seconds
+    is short enough that a queued plan shows up while the operator is
+    still looking at the panel, and long enough that the panel does not
+    hammer the API. */
+const SCHEDULER_POLL_MS = 5000;
+
+/** The one timer that drives the panel's refreshes.  A single handle is
+    what keeps a second visit from stacking a second timer on top of the
+    first. */
+let _schedulerPoller = null;
+
+/** Is the scheduler view the one on screen?  A poll that runs while the
+    operator is on another view refreshes a panel nobody is looking at,
+    so it draws nothing. */
+function schedulerViewVisible() {
+    const view = $("#scheduler-view");
+    return Boolean(view) && !view.classList.contains("hidden");
+}
+
+/** Re-read the read model and redraw the panel.  This is a redraw and
+    nothing else: the page is not reloaded, so the operator keeps the
+    view they are in, and the loader that already exists is the one
+    that does the reading.
+
+    A hidden page reads nothing.  The guard is here rather than in the
+    timer so that every caller is covered — the interval, the manual
+    refresh and the refresh that happens when the tab comes back.
+
+    The poll reads quietly.  It is the one reader the operator did not
+    ask a question, so a failure it hits is a note in the console
+    rather than an error painted over a panel that is otherwise fine —
+    and the panel keeps the frame it last drew. */
+async function refreshScheduler() {
+    if (document.hidden || !schedulerViewVisible()) return;
+    await loadSchedulerState({ quiet: true });
+}
+
+/** Start the panel's refresh timer.  The previous timer is cleared
+    first, so entering the view twice cannot leave two of them running
+    and double the request rate. */
+function startSchedulerPolling() {
+    stopSchedulerPolling();
+    if (!schedulerViewVisible()) return;
+    _schedulerPoller = setInterval(refreshScheduler, SCHEDULER_POLL_MS);
+}
+
+/** Stop the panel's refresh timer. */
+function stopSchedulerPolling() {
+    if (_schedulerPoller) {
+        clearInterval(_schedulerPoller);
+        _schedulerPoller = null;
+    }
+}
+
+/** React to the page being hidden or shown.
+
+    A hidden tab stops polling: nobody is looking at the panel, so the
+    requests are pure load.  A tab that comes back refreshes at once —
+    the operator should not have to wait out an interval to see the
+    state they came back for — and then resumes the cadence.
+
+    The scheduler view is checked as well as the page: coming back to
+    the tab while another view is on screen starts nothing, because
+    there is no panel on screen to keep current. */
+function handleSchedulerVisibilityChange() {
+    if (document.hidden) {
+        stopSchedulerPolling();
+        return;
+    }
+    if (!schedulerViewVisible()) return;
+    refreshScheduler();
+    startSchedulerPolling();
 }
 
 /** What a command did, in the command's own words. */
@@ -2519,6 +2660,7 @@ function goHome() {
     loadPlans();
     loadSchedulerState();
     updateSidebarActiveItem(null);
+    stopSchedulerPolling();
 }
 
 function init() {
@@ -2780,6 +2922,7 @@ function init() {
     safeBind("#btn-open-scheduler", "click", () => {
         show("scheduler-view");
         loadSchedulerState();
+        startSchedulerPolling();
     });
     safeBind("#btn-refresh-scheduler", "click", () => {
         loadSchedulerState();
@@ -2814,3 +2957,9 @@ function init() {
 }
 
 document.addEventListener("DOMContentLoaded", init);
+
+// Registered here, at the top level of the module, and not inside
+// init(): init() is re-callable, and a listener registered per call
+// would run the handler once per registration — another refresh and
+// another timer every time the tab is switched.
+document.addEventListener("visibilitychange", handleSchedulerVisibilityChange);
