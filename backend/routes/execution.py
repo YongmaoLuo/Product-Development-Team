@@ -37,6 +37,24 @@ import server as _server
 # directory is.
 from project_dir_guard import ProjectDirInvalidError, validate_project_dir
 
+# The process ledger is the durable record of what this backend started.
+# ``record_spawn`` / ``record_exit`` are imported by value so the seam
+# is explicit and a test can make the write fail on purpose; the
+# identity probe reads the kernel's own answer about a pid -- pids are
+# recycled, so the number alone does not identify a process, the start
+# time does.
+from process_identity import matches as identity_matches
+from process_identity import probe as probe_process_identity
+from process_ledger import ProcessRecord
+from process_ledger import live_records as ledger_live_records
+from process_ledger import record_event as ledger_record_event
+from process_ledger import record_exit as ledger_record_exit
+from process_ledger import record_spawn as ledger_record_spawn
+from scheduler_ownership import scheduler_holds
+from process_reaper import DEFAULT_GRACE_SECONDS
+from process_reaper import EVENT_IDENTITY_MISMATCH
+from process_reaper import reap_plan
+
 # The park's kind is decided ONCE — in the module that owns the
 # decision — and written down by the writer that records the park.
 # Imported by value for the same reason as the guard above: the
@@ -52,6 +70,59 @@ from capacity_wait import WAIT_KIND_FIELD, quota_wait_event_data
 import execution_log_tail
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# The startup reconcile — the recorded pid, checked against the kernel
+# ---------------------------------------------------------------------------
+#
+# ``plan_execution.exec_pid`` is a pid, and pids are recycled.  A row
+# that says "the executor of this plan is pid 4242" is true only until
+# the kernel hands 4242 to somebody else.  The old recovery asked
+# ``os.kill(pid, 0)`` — "is anything running at this number?" — and
+# took a yes for an answer, so a recycled pid was adopted as the
+# plan's executor and later signalled with it.
+#
+# The ledger already holds the answer.  Every process this backend
+# started was recorded with the start time and the command line the
+# kernel reported, and ``process_identity.matches`` compares those
+# against what the kernel says now.  Three answers, three consequences:
+#
+# * **match** — the executor really is ours.  It outlived the backend
+#   that started it and nobody is left to own it, so it is reaped
+#   (``reap_plan``) and the plan is parked as ``stopped``.  The kill
+#   comes first: a half-adopted executor is worse than none.
+# * **gone** — the pid names no process any more.  The exit is
+#   recorded, the pid is cleared and the plan is parked as
+#   ``stopped``.  This is not ``_mark_failed_dead``: the process did
+#   not die unexpectedly, the run was interrupted by the restart, and
+#   the plan is resumable rather than failed.
+# * **mismatch** — the pid is alive but is not the process that was
+#   recorded (or the ledger never recorded it at all).  Nothing is
+#   signalled: "not known to be ours" is not a licence to kill.  The
+#   pid is cleared, the plan is parked as ``stopped`` and the ledger
+#   records an ``identity_mismatch`` event.
+
+
+#: The reason written on a plan the startup reconcile parked.
+STARTUP_RECONCILE_REASON = "startup_reconcile"
+
+#: The executor was ours and was reaped.
+ACTION_KILLED = "killed"
+
+#: The pid named no process any more.
+ACTION_CLEARED = "cleared"
+
+#: The pid was alive but was not the process that was recorded.
+ACTION_MISMATCH = "mismatch"
+
+#: There was nothing to reconcile.
+ACTION_SKIPPED = "skipped"
+
+#: The executor outlived the backend, and the **scheduler** owns the
+#: run: the scheduler adopts it (its own recovery re-times the slot
+#: from the moment of the restart), so nothing was signalled.
+ACTION_ADOPTED = "adopted"
 
 
 def _restore_execution_state_from_row(
@@ -106,24 +177,34 @@ def _restore_execution_state_from_row(
     return state
 
 
-def _recover_execution_states(plans_dir: Path) -> None:
+def _recover_execution_states(plans_dir: Path) -> List[Tuple[str, str]]:
     """On startup, scan plan directories and restore execution state.
 
     - Read the plan_execution row from the state-machine SQLite
       (ExecutionRepository.summary) into _execution_state.
-    - For 'running' entries, probe PID with os.kill(pid, 0).
-    - Dead or missing PID → mark failed + sync plan_state.
+    - For a 'running' row, reconcile the recorded pid against the
+      kernel (see :func:`_reconcile_exec_pid`): the identity is
+      checked before a signal is sent, and the plan is parked as
+      'stopped' whichever way the check comes out.
     - Corrupt / missing row → skip with a log warning.
+
+    Returns one ``(plan_id, action)`` pair per plan that had an
+    execution row.  ``action`` is :data:`ACTION_KILLED` (the executor
+    was ours and was reaped), :data:`ACTION_CLEARED` (the pid named
+    no process any more), :data:`ACTION_MISMATCH` (the pid was alive
+    but was not the process we recorded — nothing was signalled) or
+    :data:`ACTION_SKIPPED` (there was nothing to reconcile).
     """
+    actions: List[Tuple[str, str]] = []
     if not plans_dir.exists():
-        return
+        return actions
     # Open a single SQLite connection for the lifetime of the
     # recovery scan; the state-machine layer is the canonical source
     # of execution metadata (architecture decision point 5).
     sm = _server._open_state_machine()
     if sm is None:
         # Fresh install — no state.db yet — nothing to recover.
-        return
+        return actions
     _conn, _routing_repo, execution_repo, _verification_repo, _artifact_repo = sm
     try:
         for plan_dir in plans_dir.iterdir():
@@ -141,30 +222,290 @@ def _recover_execution_states(plans_dir: Path) -> None:
                 continue
             if row is None:
                 continue
-            # Restore in-memory state (handle None values gracefully).
-            # The status and the pid are read out of the restored state,
-            # so the scan judges exactly what a reader would see.
-            state = _restore_execution_state_from_row(plan_id, row)
-            status = state.get("status")
-            pid = state.get("pid")
+            status = row.get("exec_status") or "not_started"
+            pid = row.get("exec_pid")
+            if status == "running" and pid and not _is_own_pid(pid):
+                # The executor outlived the backend.  It is reconciled
+                # BEFORE the state is restored: the plan is parked as
+                # 'stopped' and is never advertised as running with a
+                # pid that nobody owns any more.
+                #
+                # The reconcile is the ledger's, not the kernel's: the
+                # pid is checked against the record the plan's ledger
+                # holds (start time, command line) before anything is
+                # signalled, so a recycled pid is reported rather than
+                # killed.  A plain ``os.kill(pid, 0)`` cannot tell the
+                # two apart, which is why this path does not use one.
+                action = _reconcile_exec_pid(plan_dir, plan_id, pid)
+                if action in (ACTION_SKIPPED, ACTION_ADOPTED):
+                    # Nothing to reconcile, or the scheduler owns the
+                    # run and adopts it: the row's own verdict is the
+                    # answer, and the plan keeps running with the
+                    # process it was running with.
+                    _restore_execution_state_from_row(plan_id, row)
+                elif _shutdown_interrupted_this_run(plan_dir, row):
+                    # The checkpoint is the evidence that the *server*
+                    # went down under this run: the work was interrupted,
+                    # not broken.  That is a stronger statement than the
+                    # reconcile can make, and it has its own parking —
+                    # phase ``queued``, the phase the scheduler waits on
+                    # — so the plan is picked up again instead of being
+                    # stranded in a terminal phase.
+                    #
+                    # Without that evidence the run is parked as
+                    # ``stopped`` (``_park_reconciled_plan``): the
+                    # restart interrupted it, but nothing proves *how*,
+                    # so nothing claims that it died unexpectedly.
+                    _restore_execution_state_from_row(plan_id, row)
+                    _park_shutdown_interrupted(
+                        plan_id,
+                        plan_dir=plan_dir,
+                        execution_repo=execution_repo,
+                    )
+                else:
+                    _park_reconciled_plan(plan_id, plan_dir, row, execution_repo)
+                actions.append((plan_id, action))
+                continue
 
-            # If still running, check if the process is alive
-            if status == "running":
-                if not pid:
-                    _judge_process_dead(plan_id, row)
-                    continue
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    _judge_process_dead(plan_id, row)
-                except PermissionError:
-                    pass
+            # Nothing to reconcile: the row is not running, it names no
+            # pid, or it names this backend's own pid — which is never
+            # a plan's executor and must never be signalled.
+            #
+            # The restore is the shared one: the row's verdict decides
+            # the status and the stop reason, so a plan restored at
+            # boot and a plan restored by a status read answer
+            # identically.
+            _restore_execution_state_from_row(plan_id, row)
+            if status == "running" and not pid:
+                # A row that claims to be running without a pid: the
+                # pre-existing "dead without a pid" case, which the
+                # legacy marking still answers.  There is no pid to
+                # reconcile, so the reconcile is skipped — but the
+                # claim is still a claim, and it is still answered.
+                _judge_process_dead(plan_id, row)
+            actions.append((plan_id, ACTION_SKIPPED))
     finally:
         # 2026-09-23: this connection is opened once for the whole scan
         # and must be released even if the traversal raises. Its sibling
         # _recover_verification_states used to leak one handle per plan;
         # see tests/unit/test_recovery_closes_its_connections.py.
         _server._close_state_machine(sm)
+    return actions
+
+
+def _restore_execution_state(
+    plan_id: str,
+    row: Dict[str, Any],
+    *,
+    status: str,
+    pid: Optional[int],
+    ended_at: Optional[str] = None,
+    stop_reason: Optional[str] = None,
+) -> None:
+    """Put the recovered run state back into ``_execution_state``.
+
+    The handle is ``None`` on purpose: the in-memory handle died with
+    the backend process, and the ledger — not this dict — is what says
+    which pids the plan still owns.
+    """
+    _server._execution_state[plan_id] = {
+        "status": status,
+        "started_at": row.get("started_at"),
+        "ended_at": ended_at,
+        "pid": pid,
+        "stop_reason": (
+            stop_reason if stop_reason is not None else row.get("stop_reason")
+        ),
+        "project_dir": row.get("project_dir"),
+        "logs": deque(maxlen=2000),
+        "process": None,
+    }
+
+
+def _is_own_pid(pid: Any) -> bool:
+    """True when the pid is the backend's own pid.
+
+    The framework never signals itself, and ``process_identity.matches``
+    refuses to match our own pid — so a row pointing at it is not an
+    executor to reconcile.  It is left alone rather than being declared
+    a mismatch on a pid we know is not the plan's.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    return pid == os.getpid()
+
+
+def _reconcile_exec_pid(plan_dir: Path, plan_id: str, pid: int) -> str:
+    """Check the recorded executor pid against the kernel, and act on it.
+
+    Returns the action taken: :data:`ACTION_KILLED` (the identity
+    matched and the process was reaped), :data:`ACTION_CLEARED` (the
+    pid named no process) or :data:`ACTION_MISMATCH` (the pid was
+    alive but was not the process we recorded — nothing was signalled).
+    """
+    identity = probe_process_identity(pid)
+    if identity is None:
+        # The pid names no process.  The run was interrupted by the
+        # restart, not killed: record the exit so the ledger stops
+        # claiming the process, and hand the plan's orphaned
+        # ``in_progress`` task rows back to the scheduler.  That is the
+        # same conclusion ``_mark_failed_dead`` reaches — the owner is
+        # gone — reached without marking the plan failed.
+        ledger_record_exit(
+            plan_dir,
+            pid,
+            "exit",
+            detail="process gone at startup reconcile",
+        )
+        _reap_orphaned_tasks(plan_id)
+        return ACTION_CLEARED
+
+    record = ledger_live_records(plan_dir).get(pid)
+    if record is None or not identity_matches(
+        identity,
+        create_time=record.create_time,
+        cmdline=record.cmdline,
+    ):
+        # The pid is alive but it is not the process that was recorded
+        # (or the ledger never recorded it at all).  Send nothing: a
+        # pid that cannot be vouched for is not a pid that may be
+        # killed.  The mismatch is written to the ledger so the next
+        # reader can see why the pid was let go.
+        ledger_record_event(
+            plan_dir,
+            EVENT_IDENTITY_MISMATCH,
+            terminal=False,
+            pid=pid,
+            role=record.role if record is not None else "executor",
+            plan_id=plan_id,
+            reason=STARTUP_RECONCILE_REASON,
+        )
+        _server.logger.warning(
+            "[startup_reconcile] plan=%s exec_pid=%s is not the recorded "
+            "executor; nothing was signalled",
+            plan_id,
+            pid,
+        )
+        return ACTION_MISMATCH
+
+    # The identity matches: this really is our executor.  It outlived
+    # the backend that started it and nobody is left to own it, so it
+    # is reaped by the ledger's own rules — children first, and the
+    # identity checked again before every signal.
+    #
+    # Unless the **scheduler** owns the run: a plan the scheduler
+    # admitted keeps running across a restart of the backend — the
+    # scheduler's own recovery adopts it and re-times its slot from the
+    # moment of the restart (``plan_scheduler.engine``'s recovery).
+    # Reaping it here would take away a run the scheduler is about to
+    # adopt, and the scheduler would never see it again.
+    if scheduler_holds(plan_id):
+        _server.logger.warning(
+            "[startup_reconcile] plan=%s exec_pid=%s is held by the "
+            "scheduler; nothing was signalled",
+            plan_id,
+            pid,
+        )
+        return ACTION_ADOPTED
+
+    reap_plan(plan_dir, plan_id, reason=STARTUP_RECONCILE_REASON)
+    return ACTION_KILLED
+
+
+def _shutdown_interrupted_this_run(
+    plan_dir: Path, row: Dict[str, Any]
+) -> bool:
+    """Did the *server* go down under this run?
+
+    The reconcile can say that the executor is gone; it cannot say
+    *why*.  The checkpoint the shutdown path leaves behind is the only
+    evidence that says "the server went down", and it is the evidence
+    the recovery has always asked for before it decides what a dead
+    executor means.
+
+    The predicate is one-sided on purpose (see
+    :func:`shutdown_checkpoint.is_shutdown_interrupted`): it may only
+    say yes to a shutdown it can prove, and "cannot prove it" means
+    "park it as stopped", never "the server went down".
+
+    Never raises: this runs on the recovery path, where one plan's
+    failure must not cost every other plan its recovery.
+    """
+    from shutdown_checkpoint import is_shutdown_interrupted
+
+    try:
+        return bool(is_shutdown_interrupted(
+            plan_dir,
+            kind="execution",
+            run_started_at=(row or {}).get("started_at"),
+        ))
+    except Exception:  # noqa: BLE001 — an unreadable checkpoint is no evidence
+        _server.logger.warning(
+            "[startup_reconcile] could not read the shutdown checkpoint "
+            "plan=%s", plan_dir.name, exc_info=True,
+        )
+        return False
+
+
+def _park_reconciled_plan(
+    plan_id: str,
+    plan_dir: Path,
+    row: Dict[str, Any],
+    execution_repo: Any,
+) -> None:
+    """Park a reconciled plan as ``stopped``.
+
+    The row loses its pid — a stopped run has no executor — the
+    in-memory state says the same thing, and the plan is moved into
+    the ``stopped`` phase so that nothing reads it as live.
+    """
+    try:
+        execution_repo.update_fields(
+            plan_id,
+            create_if_missing=True,
+            exec_status="stopped",
+            exec_pid=None,
+            stop_reason=STARTUP_RECONCILE_REASON,
+        )
+    except Exception:  # noqa: BLE001 — the state is restored either way
+        _server.logger.warning(
+            "[startup_reconcile] could not persist the stopped state "
+            "plan=%s", plan_id, exc_info=True,
+        )
+    _restore_execution_state(
+        plan_id,
+        row,
+        status="stopped",
+        pid=None,
+        ended_at=datetime.now().isoformat(),
+        stop_reason=STARTUP_RECONCILE_REASON,
+    )
+    _park_plan_in_stopped_phase(plan_id, plan_dir, skip_terminal=True)
+
+
+def _reap_orphaned_tasks(plan_id: str) -> None:
+    """Hand a dead plan's orphaned ``in_progress`` task rows back.
+
+    The reclaim itself lives in
+    :func:`_reap_orphaned_in_progress_tasks`, and the boot funnel used
+    to reach it through ``_mark_failed_dead``.  The reconcile does not
+    use that helper — the plan is parked as ``stopped``, not failed —
+    so it calls the reclaim directly.  The conclusion is the same one:
+    the process that owned those rows is gone.
+    """
+    try:
+        from verification_loop import _reap_orphaned_in_progress_tasks
+    except Exception:  # noqa: BLE001 — a missing helper is not a crash
+        return
+    try:
+        _reap_orphaned_in_progress_tasks(plan_id)
+    except Exception:  # noqa: BLE001 — the reclaim is best-effort
+        _server.logger.warning(
+            "[startup_reconcile] could not reclaim the orphaned task rows "
+            "plan=%s", plan_id, exc_info=True,
+        )
 
 
 def _adopt_run_project_dir(
@@ -238,6 +579,144 @@ def _adopt_run_project_dir(
             "execution_project_dir_adopt_failed plan=%s", plan_dir.name
         )
         return None
+
+
+# ---------------------------------------------------------------------------
+# The process ledger — the durable record of what this backend started
+# ---------------------------------------------------------------------------
+#
+# The in-memory handle to the executor dies with the backend process.
+# After a restart nothing knows which pid the plan started, and every one
+# of them is an orphan nobody will ever reap. The ledger
+# (``backend/process_ledger.py``) is the durable answer: a ``spawn``
+# event at the moment the process starts, an ``exit`` event when it ends.
+#
+# Two rules govern the writing:
+#
+# * **A ledger failure never blocks an execution.** The ledger is
+#   evidence, not a gate. A read-only plan directory or a full disk must
+#   not cost the operator the run they asked for — the failure is
+#   logged and the work continues.
+# * **The identity is read from the kernel, not guessed.** pids are
+#   recycled, so the number alone does not identify a process; the start
+#   time does. ``process_identity.probe`` supplies it.
+
+
+#: The roles a spawned executor may carry.
+#:
+#: A closed set on purpose. The reaper decides what to do with a
+#: process by its role — children first, parents last — so a role
+#: nobody has agreed on would leave the reaper guessing. The refusal
+#: happens *before* the spawn: a role the ledger cannot represent
+#: would produce a record the reader skips, and the "a ledger failure
+#: never blocks a run" rule would swallow the mistake instead of
+#: naming it.
+SPAWN_ROLES = ("executor", "repair_executor")
+
+
+def _ledger_write_spawn(
+    plan_dir: Path,
+    plan_id: str,
+    process: subprocess.Popen,
+    cmd: List[str],
+    role: str,
+    cwd: Path,
+) -> None:
+    """Write the ``spawn`` event for a process this backend just started.
+
+    The record names the pid, the process group the process can be
+    killed through, the identity the kernel gave it, and the backend
+    process that owns it.
+
+    Never raises: the ledger is evidence, not a gate.
+    """
+    try:
+        pid = int(getattr(process, "pid", 0) or 0)
+        identity = probe_process_identity(pid) if pid > 0 else None
+
+        if identity is not None:
+            # ``start_new_session=True`` makes the child the leader of a
+            # process group of its own, so the group to signal is the
+            # child's own pid. The probe confirms that rather than the
+            # code assuming it.
+            pgid = identity.pgid if identity.pgid else pid
+            create_time = (
+                identity.create_time
+                if identity.create_time is not None
+                else 0.0
+            )
+            cmdline = identity.cmdline if identity.cmdline else tuple(cmd)
+            cwd_str = identity.cwd or str(cwd)
+        else:
+            # The kernel could not describe the process — it may have
+            # exited already, or neither psutil nor ``ps`` could answer.
+            # The spawn still happened, so the record is still written.
+            # A zero ``create_time`` means "the start time is unknown",
+            # and the identity check refuses to act on an unknown rather
+            # than acting on a wrong one.
+            pgid = pid
+            create_time = 0.0
+            cmdline = tuple(cmd)
+            cwd_str = str(cwd)
+
+        ledger_record_spawn(
+            plan_dir,
+            ProcessRecord(
+                plan_id=plan_id,
+                role=role,
+                pid=pid,
+                pgid=pgid,
+                create_time=create_time,
+                cmdline=cmdline,
+                cwd=cwd_str,
+                owner_pid=os.getpid(),
+                owner_role="backend",
+            ),
+        )
+        # The ledger is a file on disk that nobody watches. The log line
+        # is what an operator actually sees when they ask "which pid is
+        # the executor of this plan?" — and it carries the pgid, which
+        # is the value a kill has to aim at.
+        _server.logger.info(
+            "executor_spawned plan=%s pid=%s pgid=%s role=%s",
+            plan_id,
+            pid,
+            pgid,
+            role,
+        )
+    except Exception:  # noqa: BLE001 — the ledger must never block a spawn
+        _server.logger.warning(
+            "executor_spawn_ledger_write_failed plan=%s", plan_id, exc_info=True
+        )
+
+
+def _ledger_write_exit(
+    plan_dir: Path,
+    pid: int,
+    exit_code: Optional[int],
+    detail: Optional[str] = None,
+) -> None:
+    """Write the ``exit`` event for a process that has ended.
+
+    Never raises: the ledger is evidence, not a gate.
+    """
+    try:
+        ledger_record_exit(
+            plan_dir, pid, "exit", exit_code=exit_code, detail=detail
+        )
+        _server.logger.info(
+            "executor_exited plan=%s pid=%s exit_code=%s",
+            plan_dir.name,
+            pid,
+            exit_code,
+        )
+    except Exception:  # noqa: BLE001 — the ledger must never break a run
+        _server.logger.warning(
+            "executor_exit_ledger_write_failed plan_dir=%s pid=%s",
+            plan_dir,
+            pid,
+            exc_info=True,
+        )
 
 
 #: The environment variable that replaces the executor's command line.
@@ -315,6 +794,7 @@ def _spawn_executor_subprocess(
     extra_args: Optional[List[str]] = None,
     log_path: Optional[Path] = None,
     extra_env: Optional[Dict[str, str]] = None,
+    role: str = "executor",
 ) -> Tuple[subprocess.Popen, Path]:
     """Spawn ``cli.py --recover`` as a subprocess with stdout drained to
     a log file. Returns ``(process, log_path)``.
@@ -361,8 +841,10 @@ def _spawn_executor_subprocess(
         plan_id: identifies the plan — used for log file naming and
             the ``PDT_PLAN_ID`` env var that the executor reads.
         backend_dir: path to ``backend/`` (parent of cli.py).
-        project_dir: forwarded as ``-w`` to cli.py.
-        tasks_file: forwarded as ``--tasks-file`` to cli.py.
+        project_dir: forwarded as ``-w`` to cli.py — made absolute first,
+            because the child's working directory is ``backend_dir``.
+        tasks_file: forwarded as ``--tasks-file`` to cli.py — made
+            absolute first, for the same reason.
         tool: optional ``--tool <claude|...>`` arg.
         extra_args: extra CLI args appended before spawn (e.g.
             ``["--verification-tasks", str(...)]`` from the repair
@@ -373,12 +855,29 @@ def _spawn_executor_subprocess(
             directories are created automatically.
         extra_env: extra env vars to merge into the subprocess env
             (PYTHONUNBUFFERED=1 and PDT_PLAN_ID are always set).
+        role: the role the process is recorded under in the process
+            ledger. Defaults to ``"executor"``; the reaper decides what
+            to do with a process by its role, so a caller that starts a
+            different kind of process says so here. Only the roles in
+            :data:`SPAWN_ROLES` are accepted — anything else raises
+            ``ValueError`` before a process is started.
 
     Returns:
         ``(process, log_path)`` so the caller can decide whether to
         block on ``process.wait()`` (synchronous repair flow) or
         thread-drain it (HTTP execution flow).
+
+    Raises:
+        ValueError: the ``role`` is not one of :data:`SPAWN_ROLES`.
+            Raised *before* the spawn, so a refused role never leaves a
+            process behind.
     """
+    if role not in SPAWN_ROLES:
+        raise ValueError(
+            "unknown spawn role %r (expected one of: %s)"
+            % (role, ", ".join(SPAWN_ROLES))
+        )
+
     plan_dir = _server._plan_dir(plan_id)
 
     if log_path is None:
@@ -386,10 +885,25 @@ def _spawn_executor_subprocess(
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"executor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
+    # The child's working directory is ``backend_dir`` — the plan's tree
+    # is not under it. So every path handed to the child is made
+    # absolute *here*, where the backend's own view of it still holds:
+    # a relative ``--tasks-file`` would be resolved by the child
+    # against ``backend/``, and the executor would look for a plan that
+    # is not there, find no tasks, and exit successfully having done
+    # nothing (2026-10-31 — the backend read that as "the run
+    # finished", and had no process tree to kill).
+    tasks_file_arg = Path(tasks_file).expanduser().resolve()
+    project_dir_arg = Path(project_dir).expanduser().resolve()
+
+    # The command line is built by the one helper that knows about the
+    # ``PDT_EXECUTOR_CMD`` override — the default path it builds is the
+    # production command line, unchanged — and the paths handed to it
+    # are the absolute ones above.
     cmd = _executor_command(
         backend_dir=backend_dir,
-        project_dir=project_dir,
-        tasks_file=tasks_file,
+        project_dir=project_dir_arg,
+        tasks_file=tasks_file_arg,
         tool=tool,
         extra_args=extra_args,
     )
@@ -417,6 +931,12 @@ def _spawn_executor_subprocess(
         env=env,
         start_new_session=True,
     )
+    # 2026-10-30: the ledger write comes *after* the spawn. A record may
+    # only name a pid that actually exists, so a spawn that failed leaves
+    # no record — there is no process to own. ``start_new_session=True``
+    # above is what makes the child the leader of its own process group,
+    # and that group is what the record's ``pgid`` points at.
+    _ledger_write_spawn(plan_dir, plan_id, process, cmd, role, backend_dir)
     return process, log_path
 
 
@@ -1014,7 +1534,12 @@ def _write_crash_verdict(plan_id: str) -> Optional[Dict[str, Any]]:
     return _persisted_execution_row(plan_id)
 
 
-def _park_shutdown_interrupted(plan_id: str) -> None:
+def _park_shutdown_interrupted(
+    plan_id: str,
+    *,
+    plan_dir: Optional[Path] = None,
+    execution_repo: Any = None,
+) -> None:
     """Park a run the shutdown interrupted: ``stopped``, and phase ``queued``.
 
     A dead executor is not one thing.  It is one thing when the *work*
@@ -1040,6 +1565,12 @@ def _park_shutdown_interrupted(plan_id: str) -> None:
 
     Nothing here raises.  This runs on the recovery path, where one
     plan's failure must not cost every other plan its recovery.
+
+    ``plan_dir`` and ``execution_repo`` are the caller's own handles,
+    handed over so that the recovery scan does not open a second
+    connection to the database it is already reading.  Both are
+    optional: the judge that is called from the "running row without a
+    pid" path has neither, and opens its own.
     """
     from shutdown_checkpoint import SHUTDOWN_STOP_REASON
     from state_machine.db.connection import open as open_db
@@ -1062,17 +1593,25 @@ def _park_shutdown_interrupted(plan_id: str) -> None:
         )
 
     try:
-        conn = open_db(_server._state_db_path())
-        try:
-            migrate(conn)
-            ExecutionRepository(conn).update_fields(
+        if execution_repo is not None:
+            execution_repo.update_fields(
                 plan_id,
                 exec_status="stopped",
                 stop_reason=SHUTDOWN_STOP_REASON,
                 exec_pid=None,
             )
-        finally:
-            conn.close()
+        else:
+            conn = open_db(_server._state_db_path())
+            try:
+                migrate(conn)
+                ExecutionRepository(conn).update_fields(
+                    plan_id,
+                    exec_status="stopped",
+                    stop_reason=SHUTDOWN_STOP_REASON,
+                    exec_pid=None,
+                )
+            finally:
+                conn.close()
     except Exception:  # noqa: BLE001 — a failed verdict write is not a failed scan
         _server.logger.exception("park: row write failed plan=%s", plan_id)
 
@@ -1080,7 +1619,8 @@ def _park_shutdown_interrupted(plan_id: str) -> None:
     # a failing phase write cannot leave the plan stuck in_progress.
     _reap_orphaned_in_progress_tasks(plan_id)
 
-    plan_dir = _server._plan_dir(plan_id)
+    if plan_dir is None:
+        plan_dir = _server._plan_dir(plan_id)
     if not plan_dir.exists():
         return
     try:
@@ -1661,9 +2201,183 @@ def _record_project_dir_rejection(
         )
 
 
+# ---------------------------------------------------------------------------
+# The single-instance guard — one executor per plan
+# ---------------------------------------------------------------------------
+#
+# ``/start`` used to answer "is this plan already running?" from the
+# in-memory handle alone (``server._execution_state``).  That answer
+# dies with the backend: after a restart the dict is empty, the plan
+# looks idle, and the start spawns a SECOND executor for a plan whose
+# first one is still running.  Two executors on one plan is not a slow
+# run — it is two runs writing the same task rows, the same git
+# worktree and the same log file.
+#
+# The ledger (``backend/process_ledger.py``) is the durable record of
+# what this backend started, so it — not the handle — is what the guard
+# reads.  A record counts as *live* only while the kernel still has a
+# process at that pid: a record whose process is gone is what a run
+# that ended without writing its exit event leaves behind, and
+# treating it as a running executor would block every later start of
+# that plan for ever.  The reaper draws the same line when it sweeps.
+#
+# Two ways out:
+#
+#   * ``?force=true`` — sweep the plan's tree from the ledger first
+#     (``reap_plan``) and start only if the sweep was clean.  A sweep
+#     that could not take everything down answers ``kill_incomplete``
+#     and names the survivors: starting on top of a survivor is the
+#     two-executor situation the guard exists to prevent.
+#   * no force — the answer is ``already_running`` and the pids that
+#     are still running.
+#
+# Both refusals are HTTP 409, and neither of them spawns anything.
+
+#: The reason written on the ledger events of a forced start's sweep.
+START_FORCE_REAP_REASON = "start_force"
+
+#: The error a start answers when the plan already has a live executor.
+START_ERROR_ALREADY_RUNNING = "already_running"
+
+#: The error a start answers when a forced sweep left something alive.
+START_ERROR_KILL_INCOMPLETE = "kill_incomplete"
+
+
+def _live_executor_pids(plan_dir: Path) -> List[int]:
+    """The pids the ledger says are still running as this plan's executor.
+
+    Only the executor roles count.  A sub-agent or a VP service left
+    behind is a leftover, not a second executor: blocking a start on
+    one of those would refuse work that has nothing to do with them.
+
+    A record whose pid names no process any more is not live — it is
+    the leftover of a run that ended without writing its exit event.
+    The kernel is asked, not the record: a pid on its own does not say
+    whether the process behind it is still running.
+    """
+    pids: List[int] = []
+    for pid, record in sorted(ledger_live_records(plan_dir).items()):
+        if record.role not in SPAWN_ROLES:
+            continue
+        if probe_process_identity(pid) is None:
+            continue
+        pids.append(int(pid))
+    return pids
+
+
+def _reap_survivor_pids(outcome: Any) -> List[int]:
+    """The pids a sweep could not take down.
+
+    The survivors are the processes that are still running (a SIGKILL
+    that did not land) and the ones the reaper could not even identify
+    ("not known to be ours" is not a licence to kill, so they are
+    reported instead).  The shape is the stop's: ``(clean, pids)``.
+    """
+    survivors: List[int] = []
+    for entry in list(outcome.failed) + list(outcome.unknown):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            survivors.append(int(entry.get("pid")))
+        except (TypeError, ValueError):
+            continue
+    return survivors
+
+
+def _resolve_reap_grace() -> float:
+    """The SIGTERM grace window a sweep gets.
+
+    The same window the stop gets (``PDT_STOP_GRACE_SECONDS``): it is
+    one knob for "how long a process has to die on its own", and a
+    forced start that used a second rule would be a second rule to
+    remember.
+    """
+    grace = _resolve_stop_grace()
+    if grace is None:
+        return DEFAULT_GRACE_SECONDS
+    return grace
+
+
+def _start_force_sweep(plan_dir: Path, plan_id: str) -> Tuple[bool, List[int]]:
+    """Sweep the plan's tree for a forced start.
+
+    Returns ``(clean, surviving_pids)`` — the same pair the stop
+    answers with, so the two endpoints speak one vocabulary.
+    """
+    try:
+        outcome = reap_plan(
+            plan_dir,
+            plan_id,
+            reason=START_FORCE_REAP_REASON,
+            grace_seconds=_resolve_reap_grace(),
+        )
+    except Exception:  # noqa: BLE001 — a failed sweep must not start a second executor
+        _server.logger.exception(
+            "execution_start: could not sweep the plan's tree plan=%s",
+            plan_id,
+        )
+        # The sweep is what says the tree is dead.  A sweep that did
+        # not run says nothing, and "nothing" is not "dead".
+        return False, []
+    return outcome.clean(), _reap_survivor_pids(outcome)
+
+
+def _start_single_instance_guard(
+    plan_id: str, plan_dir: Path, *, force: bool
+) -> Optional[JSONResponse]:
+    """The one-executor-per-plan guard.  ``None`` means the start may go on.
+
+    ``force`` is the operator saying "reclaim the plan first": the
+    tree is swept from the ledger and the start continues only if that
+    sweep was clean.  Without it, a plan that already has a live
+    executor is refused — the ledger is asked, because the in-memory
+    handle cannot answer after a backend restart.
+    """
+    if force:
+        clean, survivors = _start_force_sweep(plan_dir, plan_id)
+        if not clean:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": START_ERROR_KILL_INCOMPLETE,
+                    "pids": survivors,
+                },
+            )
+        return None
+
+    live_pids = _live_executor_pids(plan_dir)
+    if live_pids:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": START_ERROR_ALREADY_RUNNING,
+                "pids": live_pids,
+            },
+        )
+    return None
+
+
 @router.post("/api/execution/{plan_id}/start")
-def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.StartExecutionRequest()):
+def start_execution(
+    plan_id: str,
+    req: _server.StartExecutionRequest = _server.StartExecutionRequest(),
+    force: bool = False,
+):
     """Start autonomous task execution as a background subprocess.
+
+    Single-instance contract (architecture decision point 4):
+
+      0. Before anything is spawned, the ledger is asked whether this
+         plan already has a live executor.  The in-memory handle
+         cannot answer that question after a backend restart, and a
+         plan with two executors has two runs writing the same task
+         rows.  A plan that already has one is refused with HTTP 409
+         ``{"error": "already_running", "pids": [...]}``.
+         ``?force=true`` sweeps the plan's tree from the ledger first
+         and continues only if that sweep was clean; a sweep that left
+         something alive answers HTTP 409
+         ``{"error": "kill_incomplete", "pids": [...]}``.  Neither
+         refusal spawns anything, and neither moves the plan's phase.
 
     State-machine contract (architecture decision point 3):
 
@@ -1830,6 +2544,17 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
     except ProjectDirInvalidError as exc:
         _record_project_dir_rejection(plan_id, plan_dir, exc)
         raise HTTPException(400, str(exc))
+
+    # --- The single-instance guard --------------------------------------
+    # The ledger is asked whether this plan already has a live
+    # executor.  It runs AFTER the request is known to be well-formed
+    # (a start that cannot name a working directory must not kill a
+    # running executor on its way to a 400) and BEFORE the routing CAS
+    # (a refusal must leave the plan in the phase it was in — never
+    # ``executing``) and before the spawn (a refusal spawns nothing).
+    refusal = _start_single_instance_guard(plan_id, plan_dir, force=force)
+    if refusal is not None:
+        return refusal
 
     # Kill any existing execution for this plan
     existing = _server._execution_state.get(plan_id, {})
@@ -2139,6 +2864,20 @@ def start_execution(plan_id: str, req: _server.StartExecutionRequest = _server.S
             # the contract.
             state["executor_finished_cleanly"] = True
             state["executor_returncode"] = process.returncode
+            # 2026-10-30: the executor is gone — record the exit before
+            # anything else touches the run's state, so the ledger and
+            # the database cannot disagree about whether the pid is
+            # still running. It is written *after* ``process.wait()``
+            # (the process really has ended — an exit for a process that
+            # is still running would be a lie) and *before* the status
+            # persist further down (so a crash in between leaves an exit
+            # on record rather than a pid that still looks live).
+            _ledger_write_exit(
+                plan_dir,
+                process.pid,
+                process.returncode,
+                detail="executor_finished",
+            )
             if state["status"] == "running":
                 if process.returncode == 0:
                     # 2026-08-24: the original code
@@ -3121,11 +3860,23 @@ def _stop_interruption(
     return interrupted, unfinished
 
 
+#: The reason written on the ledger events a stop's sweep produces.
+STOP_REAP_REASON = "stop"
+
+#: The status a stop answers when the plan's tree is confirmed dead.
+STOP_STATUS_STOPPED = "stopped"
+
+#: The status a stop answers when part of the plan's tree survived.
+STOP_STATUS_KILL_INCOMPLETE = "kill_incomplete"
+
+
 def _stop_response(
     *,
     paused: bool,
     paused_at: Optional[str],
     interrupted: int,
+    status: str = STOP_STATUS_STOPPED,
+    surviving_pids: Optional[List[int]] = None,
     phase_transition_error: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The answer ``POST /stop`` gives, whichever path it took.
@@ -3137,13 +3888,20 @@ def _stop_response(
     chain that reads the phase may still consider it live. The key is
     absent on a clean stop, so the normal four-key contract is
     unchanged.
+
+    ``surviving_pids`` is present when the caller has survivors to
+    name — that is, when the stop could not confirm the death. It is
+    absent on a clean stop, so the normal four-key contract is
+    unchanged there too.
     """
     body: Dict[str, Any] = {
-        "status": "stopped",
+        "status": status,
         "paused": paused,
         "paused_at": paused_at,
         "interrupted_task_count": interrupted,
     }
+    if surviving_pids is not None:
+        body["surviving_pids"] = list(surviving_pids)
     if phase_transition_error is not None:
         body["phase_transition_error"] = phase_transition_error
     return body
@@ -3184,6 +3942,144 @@ def _park_plan_in_stopped_phase(
         return str(exc)
 
 
+def _stop_sweep_from_ledger(
+    plan_id: str, plan_dir: Path,
+) -> Tuple[bool, List[int]]:
+    """Sweep the plan's tree from the ledger.
+
+    The ledger knows every process this plan owns — the executor, its
+    sub-agents, the VP services — and it knows it even when the
+    in-memory handle is gone (a backend restart took the handle with
+    it).  The reaper kills them children first and checks every
+    identity before it signals, so a recycled pid is reported rather
+    than killed.
+
+    Returns ``(clean, surviving_pids)``:
+
+    * ``clean`` is :meth:`process_reaper.ReapOutcome.clean` — False
+      when something of this plan is still running, or could not be
+      identified well enough to be sure that it is not.
+    * ``surviving_pids`` names those leftovers, so the answer can tell
+      the operator what is still running.
+    """
+    grace = _resolve_stop_grace()
+    if grace is None:
+        grace = DEFAULT_GRACE_SECONDS
+    try:
+        outcome = reap_plan(
+            plan_dir,
+            plan_id,
+            reason=STOP_REAP_REASON,
+            grace_seconds=grace,
+        )
+    except Exception:  # noqa: BLE001 — a failed sweep must not abort the stop
+        _server.logger.exception(
+            "stop_execution: could not sweep the plan's tree plan=%s",
+            plan_id,
+        )
+        # The sweep is what says the tree is dead.  A sweep that did
+        # not run says nothing, and "nothing" is not "dead".
+        return False, []
+
+    survivors: List[int] = []
+    for entry in list(outcome.failed) + list(outcome.unknown):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            survivors.append(int(entry.get("pid")))
+        except (TypeError, ValueError):
+            continue
+    return outcome.clean(), survivors
+
+
+def _read_execution_row(plan_id: str) -> Optional[Dict[str, Any]]:
+    """The execution row as it is right now; ``None`` when there is none."""
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+    )
+
+    try:
+        conn = open_db(_server._state_db_path())
+        try:
+            migrate(conn)
+            return ExecutionRepository(conn).summary(plan_id)
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — a missing row is not a stop
+        return None
+
+
+def _restore_execution_row(
+    plan_id: str,
+    previous: Optional[Dict[str, Any]],
+    surviving_pids: List[int],
+) -> None:
+    """Put the execution row back after a stop that did not hold.
+
+    The stop marks the row ``stopped`` *before* it kills anything,
+    because the executor's watcher thread and the heartbeat watchdog
+    both act on a row that still says ``running``.  When the kill
+    turns out to be incomplete that mark is a lie — the plan is still
+    running — so the row goes back to what it was, with the pid it
+    had.
+    """
+    from state_machine.db.connection import open as open_db
+    from state_machine.db.schema import migrate
+    from state_machine.repositories.execution_repository import (
+        ExecutionRepository,
+    )
+
+    status = (previous or {}).get("exec_status")
+    pid = (previous or {}).get("exec_pid")
+    if not status:
+        # The stop created this row; there is no earlier run state to
+        # go back to.  What there *is* is a process that is still
+        # running, so the row says so.
+        status = "running"
+        pid = surviving_pids[0] if surviving_pids else None
+
+    fields: Dict[str, Any] = {"exec_status": status}
+    if pid is not None:
+        fields["exec_pid"] = int(pid)
+    try:
+        conn = open_db(_server._state_db_path())
+        try:
+            migrate(conn)
+            ExecutionRepository(conn).update_fields(
+                plan_id, create_if_missing=True, **fields,
+            )
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — the answer matters more
+        _server.logger.exception(
+            "stop_execution: could not restore the execution row "
+            "plan=%s", plan_id,
+        )
+
+
+def _stop_state_without_handle() -> Dict[str, Any]:
+    """The in-memory state a stop works on when the plan has none.
+
+    A plan the backend has no record of can still own processes — the
+    ledger says so, and the ledger outlives the backend.  The stop
+    needs somewhere to write its mark, and it must not invent a run
+    that never happened, so this is the smallest record that can carry
+    the mark.
+    """
+    return {
+        "status": "running",
+        "process": None,
+        "logs": deque(maxlen=100),
+        "project_dir": None,
+        "pid": None,
+        "started_at": None,
+        "ended_at": None,
+        "stop_reason": None,
+    }
+
+
 def _stop_running_execution(
     plan_id: str,
     plan_dir: Path,
@@ -3191,8 +4087,20 @@ def _stop_running_execution(
     proc: Any,
     *,
     discard: bool,
-) -> Dict[str, Any]:
-    """Mark, terminate, checkpoint, transition — in that order."""
+) -> Tuple[str, List[int]]:
+    """Mark, terminate, checkpoint — and report what is still alive.
+
+    Returns ``(status, surviving_pids)``:
+
+    * ``("stopped", [])`` — every process this plan owns is confirmed
+      gone.  The plan is marked stopped, its ``exec_pid`` is cleared
+      and the resume point is written.
+    * ``("kill_incomplete", [pid, ...])`` — something of this plan
+      survived.  The plan is **not** marked stopped, its ``exec_pid``
+      is kept, and no resume point is written: the work was not
+      paused, it is still running, and a resume point next to a live
+      executor would start a second one.
+    """
     from datetime import datetime
     from state_machine.db.connection import open as open_db
     from state_machine.db.schema import migrate
@@ -3201,6 +4109,16 @@ def _stop_running_execution(
         PlanNotFoundError as ExecPlanNotFoundError,
     )
     from pause_state import clear_pause_checkpoint, write_pause_checkpoint
+
+    # --- 0. what the row looked like before the mark ------------------
+    # The mark below has to happen BEFORE the kill (step 2) — the
+    # executor's watcher thread and the heartbeat watchdog both act on
+    # a row that still says "running".  When the kill turns out to be
+    # incomplete, that mark is a lie, and this is the row to put back.
+    previous_row = _read_execution_row(plan_id)
+    previous_status = state.get("status")
+    previous_stop_reason = state.get("stop_reason")
+    previous_ended_at = state.get("ended_at")
 
     # --- 1. mark ------------------------------------------------------
     # The plan is marked BEFORE anything is killed. The executor's
@@ -3284,8 +4202,21 @@ def _stop_running_execution(
         )
 
     # --- 2. terminate -------------------------------------------------
-    # Only THIS plan's process group. Another plan's executor is none
-    # of this stop's business.
+    # The ledger first: it knows the whole tree — the executor, its
+    # sub-agents, the VP services — and it knows it even when the
+    # in-memory handle is gone (a backend restart took the handle with
+    # it).  The reaper kills children first and checks every identity
+    # before it signals.
+    sweep_clean, survivors = _stop_sweep_from_ledger(plan_id, plan_dir)
+
+    # Then the handle's own process group: the fallback for whatever
+    # the ledger never knew about.  Only THIS plan's group — another
+    # plan's executor is none of this stop's business.
+    #
+    # The kill is what proves the handle's process is gone: it waits
+    # for the group and escalates to SIGKILL before it returns.  A kill
+    # that blew up proves nothing, so the handle's pid counts as a
+    # survivor.
     hard_killed = False
     if proc is not None and proc.poll() is None:
         try:
@@ -3294,11 +4225,30 @@ def _stop_running_execution(
                     proc, grace_seconds=_resolve_stop_grace()
                 )
             )
-        except Exception:  # noqa: BLE001 — a failed kill still pauses
+        except Exception:  # noqa: BLE001 — a failed kill is reported
             _server.logger.exception(
                 "stop_execution: could not terminate the executor "
                 "plan=%s", plan_id,
             )
+            try:
+                survivors.append(int(proc.pid))
+            except (TypeError, ValueError):
+                pass
+
+    if not sweep_clean or survivors:
+        # --- 2b. the tree did not die ----------------------------------
+        # The plan is still running.  Put the row and the in-memory
+        # state back: a row that says "stopped" with the pid cleared
+        # is the exact lie this endpoint exists to stop telling.
+        _restore_execution_row(plan_id, previous_row, survivors)
+        state["status"] = previous_status or "running"
+        state["stop_reason"] = previous_stop_reason
+        state["ended_at"] = previous_ended_at
+        _server.logger.error(
+            "stop_execution: the plan's tree did not die plan=%s "
+            "surviving_pids=%s", plan_id, survivors,
+        )
+        return STOP_STATUS_KILL_INCOMPLETE, survivors
 
     # --- 3. checkpoint ------------------------------------------------
     # Written AFTER the termination completed, so it describes the
@@ -3311,9 +4261,8 @@ def _stop_running_execution(
     if discard:
         # "Throw it away" — the resume point goes with the work.
         clear_pause_checkpoint(plan_dir)
-        checkpoint = None
     else:
-        checkpoint = write_pause_checkpoint(
+        write_pause_checkpoint(
             plan_dir,
             kind="execution",
             project_dir=project_dir,
@@ -3322,31 +4271,15 @@ def _stop_running_execution(
             unfinished_tasks=unfinished,
         )
 
-    # --- 4. transition ------------------------------------------------
-    # A refusal here is reported, not swallowed (2026-10-23). The plan
-    # is killed but not parked, so the phase still says whatever it
-    # said before — and a phase that says "verification_*" is read by
-    # the chain as "still live". Swallowing the ``ValueError`` made the
-    # endpoint answer a clean 200 for a stop that did not hold.
-    phase_transition_error = _park_plan_in_stopped_phase(
-        plan_id, plan_dir, skip_terminal=False,
-    )
-
-    # The pause is over: the reason for it is no longer "a pause is in
-    # progress" but the stop that was asked for.
+    # --- 4. the pause is over ----------------------------------------
+    # The reason for it is no longer "a pause is in progress" but the
+    # stop that was asked for.
     state["stop_reason"] = "user_requested"
 
-    if checkpoint is None:
-        return _stop_response(
-            paused=False, paused_at=None, interrupted=0,
-            phase_transition_error=phase_transition_error,
-        )
-    return _stop_response(
-        paused=True,
-        paused_at=checkpoint.get("paused_at"),
-        interrupted=len(interrupted),
-        phase_transition_error=phase_transition_error,
-    )
+    # The phase is parked by the caller: parking can fail, and a
+    # refusal has to reach the answer as ``phase_transition_error`` —
+    # the caller is what builds the answer.
+    return STOP_STATUS_STOPPED, []
 
 
 def _stop_idle_execution(
@@ -3418,8 +4351,11 @@ def stop_execution(plan_id: str, discard: bool = False):
          kill that landed first could let the executor stamp the
          plan ``failed`` — the one outcome a pause must never
          produce.
-      2. **Terminate** — only this plan's own process group is
-         signalled; another plan's executor is never touched.
+      2. **Terminate** — the plan's whole tree is swept from the
+         ledger (children first, every signal preceded by an identity
+         check); the handle's own process group is the fallback for
+         whatever the ledger never knew about. Another plan's
+         executor is never touched.
       3. **Checkpoint** — the resume point is written *after* the
          termination completed, so it describes the interruption as
          it actually ended.
@@ -3428,7 +4364,15 @@ def stop_execution(plan_id: str, discard: bool = False):
     ``?discard=true`` is the escape hatch: the work is thrown away
     instead of paused, the checkpoint is removed, and the answer says
     ``paused: false``.
+
+    The answer says ``stopped`` only when the plan's tree is
+    *confirmed* dead. A stop that could not kill everything answers
+    ``kill_incomplete`` and names the pids that survived — a stop
+    that kills nothing and says "stopped" is worse than no stop at
+    all, because the operator stops looking.
     """
+    from pause_state import read_pause_checkpoint
+
     # VP-020: an archived plan is read-only — refuse before touching
     # ``_execution_state`` or any SQLite row. This endpoint had no
     # archived guard at all, so a stop against a pre-2026-08-05 plan
@@ -3443,10 +4387,50 @@ def stop_execution(plan_id: str, discard: bool = False):
     proc_alive = bool(proc is not None and proc.poll() is None)
     in_flight = bool(state) and (state.get("status") == "running" or proc_alive)
 
-    if in_flight:
-        response = _stop_running_execution(
+    # The ledger is the durable answer to "what does this plan still
+    # own". The handle is not: it dies with the backend, so after a
+    # restart the stop had nothing to kill — and it marked the plan
+    # stopped anyway. The ledger only ever *adds* to what the stop
+    # knows; it never takes work away from the idle path.
+    ledger_live = ledger_live_records(plan_dir)
+
+    if in_flight or ledger_live:
+        if state is None:
+            state = _stop_state_without_handle()
+        status, surviving_pids = _stop_running_execution(
             plan_id, plan_dir, state, proc, discard=discard,
         )
+        if status == STOP_STATUS_KILL_INCOMPLETE:
+            # The plan is still running: there is no resume point (a
+            # resume next to a live executor would start a second one)
+            # and the phase is left where it was — a phase that says
+            # "stopped" for a plan that is still running is the same
+            # lie, one level up.
+            response = _stop_response(
+                status=status,
+                surviving_pids=surviving_pids,
+                paused=False, paused_at=None, interrupted=0,
+            )
+        else:
+            # A refusal here is reported, not swallowed (2026-10-23).
+            # The plan is killed but not parked, so the phase still
+            # says whatever it said before — and a phase that says
+            # "verification_*" is read by the chain as "still live".
+            phase_transition_error = _park_plan_in_stopped_phase(
+                plan_id, plan_dir, skip_terminal=False,
+            )
+            checkpoint = None
+            if not discard:
+                checkpoint = read_pause_checkpoint(plan_dir)
+            response = _stop_response(
+                status=status,
+                paused=checkpoint is not None,
+                paused_at=(checkpoint or {}).get("paused_at"),
+                interrupted=len(
+                    (checkpoint or {}).get("interrupted_tasks") or []
+                ),
+                phase_transition_error=phase_transition_error,
+            )
     else:
         response = _stop_idle_execution(plan_id, plan_dir, discard=discard)
 

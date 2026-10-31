@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -165,6 +166,13 @@ def test_every_port_assignment_emits_event(
     address the relocation moved to, and the address that was reaped is
     the one the round used.  A log that records four unrelated events
     would not answer "where did this port come from".
+
+    The service is a **real** process here, and the reap is the real
+    one: the VP services are reaped through the unified ledger's
+    reaper, which kills the process the ledger names and then asks the
+    port whether the address came back.  A stubbed service would make
+    the second half of that question meaningless — there is no process
+    to kill, so the port can only ever answer "somebody else holds it".
     """
     holder = {"pid": None}
 
@@ -174,67 +182,108 @@ def test_every_port_assignment_emits_event(
             return _probe(
                 port, ["/usr/bin/postgres -D /var/db"], start_epoch=1e12,
             )
-        return _probe(
-            port, [f"npx next dev -p {RELOCATED_PORT}"],
-            pids=[holder["pid"]] if holder["pid"] else [],
-            start_epoch=1e12,
-        )
+        # Our own service holds the relocated port — for as long as it
+        # lives.  The reap kills it and then asks the port whether the
+        # address came back, so the answer has to follow the process.
+        #
+        # ``poll()`` is the honest answer: it collects the child, so a
+        # process that was killed but not yet reaped does not read as
+        # alive — which is exactly what ``os.kill(pid, 0)`` would say.
+        if holder["pid"] and service.poll() is None:
+            return _probe(
+                port, [f"npx next dev -p {RELOCATED_PORT}"],
+                pids=[holder["pid"]],
+                start_epoch=1e12,
+            )
+        return _probe(port, [])
 
     monkeypatch.setattr(sm, "probe_port", _probe_stub)
     monkeypatch.setattr(sm, "allocate_free_port", lambda: RELOCATED_PORT)
-    _stub_start(monkeypatch)
 
-    runtime_map = sm.ensure_services(
-        project_dir, {"api": _decl()},
-        plan_dir=plan_dir, plan_id=plan_dir.name,
+    # A real service process, in a session of its own — the shape of a
+    # detached PDT layer, and the shape the reaper is willing to signal.
+    service = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
-    runtime = runtime_map.runtimes["api"]
-    assert runtime.ready is True, runtime.detail
-    assert runtime.port == RELOCATED_PORT
-    assert runtime.declared_port == DECLARED_PORT
-    holder["pid"] = runtime.pid
 
-    # The ledger write is the state change; the events are on disk
-    # before it.
-    sm.record_runtimes(
-        plan_dir, plan_dir.name, runtime_map, project_dir=project_dir,
-    )
-    ledger = sm.read_ledger(plan_dir)
-    assert ledger["services"][0]["port"] == RELOCATED_PORT
+    def _real_start(decl, project, **kwargs):
+        return sm.ServiceRuntime(
+            name=decl.name,
+            port=RELOCATED_PORT,
+            pid=service.pid,
+            pgid=service.pid,
+            start_cmd=decl.start_cmd,
+            cwd=decl.cwd,
+            origin="spawned",
+            ready=True,
+            detail="real process",
+        )
 
-    # The reap: our own process holds the port, so it is ours to stop.
-    monkeypatch.setattr(
-        sm, "stop_service",
-        lambda *a, **k: {"port_free": True, "detail": "stub"},
-    )
-    report = sm.reap_services(
-        plan_dir, plan_id=plan_dir.name, reason="round over",
-        owner_token=round_token,
-    )
-    assert report.reaped == ["api"]
+    monkeypatch.setattr(sm, "start_service", _real_start)
 
-    events = _events(plan_dir)
-    allocated = _of_kind(events, "allocated")
-    relocated = _of_kind(events, "relocated")
-    bound = _of_kind(events, "bound")
-    reaped = _of_kind(events, "reaped")
-    assert allocated, f"the allocated address left no event: {events}"
-    assert relocated, f"the relocation left no event: {events}"
-    assert bound, f"the bound address left no event: {events}"
-    assert reaped, f"the reap left no event: {events}"
+    try:
+        runtime_map = sm.ensure_services(
+            project_dir, {"api": _decl()},
+            plan_dir=plan_dir, plan_id=plan_dir.name,
+        )
+        runtime = runtime_map.runtimes["api"]
+        assert runtime.ready is True, runtime.detail
+        assert runtime.port == RELOCATED_PORT
+        assert runtime.declared_port == DECLARED_PORT
+        holder["pid"] = runtime.pid
 
-    assert allocated[0]["new_port"] == RELOCATED_PORT
-    assert allocated[0]["declared_port"] == DECLARED_PORT
-    assert relocated[0]["old_port"] == DECLARED_PORT
-    assert relocated[0]["new_port"] == RELOCATED_PORT
-    assert relocated[0]["declared_port"] == DECLARED_PORT
-    assert bound[0]["new_port"] == RELOCATED_PORT
-    assert reaped[0]["old_port"] == RELOCATED_PORT
+        # The ledger write is the state change; the events are on disk
+        # before it.
+        sm.record_runtimes(
+            plan_dir, plan_dir.name, runtime_map, project_dir=project_dir,
+        )
+        ledger = sm.read_ledger(plan_dir)
+        assert ledger["services"][0]["port"] == RELOCATED_PORT
 
-    # The order is the order of the round: the address was taken, then
-    # the round was bound to it, then the round gave it back.
-    assert _index_of(events, "allocated") < _index_of(events, "bound")
-    assert _index_of(events, "bound") < _index_of(events, "reaped")
+        # The reap: our own process holds the port, so it is ours to
+        # stop.  The reaper kills it through the unified ledger and
+        # then asks the port whether the address came back.
+        report = sm.reap_services(
+            plan_dir, plan_id=plan_dir.name, reason="round over",
+            owner_token=round_token,
+        )
+        assert report.reaped == ["api"]
+        assert service.poll() is not None, (
+            "the reap answered 'reaped' while the process is still running"
+        )
+
+        events = _events(plan_dir)
+        allocated = _of_kind(events, "allocated")
+        relocated = _of_kind(events, "relocated")
+        bound = _of_kind(events, "bound")
+        reaped = _of_kind(events, "reaped")
+        assert allocated, f"the allocated address left no event: {events}"
+        assert relocated, f"the relocation left no event: {events}"
+        assert bound, f"the bound address left no event: {events}"
+        assert reaped, f"the reap left no event: {events}"
+
+        assert allocated[0]["new_port"] == RELOCATED_PORT
+        assert allocated[0]["declared_port"] == DECLARED_PORT
+        assert relocated[0]["old_port"] == DECLARED_PORT
+        assert relocated[0]["new_port"] == RELOCATED_PORT
+        assert relocated[0]["declared_port"] == DECLARED_PORT
+        assert bound[0]["new_port"] == RELOCATED_PORT
+        assert reaped[0]["old_port"] == RELOCATED_PORT
+
+        # The order is the order of the round: the address was taken,
+        # then the round was bound to it, then the round gave it back.
+        assert _index_of(events, "allocated") < _index_of(events, "bound")
+        assert _index_of(events, "bound") < _index_of(events, "reaped")
+    finally:
+        if service.poll() is None:
+            service.kill()
+        try:
+            service.wait(timeout=10)
+        except Exception:  # noqa: BLE001 — cleanup must not fail the test
+            pass
 
 
 def test_event_contains_run_and_round_token(

@@ -29,13 +29,23 @@
   裸字符串；而且它指的是**我们写进去的那一瞬间**（离现在不到 5 分钟），
   不是被当成 UTC 读偏了 8 小时的另一个瞬间。
 
-为什么 seed 的 ``exec_pid`` 是测试进程自己的 pid
--------------------------------------------------
+这个 run 是**真的跑起来的**：由后端自己 spawn
+------------------------------------------
 
 后端启动时会扫描计划目录，把每一行的 run 恢复进内存；对 ``running`` 的
-行还要探一次 pid：进程没了就判 ``failed``。所以这一行得挂在一个**活着**
-的进程上，否则后端一启动就把这次 run 判成崩溃，测到的就成了"重启后 run
-死了"，而不是"重启后日志还在"。测试进程自己就是那个活着的进程。
+行还要按**进程台账**对一次账。台账不认识、或者对不上的 pid，后端一律
+不发信号，把这一行停成 ``stopped``（``routes/execution._reconcile_exec_pid``）。
+所以手写一行"进程还活着"的 ``exec_pid`` 是活不过第二次启动的：那是别人的
+pid，后端不认领它。
+
+于是这个 run 走**生产的那条缝**：``PDT_EXECUTOR_CMD`` 指向一个确定性的替身
+执行器（``tests/e2e/fixtures/deterministic_executor.py``），run 通过
+``POST /api/execution/{id}/start`` 启动，于是**后端自己** spawn 出执行器、
+写下 ``plan_execution`` 行、写下台账里"这个 pid 属于这个计划"的那一条。
+第一段人生被 ``SIGKILL`` 打断（不是优雅退出，所以没有 shutdown
+checkpoint），第二段人生启动时看到的是一个台账认得的 pid：它按台账把它收掉，
+把计划停成 ``stopped``；然后测试再启动一次 run，第二段人生回答的是一次
+**真的在跑**的 run，而它的日志行不在它的内存里 —— 在磁盘上，答案从那里来。
 
 为什么 seed 和后端必须指向同一个 state.db
 -------------------------------------------
@@ -58,6 +68,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -97,6 +108,14 @@ REQUEST_HEADERS = {
 #: validates it (``server._validated_plan_id``) before it resolves a path.
 PLAN_ID = "p1"
 
+#: The stand-in executor, installed through the named production seam
+#: (``PDT_EXECUTOR_CMD``).  It is a real process with a real pid; it is
+#: spawned by the **server**, so the server owns it and the process
+#: ledger records it.
+EXECUTOR_FIXTURE: Path = (
+    BACKEND_DIR / "tests" / "e2e" / "fixtures" / "deterministic_executor.py"
+)
+
 #: How long the backend may take to answer its readiness probe.  A boot
 #: that has not answered within this budget is a failure, and the failure
 #: carries the tail of the server's own output — a boot that died says why
@@ -108,6 +127,11 @@ READY_TIMEOUT_SECONDS = 90.0
 #: instant a naive string names.
 LINE_SHAPE_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
 STAMP_RE = re.compile(r"^\[(?P<stamp>[^\]]+)\]")
+
+#: The message the seed writes into ``execution.log``.  A line carrying
+#: it in the status answer can only have come from that file: it was
+#: written before the second backend process existed.
+SEED_MESSAGE = "e2e seed"
 
 #: How fresh the last log line has to be.  The seeded line is written
 #: half a minute ago, so anything older than this means the answer was
@@ -197,24 +221,27 @@ def _seed(work: Path, plan_id: str) -> None:
 
     Two artefacts, one per source of truth:
 
-    * the ``plan_execution`` row in ``work/state.db`` — the durable
-      record of the run, and the row the boot-time recovery scan reads;
+    * the ``plan_routing`` row in ``work/state.db`` — where the plan is
+      in the workflow.  It is ``queued``, one of the phases a start may
+      be issued from (``server._EXECUTION_START_SOURCE_PHASES``);
     * ``work/plans/<plan_id>/execution.log`` — the activity, in the exact
       shape ``backend/execution_logger.py`` writes it (one JSON object per
       line, ``ts`` a naive UTC stamp).
 
-    The pid on the row is **this** process: the boot scan probes the pid
-    of a ``running`` row and judges a missing process to be a crash, so
-    the row has to hang on something alive.  The start time is written the
-    way the pre-fix writer wrote it — ``datetime.now().isoformat()``,
-    naive and local — because that is the shape the reader has to make
-    sense of after the restart.
+    **There is no ``plan_execution`` row here, and that is the point.**
+    The run this story is about is started through the API, by the
+    server, so the server owns it: the server spawns the executor, the
+    server writes the row, and the server writes the ledger record that
+    says which pid belongs to this plan.  A hand-written row naming a
+    pid the server never spawned is a *stranger's* pid, and the startup
+    reconcile refuses to claim one — a pid the ledger does not back is
+    not signalled, and the plan is parked as ``stopped``
+    (``routes/execution._reconcile_exec_pid``).  Under that contract a
+    seeded "running" row is parked before the run ever starts, and a
+    parked run is not a run the status endpoint will answer about.
     """
     from state_machine.db.connection import open as db_open
     from state_machine.db.schema import migrate
-    from state_machine.repositories.execution_repository import (
-        ExecutionRepository,
-    )
     from state_machine.repositories.routing_repository import RoutingRepository
 
     db_path = work / "state.db"
@@ -224,20 +251,31 @@ def _seed(work: Path, plan_id: str) -> None:
         # reads the row out of it, so the schema has to be there before
         # the row is written — not after.
         migrate(conn)
-        RoutingRepository(conn).insert(plan_id, "executing")
-        ExecutionRepository(conn).update_fields(
-            plan_id,
-            create_if_missing=True,
-            exec_status="running",
-            exec_pid=os.getpid(),
-            project_dir=str(work / "target"),
-            started_at=datetime.now().isoformat(),
-        )
+        RoutingRepository(conn).insert(plan_id, "queued")
     finally:
         conn.close()
 
     plan_dir = work / "plans" / plan_id
     plan_dir.mkdir(parents=True, exist_ok=True)
+    # The task list a start needs (the endpoint refuses a plan without
+    # one), and the working directory the run is pointed at.
+    (plan_dir / "tasks.json").write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "id": "t1",
+                        "title": "the one task this plan has",
+                        "description": "## 背景\nnothing\n\n## 目标\nsomething",
+                        "test_command": "true",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (work / "target").mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
     with (plan_dir / "execution.log").open("a", encoding="utf-8") as handle:
         for offset, event, message in (
@@ -298,6 +336,13 @@ def _boot(work: Path, port: int) -> subprocess.Popen:
             "PDT_PORT": str(port),
             "PDT_PROVIDER_MODE": "inherit",
             "PDT_ORPHAN_REAPER": "0",
+            # The one substitution this file makes: the executor is a
+            # stand-in, installed through the named production seam, and
+            # the **server** spawns it (so the server owns the pid and
+            # the process ledger records it).
+            "PDT_EXECUTOR_CMD": "{0} -u {1}".format(
+                str(VENV_PYTHON), str(EXECUTOR_FIXTURE)
+            ),
             "PYTEST_CURRENT_TEST": (
                 "backend/tests/e2e/test_execution_status_restart_e2e.py (setup)"
             ),
@@ -367,6 +412,53 @@ def _wait_ready(base_url: str, proc: subprocess.Popen) -> None:
     )
 
 
+def _crash(proc: Optional[subprocess.Popen]) -> None:
+    """Kill the backend the way a crash kills it: ``SIGKILL``, no cleanup.
+
+    A graceful shutdown writes a shutdown checkpoint and parks the run in
+    ``queued``; a crash writes nothing.  This story is about the crash:
+    the plan's run is simply gone when the next process boots, and the
+    next process has to answer from what is on disk.
+    """
+    if proc is None:
+        return
+    handle = getattr(proc, "_pdt_log_handle", None)
+    try:
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, AttributeError):
+                proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:  # pragma: no cover - the handle is ours
+                pass
+
+
+def _start_run(base_url: str, plan_id: str, project_dir: Path) -> Dict[str, Any]:
+    """Start the plan's run through the API, the way an operator does.
+
+    The server spawns the executor, writes the ``plan_execution`` row
+    and writes the process ledger record that owns the pid.  That is
+    what makes the run a run the next boot has to reconcile: a pid the
+    ledger backs, not a stranger's pid.
+    """
+    status, body = _http_json(
+        "POST",
+        f"{base_url}/api/execution/{plan_id}/start",
+        {"project_dir": str(project_dir)},
+    )
+    assert status == 200, f"the start was refused: {status} {body!r}"
+    assert isinstance(body, dict), f"the start answered {body!r}"
+    return body
+
+
 def _teardown(proc: Optional[subprocess.Popen]) -> None:
     """Stop the backend and let go of its port.
 
@@ -414,15 +506,26 @@ def restarted_status(tmp_path_factory) -> Dict[str, Any]:
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
 
+    # The first life: a real run, started through the API.  The server
+    # owns the executor, so the next boot finds a pid the ledger backs
+    # and has something real to reconcile.
     first = _boot(work, port)
     try:
         _wait_ready(base_url, first)
+        _start_run(base_url, PLAN_ID, work / "target")
     finally:
-        _teardown(first)
+        _crash(first)
 
+    # The second life: the same plans tree, the same database, a process
+    # that knows nothing but what is on disk.
     second = _boot(work, port)
     try:
         _wait_ready(base_url, second)
+        # The run is started again, so the answer the second process
+        # gives is about a run that is really going.  Its log lines are
+        # not in its memory — they are on disk, and that is where the
+        # answer comes from.
+        _start_run(base_url, PLAN_ID, work / "target")
         status, body = _http_json(
             "GET", f"{base_url}/api/execution/{PLAN_ID}/status"
         )
@@ -441,14 +544,22 @@ def restarted_status(tmp_path_factory) -> Dict[str, Any]:
 def test_logs_survive_real_backend_restart(restarted_status: Dict[str, Any]):
     """The logs are still there after a real restart, and they are fresh.
 
-    The first boot's memory is gone — the process that held it was killed.
-    What the second process answers has to come from the log file on
-    disk, in the one shape a reader can parse, and the last line has to
-    be recent enough to say "this run is still going".
+    The first boot's memory is gone — the process that held it was killed
+    outright.  What the second process answers has to come from the log
+    file on disk, in the one shape a reader can parse, and the last line
+    has to be recent enough to say "this run is still going".
     """
     logs = restarted_status.get("logs")
     assert isinstance(logs, list), f"logs is not a list: {logs!r}"
     assert logs, "the status answer carries no logs after the restart"
+
+    # The lines the seed wrote are on disk and were written **before the
+    # second process existed**.  If they show up in the answer, the
+    # answer was built out of that file and not out of the second
+    # process's own (empty) memory.
+    assert any(SEED_MESSAGE in line for line in logs), (
+        f"the answer carries no line the seed wrote to disk: {logs!r}"
+    )
 
     last = logs[-1]
     assert isinstance(last, str), f"the last log line is not text: {last!r}"
@@ -469,11 +580,10 @@ def test_logs_survive_real_backend_restart(restarted_status: Dict[str, Any]):
 def test_started_at_has_offset_after_restart(restarted_status: Dict[str, Any]):
     """``started_at`` still says which instant it names, after the restart.
 
-    The row was written the way the pre-fix writer wrote it: a naive
-    local stamp.  Read as UTC it would be eight hours off, and a reader
-    that computes an age from it would call a two-minute-old run
-    eight-hour-old.  So the answer has to carry an offset, and the
-    instant it names has to be the one that was written.
+    The stamp is written with an explicit offset, so it names one
+    instant and not a direction.  A reader that computes an age from it
+    has to get the age of the run that is going now, not the age of the
+    run the second process inherited from disk and stopped.
     """
     started_at = restarted_status.get("started_at")
     assert started_at, f"the status answer carries no start time: {started_at!r}"

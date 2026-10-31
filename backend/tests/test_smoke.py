@@ -131,7 +131,14 @@ class TestSmoke:
         assert _execution_state[plan_id]["ended_at"] is not None
 
     def test_smoke_restart_recovery(self, tmp_path, monkeypatch):
-        """A stale running plan_execution row with dead pid → recovery marks failed."""
+        """A stale running plan_execution row with dead pid → recovery parks it.
+
+        The startup reconcile (2026-10-31) parks the plan as ``stopped``:
+        the restart interrupted the run, but nothing proves how it
+        ended, so nothing claims that it died unexpectedly.  A crash
+        the backend *watches* happen is still ``failed`` — see
+        ``test_smoke_kill9`` below.
+        """
         plan_id = "smoke-restart"
         plan_dir = _setup_plan_dir(plan_id, tmp_path)
 
@@ -148,14 +155,14 @@ class TestSmoke:
         from server import _recover_execution_states
         _recover_execution_states(tmp_path / "plans")
 
-        # Should be marked failed
-        assert _execution_state[plan_id]["status"] == "failed"
-        assert _execution_state[plan_id]["stop_reason"] == "process_died_unexpectedly"
+        # Should be parked as stopped
+        assert _execution_state[plan_id]["status"] == "stopped"
+        assert _execution_state[plan_id]["stop_reason"] == "startup_reconcile"
 
-        # plan_state should be failed
+        # plan_state should be stopped
         from plan_state import PlanState
         ps = PlanState(plan_dir)
-        assert ps.get_current_phase() == "failed"
+        assert ps.get_current_phase() == "stopped"
 
     def test_smoke_kill9(self, tmp_path, monkeypatch):
         """Start a real subprocess, kill -9 it, then lazy check marks failed."""

@@ -660,10 +660,12 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     "frontend/style.css": (
         "0cab7b66dae8b5b693a9e8e4b5c4cda4f8651ae649512e81d8aa8c18a24f836b"
     ),
+    # 2026-10-31：因本分支新增 `_repair_exit_writer`（修复轮退出事件的单一写入器）
+    # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。
     # 2026-10-29：因「关机检查点恢复」新增 `_requeue_shutdown_interrupted_verification`（+80 行），
     # 按本 gate 的既定流程重新钉住该文件的哈希。
     "backend/verification_loop.py": (
-        "78caf3bbbf5a8734ed0984eaefa14451b6f78c7701e2a771dd4683bacfe11cbf"
+        "d937f90f6f3a390d7440aca91904827e1c1b6e3e351859bb45d0ef745fa78da4"
     ),
 }
 

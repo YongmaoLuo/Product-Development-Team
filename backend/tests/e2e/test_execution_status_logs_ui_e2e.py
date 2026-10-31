@@ -141,6 +141,8 @@ _seed = _RESTART._seed
 _boot = _RESTART._boot
 _wait_ready = _RESTART._wait_ready
 _teardown = _RESTART._teardown
+_crash = _RESTART._crash
+_start_run = _RESTART._start_run
 _http_json = _RESTART._http_json
 _playwright_interpreter = _UI._playwright_interpreter
 
@@ -302,15 +304,25 @@ def restarted_backend(tmp_path_factory) -> str:
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
 
+    # The first life: a run that is really running, started through the
+    # API so the **server** owns the executor (and the process ledger
+    # backs its pid).  Then the process is killed outright, so what it
+    # held in memory is gone.
     first = _boot(work, port)
     try:
         _wait_ready(base_url, first)
+        _start_run(base_url, PLAN_ID, work / "target")
     finally:
-        _teardown(first)
+        _crash(first)
 
+    # The second life: a new process on the same plans tree.  Its run is
+    # started again, so the panel it renders is about a run that is going
+    # — and the log lines it shows are not in its memory, they are in the
+    # file on disk.
     second = _boot(work, port)
     try:
         _wait_ready(base_url, second)
+        _start_run(base_url, PLAN_ID, work / "target")
         yield base_url
     finally:
         _teardown(second)

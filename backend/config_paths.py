@@ -206,6 +206,26 @@ def _load_backend_config_yaml() -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _anchor_on_project_root(env_value: str) -> Path:
+    """Turn an environment-supplied path into an absolute one.
+
+    An absolute value is returned as it is — an absolute path already
+    names its exact location. A relative one is resolved against
+    :data:`PROJECT_ROOT`, so it means the same thing to every process
+    that reads it, whatever that process's working directory is.
+
+    This is the convention :func:`resolve_config_dir` already used, and
+    the reason the plans root and the state database now follow it
+    too: both are read by the backend *and* by the processes it starts,
+    and the executor's working directory is ``backend/`` — not the
+    repository root.
+    """
+    candidate = Path(env_value).expanduser()
+    if not candidate.is_absolute():
+        candidate = (PROJECT_ROOT / candidate).resolve()
+    return candidate
+
+
 def resolve_plans_dir() -> Path:
     """Return the absolute per-plan artifact root to use right now.
 
@@ -213,7 +233,8 @@ def resolve_plans_dir() -> Path:
 
     1. ``PDT_PLANS_DIR`` environment variable — the test / harness
        escape hatch, mirroring ``PDT_STATE_DB_PATH`` for the SQLite
-       state store.
+       state store. A **relative** value is resolved against
+       :data:`PROJECT_ROOT`; an absolute one is used as it is.
     2. :data:`PLANS_DIR` — ``<repo>/plans``.
 
     **Why this exists (2026-09-13):** the plans tree is *live operator
@@ -226,12 +247,24 @@ def resolve_plans_dir() -> Path:
     symptom of test pollution. ``server.PLANS_DIR`` already honoured
     ``PDT_PLANS_DIR``; this makes every other resolver agree.
 
+    **Why a relative value is anchored (2026-10-31).** The plans root
+    is read by the backend *and* handed to the processes it starts —
+    and the executor's working directory is ``backend/``, not the
+    repository root. A relative root therefore named one directory for
+    the backend and another for everything the backend started: the
+    executor looked for ``backend/<root>/<plan_id>/tasks.json``, found
+    nothing, and exited successfully having done nothing. The backend
+    read that as "the run finished" and had no process tree to kill.
+    Anchoring on :data:`PROJECT_ROOT` — the same convention
+    :func:`resolve_config_dir` already used — makes the root mean the
+    same thing to every process that reads it.
+
     Resolution is re-run on every call (never cached) so a test that
     sets the env var *after* import still gets the redirected root.
     """
     env_value = os.environ.get("PDT_PLANS_DIR")
     if env_value:
-        return Path(env_value).expanduser()
+        return _anchor_on_project_root(env_value)
     return PLANS_DIR
 
 
@@ -241,7 +274,8 @@ def resolve_state_db_path() -> Path:
     Precedence (first hit wins):
 
     1. ``PDT_STATE_DB_PATH`` environment variable — operator override
-       and the test/harness seam.
+       and the test/harness seam. A **relative** value is resolved
+       against :data:`PROJECT_ROOT`; an absolute one is used as it is.
     2. :data:`STATE_DB` — ``<repo>/.pdt/state.db``.
 
     **Why this function exists (2026-09-28).** The same two-step
@@ -264,12 +298,18 @@ def resolve_state_db_path() -> Path:
     remove: with one resolver, a wrong path is a single wrong line
     rather than a per-site drift nobody notices.
 
+    A relative override is anchored on :data:`PROJECT_ROOT` for the
+    same reason :func:`resolve_plans_dir` anchors it (2026-10-31): the
+    database path is read by processes whose working directories are
+    not the repository root, and a relative value named a different
+    file for each of them.
+
     Resolution is re-run on every call (never cached) so a test that
     sets the env var *after* import still gets the redirected file.
     """
     env_value = os.environ.get(STATE_DB_ENV)
     if env_value:
-        return Path(env_value).expanduser()
+        return _anchor_on_project_root(env_value)
     return STATE_DB
 
 
@@ -287,10 +327,7 @@ def resolve_config_dir() -> Path:
     """
     env_value = os.environ.get("PDT_CONFIG_DIR")
     if env_value:
-        candidate = Path(env_value).expanduser()
-        if not candidate.is_absolute():
-            candidate = (PROJECT_ROOT / candidate).resolve()
-        return candidate
+        return _anchor_on_project_root(env_value)
     return CONFIG_DIR
 
 

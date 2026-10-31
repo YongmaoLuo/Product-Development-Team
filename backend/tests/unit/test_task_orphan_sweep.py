@@ -2,23 +2,37 @@
 
 The defect this pins
 --------------------
-``_mark_failed_dead`` is the single place where "the process that owns
-this execution is gone" is concluded. It used to conclude that and stop
-there: the ``plan_execution`` row went to ``failed`` and the plan phase
-went to ``failed``, but every ``plan_tasks`` row the dead executor had
-marked ``in_progress`` stayed exactly where it was. Nothing revisits
-those rows -- no later sweep, no migration -- and the progress surfaces
-read the row directly, so the plan kept reporting "currently running
-<task>" indefinitely, backed by no executing process at all.
+"The process that owns this execution is gone" used to be concluded in
+exactly one place, and it stopped there: the ``plan_execution`` row went
+to ``failed`` and the plan phase went to ``failed``, but every
+``plan_tasks`` row the dead executor had marked ``in_progress`` stayed
+exactly where it was. Nothing revisits those rows -- no later sweep, no
+migration -- and the progress surfaces read the row directly, so the plan
+kept reporting "currently running <task>" indefinitely, backed by no
+executing process at all.
 
-The fix hangs the reclaim off the same conclusion: once the idempotency
-gate has admitted the call, the owner is known dead, so every
-``in_progress`` row for that plan is residue and goes back to ``pending``.
+The fix hangs the reclaim off the same conclusion: once the owner is
+known dead, every ``in_progress`` row for that plan is residue and goes
+back to ``pending``.
+
+Where that conclusion is drawn now
+-----------------------------------
+Since the process-tree ownership change (2026-10-31) the boot funnel no
+longer reaches the sweep through ``_mark_failed_dead``: the startup
+reconcile (``routes.execution._reconcile_exec_pid``) draws the same
+conclusion itself and parks the plan as ``stopped`` with
+``stop_reason='startup_reconcile'`` -- the restart interrupted the run,
+but nothing proves *how* it ended, so nothing claims that it died
+unexpectedly. The reclaim is unchanged and still runs on that path
+(``routes.execution._reap_orphaned_tasks``): the orphaned rows go back
+to ``pending`` exactly as before. Only the plan-level verdict changed,
+and the assertions below follow it -- the task half of the contract is
+untouched.
 
 Why these tests go through ``_recover_execution_states``
 -------------------------------------------------------
 The unit under test is not "a function that rewrites rows", it is the
-boot funnel. Reaching ``_mark_failed_dead`` directly would prove the
+boot funnel. Reaching the reclaim helper directly would prove the
 helper works while leaving the liveness probe that actually gates it
 untested -- and that probe is where the interesting cases live: an alive
 PID must mean no reclaim, and a non-``running`` ``exec_status`` must
@@ -227,6 +241,15 @@ class TestOrphanedInProgressIsReaped:
     """The dead-owner case -- the one that motivated the sweep."""
 
     def test_dead_pid_reaps_in_progress_to_pending(self, sample_plan_factory):
+        """The dead-owner case -- the one that motivated the sweep.
+
+        The plan is parked as ``stopped``, not ``failed``: the startup
+        reconcile (``routes.execution._reconcile_exec_pid``) reads a pid
+        that names no process as "the restart interrupted this run",
+        and nothing proves how it ended, so nothing claims that it died
+        unexpectedly.  The reclaim itself is unchanged -- the orphaned
+        ``in_progress`` row still goes back to ``pending``.
+        """
         plan_dir = _make_plan(sample_plan_factory, "reap-dead")
         plan_id = plan_dir.name
         _seed_execution_row(
@@ -241,7 +264,9 @@ class TestOrphanedInProgressIsReaped:
         _execution_state.clear()
         _recover_execution_states(plan_dir.parent)
 
-        assert _execution_state[plan_id]["status"] == "failed"
+        assert _execution_state[plan_id]["status"] == "stopped"
+        assert _execution_state[plan_id]["stop_reason"] == "startup_reconcile"
+        assert PlanState(plan_dir).get_current_phase() == "stopped"
         assert _task_statuses(plan_id) == {"repair-r1-11": "pending"}
 
     def test_alive_pid_leaves_row_untouched(self, sample_plan_factory):
@@ -493,15 +518,26 @@ class TestOrphanedInProgressIsReaped:
 class TestSweepCannotBreakRecovery:
     """Requirement: a failed reap must not abort recovery.
 
-    ``_mark_failed_dead`` is the funnel every dead-owner path goes
-    through. If the sweep can raise, it takes the execution-row write
-    and the plan-phase transition down with it -- recovery would fail
-    *because* it tried to clean up after recovery.
+    The boot funnel draws the dead-owner conclusion in
+    ``routes.execution._reconcile_exec_pid`` and then parks the plan
+    (the execution row and the plan phase). If the sweep can raise, it
+    takes that parking down with it -- recovery would fail *because* it
+    tried to clean up after recovery.
     """
 
     def test_update_task_failure_does_not_propagate(
         self, sample_plan_factory, monkeypatch
     ):
+        """A sweep that cannot write must not cost the plan its parking.
+
+        The plan is parked as ``stopped`` (not ``failed``): the startup
+        reconcile (``routes.execution._reconcile_exec_pid``) parks a
+        run whose executor is gone as ``stopped`` /
+        ``startup_reconcile``, because the restart interrupted the run
+        and nothing proves that it died unexpectedly.  The sweep failing
+        is orthogonal to that verdict: it must not take the parking
+        down with it.
+        """
         from state_machine.repositories.plan_task_repository import (
             PlanTaskRepository,
         )
@@ -525,18 +561,22 @@ class TestSweepCannotBreakRecovery:
         _execution_state.clear()
         _recover_execution_states(plan_dir.parent)  # must not raise
 
-        assert _execution_state[plan_id]["status"] == "failed"
-        assert PlanState(plan_dir).get_current_phase() == "failed"
+        assert _execution_state[plan_id]["status"] == "stopped"
+        assert _execution_state[plan_id]["stop_reason"] == "startup_reconcile"
+        assert PlanState(plan_dir).get_current_phase() == "stopped"
 
     def test_missing_plan_tasks_table_does_not_propagate(
         self, sample_plan_factory, monkeypatch
     ):
         """A state DB with no ``plan_tasks`` table at all.
 
-        Both ``_mark_failed_dead`` and the sweep migrate before touching
-        their tables, so migration is neutralised here and the table
-        dropped -- otherwise the sweep would silently re-create it and
-        the case would never be exercised.
+        The sweep migrates before touching its table, so migration is
+        neutralised here and the table dropped -- otherwise the sweep
+        would silently re-create it and the case would never be
+        exercised.  The plan is still parked as ``stopped`` /
+        ``startup_reconcile`` (the startup reconcile's verdict, see
+        ``routes.execution._reconcile_exec_pid``), because a sweep that
+        cannot run is not a reason to lose the parking.
         """
         from server import _state_db_path
         from state_machine.db.connection import open as db_open
@@ -562,18 +602,19 @@ class TestSweepCannotBreakRecovery:
         _execution_state.clear()
         _recover_execution_states(plan_dir.parent)  # must not raise
 
-        assert _execution_state[plan_id]["status"] == "failed"
-        assert PlanState(plan_dir).get_current_phase() == "failed"
+        assert _execution_state[plan_id]["status"] == "stopped"
+        assert _execution_state[plan_id]["stop_reason"] == "startup_reconcile"
+        assert PlanState(plan_dir).get_current_phase() == "stopped"
 
     def test_unopenable_db_is_swallowed_by_the_helper(self, monkeypatch):
         """The sweep's own open failure is caught by the sweep.
 
         Scoped to the helper rather than the whole funnel on purpose:
-        ``_mark_failed_dead`` opens the same database for its
-        ``plan_execution`` write *before* the sweep runs, so a database
-        neither can open is a pre-existing condition of that function,
-        not something the sweep introduces. What is new -- and what is
-        pinned here -- is that the sweep adds no second way to fail.
+        the funnel opens the same database for its ``plan_execution``
+        write *before* the sweep runs, so a database neither can open is
+        a pre-existing condition of the funnel, not something the sweep
+        introduces. What is new -- and what is pinned here -- is that
+        the sweep adds no second way to fail.
         """
         import server as server_mod
 
