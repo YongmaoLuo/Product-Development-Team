@@ -57,9 +57,13 @@ Schema
 
 判定
 ----
-``ci_entry`` 退出 0 → PASSED；非 0 / 超时 / 入口不可执行 → FAILED，并把
+``ci_entry`` 退出 0 → PASSED；门禁自己的 summary 说它「判不了」（退出 3，
+或预算用尽）→ INCONCLUSIVE；其余非 0 / 超时 / 入口不可执行 → FAILED，并把
 stdout/stderr 尾部附在 verdict 的 evidence 里、原始输出落盘
 ``plans/<id>/vp_artifacts/<vp_id>/ci_output.json``。**只有这一条判据。**
+
+INCONCLUSIVE 不是「过了」，也不是「代码坏了」—— 门禁没有判，它只说明这次
+运行没跑完。把它写成 FAILED 会让修复循环去改一个没被证明有缺陷的交付物。
 
 截尾的输出只留最后 :data:`MAX_OUTPUT_CHARS` 个字符，而门禁是三段串行跑的
 —— 段 1 的失败在段 3 结束时早就被截掉了。所以门禁脚本在
@@ -79,13 +83,14 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from bounded_subprocess import run_bounded
 from credentials import _FD_ENV_PREFIX as _SECRET_FD_ENV_PREFIX
@@ -95,6 +100,15 @@ logger = logging.getLogger(__name__)
 STATUS_PASSED = "PASSED"
 STATUS_FAILED = "FAILED"
 
+#: The gate could not decide: its budget ran out, or the host could not
+#: be measured.  The gate has three exit codes (0 passed / 1 a phase
+#: failed / 3 could not decide) and exit 3 says nothing about the code.
+#:
+#: It must not be reported as :data:`STATUS_FAILED`: a FAILED verdict is
+#: what the repair loop turns into a fix task, and a machine that ran
+#: out of time has not proven a deliverable defective.
+STATUS_INCONCLUSIVE = "INCONCLUSIVE"
+
 #: The one field a ``full_ci`` VP must declare.
 CI_ENTRY_FIELD = "ci_entry"
 
@@ -103,7 +117,46 @@ CI_ENTRY_FIELD = "ci_entry"
 #: the default is deliberately far
 #: above the Phase-1 evidence-command ceiling (600s). It is still a hard
 #: cap: a hung gate is killed and reported, not left to eat the round.
+#:
+#: This is the *fallback*: it applies only when the gate does not declare
+#: a budget of its own.  A gate that declares one (see
+#: :func:`gate_budget_seconds`) is watched with that budget plus a
+#: margin, because a watchdog that is shorter than the gate it watches
+#: cannot report anything except the fact that it fired.
 DEFAULT_CI_TIMEOUT_SECONDS = 3600
+
+#: The margin the watchdog adds to the budget the gate declares.
+#:
+#: The gate stops *itself* at its budget and prints a verdict; the
+#: margin is the time it needs to finish that verdict, write its
+#: summary and be reaped.  Without it the watchdog would fire in the
+#: very second the gate is trying to report that it ran out of time.
+GATE_BUDGET_MARGIN_SECONDS = 300
+
+#: Where the gate lives inside a project, relative to the project root.
+GATE_SCRIPT_RELATIVE_PATH = ("scripts", "run_tests.sh")
+
+#: The declaration the gate publishes its budget with.  The gate is the
+#: single source of truth — the watchdog reads the number out of the
+#: gate's own script rather than keeping a second copy of it, which is
+#: how the two budgets drifted apart in the first place.
+_GATE_BUDGET_RE = re.compile(
+    r"^GATE_BUDGET_SECONDS_([A-Z0-9]+)=([0-9]+)\s*$", re.MULTILINE
+)
+
+#: The lane a ``--lane`` argument names, in either spelling.
+_LANE_ARGUMENT_RE = re.compile(r"(?:^|\s)--lane(?:=|\s+)([A-Za-z0-9_]+)")
+
+#: The machine-readable lines of the gate's own summary.
+_GATE_BUDGET_LINE_RE = re.compile(r"^gate budget:\s*(\d+)s\s*$", re.MULTILINE)
+_GATE_ELAPSED_LINE_RE = re.compile(r"^gate elapsed:\s*(\d+)s\s*$", re.MULTILINE)
+_GATE_EXHAUSTED_LINE_RE = re.compile(
+    r"^gate budget exhausted in:\s*(.+?)\s*$", re.MULTILINE
+)
+_GATE_VERDICT_LINE_RE = re.compile(
+    r"^gate:\s*([A-Z]+)\s*\(exit (\d+)\)", re.MULTILINE
+)
+_GATE_PHASE_HEADER_RE = re.compile(r"^=== phase (.+?) ===\s*$", re.MULTILINE)
 
 #: Output kept per stream in the verdict evidence.
 MAX_OUTPUT_CHARS = 4000
@@ -505,12 +558,135 @@ def validate_vp(vp: Any, *, project_dir: Optional[Path] = None) -> List[SchemaIs
 # ---------------------------------------------------------------------------
 
 
-def ci_timeout(vp: Dict[str, Any]) -> int:
+def gate_budget_seconds(
+    project_dir: Optional[Path],
+    entry: Optional[str] = None,
+) -> Optional[int]:
+    """The budget the gate declares for the run *entry* asks for.
+
+    The gate publishes its budget in its own script (``scripts/run_tests.sh``)
+    and this reads that publication — the gate is the single source of
+    truth, and the watchdog is a reader of it rather than a second copy
+    of it.
+
+    *entry* is the command the VP runs; it may name a lane
+    (``--lane unit``), and a lane has a smaller budget than the whole
+    gate.  An entry that names no lane asks for the whole gate.
+
+    ``GATE_BUDGET_SECONDS`` in the environment overrides both — the gate
+    reads the same variable, so an operator who raises the budget raises
+    it on both sides of the fence.
+
+    ``None`` means "the gate declares no budget" — the caller falls back
+    to the historical default.
+    """
+    override = os.environ.get("GATE_BUDGET_SECONDS", "").strip()
+    if override.isdigit() and int(override) > 0:
+        return int(override)
+    if project_dir is None:
+        return None
+    script = Path(project_dir).joinpath(*GATE_SCRIPT_RELATIVE_PATH)
+    try:
+        text = script.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    budgets = {
+        lane.lower(): int(value)
+        for lane, value in _GATE_BUDGET_RE.findall(text)
+    }
+    if not budgets:
+        return None
+    return budgets.get(_lane_of(entry), budgets.get("all"))
+
+
+def _lane_of(entry: Optional[str]) -> str:
+    """The lane an entry asks for; the whole gate when it names none."""
+    if not entry:
+        return "all"
+    match = _LANE_ARGUMENT_RE.search(entry)
+    if not match:
+        return "all"
+    return match.group(1).lower()
+
+
+def parse_gate_summary(stdout: str) -> Dict[str, Any]:
+    """What the gate's own summary says about the run it just did.
+
+    The summary is the gate's account of itself: the budget it was
+    given, the time it spent, the phase that ran out of budget, and the
+    verdict it reached.  A reader that cannot parse it is left with the
+    last line of stdout — which is what the round-2 artifact recorded,
+    and it answers nothing.
+
+    Anything that is not a gate summary reads as "nothing is known",
+    which is what it is: an entry that is not the gate has no summary.
+    """
+    summary: Dict[str, Any] = {
+        "budget_seconds": None,
+        "elapsed_seconds": None,
+        "verdict": "",
+        "exit_code": None,
+        "budget_exhausted_in": "",
+        "running_phase": "",
+    }
+    if not stdout:
+        return summary
+    budget = _GATE_BUDGET_LINE_RE.search(stdout)
+    if budget:
+        summary["budget_seconds"] = int(budget.group(1))
+    elapsed = _GATE_ELAPSED_LINE_RE.search(stdout)
+    if elapsed:
+        summary["elapsed_seconds"] = int(elapsed.group(1))
+    exhausted = _GATE_EXHAUSTED_LINE_RE.search(stdout)
+    if exhausted:
+        summary["budget_exhausted_in"] = exhausted.group(1)
+    verdict = _GATE_VERDICT_LINE_RE.search(stdout)
+    if verdict:
+        summary["verdict"] = verdict.group(1)
+        summary["exit_code"] = int(verdict.group(2))
+    phases = _GATE_PHASE_HEADER_RE.findall(stdout)
+    if phases:
+        # The last phase that started is the one that was running.
+        summary["running_phase"] = phases[-1]
+    return summary
+
+
+def ci_timeout(
+    vp: Dict[str, Any],
+    *,
+    project_dir: Optional[Path] = None,
+    entry: Optional[str] = None,
+) -> int:
+    """The watchdog's budget for this VP.
+
+    The watchdog is **never shorter than the gate it watches**.  When the
+    gate declares a budget, the watchdog gets that budget plus a margin
+    — a VP that declares a shorter timeout does not get one, because a
+    watchdog shorter than the gate is the failure this whole mechanism
+    exists to prevent: the gate is killed from the outside and reports
+    nothing.
+
+    When the gate declares nothing, the historical default stands.
+    """
+    declared = _declared_ci_timeout(vp)
+    budget = gate_budget_seconds(project_dir, entry)
+    if budget is None:
+        if declared is None:
+            return DEFAULT_CI_TIMEOUT_SECONDS
+        return declared
+    floor = budget + GATE_BUDGET_MARGIN_SECONDS
+    if declared is None:
+        return floor
+    return max(declared, floor)
+
+
+def _declared_ci_timeout(vp: Dict[str, Any]) -> Optional[int]:
+    """The timeout the VP itself declares, or ``None`` when it declares none."""
     raw = vp.get("ci_timeout_seconds")
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        return DEFAULT_CI_TIMEOUT_SECONDS
+        return None
     return max(1, value)
 
 
@@ -540,6 +716,41 @@ def ci_subprocess_env() -> Dict[str, str]:
         for key, value in os.environ.items()
         if not key.startswith(_SECRET_FD_ENV_PREFIX)
     }
+
+
+def _spawn_registry() -> Tuple[Path, Path]:
+    """The registry of this run's detached processes, and its directory.
+
+    The gate is about to start services, and a service is started
+    detached: it leads its own session, so the watchdog that kills the
+    gate's process group does not reach it.  The registry is how the
+    runner finds those services afterwards — including when the gate
+    was killed and never got to its own cleanup.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="pdt-ci-spawn-registry-"))
+    return directory, directory / "spawn_registry.jsonl"
+
+
+def _reap_spawned(registry: Path, *, reason: str) -> List[Dict[str, Any]]:
+    """Give back the processes the registry names.  Never raises.
+
+    A cleanup path that raises would take the verdict down with it, and
+    the verdict is the thing this module exists to produce.
+    """
+    try:
+        import orphan_reaper
+    except Exception:  # pragma: no cover - the module is stdlib-only
+        return []
+    try:
+        return list(
+            orphan_reaper.reap_spawned_processes(registry, reason=reason)
+        )
+    except Exception as exc:  # noqa: BLE001 - a cleanup never fails a verdict
+        logger.warning(
+            "[verification_ci_runner] could not give the spawned "
+            "processes back: %s", exc,
+        )
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -780,20 +991,33 @@ def run_ci_verification(
         return result
 
     entry = str(vp[CI_ENTRY_FIELD]).strip()
-    timeout = ci_timeout(vp)
     project_dir = Path(project_dir)
+    timeout = ci_timeout(vp, project_dir=project_dir, entry=entry)
+    declared_budget = gate_budget_seconds(project_dir, entry)
 
     started = time.monotonic()
     exit_code: Optional[int] = None
     stdout = stderr = ""
     timed_out = False
     error = ""
+    gate_summary: Dict[str, Any] = {}
+    reaped: List[Dict[str, Any]] = []
+
+    # The registry of the processes this run starts.  It is named in the
+    # gate's environment, so the service, the reaper daemon the service
+    # starts and the harness that spawns a server all write themselves
+    # into the same file — and the runner can give them back when the
+    # gate is gone.
+    registry_dir, registry = _spawn_registry()
+    gate_env = ci_subprocess_env()
+    gate_env["PDT_SPAWN_REGISTRY"] = str(registry)
 
     # The junit reports of the phases land next to the audit copy of this
     # verdict — the same directory ``_write_artifact`` uses — so the two
     # pieces of evidence sit together and the report names the phase it
-    # belongs to.
-    env = ci_subprocess_env()
+    # belongs to.  The gate environment already carries the spawn
+    # registry above; the junit directory joins it on the same dict, so
+    # the one subprocess sees both.
     junit_dir: Optional[Path] = None
     if artifact_dir is not None:
         candidate = Path(artifact_dir) / vp_id
@@ -810,30 +1034,57 @@ def run_ci_verification(
             )
         else:
             junit_dir = candidate
-            env[GATE_JUNIT_DIR_ENV] = str(candidate)
+            gate_env[GATE_JUNIT_DIR_ENV] = str(candidate)
 
     try:
-        completed = run_bounded(
-            entry,
-            cwd=str(project_dir),
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-        exit_code = completed.returncode
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-        stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
-        error = f"超时：{timeout}s 内没有跑完"
-    except Exception as exc:  # noqa: BLE001 - a broken gate is FAILED
-        error = f"{type(exc).__name__}: {exc}"
+        try:
+            completed = run_bounded(
+                entry,
+                cwd=str(project_dir),
+                text=True,
+                timeout=timeout,
+                env=gate_env,
+            )
+            exit_code = completed.returncode
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+            stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
+            gate_summary = parse_gate_summary(stdout)
+            error = _timeout_reason(
+                timeout,
+                time.monotonic() - started,
+                gate_summary,
+                declared_budget,
+            )
+        except Exception as exc:  # noqa: BLE001 - a broken gate is FAILED
+            error = f"{type(exc).__name__}: {exc}"
+    finally:
+        # The gate may have been killed before its own cleanup could
+        # run — and a service is detached, so it outlives the gate that
+        # started it.  The runner is the process that outlives the
+        # gate, so the runner is the process that gives it back.
+        reaped = _reap_spawned(registry, reason="the CI gate ended")
+        shutil.rmtree(registry_dir, ignore_errors=True)
 
     duration = time.monotonic() - started
     stdout_tail = stdout[-MAX_OUTPUT_CHARS:]
     stderr_tail = stderr[-MAX_OUTPUT_CHARS:]
+    if not gate_summary:
+        gate_summary = parse_gate_summary(stdout)
+
+    # The gate's own account of itself, lifted to the top level of the
+    # evidence so a reader does not have to dig into ``gate_summary``
+    # for it.  ``gate_elapsed_seconds`` is what the gate reported; a
+    # gate that reported nothing falls back to the time the runner
+    # measured, which is the same number for a gate that ran to its end.
+    exhausted_in = str(gate_summary.get("budget_exhausted_in") or "")
+    gate_verdict = str(gate_summary.get("verdict") or "")
+    gate_elapsed = gate_summary.get("elapsed_seconds")
+    if gate_elapsed is None:
+        gate_elapsed = int(duration)
 
     evidence: Dict[str, Any] = {
         "vp_id": vp_id,
@@ -843,6 +1094,12 @@ def run_ci_verification(
         "duration_seconds": round(duration, 2),
         "stdout_tail": stdout_tail,
         "stderr_tail": stderr_tail,
+        "ci_timeout_seconds": timeout,
+        "gate_budget_seconds": declared_budget,
+        "gate_summary": gate_summary,
+        "spawned_processes_reaped": reaped,
+        "budget_exhausted_in": exhausted_in,
+        "gate_elapsed_seconds": gate_elapsed,
     }
     if error:
         evidence["error"] = error
@@ -858,6 +1115,29 @@ def run_ci_verification(
         result.reasons = [
             f"[full_ci] `{entry}` 退出码 0（用时 {duration:.0f}s）"
         ]
+    elif not timed_out and not error and _gate_could_not_decide(
+        exit_code, gate_summary,
+    ):
+        # The gate could not decide.  That is not a verdict about the
+        # code, so it is not a FAILED verdict: a FAILED verdict is what
+        # the repair loop turns into a fix task, and a machine that ran
+        # out of time has not proven a deliverable defective.
+        result.status = STATUS_INCONCLUSIVE
+        result.reasons = [
+            f"[full_ci] `{entry}` "
+            + _inconclusive_reason(
+                exit_code=exit_code,
+                gate_verdict=gate_verdict,
+                exhausted_in=exhausted_in,
+                summary=gate_summary,
+                declared_budget=declared_budget,
+                elapsed=gate_elapsed,
+                duration=evidence["duration_seconds"],
+            )
+        ]
+        tail = stderr_tail.strip() or stdout_tail.strip()
+        if tail:
+            result.reasons.append(f"输出尾部：{tail[-600:]}")
     else:
         result.status = STATUS_FAILED
         if timed_out:
@@ -876,6 +1156,118 @@ def run_ci_verification(
     result.evidence = evidence
     _write_artifact(artifact_dir, vp_id, evidence)
     return result
+
+
+def _gate_could_not_decide(
+    exit_code: Optional[int],
+    summary: Dict[str, Any],
+) -> bool:
+    """Did the gate stop without saying anything about the code?
+
+    The gate's own summary is the evidence, and it is the only evidence
+    that fits: a run that could not decide says so.  Three ways it says
+    it:
+
+    * it names the phase its budget ran out in
+      (``gate budget exhausted in: …``);
+    * it declares itself INCONCLUSIVE (``gate: INCONCLUSIVE (exit 3)``)
+      — which stands on its own even when no phase could be parsed;
+    * it exits 3 — the code the gate uses for a run that could not
+      decide (``scripts/run_tests.sh`` uses 0 for a pass, 1 for a failed
+      phase, 3 for a run that could not decide).
+
+    A run whose summary says nothing at all is not a gate that spoke:
+    there is no declaration to read, and the historical FAILED verdict
+    stands.
+    """
+    if not _summary_has_content(summary):
+        return False
+    if str(summary.get("budget_exhausted_in") or ""):
+        return True
+    if exit_code == 3:
+        return True
+    return str(summary.get("verdict") or "").upper() == STATUS_INCONCLUSIVE
+
+
+def _summary_has_content(summary: Dict[str, Any]) -> bool:
+    """Did the gate print anything the runner could read back?"""
+    if not summary:
+        return False
+    return any(value not in (None, "", 0) for value in summary.values())
+
+
+def _inconclusive_reason(
+    *,
+    exit_code: Optional[int],
+    gate_verdict: str,
+    exhausted_in: str,
+    summary: Dict[str, Any],
+    declared_budget: Optional[int],
+    elapsed: int,
+    duration: float,
+) -> str:
+    """Why the run is inconclusive — in words that answer questions.
+
+    "退出码 3" is a true sentence that answers no question: not which
+    phase ran out of budget, not what the gate had budgeted for itself,
+    not how long it had been running.  The reason carries all three,
+    because the gate's own summary carries them and a verdict that
+    drops them sends the reader to dig for a summary that was there
+    all along.
+    """
+    budget = summary.get("budget_seconds") or declared_budget
+    budget_text = f"{budget}s" if budget else "未声明"
+    if exhausted_in:
+        return (
+            f"退出码 {exit_code}：门禁在 {exhausted_in} 用尽了它自己声明的 "
+            f"{budget_text} 预算（预算用尽，不是代码失败；"
+            f"budget_exhausted_in={exhausted_in}，duration={duration}s，"
+            f"门禁自报用时 {elapsed}s）"
+        )
+    verdict_text = f"门禁自报 {gate_verdict}；" if gate_verdict else ""
+    return (
+        f"退出码 {exit_code}：门禁没能给出结论（{verdict_text}"
+        f"预算用尽或主机不可测量，不是代码失败；duration={duration}s，"
+        f"门禁自报用时 {elapsed}s）"
+    )
+
+
+def _timeout_reason(
+    timeout: int,
+    elapsed: float,
+    summary: Dict[str, Any],
+    declared_budget: Optional[int],
+) -> str:
+    """Why the watchdog fired — in words that answer questions.
+
+    "超时：3600s 内没有跑完" was true and useless: it did not say
+    whether the gate had run out of *its own* budget (the machine was
+    too slow) or had been killed from the outside (something went wrong
+    between the gate and the watchdog), it did not name the phase that
+    was running, and it did not say how long the gate had been running
+    or what it had budgeted for itself.
+
+    The verdict has to carry those four things, because the round-2
+    artifact carried none of them.
+    """
+    budget = summary.get("budget_seconds") or declared_budget
+    budget_text = f"{budget}s" if budget else "未声明"
+    phase = summary.get("running_phase") or "未知阶段"
+    elapsed_seconds = summary.get("elapsed_seconds")
+    if elapsed_seconds is None:
+        elapsed_seconds = int(elapsed)
+    exhausted_in = summary.get("budget_exhausted_in") or ""
+    if exhausted_in:
+        return (
+            f"超时：门禁在 {exhausted_in} 用尽了它自己声明的 {budget_text} 预算"
+            f"（预算用尽，不是被外部杀掉；看门狗给的是 {timeout}s，已用 "
+            f"{elapsed_seconds}s）"
+        )
+    return (
+        f"超时：{timeout}s 内没有跑完，门禁被外部杀掉（看门狗开的枪；"
+        f"已用 {elapsed_seconds}s；被杀的时候正在跑 {phase}；"
+        f"门禁声明的预算是 {budget_text}）"
+    )
 
 
 def _write_artifact(

@@ -137,7 +137,9 @@ is reached and written down, and not one signal is sent.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
+import errno
 import inspect
 import json
 import logging
@@ -148,6 +150,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -159,6 +162,7 @@ from typing import (
     FrozenSet,
     IO,
     Iterable,
+    Iterator,
     List,
     Mapping,
     MutableMapping,
@@ -294,6 +298,7 @@ ENV_INTERVAL = "PDT_ORPHAN_REAPER_INTERVAL"
 ENV_PROTECT_PORTS = "PDT_ORPHAN_REAPER_PROTECT_PORTS"
 ENV_GRACE = "PDT_ORPHAN_REAPER_GRACE"
 ENV_IDLE_EXIT = "PDT_ORPHAN_REAPER_IDLE_EXIT"
+ENV_MAX_LIFETIME = "PDT_ORPHAN_REAPER_MAX_LIFETIME"
 ENV_DRY_RUN = "PDT_ORPHAN_REAPER_DRY_RUN"
 ENV_BURST_THRESHOLD = "PDT_ORPHAN_REAPER_BURST_THRESHOLD"
 ENV_SWAP_THRESHOLD = "PDT_ORPHAN_REAPER_SWAP_THRESHOLD"
@@ -308,6 +313,17 @@ DEFAULT_GRACE = 5.0
 DEFAULT_IDLE_EXIT = 1800
 DEFAULT_BURST_THRESHOLD = 50
 DEFAULT_SWAP_THRESHOLD = 90.0
+
+#: The longest a reaper daemon may live, whatever else happens (24h).
+#:
+#: The idle streak is about idleness; this is about **age**.  A daemon
+#: has to have an end, because a daemon that cannot end is a daemon
+#: that accumulates: on 2026-10-31 twenty-six of them were running on
+#: one machine, each of them walking every process on the box every
+#: thirty seconds.  The ceiling is generous on purpose — a production
+#: backend may run for days — and it is the *last* door out, behind
+#: the idle streak and behind the "my world has been deleted" check.
+DEFAULT_MAX_LIFETIME = 86400
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -565,6 +581,636 @@ def install_owner_marks(
     env[SPAWN_OWNER_PID] = marks[SPAWN_OWNER_PID]
     env[SPAWN_OWNER_START] = marks[SPAWN_OWNER_START]
     return marks
+
+
+# --------------------------------------------------------------------------
+# The spawn registry
+# --------------------------------------------------------------------------
+#
+# The spawn marker says a process is *ours*.  The registry says a
+# process is *this run's* -- and this run is the thing that has to be
+# able to give it back.
+#
+# A declared service is started detached: it calls ``setsid()`` and
+# becomes a session leader, so a watchdog that kills the gate's process
+# group does not touch it.  That is what makes a service outlive the
+# run that started it, and it is how the CI of 2026-10-31 left a
+# ``backend.server`` answering ``/health`` a minute after the watchdog
+# had fired -- and how twenty-six reaper daemons accumulated on one
+# machine, each of them leading a session of its own again.
+#
+# So every detached process a run starts writes itself down, and every
+# cleanup path gives it back:
+#
+# * the gate, on its way out (its EXIT trap);
+# * the CI runner, after the gate returns -- including when the gate
+#   was killed and never got to its own cleanup.
+#
+# The registry is named by an environment variable, so it is inherited
+# by everything the run starts: the service, the reaper daemon the
+# service starts, the harness that spawns a server.  A process that
+# registers itself is one the run can find again.
+
+#: The environment variable that names the registry of this run's
+#: detached processes.
+SPAWN_REGISTRY_ENV = "PDT_SPAWN_REGISTRY"
+
+
+# --------------------------------------------------------------------------
+# The registry's lock
+# --------------------------------------------------------------------------
+#
+# The registry is written by everybody in the run: the gate writes
+# itself down, the CI runner does, and every service writes down the
+# reaper daemon it starts.  Those writes used to race -- an append
+# against a rewrite -- and a rewrite that lost an append lost a
+# *process*: an entry that is not in the registry is a process nobody
+# can give back, which is the whole failure the registry exists to
+# prevent.
+#
+# So the registry has a lock.  It is an ``flock`` on a sidecar file
+# next to the registry, taken exclusively for a write and shared for a
+# read.  The lock covers the read and the write of a read-modify-write
+# cycle and nothing else: a cleanup pass that held it while it waited
+# for a process to die would keep every other process out of the
+# registry for as long as the grace period lasts.
+#
+# The lock is advisory and it is best-effort.  A platform without
+# ``fcntl``, an unwritable directory, or a holder that does not let go
+# in time leaves the caller without a lock -- and a caller without a
+# lock still writes, it just writes without the guarantee.  Waiting for
+# ever is not an option: a registry that cannot be written is a run
+# that cannot record what it started.
+
+#: The suffix of the file that carries the registry's lock.
+_REGISTRY_LOCK_SUFFIX = ".lock"
+
+#: How long a writer waits for the registry's lock before going on
+#: without it.
+_REGISTRY_LOCK_TIMEOUT = 5.0
+
+#: The lock this thread holds, if it holds one.
+#:
+#: ``flock`` is per *open file description*, so taking the lock twice
+#: in one thread -- once for the read and once for the write of a
+#: read-modify-write cycle -- would wait for a lock the thread itself
+#: holds.  The depth counter is what keeps that from happening; the pid
+#: is what keeps a forked child from inheriting the claim.
+_REGISTRY_LOCK_STATE = threading.local()
+
+
+def _registry_lock_path(target: Path) -> Path:
+    """The file that carries the registry's lock."""
+    return target.with_name(target.name + _REGISTRY_LOCK_SUFFIX)
+
+
+def _take_flock(handle: IO[str], timeout: float, shared: bool) -> bool:
+    """Take a ``flock`` on *handle*, waiting at most *timeout* seconds.
+
+    ``False`` when the lock could not be taken: no ``fcntl`` on this
+    platform, an error the kernel will not repeat, or a holder that did
+    not let go in time.  The caller goes on without the lock rather than
+    waiting for ever -- a registry that cannot be written is worse than
+    a registry that is written without a guarantee.
+    """
+    if fcntl is None:  # pragma: no cover - Windows
+        return False
+    mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    delay = 0.005
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), mode | fcntl.LOCK_NB)
+            return True
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(delay)
+            delay = min(delay * 2, 0.05)
+
+
+@contextlib.contextmanager
+def _registry_lock(
+    target: Path,
+    *,
+    timeout: float = _REGISTRY_LOCK_TIMEOUT,
+    shared: bool = False,
+) -> Iterator[bool]:
+    """Hold the registry's lock while the body runs.
+
+    Yields ``True`` when the lock was taken and ``False`` when it was
+    not.  ``False`` is not a failure: the caller writes without the
+    guarantee rather than blocking for ever.  The lock is taken
+    exclusively unless *shared* is asked for, and it is taken for at
+    most *timeout* seconds.
+
+    The lock is re-entrant within a thread: a caller that already holds
+    it -- the read-modify-write cycle does -- gets it again without
+    waiting for itself.
+    """
+    state = _REGISTRY_LOCK_STATE
+    if (
+        getattr(state, "depth", 0)
+        and getattr(state, "pid", None) == os.getpid()
+    ):
+        state.depth += 1
+        try:
+            yield bool(getattr(state, "locked", False))
+        finally:
+            state.depth -= 1
+        return
+
+    lock_path = _registry_lock_path(target)
+    handle: Optional[IO[str]] = None
+    locked = False
+    try:
+        handle = open(lock_path, "a+", encoding="utf-8")
+        locked = _take_flock(handle, timeout, shared)
+    except OSError as exc:
+        if exc.errno != errno.ENOENT:
+            logger.warning(
+                "orphan reaper: could not open the spawn registry lock %s "
+                "(%s)", lock_path, exc,
+            )
+        if handle is not None:
+            handle.close()
+        handle = None
+        locked = False
+    if handle is not None and not locked:
+        logger.warning(
+            "orphan reaper: could not take the spawn registry lock %s; "
+            "writing without it", lock_path,
+        )
+
+    state.depth = 1
+    state.pid = os.getpid()
+    state.locked = locked
+    try:
+        yield locked
+    finally:
+        state.depth = 0
+        if handle is not None:
+            try:
+                if locked:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:  # pragma: no cover - the lock is already gone
+                pass
+            handle.close()
+
+
+def spawn_registry_path(
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[Path]:
+    """The registry this run writes its processes down in.
+
+    ``None`` means there is none.  A run that does not name a registry
+    does not want one -- the backend's own sessions never do -- and
+    every call below reads that as "nothing to write down, nothing to
+    give back".
+    """
+    env = os.environ if environ is None else environ
+    raw = str(env.get(SPAWN_REGISTRY_ENV, "") or "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
+def register_spawned_process(
+    pid: int,
+    *,
+    pgid: Optional[int] = None,
+    kind: str = KIND_SERVICE,
+    name: str = "",
+    path: Optional[Path] = None,
+) -> Optional[Path]:
+    """Write a detached process down, so this run can give it back.
+
+    The entry carries the process' *start time* next to its pid: a pid
+    on its own is not an identity, because pids are recycled, and a
+    recycled pid signalled by mistake is a process this run never
+    started.
+
+    The write is made under the registry's lock, so that it cannot
+    land in a file that a cleanup pass is replacing at that very
+    moment: a line appended to a file that is about to be replaced is
+    a line nobody will ever read.
+
+    Returns the registry the entry went into, or ``None`` when there
+    is no registry to write into.
+    """
+    target = Path(path) if path is not None else spawn_registry_path()
+    if target is None:
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 1:
+        return None
+    entry: Dict[str, Any] = {
+        "pid": pid,
+        "pgid": int(pgid) if pgid else None,
+        "kind": str(kind or ""),
+        "name": str(name or ""),
+        "owner_pid": os.getpid(),
+        # The start time is read *before* the lock is taken.  It costs a
+        # ``ps`` on macOS, and the registry's lock is not a place to
+        # spend that: everything else in the run is waiting for it.
+        "start_epoch": process_start_epoch(pid),
+        "registered_at": time.time(),
+    }
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with _registry_lock(target):
+            text = _read_registry_text(target)
+            if text and not text.endswith("\n"):
+                # The last line has no newline of its own -- a writer
+                # that died half way through.  Without this the new
+                # line would be appended to it, and the two would
+                # become one line that parses as neither.
+                text += "\n"
+            _replace_spawn_registry(target, text + line)
+    except OSError as exc:
+        logger.warning(
+            "orphan reaper: could not write the spawn registry %s (%s)",
+            target, exc,
+        )
+        return None
+    return target
+
+
+def _read_registry_text(target: Path) -> str:
+    """The registry's raw text.
+
+    Every write replaces the file atomically (see
+    :func:`_replace_spawn_registry`), so a reader always sees a whole
+    file: the old one or the new one, never a mixture of the two.
+    """
+    try:
+        return target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _read_spawn_registry_unlocked(target: Path) -> List[Dict[str, Any]]:
+    """The registry's entries, read without taking the lock.
+
+    Reading is safe without the lock because every write replaces the
+    file atomically (see :func:`_replace_spawn_registry`): a reader
+    sees either the old file or the new one, and never half of either.
+    """
+    entries: List[Dict[str, Any]] = []
+    for line in _read_registry_text(target).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(entry, dict) and entry.get("pid"):
+            entries.append(entry)
+    return entries
+
+
+def read_spawn_registry(path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """The processes this run has written down, oldest first."""
+    target = Path(path) if path is not None else spawn_registry_path()
+    if target is None:
+        return []
+    with _registry_lock(target, shared=True):
+        return _read_spawn_registry_unlocked(target)
+
+
+def _write_spawn_registry(target: Path, entries: List[Dict[str, Any]]) -> None:
+    """Replace the registry with *entries* (one JSON object per line).
+
+    The entries are written to a temporary file in the same directory
+    and then moved into place with ``os.replace``.  A reader that opens
+    the registry while the write is in flight therefore sees either the
+    old file or the new one -- never half of either.  A registry
+    written in place (``open(target, "w")``) is a half-written file for
+    as long as the write takes, and a reader that cannot parse a line
+    throws it away: a rewrite dropped entries that were perfectly fine.
+
+    The registry's lock is taken here, so the write is serialised
+    against the writes of everybody else in the run.  A caller that
+    already holds the lock -- a read-modify-write cycle does -- takes it
+    again without waiting for itself.
+    """
+    payload = "".join(
+        json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries
+    )
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "orphan reaper: could not create the spawn registry's "
+            "directory %s (%s)", target.parent, exc,
+        )
+        return
+    with _registry_lock(target):
+        _replace_spawn_registry(target, payload)
+
+
+def _replace_spawn_registry(target: Path, payload: str) -> None:
+    """Move *payload* into the registry's place, atomically."""
+    tmp_path: Optional[Path] = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "orphan reaper: could not create the spawn registry's "
+            "directory %s (%s)", target.parent, exc,
+        )
+        return
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(target.parent),
+            prefix=target.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+        tmp_path = None
+    except OSError as exc:
+        logger.warning(
+            "orphan reaper: could not rewrite the spawn registry %s (%s)",
+            target, exc,
+        )
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:  # pragma: no cover - defensive
+                pass
+
+
+def _reap_if_our_child(pid: int) -> bool:
+    """Reap *pid* when it is our own child that has already exited.
+
+    A child of this process that has been killed stays a zombie until
+    it is waited for, and a zombie still answers ``kill(pid, 0)``.  So
+    a run that waits for its own children to disappear would wait out
+    the whole grace period for a process that is already gone.
+    """
+    try:
+        waited, _status = os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        return False
+    return waited == pid
+
+
+def _probe_registry_alive(pid: int) -> Optional[bool]:
+    """Whether *pid* is still there, for the registry's wait loop."""
+    if _reap_if_our_child(pid):
+        return False
+    return _pid_alive(pid)
+
+
+def _registry_group_of(pid: int) -> Optional[int]:
+    """The process group *pid* leads, if it leads one.
+
+    Only a group the target itself leads is ever signalled.  A group
+    led by somebody else holds processes this run never judged, and
+    signalling it would take them out as well -- which is how a cleanup
+    path becomes a second bug.
+    """
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        return None
+    if pgid != pid:
+        return None
+    return _signallable_pgid(pgid, own_pgid=_own_pgid())
+
+
+def _reap_registry_entry(
+    entry: Dict[str, Any],
+    *,
+    grace_seconds: float,
+    reason: str,
+    probe: Optional[Callable[[int], str]] = None,
+    alive: Optional[Callable[[int], Optional[bool]]] = None,
+) -> str:
+    """Give one registered process back.
+
+    Returns ``"reaped"`` when the process was signalled, ``"gone"``
+    when there was nothing left to signal, ``"foreign"`` when the pid
+    has been recycled and the process is not ours any more, and
+    ``"unknown"`` when the process' start time could not be
+    established on either side.
+
+    ``foreign`` and ``unknown`` both mean *not ours to kill*; they
+    differ in what the run is entitled to say.  A pid whose start time
+    is **known** to be somebody else's does not get touched.  A pid
+    whose start time is **unknown** might already be somebody else's,
+    and the run cannot tell -- so it does not get touched either.  The
+    start time is the only thing that makes a pid an identity, and an
+    identity that cannot be established is not an identity.
+
+    *probe* and *alive* are the injection points: *probe* reads a
+    pid's start time (an empty string means *unknown*), *alive* says
+    whether a pid is still there.  Both default to the real thing.
+    """
+    try:
+        pid = int(entry.get("pid") or 0)
+    except (TypeError, ValueError):
+        return "gone"
+    if pid <= 1:
+        return "gone"
+
+    alive_fn = alive if alive is not None else _probe_registry_alive
+    if alive_fn(pid) is False:
+        return "gone"
+
+    probe_fn = probe if probe is not None else process_start_epoch
+
+    recorded = str(entry.get("start_epoch") or "")
+    if not recorded:
+        # The run never learned when the process started, so it cannot
+        # tell its own process from a pid that has been recycled.
+        logger.info(
+            "orphan reaper: pid %s has no recorded start time; "
+            "leaving it alone",
+            pid,
+        )
+        return "unknown"
+
+    observed = str(probe_fn(pid) or "")
+    if not observed:
+        # The start time cannot be read now, for the same reason.
+        logger.info(
+            "orphan reaper: could not observe the start time of pid %s; "
+            "leaving it alone",
+            pid,
+        )
+        return "unknown"
+
+    if not _same_start(recorded, observed):
+        # The number came back: this is somebody else's process.
+        logger.info(
+            "orphan reaper: pid %s was recycled; leaving it alone",
+            pid,
+        )
+        return "foreign"
+
+    group = _registry_group_of(pid)
+    try:
+        if group is not None:
+            os.killpg(group, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "gone"
+    except OSError as exc:
+        logger.warning(
+            "orphan reaper: could not signal pid %s (%s)", pid, exc,
+        )
+        return "gone"
+
+    if _wait_for_exit(pid, alive_fn, grace_seconds, time.sleep):
+        return "reaped"
+
+    try:
+        if group is not None:
+            os.killpg(group, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "reaped"
+    except OSError as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "orphan reaper: could not kill pid %s (%s)", pid, exc,
+        )
+    _wait_for_exit(pid, alive_fn, 1.0, time.sleep)
+    logger.info(
+        "orphan reaper: gave back %s (pid %s, %s)",
+        entry.get("name") or entry.get("kind") or "process", pid,
+        reason or "the run is over",
+    )
+    return "reaped"
+
+
+def _entry_identity(entry: Dict[str, Any]) -> Tuple[str, str, str]:
+    """What makes one registry entry the *same* entry as another.
+
+    A pid on its own is not an identity -- the kernel recycles them --
+    so the start time travels with it.  The owner travels too: the same
+    process can be written down by two different owners, and only the
+    entry this pass acted on may be taken out.
+    """
+    try:
+        pid = int(entry.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    try:
+        owner = int(entry.get("owner_pid") or 0)
+    except (TypeError, ValueError):
+        owner = 0
+    return (str(pid), str(entry.get("start_epoch") or ""), str(owner))
+
+
+def reap_spawned_processes(
+    path: Optional[Path] = None,
+    *,
+    reason: str = "",
+    grace_seconds: float = 5.0,
+    owner_pid: Optional[int] = None,
+    probe: Optional[Callable[[int], str]] = None,
+    alive: Optional[Callable[[int], Optional[bool]]] = None,
+) -> List[Dict[str, Any]]:
+    """Give back every process the registry names, and forget it.
+
+    SIGTERM first, then SIGKILL after the grace period -- the same
+    order the reaper itself uses, because the processes here are the
+    same kind of process: a service asked to stop politely first gets
+    the chance to close its port.
+
+    The entries that were acted on are removed from the registry, so
+    two cleanup paths running one after the other (the gate's trap and
+    the CI runner's) do not signal the same process twice.  An entry
+    whose process is already gone is removed as well: the registry
+    records what the run started, and it must not become a list of
+    everything the run ever started.
+
+    An entry whose process was **not** given back stays in the
+    registry -- whether the pid turned out to be somebody else's
+    ("foreign") or could not be identified at all ("unknown").  The
+    run has not established that the process is gone, so the record of
+    it has to survive the cleanup.
+
+    The registry is *merged*, not replaced: what is written back is
+    what the registry holds now, minus the entries this pass acted on.
+    That difference is the whole point -- a pass that waits out a grace
+    period can spend seconds doing it, and a process that starts in
+    the meantime is written down in exactly that window.  Writing back
+    what the pass had read would take that new entry with it, and a
+    running process that is not in the registry is a process nobody can
+    give back.  So the entries are removed by identity -- the pid, the
+    start time and the owner -- and everything else is left alone.
+
+    The lock covers the read and the write, and not the waiting: a
+    pass that held the lock while it waited for a process to die would
+    keep every other process in the run out of the registry for as long
+    as the grace period lasts.
+
+    ``owner_pid`` narrows the sweep to the processes one process
+    started -- the harness that spawned a server wants the daemon
+    *that server* started, and not the services of the whole run.
+
+    *probe* and *alive* are the injection points the reaping itself
+    uses; both default to the real thing.
+    """
+    target = Path(path) if path is not None else spawn_registry_path()
+    if target is None:
+        return []
+    entries = read_spawn_registry(target)
+    if not entries:
+        return []
+
+    reaped: List[Dict[str, Any]] = []
+    acted_on: set = set()
+    for entry in entries:
+        if owner_pid is not None:
+            try:
+                entry_owner = int(entry.get("owner_pid") or 0)
+            except (TypeError, ValueError):
+                entry_owner = 0
+            if entry_owner != int(owner_pid):
+                # Not this owner's process: it is not this pass's to
+                # give back, and it stays in the registry.
+                continue
+        status = _reap_registry_entry(
+            entry, grace_seconds=grace_seconds, reason=reason,
+            probe=probe, alive=alive,
+        )
+        if status == "reaped":
+            reaped.append(entry)
+        if status in ("reaped", "gone"):
+            # Given back, or already gone: either way the registry must
+            # not keep pointing at it.  "foreign" and "unknown" are not
+            # in here -- the run has not established that those
+            # processes are gone.
+            acted_on.add(_entry_identity(entry))
+
+    with _registry_lock(target):
+        current = _read_spawn_registry_unlocked(target)
+        survivors = [
+            entry for entry in current
+            if _entry_identity(entry) not in acted_on
+        ]
+        _write_spawn_registry(target, survivors)
+    return reaped
 
 
 # --------------------------------------------------------------------------
@@ -1105,6 +1751,9 @@ class ReaperConfig:
     grace: float = DEFAULT_GRACE
     #: Seconds of complete idleness before the daemon exits itself.
     idle_exit: int = DEFAULT_IDLE_EXIT
+    #: Hard ceiling on the daemon's own lifetime, in seconds.  Zero
+    #: disables the ceiling.
+    max_lifetime: int = DEFAULT_MAX_LIFETIME
     #: Where plan artifacts (and the audit log) live.
     plans_root: Path = field(default_factory=default_plans_root)
     #: Decide but never signal.
@@ -1239,6 +1888,9 @@ def config_from_env(environ: Optional[Mapping[str, str]] = None) -> ReaperConfig
         ),
         grace=_env_float(env, ENV_GRACE, DEFAULT_GRACE, minimum=0.0),
         idle_exit=_env_int(env, ENV_IDLE_EXIT, DEFAULT_IDLE_EXIT, minimum=0),
+        max_lifetime=_env_int(
+            env, ENV_MAX_LIFETIME, DEFAULT_MAX_LIFETIME, minimum=0
+        ),
         plans_root=default_plans_root(env),
         dry_run=_env_bool(env, ENV_DRY_RUN, False),
         burst_threshold=_env_int(
@@ -2179,6 +2831,17 @@ def ensure_daemon(
             # The child holds its own descriptor; ours is not needed.
             log.close()
 
+        # The daemon leads a session of its own, so it outlives the
+        # process that started it -- and, without a record of it, the
+        # run that started it.  The registry is that record: a run that
+        # names one can give the daemon back when it ends.
+        register_spawned_process(
+            int(process.pid),
+            pgid=int(process.pid),
+            kind=KIND_REAPER,
+            name="orphan-reaper-daemon",
+        )
+
         return int(process.pid)
     except Exception as exc:  # noqa: BLE001 - a reaper must not crash its host
         logger.warning("[orphan_reaper] could not start the reaper daemon: %s", exc)
@@ -2696,6 +3359,29 @@ def run_once(
     return result
 
 
+def _plans_root_gone(config: ReaperConfig) -> bool:
+    """True when the daemon's plan-artifact root is no longer there.
+
+    The daemon is started inside a directory — usually the plan-artifact
+    root it is meant to watch — and that directory can be deleted while
+    the daemon is running (a test's temporary directory is deleted when
+    the session ends).  A daemon whose world is gone has nothing to
+    reclaim, and the twenty-six daemons that leaked on 2026-10-31 were
+    all of that kind.
+
+    A root that cannot be read is **not** treated as gone: an
+    unreadable path is unknown, and killing the daemon because a
+    directory could not be stat'ed would be the wrong way to fail.
+    """
+    root = getattr(config, "plans_root", None)
+    if root is None:
+        return False
+    try:
+        return not Path(root).exists()
+    except OSError:  # pragma: no cover - an unreadable path is not "gone"
+        return False
+
+
 def _daemon_loop(
     config: ReaperConfig,
     *,
@@ -2709,7 +3395,7 @@ def _daemon_loop(
 ) -> int:
     """The daemon's body: scan, reap, wait, and do it again.
 
-    The loop ends in one of three ways, and every one of them is a
+    The loop ends in one of five ways, and every one of them is a
     return of zero:
 
     * it is asked to stop — the stop event is set, and the loop leaves
@@ -2717,9 +3403,49 @@ def _daemon_loop(
     * it is asked to stop *between* the scan and the cleanup, in which
       case the pending cleanup is dropped rather than started: a daemon
       that was told to stop must not go on killing things;
-    * the machine has been quiet for ``idle_exit`` seconds — no owner
-      alive and no candidate at all — in which case it leaves on its
-      own, because there is nothing left for it to reclaim.
+    * the machine has been quiet for ``idle_exit`` seconds — no
+      candidate and no owner alive — in which case it leaves on its
+      own, because there is nothing left for it to reclaim;
+    * the plan-artifact root it was started for has been deleted, in
+      which case it leaves: a daemon watching a directory that is not
+      there is watching nothing;
+    * it has reached ``max_lifetime``, in which case it leaves: a
+      daemon of any age has to have an end.
+
+    The idle streak is reset by the machine being **in use** — by the
+    candidates (the processes this daemon would actually reclaim) and
+    by ``owners_alive`` (the owners that are still running on it).  A
+    machine that is still in use is not an idle machine, so the daemon
+    may only leave a machine that has **nothing left on it**: no
+    candidate *and* no owner alive.
+
+    Both ends of that rule are needed.  The streak used to be reset by
+    the owners as well, and that made the streak unreachable on any
+    machine with a PDT instance on it: the count of live owners says
+    *somebody is using PDT*, and twenty-six daemons were running on
+    one machine for exactly that reason (2026-10-31).  Ignoring the
+    owners instead cost the machine its reaper: a daemon that leaves
+    while the machine is still in use stops reclaiming the orphans
+    that appear after it left, and nothing starts it again —
+    ``ensure_daemon`` is called once, when the server starts.
+
+    The streak is measured from the moment the daemon *observed* the
+    machine to be quiet — the first pass that found neither a
+    candidate nor an owner.  The daemon has to watch a quiet machine
+    for the whole idle window before it may call it quiet; it does
+    not inherit the quiet time of the machine it was born into.
+
+    The one exception is a machine that has **never had an owner
+    alive**: nothing on it belongs to PDT, so nothing on it can produce
+    work, and the machine has been quiet since the last time this
+    daemon had something to reclaim.  There the streak is dated back to
+    that moment — the daemon is watching a machine that cannot even
+    start giving it work.
+
+    A machine that *had* owners and lost them is not such a machine:
+    the children that just lost their owner are exactly the orphans
+    this daemon exists to reclaim, so its streak starts over at the
+    first pass that finds the machine unused.
 
     A scan that fails does not end the loop: the failure is logged and
     the loop goes on.  A daemon that gives up because one pass went
@@ -2737,18 +3463,53 @@ def _daemon_loop(
         idle_limit = float(getattr(config, "idle_exit", DEFAULT_IDLE_EXIT))
     except (TypeError, ValueError):  # pragma: no cover - a malformed config
         idle_limit = float(DEFAULT_IDLE_EXIT)
+    try:
+        max_lifetime = float(getattr(config, "max_lifetime", DEFAULT_MAX_LIFETIME))
+    except (TypeError, ValueError):  # pragma: no cover - a malformed config
+        max_lifetime = float(DEFAULT_MAX_LIFETIME)
 
-    # The reference point of the idle streak: the moment the daemon
-    # started, and then the moment the machine was last busy.
+    # The reference point of the daemon's own age.
     last_now = _read_clock(reader, 0.0)
-    anchor = last_now
-    idle_since: Optional[float] = None
+    started_at = last_now
+    # The moment the machine was last busy *for this daemon*: the last
+    # time it had something to reclaim, or the last time an owner was
+    # alive on it.  It is where the idle streak is dated back to on a
+    # machine that cannot produce any more work.
+    anchor = started_at
+    # The moment the current idle streak began: the first pass that
+    # found neither a candidate nor an owner.
+    quiet_since: Optional[float] = None
+    # Whether an owner has ever been seen alive on this machine while
+    # this daemon was watching it.  A machine that has had PDT on it
+    # cannot have its quietness dated back: the children that lost
+    # their owner are exactly the orphans this daemon exists to
+    # reclaim.
+    owner_seen = False
 
     while True:
         if _stop_event_is_set(event):
             return 0
 
         now = _read_clock(reader, last_now)
+
+        # The world this daemon watches is gone.  It was born inside a
+        # directory that has since been deleted (a test's temporary
+        # directory, say), and there is nothing left for it to reclaim.
+        if _plans_root_gone(config):
+            logger.info(
+                "orphan reaper: the plan-artifact root %s is gone; leaving",
+                getattr(config, "plans_root", None),
+            )
+            return 0
+
+        # The ceiling on the daemon's own age.
+        if max_lifetime > 0 and (now - started_at) >= max_lifetime:
+            logger.info(
+                "orphan reaper: the daemon has reached its maximum "
+                "lifetime of %.0f seconds; leaving",
+                max_lifetime,
+            )
+            return 0
 
         try:
             result = scanner(config)
@@ -2764,14 +3525,55 @@ def _daemon_loop(
             owners_alive = int(getattr(result, "owners_alive", 0) or 0)
         except (TypeError, ValueError):  # pragma: no cover - a malformed result
             owners_alive = 0
+        # ``owners_alive`` counts the owners that are still running on
+        # this machine: it says "PDT is in use here".  It decides the
+        # idle streak together with the candidates -- see below.
+        logger.debug(
+            "orphan reaper: %s candidate(s), %s owner(s) alive",
+            candidates, owners_alive,
+        )
 
-        if owners_alive > 0 or candidates > 0:
-            # The machine is in use: the idle streak starts over.
-            idle_since = None
+        if candidates > 0 or owners_alive > 0:
+            # There is work to do, or the machine is still in use: the
+            # idle streak starts over.
+            #
+            # ``owners_alive`` counts the marked processes whose owner
+            # is still running.  A machine that is still in use is not
+            # an idle machine, and a daemon that leaves one stops
+            # reclaiming the orphans that appear after it left — and
+            # nothing starts it again: ``ensure_daemon`` is called
+            # once, when the server starts.  So the owners count as
+            # work now: the streak may only start once the last owner
+            # is gone.
             anchor = now
+            quiet_since = None
+            if owners_alive > 0:
+                # This machine has PDT on it.  Remember that: the
+                # children of an owner may outlive it, so the
+                # quietness of such a machine may not be dated back to
+                # a moment before its owners died.
+                owner_seen = True
         else:
-            if idle_since is None:
-                idle_since = anchor
+            if quiet_since is None:
+                # The streak is measured from the first pass that
+                # actually saw an idle machine, not from the moment the
+                # daemon was started: the daemon has to *observe* a
+                # quiet machine for ``idle_exit`` seconds before it may
+                # call the machine quiet.  A daemon that starts into a
+                # busy machine therefore gets its full idle window once
+                # the machine goes quiet.
+                quiet_since = now
+            # A machine that has **never** had an owner alive cannot
+            # produce work: nothing on it belongs to PDT, so nothing on
+            # it can become a candidate.  The machine has therefore been
+            # quiet since the last time this daemon had something to
+            # reclaim, and the streak may be dated back to that moment.
+            #
+            # A machine that *had* owners is a different machine: the
+            # children that just lost their owner are exactly the
+            # orphans this daemon exists to reclaim, so its streak
+            # starts over at the first pass that finds it unused.
+            idle_since = quiet_since if owner_seen else anchor
             if idle_limit > 0 and (now - idle_since) >= idle_limit:
                 logger.info(
                     "orphan reaper: the machine has been idle for %.0f seconds; "

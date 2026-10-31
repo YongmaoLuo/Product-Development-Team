@@ -389,6 +389,16 @@ _SPAWN_MARKER_KEYS: Tuple[str, str, str] = (
 #: module calls ``service``.
 _MARKER_KIND_SERVICE = "service"
 
+#: The environment variable that names the registry of this run's
+#: detached processes -- the reaper module's own name for it, or the
+#: literal name when the module is not importable (it is a wire
+#: protocol, the same way the spawn marker is).
+_SPAWN_REGISTRY_ENV = (
+    orphan_reaper.SPAWN_REGISTRY_ENV
+    if orphan_reaper is not None
+    else "PDT_SPAWN_REGISTRY"
+)
+
 
 def _spawn_marker_keys() -> Tuple[str, str, str]:
     """The marker keys the reaper reads.
@@ -949,6 +959,15 @@ def _spawn_once(cfg: SpawnConfig) -> RunResult:
     A spawn that fails outright is reported as a failed run rather than
     raised: a batch that stops at the first exception measures nothing.
     The reason goes into the log tail, which is where a reader looks.
+
+    The child is **written down** before it is measured, and the
+    teardown gives back what the child started.  The child leads its
+    own session (``setsid()``), so a watchdog that kills this harness'
+    process group does not reach it -- and the reaper daemon the child
+    starts leads a session of its own again.  Without the record, a
+    harness that is killed mid-run leaves a server behind that answers
+    requests for hours, and a daemon behind that walks the machine
+    every thirty seconds for as long as it lives.
     """
     started = time.monotonic()
     stop_flag, threads = _start_busy_threads(cfg.parent_threads)
@@ -960,10 +979,21 @@ def _spawn_once(cfg: SpawnConfig) -> RunResult:
     rc: Optional[int] = None
     fd_count: Optional[int] = None
     failure = ""
+    registry, own_registry = _registry_for_run()
+    run_cfg = cfg
+    if registry:
+        run_cfg = replace(
+            cfg,
+            env_extra={
+                **(cfg.env_extra or {}),
+                _SPAWN_REGISTRY_ENV: registry,
+            },
+        )
     try:
-        proc = spawn_child(cfg)
+        proc = spawn_child(run_cfg)
         pid = proc.pid
         pgid = _process_group_of(pid)
+        _register_child(registry, pid, pgid)
         ready = _await_ready(cfg, proc)
         # Sampled again after the readiness wait.  The wrapper calls
         # ``setsid()`` itself, so the child's own process group only
@@ -986,6 +1016,12 @@ def _spawn_once(cfg: SpawnConfig) -> RunResult:
                 proc.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
                 pass
+        # What the child started goes with it: the reaper daemon it
+        # spawned leads a session of its own and does not die with the
+        # process that started it.
+        _reap_child_processes(registry, pid)
+        if own_registry:
+            _remove_registry(registry)
         _close_fds(extra_fds)
         _stop_busy_threads(stop_flag, threads)
         duration = time.monotonic() - started
@@ -999,6 +1035,78 @@ def _spawn_once(cfg: SpawnConfig) -> RunResult:
         duration=duration,
         log_tail=log_tail,
     )
+
+
+def _registry_for_run() -> Tuple[Optional[str], bool]:
+    """The registry this run's processes are written down in.
+
+    The **ambient** registry -- the one the environment names -- is
+    preferred: the gate's cleanup and the CI runner's cleanup read it,
+    so a harness that is killed mid-run still leaves a record of the
+    server it started, and the run that is still alive can give it
+    back.  A harness that runs on its own names a registry of its own,
+    so that its own teardown can give the child's reaper daemon back.
+
+    The second value says whether the registry is this harness' own --
+    only then is it this harness' to remove.
+    """
+    ambient = str(os.environ.get(_SPAWN_REGISTRY_ENV, "") or "").strip()
+    if ambient:
+        return ambient, False
+    if orphan_reaper is None:
+        return None, False
+    directory = tempfile.mkdtemp(prefix="pdt-spawn-repro-registry-")
+    return str(Path(directory) / "spawn_registry.jsonl"), True
+
+
+def _register_child(
+    registry: Optional[str], pid: Optional[int], pgid: Optional[int],
+) -> None:
+    """Write the child down, so the run that started it can give it back."""
+    if not registry or not pid or orphan_reaper is None:
+        return
+    try:
+        orphan_reaper.register_spawned_process(
+            pid, pgid=pgid, kind=orphan_reaper.KIND_SERVICE,
+            name="spawn-repro-child", path=Path(registry),
+        )
+    except Exception:  # noqa: BLE001 - a record never blocks a measurement
+        pass
+
+
+def _reap_child_processes(
+    registry: Optional[str], pid: Optional[int],
+) -> None:
+    """Give back what the child started -- its reaper daemon, mostly.
+
+    Only the processes the child itself started are given back: the
+    harness is a guest in the run, and it must not take the run's other
+    services with it.
+    """
+    if not registry or not pid or orphan_reaper is None:
+        return
+    try:
+        orphan_reaper.reap_spawned_processes(
+            Path(registry), reason="the spawn repro finished",
+            grace_seconds=3.0, owner_pid=pid,
+        )
+    except Exception:  # noqa: BLE001 - a teardown never fails a run
+        pass
+
+
+def _remove_registry(registry: Optional[str]) -> None:
+    """Remove the registry this harness made for itself."""
+    if not registry:
+        return
+    path = Path(registry)
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    try:
+        path.parent.rmdir()
+    except OSError:
+        pass
 
 
 def run_batch(cfg: SpawnConfig, runs: int) -> BatchResult:

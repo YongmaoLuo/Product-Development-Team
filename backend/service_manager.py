@@ -2318,6 +2318,36 @@ def _apply_spawn_marker(env: MutableMapping[str, str]) -> None:
     env.update(_spawn_marker_env())
 
 
+def _register_spawned_service(runtime: ServiceRuntime) -> None:
+    """Write the service down, so the run that started it can give it back.
+
+    A service is started detached: it calls ``setsid()`` and leads its
+    own session, so a watchdog that kills the gate's process group does
+    not touch it.  That is what makes a service outlive the run that
+    started it -- the CI of 2026-10-31 left a ``backend.server``
+    answering ``/health`` a minute after the watchdog had fired -- and
+    without a record of it the run has no way to take it back.
+
+    The record is best-effort.  A run that names no registry gets no
+    registry, and a service that cannot be written down is a service
+    somebody else has to find.
+    """
+    module = orphan_reaper
+    if module is None:
+        return
+    try:
+        module.register_spawned_process(
+            runtime.pid,
+            pgid=runtime.pgid,
+            kind=module.KIND_SERVICE,
+            name=runtime.name,
+        )
+    except Exception as exc:  # noqa: BLE001 - a record never blocks a start
+        logger.debug(
+            "[service_manager] could not write the service down: %s", exc,
+        )
+
+
 def start_service(
     decl: ServiceDeclaration, project_dir: Path,
     *, timeout_seconds: Optional[int] = None,
@@ -2413,6 +2443,10 @@ def start_service(
 
     runtime.pid = proc.pid
     runtime.pgid = _detached_pgid_of(proc.pid)
+    # The service leads a session of its own, so the run that started
+    # it is the only thing that can give it back.  The record is what
+    # makes that possible.
+    _register_spawned_service(runtime)
     # Our own clock, not the system's. `proc` was created by the line
     # above, so we know when it started without asking anyone, and that
     # matters twice over: the `ps -o lstart=` probe is unavailable or

@@ -19,7 +19,9 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import socket
 import sqlite3
+import statistics
 import subprocess
 import sys
 import tarfile
@@ -31,6 +33,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
+from typing import NamedTuple, Optional
 from unittest.mock import patch
 
 import pytest
@@ -39,7 +42,16 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+#: The backend package root — ``<repo>/backend``.  The shared host-load gate
+#: lives in ``backend/tests/_host_load.py``, so the backend directory has to
+#: be importable from here: this file measures the tree it lives in, and it
+#: asks the same gate every other wall-clock case asks.
+_BACKEND_DIR = Path(__file__).resolve().parents[2]
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
 from provider_order import cache_clear, load_fallback_order  # noqa: E402
+from tests import _host_load  # noqa: E402
 
 pytestmark = pytest.mark.perf
 
@@ -51,7 +63,25 @@ pytestmark = pytest.mark.perf
 #: being reported as "the server never came up". The previous 15 s was
 #: tight enough that the baseline half of the comparison (a second full
 #: server booted from ``git archive HEAD``) could exceed it and skip.
-_STARTUP_DEADLINE_SECONDS = 30.0
+#:
+#: The window starts when the process is *spawned*, so it covers the
+#: interpreter's start-up and the import of the whole application before
+#: the lifespan's first line runs — and none of that is a fixed number
+#: of seconds. Thirty was enough for a machine with the machine to
+#: itself and not enough for one running other suites: on 2026-10-30 the
+#: server was still importing when the window closed, and the
+#: measurement reported "the server never came up" for a server that was
+#: coming up. 120 s is the same order as the lane's own budget
+#: (``--timeout=1800`` for the six boots this file takes), so a slow
+#: machine waits and a broken one still fails.
+_STARTUP_DEADLINE_SECONDS = 120.0
+
+#: How many ports a single measurement may try before it gives up.
+#:
+#: One retry is enough: the race this protects against is another
+#: process taking the port between the probe and the bind, and the
+#: probability of losing it twice is negligible.
+_PORT_ATTEMPTS = 3
 
 #: Per-attempt socket timeout inside that poll. Separate from the deadline
 #: above on purpose: a timeout here means "not ready yet, try again", and
@@ -78,11 +108,162 @@ _STARTUP_ENDPOINT = "/health"
 #: deadline on a healthy server.
 _REQUEST_HEADERS = {"X-PDT-Request": "1"}
 
+#: The host-timing probe: how long each sample sleeps, how many samples
+#: are taken, and the median sleep above which the host is declared
+#: unable to keep time.
+#:
+#: These are the numbers ``scripts/run_tests.sh`` uses, so that this
+#: case and the gate agree on what "the host cannot be timed" means.
+#: The gate calls a wall-clock phase that fails on such a host
+#: INCONCLUSIVE (exit code 3) — the machine, not the code.  A case that
+#: cannot measure what it asserts has to reach the same verdict on its
+#: own, because a wall-clock comparison that reports the machine's load
+#: as a regression is a broken case, not a red build.
+HOST_PROBE_SLEEP_SECONDS = 0.05
+HOST_PROBE_SAMPLES = 5
+HOST_PROBE_MAX_MEDIAN_SLEEP = 0.06
+
+
+class _HostProbe(NamedTuple):
+    """What the host-timing probe measured."""
+
+    median_sleep: float
+    loadavg: float
+    threshold: float
+    verdict: str
+
+
+def _host_timing_probe() -> _HostProbe:
+    """Measure whether this host can be timed at all.
+
+    The standard is the one ``scripts/run_tests.sh`` settled on: five
+    sleeps of 50 ms, and the median of them says whether the machine
+    kept time.  A host that stretches a 50 ms sleep to a fifth of a
+    second is too busy for a wall-clock comparison — and it is exactly
+    such a host where two boots of the *same* tree differ by seconds
+    instead of by the milliseconds this file's bound asserts.
+
+    ``PDT_HOST_TIMING_PROBE`` forces the verdict (``pass`` / ``fail``)
+    and ``PDT_HOST_TIMING_PROBE_MAX_SLEEP`` moves the threshold, so an
+    operator who knows what their machine is doing can decide.
+
+    The load average is read by the shared gate (``tests._host_load``) —
+    the one place in the suite that reads it — so one limit and one
+    message format apply to every case that measures the clock.
+    """
+    forced = os.environ.get("PDT_HOST_TIMING_PROBE", "auto").strip().lower()
+    try:
+        threshold = float(
+            os.environ.get(
+                "PDT_HOST_TIMING_PROBE_MAX_SLEEP", HOST_PROBE_MAX_MEDIAN_SLEEP
+            )
+        )
+    except ValueError:
+        threshold = HOST_PROBE_MAX_MEDIAN_SLEEP
+    samples: list[float] = []
+    for _ in range(HOST_PROBE_SAMPLES):
+        started = time.monotonic()
+        time.sleep(HOST_PROBE_SLEEP_SECONDS)
+        samples.append(time.monotonic() - started)
+    median = statistics.median(samples)
+    loadavg = _host_load.current_host_load()
+    if forced == "pass":
+        verdict = "OK"
+    elif forced == "fail":
+        verdict = "FAIL"
+    else:
+        verdict = "OK" if median <= threshold else "FAIL"
+    return _HostProbe(median, loadavg, threshold, verdict)
+
+
+def _host_can_measure(probe: _HostProbe) -> bool:
+    """Whether the probe found a host that kept time."""
+    return probe.verdict == "OK"
+
+
+def _host_skip_reason(probe: _HostProbe) -> Optional[str]:
+    """Why this host cannot carry the comparison, or ``None``.
+
+    Two questions, and the shared gate answers the first one: is the host
+    loaded past the point where a wall-clock number means anything?
+    ``tests._host_load`` owns that decision — one limit, one message, one
+    place — and the perf directory asks it through the same autouse fixture
+    in ``tests/conftest.py``.
+
+    The second question is the probe's own: can the host keep time at all?
+    Five 50 ms sleeps say whether it can, and the load average does not
+    answer it — a host can be quiet and still stretch a 50 ms sleep.  Both
+    answers carry the numbers that produced them, so the lane log says why
+    the bound was not asserted instead of leaving a silent gap.
+    """
+    reason = _host_load.skip_reason(load=probe.loadavg)
+    if reason is not None:
+        return reason
+
+    if _host_can_measure(probe):
+        return None
+
+    return (
+        "the host cannot measure wall-clock time: %d sleeps of %g ms took a "
+        "median of %.3f s (threshold %.3f s, load average %.2f). The bound "
+        "below compares two server boots of trees that differ by nothing "
+        "this test is about, and on a host that cannot keep time two boots "
+        "of the same tree differ by seconds — so it is not asserted here."
+        % (
+            HOST_PROBE_SAMPLES,
+            HOST_PROBE_SLEEP_SECONDS * 1000,
+            probe.median_sleep,
+            probe.threshold,
+            probe.loadavg,
+        )
+    )
+
+
+def _require_a_measurable_host(probe: _HostProbe) -> None:
+    """Skip the comparison on a host that cannot carry the bound.
+
+    The skip reason carries the numbers that decided it, so the lane log
+    says why the bound was not asserted instead of leaving a silent gap.
+    """
+    reason = _host_skip_reason(probe)
+    if reason is not None:
+        pytest.skip(reason)
+
 
 def _venv_python(project_root: Path) -> Path:
     """Return the project's venv interpreter, falling back to sys.executable."""
     venv = project_root / "backend" / ".venv" / "bin" / "python"
     return venv if venv.exists() else Path(sys.executable)
+
+
+class _PortTaken(Exception):
+    """The port the server was told to bind was already in use."""
+
+
+def _free_port() -> int:
+    """Return a loopback port that nothing is serving on.
+
+    The kernel hands out an ephemeral port and gives it back when the
+    socket is closed, which leaves a window in which somebody else can
+    take it.  The port is therefore checked before it is handed to the
+    server: a connect that is refused is the answer that means "nobody
+    is serving here".
+    """
+    for _ in range(_PORT_ATTEMPTS):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        # The socket above is closed by now, so the kernel may have
+        # handed the port to somebody else in the meantime.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.25)
+            try:
+                probe.connect(("127.0.0.1", port))
+            except OSError:
+                return port
+    raise RuntimeError(
+        "could not find a loopback port that nothing is serving on"
+    )
 
 
 def _child_pythonpath() -> str:
@@ -232,22 +413,16 @@ def _cc_switch_serving(names: list[str]):
         thread.join(timeout=5.0)
 
 
-def _measure_startup(
-    project_root: Path,
-    endpoint: str,
-    order_file: Path | None = None,
-    home_dir: Path | None = None,
-    cc_switch_base: str = "http://127.0.0.1:1",
-) -> float:
-    """Time ``endpoint`` returning 200.
+def _child_env(
+    home_dir: Path | None,
+    cc_switch_base: str,
+    port: int,
+) -> dict[str, str]:
+    """The environment the server subprocess is started with.
 
-    ``order_file`` is accepted and ignored: it was how a chain was
-    planted in the environment, and the chain no longer comes from a
-    file. It stays in the signature so the callers read unchanged;
-    ``home_dir`` and ``cc_switch_base`` are what now decide the chain.
-
-    Start ``backend/server.py`` and measure time until ``endpoint``
-    returns 200.
+    Split out of ``_measure_startup`` so the contract it has to satisfy
+    — in particular the port the child is told to bind — can be asserted
+    without booting a server.
     """
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     # 2026-10-24: the child must not inherit the operator's secret-pipe
@@ -270,6 +445,14 @@ def _measure_startup(
     # and so both the current tree and the git-archive baseline ask the
     # same question.
     env["PDT_PROVIDER_ORDER_API_URL"] = cc_switch_base
+    # Which port to bind.  The server's default is 8000, and on a
+    # developer machine — and on a runner with the resident backend left
+    # up — that port is usually already serving.  The server then falls
+    # back to the next one and announces *that*, so the port this file
+    # reads out of the log is a port nobody chose, and the log carries
+    # "Port 8000 occupied; using fallback port 8001".  The port is
+    # chosen here instead, and checked before it is used.
+    env["PDT_PORT"] = str(port)
     if home_dir is not None:
         env["HOME"] = str(home_dir)
         # 2026-09-13: point BOTH current and baseline servers at an
@@ -285,6 +468,61 @@ def _measure_startup(
     # process's import paths explicitly. Without it the server dies at
     # ``import anyio`` and the measurement cannot even start.
     env["PYTHONPATH"] = _child_pythonpath()
+    return env
+
+
+def _measure_startup(
+    project_root: Path,
+    endpoint: str,
+    order_file: Path | None = None,
+    home_dir: Path | None = None,
+    cc_switch_base: str = "http://127.0.0.1:1",
+) -> float:
+    """Time ``endpoint`` returning 200.
+
+    ``order_file`` is accepted and ignored: it was how a chain was
+    planted in the environment, and the chain no longer comes from a
+    file. It stays in the signature so the callers read unchanged;
+    ``home_dir`` and ``cc_switch_base`` are what now decide the chain.
+
+    Start ``backend/server.py`` and measure time until ``endpoint``
+    returns 200.
+
+    The port the child binds is chosen here, and a port that is taken
+    between the choice and the bind is retried on another one: the
+    measurement has to be taken on the port it asked for, and the
+    server's fallback is a port nobody chose.
+    """
+    last_error: Exception | None = None
+    for _ in range(_PORT_ATTEMPTS):
+        port = _free_port()
+        try:
+            return _measure_startup_on_port(
+                project_root, endpoint, port, order_file, home_dir,
+                cc_switch_base,
+            )
+        except _PortTaken as exc:
+            last_error = exc
+    raise RuntimeError(
+        "could not start the server on a free port after %d attempts: %s"
+        % (_PORT_ATTEMPTS, last_error)
+    )
+
+
+def _measure_startup_on_port(
+    project_root: Path,
+    endpoint: str,
+    port: int,
+    order_file: Path | None = None,
+    home_dir: Path | None = None,
+    cc_switch_base: str = "http://127.0.0.1:1",
+) -> float:
+    """Start the server on ``port`` and time ``endpoint`` returning 200.
+
+    Raises ``_PortTaken`` when the server could not have that port and
+    bound another one instead.
+    """
+    env = _child_env(home_dir, cc_switch_base, port)
 
     # 2026-09-13: module mode, matching ~/scripts/ac-backend-launch.sh.
     # Script mode (``python backend/server.py``) puts backend/ alone on
@@ -304,16 +542,25 @@ def _measure_startup(
     start = time.monotonic()
     output = _ServerOutput(proc)
     try:
-        port = output.wait_for_port(_STARTUP_DEADLINE_SECONDS)
-        if port is None:
+        announced = output.wait_for_port(_STARTUP_DEADLINE_SECONDS)
+        if announced is None:
             raise RuntimeError(
                 "Could not determine server port from startup logs "
                 f"(process exit code {proc.poll()}) — last stdout:\n"
                 f"{output.tail()}"
             )
+        if announced != port:
+            # The server was told to bind ``port`` and could not: it
+            # fell back to the next one and is answering there.  The
+            # measurement would be of that other port, so this call
+            # reports the collision instead and the caller starts over.
+            raise _PortTaken(
+                "the server was told to bind %d and bound %d instead — "
+                "last stdout:\n%s" % (port, announced, output.tail())
+            )
 
         return _poll_until_ready(
-            f"http://127.0.0.1:{port}{endpoint}", endpoint, start,
+            f"http://127.0.0.1:{announced}{endpoint}", endpoint, start,
             server_output=output,
         )
     finally:
@@ -421,6 +668,15 @@ def _median(values: list[float]) -> float:
 @pytest.mark.time_sensitive
 def test_backend_startup_latency_within_10ms(tmp_path: Path) -> None:
     """Upgrade (provider-order cache) must not add >10 ms to startup time."""
+    # The bound below is 200 ms, and the measurement it guards is two
+    # server boots — seconds long each.  Before spending six boots on a
+    # host that cannot keep time, the host is asked whether it can: the
+    # same probe the gate script uses.  On a host that stretches a 50 ms
+    # sleep, two boots of the *same* tree differ by seconds, and the
+    # comparison would report the machine's load as a startup
+    # regression.  The skip reason carries the probe's numbers.
+    _require_a_measurable_host(_host_timing_probe())
+
     order_file = _make_order_file(tmp_path)
     # Provide a fake CC Switch DB so the consumer-layer filter in
     # load_providers() can resolve provider IDs without a real DB.
@@ -710,3 +966,164 @@ def test_a_server_that_never_answers_raises_runtime_error(
         _poll_until_ready(
             "http://127.0.0.1:1/health", "/health", time.monotonic()
         )
+
+
+# ---------------------------------------------------------------------------
+# The port the measurement is taken on
+#
+# The server binds the port it is told to bind, and falls back to the
+# next one when that port is taken.  The port this file reads out of
+# the server's log is therefore the port the server *bound*, not the
+# port this file chose — and when the two differ, the measurement is a
+# measurement of a port nobody chose.  On a machine where the resident
+# backend already serves 8000, that is every measurement.
+# ---------------------------------------------------------------------------
+
+
+def test_the_child_is_told_which_port_to_bind(tmp_path: Path) -> None:
+    """The server is told which port to bind — it is not left to guess.
+
+    The default is 8000, and on a developer machine (and on a CI runner
+    with a backend left up) that port is usually already serving.  The
+    server then falls back, and the port this file reads out of the log
+    is the fallback one.
+    """
+    env = _child_env(tmp_path, "http://127.0.0.1:1", 47123)
+
+    assert env["PDT_PORT"] == "47123", (
+        "the server has to be told which port to bind; without it it "
+        "binds 8000, or whatever is left of it: %r" % (env.get("PDT_PORT"),)
+    )
+
+
+def test_the_port_the_measurement_uses_is_not_being_served_on() -> None:
+    """The port handed to the server is checked before it is handed over.
+
+    The kernel hands out an ephemeral port and gives it back when the
+    socket is closed, which leaves a window in which somebody else can
+    take it.  A connect that is refused is the answer that means
+    "nobody is serving here".
+    """
+    port = _free_port()
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.5)
+        with pytest.raises(OSError):
+            probe.connect(("127.0.0.1", port))
+
+
+def test_a_taken_port_makes_the_measurement_choose_another_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Losing the race must not fail the measurement.
+
+    The server was told to bind a port that was taken between the probe
+    and the bind; it fell back to another port.  The measurement has to
+    notice that and start over on a port of its own choosing, rather
+    than report a number measured on the wrong port.
+    """
+    ports = iter([47201, 47202])
+    monkeypatch.setattr(
+        sys.modules[__name__], "_free_port", lambda: next(ports)
+    )
+
+    calls: list[int] = []
+
+    def _fake_measure(project_root, endpoint, port, *args):
+        calls.append(port)
+        if len(calls) == 1:
+            raise _PortTaken("port %d was taken before the bind" % port)
+        return 1.25
+
+    monkeypatch.setattr(
+        sys.modules[__name__], "_measure_startup_on_port", _fake_measure
+    )
+
+    measured = _measure_startup(_PROJECT_ROOT, _STARTUP_ENDPOINT)
+
+    assert measured == 1.25
+    assert calls == [47201, 47202], (
+        "the measurement has to try a second port after losing the first "
+        "one: %r" % (calls,)
+    )
+
+
+def test_the_readiness_window_covers_a_boot_on_a_busy_machine() -> None:
+    """The window has to cover a boot, not just a bind.
+
+    The window starts when the process is spawned, so it covers the
+    interpreter's start-up and the import of the whole application
+    before the first line of the lifespan runs — and none of that is
+    a fixed number of seconds.  Thirty was enough for a machine with
+    the machine to itself and not enough for one running other suites:
+    the server was still importing when the window closed, and the
+    measurement reported "the server never came up" for a server that
+    was coming up.
+    """
+    assert _STARTUP_DEADLINE_SECONDS >= 120.0, (
+        "the readiness window is %gs; a boot on a busy host needs at "
+        "least 120s, or the measurement reports a slow server as a "
+        "server that never came up"
+        % (_STARTUP_DEADLINE_SECONDS,)
+    )
+
+
+# ---------------------------------------------------------------------------
+# The host-timing probe — the contract this comparison owes the reader
+#
+# The comparison asserts that the current tree does not boot more than
+# 200 ms slower than ``HEAD``.  That bound is smaller than the noise
+# of the measurement on a loaded host: there, two boots of the same
+# tree can differ by seconds, so the paired difference lands an order
+# of magnitude above the bound — on trees that differ by nothing this
+# test is about.
+#
+# The repository settled this question once already, in
+# ``scripts/run_tests.sh``: five 50 ms sleeps, and the median of them
+# decides whether the machine can be timed on at all.  The gate script
+# calls such a phase INCONCLUSIVE rather than failed; the case has to
+# reach the same verdict on its own, because a wall-clock case that
+# cannot measure what it asserts reports the machine as a regression.
+# ---------------------------------------------------------------------------
+
+
+def test_the_probe_calls_a_host_that_cannot_keep_time_unmeasurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that stretches a 50 ms sleep cannot time a comparison."""
+    real_sleep = time.sleep
+
+    def _stretched(seconds: float) -> None:
+        real_sleep(seconds * 4.0)
+
+    monkeypatch.setattr(time, "sleep", _stretched)
+
+    probe = _host_timing_probe()
+
+    assert probe.verdict == "FAIL", (
+        "a host that stretches a %g ms sleep to four times that cannot "
+        "keep time, and the probe has to say so: %r"
+        % (HOST_PROBE_SLEEP_SECONDS * 1000, probe)
+    )
+    assert not _host_can_measure(probe)
+
+
+def test_the_comparison_is_not_asserted_on_a_host_that_cannot_keep_time() -> None:
+    """The bound is skipped, and the skip says why."""
+    probe = _HostProbe(
+        median_sleep=0.198, loadavg=19.23, threshold=0.06, verdict="FAIL"
+    )
+
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        _require_a_measurable_host(probe)
+
+    assert "cannot measure wall-clock time" in str(excinfo.value)
+
+
+def test_the_comparison_is_asserted_on_a_host_that_can_keep_time() -> None:
+    """A measurable host gets no skip — the bound is asserted as before."""
+    probe = _HostProbe(
+        median_sleep=0.051, loadavg=1.20, threshold=0.06, verdict="OK"
+    )
+
+    _require_a_measurable_host(probe)

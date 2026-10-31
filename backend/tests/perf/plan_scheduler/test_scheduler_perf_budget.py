@@ -94,11 +94,12 @@ import json
 import logging
 import os
 import shutil
+import statistics
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Set
+from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Set
 
 import pytest
 from fastapi.testclient import TestClient
@@ -118,6 +119,7 @@ from plan_scheduler.queue import queue_key  # noqa: E402
 from plan_scheduler.store import SqliteSchedulerStore  # noqa: E402
 from state_machine.db.connection import open as open_db  # noqa: E402
 from state_machine.db.schema import migrate  # noqa: E402
+from tests import _host_load  # noqa: E402
 
 #: The marker this file carries.  ``perf`` is what puts it in the lane
 #: CI runs alone; see the module docstring for why it is not
@@ -173,6 +175,20 @@ SERIAL_LANE = "time_sensitive or perf"
 DEFAULT_LANES = (
     "not e2e and not integration and not time_sensitive and not perf"
 )
+
+#: The host-timing probe: how long a sleep the probe asks for, how many
+#: times it asks for it, and the median that decides the verdict.
+#:
+#: These are the numbers ``scripts/run_tests.sh`` uses for the same
+#: question (``PROBE_SOURCE`` there, and the ``PDT_HOST_TIMING_PROBE*``
+#: environment variables around it): five 50 ms sleeps, and the median
+#: of them has to stay under 60 ms.  A host that cannot sleep 50 ms in
+#: about 50 ms cannot time anything, so a wall-clock budget measured on
+#: it is a measurement of the machine — the same reason the gate script
+#: calls such a phase INCONCLUSIVE rather than failed.
+HOST_PROBE_SLEEP_SECONDS = 0.05
+HOST_PROBE_SAMPLES = 5
+HOST_PROBE_MAX_MEDIAN_SLEEP = 0.06
 
 
 def _evaluate(node: ast.AST, namespace: Dict[str, bool]) -> bool:
@@ -493,6 +509,140 @@ def _report(metrics: Dict[str, Any], request: Any) -> None:
         reporter.write_line(line)
 
 
+class _HostProbe(NamedTuple):
+    """What the host says about its own ability to keep time.
+
+    ``median_sleep`` is the median of the probe's sleeps; ``verdict`` is
+    what that median means — ``"OK"`` when the host can be timed on,
+    ``"FAIL"`` when it cannot.
+    """
+
+    median_sleep: float
+    loadavg: float
+    threshold: float
+    verdict: str
+
+
+def _host_timing_probe() -> _HostProbe:
+    """Ask the host whether it can measure wall-clock time at all.
+
+    The question is asked the way ``scripts/run_tests.sh`` asks it: five
+    50 ms sleeps, and the median of them decides.  The load average is
+    read alongside so a failure can say what the machine was doing — and
+    it is read by the shared gate (``tests._host_load``), which is the
+    one place in the suite that reads it, so one limit and one message
+    format apply to every case that measures the clock.
+
+    ``PDT_HOST_TIMING_PROBE`` forces the verdict (``pass`` / ``fail``)
+    so both branches can be exercised deterministically — the same
+    escape hatch the gate script has — and
+    ``PDT_HOST_TIMING_PROBE_MAX_SLEEP`` moves the threshold.
+    """
+    forced = os.environ.get("PDT_HOST_TIMING_PROBE", "auto").strip().lower()
+    try:
+        threshold = float(
+            os.environ.get(
+                "PDT_HOST_TIMING_PROBE_MAX_SLEEP", HOST_PROBE_MAX_MEDIAN_SLEEP
+            )
+        )
+    except ValueError:
+        threshold = HOST_PROBE_MAX_MEDIAN_SLEEP
+
+    samples: List[float] = []
+    for _ in range(HOST_PROBE_SAMPLES):
+        started = time.monotonic()
+        time.sleep(HOST_PROBE_SLEEP_SECONDS)
+        samples.append(time.monotonic() - started)
+    median = statistics.median(samples)
+
+    loadavg = _host_load.current_host_load()
+
+    if forced == "pass":
+        verdict = "OK"
+    elif forced == "fail":
+        verdict = "FAIL"
+    else:
+        verdict = "OK" if median <= threshold else "FAIL"
+    return _HostProbe(median, loadavg, threshold, verdict)
+
+
+def _host_can_measure(probe: _HostProbe) -> bool:
+    """Whether the host's own timing is good enough to assert a budget on."""
+    return probe.verdict == "OK"
+
+
+def _host_skip_reason(probe: _HostProbe) -> Optional[str]:
+    """Why this host cannot carry a wall-clock budget, or ``None``.
+
+    Two questions, and the shared gate answers the first one: is the
+    host loaded past the point where a wall-clock number means anything?
+    ``tests._host_load`` owns that decision — one limit, one message, one
+    place — and the perf directory asks it through the same autouse
+    fixture in ``tests/conftest.py``.
+
+    The second question is the probe's own: can the host keep time at
+    all?  Five 50 ms sleeps say whether it can, and a host that cannot
+    is not measured on either.  The load average does not answer it — a
+    host can be quiet and still stretch a 50 ms sleep — so both answers
+    are asked, and both carry the numbers that produced them.
+    """
+    reason = _host_load.skip_reason(load=probe.loadavg)
+    if reason is not None:
+        return reason
+
+    if _host_can_measure(probe):
+        return None
+
+    return (
+        "the host cannot measure wall-clock time: %d sleeps of %g ms "
+        "took a median of %.3f s (threshold %.3f s, load average "
+        "%.2f). The budget below is a property of the machine on this "
+        "run, not of the code, so it is not asserted here; the "
+        "measurements above are the numbers it would have been "
+        "asserted on."
+        % (
+            HOST_PROBE_SAMPLES,
+            HOST_PROBE_SLEEP_SECONDS * 1000,
+            probe.median_sleep,
+            probe.threshold,
+            probe.loadavg,
+        )
+    )
+
+
+def _require_a_measurable_host(
+    probe: _HostProbe, request: Any, metrics: Dict[str, Any]
+) -> None:
+    """Publish the numbers, and skip when the host cannot carry the budget.
+
+    The budget cases in this file assert on wall-clock time, and a wall
+    clock measured on a host that cannot sleep 50 ms in 50 ms measures
+    the host.  The repository already has this contract — the gate
+    script asks the same question of the machine before it calls a
+    wall-clock phase a failure — and these cases were the ones that had
+    not implemented it: a p95 of 867 ms on a host stretched 3.6x was
+    reported as a code failure.
+
+    So the numbers are published either way (the tick's p50/p95/p99/max
+    *and* the probe's own readings), and the budget is only asserted on
+    a host that can be timed on.  A skip says what it skipped and why;
+    it is not a green that hides a failure, because the numbers that
+    would have failed are in the log with it.
+    """
+    metrics.update(
+        {
+            "host_probe_median_sleep_s": round(probe.median_sleep, 4),
+            "host_probe_loadavg": round(probe.loadavg, 2),
+            "host_probe_threshold_s": probe.threshold,
+            "host_probe_verdict": probe.verdict,
+        }
+    )
+    _report(metrics, request)
+    reason = _host_skip_reason(probe)
+    if reason is not None:
+        pytest.skip(reason)
+
+
 def test_sort_500_rows_under_50ms(request: Any) -> None:
     """Sorting a full queue stays cheap.
 
@@ -549,7 +699,9 @@ def test_tick_p95_within_budget(world: _World, request: Any) -> None:
     p95 = _percentile(samples, 95)
     p99 = _percentile(samples, 99)
 
-    _report(
+    _require_a_measurable_host(
+        _host_timing_probe(),
+        request,
         {
             "tick_ms_p50": round(_percentile(samples, 50), 3),
             "tick_ms_p95": round(p95, 3),
@@ -557,7 +709,6 @@ def test_tick_p95_within_budget(world: _World, request: Any) -> None:
             "tick_ms_max": round(max(samples), 3),
             "ticks": TICK_SAMPLES,
         },
-        request,
     )
 
     assert p95 <= 500.0, (
@@ -605,7 +756,9 @@ def test_snapshot_p95_within_budget(world: _World, request: Any) -> None:
 
     p95 = _percentile(samples, 95)
 
-    _report(
+    _require_a_measurable_host(
+        _host_timing_probe(),
+        request,
         {
             "snapshot_ms_p50": round(_percentile(samples, 50), 3),
             "snapshot_ms_p95": round(p95, 3),
@@ -613,7 +766,6 @@ def test_snapshot_p95_within_budget(world: _World, request: Any) -> None:
             "snapshot_ms_max": round(max(samples), 3),
             "requests": SNAPSHOT_SAMPLES,
         },
-        request,
     )
 
     assert p95 <= 200.0, (
@@ -650,3 +802,112 @@ def test_marked_perf_and_serial(request: Any) -> None:
         "be measured on a shared runner: %r"
         % (DEFAULT_LANES, sorted(markers))
     )
+
+
+# ---------------------------------------------------------------------------
+# The host-timing probe — the contract the budget cases owe the reader
+#
+# The budgets above are wall-clock budgets, and a wall clock measured on
+# a host that cannot sleep 50 ms in 50 ms measures the host.  The
+# repository settled this question once already, in
+# ``scripts/run_tests.sh``: five 50 ms sleeps, and the median of them
+# decides whether the machine can be timed on at all.  These cases are
+# where that contract has to be implemented, because they are the cases
+# that assert the budget.
+# ---------------------------------------------------------------------------
+
+
+def test_the_probe_calls_a_host_that_cannot_keep_time_unmeasurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that stretches a 50 ms sleep cannot time a budget.
+
+    The stretch is the shape the 2026-10-30 failure had: five 50 ms
+    sleeps that took 0.180 s each, on a host running five other plans'
+    pytest suites.  The p95 that case measured (867 ms against a 500 ms
+    budget) was the machine, not the scheduler.
+    """
+    real_sleep = time.sleep
+
+    def _stretched(seconds: float) -> None:
+        real_sleep(seconds * 4.0)
+
+    monkeypatch.setattr(time, "sleep", _stretched)
+
+    probe = _host_timing_probe()
+
+    assert probe.verdict == "FAIL", (
+        "a host that stretches a %g ms sleep to four times that cannot "
+        "keep time, and the probe has to say so: %r"
+        % (HOST_PROBE_SLEEP_SECONDS * 1000, probe)
+    )
+    assert not _host_can_measure(probe)
+    assert probe.median_sleep > probe.threshold
+
+
+def test_the_probe_calls_a_quiet_host_measurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half: a host that sleeps what it is told can be timed."""
+    real_sleep = time.sleep
+
+    monkeypatch.setattr(time, "sleep", lambda seconds: real_sleep(0.0))
+
+    probe = _host_timing_probe()
+
+    assert _host_can_measure(probe), (
+        "a host that sleeps what it is told can be timed on: %r" % (probe,)
+    )
+
+
+def test_the_probe_verdict_can_be_forced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both branches are reachable without a busy machine.
+
+    The same escape hatch the gate script has (``PDT_HOST_TIMING_PROBE``)
+    so an operator who knows what their machine is doing can decide.
+    """
+    monkeypatch.setenv("PDT_HOST_TIMING_PROBE", "fail")
+    assert not _host_can_measure(_host_timing_probe())
+
+    monkeypatch.setenv("PDT_HOST_TIMING_PROBE", "pass")
+    assert _host_can_measure(_host_timing_probe())
+
+
+def test_the_budget_is_skipped_on_a_host_that_cannot_keep_time(
+    request: Any,
+) -> None:
+    """The numbers are published; the budget is not asserted.
+
+    A skip that says nothing is a green that hides a failure, so the
+    measurements and the probe's own readings both have to be in the
+    log that says why the budget was not asserted.
+    """
+    probe = _HostProbe(
+        median_sleep=0.198, loadavg=19.23, threshold=0.06, verdict="FAIL"
+    )
+    metrics: Dict[str, Any] = {"tick_ms_p95": 867.128}
+
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        _require_a_measurable_host(probe, request, metrics)
+
+    assert "cannot measure wall-clock time" in str(excinfo.value)
+    assert metrics["host_probe_median_sleep_s"] == 0.198
+    assert metrics["host_probe_loadavg"] == 19.23
+    assert metrics["host_probe_verdict"] == "FAIL"
+    assert metrics["tick_ms_p95"] == 867.128
+
+
+def test_the_budget_is_asserted_on_a_host_that_can_keep_time(
+    request: Any,
+) -> None:
+    """A measurable host gets no skip — the budget is asserted as before."""
+    probe = _HostProbe(
+        median_sleep=0.051, loadavg=1.20, threshold=0.06, verdict="OK"
+    )
+    metrics: Dict[str, Any] = {"tick_ms_p95": 12.5}
+
+    _require_a_measurable_host(probe, request, metrics)
+
+    assert metrics["host_probe_verdict"] == "OK"

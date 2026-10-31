@@ -770,6 +770,76 @@ def pytest_collection_modifyitems(config, items):
                 item.add_marker(skip_real_model)
 
 
+# ---------------------------------------------------------------------------
+# The host-load gate — one decision, asked once per case.
+# ---------------------------------------------------------------------------
+#
+# The performance lanes assert on wall-clock numbers.  On a host that is
+# already carrying someone else's work those numbers measure the machine
+# rather than the code under test, and the failure reads like a regression
+# of the thing being measured.  So the host is asked *before* the bound is
+# asserted whether it is too loaded to measure on at all, and a busy host
+# skips the case instead of failing it.
+#
+# ``backend/tests/_host_load.py`` holds the decision — the limit, the CI
+# exception, the message format — so that one limit and one message apply
+# everywhere.  This is where the decision is *asked*.
+#
+# Why the marker decides
+# ----------------------
+# The cases that measure wall-clock time are the ones marked ``perf`` or
+# ``time_sensitive``: the lanes CI runs alone, on a runner that has the
+# machine to itself.  A case with neither marker is not measuring the clock,
+# so a busy host is not its problem — and skipping it would turn a busy
+# afternoon into an empty report.
+#
+# Why a fixture and not ``pytest_collection_modifyitems``
+# ------------------------------------------------------
+# A collection hook sees every item in the session, not every item in a
+# directory: ``pytest_collection_modifyitems`` in a subdirectory's conftest
+# is a session-level hook, so gating "the perf directory" with one would
+# gate the whole run.  The fixture reads the markers of the single item it
+# is attached to, so what it skips is exactly what carries the marker.
+#
+# CI stands the gate down: a hosted runner's load is not the runner's own
+# doing, and a lane that quietly skipped would report green while asserting
+# nothing at all.
+
+
+def _host_load_skip_reason(item) -> str | None:
+    """Why this case must be skipped because the host is too busy, or ``None``.
+
+    ``item`` is the test item; its markers say whether the case measures
+    wall-clock time at all.  The load, the limit and the CI exception belong
+    to ``tests._host_load`` — this function asks the question and hands back
+    the answer, with the numbers that produced it.
+    """
+    from tests import _host_load
+
+    markers = set()
+    for marker in item.iter_markers():
+        # A real marker is a ``Mark`` and carries its name; a test double
+        # may yield the name itself.
+        markers.add(str(getattr(marker, "name", marker)))
+
+    if not markers & {"perf", "time_sensitive"}:
+        return None
+
+    return _host_load.skip_reason()
+
+
+@pytest.fixture(autouse=True)
+def _host_load_gate(request) -> None:
+    """Skip a wall-clock case on a host that is too loaded to measure on.
+
+    The skip is raised rather than returned: a case that is not measured
+    must not look like a case that passed.
+    """
+    reason = _host_load_skip_reason(request.node)
+    if reason is not None:
+        pytest.skip(reason)
+
+
 @pytest.fixture(autouse=True)
 def isolated_provider_state():
     """Give every test its own provider concurrency + cooldown state.
