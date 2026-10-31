@@ -93,6 +93,7 @@ import ast
 import json
 import os
 import re
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -745,6 +746,23 @@ def _wait_port_released(port: int, timeout: float = 10.0) -> bool:
             probe.close()
 
 
+def _server_group(proc: subprocess.Popen) -> int | None:
+    """The process group the spawned server leads, or ``None``.
+
+    The server is spawned with ``start_new_session``, so it leads a group
+    of its own and the test session's group is a different one.  The
+    group is reported only when it is that group -- never the test
+    session's own group, and never a sentinel.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        return None
+    if pgid <= 1 or pgid == os.getpgrp():
+        return None
+    return pgid
+
+
 def _stop_server(proc: subprocess.Popen, port: int, timeout: float = 10.0) -> None:
     """Stop a spawned uvicorn deterministically and confirm the port is free.
 
@@ -760,13 +778,32 @@ def _stop_server(proc: subprocess.Popen, port: int, timeout: float = 10.0) -> No
       that spawned it and answer the next run's health probe — the failure
       this whole port change exists to remove. A teardown that cannot
       account for its child fails loudly instead.
+
+    The signal goes to the group the spawn created -- the server and
+    whatever it started, and nothing outside it.  The pid alone is not
+    enough: the server starts a reaper daemon, and a signal that reaches
+    only the server leaves that daemon running after the test is gone.
     """
+    group = _server_group(proc)
+
+    def _signal(sig: int) -> None:
+        if group is not None:
+            try:
+                os.killpg(group, sig)
+                return
+            except OSError:
+                pass
+        if sig == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+
     if proc.poll() is None:
-        proc.terminate()
+        _signal(signal.SIGTERM)
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _signal(signal.SIGKILL)
         proc.wait(timeout=timeout)
     if not _wait_port_released(port):
         raise AssertionError(
@@ -890,6 +927,11 @@ def exec_instance_setup(tmp_path, monkeypatch):
             # assertions go on to report as an empty ``sqlite_master``.
             stdout=server_log,
             stderr=subprocess.STDOUT,
+            # A session of its own: the server (and the reaper daemon it
+            # starts) get a process group of their own, so stopping
+            # them cannot reach the test session, and a signal aimed at the
+            # test session cannot reach them.
+            start_new_session=True,
         )
         # Wait for the server to come up.  30 s budget.
         deadline = time.time() + 30
@@ -2297,6 +2339,11 @@ def exec_instance_lifecycle(tmp_path, monkeypatch):
             # assertions go on to report as an empty ``sqlite_master``.
             stdout=server_log,
             stderr=subprocess.STDOUT,
+            # A session of its own: the server (and the reaper daemon it
+            # starts) get a process group of their own, so stopping
+            # them cannot reach the test session, and a signal aimed at the
+            # test session cannot reach them.
+            start_new_session=True,
         )
         # Wait for /health to come up (30 s budget).
         deadline = time.time() + 30

@@ -918,6 +918,114 @@ def _process_group_of(pid: int) -> Optional[int]:
     return pgid
 
 
+def _process_groups_table() -> Dict[int, Tuple[int, int]]:
+    """``pid -> (ppid, pgid)`` for every process the platform reports.
+
+    One ``ps`` call for the whole table, not one call per ancestor.
+
+    ``ps`` rather than ``os.getpgid`` here, on purpose.  ``os.getpgid``
+    is the kernel's own answer and it is the right one on the spawn
+    path (see :func:`_process_group_of`), but the ancestors of this
+    process are not being spawned by it: they are long-lived, and the
+    kernel answers about them one call at a time.  The process table
+    answers about all of them at once, and — this is the reason it is
+    read here and not one ``getpgid`` at a time — it answers about
+    *the caller's own* tree.  A caller that replaced ``os.getpgid`` (to
+    describe a child process of its own) has that replacement applied
+    to its ancestors as well, so the answer it reads back describes the
+    process it asked about rather than the ancestor it needed, and the
+    group it then refuses is a group nobody is in.
+
+    A platform without ``ps`` contributes nothing, and the caller then
+    keeps the behaviour it had.
+    """
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid="],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    table: Dict[int, Tuple[int, int]] = {}
+    for line in (completed.stdout or "").splitlines():
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        try:
+            pid = int(fields[0])
+            ppid = int(fields[1])
+            pgid = int(fields[2])
+        except ValueError:
+            continue
+        table[pid] = (ppid, pgid)
+    return table
+
+
+def _ancestor_process_groups(max_depth: int = 8) -> Set[int]:
+    """The process groups that hold one of this process's ancestors.
+
+    A stop must never group-signal a group that holds an ancestor of
+    the caller.  The shape that matters is the one the CI hit: the
+    caller lives in a group of its own (a service started with
+    ``start_new_session=True``), and the group it is asked to stop holds
+    the shell that is waiting for the test session.  Signalling that
+    group kills the shell, the shell forwards the signal to the child it
+    waits for, and the caller dies of a signal it never sent.
+
+    The walk is bounded and every step of it is optional: a platform
+    that cannot answer contributes nothing, and the caller then keeps the
+    behaviour it had.
+    """
+    table = _process_groups_table()
+    if not table:
+        return set()
+    groups: Set[int] = set()
+    try:
+        pid = int(os.getpid())
+    except OSError:
+        return groups
+    seen: Set[int] = set()
+    for _ in range(max_depth):
+        entry = table.get(pid)
+        if entry is None:
+            break
+        ppid, pgid = entry
+        if pgid > 1:
+            groups.add(pgid)
+        if ppid <= 1 or ppid in seen:
+            break
+        seen.add(ppid)
+        pid = ppid
+    return groups
+
+
+def _protected_groups() -> Set[int]:
+    """The groups a group-signal must never touch.
+
+    Two of them, and they are the same kind of danger:
+
+    * the caller's own group — that is the caller and everything it
+      owns;
+    * the group of any of the caller's ancestors — the shell that owns
+      the test session, the executor that owns the caller.  Signalling
+      that group takes the ancestor with it, and an ancestor that
+      forwards a signal to its child takes the caller down too.
+
+    The set is computed per call rather than cached: the tree around a
+    stop is short-lived, and a cached answer would be an answer about a
+    tree that no longer exists.
+    """
+    groups: Set[int] = set()
+    try:
+        own = int(os.getpgrp())
+    except OSError:
+        own = None
+    if own is not None and own > 1:
+        groups.add(own)
+    groups |= _ancestor_process_groups()
+    return groups
+
+
 #: The program a declared service is started through.
 #:
 #: It does three things, in this order:
@@ -1219,10 +1327,16 @@ def kill_service(
         group = int(group) if group is not None else None
     except (TypeError, ValueError):
         group = None
-    # Never our own group: that is the caller, and everything it owns.
-    # Signalling it would take down the backend — or, under pytest, the
-    # whole session, which is a failure with no trace of its cause.
-    if group is not None and group == os.getpgrp():
+    # Never a group that holds the caller or one of its ancestors:
+    # signalling it takes the caller down — or, under pytest, the whole
+    # session — and the caller is not the one that sent the signal.  A
+    # refused group degrades to the individual pids, which are the
+    # processes this call is about, when the caller allows that
+    # (``fallback_to_pids``); a caller that does not allow it gets no
+    # signal at all, which is its own choice and not this one's.
+    refused_pgid: Optional[int] = None
+    if group is not None and group in _protected_groups():
+        refused_pgid = group
         group = None
     if group is not None and group <= 1:
         # 1 is ``kill(-1)``: every process we may signal.  See
@@ -1235,6 +1349,7 @@ def kill_service(
         "pid": runtime.pid,
         "port": runtime.port,
         "pgid": group,
+        "refused_pgid": refused_pgid,
         "signal": int(sig),
         "caller": str(caller or ""),
         "reason": str(reason or ""),
@@ -1295,6 +1410,7 @@ def kill_service(
         "pid": runtime.pid,
         "port": runtime.port,
         "pgid": group,
+        "refused_pgid": refused_pgid,
         "signal": int(sig),
         "caller": str(caller or ""),
         "reason": str(reason or ""),

@@ -1522,12 +1522,15 @@ def test_wrapper_strips_only_fd_prefix(tmp_path: Path):
 
     # -- the behaviour ------------------------------------------------
     # The wrapper's own source, run over a known environment; the
-    # command it execs reports what it inherited.
+    # command it execs reports what it inherited.  The probe variable is
+    # a plain non-secret one, and its value is deliberately not
+    # port-shaped: nothing here binds a port, and a bare number in this
+    # dict reads as an address that a fixture forgot to allocate.
     dump = tmp_path / "child_env.txt"
     parent_env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(tmp_path),
-        "PDT_SVC_ENV_PROBE_PORT": "18091",
+        "PDT_SVC_ENV_PROBE_PORT": "probe-port",
         credentials._FD_ENV_PREFIX + "ONE": "11",
         credentials._FD_ENV_PREFIX + "TWO": "22",
     }
@@ -1550,7 +1553,10 @@ def test_wrapper_strips_only_fd_prefix(tmp_path: Path):
     )
     assert credentials._FD_ENV_PREFIX + "ONE" not in child_env
     assert credentials._FD_ENV_PREFIX + "TWO" not in child_env
-    assert child_env.get("PDT_SVC_ENV_PROBE_PORT") == "18091"
+    assert (
+        child_env.get("PDT_SVC_ENV_PROBE_PORT")
+        == parent_env["PDT_SVC_ENV_PROBE_PORT"]
+    )
     assert child_env.get("PATH") == parent_env["PATH"]
     assert child_env.get("HOME") == parent_env["HOME"]
 

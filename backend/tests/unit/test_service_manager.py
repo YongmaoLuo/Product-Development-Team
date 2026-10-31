@@ -23,10 +23,11 @@ import os
 import shlex
 import signal
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import List, NamedTuple, Optional, Tuple
 
 import pytest
 
@@ -3865,3 +3866,206 @@ def test_end_to_end_relocation_around_a_stranger_ends_ready(
             sm.stop_service(runtime, grace_seconds=5.0)
         stranger.kill()
         stranger.wait(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# The group a stop is allowed to signal (2026-10-29, repair-r1-01)
+# ---------------------------------------------------------------------------
+
+#: The caller of :func:`service_manager.kill_service`.  It is started as
+#: a child of the helper, so the group it is pointed at holds the
+#: process it was started by.
+_CALLER_SRC = r'''
+import json, os, sys
+
+sys.path.insert(0, sys.argv[1])
+import service_manager as sm
+
+target_pgid = int(sys.argv[2])
+runtime = sm.ServiceRuntime(
+    name="probe", port=0, pid=999999, pgid=target_pgid,
+)
+result = sm.kill_service(
+    runtime,
+    "test.ancestor_group",
+    "the group that holds the caller's ancestor",
+    plan_dir=sys.argv[3],
+    sig=15,
+    pgid=target_pgid,
+)
+sys.stdout.write(json.dumps({
+    "group_signalled": result["group_signalled"],
+    "signalled": result["signalled"],
+    "pgid": result["pgid"],
+}))
+'''
+
+#: The helper: it owns the group the caller is pointed at, and it is the
+#: caller's ancestor.
+_HELPER_SRC = r'''
+import json, os, subprocess, sys
+
+caller = subprocess.Popen(
+    [
+        sys.executable, sys.argv[4],
+        sys.argv[1], str(os.getpgrp()), sys.argv[3],
+    ],
+    start_new_session=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+)
+out, _ = caller.communicate(timeout=60)
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    handle.write(json.dumps({"caller_output": out}))
+'''
+
+
+def test_kill_service_refuses_a_group_that_holds_the_callers_ancestor(
+    tmp_path: Path,
+):
+    """A group that holds an ancestor of the caller is never signalled.
+
+    The shape is the one the CI hit: the caller lives in a group of its
+    own (a service started with ``start_new_session=True``), and the
+    group it is asked to stop holds the shell that is waiting for the
+    test session.  Signalling that group kills the shell, the shell
+    forwards the signal to the child it waits for, and the caller dies
+    of a signal it never sent.
+
+    The tree is built for real: this test starts a helper in its own
+    session, the helper starts the caller in another one, and the caller
+    is pointed at the helper's group.  The helper has to survive.
+    """
+    caller_path = tmp_path / "caller.py"
+    caller_path.write_text(_CALLER_SRC, encoding="utf-8")
+    result_file = tmp_path / "caller.json"
+    plan_dir = tmp_path / "plans"
+    plan_dir.mkdir()
+
+    helper = subprocess.Popen(
+        [
+            sys.executable, "-c", _HELPER_SRC,
+            str(_BACKEND_DIR), str(result_file), str(plan_dir), str(caller_path),
+        ],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _out, err = helper.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        helper.kill()
+        _out, err = helper.communicate(timeout=10)
+        pytest.fail(f"the helper never finished; stderr={err!r}")
+
+    assert helper.returncode == 0, (
+        "the helper was killed by the very group its descendant was told "
+        f"to stop (exit {helper.returncode!r}); stderr={err!r}"
+    )
+    payload = json.loads(result_file.read_text(encoding="utf-8"))
+    caller_result = json.loads(payload["caller_output"])
+    assert caller_result["group_signalled"] is False, (
+        "the group that holds the caller's ancestor was signalled: "
+        f"{caller_result!r}"
+    )
+    assert caller_result["signalled"] == [], (
+        f"the refused group still reached a process: {caller_result!r}"
+    )
+
+
+@pytest.mark.timeout(180)
+def test_stopping_a_relocated_service_never_reaches_the_test_session(
+    tmp_path: Path, monkeypatch,
+):
+    """A service that is stopped for real must not take the test with it.
+
+    The service is started the way production starts one -- through the
+    wrapper, which gives it a session of its own -- and it is stopped
+    through :func:`service_manager.stop_service`.  The group signal that
+    stop emits has exactly one legal target: the service's own group.
+    The test session's group, and the group of any ancestor of it, are
+    not legal: signalling those takes the test run down, which is the
+    failure this test exists to prevent (the CI run died of a SIGTERM
+    nobody in the repo sent).
+
+    The service is *relocated* -- it lands on a port of its own because
+    the declared one is held -- because that is the shape the CI hit:
+    the runtime that carries the stop was written by a round that had
+    already moved the service.
+    """
+    recorded: List[Tuple[int, int]] = []
+    real_killpg = os.killpg
+    own_group = os.getpgrp()
+
+    def _recording_killpg(pgid, sig):
+        recorded.append((int(pgid), int(sig)))
+        if int(pgid) == own_group:
+            # A signal aimed at the test session's own group would kill
+            # this pytest run before it could say anything -- the very
+            # failure the test is about (measured: the run ends with
+            # exit 143 and no summary line).  The recorder is the last
+            # line of defence: it writes the attempt down and refuses
+            # to deliver it, so the defect is reported instead of
+            # killing the reporter.
+            return None
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", _recording_killpg)
+
+    # The declared port is held by somebody else, so the service has to
+    # move -- and the port it moves to is one the kernel hands out at
+    # run time, never a literal.
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    declared_port = holder.getsockname()[1]
+    try:
+        script = (
+            "import http.server,socketserver;"
+            f"socketserver.TCPServer(('127.0.0.1',{declared_port}),"
+            "http.server.SimpleHTTPRequestHandler).serve_forever()"
+        )
+        decl = _decl(
+            name="stub", port=declared_port,
+            start_cmd=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+            ready_timeout_seconds=20,
+        )
+        runtime = sm._relocate_service(
+            decl, tmp_path, foreign_cmdline="the test's own holder socket",
+        )
+    finally:
+        holder.close()
+
+    assert runtime.ready, f"the relocated stub never started: {runtime.detail!r}"
+    service_pgid = runtime.pgid or sm._process_group_of(runtime.pid)
+    assert service_pgid is not None, (
+        "the service has no group of its own, so a stop could not tell "
+        "whose processes it is about to signal"
+    )
+    assert service_pgid != os.getpgrp(), (
+        "the service was started inside the test session's group; the "
+        "wrapper is supposed to give it a session of its own"
+    )
+
+    try:
+        result = sm.stop_service(runtime, grace_seconds=15.0)
+
+        assert result["port_free"], result
+        assert recorded, (
+            "the stop never signalled the group it owns: "
+            f"{result!r}"
+        )
+        for pgid, sig in recorded:
+            assert pgid == service_pgid, (
+                f"the stop signalled group {pgid} (signal {sig}), which is "
+                f"not the service's own group {service_pgid}"
+            )
+            assert pgid != os.getpgrp(), (
+                f"the stop signalled the test session's own group {pgid}"
+            )
+        # And the session this test runs in is still there.
+        os.kill(os.getpid(), 0)
+    finally:
+        _force_cleanup(runtime.pid)

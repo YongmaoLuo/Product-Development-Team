@@ -84,7 +84,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pytest
 
@@ -133,6 +133,15 @@ INTERVIEW_LABEL = "已访谈"
 IMPORT_CONTENT = "把报表页的折线图换成按天分组的柱状图"
 INTERVIEW_REQUIREMENT = "给运营后台加一个按天分组的柱状图"
 
+#: The title the imported plan is filed under (it becomes the plan id).
+#:
+#: The server derives the id as ``<date>-<slug>``, and the date alone
+#: is not enough: two runs of this file on the same day derive the
+#: *same* id, and the id is what an executor is found by
+#: (:func:`_kill_leftover_executors`) and what the artifacts are filed
+#: under.  One run's cleanup must never reach another run's executor,
+#: so the id carries this flow's own token.
+#:
 #: It carries a per-flow token, and it has to: the suite runs this module
 #: on several workers at once, and two flows that share a plan id share
 #: everything that is keyed by that id.  The teardown kills "this plan's"
@@ -144,7 +153,9 @@ INTERVIEW_REQUIREMENT = "给运营后台加一个按天分组的柱状图"
 #:
 #: The token is short enough that the derived slug still fits the
 #: 20-character limit ``derive_plan_id`` enforces -- a longer one would
-#: be truncated and could collide again.
+#: be truncated and could collide again.  It leads the slug for the same
+#: reason: the slug is truncated to a fixed length, and a token at the
+#: end would be the part that gets cut.
 IMPORT_TITLE_PREFIX = "e2e-ui"
 
 
@@ -552,9 +563,23 @@ def _teardown_server(proc: subprocess.Popen, base_url: str, plan_id: str) -> Non
 
     The executor runs in its own session, so terminating the server does
     not reach it -- it is stopped through the same facade the test used,
-    and anything that survived is killed by the shape of its own command
-    line (see :func:`_kill_leftover_executors`).
+    and anything that survived is killed by its plan id (the id is in its
+    command line) and by the shape of its own command line (see
+    :func:`_kill_leftover_executors`).
+
+    The sweep that does the killing is narrowed to the pids this server
+    spawned: the id alone names a plan, and a plan id can sit in the
+    command line of a process this run never started.
     """
+    owned: Optional[Set[int]] = None
+    if proc.poll() is None:
+        # The server is still alive, so its children are still its
+        # children -- that is the only moment the ownership is
+        # readable.  A server that is already gone has had its
+        # children re-parented to init, and then the sweep falls back
+        # to its un-narrowed form rather than narrowing itself to
+        # nothing and leaving the executor behind.
+        owned = _descendant_pids(proc.pid)
     if plan_id:
         try:
             _http(
@@ -580,10 +605,63 @@ def _teardown_server(proc: subprocess.Popen, base_url: str, plan_id: str) -> Non
                 log_handle.close()
             except Exception:  # noqa: BLE001
                 pass
-    _kill_leftover_executors(plan_id)
+    _kill_leftover_executors(plan_id, allowed_pids=owned)
 
 
-def _kill_leftover_executors(plan_id: str) -> None:
+def _process_table() -> List[Tuple[int, str]]:
+    """``(pid, command)`` for every process the platform reports.
+
+    A command line that contains a newline is printed as *several*
+    lines: the pid on the first of them, the rest of the command below
+    it.  A row is recognised by its three numeric columns, so a
+    continuation line is never taken for a process of its own -- and the
+    command is put back together, because the plan id is looked for in
+    it and a command that is cut in half is a command the plan id may
+    be missing from.  (The orphan the ownership test spawns carries its
+    id in a multi-line ``python -c`` source, so this is not a corner
+    case: it is the shape the search has to cope with.)
+
+    ``ps -ax`` and not a bare ``ps``: a process that leads a session of
+    its own has no controlling terminal, and a bare ``ps`` does not
+    even list it.
+    """
+    try:
+        # ``-ww`` because the command column is cut to the terminal width
+        # otherwise, and ``ps`` reads that width from ``COLUMNS`` when its
+        # output is a pipe.  pytest sets ``COLUMNS=80``, so without ``-ww``
+        # the plan id -- which sits at the *end* of a command line -- is
+        # exactly what gets cut off, and the search then finds nothing.
+        listing = subprocess.run(
+            ["ps", "-ax", "-ww", "-o", "pid=,ppid=,pgid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if listing.returncode != 0:
+        return []
+    rows: List[Tuple[int, str]] = []
+    for line in listing.stdout.splitlines():
+        parts = line.split(None, 3)
+        if (
+            len(parts) >= 3
+            and parts[0].isdigit()
+            and parts[1].isdigit()
+            and parts[2].isdigit()
+        ):
+            rows.append((int(parts[0]), parts[3] if len(parts) > 3 else ""))
+        elif rows:
+            # A continuation of the row above: the rest of its command.
+            pid, command = rows[-1]
+            rows[-1] = (pid, f"{command} {line.strip()}".strip())
+    return rows
+
+
+def _kill_leftover_executors(
+    plan_id: str, allowed_pids: Optional[Set[int]] = None
+) -> None:
     """Kill the plan's executor if it outlived the server -- and only it.
 
     The executor is the ``cli.py --recover`` subprocess the plan owns,
@@ -602,39 +680,100 @@ def _kill_leftover_executors(plan_id: str) -> None:
     ``ps -ax`` and not a bare ``ps``: the executor is started in its own
     session (no controlling terminal), so a bare ``ps`` does not even
     list it.
+
+    The plan id is the only handle on a stranger, and it is a *plan* id
+    -- it names a plan, not a process, so the search can find processes
+    that have nothing to do with this run.  Two things are therefore
+    never signalled: a process of this test session's own group (a
+    signal there reaches the session, and the session is what has to
+    survive to report the failure), and anything the search found that
+    is not this run's.
+
+    The second one is *ownership*, and it is what ``allowed_pids``
+    carries: the pids this run spawned (see :func:`_descendant_pids`).
+    A group check cannot stand in for it -- the stranger leads a session
+    of its own, exactly like the executor the sweep is looking for -- so
+    without the ownership set the sweep would signal any process on the
+    host whose command line happens to carry the plan id.
+
+    ``allowed_pids=None`` keeps the un-narrowed sweep, which is what
+    the test that pins the group refusal uses; the teardown always
+    passes the pids it owns.
     """
     if not plan_id:
         return
+    own_pgid = os.getpgrp()
+    for pid, command in _process_table():
+        if pid == os.getpid():
+            continue
+        if plan_id not in command:
+            continue
+        # The plan's own recovery CLI is recognised by its shape: the
+        # recovery entry point and its flag.  A process that merely
+        # mentions the plan id is not the executor -- that is the
+        # browser driver of this run or of another one.
+        is_executor = "cli.py" in command and "--recover" in command
+        if allowed_pids is not None and pid not in allowed_pids:
+            # Found by the id, but not this run's: not ours to signal.
+            continue
+        if not is_executor:
+            try:
+                if os.getpgid(pid) == own_pgid:
+                    # Our own group: the test session is in it, and a
+                    # signal there is a signal to the session itself.
+                    continue
+            except OSError:
+                continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+
+
+def _descendant_pids(root_pid: int) -> Optional[Set[int]]:
+    """The pids below *root_pid* in the process tree.
+
+    Ownership is the only thing that separates "this run's executor"
+    from "a process that happens to carry the plan id", and it has to be
+    read *before* the owner dies: once the server is gone its children
+    are re-parented to init and the link is lost.
+
+    Returns ``None`` when the process table cannot be read — the caller
+    then keeps the old, un-narrowed sweep rather than silently
+    narrowing it to nothing.
+    """
     try:
         listing = subprocess.run(
-            ["ps", "-ax", "-ww", "-o", "pid=,command="],
+            ["ps", "-axo", "pid=,ppid="],
             capture_output=True,
             text=True,
             timeout=15,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return
+        return None
     if listing.returncode != 0:
-        return
+        return None
+    children: Dict[int, List[int]] = {}
     for line in listing.stdout.splitlines():
-        pid_text, _, command = line.strip().partition(" ")
-        if not command:
-            continue
-        if "cli.py" not in command or "--recover" not in command:
-            continue
-        if plan_id not in command:
+        parts = line.split()
+        if len(parts) != 2:
             continue
         try:
-            pid = int(pid_text)
+            pid = int(parts[0])
+            ppid = int(parts[1])
         except ValueError:
             continue
-        if pid == os.getpid():
-            continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            continue
+        children.setdefault(ppid, []).append(pid)
+    found: Set[int] = set()
+    frontier = [root_pid]
+    while frontier:
+        pid = frontier.pop()
+        for child in children.get(pid, ()):
+            if child not in found:
+                found.add(child)
+                frontier.append(child)
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -863,6 +1002,30 @@ def _driver_env() -> Dict[str, str]:
     return env
 
 
+def _kill_driver_group(proc: subprocess.Popen) -> None:
+    """Stop the driver and the browser it launched, and nothing else.
+
+    The driver was started with ``start_new_session``, so its process
+    group is the one it leads -- the group this test created.  The
+    signal is therefore aimed at a group this test owns; the test
+    session's own group is not touched (it is not this group, and a
+    test that kills its own session cannot report anything).
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    if pgid is not None and pgid > 1 and pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def _run_driver(
     interpreter: str,
     script: Path,
@@ -872,8 +1035,21 @@ def _run_driver(
     artifacts_dir: Path,
     requirement: str = "",
 ) -> Dict[str, Any]:
-    """Run one browser pass; return the report it printed."""
-    result = subprocess.run(
+    """Run one browser pass; return the report it printed.
+
+    The driver gets a session of its own (``start_new_session``), so it
+    and the browser it launches are in a process group of their own and
+    not in the group of the test session.  Two things follow from that,
+    and both are the point:
+
+    * a signal aimed at the test session's group cannot reach the
+      driver, and a signal aimed at the driver cannot reach the test
+      session -- before this, the driver sat in the test session's
+      group, so a group signal to either of them took both;
+    * a driver that overruns is stopped by its own group, which is the
+      group this call created, and nothing else.
+    """
+    proc = subprocess.Popen(
         [
             interpreter,
             str(script),
@@ -883,12 +1059,22 @@ def _run_driver(
             str(artifacts_dir),
             requirement,
         ],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=300,
-        check=False,
         env=_driver_env(),
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        _kill_driver_group(proc)
+        stdout, stderr = proc.communicate()
+        raise AssertionError(
+            f"the browser driver did not finish within 300s; "
+            f"stdout={stdout!r} stderr={stderr!r}"
+        )
+    result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
     if result.returncode != 0:
         combined = f"{result.stdout}\n{result.stderr}"
         if "Executable doesn't exist" in combined or "playwright install" in combined:
@@ -1274,6 +1460,252 @@ def test_screenshots_are_written(lifecycle_ui_flow):
         assert path.stat().st_size > 0, f"{path} is empty"
 
 
+def test_the_leftover_sweep_refuses_the_test_sessions_own_group():
+    """The sweep signals a stray executor, never the session it runs in.
+
+    The sweep finds its victims by the plan id in a command line, and a
+    plan id names a *plan*, not a process: the search can match a
+    process of this very session (another run's browser driver carries
+    the id in its argv, and so does anything else that was told about
+    the plan).  A signal to a process of the session's own group is a
+    signal to the session -- and the session is what has to survive in
+    order to report the failure -- so the sweep refuses that group and
+    signals only what leads a session of its own.
+
+    Both helpers below carry the plan id in their command line, so the
+    search finds them; the only difference between them is the group
+    they are in.
+    """
+    plan_id = "pdt-sweep-probe-" + uuid.uuid4().hex
+    # The id has to be in the command line, because that is what the
+    # search looks at; a comment keeps it there without changing what
+    # the helper does.
+    probe = "import time; time.sleep(30)  # " + plan_id
+
+    in_session = subprocess.Popen([sys.executable, "-c", probe])
+    own_group = subprocess.Popen(
+        [sys.executable, "-c", probe], start_new_session=True
+    )
+    try:
+        listing = subprocess.run(
+            ["pgrep", "-f", plan_id],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        found = {int(line) for line in listing.stdout.split() if line.strip()}
+        assert in_session.pid in found, (
+            f"the search did not find the helper in the session's own "
+            f"group ({in_session.pid}); found {sorted(found)}"
+        )
+        assert own_group.pid in found, (
+            f"the search did not find the helper that leads a session of "
+            f"its own ({own_group.pid}); found {sorted(found)}"
+        )
+
+        _kill_leftover_executors(plan_id)
+
+        deadline = time.monotonic() + 10.0
+        while own_group.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert own_group.poll() is not None, (
+            f"the sweep did not signal pid {own_group.pid}, which leads a "
+            f"session of its own: the sweep has to be able to stop the "
+            f"executor it is looking for"
+        )
+        # A signal is not a death: give the one the sweep may have sent
+        # to the session's own helper the time to land before asking
+        # whether the helper is still there.
+        time.sleep(1.0)
+        assert in_session.poll() is None, (
+            f"the sweep signalled pid {in_session.pid}, which is in the "
+            f"test session's own group (pgid {os.getpgrp()}): a signal "
+            f"there is a signal to the session itself"
+        )
+    finally:
+        for proc in (in_session, own_group):
+            if proc.poll() is None:
+                try:
+                    os.kill(proc.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+# ---------------------------------------------------------------------------
+# The sweep signals only what this run spawned
+# ---------------------------------------------------------------------------
+
+
+def _pid_alive(pid: int) -> bool:
+    """True while *pid* still exists (signal 0 probes without acting)."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _spawn_orphan_carrying(plan_id: str) -> None:
+    """Start a helper that carries *plan_id* and belongs to nobody.
+
+    The helper is a grandchild: the process this starts exits at once,
+    so the one that keeps running is re-parented to init -- the shape a
+    leftover executor has once the server that spawned it is gone.  The
+    id rides in the command line, because that is what the search looks
+    at, and the helper leads a session of its own.
+    """
+    source = (
+        "import os, time\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    os.setsid()\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "os._exit(0)\n"
+    )
+    subprocess.run(
+        [sys.executable, "-c", f"{source}  # {plan_id}"],
+        check=False,
+        timeout=30,
+    )
+
+
+def test_the_leftover_sweep_signals_only_the_pids_this_run_spawned():
+    """The sweep may only signal what this run started.
+
+    The sweep finds its victims by the plan id in a command line, and a
+    plan id names a *plan*, not a process: the same id can sit in the
+    command line of something this run never started -- a leftover of an
+    earlier run, a process an operator started by hand, a process of
+    another agent working on the same plan.  Signalling one of those is
+    the "kill a stranger's process" this suite must never do, and no
+    group check can catch it: the stranger leads a session of its own,
+    exactly like the executor the sweep is looking for.
+
+    What tells the two apart is *ownership*.  The teardown knows which
+    pids the server it started spawned, and the sweep may only signal
+    those.
+    """
+    plan_id = "pdt-sweep-stranger-" + uuid.uuid4().hex
+    _spawn_orphan_carrying(plan_id)
+
+    stranger = None
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        listing = subprocess.run(
+            ["pgrep", "-f", plan_id],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        found = {int(line) for line in listing.stdout.split() if line.strip()}
+        found.discard(os.getpid())
+        if found:
+            stranger = min(found)
+            break
+        time.sleep(0.2)
+    assert stranger is not None, (
+        "the helper never showed up in the search, so the sweep had "
+        "nothing to refuse: the test cannot say anything"
+    )
+
+    try:
+        # This run spawned nothing that carries the id, so the sweep has
+        # to leave the stranger alone.
+        try:
+            _kill_leftover_executors(plan_id, allowed_pids=set())
+        except TypeError as exc:
+            pytest.fail(
+                f"the sweep cannot be narrowed to this run's own pids: {exc}"
+            )
+        time.sleep(1.5)
+        assert _pid_alive(stranger), (
+            f"the sweep signalled pid {stranger}, which this run did not "
+            f"spawn: a process that merely carries the plan id is not "
+            f"this run's to signal"
+        )
+
+        # Given the pid as one of its own, the same sweep stops it.
+        _kill_leftover_executors(plan_id, allowed_pids={stranger})
+        deadline = time.monotonic() + 10.0
+        while _pid_alive(stranger) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not _pid_alive(stranger), (
+            f"the sweep did not signal pid {stranger} even though it was "
+            f"given as this run's own process: the sweep has to be able "
+            f"to stop the executor it is looking for"
+        )
+    finally:
+        try:
+            os.kill(stranger, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def test_the_teardown_keeps_the_un_narrowed_sweep_when_the_server_is_already_gone(
+    monkeypatch,
+):
+    """A server that died before the teardown has no readable ownership.
+
+    Its children were re-parented to init the moment it died, so the
+    process table can no longer say which of them were ours.  The
+    teardown then keeps the old sweep -- which still refuses the
+    session's own group -- rather than narrowing itself to nothing and
+    leaving the executor behind.  A server that is still alive is the
+    opposite case: the ownership is readable, and the sweep is narrowed
+    to it.
+    """
+    this_module = sys.modules[__name__]
+    seen: Dict[str, Any] = {}
+
+    def _fake_descendants(root_pid: int) -> Set[int]:
+        seen["descendants_read_from"] = root_pid
+        return {4242}
+
+    def _fake_sweep(plan_id: str, allowed_pids: Optional[Set[int]] = None) -> None:
+        seen["allowed_pids"] = allowed_pids
+
+    monkeypatch.setattr(this_module, "_descendant_pids", _fake_descendants)
+    monkeypatch.setattr(this_module, "_kill_leftover_executors", _fake_sweep)
+
+    class _DeadProc:
+        pid = 424242
+
+        def poll(self) -> int:
+            return 1
+
+    _teardown_server(_DeadProc(), "", "")  # type: ignore[arg-type]
+    assert "descendants_read_from" not in seen, (
+        "the teardown read the ownership of a server that is already "
+        "gone: its children belong to init now, so the process table "
+        "cannot say which of them were ours"
+    )
+    assert seen.get("allowed_pids", "missing") is None, (
+        "a server that is already gone must leave the sweep "
+        "un-narrowed, or the executor it left behind is never stopped"
+    )
+
+    seen.clear()
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        _teardown_server(live, "", "")
+    finally:
+        if live.poll() is None:
+            live.kill()
+            live.wait(timeout=5)
+    assert seen.get("descendants_read_from") == live.pid, (
+        "the teardown did not read the ownership of a server that was "
+        "still alive: that is the only moment the ownership is readable"
+    )
+    assert seen.get("allowed_pids") == {4242}, (
+        "the sweep was not narrowed to the pids the server spawned"
+    )
 # ---------------------------------------------------------------------------
 # The isolation of one run from another
 # ---------------------------------------------------------------------------
