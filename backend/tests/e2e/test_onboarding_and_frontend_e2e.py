@@ -110,18 +110,64 @@ REQUEST_HEADER_VALUE = "1"
 #: raising the floor means editing this constant deliberately.
 E2E_BASELINE_CASE_COUNT = 33
 
+#: How long the server may take to answer ``GET /health`` after it was
+#: spawned.
+#:
+#: Thirty seconds was the window this file used, and it was written for
+#: a machine with the machine to itself.  The server's own startup is
+#: not a fixed number of seconds — the interpreter has to import the
+#: app, the lifespan has to run, and only then does uvicorn bind — and
+#: on a host that is running other suites none of those steps is quick.
+#: A window that is too short does not report "the server was slow"; it
+#: reports "the server never came up", and it reports it for every case
+#: in the file, because the server is booted once for the whole module.
+_SERVER_READY_TIMEOUT_SECONDS = 120.0
+
+#: How many ports the boot may try before it gives up.
+#:
+#: One retry is enough: the race this protects against is another
+#: process taking the port between the probe and the bind, and the
+#: probability of losing it twice is negligible.
+_BOOT_ATTEMPTS = 3
+
+#: What the server prints when the port it was told to bind was already
+#: in use and it fell back to another one.
+_PORT_TAKEN_MARKER = "using fallback port"
+
+
+class _PortTaken(Exception):
+    """The port the server was told to bind was already in use."""
+
 
 def _free_port() -> int:
     """Bind to an ephemeral loopback port and return its number.
 
     The kernel hands us a free port, then releasing the socket leaves
     a small race window during which another process could grab it.
-    That race is acceptable for an isolated test process; the
-    ``_wait_for_server`` polling below tolerates it.
+    That race used to be accepted here, and it is not benign: the
+    server that is handed the port falls back to another one and
+    answers there, while this file keeps polling the port it asked
+    for — so the module fixture times out on a healthy server.
+
+    So the port is checked before it is handed over: a connect that is
+    refused is the answer that means "nobody is serving here", and a
+    port that is being served is not the port this function returns.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    for _ in range(_BOOT_ATTEMPTS):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        # The socket above is closed by now, so the kernel may have
+        # handed the port to somebody else in the meantime.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.25)
+            try:
+                probe.connect(("127.0.0.1", port))
+            except OSError:
+                return port
+    raise RuntimeError(
+        "could not find a loopback port that nothing is serving on"
+    )
 
 
 def _utcnow_iso() -> str:
@@ -133,7 +179,9 @@ def _utcnow_iso() -> str:
     )
 
 
-def _wait_for_server(base_url: str, timeout: float = 30.0) -> None:
+def _wait_for_server(
+    base_url: str, timeout: float = _SERVER_READY_TIMEOUT_SECONDS
+) -> None:
     """Block until ``GET /health`` on ``base_url`` returns 2xx."""
     deadline = time.time() + timeout
     last_exc: Exception | None = None
@@ -167,15 +215,36 @@ def boot_real_server(tmp_path: Path) -> Tuple[str, subprocess.Popen, Path]:
     contract. ``workdir`` is the directory the server's state DB and
     plans tree live under; tests MUST address the server's files via
     ``workdir`` because the subprocess has its own env.
+
+    A port that is taken between the probe and the bind is not a
+    failure of this file: the server falls back to another port and
+    answers there, so the boot is retried on a port of its own
+    choosing.  Without the retry, the module fixture — one server for
+    every case in the file — fails on a race that has nothing to do
+    with the code under test.
     """
+    last_error: Exception | None = None
+    for _ in range(_BOOT_ATTEMPTS):
+        try:
+            return _boot_real_server_on_port(tmp_path, _free_port())
+        except _PortTaken as exc:
+            last_error = exc
+    raise RuntimeError(
+        "could not boot the server on a free port after %d attempts: %s"
+        % (_BOOT_ATTEMPTS, last_error)
+    )
+
+
+def _boot_real_server_on_port(
+    tmp_path: Path, port: int
+) -> Tuple[str, subprocess.Popen, Path]:
+    """Boot the server on ``port``; raise ``_PortTaken`` if it was taken."""
     state_db = tmp_path / "state.db"
     plans_dir = tmp_path / "plans"
     backups_dir = tmp_path / "backups"
     logs_dir = tmp_path / "logs"
     for d in (plans_dir, backups_dir, logs_dir):
         d.mkdir(parents=True, exist_ok=True)
-
-    port = _free_port()
 
     env = dict(os.environ)
     env.update({
@@ -211,11 +280,23 @@ def boot_real_server(tmp_path: Path) -> Tuple[str, subprocess.Popen, Path]:
 
     base_url = f"http://127.0.0.1:{port}"
     try:
-        _wait_for_server(base_url, timeout=30.0)
+        _wait_for_server(base_url, timeout=_SERVER_READY_TIMEOUT_SECONDS)
     except Exception:
         proc.kill()
         proc.wait(timeout=5)
         log_handle.close()
+        # The server's own log says whether the port it was told to bind
+        # was already in use — it falls back to the next one and answers
+        # there, which is why the poll above never saw an answer.
+        try:
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            log_text = ""
+        if _PORT_TAKEN_MARKER in log_text:
+            raise _PortTaken(
+                "the server was told to bind %d and the port was already "
+                "in use; its log:\n%s" % (port, log_text[-2000:])
+            )
         raise
 
     proc._pdt_log_handle = log_handle  # type: ignore[attr-defined]
@@ -239,6 +320,88 @@ def teardown_server(proc: subprocess.Popen) -> None:
                 log_handle.close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+# ---------------------------------------------------------------------------
+# The boot helpers — the contracts they owe the module fixture
+#
+# The module fixture boots ONE server for the whole file, so a boot that
+# loses a race is not one failed case: it is every case in the file,
+# erroring on a fixture that never came up.  These cases pin the two
+# things that made that happen.
+# ---------------------------------------------------------------------------
+
+
+def test_the_port_the_server_is_told_to_bind_is_free() -> None:
+    """The port handed to the server must not already be serving.
+
+    ``_free_port`` binds an ephemeral port and lets it go again, which
+    leaves a window in which somebody else can take it.  The port that
+    goes on to the server is therefore checked: a connect that is
+    refused is the answer that means "nobody is serving here".
+    """
+    port = _free_port()
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.5)
+        with pytest.raises(OSError):
+            probe.connect(("127.0.0.1", port))
+
+
+def test_a_taken_port_makes_the_boot_choose_another_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Losing the bind/close race must not fail the module fixture.
+
+    The server was told to bind a port that was taken between the probe
+    and the bind; it fell back to another port and answered there, while
+    this file was still polling the port it had asked for.  The boot has
+    to notice that and start over on a port of its own choosing — the
+    fixture failing would take every case in the file with it.
+    """
+    ports = iter([47101, 47102])
+    monkeypatch.setattr(
+        sys.modules[__name__], "_free_port", lambda: next(ports)
+    )
+
+    calls: list[int] = []
+
+    def _fake_boot(work: Path, port: int):
+        calls.append(port)
+        if len(calls) == 1:
+            raise _PortTaken("port %d was taken before the bind" % port)
+        return ("http://127.0.0.1:%d" % port, None, work)
+
+    monkeypatch.setattr(
+        sys.modules[__name__], "_boot_real_server_on_port", _fake_boot
+    )
+
+    base_url, _proc, _workdir = boot_real_server(tmp_path)
+
+    assert calls == [47101, 47102], (
+        "the boot has to try a second port after losing the first one: %r"
+        % (calls,)
+    )
+    assert base_url == "http://127.0.0.1:47102"
+
+
+def test_the_server_is_given_time_to_become_ready() -> None:
+    """The readiness window has to cover a boot on a busy machine.
+
+    Thirty seconds was the window this file used, and it was written for
+    a machine with the machine to itself: the server's own startup —
+    importing the app, the lifespan, the first bind — is not a fixed
+    number of seconds, and on a host running other suites it is not a
+    small one either.  A window that is too short does not report "the
+    server was slow", it reports "the server never came up", and it
+    reports it for every case in the file.
+    """
+    assert _SERVER_READY_TIMEOUT_SECONDS >= 120.0, (
+        "the readiness window is %gs; a boot on a busy host needs at "
+        "least 120s, or the fixture fails for a reason that has nothing "
+        "to do with the code under test"
+        % (_SERVER_READY_TIMEOUT_SECONDS,)
+    )
 
 
 # ---------------------------------------------------------------------------

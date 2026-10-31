@@ -8098,12 +8098,21 @@ class Orchestrator:
             }
 
         verdict = result.to_verdict_dict()
+        # 2026-10-31: the budget evidence belongs in the event.  A gate
+        # that ran out of budget is ``INCONCLUSIVE`` — it has no verdict
+        # about the deliverable — and an operator reading the round log
+        # can only see *why* if the event says which phase was
+        # exhausted and how long the gate ran.
         self._safe_log_freshness_event(
             vp_id, "full_ci_executed",
             {
                 "status": verdict["status"],
                 "exit_code": result.evidence.get("exit_code"),
                 "timed_out": result.evidence.get("timed_out"),
+                "budget_exhausted_in": result.evidence.get(
+                    "budget_exhausted_in",
+                ),
+                "duration_seconds": result.evidence.get("duration_seconds"),
             },
         )
         return verdict

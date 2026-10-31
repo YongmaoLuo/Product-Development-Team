@@ -30,6 +30,11 @@ from verification_agent import (
     # criterion layer that decides whether a round judged anything at
     # all. The orchestrator does not get a second, looser copy of it.
     _entry_is_environment_blocked,
+    # 2026-10-31: the evidence travels as a JSON **string** on the
+    # report's entries, so every reader has to parse it before it can
+    # ask a question of it.  ONE rule for that, the same one the agent
+    # uses — the orchestrator does not get a second, looser copy.
+    _result_evidence,
 )
 from repair_generator import (
     RepairTaskGenerator,
@@ -698,16 +703,28 @@ def _undefined_vp_operator_action(vp_ids: Any) -> Optional[str]:
     )
 
 
+#: The verdict a gate writes when it could **not** decide — its budget
+#: ran out (``verification_ci_runner.STATUS_INCONCLUSIVE`` writes it;
+#: the orchestrator reads it).  Spelled here rather than imported so
+#: reading a round does not drag the CI runner — and the subprocess
+#: machinery behind it — into the orchestrator's import time.
+STATUS_INCONCLUSIVE = "INCONCLUSIVE"
+
+
 def _round_judged_nothing(report: Mapping, failed_count: int) -> bool:
     """Did this round judge anything at all?
 
     A round that could not judge what it set out to judge is **not** a
-    failure of the deliverable.  The report says so in three places:
+    failure of the deliverable.  The report says so in four places:
 
     * the round itself is flagged ``environment_blocked``;
     * a point the environment took out carries the reason code the
       environment owns (``service_data_plane_mismatch`` and friends);
-    * a point that was not judged this round is ``DEFERRED``.
+    * a point that was not judged this round is ``DEFERRED``;
+    * a gate that ran out of its budget is ``INCONCLUSIVE`` (since
+      2026-10-31) — a gate that ran out of time did not prove the
+      deliverable defective, it proved the *gate* ran out of time,
+      which is a statement about the run, not about the product.
 
     Before this question existed, such a round fell into the failure
     path: nothing was broken, so there was nothing to repair — but the
@@ -742,11 +759,113 @@ def _round_judged_nothing(report: Mapping, failed_count: int) -> bool:
     for entry in entries:
         if not isinstance(entry, Mapping):
             continue
-        if str(entry.get("status") or "") == "DEFERRED":
+        status = str(entry.get("status") or "")
+        if status == "DEFERRED":
+            return True
+        if status == STATUS_INCONCLUSIVE:
             return True
         if _entry_is_environment_blocked(entry):
             return True
     return False
+
+
+def _round_needs_operator_decision(report: Mapping) -> bool:
+    """Does this round have to be handed to a human?
+
+    An ``INCONCLUSIVE`` point is a gate that could not decide — it ran
+    out of budget, so it has no verdict about the deliverable.  Nobody
+    but the operator can say what happens next: whether the gate gets a
+    bigger budget, the point is dropped, or the plan moves on.  The loop
+    therefore stops the round and says so instead of dispatching
+    repairs for a defect nobody found.
+
+    A ``DEFERRED`` point is **not** that: deferring is the plan's own
+    business (the point waits for a later round), so a deferred round
+    keeps asking nobody — the behaviour it has always had.
+
+    Args:
+        report: The round's report.
+
+    Returns:
+        ``True`` when the round carries an ``INCONCLUSIVE`` point.
+    """
+    entries = report.get("verification_results")
+    if not isinstance(entries, (list, tuple)):
+        return False
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("status") or "") == STATUS_INCONCLUSIVE:
+            return True
+    return False
+
+
+def _round_budget_exhausted_in(report: Mapping) -> Optional[str]:
+    """Which phase ran out of budget, as the round recorded it.
+
+    The CI runner writes the phase into the gate's evidence
+    (``budget_exhausted_in``); the round's entries carry that evidence
+    on.  The **first** inconclusive entry is the one that answers — a
+    round that ran out of budget twice still has one answer to give.
+
+    Args:
+        report: The round's report.
+
+    Returns:
+        The phase's name, or ``None`` when the round has no inconclusive
+        point or the point carried no such evidence.
+    """
+    entries = report.get("verification_results")
+    if not isinstance(entries, (list, tuple)):
+        return None
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("status") or "") != STATUS_INCONCLUSIVE:
+            continue
+        value = _result_evidence(entry).get("budget_exhausted_in")
+        return str(value) if value else None
+    return None
+
+
+def _judged_nothing_cycle_result(report: Mapping) -> dict:
+    """The exit a round that judged nothing takes.
+
+    **Pure**: it reads the round's report and nothing else, so the exit
+    can be reasoned about — and tested — without standing up an
+    orchestrator and carrying its instance state around.
+    :meth:`VerificationOrchestrator.check_cycle_conditions` returns it
+    verbatim, so there is exactly one place where this exit is written
+    down.
+
+    Args:
+        report: The round's report.
+
+    Returns:
+        The round's exit dict.
+    """
+    return {
+        "should_continue": False,
+        "should_stop": True,
+        # The verdict is the ``status``; the reason vocabulary is
+        # closed, so this stop carries no new word.
+        "stop_reason": None,
+        "repair_tasks": [],
+        "waiting_for_user": False,
+        "status": "loop_stopped",
+        "intent_conflicts": [],
+        # 2026-10-31: an inconclusive round is the operator's turn —
+        # only a human can say whether the gate gets a bigger budget.
+        "needs_operator_decision": _round_needs_operator_decision(report),
+        "environment_blocked": True,
+        # 2026-10-31: which phase ran out of budget — the evidence the
+        # operator needs to decide what happens next.
+        "budget_exhausted_in": _round_budget_exhausted_in(report),
+        # 2026-10-30: a round that judged nothing has no root-cause
+        # report to read — the field is present on every return path so
+        # a consumer can read it without guarding for its absence.
+        "root_cause_scope_missing": [],
+    }
 
 
 def _state_db_path_for_orchestrator() -> Path:
@@ -3115,7 +3234,12 @@ class VerificationOrchestrator:
           that crossed the plan's own constraints and were dropped
         - needs_operator_decision: bool   # 2026-10-23: True when
           ``intent_conflicts`` is non-empty — only an operator can say
-          whether the constraint or the requirement gives way
+          whether the constraint or the requirement gives way.  2026-10-31:
+          also True when the round was unjudged because a gate ran out
+          of budget (``INCONCLUSIVE``) — only an operator can say whether
+          the gate gets a bigger budget
+        - budget_exhausted_in: Optional[str]   # 2026-10-31: which phase
+          ran out of budget, as the gate's evidence recorded it
         - root_cause_vp_ids: List[str]   # 2026-10-27: the points whose
           failure repeated under a *changed* fingerprint — the ones
           whose repair row was re-scoped to a root-cause task
@@ -3209,28 +3333,19 @@ class VerificationOrchestrator:
             self._consecutive_same_failure_rounds = 0
             self._last_round = round_number
             self._save_loop_tracking()
-            print(
-                f"[Verification] round {round_number}: the environment "
-                f"took this round out — no verdict, nothing to repair"
-            )
-            return {
-                "should_continue": False,
-                "should_stop": True,
-                # The verdict is the ``status``; the reason vocabulary is
-                # closed, so this stop carries no new word.
-                "stop_reason": None,
-                "repair_tasks": [],
-                "waiting_for_user": False,
-                "status": "loop_stopped",
-                "intent_conflicts": [],
-                "needs_operator_decision": False,
-                "environment_blocked": True,
-                # 2026-10-30: a round that judged nothing has no
-                # root-cause report to read — the field is present on
-                # every return path so a consumer can read it without
-                # guarding for its absence.
-                "root_cause_scope_missing": [],
-            }
+            budget_exhausted_in = _round_budget_exhausted_in(report)
+            if budget_exhausted_in:
+                print(
+                    f"[Verification] round {round_number}: the gate ran out "
+                    f"of budget in {budget_exhausted_in} — no verdict, an "
+                    f"operator has to decide"
+                )
+            else:
+                print(
+                    f"[Verification] round {round_number}: the environment "
+                    f"took this round out — no verdict, nothing to repair"
+                )
+            return _judged_nothing_cycle_result(report)
 
         # PASSED or PARTIAL with no real failures → treat as passed
         if overall_status == "PASSED" or (overall_status == "PARTIAL" and failed_count == 0 and deviation_count == 0):

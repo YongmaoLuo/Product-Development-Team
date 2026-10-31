@@ -25,6 +25,12 @@ own ``scripts/run_tests.sh`` placed in a throwaway project root that
 has both a stub ``backend/.venv/bin/activate`` and a
 ``backend/tests`` directory.  The copy is byte-for-byte the script the
 gate really runs, and nothing in the repository is touched.
+
+The merged gate runs every phase through the bounded runner, which is
+``backend/.venv/bin/python -c <source> <budget> <pytest> <args>``.  The
+synthetic virtualenv therefore also carries a ``bin/python`` symlink to
+the interpreter running this test: the stub pytest is still what the
+phase invokes, but the wall-clock guard around it needs a real Python.
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import List
 
@@ -86,6 +93,9 @@ def _synthetic_gate(tmp_path: Path) -> tuple[Path, Path]:
         "# stub activate: the gate only needs the file to exist\n",
         encoding="utf-8",
     )
+    # The bounded runner is ``"$VENV_PATH/bin/python" -c ...``; the stub
+    # venv needs a working interpreter for it, not a stub of its own.
+    (venv_bin / "python").symlink_to(sys.executable)
 
     tests = root / "backend" / "tests"
     tests.mkdir(parents=True)

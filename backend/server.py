@@ -4,6 +4,7 @@ FastAPI Web Server for Spec-Driven Development System
 
 import json
 import logging
+import math
 import os
 import os as _os  # module-level alias: _signal_handler (line ~3549) uses
                   # _os.getpid(); the previous function-local import left
@@ -1606,6 +1607,207 @@ def _start_orphan_reaper() -> Optional[int]:
         return None
 
 
+#: The environment variable that says how often the backend asks whether
+#: the reaper's daemon is still there.  Read per call — not at import
+#: time — so that a deployment, and a test, see the value the operator
+#: configured.
+ORPHAN_REAPER_ENSURE_INTERVAL_ENV = "PDT_ORPHAN_REAPER_ENSURE_INTERVAL_SECONDS"
+
+#: Five minutes.  Often enough that a daemon which stopped is missed for
+#: no long, rare enough that the question costs nothing: asking is a
+#: lock, a look at the lock holder, and (only when nobody holds it) a
+#: fork.
+DEFAULT_ORPHAN_REAPER_ENSURE_INTERVAL = 300
+
+#: How long the shutdown waits for the re-ensure thread to notice the
+#: stop event.  The thread waits on that event itself, so it wakes the
+#: moment the event is set; this is the belt to that pair of braces.
+_ORPHAN_REAPER_REENSURE_JOIN_TIMEOUT = 5.0
+
+#: The re-ensure thread, and the event that stops it.  Module state
+#: because the lifespan *starts* the thread and the shutdown *stops* it,
+#: and those are two different places.
+_ORPHAN_REAPER_REENSURE_THREAD: Optional[threading.Thread] = None
+_ORPHAN_REAPER_REENSURE_STOP: Optional[threading.Event] = None
+
+
+def _orphan_reaper_reensure_interval() -> float:
+    """How many seconds pass between two rounds of asking about the daemon.
+
+    Five minutes by default; the environment may say otherwise.  A
+    value that cannot be used — not a number, zero, a negative number,
+    ``nan``, an infinity — falls back to the default rather than to
+    nothing: a reaper that never runs because of a typo in a
+    deployment's environment is worse than one that runs on the default
+    schedule.
+    """
+    raw = os.environ.get(ORPHAN_REAPER_ENSURE_INTERVAL_ENV)
+    if raw is None or not str(raw).strip():
+        return float(DEFAULT_ORPHAN_REAPER_ENSURE_INTERVAL)
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return float(DEFAULT_ORPHAN_REAPER_ENSURE_INTERVAL)
+    if not math.isfinite(value) or value <= 0:
+        return float(DEFAULT_ORPHAN_REAPER_ENSURE_INTERVAL)
+    return value
+
+
+def _orphan_reaper_reensure_loop(
+    config: Any,
+    stop_event: threading.Event,
+    interval: float,
+    *,
+    ensure_fn: Optional[Callable[[Any], Any]] = None,
+) -> None:
+    """Ask, every *interval* seconds, whether the reaper's daemon is there.
+
+    The daemon is a process that **stops by itself**: it leaves when the
+    box is idle (no candidates, no owners) and when its own lifetime
+    ceiling is reached.  So "the backend started it once at boot" is
+    not the same claim as "the daemon is running" — the first is a
+    moment in the past, the second is a question that has to be asked
+    again.  This loop is the asking.
+
+    Two properties make the asking safe to repeat:
+
+    * **The ask is idempotent.**  ``ensure_daemon`` answers "a daemon
+      is already running" by doing nothing at all, so a round that
+      finds the daemon alive costs a lock and nothing more.
+    * **The ask cannot kill the thread.**  A round that raises is
+      logged and the *next* round still happens — a reaper that could
+      not be started once must not be the reason the orphans go
+      uncollected from then on.
+
+    The loop waits on the stop event rather than sleeping, so the
+    thread ends as soon as it is asked to, and it waits **before** the
+    first ask: the boot already ensured the daemon once (see
+    :func:`_start_orphan_reaper`), and this loop exists for the rounds
+    *after* that one.
+    """
+    while True:
+        if stop_event.wait(interval):
+            return
+        try:
+            if ensure_fn is None:
+                if orphan_reaper is None:
+                    return
+                orphan_reaper.ensure_daemon(config)
+            else:
+                ensure_fn(config)
+        except Exception:  # noqa: BLE001 - a failed round must not end the loop
+            logger.warning(
+                "[orphan_reaper] the re-ensure failed; the next round still happens",
+                exc_info=True,
+            )
+
+
+def _start_orphan_reaper_reensure() -> Optional[threading.Event]:
+    """Start asking, periodically, whether the reaper's daemon is there.
+
+    Returns the stop event of the thread that does the asking, or
+    ``None`` when nothing was started — which is the answer in every
+    case where the reaper must not act:
+
+    * there is no reaper module to ask about;
+    * this process is a test process (``_orphan_reaper_may_act``),
+      and the suite must never reap the developer's own processes;
+    * the reaper is switched off (``PDT_ORPHAN_REAPER=0``, or any other
+      way of turning ``config.enabled`` off).
+
+    A thread that is already asking keeps asking: the ask is
+    idempotent, but two threads asking every five minutes is twice the
+    work for no gain.
+    """
+    global _ORPHAN_REAPER_REENSURE_THREAD, _ORPHAN_REAPER_REENSURE_STOP
+
+    if orphan_reaper is None:
+        logger.warning(
+            "[orphan_reaper] unavailable; the daemon is not re-ensured"
+        )
+        return None
+
+    if not _orphan_reaper_may_act():
+        return None
+
+    if (
+        _ORPHAN_REAPER_REENSURE_THREAD is not None
+        and _ORPHAN_REAPER_REENSURE_THREAD.is_alive()
+    ):
+        return _ORPHAN_REAPER_REENSURE_STOP
+
+    try:
+        config = orphan_reaper.config_from_env()
+    except Exception:
+        logger.warning(
+            "[orphan_reaper] could not read its configuration; "
+            "the daemon is not re-ensured",
+            exc_info=True,
+        )
+        return None
+
+    if not getattr(config, "enabled", True):
+        return None
+
+    stop = threading.Event()
+    interval = _orphan_reaper_reensure_interval()
+    thread = threading.Thread(
+        target=_orphan_reaper_reensure_loop,
+        args=(config, stop, interval),
+        name="orphan-reaper-reensure",
+        daemon=True,
+    )
+    _ORPHAN_REAPER_REENSURE_STOP = stop
+    _ORPHAN_REAPER_REENSURE_THREAD = thread
+    thread.start()
+    logger.warning(
+        "[orphan_reaper] the daemon will be re-ensured every %.1fs",
+        interval,
+    )
+    return stop
+
+
+def _stop_orphan_reaper_reensure() -> None:
+    """Stop the re-ensure thread and wait for it to end.
+
+    The stop is a request and the join is the guarantee: a thread that
+    was asked to stop but is still running would keep asking about the
+    daemon in a world that is being taken apart.
+
+    Stopping a re-ensure that was never started is an ordinary
+    outcome, not an error — the shutdown path runs the teardown
+    whether or not the boot started the thread, so this has to be
+    idempotent.
+    """
+    global _ORPHAN_REAPER_REENSURE_THREAD, _ORPHAN_REAPER_REENSURE_STOP
+
+    stop = _ORPHAN_REAPER_REENSURE_STOP
+    thread = _ORPHAN_REAPER_REENSURE_THREAD
+    _ORPHAN_REAPER_REENSURE_THREAD = None
+    _ORPHAN_REAPER_REENSURE_STOP = None
+
+    if stop is not None:
+        try:
+            stop.set()
+        except Exception:  # noqa: BLE001 — the teardown must not raise
+            logger.exception("[orphan_reaper] the re-ensure stop event failed")
+
+    if thread is None:
+        return
+
+    try:
+        thread.join(_ORPHAN_REAPER_REENSURE_JOIN_TIMEOUT)
+    except Exception:  # noqa: BLE001 — the teardown must not raise
+        logger.exception("[orphan_reaper] the re-ensure thread could not be joined")
+        return
+
+    if thread.is_alive():
+        logger.warning(
+            "[orphan_reaper] the re-ensure thread did not stop within %.1fs",
+            _ORPHAN_REAPER_REENSURE_JOIN_TIMEOUT,
+        )
+
+
 def _run_boot_sweeps() -> None:
     """The two boot-time sweeps, as one unit of work.
 
@@ -1858,6 +2060,24 @@ async def _lifespan(app):
     if _orphan_reaper_may_act():
         _start_orphan_reaper()
 
+    # 2026-10-31: the periodic re-ensure.
+    #
+    # The daemon started above is started **once**, at boot — and it
+    # stops by itself: it leaves when the box is idle (no candidates,
+    # no owners) and when its own lifetime ceiling is reached.  Between
+    # that exit and the next restart of the backend, nothing would start
+    # it again, and nothing would be reclaimed: an executor that
+    # outlived the plan that spawned it would keep its memory, its port
+    # and its subprocess tree for the rest of the machine's uptime.
+    #
+    # So the backend asks again, every few minutes.  The ask is
+    # idempotent — ``ensure_daemon`` does nothing when a daemon is
+    # already running — so asking when nothing is wrong costs one lock.
+    # The function decides for itself whether there is anything to ask
+    # about: a switched-off reaper and a test process both get no
+    # thread.
+    _start_orphan_reaper_reensure()
+
     # 2026-09-17 — publish the same tracker to the scene-routing dispatch
     # path. ``AutonomousAgent`` receives it by DI, but ``ClaudeCodingTool``
     # is constructed in ~25 places (most without app state in scope) and
@@ -2008,6 +2228,10 @@ async def _lifespan(app):
         if scheduler.owned:
             _stop_scheduler_engine(scheduler)
             app.state.scheduler_engine = None
+        # The re-ensure thread stops before the heartbeat: it is a
+        # background thread of this backend, and it must not go on
+        # asking about the daemon in a world that is being taken apart.
+        _stop_orphan_reaper_reensure()
         heartbeat_monitor.stop()
         if feishu_notifier is not None:
             try:
