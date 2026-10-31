@@ -30,7 +30,7 @@ with a 404 (``{"detail": "Not found"}``) instead of the snapshot.
    with the idle read model — each one logged, none of them a reason
    to leave the panel without an answer.
 
-Two further pins ride along: the route is registered *ahead* of the
+Two further pins ride along: the route is registered **ahead of** the
 catch-all (the registration order is what the 404 above is made of),
 and the route module does not open a database of its own — it reads
 the engine's snapshot and nothing else.
@@ -48,7 +48,7 @@ forgot a header.
 Why this directory has no ``__init__.py``
 -----------------------------------------
 The production package is called ``plan_scheduler``, and so is this
-directory.  A ``__init__.py`` here would make pytest import this
+directory.  An ``__init__.py`` here would make pytest import this
 directory as the **top-level** package ``plan_scheduler`` — and the
 name would then mean two things at once, with the winner decided by
 the order the files happen to be imported in:
@@ -261,15 +261,19 @@ def test_state_key_set_closed(install_engine):
     assert set(body) == EXPECTED_KEYS, sorted(body)
     assert set(body["queue"][0]) == {
         "position",
+        "plan_id",
         "seq",
         "priority",
         "promote_order",
+        "due",
         "reason",
     }, sorted(body["queue"][0])
     assert set(body["running"][0]) == {
         "plan_id",
         "acquired_at",
         "elapsed_sec",
+        "running_sec",
+        "started_at",
         "evictable",
         "workspace",
     }, sorted(body["running"][0])

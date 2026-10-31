@@ -22,7 +22,7 @@
   ``_shutdown_all_executions()`` 真的跑了；
 * **真浏览器** —— Playwright 驱动真 Chromium 打开真页面，看操作者看得见
   的是什么：计划列表里**没有**那条被停掉的计划（执行行的裁决是终局的），
-  而**调度面板**里列着它，相位 ``queued``、带着可执行的操作。
+  而**调度面板的队列**里列着它，带着可执行的操作。
 
 唯一的替身仍然是模型（``PDT_LLM_MODE=scripted``，磁盘上的固定回答），
 这跟同目录的 ``test_plan_lifecycle_ui_e2e.py`` 是同一条缝。
@@ -40,7 +40,8 @@
 4. 第二次启动读到那份检查点，把行落成 ``stopped`` + ``server_shutdown`` +
    pid 为空，把相位落成 ``queued`` —— 不是 ``failed``；
 5. 调度器看得见它（``PlanFactsReader.queued_plans()`` 里有它）；
-6. 页面上的**调度面板**列着它，相位是 ``queued``（带「排队中」这个标签）；
+6. **带终局计划的那份列表**里有它，相位是 ``queued``（带「排队中」这个标签）；
+   页面上的**调度面板的队列**里也列着它，带着可执行的操作；
 7. 再点一次开始，走的是**续跑**：``resumed=True``，``resume_plan`` 里有 t2，
    **没有 t1** —— 已经做完的任务不重跑。
 
@@ -62,8 +63,8 @@
    「一次跑挂了或被停掉的计划就是结束了，不管工作流相位怎么说」）。
    所以本文件断言的是**两件事**：默认列表**没有**这条计划（连同一条
    无关计划做负控，证明列表本身是好的），而**带终局计划的那份列表**
-   （``?include_terminal=true``，调度面板自己读的那份）里有它，
-   相位 ``queued``、标签「排队中」，浏览器里的调度面板也列着它。
+   （``?include_terminal=true``）里有它，相位 ``queued``、标签「排队中」，
+   浏览器里**调度面板的队列**里也有它，带着可执行的操作。
    同一个取舍也让同目录的 ``test_plan_lifecycle_ui_e2e.py`` 在本分支上
    变红（它的 ``requeued`` 模式同样在等一张回不来的卡片）。
 3. **续跑计划里只有 t2。** 简报的输出示例写 ``resume_plan_ids`` 是
@@ -82,6 +83,18 @@
    ``FeishuUnavailable``，通知器于是记一条日志然后**保持惰性**
    （``server.py`` 的 lifespan 把整个构造包在 ``except Exception`` 里）。
    飞书在这台机器上本来就没有配置，桩没有改变任何被测行为。
+6. **面板那一遍要一台「调度器开着」的服务器。** 调度面板画的是**队列**
+   ——``scheduler_queue`` 表，那是调度器自己的表，写它的是调度器的
+   worker。仓库自己的配置把调度器关着（``backend/config.yaml`` 的
+   ``scheduler.enabled: false``），所以调度器没开的服务器读到的是空
+   文档，队列里没有行，面板也就没有行可读。于是面板那一遍跑在一台
+   **自己的**服务器上：状态库、计划树、脚本模型都跟第二次启动那一台
+   一样（面板要看见的就是本用例停下来的那条计划），只有调度器的设置
+   是自己的 —— 通过服务器暴露的那条缝（``server._scheduler_settings_path``）
+   指到自己的文件上，缝是**点名**的，不是替身。容量是 **0**（「什么都不
+   跑」是一个自洽的容量，配置自己的注释就是这么写的）：调度器**留着队
+   列**，也就是面板要画的东西，但**不准入任何人**，所以本用例停下来的那条
+   计划一直停在那儿，剩下的步骤不会被一条自己跑起来的计划打扰。
 
 复跑
 ----
@@ -441,11 +454,11 @@ _SCHEDULER_DRIVER = r'''
 """Drive the scheduler panel and report the rows it shows.
 
 One question, two surfaces: what the plan list draws on its own, and
-what the scheduler panel lists.  The panel reads the listing with
-``?include_terminal=true`` — the terminal plans are included on
-purpose, because a stopped plan is the one that can be resumed — so a
-plan the shutdown parked is listed there with the phase it was parked
-in, and with the actions that phase allows.
+what the scheduler panel draws.  The panel draws two tables: the
+**queue** and the running plans.  The queue is where a plan that is
+waiting is named — with the reason it is waiting and the actions a
+waiting plan can be given — so a plan the shutdown parked is named
+there, and the actions beside it are the ones an operator may press.
 """
 import json
 import sys
@@ -497,16 +510,23 @@ def plan_cards(page):
 
 
 def panel_rows(page):
-    """The panel's rows: ``(plan_id, phase, number of action buttons)``."""
+    """The queue the panel draws: ``(plan_id, reason, action buttons)``.
+
+    The queue's cells are the position, the plan, the number, the
+    priority, the promotion, the reason and the actions — so the plan
+    is the second cell, the reason the sixth, and the buttons are in
+    the last one.
+    """
     return page.evaluate(
         """() => Array.from(
-              document.querySelectorAll('#scheduler-plans-list tr')
+              document.querySelectorAll('#scheduler-queue-list tr')
            ).map(row => {
               const cells = row.querySelectorAll('td');
+              const actions = cells.length > 6 ? cells[6] : null;
               return [
-                cells[0] ? cells[0].textContent.trim() : '',
                 cells[1] ? cells[1].textContent.trim() : '',
-                cells[2] ? cells[2].querySelectorAll('button').length : 0,
+                cells[5] ? cells[5].textContent.trim() : '',
+                actions ? actions.querySelectorAll('button').length : 0,
               ];
            })"""
     )
@@ -544,9 +564,9 @@ with sync_playwright() as driver:
     page.wait_for_timeout(300)
     report["plan_cards"] = plan_cards(page)
 
-    # The panel: it lists the terminal plans on purpose.
+    # The panel: the queue is the block that names a waiting plan.
     page.click("#btn-open-scheduler")
-    page.wait_for_selector("#scheduler-plans-list tr", timeout=30000)
+    page.wait_for_selector("#scheduler-queue-list tr", timeout=30000)
     page.wait_for_timeout(500)
     report["rows"] = panel_rows(page)
     page.screenshot(
@@ -555,6 +575,164 @@ with sync_playwright() as driver:
 
 print(json.dumps(report, ensure_ascii=False))
 '''
+
+
+# ---------------------------------------------------------------------------
+# A server whose scheduler is on — the panel draws the scheduler's queue
+# ---------------------------------------------------------------------------
+
+
+#: The launcher of the panel server.
+#:
+#: The scheduler reads the ``scheduler:`` section of the backend's own
+#: ``config.yaml``, and the path it reads is a seam the server exposes
+#: (``server._scheduler_settings_path``).  This run points that seam at a
+#: file of its own, so the case can say what the scheduler is told
+#: without touching the repository's configuration.  The seam is
+#: *named*, not replaced: no component of the application is swapped for
+#: a double.  (The same shape as the operator case in
+#: ``plan_scheduler/test_scheduler_operator_e2e.py``.)
+_PANEL_SERVER_LAUNCHER = r'''
+"""Boot the backend with the scheduler's settings file pointed elsewhere.
+
+The path the scheduler's settings are read from is a seam the server
+exposes (``server._scheduler_settings_path``), so this run points it at
+a file of its own.  Nothing is replaced -- the seam is named, exactly
+the way the repository's own cases name it.
+"""
+import sys
+from pathlib import Path
+
+backend_dir = Path(sys.argv[1])
+settings_path = Path(sys.argv[2])
+port = int(sys.argv[3])
+
+sys.path.insert(0, str(backend_dir))
+sys.path.insert(0, str(backend_dir.parent))
+
+import server
+
+server._scheduler_settings_path = lambda: settings_path
+
+import uvicorn
+
+uvicorn.run(server.app, host="127.0.0.1", port=port, log_level="warning")
+'''
+
+
+def _write_scheduler_settings(path: Path) -> None:
+    """Write the settings the panel server's scheduler is told to read.
+
+    The scheduler is **on**: the panel draws the scheduler's own queue,
+    and a server whose scheduler is off answers the read model with an
+    empty document — there is no queue to draw.
+
+    The capacity is **zero**, and zero is a coherent capacity ("run
+    nothing"): the scheduler keeps the line — that is what the panel
+    draws — and admits nobody, so the plan this case parked stays
+    parked and nothing starts underneath the rest of the case.  A young
+    run is protected for ten minutes, as everywhere else: a run that has
+    not had its turn is never interrupted for the sake of a number.
+    """
+    path.write_text(
+        "scheduler:\n"
+        "  enabled: true\n"
+        "  dry_run: false\n"
+        "  capacity: 0\n"
+        "  min_runtime_seconds: 600\n"
+        "  tick_seconds: 0.5\n"
+        "  command_timeout_seconds: 30\n",
+        encoding="utf-8",
+    )
+
+
+def _boot_panel_server(
+    work: Path, script_dir: Path, settings_path: Path, launcher_path: Path
+) -> Tuple[str, subprocess.Popen]:
+    """Boot a server whose scheduler is on; return ``(base_url, proc)``.
+
+    The panel is a **scheduler** surface, so it needs a scheduler: the
+    queue it draws is the scheduler's own queue table, and the scheduler
+    is what writes that table.  The repository's own configuration
+    leaves the scheduler switched off, so this server is pointed at a
+    settings file of its own through the seam the server exposes.
+
+    Everything else is the reused boot's environment — the same state
+    database, the same plans tree, the same scripted model — because
+    the panel has to show the very plan the rest of this case parked.
+    """
+    port = _H._free_port()
+    env = dict(os.environ)
+    env.update(
+        {
+            "PDT_STATE_DB_PATH": str(work / "state.db"),
+            "PDT_PLANS_DIR": str(work / "plans"),
+            "PDT_HOST": "127.0.0.1",
+            "PDT_PORT": str(port),
+            "PDT_DEBUG_ROUTES": "1",
+            "PDT_ALLOWED_HOSTS": "127.0.0.1,localhost,testserver",
+            "PDT_PROVIDER_MODE": "inherit",
+            "PDT_PROVIDER_CAPACITY_FILE": str(work / "absent.yaml"),
+            "PDT_LLM_MODE": "scripted",
+            "PDT_LLM_SCRIPT_DIR": str(script_dir),
+            "PDT_DISABLE_FALSIFIABILITY_PROBE": "1",
+            "PYTHONPATH": os.pathsep.join(
+                [str(_H.BACKEND_DIR), env.get("PYTHONPATH", "")]
+            ),
+        }
+    )
+    env.pop("ANTHROPIC_BASE_URL", None)
+    # A throwaway test server has no secret to receive, and a stale
+    # descriptor number must never be closed by a process that never
+    # owned it.
+    for key in [k for k in env if k.startswith("PDT_SECRET_FD_")]:
+        env.pop(key, None)
+
+    log_handle = (work / "panel-server.log").open("wb")
+    proc = subprocess.Popen(
+        [
+            str(VENV_PYTHON),
+            str(launcher_path),
+            str(_H.BACKEND_DIR),
+            str(settings_path),
+            str(port),
+        ],
+        cwd=str(_H.PROJECT_ROOT),
+        env=env,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        _H._wait_for_api(base_url, "/api/plans", timeout=60.0)
+    except Exception:
+        proc.kill()
+        proc.wait(timeout=5)
+        log_handle.close()
+        raise
+    proc._pdt_log_handle = log_handle  # type: ignore[attr-defined]
+    return base_url, proc
+
+
+def _kill_panel_server(proc: subprocess.Popen) -> None:
+    """Stop the panel server, without touching the plan it was showing.
+
+    The reused teardown stops the plan on its way out, and this plan
+    belongs to the *other* server: it is the one that resumes it, and
+    stopping it here would take it out of the phase the rest of the
+    case is about.  The scheduler this server ran never started
+    anything — its capacity was zero — so there is no executor to reap
+    and nothing to stop but the process itself.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, AttributeError):
+        proc.kill()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _run_scheduler_driver(
@@ -656,6 +834,13 @@ def test_shutdown_writes_a_checkpoint_and_restart_parks_queued(tmp_path, monkeyp
     script.write_text(_BROWSER_DRIVER, encoding="utf-8")
     panel_script = work / "drive_scheduler_panel.py"
     panel_script.write_text(_SCHEDULER_DRIVER, encoding="utf-8")
+    # The panel pass needs a server whose scheduler is on — the queue it
+    # draws is the scheduler's own table — so it gets a launcher and a
+    # settings file of its own.
+    settings_path = work / "scheduler-settings.yaml"
+    launcher_path = work / "launch_panel_server.py"
+    _write_scheduler_settings(settings_path)
+    launcher_path.write_text(_PANEL_SERVER_LAUNCHER, encoding="utf-8")
 
     report: Dict[str, Any] = {"plan_id": PLAN_ID}
     base_url = ""
@@ -831,12 +1016,22 @@ def test_shutdown_writes_a_checkpoint_and_restart_parks_queued(tmp_path, monkeyp
             f"{card_report.get('cards')!r}"
         )
 
-        # 7d: the browser — the scheduler panel lists it, in the queued
-        #     phase, with the actions that phase allows.  This is the
+        # 7d: the browser — the scheduler panel's **queue** holds it, with
+        #     the actions a waiting plan can be given.  This is the
         #     surface where a parked plan is visible to the operator.
-        panel = _run_scheduler_driver(
-            interpreter, panel_script, base_url, PLAN_ID, artifacts
+        #
+        #     The queue is the scheduler's own table, so the panel pass
+        #     runs against a server whose scheduler is on — with a
+        #     capacity of zero, so it keeps the line and starts nothing.
+        panel_url, panel_proc = _boot_panel_server(
+            work, script_dir, settings_path, launcher_path
         )
+        try:
+            panel = _run_scheduler_driver(
+                interpreter, panel_script, panel_url, PLAN_ID, artifacts
+            )
+        finally:
+            _kill_panel_server(panel_proc)
         report["browser_panel"] = panel
         assert not panel.get("page_errors"), (
             f"the page raised errors: {panel.get('page_errors')!r}"
@@ -854,11 +1049,12 @@ def test_shutdown_writes_a_checkpoint_and_restart_parks_queued(tmp_path, monkeyp
         rows = panel.get("rows") or []
         row = next((r for r in rows if r and r[0] == PLAN_ID), None)
         assert row is not None, (
-            f"the scheduler panel does not list the parked plan: {rows!r}"
+            f"the scheduler panel's queue does not hold the parked plan: {rows!r}"
         )
         report["panel_row"] = row
-        assert row[1] == "queued", (
-            f"the panel must show the phase the plan was parked in; got {row[1]!r}"
+        assert row[1], (
+            "the panel must say why the plan is waiting; got "
+            f"{row[1]!r}"
         )
         assert row[2] >= 1, (
             "the parked plan must be actionable in the panel — that is the "

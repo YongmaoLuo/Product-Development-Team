@@ -205,10 +205,15 @@ def test_over_capacity_matches_used() -> None:
 
 
 def test_capacity_reports_total_and_used() -> None:
-    """The capacity block says how many slots there are and how many are taken."""
+    """The capacity block says how many slots there are and how many are taken.
+
+    It says where the number came from as well: a capacity that was
+    overridden is not the same thing as a capacity that came from the
+    configuration, and the panel has to be able to tell them apart.
+    """
     result = build(_state(capacity=4, used=5))
 
-    assert result["capacity"] == {"total": 4, "used": 5}
+    assert result["capacity"] == {"total": 4, "used": 5, "source": "config"}
 
 
 # ---------------------------------------------------------------------------
@@ -249,18 +254,22 @@ def test_key_set_is_closed() -> None:
         "running",
         "generated_at",
     }
-    assert set(result["capacity"]) == {"total", "used"}
+    assert set(result["capacity"]) == {"total", "used", "source"}
     assert set(result["queue"][0]) == {
         "position",
+        "plan_id",
         "seq",
         "priority",
         "promote_order",
+        "due",
         "reason",
     }
     assert set(result["running"][0]) == {
         "plan_id",
         "acquired_at",
         "elapsed_sec",
+        "running_sec",
+        "started_at",
         "evictable",
         "workspace",
     }

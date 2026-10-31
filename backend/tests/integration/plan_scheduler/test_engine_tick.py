@@ -545,7 +545,10 @@ def test_snapshot_is_the_read_model(db_factory, plan_factory) -> None:
         "generated_at",
     }, "the snapshot has another shape: {0!r}".format(sorted(snapshot))
 
-    assert snapshot["capacity"] == {"total": 1, "used": 0}, (
+    # 2026-10-30：快照的 capacity 增加了 source 字段（容量来自配置文件还是运行期
+    # 覆盖），按本 gate 的既定流程把该字段纳入断言；形状仍按全等比较，多一个键或
+    # 少一个键都打红。
+    assert snapshot["capacity"] == {"total": 1, "used": 0, "source": "config"}, (
         "the capacity is {0!r}".format(snapshot["capacity"])
     )
     assert snapshot["over_capacity"] is False

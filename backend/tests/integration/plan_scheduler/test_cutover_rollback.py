@@ -147,6 +147,19 @@ SWITCH_WORDS = (
     "off_on",
 )
 
+#: The scheduler's own paths that are not about one plan: the read
+#: model, and the capacity knob that says how many plans may run at
+#: once.  Neither is a switch — one reads, the other sets a number —
+#: and neither acts on a single plan either.
+#:
+#: 2026-10-30：因新增容量端点 POST /api/scheduler/capacity（容量的运行期覆盖）
+#: 改动本文件，按本 gate 的既定流程把该端点纳入「不针对单个计划」的路径集合。
+#: 开关判定本身没有放宽：SWITCH_WORDS 未变，任何新的全局调度路由仍然打红。
+GLOBAL_SCHEDULER_PATHS = (
+    "/api/scheduler/state",
+    "/api/scheduler/capacity",
+)
+
 #: A switch word as a whole word.  ``schedulerToggle`` is a helper that
 #: shows and hides a table, not a switch: the word is part of a longer
 #: name, and a name is not a control.
@@ -1022,11 +1035,12 @@ def test_no_global_toggle_in_ui_or_api(server_module) -> None:
             f"the scheduler's {action} action is gone: {scheduler_paths!r}"
         )
     for path in scheduler_paths:
-        if path == "/api/scheduler/state":
+        if path in GLOBAL_SCHEDULER_PATHS:
             continue
         assert path.startswith("/api/plan/"), (
             f"a scheduler route that is not about one plan: {path!r}. The "
-            "read model and the per-plan actions are the whole of it."
+            "read model, the capacity knob and the per-plan actions are "
+            "the whole of it."
         )
 
     # The predicate has to be able to fail.

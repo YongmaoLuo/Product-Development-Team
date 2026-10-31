@@ -10,9 +10,9 @@ state-machine database MUST be EXACTLY::
 
     {plan_routing, plan_execution, plan_verification, plan_artifacts,
      plan_tasks, plan_decisions, scheduler_queue, scheduler_slot,
-     scheduler_command, schema_version}
+     scheduler_command, scheduler_setting, schema_version}
 
-i.e. the ``plan_*`` "concern" tables, the three ``scheduler_*`` tables
+i.e. the ``plan_*`` "concern" tables, the four ``scheduler_*`` tables
 and one ``schema_version`` migration logbook table.  No legacy
 ``plans``, ``plan_meta``, or ``plan_activity`` tables are allowed; no
 extra ``plan_*`` or ``scheduler_*`` tables are allowed either.
@@ -34,6 +34,10 @@ Schema v7 (2026-10-28) added three more: ``scheduler_queue``,
 ``scheduler_slot`` and ``scheduler_command`` -- the native scheduler's
 own three facts (who runs next, who holds a slot, which command was
 issued), created by the same ``migrate`` call as the tables above.
+``scheduler_setting`` (2026-10-29) joined them: the runtime knobs an
+operator changes while the scheduler runs, the capacity override above
+all -- a row in the state database, because the configuration file it
+overrides is tracked by git and may not be rewritten at runtime.
 The *expectation* is the set below, and the set is what the schema has
 to equal.
 
@@ -80,9 +84,10 @@ from state_machine.db.schema import migrate  # noqa: E402
 # ``state_machine/db/schema.py`` and ``task_manager``'s
 # ``_persist_status_to_sqlite``), the v7 ``plan_decisions`` table
 # (the human-in-the-loop decision store — see the same schema module's
-# ``_ensure_plan_decisions``), and the three v7 ``scheduler_*`` tables
-# (the native scheduler's queue order, slot occupancy and operator
-# commands — see the same schema module's ``_SCHEDULER_OBJECTS``).
+# ``_ensure_plan_decisions``), and the four v7 ``scheduler_*`` tables
+# (the native scheduler's queue order, slot occupancy, operator
+# commands and runtime settings — see the same schema module's
+# ``_SCHEDULER_OBJECTS``).
 EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
     {
         "plan_routing",
@@ -94,6 +99,7 @@ EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
         "scheduler_queue",
         "scheduler_slot",
         "scheduler_command",
+        "scheduler_setting",
         "schema_version",
     }
 )

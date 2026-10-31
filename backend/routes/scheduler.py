@@ -1,10 +1,14 @@
-"""The scheduler over HTTP: one read model, and four operator actions.
+"""The scheduler over HTTP: one read model, one capacity knob, and four
+operator actions.
 
 What this file is
 -----------------
 ``GET /api/scheduler/state`` — the whole scheduler state, in one
 document.  The operator panel, the LUI and anything else that wantsto know "what is running, what is waiting, and why is it waiting" read
 this one endpoint, so that they cannot disagree with each other.
+
+``POST /api/scheduler/capacity`` — the operator's capacity knob: how
+many plans may run at the same time, written while the scheduler runs.
 
 ``POST /api/plan/{plan_id}/scheduler/{promote|pause|resume|start}`` —
 the four actions an operator can take on a plan.  Each one is a
@@ -58,8 +62,39 @@ The engine handle
 -----------------
 ``app.state.scheduler_engine`` — the same handle the lifespan hangs
 the engine on, and ``None`` while the scheduler is not running.  The
-route reads it and nothing else; it never constructs an engine, never
-starts one and never writes.
+routes read it and nothing else; they never construct an engine and
+never start one.  The capacity endpoint writes **through** that engine
+— on its store, on its connection — so that the scheduler's facts keep
+their one writer and the route opens no database of its own.
+
+The capacity knob
+-----------------
+``POST /api/scheduler/capacity`` writes the **capacity override** — how
+many plans may run at the same time — while the scheduler runs, and
+takes it away again on request.  The override is a row in the state
+database, and the engine reads that row on every tick, so a number
+written here is in force at once and a number removed puts the
+configured capacity back.
+
+The answer carries the number that is in force **and the word that
+says where it came from** — ``override`` or ``config`` — because a
+panel that shows the number without the word cannot tell the
+operator's number from the configured one.
+
+Three answers, and what each of them is:
+
+* **200** — the capacity was written, or the configured one was put
+  back;
+* **400** — the request says something the scheduler cannot run with: a
+  capacity that is not a number, a number outside the range, or a
+  request that says nothing at all.  The refusal says which of them it
+  was;
+* **503** — there is no scheduler to write on: the engine is not
+  running, or its configuration says the scheduler is switched off.
+
+A number written here is **the** capacity while it is there, and the
+engine reads it again on every tick — so the endpoint writes a fact,
+not a wish.
 
 The answers the four actions give
 ---------------------------------
@@ -135,6 +170,7 @@ from typing import Any, Dict, FrozenSet, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from plan_scheduler.commands import (
     APPLIED,
@@ -144,6 +180,7 @@ from plan_scheduler.commands import (
     STARTED,
     CommandRejected,
 )
+from plan_scheduler.capacity import CAPACITY_OVERRIDE_KEY
 from plan_scheduler.engine import FAILED, PENDING_ANSWER
 from plan_scheduler.snapshot import build
 
@@ -246,6 +283,180 @@ def get_scheduler_state(request: Request) -> Dict[str, Any]:
         return _empty_snapshot()
 
     return dict(snapshot)
+
+
+# ---------------------------------------------------------------------------
+# The capacity knob
+# ---------------------------------------------------------------------------
+
+
+#: The lowest and the highest capacity the endpoint accepts.
+#:
+#: A capacity is a number of plans the machine may run at the same
+#: time: it has to be a whole number, and it has to be inside the
+#: range.  The range is written down here — once — so that the endpoint
+#: and the panel cannot drift apart about what may be asked for, and so
+#: that the refusal can quote it.
+_CAPACITY_MIN = 1
+_CAPACITY_MAX = 64
+
+
+class CapacityRequest(BaseModel):
+    """The request body of ``POST /api/scheduler/capacity``.
+
+    Two fields, two meanings:
+
+    * ``total`` — the capacity the operator asks for: a whole number
+      between 1 and 64, or ``None`` to put the configured one back;
+    * ``reset`` — put the configured capacity back.
+
+    ``total`` is typed ``Any`` and not ``int`` **on purpose**: a model
+    that typed it as an integer would quietly turn ``"5"`` into ``5``
+    and ``true`` into ``1`` before the route ever saw them — and
+    neither is the number that was asked for.  The model here only
+    **takes the request in**; whether the number is one the scheduler
+    may run with is the route's answer to give, and it gives it with a
+    400 that says what was wrong.
+    """
+
+    total: Any = Field(
+        default=None,
+        json_schema_extra={
+            "type": ["integer", "null"],
+            "minimum": _CAPACITY_MIN,
+            "maximum": _CAPACITY_MAX,
+            "description": (
+                "how many plans may run at the same time; null puts the "
+                "configured capacity back"
+            ),
+        },
+    )
+    reset: bool = Field(
+        default=False,
+        description="put the configured capacity back",
+    )
+
+
+def _scheduler_engine(request: Request) -> Any:
+    """The engine the request is about — or a refusal.
+
+    The handle is the one the lifespan hangs the engine on, and it is
+    ``None`` while the scheduler is not running.  An engine whose
+    configuration says the scheduler is switched off is refused the same
+    way: nothing is running that could enforce a capacity, so a number
+    written on it would be a number nobody keeps.
+    """
+    engine = getattr(request.app.state, "scheduler_engine", None)
+    if engine is None:
+        raise HTTPException(503, {"error": "scheduler_unavailable"})
+
+    config = getattr(engine, "_config", None)
+    if not bool(getattr(config, "enabled", True)):
+        raise HTTPException(503, {"error": "scheduler_unavailable"})
+
+    return engine
+
+
+def _requested_total(body: CapacityRequest) -> Optional[int]:
+    """The number that was asked for — or ``None`` to reset.
+
+    Three questions, in this order:
+
+    * a number was sent → it is the capacity, and it has to be one the
+      scheduler may run with;
+    * ``total`` was sent as ``null``, or ``reset`` was asked for → put
+      the configured capacity back;
+    * nothing was said → the request says nothing, and is refused.
+
+    A number wins over ``reset``: a number was asked for, and one
+    number is more specific than "put it back".
+    """
+    if "total" in body.model_fields_set and body.total is not None:
+        value = body.total
+        # ``bool`` is an ``int`` in Python, so ``true`` would otherwise
+        # slip through as the capacity ``1`` — a number nobody wrote.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise HTTPException(
+                400,
+                "total must be a whole number between "
+                f"{_CAPACITY_MIN} and {_CAPACITY_MAX}",
+            )
+        if value < _CAPACITY_MIN or value > _CAPACITY_MAX:
+            raise HTTPException(
+                400,
+                "total must be between "
+                f"{_CAPACITY_MIN} and {_CAPACITY_MAX} (got {value})",
+            )
+        return value
+
+    if body.reset or "total" in body.model_fields_set:
+        return None
+
+    raise HTTPException(
+        400,
+        "the request must carry a total, or reset: true",
+    )
+
+
+def _write_capacity(engine: Any, total: Optional[int]) -> None:
+    """Write the operator's capacity — or take it away again.
+
+    The override is a **row in the state database**, and the engine
+    reads that row on every tick: a number written here is in force at
+    once, and a number removed puts the configured capacity back.
+
+    The row is written through the engine's own store, on the engine's
+    own connection.  The route opens no database of its own: there is
+    one connection on the state database, and the scheduler's facts
+    keep their one writer.
+    """
+    store = getattr(engine, "_store", None)
+    conn = getattr(engine, "_conn", None)
+    if store is None or conn is None:
+        # An engine that cannot be written on is an engine the capacity
+        # cannot be written on either.
+        raise HTTPException(503, {"error": "scheduler_unavailable"})
+
+    if total is None:
+        store.delete_setting(conn, CAPACITY_OVERRIDE_KEY)
+    else:
+        store.set_setting(conn, CAPACITY_OVERRIDE_KEY, str(total))
+
+
+def _capacity_in_force(engine: Any) -> Dict[str, Any]:
+    """The capacity that is in force right now, and where it came from.
+
+    Read from the engine's own reader — the one that fills the read
+    model's ``capacity`` and its ``source`` — so that the number and
+    the word always agree with each other, and so that the answer to
+    this call and the answer to ``GET /api/scheduler/state`` cannot
+    disagree.
+    """
+    total, source = engine._capacity_and_source()
+    return {"total": total, "source": source}
+
+
+@router.post("/api/scheduler/capacity")
+def set_capacity(body: CapacityRequest, request: Request) -> JSONResponse:
+    """Set the capacity the scheduler runs with — or put it back.
+
+    The number the operator writes is the capacity **while it is
+    there**: the engine reads the override again on every tick, so it
+    takes effect at once and needs no restart.
+
+    The answer says which number is in force and where it came from —
+    ``override`` for the operator's number, ``config`` for the
+    configured one — so a caller never has to guess whether the number
+    it sees is the one it wrote.
+    """
+    engine = _scheduler_engine(request)
+    total = _requested_total(body)
+
+    _write_capacity(engine, total)
+
+    return JSONResponse(
+        status_code=200, content={"capacity": _capacity_in_force(engine)}
+    )
 
 
 # ---------------------------------------------------------------------------

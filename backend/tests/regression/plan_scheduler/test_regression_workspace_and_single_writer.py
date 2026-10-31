@@ -903,7 +903,11 @@ def test_regression_workspace_block_is_reported(tmp_path, monkeypatch):
     # plan was working.  So the second plan was not stopped by the
     # lack of a slot — it was stopped by the directory, and the reason
     # above has to say so.
-    assert snapshot["capacity"] == {"total": 2, "used": 1}, snapshot
+    # The snapshot's capacity carries a source field (the configured
+    # capacity or a runtime override), so the comparison takes that
+    # field into account -- the shape is still compared for exact
+    # equality, so one key too many or too few turns the gate red.
+    assert snapshot["capacity"] == {"total": 2, "used": 1, "source": "config"}, snapshot
 
     # The blocked plan is the one that is waiting — it was never
     # started, and it is still waiting.
@@ -1379,10 +1383,13 @@ def test_scheduler_routes_do_not_reach_the_scheduler_storage():
 # VP-015 — the workspace: the block is recomputed, and it is never stored
 # ---------------------------------------------------------------------------
 
-#: The scheduler's own three tables.  They are the only tables the
+#: The scheduler's own four tables.  They are the only tables the
 #: scheduler writes, and the question the second case below asks is
 #: whether any of them carries a workspace.
-SCHEDULER_TABLES = ("scheduler_command", "scheduler_queue", "scheduler_slot")
+SCHEDULER_TABLES = (
+    "scheduler_command", "scheduler_queue", "scheduler_slot",
+    "scheduler_setting",
+)
 
 
 # ---------------------------------------------------------------------------
