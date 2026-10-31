@@ -35,7 +35,9 @@ The five questions
     Which plans are holding compute.  Two kinds of work hold compute:
     an execution subprocess, and a verification round.  The two sets are
     unioned and counted per plan, because a plan that does both holds
-    one slot, not two.
+    one slot, not two.  Each row also carries the ``started_at`` of the
+    plan's execution row — the moment the plan really began, which the
+    slot clock loses on every restart.
 ``has_pending_decision(plan_id)``
     Is a human being asked about this plan?  The answer is a *guard*,
     not a release: a pending decision keeps a plan from being mistaken
@@ -48,6 +50,7 @@ The five questions
 
 The two sides of "is this plan working?"
 ----------------------------------------
+
 **The execution side** is the subprocess: ``exec_status`` says running
 and ``exec_pid`` names a process that is still there.  The pid is
 probed with ``kill(pid, 0)`` rather than trusted, because ``exec_pid``
@@ -172,6 +175,7 @@ _EXECUTION_COLUMNS = (
     "exec_status",
     "project_dir",
     "next_run_at",
+    "started_at",
 )
 
 #: The columns of ``plan_verification`` this module reads.
@@ -186,6 +190,26 @@ def _as_dict(columns: Tuple[str, ...], row: Any) -> Dict[str, Any]:
     production connection hands out plain tuples.
     """
     return dict(zip(columns, tuple(row)))
+
+
+def _started_at_text(row: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return the start time an execution row holds, or ``None``.
+
+    The stamp is passed through as it was written — a naive local-time
+    ISO string — and is not parsed here: parsing it is the caller's
+    business, and a reader that guessed a time zone would report an
+    elapsed time wrong by exactly the offset it guessed.
+
+    A row without a start time, and a row whose start time is blank,
+    both answer ``None``: there is nothing to pass through.
+    """
+    if row is None:
+        return None
+    value = row.get("started_at")
+    if value is None:
+        return None
+    text = str(value)
+    return text if text.strip() else None
 
 
 def _iso_from_epoch(epoch: float) -> str:
@@ -424,10 +448,17 @@ class PlanFactsReader:
         released when the process is gone, the verification side when
         the round stops.
 
+        Each row also carries the ``started_at`` of the plan's
+        execution row: the moment the plan really started, which the
+        slot clock cannot say — a restart re-acquires every slot and
+        starts the clock again.  The stamp is passed through as it was
+        written; a plan with no execution row — one that is only
+        verifying — has no start time and says ``None``.
+
         Returns:
-            The active plans, each a dict of ``plan_id``, ``side`` and
-            ``workspace``, ordered by plan id.  Empty when nothing is
-            working.
+            The active plans, each a dict of ``plan_id``, ``side``,
+            ``workspace`` and ``started_at``, ordered by plan id.
+            Empty when nothing is working.
         """
         routing = {
             row["plan_id"]: row["current_phase"]
@@ -444,7 +475,7 @@ class PlanFactsReader:
                 _as_dict(_EXECUTION_COLUMNS, raw)
                 for raw in self._conn.execute(
                     "SELECT plan_id, exec_pid, exec_status, project_dir, "
-                    "next_run_at FROM plan_execution"
+                    "next_run_at, started_at FROM plan_execution"
                 ).fetchall()
             )
         }
@@ -473,6 +504,7 @@ class PlanFactsReader:
                     "plan_id": plan_id,
                     "side": side,
                     "workspace": self.workspace_key(plan_id),
+                    "started_at": _started_at_text(execution.get(plan_id)),
                 }
             )
         return active

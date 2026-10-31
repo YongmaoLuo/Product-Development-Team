@@ -43,6 +43,20 @@ before and after.
 the process the scheduler recorded really the stand-in this suite
 installed?
 
+How the four actions are issued
+-------------------------------
+The panel draws a waiting plan's buttons in its **queue** row: a
+promotion and a start.  It draws a pause for a plan that holds a slot,
+and it draws no resume at all.
+
+The promotion and the start are therefore **pressed** — the queue
+row's own ``.scheduler-action`` button, watched on its way out, so the
+report can say that the request really carried the guard's header.
+The pause and the resume are **issued** as commands: the same endpoint
+the button would have called, the same header, the same server — what
+is missing is the button, not the product.  The report says which of
+the two each action was, so the two are never confused for one another.
+
 What is real here
 -----------------
 Everything but the executor, and the executor is replaced through the
@@ -259,16 +273,30 @@ Arguments:
   2. a JSON list of steps: ``[{"action": ..., "plan": ..., ...}, ...]``
   3. the directory the screenshots are written into
 
-Every step clicks a button the panel drew — the same ``.scheduler-action``
-button an operator clicks — and then reads the panel back: what the
-action box says, what the line looks like now, and which phase the
-plan is in.
+A step names an action and a plan, and says how the action is
+issued:
 
-The requests the four buttons issue are intercepted on the way out, so
-the report can say whether they carried the request guard's header.
-The read model is read through the same session as well, at the same
-moment, so the panel and the API can be compared without the clock
-moving between the two reads.
+* ``"via": "panel"`` (the default) — the button the panel drew is
+  pressed.  A waiting plan's buttons are drawn in its **queue** row,
+  so the button that is pressed is the queue row's own
+  ``.scheduler-action`` button;
+* ``"via": "api"`` — the command is issued as a command.  Two of the
+  four actions have no button to press: the panel draws a promotion
+  and a start for a waiting plan, and a pause for a plan that holds a
+  slot, and it draws no resume at all.  Such a command goes to the
+  endpoint the button would have called, with the request guard's
+  header, on the same session — only the button is missing.
+
+Every step reads the panel back afterwards: what the action box says,
+what the line looks like now, and what is running.
+
+The requests the panel's buttons issue are intercepted on the way out,
+so the report can say whether they carried the request guard's header.
+The commands the case issues itself are recorded the same way, with
+the headers the request really carried.  The read model is read
+through the same session as well, at the same moment, so the panel and
+the API can be compared without the clock moving between the two
+reads.
 """
 import json
 import sys
@@ -347,38 +375,45 @@ def read_running(page):
     return read_rows(page, "#scheduler-running-list tr")
 
 
-def read_plans(page):
-    """The plans an operator can act on, as the panel draws them."""
-    return read_rows(page, "#scheduler-plans-list tr")
-
-
-def read_phase(page, plan_id):
-    """The phase the panel shows for one plan."""
-    for row in read_plans(page):
-        if row and row[0] == plan_id:
-            return row[1] if len(row) > 1 else ""
-    return ""
-
-
 def outcome_text(page):
     """What the action box says."""
     return page.inner_text("#scheduler-action-outcome").strip()
 
 
-def expectation_met(page, step):
-    """Whether the step's expectation holds on the panel, right now."""
-    if "expect_outcome" in step and outcome_text(page) != step["expect_outcome"]:
-        return False
-    if "expect_phase" in step and read_phase(page, step["plan"]) != step["expect_phase"]:
-        return False
+def queue_plan_ids(page):
+    """The plans the line holds, in the order the panel draws them."""
+    return [row[1] for row in read_queue(page) if len(row) > 1]
+
+
+def expectation_met(page, step, api_outcome):
+    """Whether the step's expectation holds on the panel, right now.
+
+    A step the panel drove is judged by what the panel says — the
+    action box is the panel's own answer, and it is read again on
+    every turn of the waiting loop, because the box is written when
+    the command's answer reaches the page.  A step that was issued as
+    a command has no such box: the answer came back from the server,
+    and that answer is what the step is judged by.
+    """
+    if "expect_outcome" in step:
+        outcome = api_outcome if step.get("via") == "api" else outcome_text(page)
+        if outcome != step["expect_outcome"]:
+            return False
     if "expect_queue_head_seq" in step:
         rows = read_queue(page)
         if not rows or len(rows[0]) < 3 or rows[0][2] != str(step["expect_queue_head_seq"]):
             return False
+    if "expect_queue_head_plan" in step:
+        rows = read_queue(page)
+        if not rows or len(rows[0]) < 2 or rows[0][1] != str(step["expect_queue_head_plan"]):
+            return False
+    if "expect_queue_absent" in step:
+        if str(step["expect_queue_absent"]) in queue_plan_ids(page):
+            return False
     return True
 
 
-def settle(page, step, timeout=30.0):
+def settle(page, step, api_outcome="", timeout=30.0):
     """Wait until the panel has stopped changing and the step's expectation holds.
 
     The panel reloads the read model and the listing after every
@@ -403,11 +438,11 @@ def settle(page, step, timeout=30.0):
     while time.time() < deadline:
         page.click("#btn-open-scheduler", timeout=30000)
         current = json.dumps(
-            {"queue": read_queue(page), "running": read_running(page), "plans": read_plans(page)},
+            {"queue": read_queue(page), "running": read_running(page)},
             sort_keys=True,
             ensure_ascii=False,
         )
-        if current == previous and expectation_met(page, step):
+        if current == previous and expectation_met(page, step, api_outcome):
             return
         previous = current
         page.wait_for_timeout(400)
@@ -419,7 +454,6 @@ def settle(page, step, timeout=30.0):
                 "outcome": outcome_text(page),
                 "queue": read_queue(page),
                 "running": read_running(page),
-                "plans": read_plans(page),
             },
             ensure_ascii=False,
         )
@@ -436,11 +470,126 @@ launch_kwargs = {"executable_path": executable} if executable else {}
 
 seen = []
 answered = []
+api_actions = []
+
+#: Who issued the request that is on its way out right now: the panel's
+#: own button, or the command the case issues itself.  The route
+#: handler reads it, so every request is labelled by whoever sent it.
+issued_by = {"source": "panel"}
 
 
 def is_action(url):
     """Whether the URL is one of the four actions' URLs."""
     return "/api/plan/" in url and "/scheduler/" in url
+
+
+def detail_text(detail):
+    """One detail, in the words a reader reads."""
+    if detail is None:
+        return ""
+    if isinstance(detail, str):
+        return detail
+    return json.dumps(detail, ensure_ascii=False)
+
+
+def press_queue_button(page, action, plan):
+    """Press the button the queue row of *plan* draws.
+
+    The panel draws a waiting plan's buttons in its queue row: a
+    promotion and a start.  The button is waited for, pressed, and the
+    request it made is watched on its way out — the intercepted request
+    is the proof that the button was really pressed, and the answer
+    that comes back is the proof that the command was carried out.
+    """
+    selector = (
+        "#scheduler-queue-list button.scheduler-action"
+        "[data-action='{0}'][data-plan='{1}']"
+    ).format(action, plan)
+    page.wait_for_selector(selector, timeout=30000)
+    before = len(seen)
+    before_answered = len(answered)
+    page.click(selector, timeout=30000)
+    # The command left the browser: the intercepted request is the
+    # proof that the button was really pressed.  Then the answer came
+    # back: until it has, the panel is still showing the state the
+    # command has not changed yet.
+    deadline = time.time() + 30
+    while len(seen) == before and time.time() < deadline:
+        page.wait_for_timeout(50)
+    if len(seen) == before:
+        raise AssertionError(
+            "the button was pressed but no request left the browser: " + selector
+        )
+    deadline = time.time() + 30
+    while len(answered) == before_answered and time.time() < deadline:
+        page.wait_for_timeout(50)
+    if len(answered) == before_answered:
+        raise AssertionError(
+            "the request left the browser but no answer came back: " + selector
+        )
+    return selector
+
+
+def issue_command(page, base_url, action, plan):
+    """Issue one command the panel draws no button for.
+
+    The command goes to the endpoint the button would have called, on
+    the same session and with the request guard's header — what is
+    missing is the button, not the product.
+
+    It is sent **from the page**, so it is a request of the browser
+    like any other: it is intercepted on its way out, the headers it
+    really carried are read off the intercepted request, and the report
+    can say about it what it says about the requests the buttons made.
+    """
+    path = base_url.rstrip("/") + "/api/plan/{0}/scheduler/{1}".format(plan, action)
+    before = len(seen)
+    before_answered = len(answered)
+    issued_by["source"] = "command"
+    try:
+        answer = page.evaluate(
+            """async (arg) => {
+                   const response = await fetch(arg.path, {
+                       method: "POST",
+                       headers: {[arg.header]: arg.value},
+                   });
+                   const text = await response.text();
+                   let body = {};
+                   try { body = JSON.parse(text); } catch (err) { body = {raw: text}; }
+                   return {status: response.status, body: body};
+               }""",
+            {"path": path, "header": GUARD_HEADER, "value": GUARD_VALUE},
+        )
+    finally:
+        issued_by["source"] = "panel"
+
+    # The command left the browser: the intercepted request is the
+    # proof that it was really sent.  Then the answer came back.
+    deadline = time.time() + 30
+    while len(seen) == before and time.time() < deadline:
+        page.wait_for_timeout(50)
+    if len(seen) == before:
+        raise AssertionError(
+            "the command was issued but no request left the browser: " + path
+        )
+    deadline = time.time() + 30
+    while len(answered) == before_answered and time.time() < deadline:
+        page.wait_for_timeout(50)
+    if len(answered) == before_answered:
+        raise AssertionError(
+            "the request left the browser but no answer came back: " + path
+        )
+
+    request = seen[-1]
+    body = answer.get("body") or {}
+    api_actions.append({
+        "url": request["url"],
+        "method": request["method"],
+        "guard": request["guard"],
+        "status": answer.get("status"),
+        "outcome": str(body.get("outcome") or ""),
+    })
+    return body
 
 
 with sync_playwright() as driver:
@@ -452,6 +601,7 @@ with sync_playwright() as driver:
             "url": request.url,
             "method": request.method,
             "guard": request.headers.get(GUARD_HEADER),
+            "source": issued_by["source"],
         })
         route.continue_()
 
@@ -490,45 +640,33 @@ with sync_playwright() as driver:
     for step in steps:
         action = step["action"]
         plan = step["plan"]
-        selector = (
-            "#scheduler-plans-list button.scheduler-action"
-            "[data-action='{0}'][data-plan='{1}']"
-        ).format(action, plan)
+        via = step.get("via", "panel")
         started = time.time()
-        page.wait_for_selector(selector, timeout=30000)
-        before = len(seen)
-        before_answered = len(answered)
-        page.click(selector, timeout=30000)
-        # The command left the browser: the intercepted request is the
-        # proof that the button was really pressed.  Then the answer
-        # came back: until it has, the panel is still showing the state
-        # the command has not changed yet.
-        deadline = time.time() + 30
-        while len(seen) == before and time.time() < deadline:
-            page.wait_for_timeout(50)
-        if len(seen) == before:
-            raise AssertionError(
-                "the button was pressed but no request left the browser: "
-                + json.dumps(step)
-            )
-        deadline = time.time() + 30
-        while len(answered) == before_answered and time.time() < deadline:
-            page.wait_for_timeout(50)
-        if len(answered) == before_answered:
-            raise AssertionError(
-                "the request left the browser but no answer came back: "
-                + json.dumps(step)
-            )
+        if via == "api":
+            # The panel draws no button for this one, so the command is
+            # issued — on the same session, with the same header.
+            body = issue_command(page, url, action, plan)
+            api_outcome = str(body.get("outcome") or "")
+            detail = detail_text(body.get("detail"))
+        else:
+            press_queue_button(page, action, plan)
+            api_outcome = ""
+            detail = ""
         # The panel reads its model again when the view is opened, and
         # the listing it reads is served from a short-lived cache — so
         # the view is opened again to see what the command produced.
-        settle(page, step)
+        settle(page, step, api_outcome)
+        if via == "api":
+            outcome = api_outcome
+        else:
+            outcome = outcome_text(page)
+            detail = page.inner_text("#scheduler-action-detail").strip()
         observations.append({
             "action": action,
             "plan": plan,
-            "outcome": outcome_text(page),
-            "detail": page.inner_text("#scheduler-action-detail").strip(),
-            "phase": read_phase(page, plan),
+            "via": via,
+            "outcome": outcome,
+            "detail": detail,
             "capacity": read_capacity(page, "#scheduler-view-capacity"),
             "queue": read_queue(page),
             "running": read_running(page),
@@ -543,7 +681,8 @@ with sync_playwright() as driver:
         "running": running,
         "api": api_state,
         "steps": observations,
-        "requests": seen,
+        "requests": [entry for entry in seen if entry["source"] == "panel"],
+        "api_actions": api_actions,
     }, ensure_ascii=False))
     browser.close()
 '''
@@ -756,6 +895,56 @@ def _http(
         return status, json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return status, payload
+
+
+def _phase_of(world: "_World", plan_id: str) -> str:
+    """The phase the state machine holds for one plan.
+
+    The panel does not draw a phase any more — the two tables that
+    remain are the queue and the running plans, and neither of them
+    carries one — so the phase is read where it is written: the state
+    machine's own routing table.
+    """
+    for row in world.routing_rows():
+        if str(row["plan_id"]) == plan_id:
+            return str(row["current_phase"])
+    return ""
+
+
+#: How many seconds each unit of a duration stands for.
+_DURATION_UNITS = {"h": 3600, "m": 60, "s": 1}
+
+
+def _duration_seconds(text: str) -> Tuple[Optional[int], int]:
+    """The panel's duration text, in seconds, and the slack it left out.
+
+    The panel draws how long a plan has been running as a duration —
+    ``45s``, ``1m 3s``, ``2h 5m`` — and the read model carries a
+    number of seconds.  The two are the same fact, so comparing them
+    needs the text turned back into seconds.
+
+    The drawing leaves out what it does not show: an hour and a half is
+    drawn as ``1h 30m``, and the seconds are gone.  The second number
+    this returns is how many seconds the drawing may have left out —
+    the comparison may be that much off and still be right.
+    """
+    total = 0
+    units = set()
+    for token in str(text).split():
+        if not token or token[-1] not in _DURATION_UNITS:
+            return None, 0
+        try:
+            value = int(token[:-1])
+        except ValueError:
+            return None, 0
+        total += value * _DURATION_UNITS[token[-1]]
+        units.add(token[-1])
+    if not units:
+        return None, 0
+    slack = 0
+    if "s" not in units:
+        slack = 59 if "m" in units else 3599
+    return total, slack
 
 
 # ---------------------------------------------------------------------------
@@ -1097,10 +1286,12 @@ class _World:
     def drive(self, steps: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         """Drive the panel through *steps* and report what it did.
 
-        The steps are the buttons an operator clicks: each one names an
-        action and a plan.  Nothing is simulated — the browser clicks
-        the panel's own buttons, and the report is what the panel then
-        shows.
+        A step names an action and a plan, and says how the action is
+        issued: ``"via": "panel"`` presses the button the panel drew
+        (the queue row's own button), and ``"via": "api"`` issues the
+        command the panel draws no button for.  Nothing is simulated —
+        the browser clicks the panel's own buttons and the report is
+        what the panel then shows.
         """
         interpreter = _playwright_interpreter()
         if interpreter is None:
@@ -1429,7 +1620,15 @@ def test_operator_full_flow(world):
     assert all(seq > 0 for seq in seqs), f"the line's numbers are not positive: {seqs!r}"
 
     state = world.scheduler_state()
-    assert state["capacity"] == {"total": CAPACITY, "used": CAPACITY}, (
+    # The snapshot's capacity carries a source field (the configured
+    # capacity or a runtime override), so the comparison takes that
+    # field into account -- the shape is still compared for exact
+    # equality, so one key too many or too few turns the gate red.
+    assert state["capacity"] == {
+        "total": CAPACITY,
+        "used": CAPACITY,
+        "source": "config",
+    }, (
         f"the capacity is {state['capacity']!r}"
     )
     assert state["queue_length"] == len(waiting), (
@@ -1468,7 +1667,13 @@ def test_operator_full_flow(world):
     )
     before_capacity = world.scheduler_state()["capacity"]
 
-    report = world.drive(
+    # The four actions happen in two sessions, in the order the operator
+    # pressed them, so each action is judged by what the panel drew
+    # right after that action.  The sessions are split where the phase
+    # has to be read: the phase the pause parks the plan in is gone by
+    # the time the resume has put the plan back, so it is read between
+    # the two, from the state machine's own routing table.
+    first = world.drive(
         [
             {
                 "action": "promote",
@@ -1477,16 +1682,28 @@ def test_operator_full_flow(world):
                 "expect_queue_head_seq": tail_seq,
             },
             {
+                # The panel draws a pause for a plan that holds a slot;
+                # this plan is waiting, so the command is issued rather
+                # than pressed.
                 "action": "pause",
                 "plan": head,
+                "via": "api",
                 "expect_outcome": APPLIED,
-                "expect_phase": STOPPED_PHASE,
+                "expect_queue_absent": head,
             },
+        ]
+    )
+    paused_phase = _phase_of(world, head)
+    second = world.drive(
+        [
             {
+                # Nothing in the panel draws a resume at all, so this
+                # command is issued too.
                 "action": "resume",
                 "plan": head,
+                "via": "api",
                 "expect_outcome": APPLIED,
-                "expect_phase": QUEUED_PHASE,
+                "expect_queue_head_plan": head,
             },
             {
                 "action": "start",
@@ -1495,25 +1712,24 @@ def test_operator_full_flow(world):
             },
         ]
     )
+    resumed_phase = _phase_of(world, head)
 
     # -- phase 4: the promotion ---------------------------------------------
     #
-    # The four actions happen in one session, in the order the operator
-    # pressed them, so each action is judged by what the panel drew right
-    # after that action.  The scheduler's own tables are read afterwards,
-    # for what the four actions together left behind.
-    promoted = report["steps"][0]
+    # The scheduler's own tables are read afterwards, for what the four
+    # actions together left behind.
+    promoted = first["steps"][0]
     assert promoted["outcome"] == APPLIED, (
         f"the promotion was answered with {promoted['outcome']!r} "
         f"({promoted['detail']!r})"
     )
     # Before the promotion the plan to promote stood second in the line...
-    assert len(report["queue"]) >= 2, (
-        f"the line the panel drew holds {len(report['queue'])} plans, not two: "
-        f"{report['queue']!r}"
+    assert len(first["queue"]) >= 2, (
+        f"the line the panel drew holds {len(first['queue'])} plans, not two: "
+        f"{first['queue']!r}"
     )
-    assert report["queue"][1][2] == str(tail_seq), (
-        f"the panel's second row is {report['queue'][1]!r}, which is not the "
+    assert first["queue"][1][2] == str(tail_seq), (
+        f"the panel's second row is {first['queue'][1]!r}, which is not the "
         f"plan the promotion was meant for (number {tail_seq})"
     )
     # ...and after it, it stands first.
@@ -1539,21 +1755,23 @@ def test_operator_full_flow(world):
     # -- phase 5: the pause --------------------------------------------------
     #
     # The paused plan leaves the line: the panel's line is one plan
-    # shorter, and the plan's own row is the one that is gone.
-    paused = report["steps"][1]
+    # shorter, and the plan's own row is the one that is gone.  The
+    # phase is read where it is written — the state machine's own
+    # routing table — because the panel draws no phase any more.
+    paused = first["steps"][1]
     assert paused["outcome"] == APPLIED, (
         f"the pause was answered with {paused['outcome']!r} ({paused['detail']!r})"
     )
-    assert paused["phase"] == STOPPED_PHASE, (
-        f"the panel shows the paused plan in the phase {paused['phase']!r}"
+    assert paused_phase == STOPPED_PHASE, (
+        f"the paused plan is in the phase {paused_phase!r}"
     )
     assert str(head_seq) not in [row[2] for row in paused["queue"]], (
         f"the paused plan still holds a place in the line the panel drew: "
         f"{paused['queue']!r}"
     )
-    assert len(paused["queue"]) == len(report["queue"]) - 1, (
+    assert len(paused["queue"]) == len(first["queue"]) - 1, (
         f"the line holds {len(paused['queue'])} plans after the pause, "
-        f"{len(report['queue']) - 1} should"
+        f"{len(first['queue']) - 1} should"
     )
 
     # -- phase 6: the resume -------------------------------------------------
@@ -1562,12 +1780,12 @@ def test_operator_full_flow(world):
     # front.  The number it carries in the line is read from the
     # scheduler's own table, which the refused start did not change: a
     # start that is refused only promotes.
-    resumed = report["steps"][2]
+    resumed = second["steps"][0]
     assert resumed["outcome"] == APPLIED, (
         f"the resume was answered with {resumed['outcome']!r} ({resumed['detail']!r})"
     )
-    assert resumed["phase"] == QUEUED_PHASE, (
-        f"the panel shows the resumed plan in the phase {resumed['phase']!r}"
+    assert resumed_phase == QUEUED_PHASE, (
+        f"the resumed plan is in the phase {resumed_phase!r}"
     )
     resumed_row = next(
         row for row in world.queue_rows() if str(row["plan_id"]) == head
@@ -1586,7 +1804,7 @@ def test_operator_full_flow(world):
     #
     # The capacity is full and every run is young, so nobody may be
     # interrupted: the start is refused, and nobody is evicted.
-    refused = report["steps"][3]
+    refused = second["steps"][1]
     assert refused["outcome"] == BLOCKED_BY_CAPACITY, (
         f"the start was answered with {refused['outcome']!r} ({refused['detail']!r})"
     )
@@ -1625,19 +1843,44 @@ def test_operator_full_flow(world):
         not row["evictable"] for row in after_start["running"]
     ), "a run that has not had its turn is not evictable"
 
-    # Every request the four buttons issued carried the guard's header.
-    assert len(report["requests"]) == 4, (
-        f"the panel issued {len(report['requests'])} action requests, not four: "
-        f"{report['requests']!r}"
+    # Every request the panel's buttons issued carried the guard's
+    # header — and so did the two commands the case issued itself.
+    requests = first["requests"] + second["requests"]
+    assert len(requests) == 2, (
+        f"the panel issued {len(requests)} action requests, not two: "
+        f"{requests!r}"
     )
-    for request in report["requests"]:
+    for request in requests:
         assert request["method"] == "POST", f"the request was not a POST: {request!r}"
         assert request["guard"] == REQUEST_HEADER_VALUE, (
             f"the request did not carry the guard's header: {request!r}"
         )
-    actions = sorted(request["url"].rsplit("/", 1)[-1] for request in report["requests"])
-    assert actions == ["pause", "promote", "resume", "start"], (
-        f"the panel issued {actions!r} rather than the four actions"
+    actions = sorted(request["url"].rsplit("/", 1)[-1] for request in requests)
+    assert actions == ["promote", "start"], (
+        f"the panel issued {actions!r} rather than the two actions it draws "
+        f"buttons for"
+    )
+
+    # The two actions the panel draws no button for went to the same
+    # endpoints, on the same session, with the same header.
+    commands = first["api_actions"] + second["api_actions"]
+    assert len(commands) == 2, (
+        f"the case issued {len(commands)} commands, not two: "
+        f"{commands!r}"
+    )
+    for entry in commands:
+        assert entry["method"] == "POST", f"the command was not a POST: {entry!r}"
+        assert entry["guard"] == REQUEST_HEADER_VALUE, (
+            f"the command did not carry the guard's header: {entry!r}"
+        )
+        assert entry["status"] == 200, f"the command was refused: {entry!r}"
+    issued = sorted(entry["url"].rsplit("/", 1)[-1] for entry in commands)
+    assert issued == ["pause", "resume"], (
+        f"the case issued {issued!r} rather than the two actions the panel "
+        f"draws no button for"
+    )
+    assert sorted(actions + issued) == ["pause", "promote", "resume", "start"], (
+        f"the four actions came out as {sorted(actions + issued)!r}"
     )
 
     # -- phase 8: the restart -----------------------------------------------
@@ -1771,6 +2014,8 @@ def test_panel_and_api_parity(world):
     # The running plans, row by row: the plan, and whether it may be
     # interrupted.  The elapsed time is read twice — once by each side —
     # so it is compared with the tolerance of a clock, not exactly.
+    # The panel draws it as a duration and the read model carries
+    # seconds, so the drawing is turned back into seconds first.
     panel_running = report["running"]
     assert len(panel_running) == len(state["running"]), (
         f"the panel draws {len(panel_running)} running plans, the read model "
@@ -1785,8 +2030,12 @@ def test_panel_and_api_parity(world):
             f"the panel says {drawn[0]!r} may be interrupted is {drawn[2]!r}; "
             f"the read model says evictable={carried['evictable']!r}"
         )
-        drawn_elapsed = int(drawn[1]) if drawn[1].isdigit() else -1
-        assert abs(drawn_elapsed - int(carried["elapsed_sec"])) <= 2, (
+        drawn_elapsed, slack = _duration_seconds(drawn[1])
+        assert drawn_elapsed is not None, (
+            f"the panel draws {drawn[1]!r} for {drawn[0]!r}, which is not a "
+            f"duration"
+        )
+        assert abs(drawn_elapsed - int(carried["elapsed_sec"])) <= 2 + slack, (
             f"the panel says {drawn[0]!r} has been running for {drawn_elapsed}s, "
             f"the read model says {carried['elapsed_sec']}s"
         )

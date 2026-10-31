@@ -526,8 +526,19 @@ FROZEN_REQUIREMENTS_HASH: str = (
 #: was computed against exactly the same ten objects the old schema
 #: held, and the object list printed by the failing assertion shows
 #: the three new tables and the two new indexes as the only additions.
+#:
+#: 2026-10-29 (scheduler panel, capacity override): re-pinned once
+#: more.  The delta against the 2026-10-28 baseline is exactly one new
+#: table, ``scheduler_setting`` — it holds the capacity override, which
+#: the file configuration cannot hold because ``backend/config.yaml`` is
+#: tracked and carries the comments that explain it.  The object list
+#: printed by the failing assertion shows every other object unchanged,
+#: so the previous baseline
+#: (``4e31487b0ae462e470a54ecd03a5e7c6d1cdf5c90a61975c80519868535ddb23``)
+#: is the hash of exactly the fourteen objects that preceded it, and the
+#: new value is the hash of those same fourteen plus this one table.
 FROZEN_SCHEMA_DDL_HASH: str = (
-    "4e31487b0ae462e470a54ecd03a5e7c6d1cdf5c90a61975c80519868535ddb23"
+    "5ffab1223d67c64c0eb17147eaf479346b163d3dd8e6d0e19c31ddab71cfd521"
 )
 
 #: The phase merge renamed the waiting bucket to ``queued``. The rename
@@ -568,9 +579,19 @@ FROZEN_SCHEMA_DDL_HASH: str = (
 #: silently.  On 2026-10-29 the native scheduler's SPA view merged into
 #: the same file (its renderers), so the pin moves once more to the
 #: merged content.
+#:
+#: 2026-10-29 / 2026-10-30 (scheduler panel): the file moved once more
+#: after that — the scheduler view was re-laid out, the running column
+#: gained the real elapsed time, the capacity area gained the parallel
+#: agent count and the capacity dropdown.  The pin moves to the branch's
+#: approved state for the same reason it moved for the capacity work:
+#: the file changed once, on purpose, and the rule stays "these files
+#: change once, and only that way".
 FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
+    # 2026-10-30：因调度面板改版（视图重排、在跑运行时长、并行 Agent 数、容量下拉框）
+    # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。
     "frontend/app.js": (
-        "8e13b20f65706d183d3b27cd381b54bf88bd82220845ca2028087d144c9cecce"
+        "7ee4ea3b7b4441ca1b0730c003ff7ecab52750c824c02e962e5042eff5b3a00b"
     ),
     "frontend/style.css": (
         "0cab7b66dae8b5b693a9e8e4b5c4cda4f8651ae649512e81d8aa8c18a24f836b"
@@ -586,7 +607,7 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
 #: under the forbidden paths change on this branch by design:
 #:
 #:   * ``backend/state_machine/db/schema.py`` — schema v7 adds the
-#:     three ``scheduler_*`` tables (and bumps ``CURRENT_SCHEMA_VERSION``
+#:     four ``scheduler_*`` tables (and bumps ``CURRENT_SCHEMA_VERSION``
 #:     from 6 to 7).  The state machine is shared with the rest of the
 #:     product, so the change is excluded from the change-surface diff
 #:     and pinned here instead, byte for byte.
@@ -597,11 +618,16 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
 #: later edit to either file fails ``test_scheduler_surface_is_frozen``
 #: even though it no longer shows up in the diff.
 FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
+    # 2026-10-29：因新增 `scheduler_setting` 表（容量的运行期覆盖）改动本文件，
+    # 按本 gate 的既定流程重新钉住该文件的哈希；schema.py 的模块 docstring
+    # 已同步改为「four ``scheduler_*`` tables」。
     "backend/state_machine/db/schema.py": (
-        "0e63c6206ca91b48bde1161df21f92c82734ee99ad28293a34131f61a273394d"
+        "b35b29a61e764756bdf3686757dc9f7cb4ecb7673bda8ab1443d898c39adf595"
     ),
+    # 2026-10-30：因调度面板改版（视图重排、在跑运行时长、并行 Agent 数、容量下拉框）
+    # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。
     "frontend/index.html": (
-        "355a0267da8f83240053e41e305123c03306c83eee49cbeccadb70bc6d920dcd"
+        "c41bc87629f95a6afea700e359ba919315214d4496772322b170142c470719bb"
     ),
 }
 

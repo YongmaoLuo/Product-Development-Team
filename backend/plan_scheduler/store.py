@@ -9,7 +9,9 @@ and that is what the three ``scheduler_*`` tables hold:
 
 * ``scheduler_queue`` — the order in which queued plans may run;
 * ``scheduler_slot`` — which plans hold a concurrency slot;
-* ``scheduler_command`` — the manual commands an operator issued.
+* ``scheduler_command`` — the manual commands an operator issued;
+* ``scheduler_setting`` — the knobs an operator changed while the
+  scheduler was running (the capacity override above all).
 
 They live in the same database as the plan facts on purpose: "is this
 plan running?" and "is this plan in the queue?" have to be readable in
@@ -59,6 +61,16 @@ check and the restart recovery.  The store does not sort by anything of
 its own: a second order would be a second answer to "who runs next",
 and the operator's only way to find out which was which would be to
 watch plans start in the wrong order.
+
+The runtime settings
+--------------------
+A setting is a key and a value, and the key is the primary key: a key
+holds exactly one value, so writing it twice replaces the value rather
+than leaving two rows a reader would have to choose between.  The
+settings live here rather than in ``backend/config.yaml`` because that
+file is tracked by git and carries the comments that explain it — a
+knob the operator turns at runtime may not rewrite a tracked file to
+get there.  Deleting the row is what puts the configured value back.
 """
 
 from __future__ import annotations
@@ -68,9 +80,11 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional
 
+from .capacity import CAPACITY_OVERRIDE_KEY
 from .queue import queue_key
 
 __all__ = [
+    "CAPACITY_OVERRIDE_KEY",
     "PENDING_OUTCOME",
     "SqliteSchedulerStore",
 ]
@@ -82,6 +96,13 @@ __all__ = [
 #: :meth:`~SqliteSchedulerStore.finish_command` a no-op: the row is no
 #: longer pending, so the update matches nothing.
 PENDING_OUTCOME = "accepted"
+
+
+#: The key the runtime capacity override is stored under — imported above
+#: from :mod:`plan_scheduler.capacity` and re-exported here, because this
+#: module is where the row is read and written.  It is *defined* beside the
+#: ledger that reads it so that a caller which only needs the key — the
+#: route that writes the override — does not have to import this module.
 
 
 #: The columns of ``scheduler_queue``, in the order they are read.
@@ -127,7 +148,7 @@ def _as_dict(columns: tuple, row: Optional[sqlite3.Row]) -> Optional[Dict[str, A
 
 
 class SqliteSchedulerStore:
-    """Read and write the scheduler's three tables.
+    """Read and write the scheduler's own tables.
 
     Every method takes the connection it works on, so one store can
     serve any number of connections and a caller keeps control of the
@@ -552,3 +573,79 @@ class SqliteSchedulerStore:
             (command_id,),
         ).fetchone()
         return _as_dict(_COMMAND_COLUMNS, row)
+
+    # ------------------------------------------------------------------
+    # The runtime settings
+    # ------------------------------------------------------------------
+
+    def get_setting(self, conn: sqlite3.Connection, key: str) -> Optional[str]:
+        """Return the value of one setting, or ``None`` if it has none.
+
+        A setting that was never written has no value, and the caller
+        has to be able to tell that apart from a setting whose value is
+        the empty string — so the answer is ``None``, not ``""``.
+
+        Args:
+            conn: the connection to read on.
+            key: the setting to read.
+
+        Returns:
+            The value stored under ``key``, or ``None`` when the key is
+            not set.
+        """
+        row = conn.execute(
+            "SELECT value FROM scheduler_setting WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row[0])
+
+    def set_setting(
+        self,
+        conn: sqlite3.Connection,
+        key: str,
+        value: str,
+        stamp: Optional[str] = None,
+    ) -> None:
+        """Write one setting, replacing the value it held.
+
+        The key is the primary key, so writing the same key twice
+        replaces the value and the timestamp instead of adding a second
+        row — and it never raises for a key that is already there.
+
+        Args:
+            conn: the connection to write on.
+            key: the setting to write.
+            value: the value to store.
+            stamp: the timestamp to record; the current UTC time when
+                omitted.
+        """
+        moment = stamp or _utcnow_iso()
+        with self.transaction(conn):
+            conn.execute(
+                "INSERT INTO scheduler_setting (key, value, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET "
+                "value = excluded.value, updated_at = excluded.updated_at",
+                (key, value, moment),
+            )
+
+    def delete_setting(self, conn: sqlite3.Connection, key: str) -> bool:
+        """Remove one setting and put the configured value back.
+
+        Deleting a setting that is not set is not an error: the
+        settings may have changed under the caller, and there was
+        nothing to remove.
+
+        Args:
+            conn: the connection to write on.
+            key: the setting to remove.
+
+        Returns:
+            ``True`` if the setting was there, ``False`` if it was not.
+        """
+        with self.transaction(conn):
+            cursor = conn.execute(
+                "DELETE FROM scheduler_setting WHERE key = ?", (key,)
+            )
+            return cursor.rowcount > 0

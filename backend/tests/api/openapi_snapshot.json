@@ -68,6 +68,29 @@
         "title": "AnswerInterviewRequest",
         "type": "object"
       },
+      "CapacityRequest": {
+        "description": "The request body of ``POST /api/scheduler/capacity``.\n\nTwo fields, two meanings:\n\n* ``total`` \u2014 the capacity the operator asks for: a whole number\n  between 1 and 64, or ``None`` to put the configured one back;\n* ``reset`` \u2014 put the configured capacity back.\n\n``total`` is typed ``Any`` and not ``int`` **on purpose**: a model\nthat typed it as an integer would quietly turn ``\"5\"`` into ``5``\nand ``true`` into ``1`` before the route ever saw them \u2014 and\nneither is the number that was asked for.  The model here only\n**takes the request in**; whether the number is one the scheduler\nmay run with is the route's answer to give, and it gives it with a\n400 that says what was wrong.",
+        "properties": {
+          "reset": {
+            "default": false,
+            "description": "put the configured capacity back",
+            "title": "Reset",
+            "type": "boolean"
+          },
+          "total": {
+            "description": "how many plans may run at the same time; null puts the configured capacity back",
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Total",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "CapacityRequest",
+        "type": "object"
+      },
       "ContinueInterviewRequest": {
         "properties": {
           "reply": {
@@ -3219,6 +3242,43 @@
           }
         },
         "summary": "Get Review Items"
+      }
+    },
+    "/api/scheduler/capacity": {
+      "post": {
+        "description": "Set the capacity the scheduler runs with \u2014 or put it back.\n\nThe number the operator writes is the capacity **while it is\nthere**: the engine reads the override again on every tick, so it\ntakes effect at once and needs no restart.\n\nThe answer says which number is in force and where it came from \u2014\n``override`` for the operator's number, ``config`` for the\nconfigured one \u2014 so a caller never has to guess whether the number\nit sees is the one it wrote.",
+        "operationId": "set_capacity_api_scheduler_capacity_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CapacityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Capacity"
       }
     },
     "/api/scheduler/state": {

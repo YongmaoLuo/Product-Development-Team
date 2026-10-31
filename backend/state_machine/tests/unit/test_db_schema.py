@@ -211,7 +211,8 @@ def test_migrate_creates_five_tables_and_version(tmp_path: Path) -> None:
     Schema v7 (2026-10-28) adds three more: ``scheduler_queue``,
     ``scheduler_slot`` and ``scheduler_command`` — the native
     scheduler's own three facts (see the same schema module's
-    ``_SCHEDULER_OBJECTS``).
+    ``_SCHEDULER_OBJECTS``).  A fourth, ``scheduler_setting``, joins them
+    there (2026-10-29): the operator's runtime capacity override.
 
     The test's name keeps the count it was written with, the way the
     backend's copy of the same gate keeps its own name: the anchor
@@ -234,6 +235,7 @@ def test_migrate_creates_five_tables_and_version(tmp_path: Path) -> None:
             "plan_verification",
             "scheduler_command",
             "scheduler_queue",
+            "scheduler_setting",
             "scheduler_slot",
             "schema_version",
         ]

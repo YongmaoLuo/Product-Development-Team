@@ -1,7 +1,7 @@
 """Schema management for the state-machine WAL base layer.
 
 The :func:`migrate` factory creates the six ``plan_*`` tables, the
-three ``scheduler_*`` tables and the ``schema_version`` bootstrap
+four ``scheduler_*`` tables and the ``schema_version`` bootstrap
 table the state-machine refactor relies on.  Every ``CREATE TABLE``
 uses ``IF NOT EXISTS`` so the function is safe to call repeatedly —
 calling ``migrate`` on an already-migrated database is a no-op (the
@@ -88,6 +88,14 @@ phase, the running process, a pending human decision — is *derived*
 from the ``plan_*`` tables on every tick, so the scheduler never
 copies a plan fact and there is no second source of truth.
 
+The fourth scheduler table, ``scheduler_setting`` (2026-10-29), holds
+the knobs an operator changes while the scheduler runs — the capacity
+override above all.  It is a pure addition in the same sense as the
+other three: ``CREATE TABLE IF NOT EXISTS``, no existing table changes
+shape, no existing row is touched, and no schema version is bumped —
+the presence guard below is what creates it on a database that already
+reached v7.
+
 The three tables live in this database, not in a side-car file or a
 second SQLite file: scheduling facts and plan facts must be readable
 in one transaction, otherwise "is this plan running?" and "is this
@@ -95,7 +103,10 @@ plan in the queue?" are two facts that can disagree.  That is why the
 DDL goes through the same :func:`migrate` entry point as everything
 else rather than through a migration path of its own, and why
 :data:`CURRENT_SCHEMA_VERSION` is bumped to 7 — the version number
-is what tells an existing database that it needs the new tables.
+is what tells an existing database that it needs the new tables.  The
+fourth table, ``scheduler_setting``, was added later and deliberately
+did *not* move the version number: it is created by the same
+presence-guarded step, on every ``migrate`` call.
 
 Like the HITL table, the scheduler tables are a pure addition: no
 existing table changes shape and no existing row is touched.  They
@@ -478,6 +489,29 @@ CREATE INDEX IF NOT EXISTS idx_scheduler_command_plan
   ON scheduler_command(plan_id, created_at)
 """
 
+#: The runtime settings.  One row per key, one value per row: the
+#: scheduler's own knobs that an operator may change while the scheduler
+#: runs.
+#:
+#: This table exists because the *file* configuration cannot hold a
+#: runtime override.  ``backend/config.yaml`` is tracked by git and
+#: carries the comments that explain it, so it may not be rewritten by a
+#: YAML dump — and a knob the operator turns at runtime must not rewrite
+#: a tracked file either.  The state database is the other place a fact
+#: can live: it is already the scheduler's own storage, it is not under
+#: version control, and it is read on every tick.
+#:
+#: ``key`` is the primary key, so a key holds exactly one value: writing
+#: the same key twice replaces the value instead of adding a second row
+#: that a reader would then have to choose between.
+_DDL_SCHEDULER_SETTING = """
+CREATE TABLE IF NOT EXISTS scheduler_setting (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)
+"""
+
 #: Every object the v7 migration owns, with the DDL that creates it.
 #: The name is the presence key: an object that exists needs no DDL.
 _SCHEDULER_OBJECTS: tuple[tuple[str, str], ...] = (
@@ -486,6 +520,7 @@ _SCHEDULER_OBJECTS: tuple[tuple[str, str], ...] = (
     ("scheduler_slot", _DDL_SCHEDULER_SLOT),
     ("scheduler_command", _DDL_SCHEDULER_COMMAND),
     ("idx_scheduler_command_plan", _DDL_SCHEDULER_COMMAND_INDEX),
+    ("scheduler_setting", _DDL_SCHEDULER_SETTING),
 )
 
 # Order matters: the six ``plan_*`` tables come first, then the
@@ -877,19 +912,21 @@ def _add_missing_plan_decision_columns(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_scheduler_tables(conn: sqlite3.Connection) -> None:
-    """Create the three scheduler tables and their indexes when missing.
+    """Create the scheduler tables and their indexes when missing.
 
     The scheduler's own facts — queue order, slot occupancy, manual
-    commands — live next to the plan facts, in this database, so the
-    scheduler can read "is this plan running?" and "is this plan in
-    the queue?" in one transaction.
+    commands, runtime settings — live next to the plan facts, in this
+    database, so the scheduler can read "is this plan running?" and
+    "is this plan in the queue?" in one transaction.
 
     Guarded by the *presence of the objects* rather than by the version
     row, for the same reason as :func:`_ensure_plan_decisions`: the
     presence check is self-describing and idempotent, and a database
     that somehow reached the current version without the tables heals
     itself on the next ``migrate`` instead of failing every later read
-    with *"no such table: scheduler_queue"*.
+    with *"no such table: scheduler_queue"*.  This is also why adding a
+    scheduler table needs no schema version bump: a database that
+    already reached v7 gets the new table on its next ``migrate``.
 
     One read of ``sqlite_master`` answers "is anything missing?".  When
     nothing is missing the step costs that single read and issues no
@@ -911,7 +948,7 @@ def _ensure_scheduler_tables(conn: sqlite3.Connection) -> None:
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    """Create the six ``plan_*`` tables, the three ``scheduler_*``
+    """Create the six ``plan_*`` tables, the four ``scheduler_*``
     tables and the ``schema_version`` row.
 
     Idempotent: uses ``CREATE TABLE IF NOT EXISTS`` for every DDL
@@ -978,14 +1015,14 @@ def migrate(conn: sqlite3.Connection) -> None:
     # written by an older backend is upgraded rather than left behind.
     _ensure_plan_decisions(conn)
 
-    # The three scheduler tables are ensured on EVERY call, for the same
+    # The scheduler tables are ensured on EVERY call, for the same
     # reason the HITL table is: the scheduler's own facts (queue order,
-    # slot occupancy, manual commands) must sit next to the plan facts
-    # in this database, and the objects' presence is a better logbook
-    # than the version row.  The version bump to 7 is what tells an
-    # existing database that the migration ran; the presence guard is
-    # what makes a database that somehow missed the tables heal itself
-    # instead of failing every later read.
+    # slot occupancy, manual commands, runtime settings) must sit next
+    # to the plan facts in this database, and the objects' presence is a
+    # better logbook than the version row.  The version bump to 7 is
+    # what tells an existing database that the migration ran; the
+    # presence guard is what makes a database that somehow missed the
+    # tables heal itself instead of failing every later read.
     _ensure_scheduler_tables(conn)
 
 

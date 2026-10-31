@@ -2006,7 +2006,12 @@ function schedulerToggle(el, visible) {
 
 /** Render the capacity widget — used / total and the queue length.
     The home widget and the scheduler view carry the same numbers: they
-    are read out of one read model, so they cannot disagree. */
+    are read out of one read model, so they cannot disagree.
+
+    The control that changes the capacity follows the server as well:
+    the number in force is the server's, never the operator's
+    unfinished pick, and the word beside it says whether that number
+    is the operator's own override or the configured one. */
 function renderSchedulerCapacity(snapshot) {
     const capacity = (snapshot && snapshot.capacity) || {};
     const total = Number(capacity.total) || 0;
@@ -2036,6 +2041,59 @@ function renderSchedulerCapacity(snapshot) {
     });
 
     schedulerSetText("#scheduler-view-generated-at", (snapshot && snapshot.generated_at) || "—");
+
+    // Where the number in force came from.  The operator's own number
+    // is marked, so a configured capacity is never passed off as an
+    // override — and the override is never passed off as the
+    // configured one.
+    const isOverride = capacity.source === "override";
+    schedulerSetText("#scheduler-capacity-source", isOverride ? "(覆盖)" : "");
+
+    // The select shows the capacity in force.  It carries the numbers
+    // an operator may pick (1..12); a number outside them is added, so
+    // the control never shows a number the scheduler is not running
+    // with.
+    const select = $("#scheduler-capacity-select");
+    if (select) {
+        const value = String(total);
+        let option = select.querySelector(`option[value="${value}"]`);
+        if (!option) {
+            option = document.createElement("option");
+            option.value = value;
+            option.textContent = value;
+            select.appendChild(option);
+        }
+        select.value = value;
+    }
+}
+
+/** Write the capacity that was picked — or put the configured one back.
+
+    ``total`` is the number to run with; ``null`` (or no number at all)
+    asks for the configured capacity back, and the body the wire
+    carries says so — {"reset": true} — instead of carrying a number.
+
+    The number in force afterwards is the **server's**, so the panel
+    reads the state again instead of trusting the pick.  A failed write
+    says what went wrong — the error's own text, in the action-result
+    box — and puts the control back to the number that is really in
+    force, so the operator's rejected pick is never mistaken for the
+    capacity the scheduler is running with. */
+async function schedulerApplyCapacity(total) {
+    const reset = total === null || total === undefined;
+    const body = reset ? {"reset": true} : {total: total};
+    try {
+        const result = await api("/scheduler/capacity", {method: "POST", body: JSON.stringify(body)});
+        await loadSchedulerState();
+        return result;
+    } catch (err) {
+        // The pick failed: read the state again so the control is
+        // filled from the server's number, and then say what went
+        // wrong.
+        await loadSchedulerState();
+        renderSchedulerError(err);
+        throw err;
+    }
 }
 
 /** The action buttons of one row.  A row that names no plan gets no
@@ -2087,8 +2145,38 @@ function renderSchedulerQueue(snapshot) {
     schedulerToggle($("#scheduler-queue-empty"), false);
 }
 
+/** How long a plan has been running, in the words an operator reads.
+
+    Seconds become a duration: hours and minutes, minutes and seconds,
+    or plain seconds.  A number that was not given is a dash and not a
+    zero — a plan whose start time is unknown has not run for zero
+    seconds, it has run for an unknown length. */
+function schedulerDurationText(seconds) {
+    if (seconds === null || seconds === undefined) return "—";
+    const text = String(seconds).trim();
+    if (!text) return "—";
+    const total = Number(text);
+    if (!Number.isFinite(total)) return "—";
+    const value = Math.max(0, Math.floor(total));
+    if (value >= 3600) {
+        const hours = Math.floor(value / 3600);
+        const minutes = Math.floor((value % 3600) / 60);
+        return `${hours}h ${minutes}m`;
+    }
+    if (value >= 60) {
+        const minutes = Math.floor(value / 60);
+        return `${minutes}m ${value % 60}s`;
+    }
+    return `${value}s`;
+}
+
 /** The plans that hold a slot, with the time they have been running and
-    whether they may be interrupted. */
+    whether they may be interrupted.
+
+    The duration is the plan's own clock — how long the plan has been
+    running — and it falls back to the slot clock, the time since the
+    slot was acquired, for a listing that does not carry the plan
+    clock. */
 function renderSchedulerRunning(snapshot) {
     const rows = snapshot && Array.isArray(snapshot.running) ? snapshot.running : [];
     const body = $("#scheduler-running-list");
@@ -2105,9 +2193,10 @@ function renderSchedulerRunning(snapshot) {
         .map((row) => {
             const item = row || {};
             const planId = item.plan_id ? String(item.plan_id) : "";
+            const duration = schedulerDurationText(item.running_sec ?? item.elapsed_sec);
             return `<tr>
                 <td>${escapeHtml(planId || "—")}</td>
-                <td>${escapeHtml(item.elapsed_sec)}</td>
+                <td>${escapeHtml(duration)}</td>
                 <td>${escapeHtml(item.evictable ? "是" : "否")}</td>
                 <td>${escapeHtml(item.workspace || "—")}</td>
                 <td class="scheduler-row-actions">${schedulerActionButtons(planId, ["pause"])}</td>
@@ -2124,43 +2213,6 @@ function renderSchedulerRunning(snapshot) {
 function schedulerPlanPhase(plan) {
     if (!plan) return "";
     return String(plan.current_phase || plan.status || "");
-}
-
-/** The plans an operator can act on, with the actions their phase
-    allows.  The order is the listing's own — the panel does not sort
-    the plans either. */
-function renderSchedulerPlans(plans) {
-    const rows = Array.isArray(plans) ? plans : [];
-    const body = $("#scheduler-plans-list");
-    if (!body) return;
-
-    const actionable = rows.filter((plan) => {
-        const phase = schedulerPlanPhase(plan);
-        return (SCHEDULER_ACTIONS_BY_PHASE[phase] || []).length > 0;
-    });
-
-    if (!actionable.length) {
-        body.innerHTML = "";
-        schedulerToggle($("#scheduler-plans-table"), false);
-        schedulerToggle($("#scheduler-plans-empty"), true);
-        return;
-    }
-
-    body.innerHTML = actionable
-        .map((plan) => {
-            const planId = plan && plan.id ? String(plan.id) : "";
-            const phase = schedulerPlanPhase(plan);
-            const actions = SCHEDULER_ACTIONS_BY_PHASE[phase] || [];
-            return `<tr>
-                <td>${escapeHtml(planId)}</td>
-                <td>${escapeHtml(phase || "—")}</td>
-                <td class="scheduler-row-actions">${schedulerActionButtons(planId, actions)}</td>
-            </tr>`;
-        })
-        .join("");
-
-    schedulerToggle($("#scheduler-plans-table"), true);
-    schedulerToggle($("#scheduler-plans-empty"), false);
 }
 
 /** Render the scheduler's read model.  The panel draws what it is
@@ -2180,6 +2232,9 @@ async function loadSchedulerState() {
     try {
         const snapshot = await api("/scheduler/state");
         renderScheduler(snapshot);
+        // The parallel-agent count is a second, optional read: it rides
+        // along with this refresh instead of owning a timer of its own.
+        loadSchedulerAgentCount();
         return snapshot;
     } catch (err) {
         renderSchedulerError(err);
@@ -2187,18 +2242,30 @@ async function loadSchedulerState() {
     }
 }
 
-/** Read the plans the operator can act on.  The terminal plans are
-    included on purpose: a stopped plan is the one that can be
-    resumed. */
-async function loadSchedulerPlans() {
+/** How many agents are running right now.
+
+    ``GET /api/system/active`` is the workflow's own answer: how many
+    execution subprocesses and verification cycles are in flight, and
+    how many agents that is altogether.  It is not the scheduler's
+    capacity number — six plans holding six slots can be driving eight
+    agents, because one plan may be executing *and* verifying at the
+    same time.
+
+    The count is optional, and a failure must stay optional: this
+    paints a dash and stops.  It must never call renderSchedulerError()
+    — that paints an error banner over a panel that is otherwise
+    working, and an unknown agent count is not a broken scheduler. */
+async function loadSchedulerAgentCount() {
     try {
-        const data = await api("/plans?include_terminal=true");
-        const plans = Array.isArray(data) ? data : (data.plans || []);
-        renderSchedulerPlans(plans);
-        return plans;
-    } catch {
-        renderSchedulerPlans([]);
-        return [];
+        const data = await api("/system/active");
+        const raw = data && data.total_active;
+        const total = Number(raw);
+        const text = (raw === null || raw === undefined || raw === "" || !Number.isFinite(total))
+            ? "—"
+            : String(total);
+        schedulerSetText("#scheduler-view-agent-count", text);
+    } catch (err) {
+        schedulerSetText("#scheduler-view-agent-count", "—");
     }
 }
 
@@ -2240,7 +2307,6 @@ function renderSchedulerError(err) {
 async function schedulerActionDone(result) {
     renderSchedulerOutcome(result);
     await loadSchedulerState();
-    await loadSchedulerPlans();
 }
 
 /** The four actions.  Each one is a command, and each one goes through
@@ -2594,13 +2660,30 @@ function init() {
     safeBind("#btn-open-scheduler", "click", () => {
         show("scheduler-view");
         loadSchedulerState();
-        loadSchedulerPlans();
     });
     safeBind("#btn-refresh-scheduler", "click", () => {
         loadSchedulerState();
-        loadSchedulerPlans();
     });
     safeBind("#btn-scheduler-back-home", "click", goHome);
+    // The capacity knob: the picked number is written to the server,
+    // and the reset puts the configured capacity back.
+    safeBind("#scheduler-capacity-apply", "click", async () => {
+        const select = $("#scheduler-capacity-select");
+        const total = select ? Number(select.value) : NaN;
+        if (!Number.isFinite(total)) return;
+        try {
+            await schedulerApplyCapacity(total);
+        } catch {
+            // The failure is already on screen in the action-result box.
+        }
+    });
+    safeBind("#scheduler-capacity-reset", "click", async () => {
+        try {
+            await schedulerApplyCapacity(null);
+        } catch {
+            // The failure is already on screen in the action-result box.
+        }
+    });
     bindSchedulerActions();
 
     // Initial load

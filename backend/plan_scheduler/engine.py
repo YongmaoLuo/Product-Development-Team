@@ -182,7 +182,12 @@ from .config import (
 )
 from .facts import QUEUED_PHASE
 from .policy import admission_verdict, converge
-from .snapshot import build
+from .snapshot import (
+    CAPACITY_SOURCE_CONFIG,
+    CAPACITY_SOURCE_OVERRIDE,
+    build,
+)
+from .store import CAPACITY_OVERRIDE_KEY
 
 log = logging.getLogger(__name__)
 
@@ -1647,6 +1652,10 @@ class PlanSchedulerEngine:
         Every answer is derived from what is in the database at this
         moment: the plan facts from the reader, the queue and the slots
         from the store.  Nothing is cached between the ticks.
+
+        The capacity comes with the word that says where it came from,
+        so the read model may show the operator that the number in
+        force is an override and not the configured capacity.
         """
         now = self._now()
         waiting = [
@@ -1660,9 +1669,12 @@ class PlanSchedulerEngine:
             if str(row.get("plan_id") or "")
         ]
 
+        capacity, capacity_source = self._capacity_and_source()
+
         state: Dict[str, Any] = {
             "now": now,
-            "capacity": self._capacity(),
+            "capacity": capacity,
+            "capacity_source": capacity_source,
             "used": self._ledger.used(),
             "min_runtime_seconds": self._min_runtime(),
             # The tick never interrupts anybody to make room: the
@@ -1789,6 +1801,12 @@ class PlanSchedulerEngine:
         is not a plan that is running: the panel and the eviction rule
         both talk about the plans that are working, and a plan that
         has been admitted but has not started yet is neither.
+
+        The facts also say when the plan really started, and that
+        stamp is passed on as it is.  The slot's moment is the
+        scheduler's clock — it starts again from zero on every
+        restart — so the plan's own start time travels with the row
+        for whoever wants to say how long the plan has been at it.
         """
         acquired: Dict[str, float] = {}
         for slot in slots:
@@ -1810,6 +1828,7 @@ class PlanSchedulerEngine:
                     "acquired_at": moment,
                     "elapsed": max(0.0, now - moment),
                     "workspace": row.get("workspace"),
+                    "started_at": row.get("started_at"),
                 }
             )
         return running
@@ -2111,12 +2130,81 @@ class PlanSchedulerEngine:
         value = getattr(self._config, name, None)
         return default if value is None else value
 
-    def _capacity(self) -> int:
-        """How many plans may run at the same time."""
+    def _capacity_override(self) -> Optional[int]:
+        """The capacity override in force, if there is one.
+
+        The override is a row in the state database, and it is read
+        **again on every call**: it is a knob the operator turns while
+        the scheduler runs, so a value kept in the configuration
+        snapshot would only take effect after a restart — which is
+        exactly what the override is not for.
+
+        A row that does not hold a usable capacity is ignored rather
+        than obeyed: the number of plans that may run at the same time
+        is never negative, and a value that is not a number at all is
+        not a number of plans.  Zero *is* usable — it is how the
+        operator pauses the scheduling.
+
+        A store that cannot answer is recorded and answered with
+        ``None``: the tick goes on with the configured capacity
+        instead of stopping over a setting.
+
+        Returns:
+            The capacity override in force, or ``None`` when there is
+            none to obey.
+        """
         try:
-            return max(0, int(self._config_value("capacity", DEFAULT_CAPACITY)))
+            raw = self._store.get_setting(self._conn, CAPACITY_OVERRIDE_KEY)
+        except Exception as exc:  # noqa: BLE001 — a tick must not die here
+            self._record_error("capacity", exc)
+            log.warning(
+                "the scheduler's capacity override could not be read (%s); "
+                "the configured capacity is used",
+                exc,
+            )
+            return None
+        if raw is None:
+            return None
+        try:
+            value = int(str(raw).strip())
         except (TypeError, ValueError):
-            return DEFAULT_CAPACITY
+            return None
+        return value if value >= 0 else None
+
+    def _capacity_and_source(self) -> Tuple[int, str]:
+        """How many plans may run, and where that number came from.
+
+        The override is read **once**, so the number and the word that
+        says where it came from always agree: a capacity read as
+        ``override`` is the operator's number, and one read as
+        ``config`` is the configured one.  Two reads could disagree —
+        the operator may clear the override between them — and a state
+        that said ``config`` next to the override's number would be
+        telling the panel a lie.
+
+        The configured capacity is the fallback: the override wins
+        while it is there, and removing it puts the configured capacity
+        back.
+        """
+        override = self._capacity_override()
+        if override is not None:
+            return override, CAPACITY_SOURCE_OVERRIDE
+        try:
+            capacity = max(
+                0, int(self._config_value("capacity", DEFAULT_CAPACITY))
+            )
+        except (TypeError, ValueError):
+            capacity = DEFAULT_CAPACITY
+        return capacity, CAPACITY_SOURCE_CONFIG
+
+    def _capacity(self) -> int:
+        """How many plans may run at the same time.
+
+        The operator's override wins over the configured capacity while
+        it is there; removing it puts the configured capacity back.
+        """
+        capacity, _source = self._capacity_and_source()
+        return capacity
 
     def _min_runtime(self) -> float:
         """How long a young run is left alone."""

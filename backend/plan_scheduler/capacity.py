@@ -115,7 +115,26 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .config import DEFAULT_MIN_RUNTIME_SECONDS
 
-__all__ = ["CapacityLedger"]
+__all__ = ["CAPACITY_OVERRIDE_KEY", "CapacityLedger"]
+
+
+#: The key the runtime capacity override is stored under.
+#:
+#: The capacity lives in ``backend/config.yaml`` — a file that is
+#: tracked by git and carries the comments that explain it, so it may
+#: not be rewritten by a YAML dump.  An operator who wants the
+#: scheduler to run six plans at a time instead of four needs that
+#: number to change while the scheduler runs, and that number must not
+#: rewrite a tracked file to get there.  So the override is a *row*:
+#: the state database holds it, the configuration file stays as it is,
+#: and removing the row is what puts the configured capacity back.
+#:
+#: The constant lives here, beside the ledger that reads it, rather than
+#: in ``plan_scheduler.store``: the route that writes the override reaches
+#: the row through the engine's own connection, and a route must not
+#: import the module that owns the scheduler's tables (see
+#: ``tests/regression/plan_scheduler/test_regression_workspace_and_single_writer.py``).
+CAPACITY_OVERRIDE_KEY = "capacity_override"
 
 
 # ---------------------------------------------------------------------------

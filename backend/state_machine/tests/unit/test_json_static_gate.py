@@ -33,7 +33,7 @@ Defense 2: SQL schema gate (test_sqlite_schema_tables_exactly_four_plus_version)
     {"plan_routing", "plan_execution", "plan_verification",
      "plan_artifacts", "plan_tasks", "plan_decisions",
      "scheduler_queue", "scheduler_slot", "scheduler_command",
-     "schema_version"}
+     "scheduler_setting", "schema_version"}
 
   No ``plans``, ``plan_meta``, or ``plan_activity`` legacy tables.
 
@@ -146,6 +146,7 @@ EXPECTED_SCHEMA_TABLES: frozenset[str] = frozenset(
         "scheduler_queue",
         "scheduler_slot",
         "scheduler_command",
+        "scheduler_setting",
         "schema_version",
     }
 )

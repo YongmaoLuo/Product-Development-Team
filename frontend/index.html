@@ -79,7 +79,33 @@
                     <span class="scheduler-capacity-divider">·</span>
                     <span class="scheduler-capacity-label">队列</span>
                     <span id="scheduler-view-capacity-queue" class="scheduler-capacity-value">0</span>
+                    <span class="scheduler-capacity-divider">·</span>
+                    <span class="scheduler-capacity-label">并行 Agent</span>
+                    <span id="scheduler-view-agent-count" class="scheduler-capacity-value">—</span>
                     <span id="scheduler-view-capacity-over" class="scheduler-capacity-flag hidden">over-capacity</span>
+                    <!-- The capacity knob: the number the operator picks
+                         is written to the server, and the server's number
+                         is what the select shows afterwards. -->
+                    <span class="scheduler-capacity-control">
+                        <label class="scheduler-capacity-label" for="scheduler-capacity-select">并发容量</label>
+                        <select id="scheduler-capacity-select" class="scheduler-capacity-select">
+                            <option value="1">1</option>
+                            <option value="2">2</option>
+                            <option value="3">3</option>
+                            <option value="4">4</option>
+                            <option value="5">5</option>
+                            <option value="6">6</option>
+                            <option value="7">7</option>
+                            <option value="8">8</option>
+                            <option value="9">9</option>
+                            <option value="10">10</option>
+                            <option value="11">11</option>
+                            <option value="12">12</option>
+                        </select>
+                        <button id="scheduler-capacity-apply" class="btn btn-outline">应用</button>
+                        <button id="scheduler-capacity-reset" class="btn btn-outline">跟随配置</button>
+                        <span id="scheduler-capacity-source" class="scheduler-capacity-source"></span>
+                    </span>
                     <span class="scheduler-capacity-stamp">
                         <span class="scheduler-capacity-label">快照</span>
                         <span id="scheduler-view-generated-at" class="scheduler-capacity-value">—</span>
@@ -90,6 +116,23 @@
                     <span id="scheduler-action-outcome" class="scheduler-action-outcome"></span>
                     <span id="scheduler-action-detail" class="scheduler-action-detail"></span>
                 </div>
+
+                <h3 class="scheduler-subtitle">在跑</h3>
+                <div id="scheduler-running-empty" class="empty-state">
+                    <p>没有在跑的计划</p>
+                </div>
+                <table id="scheduler-running-table" class="scheduler-table hidden">
+                    <thead>
+                        <tr>
+                            <th>计划</th>
+                            <th>已运行</th>
+                            <th>可驱逐</th>
+                            <th>工作区</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="scheduler-running-list"></tbody>
+                </table>
 
                 <h3 class="scheduler-subtitle">队列</h3>
                 <div id="scheduler-queue-empty" class="empty-state">
@@ -108,38 +151,6 @@
                         </tr>
                     </thead>
                     <tbody id="scheduler-queue-list"></tbody>
-                </table>
-
-                <h3 class="scheduler-subtitle">在跑</h3>
-                <div id="scheduler-running-empty" class="empty-state">
-                    <p>没有在跑的计划</p>
-                </div>
-                <table id="scheduler-running-table" class="scheduler-table hidden">
-                    <thead>
-                        <tr>
-                            <th>计划</th>
-                            <th>已运行(秒)</th>
-                            <th>可驱逐</th>
-                            <th>工作区</th>
-                            <th>操作</th>
-                        </tr>
-                    </thead>
-                    <tbody id="scheduler-running-list"></tbody>
-                </table>
-
-                <h3 class="scheduler-subtitle">可操作的计划</h3>
-                <div id="scheduler-plans-empty" class="empty-state">
-                    <p>没有可操作的计划</p>
-                </div>
-                <table id="scheduler-plans-table" class="scheduler-table hidden">
-                    <thead>
-                        <tr>
-                            <th>计划</th>
-                            <th>相位</th>
-                            <th>操作</th>
-                        </tr>
-                    </thead>
-                    <tbody id="scheduler-plans-list"></tbody>
                 </table>
             </section>
 

@@ -1074,8 +1074,9 @@ def test_e2e_teardown_guard(exec_instance_setup) -> None:
 #     ``_CORE_SCHEMA_TABLES`` — the Repository tables
 #     (``plan_routing``, ``plan_execution``, ``plan_verification``,
 #     ``plan_artifacts``, ``plan_tasks``, ``plan_decisions``), the
-#     native scheduler's own three (``scheduler_queue``,
-#     ``scheduler_slot``, ``scheduler_command``) and the
+#     native scheduler's own four (``scheduler_queue``,
+#     ``scheduler_slot``, ``scheduler_command``,
+#     ``scheduler_setting``) and the
 #     ``schema_version`` bootstrap table.
 #
 #     Migration metadata tables (``_migration_*`` and
@@ -1139,6 +1140,12 @@ _CORE_SCHEMA_TABLES: frozenset[str] = frozenset(
         "scheduler_queue",
         "scheduler_slot",
         "scheduler_command",
+        # v7 (2026-10-29) the operator's runtime settings — the fourth
+        # scheduler table.  It is a member of the same
+        # "_SCHEDULER_OBJECTS" tuple, so migrate() creates it in the
+        # same call as the three above; it belongs in this set for the
+        # same reason they do.
+        "scheduler_setting",
         "schema_version",
     }
 )
