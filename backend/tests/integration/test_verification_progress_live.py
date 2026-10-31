@@ -60,8 +60,33 @@ _PLAN_ID = "20261023-e2e-progress"
 #: 不带 ``X-PDT-Request`` 一律 403 —— 读到的是守卫的 JSON，不是 payload。
 _REQUEST_HEADERS = {"X-PDT-Request": "1"}
 
+
+def _loopback_client(timeout: float = 10.0) -> httpx.Client:
+    """An HTTP client that talks to the spawned server **directly**.
+
+    ``trust_env=False`` keeps the request on the loopback interface.
+    A developer machine (or a CI container) may have an HTTP proxy
+    configured; httpx would otherwise route *these* calls through it —
+    and the proxy answers a request naming a local port with **its own
+    502** (empty body, no ``Server`` header), not with the server's
+    response.  The readiness probe would then read "the server is
+    broken" for a server that is answering perfectly well, and the
+    probe would keep reading it for as long as the ceiling allows —
+    raising the ceiling cannot fix a request that never arrives.
+
+    Same reasoning, same idiom as
+    ``backend/tests/e2e/test_hitl_execution_strict_e2e.py``.
+    """
+    return httpx.Client(timeout=timeout, trust_env=False)
+
 #: 服务就绪的等待上限（秒）。超时即断言失败，并把服务日志的尾巴打出来。
-_READY_TIMEOUT = 30.0
+#:
+#: 这个上限的作用是「抓住挂死」，不是「证明机器快」。它原来是 30 s ——
+#: 按空闲机器标定的数字；满载机器上真服务器起得慢，2026-10-31 那轮整仓门禁
+#: 的 4 个 error 全在这里（`the spawned server did not become ready within
+#: 30.0s (status 502)`）。放宽到 120 s：仍然是「挂死会被抓住」，但不再把
+#: 「机器忙」读成「服务坏了」。
+_READY_TIMEOUT = 120.0
 
 #: 进程回收的等待上限（秒）。
 _STOP_TIMEOUT = 10.0
@@ -92,6 +117,28 @@ _BLOCKED_VERDICT: Dict[str, Any] = {
 # ---------------------------------------------------------------------------
 # 夹具：计划文件 + 种子裁决
 # ---------------------------------------------------------------------------
+
+
+def test_the_ready_timeout_is_sized_for_a_busy_machine() -> None:
+    """就绪上限必须是「抓住挂死」用的，不是「证明机器快」用的。
+
+    30 s 是按空闲机器标定的数字：满载机器上真服务器起得慢，2026-10-31 那轮
+    整仓门禁的 4 个 error 全在这里。这个数字只说明「机器忙」，不说明「服务
+    坏了」—— 而后者才是这条用例要验的东西。
+    """
+    assert _READY_TIMEOUT >= 120.0
+
+
+def test_the_loopback_client_does_not_go_through_a_proxy() -> None:
+    """打本机服务的请求必须直连，不能经过环境里的代理。
+
+    代理会用**它自己的 502**（空 body、无 ``Server`` 头）回答一个指向
+    本机端口的请求 —— 就绪探针读到的是代理的 502，不是服务的响应，于是
+    「服务坏了」被写进了 error，而服务其实好好的。再怎么放宽上限也修不好
+    一个根本没送达的请求。
+    """
+    with _loopback_client(timeout=1.0) as client:
+        assert client.trust_env is False
 
 
 def _write_plan(plan_dir: Path) -> None:
@@ -208,11 +255,13 @@ class _LiveServer:
 
     def progress(self) -> Dict[str, Any]:
         """GET ``/api/verification/{id}/progress`` over real HTTP."""
-        response = httpx.get(
-            "{0}/api/verification/{1}/progress".format(self.base_url, _PLAN_ID),
-            headers=_REQUEST_HEADERS,
-            timeout=10.0,
-        )
+        with _loopback_client(timeout=10.0) as client:
+            response = client.get(
+                "{0}/api/verification/{1}/progress".format(
+                    self.base_url, _PLAN_ID,
+                ),
+                headers=_REQUEST_HEADERS,
+            )
         assert response.status_code == 200, response.text
         return response.json()
 
@@ -310,11 +359,11 @@ def _wait_until_ready(server: _LiveServer, timeout: float = _READY_TIMEOUT) -> N
         if bound is not None:
             server.port = bound
         try:
-            response = httpx.get(
-                "{0}/api/plans".format(server.base_url),
-                headers=_REQUEST_HEADERS,
-                timeout=2.0,
-            )
+            with _loopback_client(timeout=2.0) as client:
+                response = client.get(
+                    "{0}/api/plans".format(server.base_url),
+                    headers=_REQUEST_HEADERS,
+                )
         except httpx.HTTPError as exc:
             last_error = repr(exc)
         else:

@@ -259,8 +259,8 @@ VERIFICATION_PLAN_SYSTEM_PROMPT = """你是一位资深测试架构师。你的�
       "phase_order": 1,
       "priority": "high",
       "ci_entry": "<当前项目根目录下可直接执行的整仓 CI 总入口>",
-      "ci_timeout_seconds": 3600,
-      "expected_result": "整仓门禁与全部测试通过，退出码 0"
+      "ci_timeout_seconds": 7200,
+      "expected_result": "整仓门禁与全部测试通过，退出码 0；退出码 3 表示机器答不了（宿主不可测），不是代码失败"
     },
     {
       "id": "VP-018",
@@ -401,8 +401,11 @@ VP 开始之前，把这些服务**统一启动一次**，然后让所有 VP 请
      && pytest tests/`）；判定依据就是这条入口的退出码，由框架执行，没有
      LLM 参与。**入口不得收窄**：点名单个测试文件、`-k` / `-m` 选择器、
      pytest `::` 节点语法、`cargo test --test/--lib` 都会被判为计划不合规
-     —— 那是 Phase 1 的粒度，不是整仓门禁。可选 `ci_timeout_seconds`
-     （默认 3600）。
+     —— 那是 Phase 1 的粒度，不是整仓门禁。`ci_timeout_seconds` 必须
+     **≥ 7200**：整仓门禁在 18 并发 worker 下实测约 3458s，3600 的余量只有
+     3.9%，机器一忙就被框架自己的预算杀掉，而这个值按**下限**读（写小了也会
+     被抬到 7200）。退出码契约：**0 = 绿；1 = 门禁报告某条 lane 红（交付缺陷）；
+     3 = 机器答不了**（宿主不可测，或某条 lane 自称不确定），**这不是代码失败**。
 4. ui_validation / e2e 不得 SKIPPED：除非浏览器二进制完全不可用，否则必须实测
 5. 只输出 JSON，不要 markdown 代码块标记
 

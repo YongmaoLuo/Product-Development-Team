@@ -27,6 +27,7 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+import verification_ci_runner as ci_runner  # noqa: E402
 from verification_ci_runner import (  # noqa: E402
     DEFAULT_CI_TIMEOUT_SECONDS,
     MAX_JUNIT_FAILURES,
@@ -375,7 +376,14 @@ class TestRunCiVerification:
         joined = " ".join(result.reasons)
         assert "BOOM: 2 failed" in joined
 
-    def test_timeout_is_failed_and_marked(self, tmp_path):
+    def test_timeout_is_failed_and_marked(self, tmp_path, monkeypatch):
+        # The budget is a **floor** for ``full_ci`` (2026-10-31, VP-020):
+        # a declared 1 s can no longer kill the gate, because a gate
+        # killed by an under-declared budget is not a verdict on the
+        # delivery.  So the floor is lowered here to reach the timeout
+        # path without waiting 7200 s — the assertion below is about the
+        # timeout's shape, not about how long the budget is.
+        monkeypatch.setattr(ci_runner, "MIN_FULL_CI_TIMEOUT_SECONDS", 1)
         result = run_ci_verification(
             _vp("sleep 5", ci_timeout_seconds=1), project_dir=tmp_path,
         )
@@ -430,6 +438,245 @@ class TestRunCiVerification:
         assert isinstance(verdict["reasons"], list)
 
 
+# ---------------------------------------------------------------------------
+# The budget floor — the declared budget is a floor, not a ceiling
+# ---------------------------------------------------------------------------
+#
+# VP-020 (2026-10-31): the plan declared ``ci_timeout_seconds: 3600`` and
+# the whole-repo gate measured 3457.67 s on an idle machine.  The margin
+# was 142 s (3.9 %), so the *next* round — on a busier host — was killed
+# by the framework's own budget before the gate had finished.  The plan
+# cannot be corrected from the outside (``verification_plan_delta`` only
+# knows ``add`` / ``obsolete`` / ``replacement_for``), so the runner has
+# to hold the floor: a declared budget below the gate's measured cost is
+# not honoured as-is.
+#
+# The floor is a floor, not a new ceiling: a plan that declares *more*
+# than the floor keeps its own number.
+
+
+class TestCiTimeoutFloor:
+    def test_full_ci_never_runs_on_less_than_the_measured_gate_cost(self):
+        budget = ci_runner.ci_timeout({
+            "verification_method": "full_ci",
+            "ci_timeout_seconds": 3600,
+        })
+        assert budget >= ci_runner.MIN_FULL_CI_TIMEOUT_SECONDS
+        assert ci_runner.MIN_FULL_CI_TIMEOUT_SECONDS >= 7200
+
+    def test_a_declared_budget_above_the_floor_is_kept(self):
+        assert ci_runner.ci_timeout({
+            "verification_method": "full_ci",
+            "ci_timeout_seconds": 9000,
+        }) == 9000
+
+    def test_a_full_ci_vp_without_a_declared_budget_gets_the_default(self):
+        assert ci_runner.ci_timeout({"verification_method": "full_ci"}) == (
+            ci_runner.DEFAULT_CI_TIMEOUT_SECONDS
+        )
+
+    def test_other_verification_methods_keep_their_own_budget(self):
+        # The floor belongs to the whole-repo gate: a 120 s api_test is
+        # not a whole-repo gate and must not be stretched to two hours.
+        assert ci_runner.ci_timeout({
+            "verification_method": "api_test",
+            "ci_timeout_seconds": 120,
+        }) == 120
+
+
+# ---------------------------------------------------------------------------
+# The three states of the gate — "the machine could not decide" is not
+# "the code is broken"
+# ---------------------------------------------------------------------------
+#
+# ``scripts/run_tests.sh`` has three exit codes, and the third one is
+# the one the framework used to flatten: 0 = green, 1 = a lane went red,
+# 3 = the run could not decide (the host could not be measured, or a
+# phase called itself inconclusive).  The framework read every non-zero
+# exit as "the deliverable is broken", so a busy host produced a repair
+# task against a delivery that had not failed.
+
+
+class TestGateSignals:
+    def test_a_green_gate_carries_no_signal(self, tmp_path):
+        result = run_ci_verification(_vp("exit 0"), project_dir=tmp_path)
+        assert result.status == STATUS_PASSED
+        assert "signal" not in result.evidence
+
+    def test_a_red_gate_is_gate_failed(self, tmp_path):
+        result = run_ci_verification(_vp("exit 1"), project_dir=tmp_path)
+        assert result.status == STATUS_FAILED
+        assert result.evidence["signal"] == ci_runner.SIGNAL_GATE_FAILED
+
+    def test_an_inconclusive_gate_is_not_a_code_failure(self, tmp_path):
+        result = run_ci_verification(_vp("exit 3"), project_dir=tmp_path)
+        assert result.status == STATUS_FAILED
+        assert result.evidence["signal"] == ci_runner.SIGNAL_GATE_INCONCLUSIVE
+
+    def test_a_gate_killed_by_its_budget_is_a_timeout(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ci_runner, "MIN_FULL_CI_TIMEOUT_SECONDS", 1)
+        result = run_ci_verification(
+            _vp("sleep 5", ci_timeout_seconds=1), project_dir=tmp_path,
+        )
+        assert result.evidence["timed_out"] is True
+        assert result.evidence["signal"] == ci_runner.SIGNAL_TIMEOUT
+
+    def test_a_gate_that_cannot_be_started_at_all_is_an_infrastructure_problem(
+        self, tmp_path, monkeypatch,
+    ):
+        def _boom(*args, **kwargs):
+            raise OSError("no shell for you")
+
+        monkeypatch.setattr(ci_runner, "run_bounded", _boom)
+        result = run_ci_verification(_vp("exit 0"), project_dir=tmp_path)
+        assert result.status == STATUS_FAILED
+        assert result.evidence["signal"] == ci_runner.SIGNAL_GATE_NOT_EXECUTABLE
+
+
+# ---------------------------------------------------------------------------
+# The evidence has to survive the kill
+# ---------------------------------------------------------------------------
+#
+# The second VP-020 round was killed with 4000 characters of stdout
+# kept — the *tail*.  The tail was the second phase's progress bar; the
+# first phase's summary ("1 failed, 10530 passed … in 822.48 s") had
+# already scrolled out of it.  A run that was killed must still be able
+# to answer "which lanes finished, and what did they say".
+
+
+def _gate_output(tmp_path) -> Path:
+    """A file that looks like the gate's own summary output."""
+    out = tmp_path / "gate_output.txt"
+    out.write_text(
+        "=== gate summary ===\n"
+        "phase 1/3 (parallel):             passed\n"
+        "= 1 failed, 10530 passed, 43 skipped, 1 xfailed in 822.48s (0:13:42) =\n"
+        "phase 2/3 (e2e + integration):    FAILED (exit 1)\n"
+        "gate: FAIL (exit 1) — a phase failed\n",
+        encoding="utf-8",
+    )
+    return out
+
+
+class TestEvidenceRetention:
+    def test_a_killed_gate_still_reports_the_lanes_that_finished(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr(ci_runner, "MIN_FULL_CI_TIMEOUT_SECONDS", 1)
+        out = _gate_output(tmp_path)
+        result = run_ci_verification(
+            _vp(f"cat {out}; sleep 30", ci_timeout_seconds=1),
+            project_dir=tmp_path,
+        )
+        assert result.evidence["timed_out"] is True
+        summaries = result.evidence["lane_summaries"]
+        assert any("phase 1/3" in line for line in summaries), summaries
+        assert any("1 failed" in line for line in summaries), summaries
+        assert any(line.startswith("gate:") for line in summaries), summaries
+
+    def test_the_head_of_the_output_survives_the_kill(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr(ci_runner, "MIN_FULL_CI_TIMEOUT_SECONDS", 1)
+        out = _gate_output(tmp_path)
+        result = run_ci_verification(
+            _vp(f"cat {out}; sleep 30", ci_timeout_seconds=1),
+            project_dir=tmp_path,
+        )
+        assert result.evidence["stdout_head"].startswith("=== gate summary ===")
+        assert result.evidence["stdout_tail"]
+
+    def test_the_evidence_names_the_budget_and_says_whether_it_was_exceeded(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr(ci_runner, "MIN_FULL_CI_TIMEOUT_SECONDS", 1)
+        result = run_ci_verification(
+            _vp("sleep 5", ci_timeout_seconds=1), project_dir=tmp_path,
+        )
+        assert result.evidence["timeout_seconds"] == 1
+        assert result.evidence["budget_exceeded"] is True
+
+    def test_a_gate_that_finished_is_not_over_budget(self, tmp_path):
+        result = run_ci_verification(_vp("exit 0"), project_dir=tmp_path)
+        assert result.evidence["budget_exceeded"] is False
+        assert result.evidence["timeout_seconds"] >= (
+            ci_runner.MIN_FULL_CI_TIMEOUT_SECONDS
+        )
+
+    def test_the_audit_artifact_carries_the_new_evidence(self, tmp_path):
+        artifact = tmp_path / "vp_artifacts"
+        run_ci_verification(
+            _vp("exit 0"), project_dir=tmp_path, artifact_dir=artifact,
+        )
+        payload = json.loads(
+            (artifact / "VP-901" / "ci_output.json").read_text(encoding="utf-8")
+        )
+        for key in (
+            "stdout_head", "lane_summaries", "timeout_seconds", "budget_exceeded",
+        ):
+            assert key in payload, payload
+
+
+# ---------------------------------------------------------------------------
+# The verdict carries the class — a killed gate is not a broken delivery
+# ---------------------------------------------------------------------------
+
+
+def _full_ci_agent(tmp_path):
+    from verification_agent import VerificationAgent
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(exist_ok=True)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(exist_ok=True)
+    return VerificationAgent(
+        plan_dir=plan_dir, project_dir=project_dir, coding_tool=None,
+    )
+
+
+def _full_ci_vp(**over) -> dict:
+    vp = {
+        "id": "VP-020",
+        "title": "【全量】Nightly CI：整仓门禁",
+        "verification_method": "full_ci",
+        "verification_phase": 2,
+        "phase_order": 1,
+        "ci_entry": "exit 0",
+    }
+    vp.update(over)
+    return vp
+
+
+class TestFullCiVerdictClassification:
+    def test_a_gate_killed_by_its_budget_is_infrastructure(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ci_runner, "MIN_FULL_CI_TIMEOUT_SECONDS", 1)
+        verdict = _full_ci_agent(tmp_path)._run_full_ci_vp(
+            _full_ci_vp(ci_entry="sleep 5", ci_timeout_seconds=1),
+        )
+        assert verdict["status"] == "FAILED"
+        assert verdict["failure_class"] == "infra", verdict
+        assert verdict["failure_class_source"] == "deterministic", verdict
+
+    def test_an_inconclusive_gate_is_infrastructure(self, tmp_path):
+        verdict = _full_ci_agent(tmp_path)._run_full_ci_vp(
+            _full_ci_vp(ci_entry="exit 3"),
+        )
+        assert verdict["status"] == "FAILED"
+        assert verdict["failure_class"] == "infra", verdict
+        assert verdict["failure_class_source"] == "deterministic", verdict
+
+    def test_a_red_gate_is_a_deliverable_defect(self, tmp_path):
+        verdict = _full_ci_agent(tmp_path)._run_full_ci_vp(
+            _full_ci_vp(ci_entry="exit 1"),
+        )
+        assert verdict["status"] == "FAILED"
+        assert verdict["failure_class"] == "deliverable_defect", verdict
+        assert verdict["failure_class_source"] == "deterministic", verdict
+
+    def test_a_green_gate_carries_no_failure_class(self, tmp_path):
+        verdict = _full_ci_agent(tmp_path)._run_full_ci_vp(_full_ci_vp())
+        assert verdict["status"] == "PASSED"
+        assert set(verdict) == {"status", "reasons", "evidence"}
 # ---------------------------------------------------------------------------
 # The per-phase junit evidence
 # ---------------------------------------------------------------------------

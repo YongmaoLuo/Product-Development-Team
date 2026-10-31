@@ -51,7 +51,7 @@ Schema
       "phase_order": 1,
       "priority": "high",
       "ci_entry": "python scripts/ci_local.py --provider vendor-a-pro",
-      "ci_timeout_seconds": 3600,
+      "ci_timeout_seconds": 7200,
       "expected_result": "整仓门禁与全部测试通过，退出码 0"
     }
 
@@ -59,12 +59,54 @@ Schema
 ----
 ``ci_entry`` 退出 0 → PASSED；门禁自己的 summary 说它「判不了」（退出 3，
 或预算用尽）→ INCONCLUSIVE；其余非 0 / 超时 / 入口不可执行 → FAILED，并把
-stdout/stderr 尾部附在 verdict 的 evidence 里、原始输出落盘
+stdout/stderr 的**头尾**附在 verdict 的 evidence 里、原始输出落盘
 ``plans/<id>/vp_artifacts/<vp_id>/ci_output.json``。**只有这一条判据。**
 
 INCONCLUSIVE 不是「过了」，也不是「代码坏了」—— 门禁没有判，它只说明这次
 运行没跑完。把它写成 FAILED 会让修复循环去改一个没被证明有缺陷的交付物。
 
+
+
+一次**什么也没说**的退出 3（门禁没有打印 summary）仍然是 FAILED：没有
+声明可读，历史判定不动 —— 两侧对这一条的判断一致。
+
+三态（2026-10-31，VP-020）
+--------------------------
+本仓的整仓门禁 ``scripts/run_tests.sh`` 有**三个**退出码，不是两个：
+
+==================  ==========================================  ==========
+退出码              含义                                        signal
+==================  ==========================================  ==========
+0                   绿                                          无
+1                   某条 lane 红（代码的问题）                    ``gate_failed``
+3                   机器答不了（宿主不可测，不是代码失败）          ``gate_inconclusive``
+无（被预算杀掉）      没跑完                                      ``timeout``
+==================  ==========================================  ==========
+
+框架以前把「非 0」一律读成「交付物坏了」，于是**机器的问题被记成了交付
+缺陷**：它被计入同因、升级成人，最后变成一份针对没坏过的东西的修复任务。
+现在退出码与超时各自带一个机器可读的 signal，交给
+:mod:`verification.failure_triage` 按规则分类 —— ``gate_inconclusive`` 与
+``timeout`` 是 ``infra``（重试，不计入交付），``gate_failed`` 才是
+``deliverable_defect``。
+
+证据（2026-10-31，VP-020）
+--------------------------
+以前只保留 stdout 的**末尾** 4000 字符。被预算杀掉的那一刻，末尾是第二条
+lane 的进度条，而**已经跑完**的第一条 lane 的汇总（``1 failed, 10530 passed
+… in 822.48s``）早就滚出了这 4000 字符 —— 于是「已跑完的 lane 是红的」在
+证据里读起来像「没发现失败」。现在 evidence 同时保留：
+
+* ``stdout_head`` / ``stderr_head`` —— 开头 4000 字符；
+* ``lane_summaries`` —— 承载各 lane 结论的行（pytest 汇总、``phase N/3``、
+  ``gate:``、``host timing probe:``、``host measurability:``、失败的用例）；
+* ``timeout_seconds`` / ``budget_exceeded`` —— 实际生效的预算，以及它是否
+  被这个预算杀掉。
+
+被杀的运行因此仍然能回答「哪几条 lane 跑完了、结论是什么」。
+
+per-phase junit（2026-10-31）
+--------------------------------
 截尾的输出只留最后 :data:`MAX_OUTPUT_CHARS` 个字符，而门禁是三段串行跑的
 —— 段 1 的失败在段 3 结束时早就被截掉了。所以门禁脚本在
 :data:`GATE_JUNIT_DIR_ENV` 指向一个目录时，会**每段写一份 junit XML**
@@ -75,6 +117,14 @@ INCONCLUSIVE 不是「过了」，也不是「代码坏了」—— 门禁没有
 
 这两条字段**只是证据**：判定仍然只看退出码。XML 缺失 → 两个字段为空；
 XML 解析不了 → 记 ``junit_error`` 并继续，绝不抛异常、绝不影响判定。
+
+两套证据互不越界
+----------------
+``stdout_head`` / ``stderr_head`` 与 ``stdout_tail`` / ``stderr_tail`` 是
+**截断**出来的文本，``lane_summaries`` 是从文本里**筛**出来的结论行，
+``junit_phases`` / ``junit_failures`` 是**读** XML 读出来的结构化证据。
+它们并列写在同一份 evidence 里，但**没有一条参与判定**：verdict 只由
+退出码（及其 signal）决定，junit 读不出来只记 ``junit_error``。
 """
 from __future__ import annotations
 
@@ -118,13 +168,33 @@ CI_ENTRY_FIELD = "ci_entry"
 #: above the Phase-1 evidence-command ceiling (600s). It is still a hard
 #: cap: a hung gate is killed and reported, not left to eat the round.
 #:
-#: This is the *fallback*: it applies only when the gate does not declare
-#: a budget of its own.  A gate that declares one (see
-#: :func:`gate_budget_seconds`) is watched with that budget plus a
-#: margin, because a watchdog that is shorter than the gate it watches
-#: cannot report anything except the fact that it fired.
-DEFAULT_CI_TIMEOUT_SECONDS = 3600
+#: 2026-10-31 (VP-020): 3600 was **smaller than the gate's own cost**.
+#: The three lanes measured 3457.67 s in total (unit 478.27 s, e2e
+#: 2348.75 s, wallclock 630.65 s) — a margin of 142 s, 3.9 % — and the
+#: host's load moves that number: the unit lane alone measured 822.48 s
+#: on a busier host, so the whole gate passed 3600 s and was killed by
+#: this budget **before it had finished**. The default is therefore
+#: 7200 s, roughly twice the measured cost.
+DEFAULT_CI_TIMEOUT_SECONDS = 7200
 
+#: The floor a whole-repo gate's budget may not fall below.
+#:
+#: A plan declares its own ``ci_timeout_seconds``, but the plan cannot be
+#: corrected from the outside: ``verification_plan_delta`` only knows
+#: ``add`` / ``obsolete`` / ``replacement_for``, so a budget that was
+#: written too small stays too small. The runner therefore reads a
+#: declared budget as a **floor, not a ceiling** for ``full_ci`` — the
+#: declared value is honoured when it is larger, and raised to this
+#: floor when it is smaller. Other verification methods are untouched:
+#: a 120 s api_test is not a whole-repo gate.
+MIN_FULL_CI_TIMEOUT_SECONDS = 7200
+
+#:
+#: 2026-10-31: this default is the **fallback** for the case where
+#: neither the gate nor the VP declares a budget.  When the gate
+#: declares one of its own (``GATE_BUDGET_SECONDS_*`` in
+#: ``scripts/run_tests.sh``), that declaration is the truth and the
+#: watchdog is derived from it — see :func:`ci_timeout`.
 #: The margin the watchdog adds to the budget the gate declares.
 #:
 #: The gate stops *itself* at its budget and prints a verdict; the
@@ -158,8 +228,44 @@ _GATE_VERDICT_LINE_RE = re.compile(
 )
 _GATE_PHASE_HEADER_RE = re.compile(r"^=== phase (.+?) ===\s*$", re.MULTILINE)
 
-#: Output kept per stream in the verdict evidence.
+#: Output kept per stream in the verdict evidence — head **and** tail.
 MAX_OUTPUT_CHARS = 4000
+
+#: The exit code the repository's gate uses for "the run could not
+#: decide" (the host could not be measured, or a phase called itself
+#: inconclusive). It is **not** a code failure, and it is not the same
+#: thing as exit 1.
+GATE_INCONCLUSIVE_EXIT_CODE = 3
+
+#: The machine-readable signals this runner emits. They are the names
+#: :mod:`verification.failure_triage` knows, so the four-class triage
+#: decides them by rule instead of guessing from the text.
+SIGNAL_GATE_FAILED = "gate_failed"
+SIGNAL_GATE_INCONCLUSIVE = "gate_inconclusive"
+SIGNAL_TIMEOUT = "timeout"
+SIGNAL_GATE_NOT_EXECUTABLE = "gate_not_executable"
+
+#: The lines that carry a lane's conclusion. A gate run that is killed
+#: mid-way still has to answer "which lanes finished, and what did they
+#: say" — and the answer is in these lines, not in the tail of the
+#: progress bar.
+#:
+#: The shapes come from the two producers: pytest's own summary banner
+#: (``= 1 failed, 10530 passed, … in 822.48s (0:13:42) =``) and the
+#: gate script's summary block (``phase 1/3 (parallel): passed``,
+#: ``gate: FAIL (exit 1) — a phase failed``). The failing cases are
+#: included too: "which test failed" is the first question anybody asks
+#: of a red gate.
+_LANE_SUMMARY_RE = re.compile(
+    r"^(?:=+\s.*\s=+$"                        # pytest's summary banner
+    r"|\d+\s+(?:failed|passed|error|errors|xfailed|xpassed|skipped"
+    r"|deselected)\b.*\bin\s+[\d.]+s"        # pytest's summary, undecorated
+    r"|phase\s+\d+/\d+"                       # the gate's per-phase verdict
+    r"|gate:"                                # the gate's own verdict
+    r"|host (?:measurability|timing probe):"  # the host's own measurement
+    r"|(?:FAILED|ERROR)\s+\S+"               # a failing case (short summary)
+    r"|\S+::\S+.*\b(?:FAILED|ERROR)\b)"      # a failing case (verbose mode)
+)
 
 #: The environment variable that tells the gate script where to write one
 #: junit report per phase.
@@ -660,34 +766,73 @@ def ci_timeout(
     """The watchdog's budget for this VP.
 
     The watchdog is **never shorter than the gate it watches**.  When the
-    gate declares a budget, the watchdog gets that budget plus a margin
-    — a VP that declares a shorter timeout does not get one, because a
-    watchdog shorter than the gate is the failure this whole mechanism
-    exists to prevent: the gate is killed from the outside and reports
-    nothing.
+    gate declares a budget of its own, the watchdog gets that budget
+    plus a margin — a VP that declares a shorter timeout does not get
+    one, because a watchdog shorter than the gate is the failure this
+    whole mechanism exists to prevent: the gate is killed from the
+    outside and reports nothing.
 
-    When the gate declares nothing, the historical default stands.
+    When the gate declares nothing, the VP's own number stands: the gate
+    has said that it needs no floor, and the historical default stands
+    for a VP that declares nothing either.
+
+    There is one case left — **there is no project to ask**.  A caller
+    that does not say where the project is has told the runner nothing
+    about what the gate costs, and a whole-repo gate then keeps the
+    universal floor :data:`MIN_FULL_CI_TIMEOUT_SECONDS`: the measured
+    cost of this repo's gate was 3457.67 s, so a declared 3600 s left a
+    3.9 % margin, and the host's load took it away (the unit lane alone
+    measured 822.48 s on a busier host).  A budget that is smaller than
+    the thing it bounds kills the gate before the gate has finished,
+    and the framework then has no verdict to report.
+
+    The floor is a floor, not a new ceiling: a plan that declares
+    *more* than the floor keeps its own number.
     """
     declared = _declared_ci_timeout(vp)
+    value = DEFAULT_CI_TIMEOUT_SECONDS if declared is None else declared
     budget = gate_budget_seconds(project_dir, entry)
-    if budget is None:
-        if declared is None:
-            return DEFAULT_CI_TIMEOUT_SECONDS
-        return declared
-    floor = budget + GATE_BUDGET_MARGIN_SECONDS
-    if declared is None:
-        return floor
-    return max(declared, floor)
+    if budget is not None:
+        # The gate declares its own budget: the watchdog is that budget
+        # plus a margin, never shorter than the gate.
+        return max(value, budget + GATE_BUDGET_MARGIN_SECONDS)
+    if project_dir is None and str(
+        vp.get("verification_method") or ""
+    ).strip().lower() == "full_ci":
+        # Nothing is known about the gate: the measured cost is the floor.
+        value = max(value, MIN_FULL_CI_TIMEOUT_SECONDS)
+    return value
 
 
 def _declared_ci_timeout(vp: Dict[str, Any]) -> Optional[int]:
     """The timeout the VP itself declares, or ``None`` when it declares none."""
+
     raw = vp.get("ci_timeout_seconds")
     try:
         value = int(raw)
     except (TypeError, ValueError):
+        # A budget that cannot be read is no budget: the caller
+        # falls back to the default, or to the gate's own declaration.
         return None
     return max(1, value)
+
+
+def lane_summaries(stdout: str) -> List[str]:
+    """The lines of ``stdout`` that carry a lane's conclusion.
+
+    Kept in order, and kept whole: a killed run has to be able to say
+    which lanes finished and what each of them concluded.  The order is
+    the order the gate printed them in, and no line is dropped — the
+    point of this list is to be the summary the tail cannot be.
+    """
+    out: List[str] = []
+    for raw in str(stdout or "").splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        if _LANE_SUMMARY_RE.search(line):
+            out.append(line)
+    return out
 
 
 def ci_subprocess_env() -> Dict[str, str]:
@@ -1070,7 +1215,9 @@ def run_ci_verification(
         shutil.rmtree(registry_dir, ignore_errors=True)
 
     duration = time.monotonic() - started
+    stdout_head = stdout[:MAX_OUTPUT_CHARS]
     stdout_tail = stdout[-MAX_OUTPUT_CHARS:]
+    stderr_head = stderr[:MAX_OUTPUT_CHARS]
     stderr_tail = stderr[-MAX_OUTPUT_CHARS:]
     if not gate_summary:
         gate_summary = parse_gate_summary(stdout)
@@ -1092,8 +1239,13 @@ def run_ci_verification(
         "exit_code": exit_code,
         "timed_out": timed_out,
         "duration_seconds": round(duration, 2),
+        "timeout_seconds": timeout,
+        "budget_exceeded": timed_out,
+        "stdout_head": stdout_head,
         "stdout_tail": stdout_tail,
+        "stderr_head": stderr_head,
         "stderr_tail": stderr_tail,
+        "lane_summaries": lane_summaries(stdout),
         "ci_timeout_seconds": timeout,
         "gate_budget_seconds": declared_budget,
         "gate_summary": gate_summary,
@@ -1140,12 +1292,24 @@ def run_ci_verification(
             result.reasons.append(f"输出尾部：{tail[-600:]}")
     else:
         result.status = STATUS_FAILED
+        signal = ""
         if timed_out:
             detail = error
+            signal = SIGNAL_TIMEOUT
         elif error:
             detail = f"入口无法执行：{error}"
+            signal = SIGNAL_GATE_NOT_EXECUTABLE
+        elif exit_code == GATE_INCONCLUSIVE_EXIT_CODE:
+            detail = (
+                f"退出码 {exit_code}（机器答不了：宿主不可测或某条 lane 自称"
+                f"不确定，这不是代码失败）"
+            )
+            signal = SIGNAL_GATE_INCONCLUSIVE
         else:
-            detail = f"退出码 {exit_code}"
+            detail = f"退出码 {exit_code}（门禁报告某条 lane 红）"
+            signal = SIGNAL_GATE_FAILED
+        if signal:
+            evidence["signal"] = signal
         result.reasons = [
             f"[full_ci] `{entry}` {detail}（用时 {duration:.0f}s）"
         ]
