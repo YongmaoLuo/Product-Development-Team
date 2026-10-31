@@ -306,6 +306,57 @@ def test_prompt_pins_methods_to_phases():
 
 
 # ---------------------------------------------------------------------------
+# The gate's budget and its exit-code contract (2026-10-31, VP-020)
+# ---------------------------------------------------------------------------
+#
+# VP-020's plan declared ``ci_timeout_seconds: 3600`` — copied straight
+# out of the prompt's example — and the whole-repo gate measured 3457.67 s
+# on an idle machine.  The margin was 3.9 %, so the next round was killed
+# by the framework's own budget before the gate had finished, and the
+# framework filed "the machine did not finish" as "the delivery is
+# broken".
+#
+# The example is where the number comes from: a plan that copies the
+# example's budget gets a budget that is smaller than the gate's own
+# cost.  So the example has to carry the floor, and the text has to say
+# what the exit codes mean — 3 is "the machine could not decide", which
+# is not a code failure.
+
+
+def test_prompt_does_not_default_the_gate_budget_to_3600():
+    mod = _import_fresh_prompts_module()
+    prompt = mod.VERIFICATION_PLAN_SYSTEM_PROMPT
+    assert "默认 3600" not in prompt
+    assert '"ci_timeout_seconds": 3600' not in prompt
+
+
+def test_prompt_states_the_gate_budget_floor():
+    mod = _import_fresh_prompts_module()
+    prompt = mod.VERIFICATION_PLAN_SYSTEM_PROMPT
+    assert "7200" in prompt
+    assert "≥ 7200" in prompt
+
+
+def test_prompt_states_the_gate_exit_code_contract():
+    mod = _import_fresh_prompts_module()
+    prompt = mod.VERIFICATION_PLAN_SYSTEM_PROMPT
+    assert "机器答不了" in prompt
+
+
+def test_the_full_ci_example_carries_the_budget_and_the_contract():
+    mod = _import_fresh_prompts_module()
+    example = _example_plan_block(mod.VERIFICATION_PLAN_SYSTEM_PROMPT)
+    gates = [
+        vp for vp in example["verification_points"]
+        if vp.get("verification_method") == "full_ci"
+    ]
+    assert gates, "示例里必须有一条 full_ci 的 VP"
+    gate = gates[0]
+    assert gate["ci_timeout_seconds"] >= 7200
+    assert "机器答不了" in gate["expected_result"]
+
+
+# ---------------------------------------------------------------------------
 # api_test 断言规范表格 —— 由 verification_api_runner 的词汇表派生，
 # 不是手抄。教 LLM 一个运行器不认的 spell，等于把它送进"永远判不了"。
 # ---------------------------------------------------------------------------

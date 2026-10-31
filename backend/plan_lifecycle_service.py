@@ -102,8 +102,8 @@ pause 与 requeue
 * ``pause_plan`` —— **在跑** → 既有 ``stop_plan(requeue=False)``；
   **排队中** → 既有合法边 ``queued → stopped``（``plan_state`` 的边表
   里那一行），并且把队列行删掉。
-* ``requeue_plan`` —— **停住** → 既有合法边 ``stopped → queued``（复用
-  ``_requeue_to_queued``）。
+* ``requeue_plan`` —— **停住 / 失败** → 既有合法边 ``stopped → queued`` 与
+  ``failed → queued``（复用 ``_requeue_to_queued``）。
 
 两条边都由状态机承担，门面只发起迁移：合法性查的是状态机那两张边表，
 门面不自己判断「这条边存不存在」——自己判断就是一份会漂移的边表副本。
@@ -354,7 +354,8 @@ class PlanLifecycleService:
     def _requeue_to_queued(plan_dir) -> bool:
         """把停住的计划迁回等待相位（``queued``）；返回迁移是否成功。
 
-        ``stopped → queued`` 那条边由状态机承担，门面只发起迁移。
+        ``stopped → queued`` 与 ``failed → queued`` 那两条边由状态机承担，
+        门面只发起迁移。
 
         ``ValueError``（非法迁移）**不外抛**：stop 已经成功了，「没进队列」
         不是 stop 的失败 —— 让它冒泡会把一次成功的停变成 500。失败时记
@@ -546,11 +547,17 @@ class PlanLifecycleService:
         )
 
     def requeue_plan(self, plan_id: str) -> LifecycleResult:
-        """把一个停住的计划放回等待相位 —— 既有合法边 ``stopped → queued``。
+        """把一个停住或失败的计划放回等待相位 —— 既有合法边
+        ``stopped → queued`` 与 ``failed → queued``。
 
-        **只接受 ``stopped``**：别的相位一律冲突（相位原样不动）。在跑
-        的计划没有「放回等待相位」这回事 —— 那是一次停止加一次入队，两
-        件事，不能用一个名字糊过去。
+        **接受 ``stopped`` 与 ``failed``**：这两个相位都放回等待相位
+        ``queued``。状态机的边表里那两条边（``stopped → queued`` 与
+        ``failed → queued``）本来就存在 —— 收窄只发生在门面：入口相位
+        集合少写了一个名字，于是那条本来合法的边永远走不到。
+
+        别的相位一律冲突（相位原样不动）。**``executing`` 仍然是冲突**：
+        在跑的计划没有「放回等待相位」这回事 —— 那是一次停止加一次入队，
+        两件事，不能用一个名字糊过去。
 
         :param plan_id: 目标计划。
         :return: :class:`LifecycleResult`；冲突时 ``ok`` 是 ``False``。
@@ -564,14 +571,17 @@ class PlanLifecycleService:
             raise PlanNotFoundError(plan_id)
 
         phase = self._current_phase(plan_dir)
-        if phase != "stopped":
+        # 入口相位集合：``stopped`` 与 ``failed``。其余相位 —— 包括
+        # ``executing`` —— 一律冲突。
+        if phase not in ("stopped", "failed"):
             logger.info(
                 "plan_lifecycle_requeue_conflict: plan=%s cannot be requeued "
                 "from the phase %r", plan_id, phase,
             )
             return self._conflict(plan_id, phase)
 
-        # ``stopped → queued`` 那条边由状态机承担，门面只发起迁移。
+        # ``stopped → queued`` / ``failed → queued`` 那两条边由状态机承担，
+        # 门面只发起迁移。
         # CAS 冲突（``ConflictError``）照既有语义往外抛，不重试。
         if not self._requeue_to_queued(plan_dir):
             # 迁移被拒（相位在读与写之间变了，或那条边不合法）：冲突。

@@ -618,6 +618,26 @@ FROZEN_SCHEMA_DDL_HASH: str = (
 #: and the parallel-agent count, and the poll reads the read model
 #: alone.  The file changed once, on purpose, for the same reason it
 #: moved for the capacity work, so the pin moves again.
+#: 2026-10-31: the same file now carries the **failed-phase action
+#: split** — the scheduler panel offers 「启动」 and 「重跑验证」 as two
+#: separate buttons, because they are two different commands: 「启动」
+#: puts a failed plan back in the queue, while 「重跑验证」 re-runs the
+#: verification round (two requests: the round counter is rewound, then
+#: the round starts).  The two actions need two different words, so the
+#: button's label is now chosen per *phase* and not per action — on a
+#: failed plan 「启动」 would read as "run the whole thing again" while
+#: it only re-queues, so that phase says 「重新排队执行」 instead.
+#: The change is additive (+66/-5 lines: one action label, one
+#: phase-label table, one label helper, one re-run function and its
+#: dispatch arm, and the phase argument on the button renderer); no
+#: existing phase name, no existing action and no existing branch of
+#: the renderer changed, which is why the freeze moves rather than the
+#: gate being loosened.
+#:
+#: 2026-10-31 (合入 main): 两侧的改动都在这个文件里 —— main 的调度面板改版
+#: （视图重排、在跑运行时长、并行 Agent 数、容量下拉框）与本分支的 failed 相位
+#: 动作拆分（两个按钮、failed 相位专属文案、重跑验证的两次请求），以及为终态
+#: 计划区块保留的 renderer。哈希按本 gate 的既定流程重新钉住合并后的文件。
 FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 2026-10-29：因「调度面板自动刷新」新增 5 秒轮询与「页面不可见时暂停、回可见立即刷新」
     # （`refreshScheduler` / `handleSchedulerVisibilityChange`），按本 gate 的既定流程重新钉住
@@ -630,8 +650,12 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 轮询间隔与可见性处理一字未动，按本 gate 的既定流程把该文件的哈希再前移一次。
     # 2026-10-31：合入 origin/main（PR #70）并删除已被 main 删掉的 `loadSchedulerPlans` /
     # `renderSchedulerPlans` 之后，文件内容再次变化，按本 gate 的既定流程再钉一次。
+    # 2026-10-31：因 failed 相位拆分「启动」与「重跑验证」两个动作（新增 rerun-verification
+    # 动作、failed 相位专属文案「重新排队执行」、重跑验证的两次请求）与调度面板改版
+    # （视图重排、在跑运行时长、并行 Agent 数、容量下拉框），按本 gate 的既定流程
+    # 重新钉住该文件的哈希。
     "frontend/app.js": (
-        "1b394790ff6746eb2d115d7f01e2a42795caa0420c083c0b9876db2110d392ed"
+        "d6cd5c015d0e3d4ac1f963e6275b29350c256ff1b6ad8335aef56cd37f1595e0"
     ),
     "frontend/style.css": (
         "0cab7b66dae8b5b693a9e8e4b5c4cda4f8651ae649512e81d8aa8c18a24f836b"
@@ -666,8 +690,11 @@ FROZEN_SCHEDULER_SURFACE_SHA256: dict[str, str] = {
     ),
     # 2026-10-30：因调度面板改版（视图重排、在跑运行时长、并行 Agent 数、容量下拉框）
     # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。
+    # 2026-10-31（合入 main）：调度面板改版之上多回了「终态计划」区块 ——
+    # failed 计划既不在队列里也不在「在跑」里，failed 相位的两个按钮画在
+    # 这个区块里；同样按本 gate 的既定流程重新钉住哈希。
     "frontend/index.html": (
-        "c41bc87629f95a6afea700e359ba919315214d4496772322b170142c470719bb"
+        "02e443000dfd112b687d909d56a4444a4ed58bed9b07d3caeb07433f16fbc0f7"
     ),
 }
 

@@ -24,6 +24,10 @@ the two exits comparable:
 
 * **One decision list, two exits.**  The same list handed to both sinks
   yields the same ``action`` / ``plan_id`` / ``reason`` for every item.
+* **One decision, one outcome.**  The execute sink carries every
+  decision out on its own: a decision the executor could not carry out
+  is reported as a failure, and the decisions behind it are still
+  carried out.  The batch is not lost to the first failure.
 * **Recording is inert.**  :class:`RecordSink` writes a file.  It never
   calls the plan lifecycle and never starts a subprocess.
 * **The record accumulates.**  The file is appended to, so one run's
@@ -158,6 +162,16 @@ class DecisionSink(ABC):
     Implementations return one entry per decision, in the order the
     decisions were given, so the caller can line the two exits up
     against each other.
+
+    An entry may carry more than the decision itself.  The execute
+    sink adds two fields to every entry it returns: ``ok`` — whether
+    the executor carried the decision out — and ``error``: the
+    exception a decision that was not carried out raised, and ``None``
+    for one that was.  The recording sinks do not add them: their
+    entries are the four canonical fields and nothing else.  A caller
+    that reads ``ok`` off a recorded entry has to read a missing one
+    as *success* — the recording exit carries nothing out, so there is
+    no per-decision failure for it to report.
     """
 
     @abstractmethod
@@ -188,10 +202,14 @@ class ExecuteSink(DecisionSink):
     rewrites what it is given would change what the recording exit
     sees, and the two exits would no longer be comparable.
 
-    An executor that raises ends the whole call: a decision the
-    executor could not carry out is not a decision that was carried
-    out, and hiding that behind a placeholder would make the live exit
-    look like it succeeded.
+    An executor that raises does not end the whole call.  The decisions
+    of a tick are independent of each other, so one failure is one
+    failure: the decisions behind it are still handed to the executor,
+    and every entry says how its own decision went.  A batch that was
+    lost to the first exception would leave the plans behind the
+    failing one untouched without anybody knowing, and the caller would
+    be left without a result to say which decisions were carried out
+    and which were not.
     """
 
     def __init__(self, executor: Callable[[Dict[str, Any]], Dict[str, Any]]) -> None:
@@ -213,10 +231,32 @@ class ExecuteSink(DecisionSink):
     def apply(self, decisions: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Run every decision through the executor, in order.
 
+        Every decision is carried out on its own.  One that raises is
+        reported as a failure and the decisions behind it are still
+        carried out: the batch is not lost to the first exception.
+
+        Args:
+            decisions: the decisions to carry out.
+
         Returns:
-            The executor's results, one per decision, in order.
+            One entry per decision, in order.  Each entry carries the
+            decision's own fields, plus ``ok`` — whether the executor
+            carried it out — and ``error``: the exception a decision
+            that was not carried out raised, and ``None`` for one that
+            was.  What the executor returned comes back on the entry
+            as well; a result that is not a mapping is ignored, and the
+            decision's own fields stand on their own.
         """
-        return [self._executor(decision) for decision in decisions]
+        outcomes: List[Dict[str, Any]] = []
+        for decision in decisions:
+            try:
+                result = self._executor(decision)
+            except Exception as exc:  # noqa: BLE001 — one decision's failure is one decision's failure
+                outcomes.append({**decision, "ok": False, "error": exc})
+                continue
+            carried = result if isinstance(result, dict) else {}
+            outcomes.append({**decision, **carried, "ok": True, "error": None})
+        return outcomes
 
 
 class RecordSink(DecisionSink):
@@ -239,6 +279,11 @@ class RecordSink(DecisionSink):
     architecture's decision point 7 pins it.  The record is the
     comparable core of a decision: what the live engine acted on and
     what the dry run wrote down can be lined up against each other.
+
+    A record carries no verdict of its own: the recording exit carries
+    nothing out, so there is no per-decision failure for it to report,
+    and a caller that reads ``ok`` off a record has to read a missing
+    one as *success*.
     """
 
     def __init__(self, out_dir: os.PathLike[str] | str) -> None:
@@ -1021,7 +1066,11 @@ class DryRunWriter(DecisionSink):
 
     The writer is a :class:`DecisionSink`, so the tick hands its
     decisions to it the way it hands them to the executor — the same
-    exit, a different place to put them.
+    exit, a different place to put them.  The records it returns are
+    the four canonical fields, like the record sink's: the writer
+    executes nothing, so it has no per-decision failure to report, and
+    a caller that reads ``ok`` off a record has to read a missing one
+    as *success*.
 
     A window is only as good as the comparison behind it.  The writer
     holds the **new** engine's side; the other side is the old

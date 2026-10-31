@@ -337,6 +337,42 @@ STRICTLY_STRONGER = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# A gate that could not decide is not a broken deliverable (2026-10-31)
+# ---------------------------------------------------------------------------
+#
+# VP-020's second round was killed by the framework's own budget: the
+# gate never finished, so there was no exit code to read.  The failure
+# was filed as ``deliverable_defect`` / ``defaulted`` — the class that
+# counts against the same-cause threshold and that becomes a repair
+# task — because the timeout reason is Chinese and the text fallback
+# table only carried English markers, and because the ``full_ci`` path
+# never carried a signal for the classifier to read.
+#
+# The rule the fix rests on: a verdict decided by a rule (tier A) is
+# not degraded, and an infrastructure failure does not move the
+# same-cause counter.
+def test_a_gate_killed_by_its_budget_is_infrastructure_and_is_not_counted():
+    triage = _triage()
+
+    verdict = {
+        "verdict": "FAILED",
+        "failure_class": "infra",
+        "failure_class_source": "deterministic",
+        "evidence_quote": "",
+        "actual_result": "超时：3600s 内没有跑完",
+    }
+
+    assert triage.classify_verdict(verdict) == ("infra", "deterministic")
+    assert triage.disposition_for("infra") == "retry_not_counted"
+    assert triage.is_counted("infra") is False
+
+    # The class a defaulted verdict would have landed on is the one that
+    # counts — which is exactly why the machine's problem had to be named
+    # by a rule instead of being defaulted.
+    assert triage.is_counted("deliverable_defect") is True
+
+
 def test_is_not_looser_matrix():
     """A replacement may not be a weaker check than the original.
 

@@ -73,6 +73,7 @@ from test_scheduler_view_present import _function_body, _source  # noqa: E402
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _APP_JS = _REPO_ROOT / "frontend" / "app.js"
+_INDEX_HTML = _REPO_ROOT / "frontend" / "index.html"
 
 
 # ---------------------------------------------------------------------------
@@ -225,10 +226,27 @@ def test_the_deleted_plans_block_is_not_read_again() -> None:
             "and the panel goes blank around it."
         )
 
-    assert "/plans?include_terminal=true" not in source, (
-        "frontend/app.js still reads /plans?include_terminal=true. The "
-        "panel's plans block is gone; the read behind it is a second "
-        "request for a table nobody is looking at."
+    # 2026-10-31（合入 #71）：终态计划区块回到面板上 —— failed 计划既不在队列里、
+    # 也不在「在跑」里，它们的两个按钮（「启动」/「重跑验证」）画在
+    # `#scheduler-terminal-list` 里，数据来自 `/plans?include_terminal=true`。
+    # **被删掉的是另一个区块**（「可操作的计划」，`#scheduler-plans-list`），它的
+    # 两个 loader 仍然不许回来（上面已经断言）。所以这里不再整体禁掉那个 URL，
+    # 而是钉住这条用例真正防的事：**读它的人只有一个，且它渲染的目标在 markup 里
+    # 真实存在** —— 一个读者找不到自己的目标，才是「面板每五秒空一次」的来源。
+    assert "loadSchedulerTerminalPlans" in source, (
+        "frontend/app.js has no terminal plans loader: the failed plans' two "
+        "buttons (「启动」 / 「重跑验证」) would never be drawn."
+    )
+    assert source.count("/plans?include_terminal=true") == 1, (
+        "frontend/app.js reads /plans?include_terminal=true "
+        f"{source.count('/plans?include_terminal=true')} times. The "
+        "terminal plans block is the only reader left; a second read is the "
+        "「可操作的计划」 block coming back with it."
+    )
+    assert 'id="scheduler-terminal-list"' in _source(_INDEX_HTML), (
+        "the terminal plans loader renders into #scheduler-terminal-list, "
+        "which is not in frontend/index.html: the loader would find nothing "
+        "and the panel would go blank around it every tick."
     )
 
 

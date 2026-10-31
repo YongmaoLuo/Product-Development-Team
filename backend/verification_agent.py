@@ -8059,6 +8059,44 @@ class Orchestrator:
         verdict["failure_class"] = failure_class
         verdict["failure_class_source"] = SOURCE_DETERMINISTIC
 
+    @staticmethod
+    def _classify_full_ci_verdict(verdict: dict, result: Any) -> None:
+        """Classify a whole-repo gate verdict, in place.
+
+        The same shape as :meth:`_classify_api_test_verdict`, and for
+        the same reason: the gate's exit code is a **machine-readable
+        fact**, and the four-class triage decides it by rule.
+
+        2026-10-31 (VP-020): the ``full_ci`` path used to hand the
+        classifier nothing at all.  The runner's timeout reason is
+        Chinese ("超时：3600s 内没有跑完") and the text fallback table
+        carried only English markers, so a run that was killed by the
+        framework's own budget was filed as ``deliverable_defect`` /
+        ``defaulted`` — the class that counts against the same-cause
+        threshold and that becomes a repair task.  The gate was killed
+        before it had finished; the delivery was never judged.
+
+        The class comes from :func:`verification.failure_triage.
+        classify_deterministic`, so the source says the class was
+        decided by that rule rather than assumed.
+        """
+        evidence = getattr(result, "evidence", None) or {}
+        signal = evidence.get("signal")
+        if not signal:
+            return
+        from verification.failure_triage import (
+            SOURCE_DETERMINISTIC,
+            classify_deterministic,
+        )
+
+        failure_class = classify_deterministic(
+            signal, str(evidence.get("error") or ""),
+        )
+        if not failure_class:
+            return
+        verdict["failure_class"] = failure_class
+        verdict["failure_class_source"] = SOURCE_DETERMINISTIC
+
     def _run_full_ci_vp(self, vp: dict) -> dict:
         """Grade a ``full_ci`` VP without an LLM (2026-09-18, D2).
 
@@ -8070,8 +8108,10 @@ class Orchestrator:
 
         Runs on the executor's thread pool. A whole-repo gate is the one
         command in the system allowed to take tens of minutes; it is
-        bounded by the VP's own ``ci_timeout_seconds`` (default 3600) and
-        is killed at that ceiling rather than left to eat the round.
+        bounded by the VP's own ``ci_timeout_seconds`` — read as a
+        **floor**, because the declared number can be smaller than the
+        gate's own cost (7200 s default, 2026-10-31) — and is killed at
+        that ceiling rather than left to eat the round.
 
         Never raises — :func:`verification_ci_runner.run_ci_verification`
         turns every failure mode into a FAILED verdict carrying its reason.
@@ -8103,6 +8143,7 @@ class Orchestrator:
         # about the deliverable — and an operator reading the round log
         # can only see *why* if the event says which phase was
         # exhausted and how long the gate ran.
+        self._classify_full_ci_verdict(verdict, result)
         self._safe_log_freshness_event(
             vp_id, "full_ci_executed",
             {
