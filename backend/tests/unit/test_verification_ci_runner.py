@@ -9,6 +9,9 @@ Covers:
     repo-path existence check.
   * ``run_ci_verification`` — exit 0 → PASSED; non-zero / timeout /
     missing entry → FAILED with the reason; the audit artifact.
+  * the per-phase junit evidence — the reports the gate writes are read
+    back into the verdict, and a report that is missing or broken
+    leaves the verdict exactly where it was.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ if str(_BACKEND_DIR) not in sys.path:
 
 from verification_ci_runner import (  # noqa: E402
     DEFAULT_CI_TIMEOUT_SECONDS,
+    MAX_JUNIT_FAILURES,
     STATUS_FAILED,
     STATUS_PASSED,
     _referenced_paths,
@@ -424,3 +428,238 @@ class TestRunCiVerification:
         ).to_verdict_dict()
         assert set(verdict) == {"status", "reasons", "evidence"}
         assert isinstance(verdict["reasons"], list)
+
+
+# ---------------------------------------------------------------------------
+# The per-phase junit evidence
+# ---------------------------------------------------------------------------
+#
+# The gate script runs three phases back to back and the verdict keeps
+# only the tail of the whole run's output — so a failure in phase 1 is
+# gone from the evidence by the time phase 3 ends.  The junit reports
+# are what makes the failure locatable again.
+#
+# The rule this file pins: **the reports are evidence, never a verdict.**
+# They are read back, they are summarised, and a report that is missing
+# or broken changes nothing about PASSED / FAILED — because that verdict
+# is the exit code and nothing else.
+
+#: A fake CI entry.  It publishes the prepared reports into the
+#: directory the runner named through ``PDT_GATE_JUNIT_DIR`` — the very
+#: variable the real gate script reads — so the test exercises the
+#: wiring the production path uses rather than reaching into the
+#: reader directly.
+#:
+#: The exit code is the one the test asked for; when the environment
+#: variable is missing the entry exits 99 instead, so a test can tell
+#: "the gate ran and failed" from "the gate never learned where to
+#: write".
+_FAKE_GATE_SOURCE = '''\
+import os
+import shutil
+import sys
+from pathlib import Path
+
+target = os.environ.get("PDT_GATE_JUNIT_DIR")
+if not target:
+    sys.exit(99)
+destination = Path(target)
+destination.mkdir(parents=True, exist_ok=True)
+for report in sorted((Path(__file__).parent / "reports").glob("*.xml")):
+    shutil.copyfile(report, destination / report.name)
+sys.exit(int(sys.argv[1]))
+'''
+
+#: One phase with two failures and one skipped case, in the shape pytest
+#: writes.
+_PHASE_ONE_XML = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="pytest tests">
+  <testsuite name="pytest" errors="0" failures="2" skipped="1" tests="3" \
+time="0.123" timestamp="2026-10-31T00:00:00" hostname="gate">
+    <testcase classname="tests.unit.test_alpha" name="test_first" time="0.001">
+      <failure message="assert 1 == 2">def test_first():
+&gt;       assert 1 == 2
+E       assert 1 == 2</failure>
+    </testcase>
+    <testcase classname="tests.unit.test_alpha" name="test_second" time="0.002">
+      <failure message="ValueError: boom">def test_second():
+E       ValueError: boom</failure>
+    </testcase>
+    <testcase classname="tests.unit.test_alpha" name="test_skipped" time="0.000">
+      <skipped type="pytest.skip" message="not today" />
+    </testcase>
+  </testsuite>
+</testsuites>
+"""
+
+#: A second phase, carrying a collection error rather than a failure.
+_PHASE_TWO_XML = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="pytest tests">
+  <testsuite name="pytest" errors="1" failures="0" skipped="0" tests="1" \
+time="0.500" timestamp="2026-10-31T00:00:01" hostname="gate">
+    <testcase classname="tests.unit.test_beta" name="test_collect" time="0.500">
+      <error message="collection failure">ImportError: no module named beta</error>
+    </testcase>
+  </testsuite>
+</testsuites>
+"""
+
+
+def _fake_gate(tmp_path: Path, reports: dict, exit_code: int = 1) -> str:
+    """Write the fake entry and return the ``ci_entry`` that runs it."""
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    for name, body in reports.items():
+        (reports_dir / name).write_text(body, encoding="utf-8")
+    gate = tmp_path / "fake_gate.py"
+    gate.write_text(_FAKE_GATE_SOURCE, encoding="utf-8")
+    return f'"{sys.executable}" "{gate}" {exit_code}'
+
+
+def _junit_xml(failures: int) -> str:
+    """A phase report with ``failures`` failing cases."""
+    cases = "".join(
+        f'<testcase classname="tests.unit.test_many" name="test_{index}" '
+        f'time="0.001"><failure message="assert {index} == {index + 1}">'
+        f"E       assert {index} == {index + 1}</failure></testcase>"
+        for index in range(failures)
+    )
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuites name="pytest tests">\n'
+        f'  <testsuite name="pytest" errors="0" failures="{failures}" '
+        f'skipped="0" tests="{failures}" time="1.000" '
+        'timestamp="2026-10-31T00:00:00" hostname="gate">\n'
+        f"    {cases}\n"
+        "  </testsuite>\n"
+        "</testsuites>\n"
+    )
+
+
+class TestJunitEvidence:
+    def test_the_reports_of_every_phase_are_read_back(self, tmp_path):
+        entry = _fake_gate(
+            tmp_path,
+            {"phase-1.xml": _PHASE_ONE_XML, "phase-2.xml": _PHASE_TWO_XML},
+        )
+        result = run_ci_verification(
+            _vp(entry), project_dir=tmp_path, artifact_dir=tmp_path / "arts",
+        )
+
+        # The entry ran with the exit code it was given (99 would mean
+        # it never learned where to write).
+        assert result.evidence["exit_code"] == 1
+
+        assert result.evidence["junit_phases"] == [
+            {"phase": 1, "tests": 3, "failures": 2, "errors": 0, "skipped": 1},
+            {"phase": 2, "tests": 1, "failures": 0, "errors": 1, "skipped": 0},
+        ]
+
+        failures = result.evidence["junit_failures"]
+        assert [f["node_id"] for f in failures] == [
+            "tests/unit/test_alpha.py::test_first",
+            "tests/unit/test_alpha.py::test_second",
+            "tests/unit/test_beta.py::test_collect",
+        ]
+        assert [f["phase"] for f in failures] == [1, 1, 2]
+        assert [f["kind"] for f in failures] == ["failure", "failure", "error"]
+        assert failures[0]["first_line"] == "assert 1 == 2"
+        assert failures[1]["first_line"] == "ValueError: boom"
+        assert failures[2]["first_line"] == "collection failure"
+
+    def test_the_verdict_is_still_the_exit_code(self, tmp_path):
+        entry = _fake_gate(tmp_path, {"phase-1.xml": _PHASE_ONE_XML})
+        result = run_ci_verification(
+            _vp(entry), project_dir=tmp_path, artifact_dir=tmp_path / "arts",
+        )
+        assert result.status == STATUS_FAILED
+        assert result.evidence["junit_failures"]
+
+    def test_a_passing_gate_with_reports_is_still_passed(self, tmp_path):
+        entry = _fake_gate(
+            tmp_path, {"phase-1.xml": _PHASE_ONE_XML}, exit_code=0,
+        )
+        result = run_ci_verification(
+            _vp(entry), project_dir=tmp_path, artifact_dir=tmp_path / "arts",
+        )
+        assert result.status == STATUS_PASSED
+        # The reports are still read — a passing gate's reports say how
+        # much it ran.
+        assert result.evidence["junit_phases"][0]["tests"] == 3
+
+    def test_no_reports_leaves_the_evidence_empty_and_the_verdict_alone(
+        self, tmp_path,
+    ):
+        result = run_ci_verification(
+            _vp("exit 1"), project_dir=tmp_path, artifact_dir=tmp_path / "arts",
+        )
+        assert result.status == STATUS_FAILED
+        assert result.evidence["junit_phases"] == []
+        assert result.evidence["junit_failures"] == []
+        assert "junit_error" not in result.evidence
+
+    def test_a_broken_report_is_recorded_and_never_raised(self, tmp_path):
+        entry = _fake_gate(
+            tmp_path, {"phase-1.xml": "<testsuites><not-closed>"},
+        )
+        result = run_ci_verification(
+            _vp(entry), project_dir=tmp_path, artifact_dir=tmp_path / "arts",
+        )
+        assert result.status == STATUS_FAILED
+        assert result.evidence["exit_code"] == 1
+        assert result.evidence["junit_error"]
+        assert "phase-1.xml" in result.evidence["junit_error"]
+        assert result.evidence["junit_failures"] == []
+
+    def test_more_failures_than_the_ceiling_are_truncated(self, tmp_path):
+        entry = _fake_gate(
+            tmp_path,
+            {"phase-1.xml": _junit_xml(MAX_JUNIT_FAILURES + 10)},
+        )
+        result = run_ci_verification(
+            _vp(entry), project_dir=tmp_path, artifact_dir=tmp_path / "arts",
+        )
+        assert result.status == STATUS_FAILED
+        assert len(result.evidence["junit_failures"]) == MAX_JUNIT_FAILURES
+        assert result.evidence["junit_failures_truncated"] is True
+        # The count of what was left out is still reported.
+        assert result.evidence["junit_phases"][0]["failures"] == (
+            MAX_JUNIT_FAILURES + 10
+        )
+
+    def test_the_truncation_flag_is_absent_below_the_ceiling(self, tmp_path):
+        entry = _fake_gate(tmp_path, {"phase-1.xml": _junit_xml(3)})
+        result = run_ci_verification(
+            _vp(entry), project_dir=tmp_path, artifact_dir=tmp_path / "arts",
+        )
+        assert len(result.evidence["junit_failures"]) == 3
+        assert "junit_failures_truncated" not in result.evidence
+
+    def test_the_reports_land_next_to_the_audit_copy(self, tmp_path):
+        entry = _fake_gate(tmp_path, {"phase-1.xml": _PHASE_ONE_XML})
+        artifact = tmp_path / "arts"
+        run_ci_verification(
+            _vp(entry), project_dir=tmp_path, artifact_dir=artifact,
+        )
+        assert (artifact / "VP-901" / "phase-1.xml").exists()
+        assert (artifact / "VP-901" / "ci_output.json").exists()
+
+    def test_the_audit_copy_carries_the_junit_evidence(self, tmp_path):
+        entry = _fake_gate(tmp_path, {"phase-1.xml": _PHASE_ONE_XML})
+        artifact = tmp_path / "arts"
+        run_ci_verification(
+            _vp(entry), project_dir=tmp_path, artifact_dir=artifact,
+        )
+        payload = json.loads(
+            (artifact / "VP-901" / "ci_output.json").read_text(encoding="utf-8")
+        )
+        assert payload["junit_phases"][0]["failures"] == 2
+        assert payload["junit_failures"][0]["node_id"] == (
+            "tests/unit/test_alpha.py::test_first"
+        )
+
+    def test_without_an_artifact_dir_there_is_nowhere_to_write(self, tmp_path):
+        result = run_ci_verification(_vp("exit 0"), project_dir=tmp_path)
+        assert result.status == STATUS_PASSED
+        assert result.evidence["junit_phases"] == []
+        assert result.evidence["junit_failures"] == []

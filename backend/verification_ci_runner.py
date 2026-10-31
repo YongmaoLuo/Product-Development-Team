@@ -60,6 +60,17 @@ Schema
 ``ci_entry`` 退出 0 → PASSED；非 0 / 超时 / 入口不可执行 → FAILED，并把
 stdout/stderr 尾部附在 verdict 的 evidence 里、原始输出落盘
 ``plans/<id>/vp_artifacts/<vp_id>/ci_output.json``。**只有这一条判据。**
+
+截尾的输出只留最后 :data:`MAX_OUTPUT_CHARS` 个字符，而门禁是三段串行跑的
+—— 段 1 的失败在段 3 结束时早就被截掉了。所以门禁脚本在
+:data:`GATE_JUNIT_DIR_ENV` 指向一个目录时，会**每段写一份 junit XML**
+（``phase-<n>.xml``）；跑完后本模块把这份证据读回 verdict：
+
+* ``junit_phases`` —— 每段的用例数 / 失败数 / 错误数 / 跳过数；
+* ``junit_failures`` —— 每条失败的 node id 与首行消息。
+
+这两条字段**只是证据**：判定仍然只看退出码。XML 缺失 → 两个字段为空；
+XML 解析不了 → 记 ``junit_error`` 并继续，绝不抛异常、绝不影响判定。
 """
 from __future__ import annotations
 
@@ -71,6 +82,7 @@ import shlex
 import subprocess
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -95,6 +107,29 @@ DEFAULT_CI_TIMEOUT_SECONDS = 3600
 
 #: Output kept per stream in the verdict evidence.
 MAX_OUTPUT_CHARS = 4000
+
+#: The environment variable that tells the gate script where to write one
+#: junit report per phase.
+#:
+#: The gate runs three phases back to back, and the verdict keeps only
+#: the last :data:`MAX_OUTPUT_CHARS` characters of the whole run's
+#: output — so a failure in phase 1 is gone from the evidence by the
+#: time phase 3 ends.  A junit report per phase is what makes the
+#: failure locatable again: each phase writes its own report, and a
+#: report *names* the cases that failed instead of leaving them in a
+#: scrolled-off stream.
+GATE_JUNIT_DIR_ENV = "PDT_GATE_JUNIT_DIR"
+
+#: Ceiling on the number of failures the evidence carries.  A gate that
+#: fails five thousand cases says less with five thousand entries than
+#: with the first fifty — and the total is in ``junit_phases`` either
+#: way, so nothing is hidden by the ceiling.
+MAX_JUNIT_FAILURES = 50
+
+#: Ceiling on the length of a failure's first line.  The line is a
+#: pointer ("assert 41 == 42"), not the traceback: the whole traceback
+#: is in the junit file the evidence names.
+MAX_JUNIT_MESSAGE_CHARS = 300
 
 #: 结构性收窄标记 —— 一条 ``ci_entry`` 命中任何一个，说明它指的不是"整仓"，
 #: 而是"某个测试子集"。``full_ci`` 的职责是整仓门禁，收窄过的入口属于
@@ -507,6 +542,219 @@ def ci_subprocess_env() -> Dict[str, str]:
     }
 
 
+# ---------------------------------------------------------------------------
+# The per-phase junit reports (evidence, never a verdict)
+# ---------------------------------------------------------------------------
+#
+# The gate script writes one junit report per phase when
+# :data:`GATE_JUNIT_DIR_ENV` names a directory.  Everything below reads
+# those reports back into the verdict's evidence.
+#
+# The rule that governs this whole section: **the verdict is the exit
+# code and nothing else.**  A missing report, an unreadable report and a
+# malformed report all leave the verdict exactly where it was; they only
+# decide what the evidence says.  A report that cannot be parsed is a
+# broken report, not a broken gate — so it is recorded and the run goes
+# on, exactly like the audit copy in :func:`_write_artifact`.
+
+#: The junit file name carries the phase it belongs to.
+_JUNIT_PHASE_RE = re.compile(r"^phase-(\d+)\.xml$")
+
+
+def _junit_phase_number(path: Path) -> Optional[int]:
+    """The phase a junit report belongs to (``phase-2.xml`` → ``2``).
+
+    ``None`` for a file whose name does not follow the convention — the
+    report is then not ours and is not read.
+    """
+    match = _JUNIT_PHASE_RE.match(path.name)
+    return int(match.group(1)) if match else None
+
+
+def _junit_node_id(case: ET.Element) -> str:
+    """The node id a junit ``<testcase>`` stands for.
+
+    The junit format does not carry pytest's node id — it carries the
+    *class* part of it as a dotted path (``backend.tests.unit.test_foo``)
+    and the test name beside it, so the id has to be rebuilt from what
+    the format does carry:
+
+    * a ``file`` attribute (the xunit1 family, and other producers) is
+      the file path and is used verbatim;
+    * otherwise the dotted class name is turned back into a path, and
+      the components that name a *class* — they start with an upper-case
+      letter — are kept as node-id segments instead of being folded
+      into the file path.
+
+    So a module-level test comes back as the id pytest itself prints
+    (``backend/tests/unit/test_foo.py::test_bar``), and a class-based
+    test keeps its class segment (``...::TestBar::test_baz``).  A class
+    whose name does not follow the upper-case convention cannot be told
+    apart from a package by the format itself, and comes back as part of
+    the file path — the phase it failed in and the case's name are still
+    exact.
+    """
+    name = (case.get("name") or "").strip()
+    classname = (case.get("classname") or "").strip()
+    file_attr = (case.get("file") or "").strip()
+
+    if file_attr:
+        module_dotted = file_attr.replace("\\", "/").replace("/", ".")
+        if module_dotted.endswith(".py"):
+            module_dotted = module_dotted[: -len(".py")]
+        class_part = ""
+        if classname.startswith(module_dotted):
+            class_part = classname[len(module_dotted):].strip(".")
+        segments = [file_attr]
+        if class_part:
+            segments.append(class_part)
+        if name:
+            segments.append(name)
+        return "::".join(segments)
+
+    if not classname:
+        return name
+
+    parts = classname.split(".")
+    class_parts: List[str] = []
+    while len(parts) > 1 and parts[-1][:1].isupper():
+        class_parts.insert(0, parts.pop())
+    segments = ["/".join(parts) + ".py"] + class_parts
+    if name:
+        segments.append(name)
+    return "::".join(segments)
+
+
+def _junit_first_line(node: ET.Element) -> str:
+    """The first line of a failure's message, truncated.
+
+    The ``message`` attribute is what pytest puts there — the exception's
+    own message (``assert 41 == 42``), which is the line that says
+    *what* broke.  The element's text is the whole traceback, and its
+    first non-blank line is the source line; it is the fallback for a
+    report that carries no message.
+    """
+    for source in (node.get("message") or "", node.text or ""):
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped:
+                return stripped[:MAX_JUNIT_MESSAGE_CHARS]
+    return ""
+
+
+def _junit_count(suite: ET.Element, attribute: str, fallback: int) -> int:
+    """One count off a ``<testsuite>``, counted from its cases if absent.
+
+    The attribute is what pytest wrote, and it is the authority; the
+    count from the cases is the fallback for a report that does not
+    carry it (and for one whose attribute is not a number).
+    """
+    raw = suite.get(attribute)
+    if raw is None:
+        return fallback
+    try:
+        return int(raw)
+    except ValueError:
+        return fallback
+
+
+def _read_junit_evidence(junit_dir: Optional[Path]) -> Dict[str, Any]:
+    """The per-phase junit evidence a gate run left behind.
+
+    Best-effort by construction: this function never raises.  A missing
+    report, an unreadable one or a malformed one is recorded and the
+    evidence comes back empty — the verdict has already been decided by
+    the exit code, and a report that cannot be parsed must not be able
+    to disturb it.
+    """
+    evidence: Dict[str, Any] = {"junit_phases": [], "junit_failures": []}
+    if junit_dir is None:
+        return evidence
+
+    try:
+        reports = sorted(
+            path for path in junit_dir.glob("phase-*.xml")
+            if _junit_phase_number(path) is not None
+        )
+    except OSError as exc:  # noqa: BLE001 - evidence must not break a verdict
+        evidence["junit_error"] = f"{type(exc).__name__}: {exc}"
+        return evidence
+
+    phases: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    for path in reports:
+        phase = _junit_phase_number(path)
+        # The report is not foreign input: this process created the
+        # directory it lives in for this very run
+        # (:data:`GATE_JUNIT_DIR_ENV`), and the pytest that writes
+        # ``phase-<n>.xml`` into it is the one the gate script
+        # (``scripts/run_tests.sh``) started on the repository's own
+        # test suite.  The gate therefore already runs code that can
+        # execute arbitrary commands on this machine, so parsing the
+        # report it wrote grants no capability that was not there
+        # before.
+        #
+        # ``defusedxml`` is deliberately not introduced here: it is not
+        # a declared dependency of this repository, and adding a
+        # dependency for the sake of one static-scan finding is out of
+        # scope for this change.
+        try:
+            root = ET.parse(path).getroot()  # nosec B314 - the gate's own pytest wrote it, see above
+        except Exception as exc:  # noqa: BLE001 - a broken report is not a verdict
+            errors.append(f"{path.name}: {type(exc).__name__}: {exc}")
+            continue
+
+        suites = (
+            root.findall("testsuite") if root.tag == "testsuites" else [root]
+        )
+        tests = suite_failures = suite_errors = suite_skipped = 0
+        for suite in suites:
+            cases = suite.findall("testcase")
+            tests += _junit_count(suite, "tests", len(cases))
+            suite_failures += _junit_count(
+                suite, "failures",
+                sum(1 for case in cases if case.find("failure") is not None),
+            )
+            suite_errors += _junit_count(
+                suite, "errors",
+                sum(1 for case in cases if case.find("error") is not None),
+            )
+            suite_skipped += _junit_count(
+                suite, "skipped",
+                sum(1 for case in cases if case.find("skipped") is not None),
+            )
+            for case in cases:
+                node_id = _junit_node_id(case)
+                for kind in ("failure", "error"):
+                    for node in case.findall(kind):
+                        failures.append({
+                            "phase": phase,
+                            "node_id": node_id,
+                            "kind": kind,
+                            "first_line": _junit_first_line(node),
+                        })
+
+        phases.append({
+            "phase": phase,
+            "tests": tests,
+            "failures": suite_failures,
+            "errors": suite_errors,
+            "skipped": suite_skipped,
+        })
+
+    if len(failures) > MAX_JUNIT_FAILURES:
+        failures = failures[:MAX_JUNIT_FAILURES]
+        evidence["junit_failures_truncated"] = True
+
+    evidence["junit_phases"] = phases
+    evidence["junit_failures"] = failures
+    if errors:
+        evidence["junit_error"] = "; ".join(errors)
+    return evidence
+
+
 def run_ci_verification(
     vp: Dict[str, Any],
     *,
@@ -541,13 +789,36 @@ def run_ci_verification(
     timed_out = False
     error = ""
 
+    # The junit reports of the phases land next to the audit copy of this
+    # verdict — the same directory ``_write_artifact`` uses — so the two
+    # pieces of evidence sit together and the report names the phase it
+    # belongs to.
+    env = ci_subprocess_env()
+    junit_dir: Optional[Path] = None
+    if artifact_dir is not None:
+        candidate = Path(artifact_dir) / vp_id
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:  # noqa: BLE001 - evidence must not break a verdict
+            # The directory could not be created, so pytest would fail to
+            # write its report — and a gate that fails because its
+            # *report* could not be written is a verdict about the
+            # reporting, not about the code. Run without it.
+            logger.warning(
+                "[ci_runner] could not create the junit directory %s: %s",
+                candidate, exc,
+            )
+        else:
+            junit_dir = candidate
+            env[GATE_JUNIT_DIR_ENV] = str(candidate)
+
     try:
         completed = run_bounded(
             entry,
             cwd=str(project_dir),
             text=True,
             timeout=timeout,
-            env=ci_subprocess_env(),
+            env=env,
         )
         exit_code = completed.returncode
         stdout = completed.stdout or ""
@@ -575,6 +846,12 @@ def run_ci_verification(
     }
     if error:
         evidence["error"] = error
+
+    # The junit evidence is added to the evidence and never decides the
+    # verdict: the exit code alone decides PASSED / FAILED.  The reports
+    # are read after the gate ran, and a report that cannot be parsed
+    # changes nothing here — it only changes what the evidence says.
+    evidence.update(_read_junit_evidence(junit_dir))
 
     if not timed_out and not error and exit_code == 0:
         result.status = STATUS_PASSED

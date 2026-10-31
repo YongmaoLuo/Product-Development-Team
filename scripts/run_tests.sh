@@ -35,6 +35,24 @@ source "$VENV_PATH/bin/activate"
 PYTEST_BIN="${PYTEST_BIN:-pytest}"
 
 # ---------------------------------------------------------------------------
+# PDT_GATE_JUNIT_DIR: where the per-phase junit reports go
+# ---------------------------------------------------------------------------
+#
+# The gate runs three phases back to back and the verdict keeps only the
+# tail of the whole run's output. A failure in phase 1 is therefore gone
+# from the evidence by the time phase 3 ends: the reader sees the last
+# 4000 characters, which belong to phase 3.
+#
+# A junit report per phase fixes that without touching the verdict: each
+# phase writes its own report, and a report names the cases that failed
+# instead of leaving them in a scrolled-off stream.
+#
+# Empty (the default) means the gate writes nothing at all — no files,
+# no extra arguments, the same argv it has always had. A run that is
+# not read as evidence stays exactly as it was.
+PDT_GATE_JUNIT_DIR="${PDT_GATE_JUNIT_DIR:-}"
+
+# ---------------------------------------------------------------------------
 # --lane: which segment of the gate runs
 # ---------------------------------------------------------------------------
 # ``--lane <name>`` selects which of the three phases below run:
@@ -396,23 +414,31 @@ rc1=0
 rc2=0
 rc3=0
 run_phase() {
-    local label="$1"
-    shift
+    local phase_no="$1"
+    local label="$2"
+    shift 2
     printf '=== phase %s ===\n' "$label"
     # errexit off for the call below, so a failing phase is *captured*
     # instead of aborting the script; ``-u`` and ``pipefail`` stay on.
     set -euo pipefail +e
-    "$PYTEST_BIN" "$@"
+    if [ -n "$PDT_GATE_JUNIT_DIR" ]; then
+        # The report of *this* phase, written next to the reports of the
+        # other phases. The phase number is part of the file name, so the
+        # three reports of one run never overwrite each other.
+        "$PYTEST_BIN" "$@" "--junitxml=${PDT_GATE_JUNIT_DIR}/phase-${phase_no}.xml"
+    else
+        "$PYTEST_BIN" "$@"
+    fi
     local rc=$?
     set -euo pipefail
     return "$rc"
 }
 
 if [ "$run_phase1" -eq 1 ]; then
-    run_phase "1/3 (parallel)" "${phase1[@]}" || rc1=$?
+    run_phase 1 "1/3 (parallel)" "${phase1[@]}" || rc1=$?
 fi
 if [ "$run_phase2" -eq 1 ]; then
-    run_phase "2/3 (e2e + integration)" "${phase2[@]}" || rc2=$?
+    run_phase 2 "2/3 (e2e + integration)" "${phase2[@]}" || rc2=$?
 fi
 
 # The probe runs before the wall-clock phase, and only when that phase is
@@ -461,7 +487,7 @@ if [ "$run_phase3" -eq 1 ]; then
         host_probe_note="OK (sleep(0.05)=${probe_measured}s, loadavg=${probe_loadavg})"
         printf 'host timing probe: %s\n' "$host_probe_note"
     fi
-    run_phase "3/3 (time_sensitive + perf)" "${phase3[@]}" || rc3=$?
+    run_phase 3 "3/3 (time_sensitive + perf)" "${phase3[@]}" || rc3=$?
 fi
 
 # ---------------------------------------------------------------------------
