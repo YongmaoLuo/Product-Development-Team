@@ -587,11 +587,51 @@ FROZEN_SCHEMA_DDL_HASH: str = (
 #: approved state for the same reason it moved for the capacity work:
 #: the file changed once, on purpose, and the rule stays "these files
 #: change once, and only that way".
+#:
+#: The scheduler panel's own refresh work follows it there: the panel
+#: re-reads the read model on a timer, and a hidden page stops that
+#: timer until the operator comes back -- so the pin moves once more to
+#: that content.  The poll's own failure handling moves with it: a
+#: quiet read that fails keeps the last good frame on screen and says
+#: what went wrong in the console, and the same failure is written only
+#: once -- so the pin moves once more to that content as well.
+#:
+#: 2026-10-31: the poll's failure handling is corrected once more, and
+#: the pin moves with it.  What makes two failures the same failure is
+#: the **read** *and* the message -- the key is ``(source, message)`` --
+#: and the marker that every read shared is gone.  The shared marker
+#: could not tell one read from another, and the reads go through the
+#: same ``api()`` wrapper: a backend that is down made them fail with
+#: the very same message, so the second failure was swallowed by the
+#: first one's marker and the console showed one line for two broken
+#: reads.  The memory is now keyed by the read
+#: (``_schedulerPollErrors[source]``), and a read that succeeds again
+#: forgets only its own failure -- another read may still be failing
+#: with the same message, and that failure must not be written a
+#: second time on the next tick.  The quiet/non-quiet behaviour, the
+#: poll's interval and the timer's visibility handling are untouched,
+#: so the pin moves once more to that content.
+#:
+#: 2026-10-31 (merge with origin/main, PR #70): the 「可操作的计划」
+#: block is gone from the panel, and with it ``loadSchedulerPlans()``
+#: and ``renderSchedulerPlans()`` -- the panel now reads the read model
+#: and the parallel-agent count, and the poll reads the read model
+#: alone.  The file changed once, on purpose, for the same reason it
+#: moved for the capacity work, so the pin moves again.
 FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
-    # 2026-10-30：因调度面板改版（视图重排、在跑运行时长、并行 Agent 数、容量下拉框）
-    # 改动本文件，按本 gate 的既定流程重新钉住该文件的哈希。
+    # 2026-10-29：因「调度面板自动刷新」新增 5 秒轮询与「页面不可见时暂停、回可见立即刷新」
+    # （`refreshScheduler` / `handleSchedulerVisibilityChange`），按本 gate 的既定流程重新钉住
+    # 该文件的哈希。
+    # 同日 task-3 的「失败保留上一帧、同类失败只记一条」（`schedulerLogPollError` /
+    # `schedulerClearPollError`）也属于本次已批准的调度轮询改动，随同一份内容一并前移重钉。
+    # 2026-10-31：VP-020 把「同类失败」的判据钉成「按 (source, message) 去重、成功只清该
+    # source 的标记、跨 source 各自记录」，实现随之改为以 source 为键的记忆
+    # （`_schedulerPollErrors[source]`）并删掉所有读共享的标记；quiet/非 quiet 分支、
+    # 轮询间隔与可见性处理一字未动，按本 gate 的既定流程把该文件的哈希再前移一次。
+    # 2026-10-31：合入 origin/main（PR #70）并删除已被 main 删掉的 `loadSchedulerPlans` /
+    # `renderSchedulerPlans` 之后，文件内容再次变化，按本 gate 的既定流程再钉一次。
     "frontend/app.js": (
-        "7ee4ea3b7b4441ca1b0730c003ff7ecab52750c824c02e962e5042eff5b3a00b"
+        "1b394790ff6746eb2d115d7f01e2a42795caa0420c083c0b9876db2110d392ed"
     ),
     "frontend/style.css": (
         "0cab7b66dae8b5b693a9e8e4b5c4cda4f8651ae649512e81d8aa8c18a24f836b"
