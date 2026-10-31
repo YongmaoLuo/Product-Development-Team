@@ -130,15 +130,102 @@ def _utcnow_iso() -> str:
     )
 
 
-def _wait_for_server(base_url: str, timeout: float = 30.0) -> None:
+#: How long the spawned server may take to answer ``/health``.
+#:
+#: The ceiling catches a **hung** server, not a slow one.  It used to be
+#: 30 s, calibrated on an idle machine: on a loaded host the real server
+#: boots slower than that, and the 2026-10-31 whole-repo gate reported
+#: ``server at http://127.0.0.1:55739 did not start in 30.0s`` — a red
+#: that says the machine was busy, not that the code was broken.  120 s
+#: still catches a hang and no longer blames the delivery for the load.
+_SERVER_READY_TIMEOUT = 120.0
+
+
+def test_the_server_ready_timeout_is_sized_for_a_busy_machine() -> None:
+    """The ceiling must outlast a loaded host's server boot.
+
+    A red that only means "the machine was busy" is a red that produces
+    repair tasks against a delivery that did not fail.
+    """
+    assert _SERVER_READY_TIMEOUT >= 120.0
+
+
+def test_the_loopback_opener_does_not_go_through_a_proxy() -> None:
+    """打本机服务的请求必须直连，不能经过环境里的代理。
+
+    代理会用**它自己的 502**（空 body）回答一个指向本机端口的请求 ——
+    就绪等待读到的是代理的 502，不是服务的响应，于是「服务没起来」被写进了
+    error，而服务其实好好的。再怎么放宽上限也修不好一个根本没送达的请求。
+
+    断言用**行为**而不是结构：起一个真的本机小服务，用这个 opener 去打，
+    读到的必须是那个服务自己的响应。开着代理时读到的是代理的 502。
+    """
+    import http.server
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - stdlib naming
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args: Any) -> None:
+            """Keep the test output clean."""
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = "http://127.0.0.1:{0}/probe".format(httpd.server_port)
+        with _loopback_opener().open(url, timeout=10) as resp:
+            assert resp.status == 200, resp.status
+            assert resp.read() == b"ok"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_loopback_opener_carries_no_proxy_handler() -> None:
+    """结构上的同一件事：opener 里不许有会发代理的 handler。
+
+    ``ProxyHandler({})`` 不会进 ``opener.handlers``（它没有 ``*_open``
+    方法可挂），所以「没有 ProxyHandler」正是「不走代理」的结构形状。
+    """
+    opener = _loopback_opener()
+    assert not [
+        handler
+        for handler in opener.handlers
+        if isinstance(handler, urllib.request.ProxyHandler)
+    ], "opener 里出现 ProxyHandler 就意味着本机请求会被发给代理"
+
+
+def _loopback_opener() -> urllib.request.OpenerDirector:
+    """An opener that talks to the spawned server **directly**.
+
+    ``urllib`` builds its default opener from ``getproxies()`` — and on
+    macOS that reads the *system* proxy configuration, so a machine
+    with a proxy client installed routes *these* loopback calls through
+    it.  The proxy answers a request naming a local port with **its own
+    502** (empty body), not with the server's response: the readiness
+    wait then reads "the server never started" for a server that is
+    answering perfectly well — and it keeps reading it for as long as
+    the ceiling allows, because the request never arrives at all.
+
+    ``ProxyHandler({})`` is urllib's way of saying "no proxy" — the
+    same idiom as ``backend/hooks/dispatcher.py``.
+    """
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _wait_for_server(base_url: str, timeout: float = _SERVER_READY_TIMEOUT) -> None:
     """Block until ``GET /health`` on ``base_url`` returns 2xx."""
     deadline = time.time() + timeout
     last_exc: Exception | None = None
+    opener = _loopback_opener()
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(
-                f"{base_url}/health", timeout=2
-            ) as resp:
+            with opener.open(f"{base_url}/health", timeout=2) as resp:
                 if 200 <= resp.status < 300:
                     return
         except (urllib.error.URLError, ConnectionResetError, OSError) as exc:
@@ -217,7 +304,7 @@ def boot_real_server(tmp_path: Path) -> Tuple[str, subprocess.Popen, Path]:
 
     base_url = f"http://127.0.0.1:{port}"
     try:
-        _wait_for_server(base_url, timeout=30.0)
+        _wait_for_server(base_url, timeout=_SERVER_READY_TIMEOUT)
     except Exception:
         proc.kill()
         proc.wait(timeout=5)
@@ -273,7 +360,7 @@ def post_start(
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _loopback_opener().open(req, timeout=30) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read() if exc.fp else b""

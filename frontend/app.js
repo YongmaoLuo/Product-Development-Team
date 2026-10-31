@@ -1974,6 +1974,16 @@ const SCHEDULER_ACTION_LABELS = {
     pause: "暂停",
     resume: "恢复",
     start: "启动",
+    "rerun-verification": "重跑验证",
+};
+
+/** Some phases need the button to say more than the action's own name.
+    On a failed plan 「启动」 reads as "run the whole thing again", but
+    the button only puts the plan back in the queue — the verification
+    is a separate command with a separate button.  The phase-specific
+    label says which one the operator is about to press. */
+const SCHEDULER_ACTION_LABEL_BY_PHASE = {
+    failed: { start: "重新排队执行" },
 };
 
 /** Which actions may be offered for a plan in a given phase.  This is
@@ -1984,9 +1994,24 @@ const SCHEDULER_ACTIONS_BY_PHASE = {
     queued: ["promote", "pause", "start"],
     executing: ["pause"],
     stopped: ["resume", "start"],
-    failed: ["start"],
+    failed: ["start", "rerun-verification"],
     waiting_for_quota: ["start"],
+    verification_loop_stopped: ["rerun-verification"],
+    verification_failed: ["rerun-verification"],
 };
+
+/** The text one action's button carries.  The phase-specific label wins
+    when there is one; otherwise the action's own label; and an action
+    nobody labelled falls back to its own name, so a button never reads
+    "undefined".  A missing phase is not an error — the queue row and
+    the running row pass no phase at all. */
+function schedulerActionLabel(action, phase) {
+    return (
+        SCHEDULER_ACTION_LABEL_BY_PHASE[phase]?.[action] ??
+        SCHEDULER_ACTION_LABELS[action] ??
+        action
+    );
+}
 
 /** The reason the server gave, as the text the panel draws. */
 function schedulerReasonText(reason) {
@@ -2097,14 +2122,16 @@ async function schedulerApplyCapacity(total) {
 }
 
 /** The action buttons of one row.  A row that names no plan gets no
-    button: a button that acts on nothing is worse than no button. */
-function schedulerActionButtons(planId, actions) {
+    button: a button that acts on nothing is worse than no button.
+    The phase is optional — a row that does not know its phase gets the
+    action's own label. */
+function schedulerActionButtons(planId, actions, phase) {
     if (!planId || !actions || !actions.length) {
         return '<span class="scheduler-action-none">—</span>';
     }
     return actions
         .map((action) =>
-            `<button class="btn btn-outline scheduler-action" data-action="${escapeHtml(action)}" data-plan="${escapeHtml(planId)}">${escapeHtml(SCHEDULER_ACTION_LABELS[action] || action)}</button>`
+            `<button class="btn btn-outline scheduler-action" data-action="${escapeHtml(action)}" data-plan="${escapeHtml(planId)}">${escapeHtml(schedulerActionLabel(action, phase))}</button>`
         )
         .join(" ");
 }
@@ -2215,6 +2242,46 @@ function schedulerPlanPhase(plan) {
     return String(plan.current_phase || plan.status || "");
 }
 
+/** The plans an operator can act on, with the actions their phase
+    allows.  The order is the listing's own — the panel does not sort
+    the plans either.
+
+    This block is the one a **failed** plan is drawn in: a failed plan
+    is in neither the queue nor the running list, so the two blocks
+    above cannot show it. */
+function renderSchedulerTerminalPlans(plans) {
+    const rows = Array.isArray(plans) ? plans : [];
+    const body = $("#scheduler-terminal-list");
+    if (!body) return;
+
+    const actionable = rows.filter((plan) => {
+        const phase = schedulerPlanPhase(plan);
+        return (SCHEDULER_ACTIONS_BY_PHASE[phase] || []).length > 0;
+    });
+
+    if (!actionable.length) {
+        body.innerHTML = "";
+        schedulerToggle($("#scheduler-terminal-table"), false);
+        schedulerToggle($("#scheduler-terminal-empty"), true);
+        return;
+    }
+
+    body.innerHTML = actionable
+        .map((plan) => {
+            const planId = plan && plan.id ? String(plan.id) : "";
+            const phase = schedulerPlanPhase(plan);
+            const actions = SCHEDULER_ACTIONS_BY_PHASE[phase] || [];
+            return `<tr>
+                <td>${escapeHtml(planId)}</td>
+                <td>${escapeHtml(phase || "—")}</td>
+                <td class="scheduler-row-actions">${schedulerActionButtons(planId, actions, phase)}</td>
+            </tr>`;
+        })
+        .join("");
+
+    schedulerToggle($("#scheduler-terminal-table"), true);
+    schedulerToggle($("#scheduler-terminal-empty"), false);
+}
 /** Render the scheduler's read model.  The panel draws what it is
     given: the order of the queue, the numbers of the capacity and the
     words on the reasons are all the server's. */
@@ -2235,10 +2302,29 @@ async function loadSchedulerState() {
         // The parallel-agent count is a second, optional read: it rides
         // along with this refresh instead of owning a timer of its own.
         loadSchedulerAgentCount();
+        // The terminal plans are a third read: they are the plans the
+        // queue and the running list cannot show.
+        await loadSchedulerTerminalPlans();
         return snapshot;
     } catch (err) {
         renderSchedulerError(err);
         return null;
+    }
+}
+
+/** Read the plans the operator can act on.  The terminal plans are
+    included on purpose: a stopped plan is the one that can be
+    resumed, and a failed plan is the one that carries the two
+    buttons. */
+async function loadSchedulerTerminalPlans() {
+    try {
+        const data = await api("/plans?include_terminal=true");
+        const plans = Array.isArray(data) ? data : (data.plans || []);
+        renderSchedulerTerminalPlans(plans);
+        return plans;
+    } catch {
+        renderSchedulerTerminalPlans([]);
+        return [];
     }
 }
 
@@ -2356,6 +2442,38 @@ async function schedulerStart(planId) {
     }
 }
 
+/** Run the verification round of a plan again.
+
+    Two commands, in this order.  The first rewinds the round counter
+    (the plan's budget is untouched — only the counter moves back), so
+    the batch may run again; the second begins the round.  Without the
+    first there are no rounds left to run, and the second would be a
+    no-op.
+
+    These are *verification* commands, not scheduler commands: a re-run
+    does not put the plan back in the queue.  That is the other button.
+
+    The body is JSON.stringify({}) and not {} because api() spreads
+    its options straight into fetch() and serialises nothing itself —
+    a plain object would reach the server as "[object Object]" and be
+    rejected. */
+async function schedulerRerunVerification(planId) {
+    try {
+        await api(`/verification/${encodeURIComponent(planId)}/reset_rounds`, {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        await api(`/verification/${encodeURIComponent(planId)}/start`, {
+            method: "POST",
+            body: JSON.stringify({}),
+        });
+        await schedulerActionDone({ outcome: "applied", detail: "verification_rerun" });
+    } catch (err) {
+        renderSchedulerError(err);
+        throw err;
+    }
+}
+
 /** Carry out the action a button asks for. */
 async function schedulerRunAction(action, planId) {
     try {
@@ -2367,6 +2485,8 @@ async function schedulerRunAction(action, planId) {
             await schedulerResume(planId);
         } else if (action === "start") {
             await schedulerStart(planId);
+        } else if (action === "rerun-verification") {
+            await schedulerRerunVerification(planId);
         }
     } catch {
         // The failure is already on screen in the action-result box.

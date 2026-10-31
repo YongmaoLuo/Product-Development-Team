@@ -78,6 +78,27 @@ def _real_home() -> Path:
 _FOREIGN_CHECKOUT_DIR = _real_home() / "work" / "other-repo"
 _FOREIGN_PRODUCTION_DIR = _real_home() / "work" / "production-checkout"
 
+#: How long one guard invocation may take before the test gives up.
+#:
+#: The ceiling is there to catch a **hung** guard, not to prove the
+#: machine is fast.  It used to be 5 s, which was calibrated on an idle
+#: box: the guard itself measures 0.3-1.8 s when it runs alone, but the
+#: whole-repo gate runs 18 xdist workers at once, and 18 concurrent
+#: invocations measured 9.1-16.2 s (three runs).  A 5 s ceiling therefore
+#: failed on the gate's own parallelism — a red that says nothing about
+#: the containment rule.  60 s still catches a hang (the guard is a
+#: subprocess, so a hang blocks forever) and survives the load.
+_GUARD_TIMEOUT_SECONDS = 60.0
+
+
+def test_the_guard_timeout_is_sized_for_the_gate_own_parallelism():
+    """The ceiling must outlast the gate's own concurrency.
+
+    This is the shape of the failure the 5 s ceiling produced: the guard
+    was correct, the machine was busy, and the case went red anyway.
+    """
+    assert _GUARD_TIMEOUT_SECONDS >= 60.0
+
 
 def _run_guard(file_path: str, *, pdt_project_dir: str, pdt_formal_repo: str = "",
                pdt_plans_dir: str = "", guard: Path = None) -> int:
@@ -135,7 +156,7 @@ def _run_guard(file_path: str, *, pdt_project_dir: str, pdt_formal_repo: str = "
         env=env,
         capture_output=True,
         text=True,
-        timeout=5,
+        timeout=_GUARD_TIMEOUT_SECONDS,
     )
     if proc.returncode not in (0, 2):
         raise RuntimeError(

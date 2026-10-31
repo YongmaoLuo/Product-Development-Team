@@ -447,4 +447,77 @@ def test_decision_key_for_a_passed_verdict_is_empty():
 
     assert triage.decision_key("VP-007", "deliverable_defect", verdict="PASSED") == ""
     assert triage.decision_key("VP-007", None, "PASSED") == ""
+
+
+# ---------------------------------------------------------------------------
+# The CI gate's three states (2026-10-31, VP-020)
+# ---------------------------------------------------------------------------
+#
+# ``scripts/run_tests.sh`` exits 0 (green), 1 (a lane went red) or 3
+# (the run could not decide — the host could not be measured).  The
+# framework read every non-zero exit as "the deliverable is broken", so
+# a busy host — not a broken delivery — produced a repair task.
+#
+# The gate's own exit code is the machine-readable fact, so tier A has
+# to know it by name: a signal the table does not carry is a ``None``,
+# and a ``None`` is handed to the semantic tier, which lands on
+# ``deliverable_defect`` — the class that counts and that becomes a
+# repair task.
+CI_GATE_SIGNAL_CLASSES = [
+    # the run could not decide: the machine's problem — retry, do not count
+    ("gate_inconclusive", "infra"),
+    # the entry could not be started at all: also the machine's problem
+    ("gate_not_executable", "infra"),
+    # a lane went red: the code under test is implicated — rework, count
+    ("gate_failed", "deliverable_defect"),
+]
+
+
+def test_the_ci_gate_signals_hit_an_explicit_mapping():
+    """Each gate signal resolves to its class, by rule and not by guess."""
+    triage = _triage()
+
+    for signal, expected in CI_GATE_SIGNAL_CLASSES:
+        got = triage.classify_deterministic(signal, "")
+        assert got == expected, (
+            f"signal {signal!r} should classify as {expected!r}, got {got!r}"
+        )
+
+
+def test_a_machine_problem_is_not_counted_against_the_deliverable():
+    """The whole point of the three states: the counter moves for the
+    code, not for the host.
+
+    A gate that could not decide is worth another try; a gate that went
+    red is a defect and has to be reworked.
+    """
+    triage = _triage()
+
+    inconclusive = triage.classify_deterministic("gate_inconclusive", "")
+    failed = triage.classify_deterministic("gate_failed", "")
+
+    assert triage.disposition_for(inconclusive) == "retry_not_counted"
+    assert triage.is_counted(inconclusive) is False
+    assert triage.disposition_for(failed) == "retry_counted"
+    assert triage.is_counted(failed) is True
+
+
+def test_the_text_fallback_reads_the_gate_wording():
+    """A caller that has only the raw text must land on the same class.
+
+    The framework's own timeout reason is Chinese ("超时：3600s 内没有跑
+    完") and the gate's own wording is English ("gate: INCONCLUSIVE …
+    this is not a code failure"), so both spellings have to be in the
+    table — otherwise the same event is disposed of two different ways
+    depending on how much the caller knew.
+    """
+    triage = _triage()
+
+    assert triage.classify_deterministic("", "超时：3600s 内没有跑完") == "infra"
+    assert triage.classify_deterministic(
+        "", "gate: INCONCLUSIVE (exit 3) — the run could not decide"
+    ) == "infra"
+    assert triage.classify_deterministic(
+        "", "gate: FAIL (exit 1) — a phase failed"
+    ) == "deliverable_defect"
     assert triage.decision_key("VP-007", "PASSED") == ""
