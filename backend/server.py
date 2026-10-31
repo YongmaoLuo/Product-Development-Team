@@ -1551,6 +1551,18 @@ def _install_orphan_reaper_marks() -> Optional[Dict[str, str]]:
         return None
 
 
+#: How long the boot waits for the startup scan to have *begun*.
+#:
+#: The scan must not be on the readiness path — uvicorn binds the socket
+#: only after the lifespan returns, so a scan that takes seconds is
+#: seconds the port spends not answering.  The boot waits only long
+#: enough for the scan to have started, so that "the boot scans, then
+#: the boot starts the daemon" stays true whatever the scheduler
+#: decides to do; a scan that is still running when the wait is over
+#: goes on running on its own thread.
+ORPHAN_REAPER_SCAN_START_GRACE_SECONDS = 1.0
+
+
 def _start_orphan_reaper() -> Optional[int]:
     """Scan once for orphans, then make sure the resident reaper is running.
 
@@ -1569,6 +1581,11 @@ def _start_orphan_reaper() -> Optional[int]:
     costs the scan; the daemon is still started, because the daemon is
     the part that keeps working after this backend is gone.  A daemon
     that cannot be started costs the daemon and nothing else.
+
+    The scan itself runs on a thread of its own — see
+    :func:`_start_orphan_reaper_scan` — because a scan of a busy machine
+    takes seconds and uvicorn binds the socket only after the lifespan
+    returns.
 
     A reaper that is switched off does nothing at all.
     """
@@ -1589,13 +1606,7 @@ def _start_orphan_reaper() -> Optional[int]:
     if not getattr(config, "enabled", True):
         return None
 
-    try:
-        orphan_reaper.run_once(config)
-    except Exception:
-        logger.warning(
-            "[orphan_reaper] the startup scan failed; continuing",
-            exc_info=True,
-        )
+    _start_orphan_reaper_scan(config)
 
     try:
         return orphan_reaper.ensure_daemon(config)
@@ -1605,6 +1616,45 @@ def _start_orphan_reaper() -> Optional[int]:
             exc_info=True,
         )
         return None
+
+
+def _start_orphan_reaper_scan(config) -> threading.Thread:
+    """Run the startup scan on a thread of its own and return that thread.
+
+    The scan walks every process on the machine, which on a busy box
+    takes seconds.  uvicorn binds the socket only *after* the lifespan
+    returns, so a scan on the boot thread is seconds the port spends not
+    answering — and the scan is housekeeping: it reclaims what a
+    previous life left behind, and the daemon that follows keeps
+    reclaiming afterwards.
+
+    The thread is a daemon, so a scan still running at shutdown cannot
+    keep the interpreter alive, and it is named, so that a thread dump
+    says what it is.
+
+    The boot waits for the scan to have *begun* — not to have finished;
+    see :data:`ORPHAN_REAPER_SCAN_START_GRACE_SECONDS`.  A scan that is
+    still running when that wait is over goes on running: the port does
+    not wait for the reaper.
+    """
+
+    def _scan() -> None:
+        try:
+            orphan_reaper.run_once(config)
+        except Exception:
+            logger.warning(
+                "[orphan_reaper] the startup scan failed; continuing",
+                exc_info=True,
+            )
+
+    thread = threading.Thread(
+        target=_scan,
+        name="orphan-reaper-scan",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=ORPHAN_REAPER_SCAN_START_GRACE_SECONDS)
+    return thread
 
 
 #: The environment variable that says how often the backend asks whether
@@ -1926,6 +1976,165 @@ def _start_boot_sweeps() -> threading.Thread:
     return thread
 
 
+class _FeishuNotifierHandle:
+    """The Feishu notifier's start, as the boot and the shutdown see it.
+
+    The notifier is built on a thread of its own, so the shutdown can
+    run while it is still importing the SDK.  This is what the two sides
+    share:
+
+    * the **thread** to wait for;
+    * the **lock** that keeps the publication of the notifier and the
+      shutdown's reading of it from interleaving — a notifier that is
+      published *after* the shutdown read the state would be a worker
+      thread nobody ever stops;
+    * the **stopping** flag that tells a notifier that comes up late
+      that nobody wants it any more;
+    * the **notifier** this handle started.  The notifier carries a
+      worker thread of its own, and that thread is only stopped by the
+      code that started the notifier: a handle that read the notifier
+      off the shared application state instead would stop *somebody's*
+      notifier and leave its own running — a worker thread that outlives
+      the server that made it.
+    """
+
+    def __init__(self) -> None:
+        self.thread: Optional[threading.Thread] = None
+        self.lock = threading.Lock()
+        self.stopping = threading.Event()
+        self.notifier: Optional[object] = None
+
+
+#: How long the shutdown waits for the notifier's thread.
+#:
+#: The SDK import is not interruptible, so a shutdown that arrives while
+#: it is running has to wait for it: a notifier that comes up *after*
+#: the server is gone would leave a worker thread behind.  The wait is
+#: bounded — a thread that outlives it is a daemon thread, and the
+#: process does not wait for it.
+FEISHU_NOTIFIER_JOIN_SECONDS = 60.0
+
+
+def _start_feishu_notifier(app) -> _FeishuNotifierHandle:
+    """Start the Feishu notifier on a thread of its own and return its handle.
+
+    The notifier's client imports the whole Feishu SDK — tens of seconds
+    on a loaded machine — and uvicorn binds the socket only *after* the
+    lifespan returns.  A notifier that is built on the boot thread is
+    therefore tens of seconds the port spends not answering, and a
+    broken Feishu configuration must never keep the server from
+    accepting requests.
+
+    So the notifier is built on a thread of its own: ``app.state`` says
+    ``None`` until it is up, and the boot does not wait for it.
+    """
+    handle = _FeishuNotifierHandle()
+
+    def _start() -> None:
+        try:
+            from notifications.feishu_notifier import FeishuNotifier
+
+            notifier = FeishuNotifier()
+            with handle.lock:
+                if handle.stopping.is_set():
+                    logger.warning(
+                        "[feishu_notifier] the server began shutting down "
+                        "while the SDK was importing; the notifier is not "
+                        "started"
+                    )
+                    return
+                notifier.start()
+                # The handle keeps the notifier it started: the shutdown
+                # stops *this* notifier, not whichever one the shared
+                # application state happens to carry.
+                handle.notifier = notifier
+                app.state.feishu_notifier = notifier
+                # 2026-09-11 plan v4: explicit warning so operators can
+                # see the per-plan rate limit (60s / card, independent
+                # across plans — different plans do NOT throttle each
+                # other). The FeishuNotifier .start() already logs
+                # "started (coalesce=..., min_interval=...)" — this line
+                # repeats the value with the v4 semantics for quick
+                # eyeball verification.  It is logged under the lock so
+                # that a failure here cannot leave a started notifier
+                # outside the handle's knowledge.
+                logger.warning(
+                    "[feishu_notifier] configured: min_interval=%.1fs "
+                    "(per-plan, independent across plans; "
+                    "1 push per card per N seconds)",
+                    notifier._min_interval_seconds,
+                )
+        except Exception:
+            logger.exception(
+                "[feishu_notifier] failed to start; continuing without push"
+            )
+            # The publication is not touched here: a notifier that was
+            # published before the failure is this handle's, and the
+            # shutdown stops it; one that was never published left the
+            # state alone already.
+
+    # The state says "no notifier" until one is up.  A notifier that is
+    # already published is *not* taken down here: this handle owns the
+    # notifier it starts, and the publication on the shared state is
+    # somebody else's to clear.
+    if not hasattr(app.state, "feishu_notifier"):
+        app.state.feishu_notifier = None
+
+    thread = threading.Thread(
+        target=_start,
+        name="feishu-notifier",
+        daemon=True,
+    )
+    handle.thread = thread
+    thread.start()
+    return handle
+
+
+def _stop_feishu_notifier(app, handle: Optional[_FeishuNotifierHandle]) -> None:
+    """Stop the Feishu notifier, if it ever came up.
+
+    The notifier is built on its own thread, so the shutdown can run
+    while it is still importing the SDK.  Stopping a notifier that is
+    not there must not raise, and a notifier that comes up after the
+    shutdown must not be started at all.
+    """
+    if handle is None:
+        return
+
+    with handle.lock:
+        handle.stopping.set()
+
+    if handle.thread is not None:
+        handle.thread.join(timeout=FEISHU_NOTIFIER_JOIN_SECONDS)
+        if handle.thread.is_alive():
+            logger.warning(
+                "[feishu_notifier] the notifier's thread did not finish "
+                "within %.1fs; it is a daemon thread and is left to die "
+                "with the process",
+                FEISHU_NOTIFIER_JOIN_SECONDS,
+            )
+
+    # The notifier this handle started — and only that one.  It carries a
+    # worker thread of its own, so a notifier that is left running is a
+    # worker thread that outlives the server that made it.
+    with handle.lock:
+        notifier = handle.notifier
+
+    if notifier is None:
+        return
+
+    try:
+        notifier.stop(timeout=5.0)
+    except Exception:
+        logger.exception("[feishu_notifier] error on shutdown")
+    finally:
+        # The publication is only taken down when it still carries *this*
+        # notifier: another lifespan may have published its own.
+        with handle.lock:
+            if getattr(app.state, "feishu_notifier", None) is notifier:
+                app.state.feishu_notifier = None
+
+
 @asynccontextmanager
 async def _lifespan(app):
     """FastAPI lifespan handler — replaces deprecated @app.on_event decorators.
@@ -2158,32 +2367,15 @@ async def _lifespan(app):
     # repository write method, so plan phase transitions, task
     # lifecycle events, and VP progress changes all push a Feishu
     # card within seconds — no polling, no symlink dependency.
-    # Construction is wrapped in try/except so a broken Feishu
-    # configuration (missing creds, missing lark-oapi) can NEVER
-    # prevent the server from accepting requests.
-    feishu_notifier = None
-    try:
-        from notifications.feishu_notifier import FeishuNotifier
-        feishu_notifier = FeishuNotifier()
-        feishu_notifier.start()
-        app.state.feishu_notifier = feishu_notifier
-        # 2026-09-11 plan v4: explicit warning so operators can see
-        # the per-plan rate limit (60s / card, independent across
-        # plans — different plans do NOT throttle each other). The
-        # FeishuNotifier .start() already logs "started
-        # (coalesce=..., min_interval=...)" — this line repeats the
-        # value with the v4 semantics for quick eyeball verification.
-        logger.warning(
-            "[feishu_notifier] configured: min_interval=%.1fs "
-            "(per-plan, independent across plans; "
-            "1 push per card per N seconds)",
-            feishu_notifier._min_interval_seconds,
-        )
-    except Exception:
-        logger.exception(
-            "[feishu_notifier] failed to start; continuing without push"
-        )
-        app.state.feishu_notifier = None
+    #
+    # 2026-10-31: the notifier is built on a thread of its own.  Its
+    # client imports the whole Feishu SDK — tens of seconds on a loaded
+    # machine — and uvicorn binds the socket only *after* the lifespan
+    # returns, so building it here was tens of seconds the port spent
+    # not answering.  A broken Feishu configuration (missing creds,
+    # missing lark-oapi) can still NEVER prevent the server from
+    # accepting requests: it cannot even keep the boot waiting.
+    feishu_notifier_handle = _start_feishu_notifier(app)
 
     # 2026-10-28: the PDT-native scheduler (architecture decision
     # point 1).  The engine is built **here**, after the phase migration
@@ -2233,11 +2425,7 @@ async def _lifespan(app):
         # asking about the daemon in a world that is being taken apart.
         _stop_orphan_reaper_reensure()
         heartbeat_monitor.stop()
-        if feishu_notifier is not None:
-            try:
-                feishu_notifier.stop(timeout=5.0)
-            except Exception:
-                logger.exception("[feishu_notifier] error on shutdown")
+        _stop_feishu_notifier(app, feishu_notifier_handle)
         _shutdown_all_executions()
         # 2026-09-23: leave a restorable copy behind on every clean
         # shutdown.  First checkpoint the WAL so the backup (and the

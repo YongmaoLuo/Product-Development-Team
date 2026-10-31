@@ -1189,6 +1189,20 @@ REPAIR_TASK_PRIORITY = "P0"
 """A conflict with the base blocks the whole round, so its repair is
 the most urgent task in the queue."""
 
+BASE_DRIFT_MERGE_SCENE = "base_drift_merge"
+"""The provider-routing scene a base-drift merge runs under.
+
+Merging a base is a different kind of work from fixing product code:
+it wants a different budget of attention and, when it fails, a
+different response.  Giving it its own scene is what makes that
+possible.
+
+Only the **name** lives here.  Which tier the scene resolves to is a
+configuration decision (``provider_routing.yaml``), so re-tiering the
+merge is a config change and not a code change — a tier literal in this
+module would silently override the operator's configuration.
+"""
+
 
 def _report_field(report: Any, name: str, default: Any = None) -> Any:
     """Read one field of a report — an object or a mapping."""
@@ -1221,6 +1235,44 @@ def _conflict_entries(report: Any) -> List[Dict[str, Any]]:
     return entries
 
 
+def _conflict_repair_title(
+    base_ref: str, base_sha: str, file_count: int
+) -> str:
+    """The one-line name of the task.
+
+    A task without a title is not a task the executor runs: the loader
+    that reconciles orphan rows merges a row's real content only when a
+    title *and* a description are both there
+    (``orphan_rules.MERGE_REQUIRED_FIELDS``), and substitutes a
+    content-free placeholder otherwise.  So the title is not decoration
+    — it is the difference between the merge running and the merge being
+    silently skipped while the round reports the repair batch drained.
+
+    It names the base and how many files are in conflict, because that
+    is what tells a reader of the queue that this row is a merge rather
+    than any other repair.  The ref is the friendlier name; a report
+    that only carries a commit still names the base by that commit, and
+    a report that carries neither still says "base" rather than nothing.
+    """
+    base = (base_ref or "").strip() or (base_sha or "").strip() or "base"
+    return f"合并 {base}：解决 {file_count} 个文件的冲突"
+
+
+def _merge_probe_command(merge_target: str) -> str:
+    """The command that answers "is the merge done?".
+
+    Two facts have to hold: the base commit is now an ancestor of HEAD
+    (the base was really merged in, not merely fetched), and no path is
+    left unmerged (the conflicts were resolved, not just staged away).
+    The command says exactly that, so a reviewer reading it knows what
+    a green result means for this task.
+    """
+    return (
+        f'git merge-base --is-ancestor {merge_target} HEAD '
+        '&& test -z "$(git ls-files -u)"'
+    )
+
+
 def _conflict_repair_description(
     *,
     plan_id: str,
@@ -1237,6 +1289,11 @@ def _conflict_repair_description(
     plan id lands, because the task row has no column for it and a
     fixer that does not know which plan the conflict belongs to cannot
     report the outcome anywhere.
+
+    The **second line** says what kind of task this is: a merge of the
+    base, not a fix of product code.  Without it the agent picks the
+    task up looking for a bug that does not exist — or "resolves" a
+    conflict by dropping one side of it.
 
     The rest is the evidence a correct resolution needs: which base was
     merged (ref *and* commit), how far the branch drifted, which files
@@ -1256,6 +1313,7 @@ def _conflict_repair_description(
 
     lines = [
         f"plan={plan_id}",
+        "任务类型: base 合并（不是产品代码修复）",
         "; ".join(evidence),
         "冲突文件："
         + "; ".join(
@@ -1305,6 +1363,12 @@ def build_conflict_repair_task(
     Every key it emits is on the task table's static allow-list, and
     ``status`` is not among them: the status belongs to whoever writes
     the row, and a payload carrying one is rejected outright.
+
+    The task carries a **title** and a **test command** because it has
+    to be executable, not merely writable: the loader that reconciles
+    orphan rows merges a row's real content only when a title and a
+    description are both present, and the round needs a command that
+    says "the merge is done" rather than one that passes by default.
     """
     entries = _conflict_entries(report)
     if not entries:
@@ -1341,12 +1405,21 @@ def build_conflict_repair_task(
         merge_target=merge_target,
     )
 
-    return {
+    task: Dict[str, Any] = {
         "id": f"repair-r{round_no}-{seq_no:02d}",
         "task_group": REPAIR_TASK_GROUP,
         "failed_vp_id": BASE_DRIFT_VP_ID,
         "round": round_no,
         "priority": REPAIR_TASK_PRIORITY,
         "files_to_modify": files,
+        "title": _conflict_repair_title(base_ref, base_sha, len(files)),
         "description": description,
     }
+
+    # The probe is only worth running when there is something to probe:
+    # an empty target makes the ancestor check vacuously true, and a
+    # command that always passes is worse than no command at all.
+    if merge_target:
+        task["test_command"] = _merge_probe_command(merge_target)
+
+    return task

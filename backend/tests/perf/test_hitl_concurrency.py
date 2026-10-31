@@ -108,6 +108,7 @@ Test command::
 from __future__ import annotations
 
 import json
+import statistics
 import sys
 import threading
 import time
@@ -163,6 +164,99 @@ from utils.atomic_io import atomic_write_json  # noqa: E402
 #: asks for — the exclusive serial one, alone on the runner — *and* a
 #: plain run of the file still collects it.
 pytestmark = [pytest.mark.perf]
+
+
+# ---------------------------------------------------------------------------
+# Can this host measure a wall clock at all?
+# ---------------------------------------------------------------------------
+#
+# The load-average gate (``backend/tests/_host_load.py``) skips a
+# wall-clock case on a host that is obviously busy -- but it stands down
+# on CI, and a host can be slow without being busy (a shared runner
+# whose neighbours are quiet, a machine with its CPU throttled, a
+# container whose quota is a fraction of the host's).  Such a host
+# cannot be judged against a half-second bound: the bound would be
+# measuring the machine, not the code.
+#
+# The gate's own convention (``scripts/run_tests.sh``) already answers
+# the question in one number: five samples of a 0.05 s sleep, and a
+# median above 0.06 s means the host cannot measure wall-clock.  The
+# same probe, with the same numbers, is used here so that the two
+# answers cannot drift apart.
+
+#: How long the sleep the host probe measures is.
+HOST_PROBE_SLEEP_SEC = 0.05
+
+#: How many samples the median is taken over.
+HOST_PROBE_SAMPLES = 5
+
+#: The median sleep a host has to manage for its clock to be trusted.
+HOST_PROBE_MAX_SLEEP_SEC = 0.06
+
+#: The environment variable that overrides the threshold -- the same
+#: name and the same meaning as the gate's own probe
+#: (``scripts/run_tests.sh``), so that an operator who has decided this
+#: host *is* measurable can say so in one place.
+HOST_PROBE_MAX_SLEEP_ENV = "PDT_HOST_TIMING_PROBE_MAX_SLEEP"
+
+
+def _host_probe_max_sleep() -> float:
+    """The threshold the host probe compares its measurement against.
+
+    The environment override wins when it names a usable number; a broken
+    override falls back to the default, because a threshold that cannot
+    be read must not silently turn the probe into "always measurable".
+    """
+    import os
+
+    raw = os.environ.get(HOST_PROBE_MAX_SLEEP_ENV)
+    if raw is None:
+        return HOST_PROBE_MAX_SLEEP_SEC
+    try:
+        limit = float(raw)
+    except (TypeError, ValueError):
+        return HOST_PROBE_MAX_SLEEP_SEC
+    if limit <= 0:
+        return HOST_PROBE_MAX_SLEEP_SEC
+    return limit
+
+
+def _measure_host_sleep_median(
+    sleep_sec: float = HOST_PROBE_SLEEP_SEC,
+    samples: int = HOST_PROBE_SAMPLES,
+) -> float:
+    """The median of *samples* sleeps of *sleep_sec* seconds.
+
+    The median rather than the mean: one unlucky sample (a page fault,
+    a scheduler tick) must not decide whether the host is measurable.
+    """
+    measured = []
+    for _ in range(samples):
+        started = time.monotonic()
+        time.sleep(sleep_sec)
+        measured.append(time.monotonic() - started)
+    return statistics.median(measured)
+
+
+def _host_measurement_skip_reason(
+    measured: float,
+    limit: Optional[float] = None,
+) -> Optional[str]:
+    """Why the wall-clock bound cannot be asserted on this host, or ``None``.
+
+    ``None`` means the host is measurable: the bound is asserted, and it
+    is asserted at the value it always had.  A reason means the host
+    cannot be judged against a wall clock, and the case is skipped
+    rather than failed -- a skip is allowed, a false failure is not.
+    """
+    if limit is None:
+        limit = _host_probe_max_sleep()
+    if measured > limit:
+        return (
+            f"skipped: the host cannot measure wall-clock "
+            f"(sleep({HOST_PROBE_SLEEP_SEC:g})={measured:.3f}s > {limit:g}s)"
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1018,7 +1112,19 @@ def test_hung_hook_does_not_delay_creation() -> None:
 
     The destination is a real subprocess that really hangs: a ``sleep``
     that is abandoned on its own timeout, and the report says so.
+
+    The bound is a wall-clock bound, so it is asserted only on a host
+    that can measure a wall clock at all: a host whose own 0.05 s sleep
+    costs a fifth of a second cannot be judged against half a second,
+    and failing it there would be a statement about the machine rather
+    than about the code.  On such a host the case is **skipped** -- the
+    bound itself is not weakened, and it is asserted unchanged wherever
+    the host is measurable.
     """
+    reason = _host_measurement_skip_reason(_measure_host_sleep_median())
+    if reason is not None:
+        pytest.skip(reason)
+
     from fastapi.testclient import TestClient
 
     import server
@@ -1099,3 +1205,57 @@ def test_hung_hook_does_not_delay_creation() -> None:
     assert report.delivered == 0, (
         f"a destination that hangs delivers nothing: {report!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. Whether this host can be judged against a wall clock
+# ---------------------------------------------------------------------------
+
+
+def test_the_wall_clock_bound_is_kept_on_a_measurable_host() -> None:
+    """A host that can measure keeps the bound; the bound does not move.
+
+    The half-second bound is the contract this file exists to pin, and
+    it is asserted at exactly that value wherever the host is able to
+    measure.  What the probe decides is only *whether the host is able
+    to measure* -- never how long the code is allowed to take.
+    """
+    assert _host_measurement_skip_reason(0.05) is None, (
+        "a host whose 0.05s sleep costs 0.05s is measurable; the "
+        "wall-clock bound must still be asserted on it"
+    )
+    reason = _host_measurement_skip_reason(0.2)
+    assert reason is not None, (
+        "a host whose 0.05s sleep costs 0.2s cannot be judged against a "
+        "half-second bound"
+    )
+    assert "cannot measure wall-clock" in reason, reason
+
+
+def test_the_wall_clock_case_skips_itself_on_a_host_that_cannot_measure(
+    monkeypatch,
+) -> None:
+    """The case skips -- it does not fail -- on a host it cannot measure.
+
+    The load-average gate already skips this file when the machine is
+    obviously busy; this is the other half, the host that is slow
+    without being busy.  A **skip** is allowed by the gate's own
+    contract; a failure there would be a statement about the machine.
+    """
+    # The module is patched *by the module object itself*, not by a
+    # dotted name: the suite imports this file as
+    # ``backend.tests.perf.test_hitl_concurrency`` (every directory up
+    # to the repository root is a package), while the dotted name below
+    # would import a **second** copy of the file under
+    # ``tests.perf.test_hitl_concurrency`` — and a copy that nothing
+    # calls.  The case would then measure the real host, find it
+    # measurable, and never skip: the skip it is here to prove would
+    # never happen.
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_measure_host_sleep_median",
+        lambda *args, **kwargs: 0.5,
+    )
+
+    with pytest.raises(pytest.skip.Exception):
+        test_hung_hook_does_not_delay_creation()

@@ -167,6 +167,7 @@ from typing import (
     Mapping,
     MutableMapping,
     Optional,
+    Sequence,
     Tuple,
 )
 
@@ -447,6 +448,73 @@ def _ps_start_epoch(pid: int) -> Optional[str]:
     if completed.returncode != 0:
         return None
     return _parse_lstart(completed.stdout.strip())
+
+
+#: How many pids one ``ps`` invocation is asked about.
+_PS_PID_BATCH = 256
+
+
+def _ps_start_epochs(pids: Sequence[int]) -> Optional[Dict[int, str]]:
+    """Return the start times of *pids*, read in as few spawns as possible.
+
+    Asking about one pid at a time costs one ``ps`` each, and a machine
+    with a hundred live owners costs a hundred spawns — wall clock that
+    the boot path pays for.  ``ps`` accepts a list of pids, so the whole
+    set is asked about at once.
+
+    ``None`` means the answer is unusable: ``ps`` could not be run, or it
+    failed in a way that says nothing about the pids.  An empty mapping
+    is a *usable* answer that reports no live pid — which is not the
+    same thing, and the caller has to be able to tell them apart.
+    """
+    wanted: List[int] = []
+    seen = set()
+    for pid in pids:
+        try:
+            value = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0 or value in seen:
+            continue
+        seen.add(value)
+        wanted.append(value)
+    if not wanted:
+        return {}
+
+    epochs: Dict[int, str] = {}
+    for start in range(0, len(wanted), _PS_PID_BATCH):
+        chunk = wanted[start:start + _PS_PID_BATCH]
+        result = _run_tool(
+            [
+                _ps_binary(),
+                "-o",
+                "pid=,lstart=",
+                "-p",
+                ",".join(str(pid) for pid in chunk),
+            ],
+            timeout=15.0,
+        )
+        if result is None:
+            return None
+        returncode, stdout, _stderr = result
+        if returncode == 1:
+            # ``ps`` reports 1 when none of the pids it was given exists.
+            # That is an answer, not a failure.
+            continue
+        if returncode != 0:
+            return None
+        for line in stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            epoch = _parse_lstart(" ".join(parts[1:6]))
+            if epoch:
+                epochs[pid] = epoch
+    return epochs
 
 
 def process_start_epoch(pid: Optional[int] = None) -> str:
@@ -1257,6 +1325,52 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 #: The columns :func:`list_processes` asks ``ps`` for.
 _PS_PROCESS_COLUMNS = "pid=,ppid=,pgid=,uid=,rss=,args="
 
+#: The columns the one-shot environment read asks ``ps`` for.
+#:
+#: The pid and the command line are enough: the command line is what has
+#: to be cut off the line before the environment behind it can be read,
+#: and :func:`list_processes` already read it.
+_PS_ENV_COLUMNS = "pid=,args="
+
+#: A spawn marker, as the environment carries it: ``NAME=value``.
+#:
+#: Only the three markers the ladder reads are picked out of an
+#: environment.  Every other variable is of no use to it, and reading
+#: them all is what made the one-shot read the slowest thing in the boot
+#: path: the environments of a whole machine are megabytes of text, and
+#: lexing that costs seconds.
+_SPAWN_MARKER_RE = re.compile(
+    r"(?:^|\s)(?P<name>"
+    + "|".join((SPAWN_OWNER_PID, SPAWN_OWNER_START, SPAWN_KIND))
+    + r")=(?P<value>[^\s]*)"
+)
+
+#: Any environment variable at all -- the sign that an environment was read.
+#:
+#: A process the platform will not show the environment of (an Apple
+#: platform binary, protected by SIP) prints its command line and nothing
+#: else, so a segment with no assignment in it is *unreadable*, not empty.
+_ENV_ASSIGNMENT_RE = re.compile(r"(?:^|\s)[A-Za-z_][A-Za-z0-9_]*=")
+
+#: The wall-clock budget of one scan, in seconds.
+#:
+#: A scan has to be bounded.  The reaper runs on the boot path and every
+#: thirty seconds in the daemon, so a scan that cannot finish is a scan
+#: that keeps the machine busy instead of reclaiming it.  What the budget
+#: does not reach is reported as *unreadable* -- a state the ladder
+#: already treats as a skip, never as a kill.
+SCAN_BUDGET_SECONDS = 10.0
+
+#: The time the one-shot environment read is given whatever the budget has
+#: left.
+#:
+#: It is one spawn whose cost does not grow with the machine, so it is
+#: worth waiting for even when the budget is nearly spent: a read that
+#: failed turns every process on the machine *unreadable*, and an
+#: unreadable process is never a kill -- the reaper would stop reclaiming
+#: anything at all.
+_BATCH_READ_MIN_SECONDS = 5.0
+
 #: A listening socket, as ``lsof`` prints it.
 _LSOF_LISTEN_RE = re.compile(r"TCP\s+(?P<host>\S+):(?P<port>\d+)\s+\(LISTEN\)")
 
@@ -1388,6 +1502,27 @@ def _parse_env_pairs(tokens: Iterable[str]) -> Dict[str, str]:
     return pairs
 
 
+def _read_spawn_markers(text: str) -> Tuple[bool, Dict[str, str]]:
+    """Return whether *text* holds an environment, and the markers in it.
+
+    The first half of the answer is the important one.  A segment with no
+    variable assignment in it is not an environment that carries no
+    marker -- it is an environment that could not be read at all, and the
+    ladder treats the two differently: one is a candidate, the other is
+    never a kill.  The difference has to survive the one-shot read.
+
+    Only the markers are returned.  The ladder reads no value but a
+    marker's, and the rest of an environment is of no use to anybody here.
+    """
+    if not _ENV_ASSIGNMENT_RE.search(text):
+        return False, {}
+
+    markers: Dict[str, str] = {}
+    for match in _SPAWN_MARKER_RE.finditer(text):
+        markers.setdefault(match.group("name"), match.group("value"))
+    return True, markers
+
+
 def _proc_environ(pid: int) -> Optional[Dict[str, str]]:
     """Read ``/proc/<pid>/environ`` (Linux).
 
@@ -1466,6 +1601,11 @@ def read_process_environ(pid: int) -> Optional[Dict[str, str]]:
     reflect changes in the environment after process launch"), which is
     why the positive control has to be a child that was launched with
     the marker in the first place.
+
+    This is the per-process route, and it costs two ``ps`` spawns per
+    process on macOS.  A scan that reads the whole machine through it
+    pays for every process on the box — which is why the scan reads the
+    machine in one spawn instead (see :func:`_darwin_environ_batch`).
     """
     try:
         target = int(pid)
@@ -1479,6 +1619,142 @@ def read_process_environ(pid: int) -> Optional[Dict[str, str]]:
         return _proc_environ(target)
     except Exception:  # pragma: no cover - the contract is "never raises"
         return None
+
+
+def _darwin_environ_batch(
+    procs: Sequence[ProcInfo],
+    *,
+    timeout: float = 15.0,
+) -> Dict[int, Optional[Dict[str, str]]]:
+    """Read the environment of every process on the machine — ONE ``ps``.
+
+    ``ps -E -axo pid=,args=`` prints one line per process: the pid, the
+    command line, and then the environment the process was launched with.
+    The command line is the very text :func:`list_processes` already
+    read, so it can be cut off the line without asking ``ps`` about it a
+    second time — which is the whole point of this function.  The
+    per-process route cost two spawns per process, so a scan of a machine
+    with 833 processes cost 1666 spawns and 47 seconds; and the scan runs
+    on the boot path, where every one of those seconds is a second the
+    port spends not answering.
+
+    A process whose environment cannot be read — an Apple platform
+    binary, protected by SIP — has no ``k=v`` segment at all.  That is
+    *unreadable*, not *empty*, and it is reported as ``None``, exactly as
+    the per-process route reports it.
+
+    What is returned for a readable environment are the spawn markers and
+    nothing else: the ladder reads no value but a marker's, and picking
+    them out of megabytes of text is what keeps the read cheap.
+
+    The map is keyed by pid; a pid the batch did not mention is absent
+    from it, which the caller reads as unreadable as well.
+    """
+    output = _run_ps(["-E", "-axo", _PS_ENV_COLUMNS], timeout=timeout)
+    if not output:
+        return {}
+
+    args_by_pid = {proc.pid: proc.argv for proc in procs}
+    envs: Dict[int, Optional[Dict[str, str]]] = {}
+
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid_text, _, rest = line.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+
+        argv = args_by_pid.get(pid)
+        segment = rest
+        if argv:
+            index = rest.find(argv)
+            if index >= 0:
+                segment = rest[index + len(argv):]
+
+        pairs = _read_spawn_markers(segment)
+        if not pairs[0]:
+            # The command line could not be located inside the line — a
+            # ``ps`` that answered both questions alike, say.  A marker
+            # that is in the output is a marker, wherever in the line it
+            # sits.
+            pairs = _read_spawn_markers(rest)
+
+        readable, markers = pairs
+        envs[pid] = markers if readable else None
+
+    return envs
+
+
+def _proc_environ_batch(
+    procs: Sequence[ProcInfo],
+    *,
+    timeout: float,
+) -> Dict[int, Optional[Dict[str, str]]]:
+    """Read the environment of every process in *procs* — no spawn at all.
+
+    This is the Linux counterpart of :func:`_darwin_environ_batch`: the
+    same contract — one pass over the machine, before the walk begins —
+    with the platform's own answer.  ``/proc/<pid>/environ`` is a file,
+    so the read costs no process at all, and the value it gives is the
+    one :func:`_proc_environ` gives, which is the value the marker was
+    written from.
+
+    A process whose environment cannot be read is reported as ``None``,
+    exactly as the per-process route reports it: *unreadable*, never
+    *empty*.  A pid the pass did not reach — the pass ran out of its
+    time — is absent from the map, which the caller reads as unreadable
+    as well.
+    """
+    envs: Dict[int, Optional[Dict[str, str]]] = {}
+    deadline = time.monotonic() + max(0.0, timeout)
+    for proc in procs:
+        envs[proc.pid] = _proc_environ(proc.pid)
+        if time.monotonic() > deadline:
+            break
+    return envs
+
+
+def _default_env_source(
+    procs: Sequence[ProcInfo],
+    *,
+    deadline: float,
+) -> Tuple[Callable[[int], Optional[Dict[str, str]]], bool]:
+    """Return the per-pid environment reader a scan should use.
+
+    On macOS the whole machine's environments are read in ONE spawn; on
+    Linux ``/proc`` answers the whole machine in ONE pass, without a
+    spawn at all.  When the batch read is not available the per-process
+    route is used: it is slower, and it says the same thing.
+
+    The batch read is given at least :data:`_BATCH_READ_MIN_SECONDS`
+    whatever the budget has left: it is ONE pass, its cost does not grow
+    with the machine, and a budget that had already been spent by the two
+    probes before it must not turn the whole machine *unreadable* — which
+    is a skip, so the reaper would stop reclaiming anything.
+
+    The second half of the answer says whether the environments were read
+    **before** the scan's walk began.  A source that was read in one go
+    answers from what it already holds, so the walk does no work and the
+    budget has nothing left to bound; a source that reads on demand is
+    bounded by it.  The distinction matters: a budget that expired during
+    the setup must not turn environments that *were* read into
+    environments that were not.
+    """
+    remaining = deadline - time.monotonic()
+    timeout = max(_BATCH_READ_MIN_SECONDS, remaining)
+    if _IS_DARWIN:
+        envs = _darwin_environ_batch(procs, timeout=timeout)
+    else:
+        envs = _proc_environ_batch(procs, timeout=timeout)
+    if envs:
+        def _from_batch(pid: int) -> Optional[Dict[str, str]]:
+            return envs.get(pid)
+
+        return _from_batch, True
+    return read_process_environ, False
 
 
 def _parse_ps_process_table(text: str) -> List[ProcInfo]:
@@ -2218,7 +2494,11 @@ def classify(
     )
 
 
-def probe_owner(pid: int) -> Optional[OwnerState]:
+def probe_owner(
+    pid: int,
+    *,
+    start_epochs: Optional[Mapping[int, str]] = None,
+) -> Optional[OwnerState]:
     """Return the state of the process that claimed to own a candidate.
 
     ``None`` means *could not be checked* — the caller must then skip
@@ -2226,6 +2506,14 @@ def probe_owner(pid: int) -> Optional[OwnerState]:
 
     A pid that exists but belongs to somebody else counts as alive:
     the kernel answered, and the process is running.
+
+    *start_epochs* holds start times that were already read — the scan
+    reads them for every owner at once, because one ``ps`` per owner is
+    one ``ps`` per process on the machine.  The map is authoritative: a
+    pid it does not mention is a pid whose start time could not be
+    read, and the answer says *unknown* (an empty ``start_epoch``),
+    which the ladder treats as a skip and never as a kill.  Without the
+    map the start time is read one pid at a time, as it always was.
     """
     try:
         target = int(pid)
@@ -2239,22 +2527,111 @@ def probe_owner(pid: int) -> Optional[OwnerState]:
         return OwnerState(alive=False, start_epoch="")
     except PermissionError:
         # It exists; it simply is not ours to inspect.
-        return OwnerState(alive=True, start_epoch=process_start_epoch(target))
+        return OwnerState(
+            alive=True, start_epoch=_owner_epoch(target, start_epochs)
+        )
     except OSError:
         return None
-    return OwnerState(alive=True, start_epoch=process_start_epoch(target))
+    return OwnerState(alive=True, start_epoch=_owner_epoch(target, start_epochs))
+
+
+def _owner_epoch(target: int, start_epochs: Optional[Mapping[int, str]]) -> str:
+    """The start time of *target*, from the batch when there is one.
+
+    A batch that ran is authoritative: a pid it does not mention is a
+    pid whose start time could not be read, and *saying so* is cheaper
+    than asking ``ps`` about it again — one ask per pid is the cost the
+    batch exists to remove.  Without a batch the start time is read one
+    pid at a time, as it always was.
+    """
+    if start_epochs is not None:
+        return start_epochs.get(target, "")
+    return process_start_epoch(target)
+
+
+def _proc_start_ticks_batch(
+    pids: Sequence[int],
+) -> Optional[Dict[int, str]]:
+    """Return the start times of *pids*, read from ``/proc`` in one pass.
+
+    The value is the one :func:`process_start_epoch` returns on Linux —
+    the start time in clock ticks since boot — so the comparison the
+    ladder makes is between like and like: the marker was written in
+    ticks, and the answer is in ticks.  A batch that answered in
+    another representation would report every live owner as a *recycled
+    pid*, which is a skip: the reaper would stop reclaiming anything on
+    the very platform the marker was written for.
+
+    ``None`` means the answer is unusable — ``/proc`` is not there, or
+    not readable — and the caller falls back to asking one pid at a
+    time, which is the route that wrote the marker in the first place.
+    """
+    epochs: Dict[int, str] = {}
+    for pid in pids:
+        value = _proc_start_ticks(pid)
+        if value is not None:
+            epochs[pid] = value
+    return epochs or None
+
+
+def _read_owner_epochs(
+    owner_pids: Sequence[int],
+    *,
+    deadline: float,
+) -> Optional[Dict[int, str]]:
+    """Read the start times of every owner the scan heard about.
+
+    The answer has to be in the **same representation** the marker was
+    written in, because that is what the ladder compares: on Linux the
+    marker carries the start time in clock ticks since boot (what
+    ``/proc`` says), and on macOS it carries epoch seconds (what ``ps``
+    says).  A batch that answered in the other representation would call
+    every live owner a recycled pid, and a recycled pid is a skip — so
+    the reaper would reclaim nothing at all, on every platform.
+
+    ``None`` means the answer is unusable and the caller has to fall
+    back to reading the start times one pid at a time.  An empty mapping
+    is a usable answer that reports no live owner: the owners are then
+    judged *unverified*, which is a skip and never a kill.
+    """
+    if not owner_pids:
+        return {}
+    if time.monotonic() > deadline:
+        logger.warning(
+            "orphan reaper: the budget was spent before the owners could "
+            "be read; their start times stay unknown"
+        )
+        return {}
+    wanted = sorted(set(owner_pids))
+    if _IS_DARWIN:
+        return _ps_start_epochs(wanted)
+    return _proc_start_ticks_batch(wanted)
+
+
+def _batched_owner_probe(
+    start_epochs: Optional[Mapping[int, str]],
+) -> Callable[[int], Optional[OwnerState]]:
+    """Return an owner probe that answers from a batch of start times."""
+
+    def _probe(pid: int) -> Optional[OwnerState]:
+        return probe_owner(pid, start_epochs=start_epochs)
+
+    return _probe
 
 
 def scan(
     config: ReaperConfig,
     *,
     list_procs: Callable[[], List[ProcInfo]] = list_processes,
-    env_reader: Callable[[int], Optional[Dict[str, str]]] = read_process_environ,
-    owner_probe: Callable[[int], Optional[OwnerState]] = probe_owner,
+    env_reader: Optional[
+        Callable[[int], Optional[Dict[str, str]]]
+    ] = None,
+    owner_probe: Optional[Callable[[int], Optional[OwnerState]]] = None,
     port_map_provider: Callable[
         [], Optional[Mapping[int, Iterable[int]]]
     ] = listening_ports_by_pid,
     self_uid: Optional[int] = None,
+    budget_seconds: float = SCAN_BUDGET_SECONDS,
 ) -> ScanResult:
     """Walk the machine once and judge every process it sees.
 
@@ -2264,6 +2641,31 @@ def scan(
     carries (``env_reader``), who owns it (``owner_probe``), and what
     it listens on (``port_map_provider``).
 
+    ``env_reader`` left out is not "no environment": it is the machine's
+    own environment read in ONE spawn — the whole point being that the
+    per-process route costs two spawns per process, and a scan of a
+    machine with a thousand processes costs minutes of wall clock that
+    the boot path pays for.  Pass a reader to have the scan ask process
+    by process instead.
+
+    ``owner_probe`` left out is not "ask about every owner one at a
+    time" either: the start times of every owner the scan heard about
+    are read in ONE spawn as well, so the owners of a thousand marked
+    processes cost one spawn rather than a thousand.  Pass a probe to
+    have the scan ask owner by owner instead.
+
+    The scan is bounded by ``budget_seconds``: what the budget does not
+    reach is reported as *unreadable*, which the ladder treats as a
+    skip, never as a kill.  A scan that cannot finish is a scan that
+    keeps the machine busy instead of reclaiming it.
+
+    The budget bounds the **reading**, not the judging.  The machine-wide
+    read is one spawn whose cost does not grow with the machine, so an
+    environment it has already read is judged even when the budget ran
+    out in the meantime: a budget that expired late must not turn a
+    readable machine into an unreadable one, which would stop the
+    reaper from reclaiming anything at all.
+
     The scan **decides**; it does not signal.  A candidate whose
     environment could not be read is reported as such rather than
     quietly treated as unmarked, and a failed port probe skips every
@@ -2272,6 +2674,8 @@ def scan(
     A configured ``pid_scope`` restricts the scan to the pids it
     names — a testing gate that narrows the blast radius.
     """
+    deadline = time.monotonic() + max(0.0, float(budget_seconds))
+
     procs = list_procs()
 
     scope = config.pid_scope
@@ -2285,20 +2689,61 @@ def scan(
         logger.warning("orphan reaper: the port probe failed", exc_info=True)
         port_map = None
 
+    env_source = env_reader
+    # ``pre_read`` says the environments were read in one go, before this
+    # walk began: the walk is then a lookup, and the budget -- which
+    # bounds the *reading* -- has nothing left to bound.  A source that
+    # reads on demand is bounded by it.
+    pre_read = False
+    if env_source is None:
+        env_source, pre_read = _default_env_source(procs, deadline=deadline)
+
     verdicts: List[Verdict] = []
     owners_alive = 0
+    unreadable = 0
+
+    # -- The read phase ----------------------------------------------------
+    # Every environment is read first and the owners they name are
+    # collected on the way.  The owners are then asked about in ONE
+    # spawn: one ``ps`` per owner is one ``ps`` per process on the
+    # machine, which is the cost this scan exists to avoid.
+    read: List[Tuple[ProcInfo, Optional[Dict[str, str]]]] = []
+    owner_pids: List[int] = []
 
     for proc in procs:
-        try:
-            env = env_reader(proc.pid)
-        except Exception:  # pragma: no cover - the contract is "never raises"
-            logger.warning(
-                "orphan reaper: the environment of pid %s could not be read",
-                proc.pid,
-                exc_info=True,
-            )
+        if not pre_read and time.monotonic() > deadline:
+            # The budget is spent.  The process is reported as unreadable
+            # rather than as unmarked: this layer is not entitled to
+            # claim that a process it could not read carries no marker.
             env = None
+            unreadable += 1
+        else:
+            try:
+                env = env_source(proc.pid)
+            except Exception:  # pragma: no cover - the contract is "never raises"
+                logger.warning(
+                    "orphan reaper: the environment of pid %s could not be read",
+                    proc.pid,
+                    exc_info=True,
+                )
+                env = None
 
+        read.append((proc, env))
+        owner_pid, _owner_start, _kind = _markers(env or {})
+        if owner_pid is not None:
+            owner_pids.append(owner_pid)
+
+    # -- The owners --------------------------------------------------------
+    # An injected probe is the caller's own business: it answers however
+    # it likes and is not asked anything.  The default probe is answered
+    # from a batch, so that the owners of a thousand marked processes
+    # cost one spawn rather than a thousand.
+    if owner_probe is None:
+        owner_epochs = _read_owner_epochs(owner_pids, deadline=deadline)
+        owner_probe = _batched_owner_probe(owner_epochs)
+
+    # -- The judge phase ---------------------------------------------------
+    for proc, env in read:
         marked = replace(proc, env=env)
 
         owner_pid, _owner_start, _kind = _markers(env or {})
@@ -2326,6 +2771,13 @@ def scan(
 
         if verdict.reason in (REASON_OWNER_ALIVE, REASON_OWNER_ALIVE_UNVERIFIED):
             owners_alive += 1
+
+    if unreadable:
+        logger.warning(
+            "orphan reaper: the scan ran out of its budget; %d process(es) "
+            "were left unread",
+            unreadable,
+        )
 
     return ScanResult(verdicts=verdicts, owners_alive=owners_alive)
 

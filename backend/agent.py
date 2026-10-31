@@ -17,7 +17,7 @@ import logging
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Set, Union
+from typing import Mapping, Optional, List, Dict, Any, Set, Union
 
 # Module-level logger — surfaces provider-fallback resolution to
 # backend.log (or any Python logging handler). Distinct from
@@ -10837,6 +10837,39 @@ the system will assume the tests failed. Do not claim PASSED without pasted comm
         return True
 
 
+#: The environment variable the executor's CHILD PROCESS inherits to
+#: learn which provider-routing scene its runs belong to.
+#:
+#: Why the environment and not an argument: the executor is started as
+#: a separate process (``cli.py --recover``), so it shares no Python
+#: state with the parent that dispatched it.  A scene chosen by the
+#: parent — e.g. the merge scene a base-drift repair runs under — has
+#: to travel through the environment to reach the child's coding tool.
+EXECUTOR_SCENE_ENV = "PDT_EXECUTOR_SCENE"
+
+
+def _executor_scene_from_env(
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    """The scene the executor's coding tool runs under, if any.
+
+    ``None`` means "no scene": the tool then falls back to its provider
+    priority chain, which is what every caller had before this variable
+    existed.  An unset variable, a blank one and a whitespace-only one
+    all read as "no scene" — a blank scene name is not a scene, and
+    routing it would resolve a chain for a scene nobody named.
+
+    ``environ`` defaults to :data:`os.environ`; tests pass an explicit
+    mapping so the answer does not depend on the ambient shell.
+    """
+    env: Mapping[str, str] = os.environ if environ is None else environ
+    raw = env.get(EXECUTOR_SCENE_ENV)
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    return value or None
+
+
 def autonomous_coding(
     requirement: str,
     project_dir: str,
@@ -11068,6 +11101,13 @@ def autonomous_coding(
         # fallback for calls that run with NO scene, where there is no tier
         # table to be approved against. A scene-routed call that resolves
         # no provider fails instead of using them.
+        #
+        # ``scene=`` is the executor's scene, read from the environment:
+        # the executor runs as a CHILD PROCESS (``cli.py --recover``), so
+        # a scene the parent chose — e.g. the merge scene a base-drift
+        # repair runs under — can only reach this process through
+        # ``PDT_EXECUTOR_SCENE``.  Unset / blank → ``None``, which is the
+        # no-scene behaviour every other caller has always had.
         coding_tool = ClaudeCodingTool(
             cwd=str(project_path),
             logger=logger,
@@ -11076,6 +11116,7 @@ def autonomous_coding(
             hook_stdin=hook_stdin,
             base_url=base_url,
             auth_token=api_key,
+            scene=_executor_scene_from_env(),
         )
         print("Using Claude as the coding tool.")
     elif tool == "vendor-c":

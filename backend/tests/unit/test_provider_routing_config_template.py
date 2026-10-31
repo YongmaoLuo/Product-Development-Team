@@ -4,7 +4,7 @@ Spec (2026-10-28, task 3):
 
   * ``example/provider_routing.yaml.example`` declares exactly the five
     tiers ``max`` / ``ultra`` / ``high`` / ``medium`` / ``low``.
-  * Its ``scenes`` map matches the decided 19-entry table EXACTLY, and
+  * Its ``scenes`` map matches the decided 20-entry table EXACTLY, and
     the retired ``breakdown`` scene is gone — from ``scenes`` and from
     the file as a whole, so it cannot creep back in through a comment.
   * At least one tier entry demonstrates the mapping spelling
@@ -78,6 +78,8 @@ EXPECTED_SCENES = {
     # --- Second-pass audit: high tier ---
     "repair_generation": "ultra",
     "audit_second_pass": "high",
+    # --- Base-drift merge: high tier ---
+    "base_drift_merge": "high",
     # --- Execution: medium tier (cost control) ---
     "execution": "medium",
     "repair_execution": "medium",
@@ -181,7 +183,7 @@ def test_example_default_tier_stays_medium() -> None:
 
 
 def test_example_scene_map_matches_the_decided_table() -> None:
-    """``scenes`` equals the decided 19-entry table, exactly.
+    """``scenes`` equals the decided 20-entry table, exactly.
 
     Equality, not containment: a leftover scene or a scene still on
     its old tier is precisely the drift this table pins down.
