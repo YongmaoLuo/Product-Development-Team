@@ -20,7 +20,11 @@ was right would be to watch the wrong plan start.  So this module
 remembers nothing *about the rows*: every call reads them again, and
 every value it returns is a value that is in the database at that
 moment.  Restarting the scheduler changes nothing, because there is
-nothing to lose.
+nothing to lose.  The two things that are remembered are which plans
+have already been complained about, so that a plan whose directory is
+missing is reported once rather than on every tick, and a plan's
+creation time, which comes from the filesystem and cannot change under
+it.
 
 The five questions
 ------------------
@@ -107,6 +111,7 @@ at that moment.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -116,6 +121,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .queue import queue_key
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "PlanFactsReader",
@@ -343,7 +350,9 @@ class PlanFactsReader:
     The reader holds no state about the plans it reports.  It has a
     connection it reads through and the directory the plans live in,
     and every answer it gives is derived from the rows that are in the
-    database at that moment.  The one thing it keeps is a plan's
+    database at that moment.  The two things it keeps are which plans
+    it has already complained about, so that a plan whose directory is
+    missing is reported once rather than on every tick, and a plan's
     creation time, which comes from the filesystem and cannot change
     under it.
 
@@ -369,10 +378,10 @@ class PlanFactsReader:
         self._conn = conn
         self._project_root = Path(project_root)
         self._clock = clock if clock is not None else time.time
-        #: The creation time of each plan, read once.  It is the only
-        #: thing this reader remembers, and it is a fact about the
-        #: filesystem that cannot drift — a directory's creation time
-        #: does not change while the directory is there.
+        self._missing_dir_warned: set[str] = set()
+        #: The creation time of each plan, read once.  It is a fact
+        #: about the filesystem that cannot drift — a directory's
+        #: creation time does not change while the directory is there.
         self._created_at_cache: Dict[str, Optional[float]] = {}
 
     # ------------------------------------------------------------------
@@ -396,6 +405,12 @@ class PlanFactsReader:
         nothing holds it back — and a plan whose ``next_run_at`` has
         passed is due; a plan scheduled for later is not.
 
+        A plan whose directory is not under the plans root is not a
+        plan any more, so it is not waiting either: it is dropped from
+        the answer, and the operator is warned about it once.  A ghost
+        left at the head of the queue would block every plan behind it
+        for as long as the scheduler runs.
+
         Returns:
             The queued plans, each a dict of ``plan_id``, ``priority``,
             ``seq`` and ``due``, in the order the shared comparator
@@ -415,6 +430,9 @@ class PlanFactsReader:
         entries: List[Tuple[Tuple[bool, int, int, int], Dict[str, Any]]] = []
         for row in rows:
             plan_id, seq, priority, promote_order, next_run_at = tuple(row)
+            if self._plan_dir(plan_id) is None:
+                self._warn_missing_plan_dir(plan_id)
+                continue
             entries.append(
                 (
                     _queue_sort_key(seq, priority, promote_order),
@@ -656,6 +674,23 @@ class PlanFactsReader:
             if candidate.is_dir():
                 return candidate
         return None
+
+    def _warn_missing_plan_dir(self, plan_id: str) -> None:
+        """Say once that a queued plan has no directory under the root.
+
+        The scheduler reads the queue on every tick, so a warning that
+        repeated would say the same thing over and over and drown the
+        log.  The set of plans already complained about is what makes
+        the warning a report rather than a heartbeat.
+        """
+        if plan_id in self._missing_dir_warned:
+            return
+        self._missing_dir_warned.add(plan_id)
+        log.warning(
+            "queued plan %s is ignored: no plan directory under %s",
+            plan_id,
+            self._project_root,
+        )
 
     # ------------------------------------------------------------------
     # The plan's age

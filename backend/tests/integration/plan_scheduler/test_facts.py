@@ -169,6 +169,19 @@ def _queue_row(
     )
 
 
+def _plan_dir(plans_root: Path, plan_id: str) -> None:
+    """Give the plan a directory under the plans root.
+
+    A plan whose directory is not there is not a plan any more: the
+    facts drop it from the queue and warn about it once (see
+    ``test_facts_missing_plan_dir.py``).  A case that wants a plan *in*
+    the queue therefore has to give it a directory — otherwise the case
+    would be about the ghost rule instead of about the derivation it
+    came for.
+    """
+    (plans_root / plan_id).mkdir(parents=True, exist_ok=True)
+
+
 def _live_pid(case_registry: Any) -> int:
     """The pid of a process that is running right now."""
     process = case_registry.spawn(
@@ -209,12 +222,14 @@ def test_queued_plans_derived_from_routing(
     db = db_factory()
     conn = db.connect()
     try:
+        plans_root = tmp_path / "plans"
+        _plan_dir(plans_root, "p1")
         _routing(conn, "p1", "queued")
         _routing(conn, "p2", "executing")
         _queue_row(conn, "p1", seq=1, priority=0)
         _queue_row(conn, "p2", seq=2, priority=0)
 
-        queued = _reader(conn, tmp_path / "plans").queued_plans()
+        queued = _reader(conn, plans_root).queued_plans()
 
         assert [entry["plan_id"] for entry in queued] == ["p1"]
         assert queued[0] == {
@@ -239,11 +254,13 @@ def test_queued_plan_is_held_back_by_next_run_at(
     db = db_factory()
     conn = db.connect()
     try:
+        plans_root = tmp_path / "plans"
+        _plan_dir(plans_root, "p1")
         _routing(conn, "p1", "queued")
         _execution(conn, "p1", next_run_at=_iso(3600))
         _queue_row(conn, "p1", seq=1)
 
-        queued = _reader(conn, tmp_path / "plans").queued_plans()
+        queued = _reader(conn, plans_root).queued_plans()
 
         assert queued == [
             {"plan_id": "p1", "priority": 0, "seq": 1, "due": False}
@@ -264,6 +281,10 @@ def test_queued_plans_are_ordered_by_the_queue_comparator(
     db = db_factory()
     conn = db.connect()
     try:
+        plans_root = tmp_path / "plans"
+        _plan_dir(plans_root, "p-late")
+        _plan_dir(plans_root, "p-early")
+        _plan_dir(plans_root, "p-promoted")
         _routing(conn, "p-late", "queued")
         _routing(conn, "p-early", "queued")
         _routing(conn, "p-promoted", "queued")
@@ -271,7 +292,7 @@ def test_queued_plans_are_ordered_by_the_queue_comparator(
         _queue_row(conn, "p-early", seq=2, priority=0)
         _queue_row(conn, "p-promoted", seq=3, priority=0, promote_order=-1)
 
-        queued = _reader(conn, tmp_path / "plans").queued_plans()
+        queued = _reader(conn, plans_root).queued_plans()
 
         assert [entry["plan_id"] for entry in queued] == [
             "p-promoted",
