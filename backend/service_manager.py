@@ -2385,6 +2385,8 @@ def start_service(
     try:
         env = dict(os.environ)
         env.update(service_env(decl))
+        # 服务是一次性 fixture，不做全盘凭据清扫；主 server 不走这条路径。
+        env["PDT_DISABLE_TEMP_SWEEP"] = "1"
         # The spawn marker: this service is started detached, so it
         # outlives this process -- which is exactly the process the
         # reaper has to recognise as an orphan later.  The marker
