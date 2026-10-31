@@ -22,9 +22,12 @@ The properties pinned here:
   check and a disabled check all leave the round running — a check that
   blocks on its own problems blocks for reasons that have nothing to do
   with the code under test;
-* in ``repair`` mode the conflict becomes a task through the repair
-  channel that **already exists**.  This file does not write to the
-  database: it builds the task and hands it to
+* a conflict becomes a task through the repair channel that **already
+  exists** — in every mode, ``report`` included.  The mode says what the
+  *check* may do to the working tree, not what the round may write
+  down: a conflict that is only reported is a conflict nobody ever
+  resolves.  This file does not write to the database: it builds the
+  task and hands it to
   :func:`verification_agent.persist_conflict_repair_task`.
 """
 

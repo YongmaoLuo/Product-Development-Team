@@ -662,8 +662,14 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     ),
     # 2026-10-29：因「关机检查点恢复」新增 `_requeue_shutdown_interrupted_verification`（+80 行），
     # 按本 gate 的既定流程重新钉住该文件的哈希。
+    # 2026-10-31：因「基线漂移冲突转可执行合并任务」把合并场景名经 `PDT_EXECUTOR_SCENE`
+    # 跨进程传给 executor 子进程（executor 是子进程，与父进程不共享 Python 状态，故只能走
+    # 环境变量），改动为纯增量：一个形参、一个 `extra_env` 字典、一处调用点实参（+30 行），
+    # 未改动任何既有分支；按本 gate 的既定流程把冻结基线移动到本分支的批准态哈希。
+    # 这是「移动冻结」而不是「放松门禁」：断言（mismatched == []）、被钉文件的范围、
+    # sha256 逐字节比对的强度都不变，该文件此后仍被逐字节钉住，任何再编辑照样红。
     "backend/verification_loop.py": (
-        "78caf3bbbf5a8734ed0984eaefa14451b6f78c7701e2a771dd4683bacfe11cbf"
+        "cb585e3776f47a15b7fa2493d039353a957e80c941f51fc7f51a79dba4449a30"
     ),
 }
 

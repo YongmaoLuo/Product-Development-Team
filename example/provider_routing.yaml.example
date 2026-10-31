@@ -146,6 +146,10 @@ scenes:
   # 第二遍独立审计（2026-10-28 提到 high 档）：它的结论能否决交付，
   # 不能像辅助调用那样按低成本档处理。
   audit_second_pass: high
+  # --- Base-drift merge: high tier ---
+  # 合并基线漂移（2026-10-31）：把基线合进来要解冲突、判归属，
+  # 错了会把别的改动带进来，所以走 high 档。
+  base_drift_merge: high
   # --- Execution: medium tier (cost control) ---
   execution: medium
   repair_execution: medium
