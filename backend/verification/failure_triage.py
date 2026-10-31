@@ -221,6 +221,19 @@ _DETERMINISTIC_SIGNALS: Dict[str, str] = {
     "service_not_ready": INFRA,
     "blocked_ports": INFRA,
     "service_unavailable": INFRA,
+    # 2026-10-31 (VP-020): the whole-repo gate has three exit codes, and
+    # the third one is the one this table used to be silent about. The
+    # gate (``scripts/run_tests.sh``) exits 3 when "the run could not
+    # decide" — the host could not be measured, or a phase called itself
+    # inconclusive — and that is **not** a code failure. Read as a
+    # generic non-zero exit it became a repair task against a delivery
+    # that had not failed, so the exit code has to be named here.
+    "gate_inconclusive": INFRA,
+    # The entry could not be started at all: the machine's problem, the
+    # same way an unreachable service is.
+    "gate_not_executable": INFRA,
+    # ... and the one that really is the code's: a lane went red.
+    "gate_failed": DELIVERABLE_DEFECT,
     # --- criterion_defect: the verification point cannot be run -------
     "schema_rejected": CRITERION_DEFECT,
     "schema_violation": CRITERION_DEFECT,
@@ -287,6 +300,22 @@ _TEXT_MARKERS: Tuple[Tuple["re.Pattern[str]", str], ...] = tuple(
         (r"service not ready", INFRA),
         (r"service_unavailable", INFRA),
         (r"blocked_ports", INFRA),
+        # 2026-10-31 (VP-020): the same event in the framework's own
+        # Chinese wording. The timeout reason the CI runner writes is
+        # "超时：3600s 内没有跑完" — and a table that carries only English
+        # markers reads that as "no opinion", which hands the case to
+        # the semantic tier, which lands on ``deliverable_defect``: the
+        # class that counts and that becomes a repair task.
+        (r"超时", INFRA),
+        # The gate's own "the run could not decide" wording — the same
+        # event as ``gate_inconclusive``, in the script's English.
+        (r"INCONCLUSIVE", INFRA),
+        (r"could not decide", INFRA),
+        (r"机器答不了", INFRA),
+        # ... and the gate's "a lane went red" wording, which is the one
+        # that really is the delivery's fault.
+        (r"gate: FAIL", DELIVERABLE_DEFECT),
+        (r"a phase failed", DELIVERABLE_DEFECT),
         (r"method must be one of", CRITERION_DEFECT),
         (r"unsupported method", CRITERION_DEFECT),
         (r"method not allowed", CRITERION_DEFECT),
