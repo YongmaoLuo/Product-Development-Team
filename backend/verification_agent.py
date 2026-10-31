@@ -294,6 +294,88 @@ def persist_conflict_repair_task(
     return True
 
 
+#: The statuses that mean a task is **over**.  Every other status — a
+#: queued task, a running task, a failed task, a row whose status was
+#: never written — still counts as unfinished.
+TERMINAL_TASK_STATUSES = frozenset({"completed", "skipped"})
+
+
+def has_open_base_drift_merge_task(
+    plan_id: str,
+    *,
+    db_path: Optional[Path] = None,
+) -> bool:
+    """Does this plan already carry an unfinished base-drift merge task?
+
+    A conflict becomes a merge task in **every** mode — the mode says
+    what the *check* may do to the working tree, not what the round may
+    write down — and the task's id carries the round number:
+    ``repair-r<round>-<seq>``.  So a conflict that recurs writes a new
+    row every round: ``repair-r3-01``, ``repair-r4-01``, ``repair-r5-01``
+    …  A merge that keeps failing then never converges.  Each round
+    finds a task it has never seen, dispatches it, fails, and the next
+    round does the same under a fresh id.
+
+    This function is the guard that closes that loop.  It reads the
+    plan's own rows and answers the one question the writer has to ask
+    *before* it writes: is there already a merge task for this plan that
+    has not finished?
+
+    * ``pending`` / ``in_progress`` / ``failed`` — the merge is **not**
+      over.  A failed merge in particular *is* the loop: the conflict is
+      still there, and re-dispatching it every round under a new id is
+      exactly what this guard exists to stop.
+    * ``completed`` / ``skipped`` — the merge is over.  If the base
+      moves again afterwards that is a *new* conflict, and it deserves
+      a task of its own.
+    * any other status — including an empty one — counts as unfinished.
+      A row that has not reached a terminal state is not a finished
+      task, and calling it one would let a stuck merge be replaced by
+      an endless series of new ones.
+
+    The rows are read **per plan**: another plan's unfinished merge says
+    nothing about this one.
+
+    A query that fails is a warning, not a block.  The round continues
+    as if there were no prior row — refusing to write a task because a
+    *read* failed would strand the conflict with nobody to resolve it,
+    which is the very failure the mode gate used to cause.
+
+    ``db_path`` defaults to :func:`config_paths.resolve_state_db_path`
+    — the one resolver the rest of the backend uses, so this read and
+    the write that follows it reach the same database.
+    """
+    plan = str(plan_id or "").strip()
+    if not plan:
+        return False
+    try:
+        target = (
+            Path(db_path) if db_path is not None else resolve_state_db_path()
+        )
+        conn = _open_state_db(target)
+        try:
+            _migrate_state_db(conn)
+            rows = PlanTaskRepository(conn).load_all(plan)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — a failed read never blocks
+        logger.warning(
+            "[base_drift] could not read the tasks of plan %r: %s", plan, exc,
+        )
+        return False
+
+    for entry in (rows or {}).values():
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("failed_vp_id") or "") != base_drift.BASE_DRIFT_VP_ID:
+            continue
+        status = str(entry.get("status") or "").strip().lower()
+        if status in TERMINAL_TASK_STATUSES:
+            continue
+        return True
+    return False
+
+
 class ApiTestSchemaViolation(RuntimeError):
     """A plan whose api_test VPs cannot be graded by the deterministic
     runner (a ``verification_api_runner`` violation) is not safe to
@@ -11705,8 +11787,14 @@ class Orchestrator:
     def _persist_base_drift_repair_task(self, report: Any) -> Optional[str]:
         """Turn a conflicting report into a repair task and store it.
 
-        Only in ``repair`` mode: the default ``report`` mode is read-only
-        by contract, and a read-only check must not write anything.
+        In **every** mode.  The mode says what the *check* may do to the
+        working tree — only ``repair`` merges or reverts anything — not
+        what the round may write down.  A conflict that is merely
+        reported is a conflict nobody ever resolves: the round blocks,
+        no task exists, and the plan sits there until it goes
+        ``failed / loop_stopped``.  Writing the task is not the check
+        acting on the tree; it is the round handing the conflict to
+        whoever can resolve it.
 
         The task is **built** by :func:`base_drift.build_conflict_repair_task`
         and **stored** by :func:`persist_conflict_repair_task` — the
@@ -11714,17 +11802,35 @@ class Orchestrator:
         the database itself: one writer per row, and the writer that
         already exists is the one that enforces the field allow-list.
 
-        Returns the task id, or ``None`` when there was nothing to
-        repair (the report names no conflicting file) or the task could
-        not be built.
-        """
-        mode = str(self._base_drift_field(report, "mode", "") or "")
-        if mode != base_drift.MODE_REPAIR:
-            return None
+        Before anything is written, :func:`has_open_base_drift_merge_task`
+        asks whether this plan already carries an **unfinished**
+        base-drift merge task.  If it does, this method returns ``None``
+        without writing a row: the task id carries the round number, so
+        a second task would be a *new* id for the *same* conflict, and a
+        merge that keeps failing would then be re-dispatched every round
+        forever.  Handing the loop no task id is what makes it stop.
 
+        Returns the task id, or ``None`` when there was nothing to
+        repair (the report names no conflicting file), the task could
+        not be built, or the plan already has an unfinished merge task.
+        A task that cannot be **stored** is reported and
+        the round goes on: a lost row must not take the round down.
+        """
         plan_id = str(
             getattr(getattr(self, "plan_dir", None), "name", "") or ""
         )
+        # The convergence guard.  A plan that already carries an
+        # unfinished base-drift merge task does not get a second one:
+        # the round then hands the loop **no** task id, and the loop
+        # stops instead of dispatching the same conflict under a new id
+        # every round.
+        if has_open_base_drift_merge_task(plan_id):
+            logger.info(
+                "[base_drift] the plan %r already has an unfinished "
+                "base-drift merge task; no new task is written",
+                plan_id,
+            )
+            return None
         try:
             round_number = int(getattr(self, "_current_round", 0) or 0)
         except (TypeError, ValueError):

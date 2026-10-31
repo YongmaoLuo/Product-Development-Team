@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shlex
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple
@@ -696,6 +698,132 @@ class _StubServer(NamedTuple):
     port: int
 
 
+# ----- the budget the stub server is given --------------------------------
+#
+# The helper starts a real interpreter and waits for it to bind a port.
+# Both halves of that are hostage to the host: a cold ``python -c``
+# measured 2.7 s on a loaded machine, and a single ``probe_port`` costs
+# 1.4 s there because it spawns ``lsof`` and ``ps``.  A fixed ten-second
+# budget is therefore a bet on the host being quiet, and losing that bet
+# turns a slow machine into a failed test that says nothing about the
+# code under test.
+
+#: The budget a quiet host is given.
+SPAWN_BUDGET_SECONDS = 10.0
+
+#: How many seconds of budget one unit of load average buys.
+SPAWN_BUDGET_LOAD_SECONDS = 1.5
+
+#: The ceiling: a scaled budget is still a budget.
+SPAWN_BUDGET_MAX_SECONDS = 60.0
+
+
+#: What the stub child prints once it has bound its port.
+BOUND_PREFIX = "BOUND"
+
+
+def _parse_bound_line(line: str) -> Optional[int]:
+    """The port the stub child said it bound, or ``None``.
+
+    The line is the child's own report, and it is written *after* the
+    bind succeeded -- so it is the one piece of evidence in this helper
+    that cannot be wrong about who took the port.
+    """
+    parts = line.strip().split()
+    if len(parts) != 2 or parts[0] != BOUND_PREFIX:
+        return None
+    try:
+        port = int(parts[1])
+    except ValueError:
+        return None
+    return port if port > 0 else None
+
+
+def _read_bound_port(proc, deadline: float) -> Optional[int]:
+    """The port the child reported it bound, or ``None``.
+
+    ``None`` means the child did not say: it died (the bind failed --
+    the port was taken), or the deadline passed.
+
+    The child's own report is the authority, and it is deliberately
+    *not* a probe of the host: ``lsof`` scans the kernel's socket table
+    and can miss a socket that was bound while the scan was running, so
+    a probe that cannot name the holder is not evidence that somebody
+    else took the port.  Acting on that evidence is what made the
+    helper kill the child it had just started -- the child that was
+    serving the port -- and report that child as the squatter.
+    """
+    stream = getattr(proc, "stdout", None)
+    if stream is None:
+        return None
+    try:
+        fd = stream.fileno()
+    except (OSError, ValueError):  # pragma: no cover - closed pipe
+        return None
+
+    buffered = b""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            ready, _, _ = select.select([fd], [], [], min(0.25, remaining))
+        except (OSError, ValueError):  # pragma: no cover - closed pipe
+            return None
+        if not ready:
+            if proc.poll() is not None:
+                return None
+            continue
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:  # pragma: no cover - closed pipe
+            return None
+        if not chunk:
+            return None        # EOF: the child is gone
+        buffered += chunk
+        while b"\n" in buffered:
+            raw, buffered = buffered.split(b"\n", 1)
+            port = _parse_bound_line(raw.decode("utf-8", "replace"))
+            if port is not None:
+                return port
+
+
+def _wait_until_probe_names(
+    port: int, pid: int, deadline: float, probe_fn=None
+) -> PortProbe:
+    """The first probe that names *pid* among the listeners of *port*.
+
+    ``lsof`` can miss a socket that was bound while it was scanning, so
+    a *single* probe is a coin flip on a busy host.  The probe that
+    names the pid is the one that answers the question; the ones before
+    it are the host being slow, not the answer being different.
+
+    *probe_fn* defaults to the production probe; a caller that has
+    replaced it (to simulate a busy host) can pass the real one back.
+    """
+    probe = (probe_fn or sm.probe_port)(port)
+    while pid not in probe.pids and time.monotonic() < deadline:
+        time.sleep(0.2)
+        probe = (probe_fn or sm.probe_port)(port)
+    return probe
+
+
+def _spawn_budget_seconds() -> float:
+    """The wall-clock budget for starting one stub server, in seconds.
+
+    The budget follows the host's load average, because both the
+    child's start-up and the cost of one probe scale with it.  It is
+    capped, so that a port nobody can bind fails the test instead of
+    hanging it.
+    """
+    try:
+        load = os.getloadavg()[0]
+    except (AttributeError, OSError):  # pragma: no cover - exotic platform
+        load = 0.0
+    budget = SPAWN_BUDGET_SECONDS + SPAWN_BUDGET_LOAD_SECONDS * max(0.0, load)
+    return min(budget, SPAWN_BUDGET_MAX_SECONDS)
+
+
 def _spawn_http_server(port: int, *, ignore_sigterm: bool = False) -> _StubServer:
     """Start a detached `python -m http.server`; return a :class:`_StubServer`
     holding **the port it actually bound** plus its pid.
@@ -718,17 +846,46 @@ def _spawn_http_server(port: int, *, ignore_sigterm: bool = False) -> _StubServe
 
     See :func:`_free_port` for why the window cannot be closed from that
     side.
+
+    The wait for the child is a **poll inside the deadline**, not a fixed
+    sleep followed by a single probe.  A child's own start-up is not
+    instant -- ``python -c`` was measured at 0.19-0.71 s on a busy host
+    -- so one probe after 0.3 s used to mistake "the child has not
+    started yet" for "somebody else took the port": the helper killed
+    the child it had just started and reported *that child* as the
+    squatter, which sent two rounds of triage after the wrong process.
+
+    The deadline itself follows the host's load average (see
+    :func:`_spawn_budget_seconds`): the child's start-up and the cost of
+    one probe both scale with the machine, so a fixed budget on a busy
+    host fails a test that has nothing to do with the code under test.
+
+    **The child says which port it bound** (see :func:`_read_bound_port`),
+    and that report is what the helper waits for.  It used to ask the
+    host instead, and a probe that cannot name the holder of a port that
+    answers is not evidence that somebody else took it: ``lsof`` scans
+    the kernel's socket table and misses a socket that was bound while
+    the scan was running.  Believing that evidence is what made the
+    helper kill the child it had just started -- the child that was
+    serving the port -- and report that child as the squatter.
     """
     import shlex
     import subprocess
     import sys as _sys
     import time as _time
 
-    script = (
-        "import http.server,socketserver;"
-        f"socketserver.TCPServer(('127.0.0.1',{port}),"
-        "http.server.SimpleHTTPRequestHandler).serve_forever()"
-    )
+    def _script_for(bound_port: int) -> str:
+        """The stub's program, told to report the port it bound."""
+        return (
+            "import http.server,socketserver,sys;"
+            f"srv=socketserver.TCPServer(('127.0.0.1',{bound_port}),"
+            "http.server.SimpleHTTPRequestHandler);"
+            f"sys.stdout.write('{BOUND_PREFIX} %d\\n'%srv.server_address[1]);"
+            "sys.stdout.flush();"
+            "srv.serve_forever()"
+        )
+
+    script = _script_for(port)
     if ignore_sigterm:
         # A shell that ignores TERM and execs python: forces the
         # escalation branch.
@@ -739,62 +896,41 @@ def _spawn_http_server(port: int, *, ignore_sigterm: bool = False) -> _StubServe
     else:
         argv = [_sys.executable, "-c", script]
 
-    deadline = _time.monotonic() + 10.0
+    deadline = _time.monotonic() + _spawn_budget_seconds()
     while True:
         proc = subprocess.Popen(
-            argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL, start_new_session=True,
         )
-        # Give the child a moment to either bind or die on EADDRINUSE.
-        _time.sleep(0.3)
-        if proc.poll() is not None:
-            # it exited — EADDRINUSE, most likely
-            pass
-        elif proc.pid in sm.probe_port(port).pids:
-            # Our child is the listener. This is the same check the
-            # production `start_service` does, and it was missing here:
-            # without it the helper handed back the pid of a dead child
-            # for a port something else was answering on, and every
-            # assertion downstream was reasoning from that.
+        # Wait for the child to say which port it bound, or to die
+        # trying (EADDRINUSE, most likely), or for the deadline to go.
+        # The child is asked, not the host: a probe that cannot name
+        # the holder of a port that answers is not evidence that
+        # somebody else took it, and acting on that evidence is what
+        # made this helper kill the child it had just started.
+        bound_port = _read_bound_port(proc, deadline)
+        if bound_port is not None:
+            port = bound_port
             break
-        else:
-            # Still running, but not the listener. Something else got
-            # there first, so treat it like a bind failure and retry.
+
+        # The child is not serving the port it was asked for.  It may
+        # have died on the bind, it may still be starting with the
+        # deadline gone, or somebody else may hold the port; in every
+        # case the child this helper started is not the listener, so it
+        # is cleaned up and the helper tries another port.
+        if proc.poll() is None:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (OSError, ProcessLookupError):
                 pass
-            if _time.monotonic() >= deadline:
-                raise AssertionError(
-                    f"port {port} is held by a process that is not the "
-                    f"server this helper started (pid {proc.pid}); gave up "
-                    f"after 10s of retries"
-                )
-            port = _free_port()
-            script = (
-                "import http.server,socketserver;"
-                f"socketserver.TCPServer(('127.0.0.1',{port}),"
-                "http.server.SimpleHTTPRequestHandler).serve_forever()"
-            )
-            if ignore_sigterm:
-                argv = [
-                    "/bin/bash", "-c",
-                    f"trap '' TERM; exec {shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
-                ]
-            else:
-                argv = [_sys.executable, "-c", script]
-            continue
         if _time.monotonic() >= deadline:
             raise AssertionError(
-                f"could not bind port {port} for the test server after "
-                f"retrying for 10s; something else is holding it"
+                f"the server this helper started (pid {proc.pid}) did not "
+                f"bind port {port} within the "
+                f"{_spawn_budget_seconds():.0f}s deadline"
             )
         port = _free_port()  # taken in the meantime; try another
-        script = (
-            "import http.server,socketserver;"
-            f"socketserver.TCPServer(('127.0.0.1',{port}),"
-            "http.server.SimpleHTTPRequestHandler).serve_forever()"
-        )
+        script = _script_for(port)
         if ignore_sigterm:
             argv = [
                 "/bin/bash", "-c",
@@ -802,13 +938,7 @@ def _spawn_http_server(port: int, *, ignore_sigterm: bool = False) -> _StubServe
             ]
         else:
             argv = [_sys.executable, "-c", script]
-    deadline = _time.monotonic() + 20
-    while _time.monotonic() < deadline:
-        if sm.probe_port(port).listening:
-            return _StubServer(proc.pid, port)
-        _time.sleep(0.2)
-    _force_cleanup(proc.pid)
-    raise AssertionError(f"stub server on {port} never came up")
+    return _StubServer(proc.pid, port)
 
 
 def _force_cleanup(pid: int) -> None:
@@ -822,6 +952,90 @@ def _force_cleanup(pid: int) -> None:
             os.kill(pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
+
+
+def test_the_helper_asks_the_child_which_port_it_bound(monkeypatch):
+    """A probe that names no holder is not a verdict about a squatter.
+
+    ``lsof`` scans the kernel's socket table and can miss a socket that
+    was bound while the scan was running; the connect fallback then
+    reports "the port accepts connections" with an **empty** pid list.
+    Reading that as "somebody else took the port" made the helper kill
+    the child it had just started -- the child that was serving the
+    port -- and retry until the budget was gone.  On a host where one
+    probe costs two seconds that turned every stub server into a
+    failure, and the failure named the wrong process.
+
+    The child is the authority: it prints the port it bound, after the
+    bind succeeded, so the helper never has to guess who is listening.
+    """
+    real_probe = sm.probe_port
+
+    def _degrading_probe(port):
+        probe = real_probe(port)
+        if probe.pids:
+            # The port is served, but lsof could not name the holder.
+            return PortProbe(
+                port=port,
+                listening=True,
+                pids=[],
+                error=(
+                    "lsof reported no holder but the port accepts "
+                    "connections"
+                ),
+            )
+        return probe
+
+    monkeypatch.setattr(sm, "probe_port", _degrading_probe)
+    # A quiet host's budget, so a regression fails fast instead of
+    # spending the whole scaled budget before it does.
+    monkeypatch.setattr(os, "getloadavg", lambda: (4.0, 4.0, 4.0))
+
+    stub = _spawn_http_server(_free_port())
+    try:
+        assert stub.pid > 0, "the helper handed back no pid"
+        assert stub.port > 0, "the helper handed back no port"
+        assert real_probe(stub.port).listening, (
+            f"nothing is listening on the port {stub.port} the child "
+            f"reported it had bound"
+        )
+    finally:
+        _force_cleanup(stub.pid)
+
+
+def test_the_stub_server_budget_scales_with_the_host_load(monkeypatch):
+    """A busy host must not be measured by a fixed budget.
+
+    The stub server's budget covers two things that both get slower
+    when the machine is busy: the child's own start-up and the cost of
+    one probe.  So the budget follows the load average.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (50.0, 40.0, 30.0))
+
+    budget = _spawn_budget_seconds()
+
+    assert budget >= 30.0, (
+        f"the stub server's budget was {budget}s on a host whose load "
+        f"average was 50; it must scale with the load"
+    )
+
+
+def test_the_stub_server_budget_stays_inside_its_ceiling(monkeypatch):
+    """A scaled budget is still a budget.
+
+    The scaling exists so that a busy host is not judged by a wall
+    clock it cannot meet.  It must not turn into "wait forever": the
+    ceiling keeps a port nobody can bind a failing test instead of a
+    hanging one.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (100000.0, 100000.0, 100000.0))
+
+    budget = _spawn_budget_seconds()
+
+    assert budget <= 60.0, (
+        f"the stub server's budget was {budget}s; a scaled budget still "
+        f"needs a ceiling so that an unbindable port fails instead of hanging"
+    )
 
 
 @pytest.mark.timeout(120)
@@ -849,7 +1063,10 @@ def test_spawn_http_server_reports_the_port_it_actually_bound():
                 f"expected the retry to move off the held port {squatted}, "
                 f"but the helper reported {stub.port}"
             )
-            probe = sm.probe_port(stub.port)
+            probe = _wait_until_probe_names(
+                stub.port, stub.pid,
+                time.monotonic() + _spawn_budget_seconds(),
+            )
             assert probe.listening, f"nothing is listening on {stub.port}: {probe!r}"
             assert stub.pid in probe.pids, (
                 f"the helper reported port {stub.port}, but its own pid "
@@ -875,6 +1092,63 @@ def test_stop_service_releases_a_real_port():
         assert result["signalled"]
     finally:
         _force_cleanup(pid)
+
+
+@pytest.mark.timeout(120)
+def test_spawn_http_server_waits_for_its_own_child_to_bind(monkeypatch):
+    """The helper must wait for its child, not kill it and blame it.
+
+    The helper used to sleep a fixed 0.3 s and then probe the port
+    **once**.  A child's own start-up takes longer than that on a busy
+    host -- ``python -c`` alone was measured at 0.19-0.71 s there -- so
+    the single probe said "not listening", the helper concluded that
+    somebody else had taken the port, killed the child it had just
+    started, and then reported *that child* as the squatter.  The error
+    named the wrong process for two rounds of triage.
+
+    The check belongs inside the deadline the helper already has: the
+    port is polled until the child binds it, the child dies, or the
+    deadline is reached.
+
+    Since this round the helper does not ask the host at all -- it asks
+    the **child**, which reports the port it bound once the bind has
+    succeeded (see :func:`_read_bound_port`).  So the probe below, which
+    lies for the first second, must not be able to move the helper off
+    the port; and the final check of "is the child really the listener"
+    is made with the production probe, because the production probe is
+    the only one entitled to answer that.
+    """
+    real_probe = sm.probe_port
+    began = time.monotonic()
+
+    def _slow_probe(port):
+        # For the first second the port reports "nothing is listening" --
+        # which is what a host that is too busy to start a child in 0.3 s
+        # looks like from here.
+        if time.monotonic() - began < 1.0:
+            return PortProbe(port=port, listening=False, pids=[])
+        return real_probe(port)
+
+    monkeypatch.setattr(sm, "probe_port", _slow_probe)
+
+    port = _free_port()
+    stub = _spawn_http_server(port)
+    try:
+        assert stub.port == port, (
+            f"the helper moved off port {port} although nothing had taken "
+            f"it -- it reported {stub.port}"
+        )
+        probe = _wait_until_probe_names(
+            stub.port, stub.pid, time.monotonic() + _spawn_budget_seconds(),
+            probe_fn=real_probe,
+        )
+        assert probe.listening, f"nothing is listening on {stub.port}: {probe!r}"
+        assert stub.pid in probe.pids, (
+            f"the helper reported port {stub.port}, but its own pid "
+            f"{stub.pid} is not among the listeners {probe.pids}"
+        )
+    finally:
+        _force_cleanup(stub.pid)
 
 
 @pytest.mark.timeout(180)
@@ -3869,6 +4143,454 @@ def test_end_to_end_relocation_around_a_stranger_ends_ready(
 
 
 # ---------------------------------------------------------------------------
+# The boot path: what the reaper's scan costs, and what the notifier's start
+#
+# Both of these sit between "the server was asked to start" and "the port
+# answers", and both used to sit on the lifespan's own thread: the scan
+# because it spawned ``ps`` twice for every process on the machine, the
+# notifier because its client pulls the whole Feishu SDK in on ``start()``.
+#
+# They are pinned here because the task's file scope allows this file and
+# the two other test modules only -- a new test module would be a file
+# outside that scope.
+# ---------------------------------------------------------------------------
+
+
+class _FakeApp:
+    """The smallest thing the notifier helpers need: a state to write to."""
+
+    class _State:
+        def __init__(self):
+            self.feishu_notifier = None
+
+    def __init__(self):
+        self.state = self._State()
+
+
+def _proc(pid: int, argv: str):
+    """A process record, as the reaper's process table reports it."""
+    import orphan_reaper as reaper
+
+    return reaper.ProcInfo(
+        pid=pid,
+        ppid=1,
+        pgid=pid,
+        uid=reaper._current_uid(),
+        rss_kb=1024,
+        argv=argv,
+    )
+
+
+def _machine_read_fakes(monkeypatch, marked_pid: int, owner: int):
+    """Teach the reaper's machine-wide read what the machine says.
+
+    The reaper reads the whole machine in one go, and the platform it
+    asks is the platform's own: ``ps`` on macOS, ``/proc`` on Linux.
+    Both are answered here, so the cases below assert the *property*
+    (one pass, not one pass per process) on either platform, instead of
+    asserting the shape of one platform's route.
+
+    The marked process carries a marker that names a **live** owner --
+    this process -- so the ladder has a real owner to judge, and the
+    owner probe has a real start time to compare.
+    """
+    import orphan_reaper as reaper
+
+    owner_start = reaper.process_start_epoch(owner)
+    marked = {
+        "PDT_SPAWN_OWNER_PID": str(owner),
+        "PDT_SPAWN_OWNER_START": owner_start,
+        "PDT_SPAWN_KIND": "service",
+    }
+    calls = []
+
+    def _fake_ps(args, timeout=10.0):
+        calls.append(list(args))
+        if args[:2] == ["-E", "-axo"]:
+            return (
+                f" {marked_pid} /usr/bin/python3 -c sleep 1 "
+                f"PDT_SPAWN_OWNER_PID={owner} PDT_SPAWN_KIND=service\n"
+                " 102 /usr/bin/sleep 30\n"
+                " 103 /usr/bin/env\n"
+            )
+        return None
+
+    def _fake_proc_environ(pid):
+        # A process whose environment carries no variable is *unreadable*,
+        # not empty: the same answer the macOS batch gives for a line
+        # without a single ``k=v``.
+        return dict(marked) if pid == marked_pid else None
+
+    monkeypatch.setattr(reaper, "_run_ps", _fake_ps)
+    monkeypatch.setattr(reaper, "_proc_environ", _fake_proc_environ)
+    return calls, marked
+
+
+def test_a_scan_reads_the_whole_machine_in_one_spawn(monkeypatch):
+    """One pass over the machine, not two spawns for each of them.
+
+    The per-process route cost two spawns per process -- the environment,
+    then the command line that has to be stripped off it -- so a scan of a
+    machine with 833 processes cost 1666 spawns and 47 seconds.  The scan
+    sits on the boot path, so all of that was time the port spent not
+    answering.
+
+    What the property forbids is a spawn *per process*.  On macOS the
+    whole machine is read with ONE ``ps``; on Linux it is read from
+    ``/proc`` with none at all -- both are one pass, and both are
+    asserted here, because the number of spawns a scan costs is a
+    property of the machine and not of the platform it runs on.
+    """
+    import orphan_reaper as reaper
+
+    procs = [
+        _proc(101, "/usr/bin/python3 -c sleep 1"),
+        _proc(102, "/usr/bin/sleep 30"),
+        _proc(103, "/usr/bin/env"),
+    ]
+    owner = os.getpid()
+    calls, marked = _machine_read_fakes(monkeypatch, 101, owner)
+
+    result = reaper.scan(reaper.ReaperConfig(), list_procs=lambda: procs)
+
+    expected_spawns = 1 if sys.platform == "darwin" else 0
+    assert len(calls) == expected_spawns, (
+        f"the scan spawned ps {len(calls)} times for {len(procs)} processes; "
+        f"it must read the whole machine in a single spawn on macOS and in "
+        f"none at all on Linux, never one per process: {calls}"
+    )
+
+    envs = {verdict.proc.pid: verdict.proc.env for verdict in result.verdicts}
+    assert envs[101] is not None, (
+        "the marked process' environment was not read at all"
+    )
+    assert envs[101].get("PDT_SPAWN_OWNER_PID") == str(owner), envs[101]
+    assert envs[102] is None, (
+        "a process whose environment carries no variable is *unreadable*, "
+        "not empty: an empty mapping would claim it carries no marker"
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="the batch route is the macOS one"
+)
+def test_a_real_marked_child_is_still_recognised(tmp_path):
+    """The regression the batch read has to earn: a real child, a real marker.
+
+    The batch read is a different way of getting the same answer, so the
+    answer itself has to be checked against a process that really carries
+    the marker -- a fixture would only prove that the fixture is read.
+    """
+    import os as _os
+    import subprocess as _subprocess
+
+    import orphan_reaper as reaper
+
+    owner = _subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    child = _subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        env=dict(
+            _os.environ,
+            PDT_SPAWN_OWNER_PID=str(owner.pid),
+            PDT_SPAWN_OWNER_START="12345",
+            PDT_SPAWN_KIND="service",
+        ),
+    )
+    try:
+        result = reaper.run_once(
+            reaper.ReaperConfig(plans_root=tmp_path, pid_scope=(child.pid,))
+        )
+        verdicts = {verdict.proc.pid: verdict for verdict in result.verdicts}
+        assert child.pid in verdicts, (
+            f"the scan did not see the child {child.pid} at all"
+        )
+        verdict = verdicts[child.pid]
+        assert verdict.reason != reaper.REASON_UNMARKED, (
+            "the child carries a marker and was read as unmarked -- the "
+            "environment was not read"
+        )
+        assert verdict.reason != reaper.REASON_ENV_UNREADABLE, (
+            "the child's environment could not be read at all"
+        )
+        assert verdict.owner_pid == owner.pid, (
+            f"the marker named {verdict.owner_pid}, not {owner.pid}"
+        )
+    finally:
+        for proc in (child, owner):
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_a_scan_gives_up_when_its_budget_is_spent():
+    """A scan must not drag on: what the budget does not reach is unreadable.
+
+    An unreadable environment is a state the ladder already knows: it is a
+    skip, never a kill.  So the budget does not weaken the scan -- it stops
+    the scan from being the reason the machine never gets a port.
+    """
+    import orphan_reaper as reaper
+
+    procs = [_proc(200 + index, "/usr/bin/sleep 30") for index in range(10)]
+    read = []
+
+    def _slow_env_reader(pid):
+        read.append(pid)
+        time.sleep(0.05)
+        return {"PDT_SPAWN_OWNER_PID": "1"}
+
+    began = time.monotonic()
+    result = reaper.scan(
+        reaper.ReaperConfig(),
+        list_procs=lambda: procs,
+        env_reader=_slow_env_reader,
+        port_map_provider=lambda: None,
+        budget_seconds=0.2,
+    )
+    elapsed = time.monotonic() - began
+
+    assert elapsed < 0.45, (
+        f"the scan took {elapsed:.3f}s although its budget was 0.2s"
+    )
+    reasons = [verdict.reason for verdict in result.verdicts]
+    assert reaper.REASON_ENV_UNREADABLE in reasons, (
+        f"the processes the budget did not reach must be reported as "
+        f"unreadable: {reasons}"
+    )
+    assert len(read) < len(procs), (
+        "the budget did not stop the scan: every process was read anyway"
+    )
+
+
+def test_a_scan_keeps_what_it_read_when_the_budget_runs_out(monkeypatch):
+    """The budget bounds the reading, not the judging.
+
+    The machine-wide read is ONE pass whose cost does not grow with the
+    machine, and the walk that follows it is a lookup.  A budget that
+    ran out during the setup must therefore not make the walk report
+    every process on the machine as *unreadable*: unreadable is the
+    state the ladder skips, so a budget that expired late would
+    silently stop the reaper from reclaiming anything at all -- the
+    very thing the budget was meant to protect.
+
+    The setup here spends the budget on purpose (the port probe is
+    slow), which is what a busy host does to the real scan.
+    """
+    import orphan_reaper as reaper
+
+    procs = [
+        _proc(301, "/usr/bin/python3 -c sleep 1"),
+        _proc(302, "/usr/bin/sleep 30"),
+    ]
+    owner = os.getpid()
+    _machine_read_fakes(monkeypatch, 301, owner)
+
+    def _slow_port_map():
+        time.sleep(0.3)
+        return None
+
+    result = reaper.scan(
+        reaper.ReaperConfig(),
+        list_procs=lambda: procs,
+        port_map_provider=_slow_port_map,
+        budget_seconds=0.1,
+    )
+
+    envs = {verdict.proc.pid: verdict.proc.env for verdict in result.verdicts}
+    assert envs.get(301) is not None, (
+        "the environment was read -- in one pass, before the budget ran "
+        "out -- and the walk threw it away: the budget must bound the "
+        "reading, not the judging"
+    )
+    assert envs[301].get("PDT_SPAWN_OWNER_PID") == str(owner), envs[301]
+    reasons = {verdict.proc.pid: verdict.reason for verdict in result.verdicts}
+    assert reasons[301] != reaper.REASON_ENV_UNREADABLE, (
+        "the marked process was reported as unreadable although its "
+        f"environment had been read: {reasons[301]}"
+    )
+
+
+def test_a_scan_does_not_spawn_a_process_per_marked_process(monkeypatch):
+    """The owners are asked about in ONE spawn, not one spawn each.
+
+    Reading a process' start time costs a ``ps`` spawn, and a scan asks
+    about the owner of every marked process -- the owner being alive is
+    the normal case.  135 marked processes were therefore 135 spawns,
+    which is the very amplification the machine-wide environment read
+    was meant to remove: the scan's cost has to be a number of spawns,
+    not a number of processes.
+
+    The judgement itself does not change: an owner that is alive is
+    still an owner that is alive.
+    """
+    import subprocess as _subprocess
+
+    import orphan_reaper as reaper
+
+    owner = os.getpid()
+    # The owner's start time, read before the counting starts: the
+    # marker has to carry it, or the ladder cannot tell *this* owner from
+    # a recycled pid and reports "alive but unverified" instead.
+    owner_start = reaper.process_start_epoch(owner)
+    procs = [_proc(400 + index, "/usr/bin/sleep 30") for index in range(5)]
+    spawns = []
+
+    real_run = _subprocess.run
+
+    def _counting_run(args, **kwargs):
+        spawns.append(list(args))
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(reaper.subprocess, "run", _counting_run)
+
+    result = reaper.scan(
+        reaper.ReaperConfig(),
+        list_procs=lambda: procs,
+        env_reader=lambda pid: {
+            "PDT_SPAWN_OWNER_PID": str(owner),
+            "PDT_SPAWN_OWNER_START": owner_start,
+        },
+        port_map_provider=lambda: None,
+    )
+
+    assert len(spawns) <= 1, (
+        f"the scan spawned {len(spawns)} processes to ask about "
+        f"{len(procs)} marked processes; the owners must be asked about "
+        f"in one spawn: {spawns}"
+    )
+    reasons = {verdict.proc.pid: verdict.reason for verdict in result.verdicts}
+    assert reasons[400] == reaper.REASON_OWNER_ALIVE, (
+        f"the owner is alive, so the candidate must be skipped, not judged "
+        f"by a broken probe: {reasons[400]}"
+    )
+
+
+def test_the_feishu_notifier_start_is_not_on_the_readiness_path(monkeypatch):
+    """A slow notifier must not keep the port from answering.
+
+    The notifier's client imports the whole Feishu SDK -- tens of seconds
+    on a loaded machine -- and it used to do that on the lifespan's own
+    thread, before uvicorn binds the socket.
+    """
+    import notifications.feishu_notifier as feishu_module
+    import server as server_mod
+
+    release = threading.Event()
+    started = threading.Event()
+    stopped = []
+
+    class _SlowNotifier:
+        """A notifier whose construction takes as long as the SDK import."""
+
+        _min_interval_seconds = 60.0
+
+        def __init__(self):
+            started.set()
+            release.wait(10)
+
+        def start(self):
+            return None
+
+        def stop(self, timeout: float = 5.0) -> None:
+            stopped.append(timeout)
+
+    monkeypatch.setattr(feishu_module, "FeishuNotifier", _SlowNotifier)
+
+    app = _FakeApp()
+    began = time.monotonic()
+    handle = server_mod._start_feishu_notifier(app)
+    elapsed = time.monotonic() - began
+
+    try:
+        assert elapsed < 0.5, (
+            f"starting the notifier took {elapsed:.3f}s on the caller's "
+            f"thread; it must be started on its own"
+        )
+        assert started.wait(5), "the notifier was never constructed"
+        assert app.state.feishu_notifier is None, (
+            "the notifier must not be published before it is up"
+        )
+    finally:
+        release.set()
+        handle.thread.join(timeout=10)
+
+    assert not handle.thread.is_alive(), "the notifier's thread outlived the call"
+    assert app.state.feishu_notifier is not None, (
+        "the notifier was constructed but never published"
+    )
+
+    server_mod._stop_feishu_notifier(app, handle)
+    assert stopped, "the notifier was never stopped"
+    assert app.state.feishu_notifier is None, (
+        "a stopped notifier must not stay published"
+    )
+
+
+def test_the_shutdown_tolerates_a_notifier_that_never_came_up():
+    """The server may stop before the notifier is up.
+
+    The notifier is started on its own thread, so the shutdown can run
+    while it is still importing the SDK.  Stopping a notifier that is not
+    there must not raise.
+    """
+    import server as server_mod
+
+    app = _FakeApp()
+    handle = server_mod._FeishuNotifierHandle()
+    handle.thread = threading.Thread(target=lambda: None, name="notifier-stub")
+    handle.thread.start()
+    handle.thread.join(timeout=5)
+
+    server_mod._stop_feishu_notifier(app, handle)
+
+    assert app.state.feishu_notifier is None
+
+
+def test_a_notifier_that_comes_up_after_the_shutdown_is_not_started(monkeypatch):
+    """A late notifier must not outlive the server.
+
+    The notifier is built on its own thread, so the shutdown can run
+    while it is still importing the SDK.  A notifier that comes up after
+    the shutdown would leave a worker thread behind -- one that nothing
+    would ever stop.
+    """
+    import notifications.feishu_notifier as feishu_module
+    import server as server_mod
+
+    release = threading.Event()
+    constructed = threading.Event()
+    started = []
+
+    class _LateNotifier:
+        """A notifier that is constructed long after the shutdown began."""
+
+        _min_interval_seconds = 60.0
+
+        def __init__(self):
+            constructed.set()
+            release.wait(2)
+
+        def start(self):
+            started.append(True)
+
+        def stop(self, timeout: float = 5.0) -> None:
+            return None
+
+    monkeypatch.setattr(feishu_module, "FeishuNotifier", _LateNotifier)
+
+    app = _FakeApp()
+    handle = server_mod._start_feishu_notifier(app)
+    try:
+        assert constructed.wait(5), "the notifier was never constructed"
+        server_mod._stop_feishu_notifier(app, handle)
+    finally:
+        release.set()
+        handle.thread.join(timeout=10)
+
+    assert not started, (
+        "the notifier was started after the shutdown had begun; it would "
+        "leave a worker thread behind"
+    )
+    assert app.state.feishu_notifier is None
 # The group a stop is allowed to signal (2026-10-29, repair-r1-01)
 # ---------------------------------------------------------------------------
 

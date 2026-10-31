@@ -3073,6 +3073,7 @@ def _run_repair_execution_async(
     tool: Optional[str] = None,
     on_complete: Optional[Callable[[int], None]] = None,
     outcome: "Optional[_VerificationLoopOutcome]" = None,
+    scene: Optional[str] = None,
 ) -> dict:
     """Spawn executor subprocess for repair tasks; return immediately.
 
@@ -3080,6 +3081,16 @@ def _run_repair_execution_async(
     subprocess runs in background; ``on_complete`` fires once on
     subprocess exit (success or failure). On spawn failure,
     ``on_complete(-1)`` fires before this function returns.
+
+    2026-10-31: ``scene`` names the provider-routing scene the executor
+    subprocess runs under.  The executor is a CHILD PROCESS, so it shares
+    no Python state with this dispatcher: the scene has to cross the
+    process boundary as an environment variable
+    (``PDT_EXECUTOR_SCENE``), which is what
+    ``agent._executor_scene_from_env()`` reads back when it builds the
+    coding tool.  A scene that stops here is a scene the executor never
+    hears about.  ``None`` (the default) adds no variable at all, so an
+    ordinary product-code repair keeps the provider chain it always had.
 
     2026-10-23: a ``project_dir`` that is not an existing directory is
     refused BEFORE the phase is stamped and the subprocess is spawned,
@@ -3182,6 +3193,12 @@ def _run_repair_execution_async(
     # repair round be torn down *before* the main executor is lost.
     # This is the path production actually runs: the synchronous
     # :func:`_run_repair_execution` has no production caller.
+    #
+    # ``extra_env`` carries the scene (see the docstring): the executor is
+    # a child process, so the environment is the only channel that reaches
+    # it.  ``None`` means "no scene" — the helper adds nothing then, and
+    # the ordinary repair dispatch is unchanged.
+    extra_env = {"PDT_EXECUTOR_SCENE": scene} if scene else None
     try:
         process, _log = _server._spawn_executor_subprocess(
             plan_id=plan_id,
@@ -3192,6 +3209,7 @@ def _run_repair_execution_async(
             extra_args=None,
             log_path=log_path,
             role="repair_executor",
+            extra_env=extra_env,
         )
     except OSError as exc:
         # Spawn failed — mirror main execution's failure path.
@@ -6893,9 +6911,15 @@ def _make_repair_on_complete(
                         # that is running — this scope has no loop
                         # outcome to hand over, and a second callback
                         # would be a second post-repair chain.
+                        #
+                        # The work is a BASE MERGE, not a product-code
+                        # fix, so the executor runs under the merge's own
+                        # provider-routing scene.  The scene reaches the
+                        # child process through the environment.
                         _server._run_repair_execution_async(
                             plan_id, project_dir, tool=tool,
                             on_complete=_on_repair_complete,
+                            scene=base_drift.BASE_DRIFT_MERGE_SCENE,
                         )
                         return
                     # No repair task behind the conflict: there is
@@ -7551,6 +7575,11 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                     # The callback is built HERE: the loop's own
                     # ``_on_repair_complete`` is bound further down,
                     # and this branch runs first.
+                    #
+                    # The work is a BASE MERGE, not a product-code fix,
+                    # so the executor runs under the merge's own
+                    # provider-routing scene.  The scene reaches the
+                    # child process through the environment.
                     _base_drift_on_complete = _make_repair_on_complete(
                         plan_id, project_dir, tool,
                     )
@@ -7558,6 +7587,7 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                         plan_id, project_dir, tool=tool,
                         on_complete=_base_drift_on_complete,
                         outcome=outcome,
+                        scene=base_drift.BASE_DRIFT_MERGE_SCENE,
                     )
                     return
                 # No repair task behind the conflict: there is nothing

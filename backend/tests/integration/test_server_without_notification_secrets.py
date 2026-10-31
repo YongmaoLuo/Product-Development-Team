@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 import pytest
 
@@ -161,6 +162,37 @@ class _StartedService:
         self.notifier = notifier
 
 
+#: How long the fixture waits for the notifier to come up.
+#:
+#: The notifier is built on a thread of its own: the boot path does not
+#: wait for the Feishu SDK to import, because a slow (or broken) Feishu
+#: configuration must never keep the port from answering.  The lifespan
+#: therefore returns *before* the notifier is up, and the state says
+#: "not up yet" until the thread publishes it
+#: (``server._start_feishu_notifier``).  The bound is generous, because
+#: the import it waits for is the slow one.
+NOTIFIER_UP_TIMEOUT_SECONDS = 120.0
+
+
+def _wait_for_the_notifier(app, timeout: float = NOTIFIER_UP_TIMEOUT_SECONDS):
+    """The notifier once it is up, or ``None`` if it never came up.
+
+    The state is read *after* the notifier is published, not the instant
+    the lifespan returns: the boot deliberately does not wait for the
+    SDK, so a reader that does not wait is reading a service that has
+    not finished starting up — and would report a missing notifier for a
+    notifier that is on its way.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        notifier = getattr(app.state, "feishu_notifier", None)
+        if notifier is not None:
+            return notifier
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
 @pytest.fixture
 def service_without_secrets(monkeypatch, fake_cc_switch_home):
     """Boot the app with no notification credential configured.
@@ -183,7 +215,7 @@ def service_without_secrets(monkeypatch, fake_cc_switch_home):
     _clear_notification_env(monkeypatch)
 
     with TestClient(server.app) as client:
-        notifier = getattr(server.app.state, "feishu_notifier", None)
+        notifier = _wait_for_the_notifier(server.app)
         if notifier is None:
             pytest.fail(
                 "no notifier attached to app.state after startup; the "
