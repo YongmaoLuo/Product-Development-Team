@@ -1491,20 +1491,43 @@ def _wait_for_executors(world: _World, timeout: float = 90.0) -> Dict[str, int]:
 
 
 def _wait_for_settle(world: _World, timeout: float = 120.0) -> Dict[str, Any]:
-    """Wait until the scheduler has filled the capacity and settled the line."""
+    """Wait until the scheduler has filled the capacity and settled the line.
+
+    Settled means three things at once: the capacity is used, the line
+    is short, and the scheduler's own table holds **exactly** the plans
+    that are waiting.
+
+    The last one is not the same moment as the others.  The read model
+    leaves a plan that is working out of the line at once, because a
+    plan that is working is not in a line; the table is reconciled at
+    the start of a tick, so the row of a plan that has just started is
+    still in the table until the tick **after** the one that started
+    it.  A case that reads the table has to wait for that
+    reconciliation: otherwise it reads the line in the middle of the
+    tick that started the plans, and the table still carries the plans
+    that are working.
+    """
     deadline = time.monotonic() + timeout
     state: Dict[str, Any] = {}
+    rows: List[Dict[str, Any]] = []
     while time.monotonic() < deadline:
         state = world.scheduler_state()
+        rows = world.queue_rows()
+        waiting = {
+            str(row["plan_id"])
+            for row in world.routing_rows()
+            if str(row["current_phase"]) == QUEUED_PHASE
+        }
         if (
             state.get("capacity", {}).get("used") == CAPACITY
             and state.get("queue_length") == len(PLAN_IDS) - CAPACITY
+            and {str(row["plan_id"]) for row in rows} == waiting
         ):
             return state
         time.sleep(0.2)
     raise AssertionError(
         f"the scheduler did not settle within {timeout}s; the last read model "
-        f"was {state!r}"
+        f"was {state!r} and the queue table held {rows!r}"
     )
 
 

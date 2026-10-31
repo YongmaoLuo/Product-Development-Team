@@ -1254,6 +1254,15 @@ def test_regression_scheduler_tables_have_one_writer(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "PLANS_DIR", plans_dir)
     monkeypatch.setenv("PDT_STATE_DB_PATH", str(tmp_path / "state.db"))
 
+    # The waiting plan needs its **directory**: the scheduler does not put
+    # a plan in the line whose directory is gone — a plan that cannot run
+    # must not hold a place in the queue, and a ghost must not appear in
+    # the queue view either.  The case is about the reconciliation
+    # backfilling a *real* waiting plan, so the plan is written the way
+    # the import writes it: a directory of its own, outside the
+    # service's own tree.
+    _write_plan("q1", tmp_path / "q1-project")
+
     import plan_scheduler.dryrun as dryrun
 
     monkeypatch.setattr(

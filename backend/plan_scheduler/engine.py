@@ -204,6 +204,7 @@ __all__ = [
     "EngineCommandResult",
     "EngineParts",
     "PlanSchedulerEngine",
+    "is_permanent_failure",
 ]
 
 
@@ -321,8 +322,81 @@ DECISION_LOG_SIZE = 512
 #: no wait at all must not turn the worker into a spin.
 MIN_TICK_WAIT = 0.001
 
+#: How many rounds the execute phase runs in one tick.
+#:
+#: A round is: hand the decisions over, read the outcomes, and — when
+#: a plan was pruned — read the state again and put the free slots to
+#: work.  The rounds are **bounded**, because a tick has to end: a
+#: queue whose every plan fails for good would otherwise keep the tick
+#: pruning and refilling for ever, and the next tick would never come.
+#: The bound is a backstop, not a policy — a tick that needs more
+#: rounds than this is a tick with a queue that does not behave.
+_MAX_EXECUTE_ROUNDS = 8
+
 #: The item that tells the worker to stop.
 _SHUTDOWN = object()
+
+
+# ---------------------------------------------------------------------------
+# The permanent-failure predicate
+# ---------------------------------------------------------------------------
+
+
+def is_permanent_failure(exc: Optional[BaseException]) -> bool:
+    """Return whether retrying this failure would change nothing.
+
+    Some failures are answers, and an answer does not change by being
+    asked again: the plan is not there, the plan is archived, the
+    request conflicts with the plan's own state.  Retrying one of
+    those a thousand times costs a thousand attempts and buys nothing,
+    so the failure has to be recognised as permanent *before* it is
+    retried.
+
+    The predicate is a pure function of the exception: it reads the
+    exception and nothing else — no clock, no database, no engine
+    state — so it can be asked about a failure that happened long ago.
+
+    Three things are permanent:
+
+    * :class:`PlanNotFoundError` — the state machine's own word for
+      "there is no such plan".  The class is imported here rather than
+      at the top of the module, for the reason the command layer
+      imports its own: the scheduler only needs the one class to
+      recognise the failure, and importing the repository layer at
+      module level would tie the package to the state machine for the
+      sake of a single ``isinstance``.
+    * ``ArchivedPlanError`` — recognised by its **name**.  The class
+      lives in the HTTP layer, and importing that layer from here
+      would be a circular import; the name is the whole of the
+      contract that crosses the boundary.
+    * A 409 or a 410 — refusals with a status of their own, read off
+      the exception's ``status_code``.
+
+    Everything else is transient: a 503, a busy database, a fault that
+    may go away by itself.  Those are still worth retrying.
+
+    Args:
+        exc: the exception to judge, or ``None`` when there is none.
+
+    Returns:
+        True when the failure is permanent, and False otherwise — and
+        False for ``None``, because "no exception" is not a failure
+        that will never go away.
+    """
+    if exc is None:
+        return False
+
+    from state_machine.repositories.routing_repository import (
+        PlanNotFoundError,
+    )
+
+    if isinstance(exc, PlanNotFoundError):
+        return True
+
+    if type(exc).__name__ == "ArchivedPlanError":
+        return True
+
+    return getattr(exc, "status_code", None) in (409, 410)
 
 
 # ---------------------------------------------------------------------------
@@ -1367,7 +1441,12 @@ class PlanSchedulerEngine:
         if state is None:
             return
         waiting = {str(row["plan_id"]) for row in state.get("waiting", [])}
-        existing = {str(row["plan_id"]) for row in state.get("queue", [])}
+        # The rows that already exist are read from the **table** and
+        # not from the view: the view drops the rows the facts do not
+        # vouch for, and those rows are exactly the ones this phase
+        # has to take away.  A reconcile that read the view would not
+        # know the row is there, and the row would stay forever.
+        existing = {str(r["plan_id"]) for r in self._store.list_queue(self._conn)}
 
         for plan_id in sorted(existing - waiting):
             self._store.remove(self._conn, plan_id)
@@ -1461,14 +1540,64 @@ class PlanSchedulerEngine:
             state["queued"] = queued[1:]
 
     def _phase_execute(self) -> None:
-        """Carry the decisions out.
+        """Carry the decisions out, and put the free slots to work again.
 
         The sink is the exit: an execute sink starts and stops the
         plans through the lifecycle, a record sink writes the
         decisions down and touches nothing else.  The tick itself
         changes nothing here — it hands the decisions over.
+
+        The decisions are handed over as a **batch**, and the batch's
+        outcomes are read **one by one**: a decision that failed does
+        not take the decisions behind it with it.
+
+        The two kinds of failure are told apart:
+
+        * A failure that will never go away
+          (:func:`is_permanent_failure`) is **pruned**: the plan is out
+          of the line, and the tick then **refills** — the state is
+          read again and the free slots are put to work, so the plan
+          behind the pruned one does not wait for the next tick.
+        * A failure that may go away by itself is only **recorded**:
+          the plan keeps its place in the queue and is tried again on
+          the next tick.
+
+        The rounds are bounded (:data:`_MAX_EXECUTE_ROUNDS`): a tick
+        that keeps pruning keeps filling, and a tick has to end.
+
+        A sink that raises takes the phase with it, exactly as it did
+        before: the phase that runs it records the failure, and the
+        tick goes on.
         """
-        self._sink.apply(list(self._tick_decisions))
+        handled = 0
+        for _ in range(_MAX_EXECUTE_ROUNDS):
+            batch = self._tick_decisions[handled:]
+            if not batch:
+                return
+            outcomes = self._sink.apply(batch) or []
+            pruned = False
+            for outcome in outcomes:
+                if outcome.get("ok", True):
+                    continue
+                error = outcome.get("error")
+                if is_permanent_failure(error):
+                    self._prune_failed_plan(outcome)
+                    pruned = True
+                    continue
+                self._record_error("execute", error)
+                log.warning(
+                    "the scheduler could not carry out the %s of plan %s "
+                    "(%s: %s); the plan keeps its place in the queue",
+                    outcome.get("action"),
+                    outcome.get("plan_id"),
+                    type(error).__name__,
+                    error,
+                )
+            handled += len(batch)
+            if not pruned:
+                return
+            self._phase_read_state()
+            self._phase_fill()
 
     def _phase_record(self) -> None:
         """Write the decisions down.
@@ -1485,6 +1614,122 @@ class PlanSchedulerEngine:
                     "plan_id": decision.get("plan_id"),
                     "reason": decision.get("reason"),
                 }
+            )
+
+    # ------------------------------------------------------------------
+    # The pruning
+    # ------------------------------------------------------------------
+
+    def _prune_failed_plan(self, outcome: Dict[str, Any]) -> None:
+        """Take a plan that failed for good out of the scheduler.
+
+        Some failures are answers, and an answer does not change by
+        being asked again — the plan is not there, the plan is
+        archived, the request conflicts with the plan's own state.
+        Such a plan is not waiting any more, and a plan that is not
+        waiting must not hold the line: the plans behind it would wait
+        for ever for a plan that will never run.
+
+        So the plan is **pruned**, and the pruning is three writes and
+        a warning:
+
+        * the **queue row** goes — the plan is not in the line any
+          more;
+        * the **slot** goes — but only when the plan was *admitted*:
+          a plan that failed to be *stopped* may still be running, and
+          a room somebody is working in is not given back on a
+          guess;
+        * the **phase** becomes ``stopped`` — the terminal word for a
+          plan that will not run again.
+
+        The caller has already decided that the failure is permanent
+        (:func:`is_permanent_failure`); a failure that may go away by
+        itself keeps its place in the queue and is tried again on the
+        next tick.
+
+        Args:
+            outcome: what the sink said about the decision — its
+                ``action``, its ``plan_id`` and the ``error`` it
+                raised.
+        """
+        plan_id = str(outcome.get("plan_id") or "")
+        action = str(outcome.get("action") or "")
+        error = outcome.get("error")
+
+        if not plan_id:
+            log.warning(
+                "the scheduler could not prune a plan it has no id for: %r",
+                outcome,
+            )
+            return
+
+        try:
+            self._store.remove(self._conn, plan_id)
+        except Exception as exc:  # noqa: BLE001 — the prune must not raise
+            log.warning(
+                "the scheduler could not take plan %s out of the queue "
+                "(%s: %s)",
+                plan_id,
+                type(exc).__name__,
+                exc,
+            )
+
+        if action == "admit":
+            try:
+                self._store.delete_slot(self._conn, plan_id)
+            except Exception as exc:  # noqa: BLE001 — the prune must not raise
+                log.warning(
+                    "the scheduler could not give plan %s its slot back "
+                    "(%s: %s)",
+                    plan_id,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        self._mark_plan_stopped(plan_id)
+
+        log.warning(
+            "the scheduler pruned plan %s after %s failed permanently "
+            "(%s: %s)",
+            plan_id,
+            action,
+            type(error).__name__,
+            error,
+        )
+
+    def _mark_plan_stopped(self, plan_id: str) -> None:
+        """Put the plan's phase where it will never move again.
+
+        The phase is the **state machine's** word, so it is written
+        through the state machine's own repository and not in SQL of
+        the scheduler's own: the transition, the history that goes
+        with it and the version the row carries are one write there,
+        and the scheduler does not get a second, thinner version of
+        them.
+
+        A phase that cannot be written — the plan has no row at all,
+        the row carries another phase, the database is busy — is
+        logged and nothing more: the plan is not running, and a plan
+        that is not running must not stay in the queue because a word
+        could not be written about it.
+
+        Args:
+            plan_id: the plan to stop.
+        """
+        from state_machine.repositories.routing_repository import (
+            RoutingRepository,
+        )
+
+        try:
+            RoutingRepository(self._conn).try_mark_phase(
+                plan_id, (QUEUED_PHASE,), "stopped"
+            )
+        except Exception as exc:  # noqa: BLE001 — the phase is not the queue
+            log.warning(
+                "the scheduler could not mark plan %s as stopped (%s: %s)",
+                plan_id,
+                type(exc).__name__,
+                exc,
             )
 
     # ------------------------------------------------------------------
@@ -1740,6 +1985,12 @@ class PlanSchedulerEngine:
         head carries the reason the policy gave for it — the same
         reason the admission check reached.
 
+        A row the facts do not vouch for is not in the line at all:
+        the queue table may still carry a plan whose directory is
+        gone, and the panel must not render a plan that cannot run.
+        The row is skipped, and the head of the view is therefore the
+        head of the **line** — the first plan the facts answer for.
+
         The plans behind the head carry their **own** reason, and the
         one that matters to them is the workspace: a plan whose
         directory is held is waiting for a directory, not for a slot,
@@ -1755,9 +2006,11 @@ class PlanSchedulerEngine:
             for entry in state.get("queued", [])
         }
         view: List[Dict[str, Any]] = []
-        for index, row in enumerate(rows):
+        for row in rows:
+            if str(row.get("plan_id") or "") not in queued:
+                continue
             entry = dict(row)
-            if index == 0:
+            if not view:
                 entry["reason"] = verdict
             else:
                 entry["reason"] = self._reason_behind(
