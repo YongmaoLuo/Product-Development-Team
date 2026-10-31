@@ -100,6 +100,44 @@ def test_the_guard_timeout_is_sized_for_the_gate_own_parallelism():
     assert _GUARD_TIMEOUT_SECONDS >= 60.0
 
 
+# ----- the wall-clock budget the guard is given ----------------------------
+#
+# The guard answers in milliseconds once it is running, but it is started
+# with ``python3``, and a cold interpreter on a host that is already busy
+# takes a while to say anything at all.  A fixed five-second budget
+# therefore measures the *host* rather than the guard, and the failure it
+# produces is a ``TimeoutExpired`` -- which says nothing about the
+# containment rule these tests exist to pin.
+
+#: The budget a quiet host is given.
+GUARD_TIMEOUT_SECONDS = 5.0
+
+#: How many seconds of budget one unit of load average buys.
+GUARD_TIMEOUT_LOAD_SECONDS = 1.0
+
+#: The ceiling: a scaled budget is still a budget, so that a genuinely
+#: hung guard fails the test instead of hanging it.
+GUARD_TIMEOUT_MAX_SECONDS = 60.0
+
+
+def _guard_timeout_seconds() -> float:
+    """The wall-clock budget for one guard invocation, in seconds.
+
+    The budget follows the host's load average: the busier the machine,
+    the longer the child may reasonably take to start and answer.  It is
+    capped, so a guard that never answers is still a failing test.
+
+    A platform that cannot report a load average gets the base budget --
+    the same one the fixed timeout used to be.
+    """
+    try:
+        load = os.getloadavg()[0]
+    except (AttributeError, OSError):  # pragma: no cover - exotic platform
+        load = 0.0
+    budget = GUARD_TIMEOUT_SECONDS + GUARD_TIMEOUT_LOAD_SECONDS * max(0.0, load)
+    return min(budget, GUARD_TIMEOUT_MAX_SECONDS)
+
+
 def _run_guard(file_path: str, *, pdt_project_dir: str, pdt_formal_repo: str = "",
                pdt_plans_dir: str = "", guard: Path = None) -> int:
     """Invoke the guard hook with the same env our sub-agent sees.
@@ -156,7 +194,19 @@ def _run_guard(file_path: str, *, pdt_project_dir: str, pdt_formal_repo: str = "
         env=env,
         capture_output=True,
         text=True,
-        timeout=_GUARD_TIMEOUT_SECONDS,
+        # The budget is the greater of the two sides' numbers, so that
+        # neither guarantee is given up.  This branch's budget scales
+        # with the host's load average: a busy host gets more than the
+        # five seconds a quiet one gets.  Main's gate hardening pinned
+        # a flat 60 s, which outlasts the gate's own 18-way xdist
+        # parallelism -- the guard was measured at 9.1-16.2 s under it,
+        # so a 5 s ceiling produced a red that said nothing about the
+        # containment rule.  Taking the greater of the two never gives
+        # the guard less than main's floor, and the scaled budget never
+        # exceeds the branch's own 60 s ceiling -- the two agree at
+        # 60 s today, and either one may be moved later without the
+        # other silently overriding it.
+        timeout=max(_guard_timeout_seconds(), _GUARD_TIMEOUT_SECONDS),
     )
     if proc.returncode not in (0, 2):
         raise RuntimeError(
@@ -356,3 +406,67 @@ def test_guard_is_wired_into_settings_file():
     # ``test_refuses_write_outside_project`` also checks by running it.
     assert "blocked = not allowed" in body
     assert "sys.exit(2)" in body
+
+
+# ----- the budget the guard is given ---------------------------------------
+
+
+def test_the_guard_budget_scales_with_the_host_load(monkeypatch):
+    """A busy host must not be measured by a fixed budget.
+
+    The guard is a small script, but it is started with ``python3``: on a
+    host whose load average was 60 a cold interpreter needed hundreds of
+    milliseconds before it said anything at all, and a fixed five-second
+    budget turned that into a ``TimeoutExpired`` -- a failure that says
+    nothing whatsoever about the containment rule this file exists to
+    pin.
+
+    So the budget follows the host's load average.  It is also capped: a
+    genuinely hung guard must still fail the test rather than hang it.
+    """
+    seen = {}
+    real_run = subprocess.run
+
+    def _capture(argv, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _capture)
+    monkeypatch.setattr(os, "getloadavg", lambda: (50.0, 40.0, 30.0))
+
+    rc = _run_guard("/tmp/pdt-guard-budget-probe.json", pdt_project_dir="/tmp")
+
+    assert rc in (0, 2), f"the guard answered {rc}"
+    assert seen.get("timeout") is not None, (
+        "the guard was run without a wall-clock budget at all"
+    )
+    assert seen["timeout"] >= 30.0, (
+        f"the guard's budget was {seen['timeout']}s on a host whose load "
+        f"average was 50; it must scale with the load"
+    )
+
+
+def test_the_guard_budget_stays_inside_its_ceiling(monkeypatch):
+    """A scaled budget is still a budget.
+
+    The scaling exists so that a busy host is not judged by a wall clock
+    it cannot meet.  It must not turn into "wait forever": the ceiling
+    keeps a hung guard a failing test.
+    """
+    seen = {}
+    real_run = subprocess.run
+
+    def _capture(argv, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _capture)
+    monkeypatch.setattr(os, "getloadavg", lambda: (100000.0, 100000.0, 100000.0))
+
+    _run_guard("/tmp/pdt-guard-budget-ceiling.json", pdt_project_dir="/tmp")
+
+    assert seen.get("timeout") is not None
+    assert seen["timeout"] <= 60.0, (
+        f"the guard's budget was {seen['timeout']}s; a scaled budget still "
+        f"needs a ceiling so that a hung guard fails instead of hanging"
+    )
