@@ -35,6 +35,7 @@ while still exercising the full state-dict mutation + persistence +
 callback firing paths.
 """
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -63,6 +64,31 @@ def _reset_execution_state():
     import server
     with server._execution_state_lock:
         server._execution_state.clear()
+
+
+def _record_spawn(plan_dir: Path, pid: int, role: str = "repair_executor"):
+    """Put a process on the plan's ledger, the way the spawn helper does.
+
+    The async path's spawn is recorded by ``routes.execution``; the
+    tests below replace the spawn helper with a stub, so they record
+    the spawn themselves — otherwise there would be nothing for the
+    exit to take out of the live set.
+    """
+    import process_ledger
+    process_ledger.record_spawn(
+        plan_dir,
+        process_ledger.ProcessRecord(
+            plan_id=plan_dir.name,
+            role=role,
+            pid=pid,
+            pgid=pid,
+            create_time=0.0,
+            cmdline=("stub",),
+            cwd=str(plan_dir),
+            owner_pid=os.getpid(),
+            owner_role="backend",
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -284,3 +310,189 @@ def test_async_repair_uses_execution_state_lock_for_setdefault(monkeypatch, tmp_
     # After async spawn, pid is the new subprocess pid (99999).
     assert state["pid"] == 99999
     assert state["_source"] == "repair_execution"
+
+
+# ---------------------------------------------------------------------------
+# Process ledger — the async repair round is on it, and it is closed
+# ---------------------------------------------------------------------------
+#
+# The ledger is the only durable record of the processes a plan owns,
+# and the reaper decides what to do with a process *by role* — children
+# first, parents last::
+#
+#     REAP_ORDER = (subagent, vp_service, tool, repair_executor, executor)
+#
+# So the asynchronous repair round has to be recorded under its own
+# role, and its exit has to be written when the process ends. A pid
+# that stays live in the ledger is a pid the reaper goes on collecting,
+# round after round, for a process that ended long ago.
+
+
+def test_async_repair_spawns_under_the_repair_executor_role(monkeypatch, tmp_path):
+    """The spawn must say which kind of process it started.
+
+    A repair executor recorded as a plain ``executor`` is
+    indistinguishable from the plan's main executor, and the ordering
+    that lets the repair round be torn down *before* the main executor
+    is lost.
+    """
+    import server
+
+    seen = {}
+
+    def _spawn(**kwargs):
+        seen.update(kwargs)
+        return _mock_subprocess(returncode=0, pid=5150), tmp_path / "log"
+
+    monkeypatch.setattr("server._spawn_executor_subprocess", _spawn)
+    monkeypatch.setattr(
+        "server.PlanState",
+        lambda *_a, **_kw: MagicMock(force_set_phase=MagicMock()),
+    )
+    monkeypatch.setattr(
+        "state_machine.db.connection.open",
+        MagicMock(side_effect=Exception("stop at open_db")),
+    )
+
+    plan_dir = tmp_path / "plans" / "p6"
+    plan_dir.mkdir(parents=True)
+    (plan_dir / "tasks.json").write_text("[]", encoding="utf-8")
+
+    _reset_execution_state()
+    server._run_repair_execution_async("p6", tmp_path, on_complete=None)
+
+    assert seen.get("role") == "repair_executor", (
+        "the asynchronous repair round was spawned with role %r — the "
+        "reaper cannot tell it apart from the plan's main executor"
+        % (seen.get("role"),)
+    )
+
+
+def test_async_repair_writes_the_exit_when_the_process_ends(monkeypatch, tmp_path):
+    """A repair round that ends must not stay live in the ledger.
+
+    The exit is written after ``process.wait()`` returns — a process
+    that has not ended cannot have exited.
+    """
+    import process_ledger
+    import server
+
+    plan_id = "p7"
+    plan_dir = tmp_path / "plans" / plan_id
+    plan_dir.mkdir(parents=True)
+    (plan_dir / "tasks.json").write_text("[]", encoding="utf-8")
+
+    pid = 31337
+
+    def _spawn(**_kwargs):
+        _record_spawn(plan_dir, pid)
+        return _mock_subprocess(returncode=0, pid=pid), tmp_path / "log"
+
+    monkeypatch.setattr("server._spawn_executor_subprocess", _spawn)
+    monkeypatch.setattr(
+        "server.PlanState",
+        lambda *_a, **_kw: MagicMock(force_set_phase=MagicMock()),
+    )
+    monkeypatch.setattr(
+        "state_machine.db.connection.open",
+        MagicMock(side_effect=Exception("stop at open_db")),
+    )
+
+    _reset_execution_state()
+    server._run_repair_execution_async(plan_id, tmp_path, on_complete=None)
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if pid not in process_ledger.live_records(plan_dir):
+            break
+        time.sleep(0.01)
+
+    assert pid not in process_ledger.live_records(plan_dir), (
+        "the repair round's pid is still live in the ledger — the exit "
+        "was never written, so the reaper goes on believing a process "
+        "that ended long ago is still running"
+    )
+
+    exits = [
+        e
+        for e in process_ledger.read_events(plan_dir)
+        if e.get("event") == "exit" and e.get("pid") == pid
+    ]
+    assert len(exits) == 1, (
+        "the repair round wrote %d exits — the exit of a round is written "
+        "once" % len(exits)
+    )
+    assert exits[0]["detail"] == "repair_finished", (
+        "the exit says %r — the detail has to say the round finished"
+        % (exits[0]["detail"],)
+    )
+    assert exits[0]["exit_code"] == 0
+    assert exits[0]["role"] == "repair_executor"
+
+
+def test_async_repair_writes_the_exit_when_the_wait_blows_up(monkeypatch, tmp_path):
+    """A round whose wait blows up still closes its pid on the ledger.
+
+    Without the exit the pid stays live in the ledger forever, and the
+    reaper goes on collecting a process the backend stopped tracking.
+    The detail says ``repair_aborted`` — the round did not finish.
+    """
+    import process_ledger
+    import server
+
+    plan_id = "p8"
+    plan_dir = tmp_path / "plans" / plan_id
+    plan_dir.mkdir(parents=True)
+    (plan_dir / "tasks.json").write_text("[]", encoding="utf-8")
+
+    pid = 31338
+
+    class _WaitExplodes:
+        """A process whose ``wait()`` raises — the round blows up."""
+
+        def __init__(self, proc) -> None:
+            self.pid = proc.pid
+            self.returncode = None
+
+        def wait(self, *args, **kwargs) -> int:
+            raise RuntimeError("wait exploded")
+
+    def _spawn(**_kwargs):
+        _record_spawn(plan_dir, pid)
+        return _WaitExplodes(_mock_subprocess(returncode=0, pid=pid)), tmp_path / "log"
+
+    monkeypatch.setattr("server._spawn_executor_subprocess", _spawn)
+    monkeypatch.setattr(
+        "server.PlanState",
+        lambda *_a, **_kw: MagicMock(force_set_phase=MagicMock()),
+    )
+    monkeypatch.setattr(
+        "state_machine.db.connection.open",
+        MagicMock(side_effect=Exception("stop at open_db")),
+    )
+
+    _reset_execution_state()
+    server._run_repair_execution_async(plan_id, tmp_path, on_complete=None)
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if pid not in process_ledger.live_records(plan_dir):
+            break
+        time.sleep(0.01)
+
+    assert pid not in process_ledger.live_records(plan_dir), (
+        "the round died during the wait and never closed its pid on the "
+        "ledger"
+    )
+
+    exits = [
+        e
+        for e in process_ledger.read_events(plan_dir)
+        if e.get("event") == "exit" and e.get("pid") == pid
+    ]
+    assert len(exits) == 1
+    assert exits[0]["detail"] == "repair_aborted", (
+        "the exit says %r — a round that blew up did not finish"
+        % (exits[0]["detail"],)
+    )
+    assert exits[0]["exit_code"] is None

@@ -6,34 +6,42 @@ The shutdown path leaves a checkpoint behind for every plan that was
 still running (``backend/shutdown_checkpoint.py``).  On the next boot the
 recovery scan (``routes.execution._recover_execution_states``) finds the
 plan's row still saying ``running`` while its pid is gone, and asks
-``_judge_process_dead`` what to make of it.
+what to make of it.
 
-Before this change that question had exactly one answer: *failed*.  A
-crash is ``failed`` -- the work died, the plan is over, and nobody is
-going to run it again.  But a run the *server* interrupted is not a
-crash: the work is unfinished, not broken, and it deserves another
-attempt.  Writing it as ``failed`` made the scheduler's waiting set
-(``queued`` and ``ready``) blind to it, so an interrupted plan was
-never picked up again -- the exact silence the checkpoint was written
-to end.
+Two verdicts are possible, and the evidence decides which one:
 
-So the recovery scan now asks the checkpoint first
-(``shutdown_checkpoint.is_shutdown_interrupted``) and, when the
-evidence holds, parks the plan instead of failing it:
+* the run the *server* interrupted is not a crash -- the work is
+  unfinished, not broken, and it deserves another attempt.  Writing it
+  as ``failed`` made the scheduler's waiting set blind to it, so an
+  interrupted plan was never picked up again -- the exact silence the
+  checkpoint was written to end.  The checkpoint is the evidence that
+  says so (``shutdown_checkpoint.is_shutdown_interrupted``), and when
+  it holds the plan is parked:
 
-* the row says ``stopped`` with ``stop_reason='server_shutdown'`` and
-  no pid;
-* the plan's phase is ``queued`` -- the phase the scheduler waits on;
-* the task rows the dead executor owned go back to ``pending``.
+  - the row says ``stopped`` with ``stop_reason='server_shutdown'`` and
+    no pid;
+  - the plan's phase is ``queued`` -- the phase the scheduler waits on;
+  - the task rows the dead executor owned go back to ``pending``;
+
+* a run the scan cannot prove the server interrupted is parked as
+  ``stopped`` with ``stop_reason='startup_reconcile'`` and phase
+  ``stopped``.  That is the branch's startup-reconcile verdict: the
+  pid is gone, so the run is over for this process, but nothing proves
+  *how* it ended, so nothing claims that it died unexpectedly.  The
+  plan is parked, not failed -- it is resumable, and the operator (or
+  the scheduler) may pick it up again.
 
 What these tests pin
 --------------------
 * a fresh shutdown checkpoint parks the plan in ``queued``;
 * the row carries that verdict (status, reason, no pid);
 * the interrupted task is handed back to the scheduler;
-* a crash with no checkpoint stays ``failed`` -- the negative control;
-* a checkpoint *older* than the run is a crash, too: it belongs to an
+* a run with no checkpoint is parked as ``stopped`` -- the negative
+  control for the checkpoint;
+* a checkpoint *older* than the run proves nothing: it belongs to an
   earlier run and says nothing about this one;
+* a checkpoint that says ``user_requested`` is somebody pressing stop,
+  not the server going down -- the predicate may not launder it;
 * a failing phase write does not escape the recovery scan, and does not
   cost the row its verdict.
 
@@ -265,8 +273,15 @@ def test_the_in_progress_task_is_handed_back(sample_plan_factory):
     )
 
 
-def test_a_crash_without_a_checkpoint_stays_failed(sample_plan_factory):
-    """Negative control: no checkpoint means the work died, and it stays failed."""
+def test_a_crash_without_a_checkpoint_is_parked_stopped(sample_plan_factory):
+    """Negative control: no checkpoint, so the run is parked, not queued.
+
+    Without the checkpoint there is no evidence that the *server* went
+    down under this run, so the plan does not get the ``queued``
+    parking.  It is parked as ``stopped`` — the startup reconcile's
+    verdict — because the pid is gone and the restart interrupted the
+    run, but nothing proves how it ended.
+    """
     plan_dir = sample_plan_factory(plan_id="p-crash", phase="executing")
     plan_id = _running_plan(
         plan_dir, started_at=_naive_local(datetime.now(timezone.utc))
@@ -276,18 +291,22 @@ def test_a_crash_without_a_checkpoint_stays_failed(sample_plan_factory):
     _recover_execution_states(plan_dir.parent)
 
     state = _execution_state[plan_id]
-    assert state["status"] == "failed"
-    assert state["stop_reason"] == "process_died_unexpectedly"
-    assert PlanState(plan_dir).get_current_phase() == "failed"
+    assert state["status"] == "stopped", (
+        "nothing proves the server went down under this run, so the run "
+        "is parked — not failed, and not 'died unexpectedly'"
+    )
+    assert state["stop_reason"] == "startup_reconcile"
+    assert PlanState(plan_dir).get_current_phase() == "stopped"
 
 
-def test_a_user_requested_checkpoint_stays_failed(sample_plan_factory):
+def test_a_user_requested_checkpoint_is_not_a_server_shutdown(
+    sample_plan_factory,
+):
     """Somebody pressing stop is not the server going down.
 
     The ``user_requested`` reason is a *different* event, and the
     predicate may not launder it into "the server went down": the run
-    was cancelled, so it stays a crash verdict and nothing about its
-    handling changes.
+    was cancelled, so it does not get the ``queued`` parking either.
     """
     plan_dir = sample_plan_factory(plan_id="p-user-stop", phase="executing")
     paused = datetime.now(timezone.utc)
@@ -305,12 +324,14 @@ def test_a_user_requested_checkpoint_stays_failed(sample_plan_factory):
     _recover_execution_states(plan_dir.parent)
 
     state = _execution_state[plan_id]
-    assert state["status"] == "failed"
-    assert state["stop_reason"] == "process_died_unexpectedly"
-    assert PlanState(plan_dir).get_current_phase() == "failed"
+    assert state["status"] == "stopped"
+    assert state["stop_reason"] == "startup_reconcile"
+    assert PlanState(plan_dir).get_current_phase() == "stopped", (
+        "a cancelled run is not put back in the scheduler's queue"
+    )
 
 
-def test_a_checkpoint_older_than_the_run_is_a_crash(sample_plan_factory):
+def test_a_checkpoint_older_than_the_run_proves_nothing(sample_plan_factory):
     """A checkpoint left over from an earlier run is not evidence of anything."""
     plan_dir = sample_plan_factory(plan_id="p-stale", phase="executing")
     now = datetime.now(timezone.utc)
@@ -326,9 +347,9 @@ def test_a_checkpoint_older_than_the_run_is_a_crash(sample_plan_factory):
     _recover_execution_states(plan_dir.parent)
 
     state = _execution_state[plan_id]
-    assert state["status"] == "failed"
-    assert state["stop_reason"] == "process_died_unexpectedly"
-    assert PlanState(plan_dir).get_current_phase() == "failed"
+    assert state["status"] == "stopped"
+    assert state["stop_reason"] == "startup_reconcile"
+    assert PlanState(plan_dir).get_current_phase() == "stopped"
 
 
 def test_a_phase_write_failure_does_not_escape_the_recovery_scan(

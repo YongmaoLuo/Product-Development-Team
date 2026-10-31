@@ -160,6 +160,15 @@ def _build_agent(project_dir: Path, coding_tool: MagicMock) -> AutonomousAgent:
     """
     logger = MagicMock()
     tasks_file = project_dir / "tasks.json"
+    # The agent's task manager reads the plan's ``tasks.json``, and a
+    # missing file is a refusal rather than an empty plan
+    # (``task_manager.TasksFileMissingError``, 2026-10-31): a plan
+    # without its tasks file cannot be run.  The manager is built for
+    # a plan whose file exists, so the file is written here.
+    if not tasks_file.exists():
+        tasks_file.write_text(
+            json.dumps({"tasks": []}), encoding="utf-8",
+        )
     return AutonomousAgent(
         requirement="test requirement",
         project_dir=project_dir,

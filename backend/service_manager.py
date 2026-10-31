@@ -97,6 +97,24 @@ from typing import (
 )
 
 from credentials import _FD_ENV_PREFIX as _SECRET_FD_ENV_PREFIX
+
+# The unified process ledger — the same file the executor, the
+# sub-agents and the tools write to. Imported flat, like every other
+# ``backend/*.py`` sibling, so a project's own copy of this module
+# resolves to the harness' ledger rather than to a second one.
+import process_ledger
+
+# The identity probe — the same reading the executor's spawn record and
+# the reaper's own check use. One identity rule, not two: the record
+# written here has to be the one the check can match.
+from process_identity import probe as probe_process_identity
+
+# The one reaper. The VP services are reaped through it, because the
+# question "may I kill this pid?" has exactly one answer and this is
+# where it lives: the identity check, the child-before-parent order and
+# the escalation are all there, and none of them are repeated here.
+from process_reaper import reap_plan
+from scheduler_ownership import scheduler_holds
 from service_declaration import SERVICE_HOST, ServiceDeclaration
 from service_freshness import (
     DATA_PLANE_PROBE_PATH,
@@ -141,7 +159,20 @@ _REAL_POPEN = subprocess.Popen
 #: plan directory. C3 reads it on every workflow exit and on backend
 #: startup (a crash leaves it behind on purpose — that is the whole
 #: point of persisting it).
-LEDGER_FILENAME = "managed_services.json"
+#:
+#: 2026-10-30: this used to name a file of its own — one whole-file
+#: dict, written only by this module. It now names the *unified*
+#: process ledger, the append-only log every layer of the process tree
+#: writes to. One file, one answer to "which pid does this plan own":
+#: two ledgers meant two answers, and the sweep that kills orphans
+#: only ever knew one of them. The name is kept because callers (and
+#: tests) import it; the file it points at is the shared one.
+LEDGER_FILENAME = "process_ledger.jsonl"
+
+#: The role a declared service carries in the unified ledger. Every
+#: service the backend starts is a VP service, so there is nothing else
+#: it could be.
+_ROLE_VP_SERVICE = "vp_service"
 
 #: Where the "which round is running" record lives, relative to the
 #: plan directory. See the owner-registry section below.
@@ -761,6 +792,73 @@ class ServiceRuntime:
     def spawned_by_ac(self) -> bool:
         return self.origin == "spawned"
 
+    def to_process_record(
+        self, plan_id: str, *, owner_pid: int = 0,
+    ) -> "process_ledger.ProcessRecord":
+        """This service as a record of the unified process ledger.
+
+        The record has to describe the process the *kernel* knows, not
+        the command this module asked for. The spawn goes through a
+        wrapper that ``exec``s the shell, and the shell ``exec``s the
+        command it was given — so the pid this module recorded belongs
+        to the *command*, and a record carrying the wrapper's own argv
+        (``/bin/bash -lc <start_cmd>``) fails the identity check later.
+        That check is the one that keeps a sweep from killing a
+        stranger that inherited the pid, so a record that cannot be
+        matched is a process that is never reaped: the port stays held
+        and the process stays alive.
+
+        So the identity is read from the kernel — the same probe, and
+        the same reading, that the executor's own spawn record uses
+        (``routes.execution._ledger_write_spawn``). The declared
+        command is only the fallback for the case where the kernel
+        cannot describe the process at all; a record that says "the
+        start time is unknown" (0.0) is refused by the identity check
+        rather than acting on a wrong one.
+        """
+        pid = int(self.pid or 0)
+        identity = probe_process_identity(pid) if pid > 0 else None
+
+        if identity is not None:
+            pgid = int(self.pgid or 0) or int(identity.pgid or 0) or pid
+            create_time = (
+                float(identity.create_time)
+                if identity.create_time is not None
+                else float(self.start_epoch or 0.0)
+            )
+            cmdline = (
+                tuple(identity.cmdline)
+                if identity.cmdline
+                else (
+                    tuple(_detached_argv(self.start_cmd)[3:])
+                    if self.start_cmd else ()
+                )
+            )
+            cwd = identity.cwd or self.cwd
+        else:
+            # The kernel could not describe the process — it may have
+            # exited already, or neither psutil nor ``ps`` could
+            # answer. The service still existed, so the record is
+            # still written; it just says less.
+            pgid = int(self.pgid or 0)
+            create_time = float(self.start_epoch or 0.0)
+            cmdline = (
+                tuple(_detached_argv(self.start_cmd)[3:])
+                if self.start_cmd else ()
+            )
+            cwd = self.cwd
+
+        return process_ledger.ProcessRecord(
+            plan_id=plan_id,
+            role=_ROLE_VP_SERVICE,
+            pid=pid,
+            pgid=pgid,
+            create_time=create_time,
+            cmdline=cmdline,
+            cwd=cwd,
+            owner_pid=int(owner_pid),
+            owner_role="backend",
+        )
     @property
     def dead(self) -> bool:
         """Is the process behind this service gone?
@@ -1102,6 +1200,12 @@ def _detached_pgid_of(pid: int) -> Optional[int]:
 
 
 def _process_start_epoch(pid: int) -> Optional[float]:
+    """When the process started, as ``ps`` reports it.
+
+    Whether two start times mean "the same process" is decided in
+    :mod:`process_identity` — one identity rule, and not two — so this
+    is only the raw reading.
+    """
     raw = _run(["ps", "-p", str(pid), "-o", "lstart="])
     if not raw:
         return None
@@ -5406,7 +5510,12 @@ def _start_process_watcher(
 
 
 def ledger_path(plan_dir: Path) -> Path:
-    return Path(plan_dir) / LEDGER_FILENAME
+    """Path of the unified process ledger inside ``plan_dir``.
+
+    Delegated rather than spelled out here, so the two modules cannot
+    drift apart and end up writing to different files.
+    """
+    return process_ledger.ledger_path(plan_dir)
 
 
 def record_runtimes(
@@ -5424,6 +5533,17 @@ def record_runtimes(
     listeners are deliberately excluded: they were running before AC
     touched them, so the backend must not claim ownership of them and C3 must
     not kill them on exit.
+
+    The record goes into the unified process ledger as one
+    ``vp_service`` spawn record per service — the same ledger the
+    executor, the sub-agents and the tools write to. The service's own
+    details (name, port, log path, the reap opt-out) ride along with
+    the record, because the reap needs them and the ledger is the only
+    file left to read them from.
+
+    Returns the ledger's path, or ``None`` when there was nothing to
+    record — a round that started no service of its own leaves no file
+    behind.
 
     Every entry carries the ``owner_token`` of the round that started
     it (2026-10-24), so a reap can tell "mine" from "a round that is
@@ -5469,40 +5589,37 @@ def record_runtimes(
     )
     if not spawned:
         return None
-    kept: List[Dict[str, Any]] = []
-    existing = read_ledger(plan_dir).get("services")
-    if isinstance(existing, list):
-        for entry in existing:
-            if not isinstance(entry, dict):
-                continue
-            entry_owner = str(entry.get("owner_token") or "")
-            if entry_owner and entry_owner == token:
-                # This round's own previous record — replaced by the new
-                # one (the same services, recorded again).
-                continue
-            # Every other entry is somebody else's: a live round that
-            # will reap it, or a crashed round whose entry is the only
-            # trace of a process that still holds its port. Dropping it
-            # here would lose that trace.
-            kept.append(entry)
-    payload = {
-        "plan_id": plan_id,
-        "project_dir": str(project_dir),
-        "round": round_number,
-        "owner_token": token,
-        "updated_at": datetime.now().isoformat(),
-        "services": kept + [r.to_dict() for r in spawned],
-    }
+    owner_pid = os.getpid()
     path = ledger_path(plan_dir)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        tmp.replace(path)
-    except OSError as exc:
+        for runtime in spawned:
+            record = runtime.to_process_record(
+                plan_id, owner_pid=owner_pid,
+            )
+            # ``record_event`` rather than ``record_spawn``: the spawn
+            # event carries the service's own details next to the
+            # record, and ``record_spawn`` writes the record alone.
+            # The event is otherwise the one ``record_spawn`` writes, so
+            # the unified fold reads it the same way.
+            process_ledger.record_event(
+                plan_dir,
+                process_ledger.EVENT_SPAWN,
+                terminal=False,
+                pid=record.pid,
+                role=record.role,
+                plan_id=plan_id,
+                project_dir=str(project_dir),
+                round=round_number,
+                record=record.to_dict(),
+                # The service view this event contributes — the same key
+                # the retired whole-file ledger used, so a reader that
+                # only knows the old format finds what it needs in the
+                # new file.  The entry carries the round's owner token,
+                # so a reap can still tell "mine" from "a round that is
+                # still running" out of the one ledger.
+                services=[runtime.to_dict()],
+            )
+    except (OSError, ValueError) as exc:
         logger.warning(
             "[service_manager] could not write service ledger %s: %s",
             path, exc,
@@ -5514,15 +5631,84 @@ def record_runtimes(
     return path
 
 
-def read_ledger(plan_dir: Path) -> Dict[str, Any]:
-    """Read a plan's service ledger. Returns ``{}`` when absent or
-    corrupt — a damaged ledger must not block a reap sweep."""
-    path = ledger_path(plan_dir)
+def _read_whole_file_ledger(path: Path) -> Optional[Dict[str, Any]]:
+    """The retired whole-file ledger, if that is what the file holds.
+
+    The ledger used to be one dict written in one go; a plan that still
+    has that file — or a ledger that a sweep has rewritten in the old
+    shape — reads back as it was written. ``None`` when the file is
+    absent, unreadable, or is not that shape.
+    """
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    # A ledger *event* is not the retired whole-file ledger, even
+    # though it carries a "services" key of its own: the file is read
+    # line by line, and a plan whose ledger holds a single record
+    # parses as one dict.
+    if "event" in payload:
+        return None
+    if not isinstance(payload.get("services"), list):
+        return None
+    return payload
+
+
+def _event_services(event: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The service entries a spawn event contributes to the view."""
+    if str(event.get("role") or "") != _ROLE_VP_SERVICE:
+        return []
+    entries = event.get("services")
+    if not isinstance(entries, (list, tuple)):
+        return []
+    return [dict(entry) for entry in entries if isinstance(entry, dict)]
+
+
+def _services_from_ledger(plan_dir: Path) -> List[Dict[str, Any]]:
+    """The service view rebuilt from the unified process ledger.
+
+    A fold over the ledger's events: a ``vp_service`` spawn puts the
+    service in, a later spawn of the same pid replaces it, and the
+    event that ends the process' life takes it out. The fold is the
+    ledger's own — a service whose process is gone is a service nobody
+    has to reap.
+    """
+    live = process_ledger.live_records(plan_dir)
+    services: Dict[int, Dict[str, Any]] = {}
+    for event in process_ledger.read_events(plan_dir):
+        for entry in _event_services(event):
+            try:
+                pid = int(entry.get("pid") or 0)
+            except (TypeError, ValueError):
+                continue
+            if pid <= 0:
+                continue
+            services[pid] = entry
+    return [
+        entry for pid, entry in services.items() if pid in live
+    ]
+
+
+def read_ledger(plan_dir: Path) -> Dict[str, Any]:
+    """Read a plan's service ledger, as the view the callers expect.
+
+    The view is **rebuilt** from the unified process ledger rather than
+    stored beside it: one file, one truth about who owns which process.
+    A plan started before the switch still has the retired whole-file
+    ledger on disk, and that file is read too — a backend that cannot
+    read it forgets the services it spawned, and they are never reaped.
+
+    Returns ``{}`` when absent or corrupt — a damaged ledger must not
+    block a reap sweep.
+    """
+    view, _source = _read_ledger_view(plan_dir)
+    return view
 
 
 # ---------------------------------------------------------------------------
@@ -5565,6 +5751,148 @@ class ReapReport:
         }
 
 
+#: The roles a VP-service reap covers.
+#:
+#: A VP service is the only role this module owns: the executor, the
+#: sub-agents and the tools belong to the layers that started them.
+#: Naming the role keeps a service sweep from taking the executor down
+#: with it.
+VP_SERVICE_ROLES = (_ROLE_VP_SERVICE,)
+
+#: Event written while a service is held out of a sweep.
+#:
+#: It is terminal on purpose: the record leaves the live set for the
+#: duration of the sweep, so the reaper — which sweeps every live
+#: record of the roles it is given — cannot signal it. It is put back
+#: right after the sweep, because the process is still running and the
+#: ledger has to keep saying so.
+_EVENT_HELD = "held"
+
+
+def _entry_pid(entry: Dict[str, Any]) -> Optional[int]:
+    """The pid a service entry names, if it names a usable one."""
+    pid = entry.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return None
+    return pid if pid > 0 else None
+
+
+def _skip_reason(entry: Dict[str, Any]) -> Optional[str]:
+    """Why this entry may not be signalled — or ``None`` if it may.
+
+    Each of these can only *prevent* a kill:
+
+    * ``reap_on_exit: false`` — the operator's opt-out.
+    * a port the backend itself runs on — those processes are not the
+      plan's to kill.
+    * an entry without a usable port — there is nothing to act on.
+    """
+    if not entry.get("reap_on_exit", True):
+        return "reap_on_exit=false"
+    port = entry.get("port")
+    if not isinstance(port, int) or isinstance(port, bool):
+        return "ledger entry has no usable port"
+    if port in PROTECTED_PORTS:
+        return f"port {port} is an backend-runtime port"
+    return None
+
+
+def _reaper_entry(
+    entry: Dict[str, Any], names_by_pid: Dict[int, str],
+) -> Dict[str, Any]:
+    """One of the reaper's process entries, in the report's shape.
+
+    The reaper speaks in pids and roles; the report speaks in service
+    names. The name is added when the pid is one of ours, so a reader
+    can tell "the service 'web' was skipped" from "some process was
+    skipped".
+    """
+    shaped: Dict[str, Any] = {
+        "pid": entry.get("pid"),
+        "reason": entry.get("reason"),
+    }
+    pid = _entry_pid(entry)
+    if pid is not None and pid in names_by_pid:
+        shaped["name"] = names_by_pid[pid]
+    role = entry.get("role")
+    if role:
+        shaped["role"] = role
+    return shaped
+
+
+def _read_ledger_view(plan_dir: Path) -> Tuple[Dict[str, Any], str]:
+    """The service view of a plan, and where it came from.
+
+    Two shapes, and they are reaped by two different rules:
+
+    ``"events"``
+        The unified process ledger — the branch's shape.  The reaper
+        owns it: it knows the process records, the identity checks and
+        the order children die in.
+    ``"whole_file"``
+        The retired whole-file ledger — main's older shape.  A plan
+        started before the switch still has one on disk, and a backend
+        that cannot read it forgets the services it spawned.  It carries
+        no process records, so the service view is what reaps it.
+
+    The whole-file shape wins when both are on disk, because that is
+    the shape the plan was started with.
+    """
+    plan_dir = Path(plan_dir)
+    payload = _read_whole_file_ledger(ledger_path(plan_dir))
+    if payload is not None:
+        return payload, "whole_file"
+    services = _services_from_ledger(plan_dir)
+    if services:
+        return {"services": services}, "events"
+    payload = _read_whole_file_ledger(
+        process_ledger.legacy_ledger_path(plan_dir),
+    )
+    if payload is not None:
+        return payload, "whole_file"
+    return {}, "events"
+
+
+def _owner_skip_reason(
+    entry: Dict[str, Any],
+    *,
+    name: str,
+    caller_token: str,
+    live_owners: Set[str],
+) -> Optional[Dict[str, Any]]:
+    """Why this entry belongs to a round that is still running.
+
+    The rules that only the *service view* knows (2026-10-24): an entry
+    another live round owns is that round's to reap, and an entry nobody
+    claims may belong to the round that is running right now.
+
+    Every one of them can only *prevent* a kill.  Returns the report
+    entry when the entry may not be signalled, and ``None`` when it may.
+    """
+    entry_owner = str(entry.get("owner_token") or "")
+    if not entry_owner:
+        # Nobody claims this entry. While a round is running it may
+        # be that round's service (a project whose own
+        # ``service_manager`` predates the owner token writes
+        # unattributed entries), so it is left alone; with no round
+        # running it is an orphan and is reaped.
+        if live_owners:
+            return {
+                "name": name,
+                "reason": "unattributed entry while a round is running",
+            }
+        return None
+    if entry_owner != caller_token and entry_owner in live_owners:
+        # Another round is running and owns this service. It reaps
+        # it when it exits; killing it here is the 2026-10-24 defect.
+        return {
+            "name": name,
+            "reason": "owned by a live run",
+            "owner_token": entry_owner,
+        }
+    return None
+
+
 def _declaration_from_ledger_entry(entry: Dict[str, Any]) -> Optional[ServiceDeclaration]:
     """Rebuild just enough of a declaration to identify the process.
 
@@ -5603,18 +5931,101 @@ def _pid_reused(entry: Dict[str, Any]) -> bool:
     return abs(float(live) - float(recorded)) > 2.0
 
 
+def _record_reap_kill_requests(
+    plan_dir: Path,
+    entries: Sequence[Dict[str, Any]],
+    *,
+    caller: str,
+    reason: str,
+    round_token: str,
+) -> None:
+    """Write down every service this reap is about to stop.
+
+    The reaper does the signalling; this writes the *request*, in the
+    same shape :func:`kill_service` writes it, so a reader of the kill
+    event stream cannot tell which path asked — and can always tell
+    that something asked.
+
+    One event per service the sweep is going to touch.  An entry the
+    sweep decided not to touch (a pin, another round's service, the
+    operator's opt-out) is not in the list, so no request is written
+    for it.
+
+    Never raises: the event stream is evidence, not a gate.
+    """
+    for entry in entries:
+        try:
+            pid = int(entry.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        try:
+            port = int(entry.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        try:
+            pgid = int(entry.get("pgid") or 0)
+        except (TypeError, ValueError):
+            pgid = 0
+        record_kill_event(
+            Path(plan_dir),
+            {
+                "event": KILL_EVENT_REQUESTED,
+                "ts": datetime.now().isoformat(),
+                "pid": pid,
+                "port": port,
+                "pgid": pgid,
+                "signal": int(signal.SIGTERM),
+                "caller": str(caller or ""),
+                "reason": str(reason or ""),
+                "round_token": str(round_token or ""),
+                "stack_hint": _kill_stack_hint(),
+            },
+        )
+
+
 def reap_services(
     plan_dir: Path,
     plan_id: str = "",
     *,
     reason: str = "",
     grace_seconds: float = 10.0,
+    roles: Optional[Sequence[str]] = VP_SERVICE_ROLES,
     owner_token: Optional[str] = None,
     caller: str = "service_manager.reap_services",
 ) -> ReapReport:
-    """Stop every service this plan's ledger says the backend started.
+    """Reap what this plan owns.
 
-    Safety, in order — each check can only *prevent* a kill:
+    Two ledgers meet here, and each of them has its own reaper.
+
+    The **unified process ledger** (``process_ledger.jsonl``) is the
+    branch's: one file, one truth about who owns which process.  The
+    killing belongs to :func:`process_reaper.reap_plan` and to nobody
+    else.  It checks every pid against the kernel before it signals
+    anything (a pid it cannot vouch for is *reported*, never killed), it
+    kills children before parents, and it writes down what it did.  This
+    module used to carry a second copy of those rules — its own
+    pid-reuse check, its own declaration matching, its own
+    ``stop_service`` call — and two copies of one rule are two rules
+    that drift apart.  The question "may I kill this pid?" has to have
+    exactly one answer.
+
+    The **retired whole-file ledger** (``managed_services.json``) is
+    main's older shape: a plan started before the switch still has one
+    on disk, and a backend that cannot read it forgets the services it
+    spawned — they are then never reaped.  That shape carries no process
+    records, so the reaper has nothing to act on it, and the *service
+    view* is what knows it.  What is left there is the part only the
+    service view knows:
+
+    * ``reap_on_exit: false`` — the operator's opt-out. The service is
+      not signalled, and its entry stays in the ledger.
+    * the ports that are still held once the sweep is over. A port held
+      by a process that is not ours is **reported**
+      (:attr:`ReapReport.foreign_ports`) and never killed: a stranger
+      is worse than an orphan.
+
+    And the rules that belong to main's round/owner model — each of
+    them can only *prevent* a kill:
 
       1. A **live** round has pinned the process → skip, and keep it
          in the ledger (2026-10-25, repair-r1-23). The pin names the
@@ -5664,14 +6075,42 @@ def reap_services(
     name, the 2026-10-24 shape — a sweep reading a running round's
     service as an orphan — left nothing behind but a corpse and a
     ``received SIGTERM`` on the service's side.
+
+    Args:
+        plan_dir: The plan's directory — where the ledger lives.
+        plan_id: The plan's id. Defaults to the directory's name.
+        reason: Why the sweep is running. It is written into the
+            ledger's events, so a later reader can tell a stop from a
+            shutdown from a sweep.
+        grace_seconds: How long a process may take to die before the
+            reaper escalates to SIGKILL.
+        roles: What the sweep may touch. The VP services by default;
+            ``None`` means every role in the tree.
+        owner_token: The round that is asking. Its own services are
+            reapable even while it is running; the services of another
+            live round are not.
+        caller: Who is doing the reaping. It is written to the plan's
+            kill event stream before the signal goes out.
+
+    Returns:
+        A :class:`ReapReport`. It does not swallow a failure: the
+        tolerance for a broken plan lives in :func:`reap_all_plans`,
+        once.
     """
     plan_dir = Path(plan_dir)
     report = ReapReport(plan_id=plan_id or plan_dir.name, reason=reason)
-    ledger = read_ledger(plan_dir)
-    entries = ledger.get("services")
-    if not isinstance(entries, list) or not entries:
-        return report
 
+    # The service view, and where it came from: the unified event log
+    # (the reaper's business) or the retired whole-file ledger (the
+    # service view's business).
+    view, source = _read_ledger_view(plan_dir)
+    entries = [
+        entry for entry in (view.get("services") or [])
+        if isinstance(entry, dict)
+    ]
+    unified = source == "events"
+
+    # --- the round that is asking --------------------------------------
     caller_token = str(owner_token or "")
     live_owners = set(live_service_owners(plan_dir))
     # The pins of the plan: "this round is using these processes right
@@ -5705,127 +6144,169 @@ def reap_services(
             ),
         )
 
-    survivors: List[Dict[str, Any]] = []
+    # --- what this sweep may not touch ---------------------------------
+    #
+    # Each of these can only prevent a kill, and none of them may be
+    # written off as gone either: the ledger has to keep saying that
+    # these processes are still there.
+    scoped: List[Tuple[Dict[str, Any], bool]] = []
     for entry in entries:
-        if not isinstance(entry, dict):
-            continue
         name = str(entry.get("name") or "?")
-        port = entry.get("port")
-        entry_owner = str(entry.get("owner_token") or "")
-        if not entry_owner:
-            # Nobody claims this entry. While a round is running it may
-            # be that round's service (a project whose own
-            # ``service_manager`` predates the owner token writes
-            # unattributed entries), so it is left alone; with no round
-            # running it is an orphan and is reaped below.
-            if live_owners:
-                report.skipped.append({
-                    "name": name,
-                    "reason": "unattributed entry while a round is running",
-                })
-                survivors.append(entry)
-                continue
-        elif entry_owner != caller_token and entry_owner in live_owners:
-            # Another round is running and owns this service. It reaps
-            # it when it exits; killing it here is the 2026-10-24 defect.
+        owner_skip = _owner_skip_reason(
+            entry, name=name, caller_token=caller_token,
+            live_owners=live_owners,
+        )
+        if owner_skip is not None:
+            report.skipped.append(owner_skip)
+            scoped.append((entry, True))
+            continue
+        skip_reason = _skip_reason(entry)
+        if skip_reason is None and unified:
+            # A pin only shields a process that is still there: a pin
+            # whose process is gone protects nothing.
+            pin_index = _pin_covers_entry(entry, pins)
+            if pin_index is not None:
+                pin = pins[pin_index]
+                if _pin_is_in_use(pin, plan_dir, caller_token):
+                    report.skipped.append({
+                        "name": name,
+                        "reason": "reap_skipped_pinned",
+                        "pid": pin.get("pid"),
+                        "port": pin.get("port"),
+                        "round_token": str(pin.get("round_token") or ""),
+                    })
+                    report.reap_skipped_pinned.append({
+                        "name": name,
+                        "pid": pin.get("pid"),
+                        "port": pin.get("port"),
+                        "round_token": str(pin.get("round_token") or ""),
+                        "reason": "reap_skipped_pinned",
+                    })
+                    scoped.append((entry, True))
+                    continue
+                # The pin may be released: the round that wrote it is over.
+                released_pins.add(pin_index)
+        if skip_reason is not None:
             report.skipped.append({
                 "name": name,
-                "reason": "owned by a live run",
-                "owner_token": entry_owner,
+                "reason": skip_reason,
             })
-            survivors.append(entry)
+            scoped.append((entry, True))
             continue
-        if not entry.get("reap_on_exit", True):
-            report.skipped.append(
-                {"name": name, "reason": "reap_on_exit=false"}
-            )
-            survivors.append(entry)
-            continue
-        if not isinstance(port, int):
-            report.skipped.append(
-                {"name": name, "reason": "ledger entry has no usable port"}
-            )
-            continue
-        if port in PROTECTED_PORTS:
-            report.skipped.append(
-                {"name": name, "reason": f"port {port} is an backend-runtime port"}
-            )
-            continue
-        if _pid_reused(entry):
-            report.skipped.append(
-                {"name": name, "reason": "recorded pid was recycled"}
-            )
-            continue
+        scoped.append((entry, False))
 
-        decl = _declaration_from_ledger_entry(entry)
-        try:
-            probe = probe_port(port)
-        except Exception as exc:  # noqa: BLE001 - probe never raises
-            report.failed.append({"name": name, "reason": f"probe: {exc}"})
-            survivors.append(entry)
+    # --- the delegation ------------------------------------------------
+    #
+    # The reaper sweeps every *live* record of the roles it is given, so
+    # an entry this sweep may not touch has to be out of the live set
+    # while the sweep runs. It is put back immediately afterwards: the
+    # process was never signalled, and a ledger that forgot it would
+    # leave a running process that nobody owns — and an opt-out that
+    # only worked once.
+    held: List[process_ledger.ProcessRecord] = []
+    live_before = process_ledger.live_records(plan_dir)
+    for entry, held_out in scoped:
+        if not held_out:
             continue
-
-        if not probe.listening:
-            report.reaped.append(name)  # already gone; nothing to do
-            _record_reaped(entry, name, port)
+        pid = _entry_pid(entry)
+        record = live_before.get(pid) if pid is not None else None
+        if record is None:
             continue
+        process_ledger.record_event(
+            plan_dir,
+            _EVENT_HELD,
+            terminal=True,
+            pid=record.pid,
+            role=record.role,
+            plan_id=report.plan_id,
+            reason=reason,
+            detail="held out of the sweep; not signalled",
+        )
+        held.append(record)
 
-        # The process is still there.  Is it **in use**?  A live round
-        # has pinned it, and the pin does not depend on the owner token
-        # — the plan's api service was recorded with an empty token on
-        # 2026-10-24, and the sweep that stopped it three seconds after
-        # it came up had nothing else to go on.
-        pin_index = _pin_covers_entry(entry, pins)
-        if pin_index is not None:
-            pin = pins[pin_index]
-            if _pin_is_in_use(pin, plan_dir, caller_token):
-                report.skipped.append({
-                    "name": name,
-                    "reason": "reap_skipped_pinned",
-                    "pid": pin.get("pid"),
-                    "port": pin.get("port"),
-                    "round_token": str(pin.get("round_token") or ""),
-                })
-                report.reap_skipped_pinned.append({
-                    "name": name,
-                    "pid": pin.get("pid"),
-                    "port": pin.get("port"),
-                    "round_token": str(pin.get("round_token") or ""),
-                    "reason": "reap_skipped_pinned",
-                })
+    # The request goes down before the signal goes out.  The *signalling*
+    # belongs to the reaper and to nobody else, but the request is the
+    # service view's to write: the plan's kill event stream is where
+    # "who asked this service to die" is answered, and a reap that is
+    # silent there leaves the very corpse this stream exists for
+    # (2026-10-26, repair-r1-49).
+    _record_reap_kill_requests(
+        plan_dir,
+        [entry for entry, held_out in scoped if not held_out],
+        caller=caller,
+        reason=reason,
+        round_token=caller_token,
+    )
+
+    try:
+        outcome = reap_plan(
+            plan_dir,
+            report.plan_id,
+            reason=reason,
+            roles=roles,
+            grace_seconds=grace_seconds,
+        )
+    finally:
+        for record in held:
+            process_ledger.record_spawn(plan_dir, record)
+
+    # --- what the reaper did -------------------------------------------
+    names_by_pid: Dict[int, str] = {}
+    for entry in entries:
+        pid = _entry_pid(entry)
+        if pid is not None:
+            names_by_pid.setdefault(pid, str(entry.get("name") or "?"))
+
+    for skipped in outcome.skipped:
+        report.skipped.append(_reaper_entry(skipped, names_by_pid))
+    for failed in outcome.failed:
+        report.failed.append(_reaper_entry(failed, names_by_pid))
+    for unknown in outcome.unknown:
+        # A process that was found but not identified well enough to
+        # kill. It was reported and left alone, which is a leftover of
+        # the sweep rather than a decision — so it counts against the
+        # sweep being clean.
+        report.failed.append({
+            "pid": unknown.get("pid"),
+            "reason": "holder_unknown: not identified; not killed",
+            "tried": unknown.get("tried"),
+        })
+
+    survivors: List[Dict[str, Any]] = []
+    if unified:
+        # --- what is left ------------------------------------------------
+        #
+        # The ledger is the only answer to "what does this plan still own",
+        # so the last word belongs to it: a pid that is still live is ours
+        # and still running, whatever the sweep made of it.
+        live_after = process_ledger.live_records(plan_dir)
+        for entry, held_out in scoped:
+            name = str(entry.get("name") or "?")
+            if held_out:
+                # Nothing was signalled, so it is still there.
                 survivors.append(entry)
                 continue
-            # The pin may be released: the round that wrote it is over.
-            released_pins.add(pin_index)
-
-        recorded_pid = entry.get("pid")
-        recorded_pgid = entry.get("pgid")
-        ours = bool(recorded_pid) and recorded_pid in probe.pids
-        if not ours and recorded_pgid:
-            # 2026-09-23: the listener is often a DESCENDANT of the
-            # process the ledger recorded, and then neither check above
-            # can see it. ``npx next dev -p N`` spawns ``npm exec`` →
-            # ``node .../.bin/next dev`` → ``next-server``; only
-            # ``next-server`` binds the port, and it rewrites its own
-            # process title, so ``matches_declaration`` has nothing to
-            # match either. All three share the group npm created, and
-            # the ledger has carried ``pgid`` all along —
-            # ``stop_service`` is already group-aware and kills with
-            # ``killpg``, it just never got the chance.
-            #
-            # Residual risk: a recycled pgid could in principle name a
-            # stranger's group. It would also have to have bound this
-            # exact port, and the ledger only ever records ports the backend
-            # itself started. That is a far smaller exposure than the
-            # leak it fixes — port 60129 outlived its plan by 3.4 days
-            # and would have outlived it indefinitely.
-            ours = any(
-                _process_group_of(pid) == recorded_pgid
-                for pid in probe.pids
-            )
-        if not ours and decl is not None:
-            ours = matches_declaration(decl, probe)
-        if not ours:
+            pid = _entry_pid(entry)
+            if pid is not None and pid in live_after:
+                # Still ours, still running: either the reaper refused to
+                # signal a pid it could not vouch for, or the process
+                # survived the escalation.
+                survivors.append(entry)
+                continue
+            # The process is gone. The port says what is left of it.
+            port = entry.get("port")
+            try:
+                probe = probe_port(port)
+            except Exception as exc:  # noqa: BLE001 - the probe never raises
+                report.failed.append({"name": name, "reason": f"probe: {exc}"})
+                survivors.append(entry)
+                continue
+            if not probe.listening:
+                report.reaped.append(name)
+                _record_reaped(entry, name, port)
+                continue
+            # The port is held and our process is gone: the holder is
+            # somebody else's. It is reported and left alone.
             report.foreign_ports.append(port)
             report.failed.append({
                 "name": name,
@@ -5836,75 +6317,172 @@ def reap_services(
                 ),
             })
             survivors.append(entry)
-            continue
+    else:
+        # --- the retired whole-file ledger --------------------------------
+        #
+        # This shape carries no process records, so the reaper had nothing
+        # to act on; the service view is what knows it, and it is what
+        # reaps it — with the round/owner rules that only it knows.
+        for entry, held_out in scoped:
+            if held_out:
+                # A skip decided above: the entry stays in the ledger, so
+                # a later sweep retries it and the round that owns it can
+                # still find it.
+                survivors.append(entry)
+                continue
+            name = str(entry.get("name") or "?")
+            port = entry.get("port")
+            entry_owner = str(entry.get("owner_token") or "")
+            if _pid_reused(entry):
+                report.skipped.append(
+                    {"name": name, "reason": "recorded pid was recycled"}
+                )
+                continue
+            decl = _declaration_from_ledger_entry(entry)
+            try:
+                probe = probe_port(port)
+            except Exception as exc:  # noqa: BLE001 - probe never raises
+                report.failed.append({"name": name, "reason": f"probe: {exc}"})
+                survivors.append(entry)
+                continue
+            if not probe.listening:
+                report.reaped.append(name)  # already gone; nothing to do
+                _record_reaped(entry, name, port)
+                continue
 
-        runtime = ServiceRuntime(
-            name=name, port=port, pid=recorded_pid,
-            pgid=entry.get("pgid"),
-            start_cmd=str(entry.get("start_cmd") or ""),
-        )
-        stop_info = stop_service(
-            runtime, decl, grace_seconds=grace_seconds,
-            caller=caller,
-            reason=reason or "the plan's ledger says this service is ours",
-            round_token=entry_owner or caller_token,
-            plan_dir=plan_dir,
-        )
-        if stop_info.get("port_free"):
-            report.reaped.append(name)
-            _record_reaped(entry, name, port)
-            continue
+            # The process is still there.  Is it **in use**?  A live round
+            # has pinned it, and the pin does not depend on the owner
+            # token — the plan's api service was recorded with an empty
+            # token on 2026-10-24, and the sweep that stopped it three
+            # seconds after it came up had nothing else to go on.
+            pin_index = _pin_covers_entry(entry, pins)
+            if pin_index is not None:
+                pin = pins[pin_index]
+                if _pin_is_in_use(pin, plan_dir, caller_token):
+                    report.skipped.append({
+                        "name": name,
+                        "reason": "reap_skipped_pinned",
+                        "pid": pin.get("pid"),
+                        "port": pin.get("port"),
+                        "round_token": str(pin.get("round_token") or ""),
+                    })
+                    report.reap_skipped_pinned.append({
+                        "name": name,
+                        "pid": pin.get("pid"),
+                        "port": pin.get("port"),
+                        "round_token": str(pin.get("round_token") or ""),
+                        "reason": "reap_skipped_pinned",
+                    })
+                    survivors.append(entry)
+                    continue
+                # The pin may be released: the round that wrote it is over.
+                released_pins.add(pin_index)
 
-        # Still held. If the holder still matches the declaration it is
-        # a leaked sibling of the same service (a VP that started its
-        # own copy) — fair game. Anything else is foreign.
-        after = probe_port(port)
-        if decl is not None and after.listening and matches_declaration(
-            decl, after,
-        ):
-            sibling = ServiceRuntime(
-                name=name, port=port,
-                pid=after.pids[0] if after.pids else None,
-                pgid=_process_group_of(after.pids[0]) if after.pids else None,
+            recorded_pid = entry.get("pid")
+            recorded_pgid = entry.get("pgid")
+            ours = bool(recorded_pid) and recorded_pid in probe.pids
+            if not ours and recorded_pgid:
+                # 2026-09-23: the listener is often a DESCENDANT of the
+                # process the ledger recorded, and then neither check above
+                # can see it. ``npx next dev -p N`` spawns ``npm exec`` →
+                # ``node .../.bin/next dev`` → ``next-server``; only
+                # ``next-server`` binds the port, and it rewrites its own
+                # process title, so ``matches_declaration`` has nothing to
+                # match either. All three share the group npm created, and
+                # the ledger has carried ``pgid`` all along —
+                # ``stop_service`` is already group-aware and kills with
+                # ``killpg``, it just never got the chance.
+                #
+                # Residual risk: a recycled pgid could in principle name a
+                # stranger's group. It would also have to have bound this
+                # exact port, and the ledger only ever records ports the
+                # backend itself started. That is a far smaller exposure
+                # than the leak it fixes — port 60129 outlived its plan by
+                # 3.4 days and would have outlived it indefinitely.
+                ours = any(
+                    _process_group_of(pid) == recorded_pgid
+                    for pid in probe.pids
+                )
+            if not ours and decl is not None:
+                ours = matches_declaration(decl, probe)
+            if not ours:
+                report.foreign_ports.append(port)
+                report.failed.append({
+                    "name": name,
+                    "reason": (
+                        f"port {port} is held by an unidentified process "
+                        f"({'; '.join(probe.cmdlines) or 'cmdline unknown'}); "
+                        f"not killed"
+                    ),
+                })
+                survivors.append(entry)
+                continue
+
+            runtime = ServiceRuntime(
+                name=name, port=port, pid=recorded_pid,
+                pgid=entry.get("pgid"),
                 start_cmd=str(entry.get("start_cmd") or ""),
             )
-            second = stop_service(
-                sibling, decl, grace_seconds=grace_seconds,
+            stop_info = stop_service(
+                runtime, decl, grace_seconds=grace_seconds,
                 caller=caller,
-                reason=(
-                    f"{reason or 'the ledger says this service is ours'} "
-                    f"— a leaked sibling still holds the port"
-                ),
+                reason=reason or "the plan's ledger says this service is ours",
                 round_token=entry_owner or caller_token,
                 plan_dir=plan_dir,
             )
-            if second.get("port_free"):
+            if stop_info.get("port_free"):
                 report.reaped.append(name)
                 _record_reaped(entry, name, port)
                 continue
-            report.failed.append({
-                "name": name,
-                "reason": f"still held after a second stop: {second.get('detail')}",
-            })
-        elif after.listening:
-            report.foreign_ports.append(port)
-            report.failed.append({
-                "name": name,
-                "reason": (
-                    f"port {port} was taken over by an unidentified "
-                    f"process; not killed"
-                ),
-            })
-        else:
-            report.failed.append({
-                "name": name,
-                "reason": str(stop_info.get("detail") or "stop failed"),
-            })
-        survivors.append(entry)
 
-    report.ledger_cleared = _finalise_ledger(
-        plan_dir, ledger, survivors, report,
-    )
+            # Still held. If the holder still matches the declaration it is
+            # a leaked sibling of the same service (a VP that started its
+            # own copy) — fair game. Anything else is foreign.
+            after = probe_port(port)
+            if decl is not None and after.listening and matches_declaration(
+                decl, after,
+            ):
+                sibling = ServiceRuntime(
+                    name=name, port=port,
+                    pid=after.pids[0] if after.pids else None,
+                    pgid=_process_group_of(after.pids[0]) if after.pids else None,
+                    start_cmd=str(entry.get("start_cmd") or ""),
+                )
+                second = stop_service(
+                    sibling, decl, grace_seconds=grace_seconds,
+                    caller=caller,
+                    reason=(
+                        f"{reason or 'the ledger says this service is ours'} "
+                        f"— a leaked sibling still holds the port"
+                    ),
+                    round_token=entry_owner or caller_token,
+                    plan_dir=plan_dir,
+                )
+                if second.get("port_free"):
+                    report.reaped.append(name)
+                    _record_reaped(entry, name, port)
+                    continue
+                report.failed.append({
+                    "name": name,
+                    "reason": f"still held after a second stop: {second.get('detail')}",
+                })
+            elif after.listening:
+                report.foreign_ports.append(port)
+                report.failed.append({
+                    "name": name,
+                    "reason": (
+                        f"port {port} was taken over by an unidentified "
+                        f"process; not killed"
+                    ),
+                })
+            else:
+                report.failed.append({
+                    "name": name,
+                    "reason": str(stop_info.get("detail") or "stop failed"),
+                })
+            survivors.append(entry)
+
+    report.ledger_cleared = _finalise_ledger(plan_dir, view, survivors)
     # The pins this reap may drop: the ones whose process is being
     # stopped, and the ones of the round that is going away (the
     # caller's own round — its exit reap is the end of that round).
@@ -5914,39 +6492,113 @@ def reap_services(
 
 def _finalise_ledger(
     plan_dir: Path,
-    ledger: Dict[str, Any],
+    view: Dict[str, Any],
     survivors: List[Dict[str, Any]],
-    report: ReapReport,
 ) -> bool:
-    """Delete the ledger when the reap was clean, else rewrite it with
-    what is left. Returns True when the file is gone."""
+    """Close the ledger: the dead services leave it, the survivors stay.
+
+    Every service that is no longer running gets an ``exit`` event, so
+    the ledger stops claiming a process that is gone. That is what
+    makes :func:`read_ledger` answer "nothing of this plan is still
+    up" — and it is what keeps the next sweep from going after a pid
+    that has since been recycled.
+
+    The retired whole-file ledger cannot carry events: it is rewritten
+    with what is left, or removed when nothing is left.
+
+    Returns ``True`` when the ledger has nothing left to claim.
+    """
     path = ledger_path(plan_dir)
-    if not survivors:
-        try:
-            path.unlink()
-            return True
-        except FileNotFoundError:
-            return True
-        except OSError as exc:
-            logger.warning(
-                "[service_manager] could not remove ledger %s: %s", path, exc,
+    legacy_path = process_ledger.legacy_ledger_path(plan_dir)
+
+    # The retired shape is one whole-file dict. It cannot carry events,
+    # so it is rewritten (or removed) rather than appended to.
+    retired = {
+        candidate: _read_whole_file_ledger(candidate)
+        for candidate in (path, legacy_path)
+    }
+    for candidate, payload in retired.items():
+        if payload is None:
+            continue
+        if survivors:
+            payload = dict(payload)
+            payload["services"] = survivors
+            payload["updated_at"] = datetime.now().isoformat()
+            try:
+                tmp = candidate.with_suffix(".json.tmp")
+                tmp.write_text(
+                    json.dumps(payload, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                tmp.replace(candidate)
+            except OSError as exc:
+                logger.warning(
+                    "[service_manager] could not rewrite ledger %s: %s",
+                    candidate, exc,
+                )
+        else:
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning(
+                    "[service_manager] could not remove ledger %s: %s",
+                    candidate, exc,
+                )
+
+    # The event log: every service that is gone gets an exit event, so
+    # the ledger stops claiming it.
+    if retired.get(path) is None:
+        survivor_pids = {
+            pid for pid in (_entry_pid(entry) for entry in survivors)
+            if pid is not None
+        }
+        for entry in view.get("services") or []:
+            if not isinstance(entry, dict):
+                continue
+            pid = _entry_pid(entry)
+            if pid is None or pid in survivor_pids:
+                continue
+            process_ledger.record_exit(
+                plan_dir, pid, detail="the service is no longer running",
             )
-            return False
-    try:
-        payload = dict(ledger)
-        payload["services"] = survivors
-        payload["updated_at"] = datetime.now().isoformat()
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        tmp.replace(path)
-    except OSError as exc:
-        logger.warning(
-            "[service_manager] could not rewrite ledger %s: %s", path, exc,
-        )
-    return False
+
+    had_ledger = bool(view.get("services")) or any(
+        payload is not None for payload in retired.values()
+    )
+    return had_ledger and not survivors
+
+
+def _plan_dirs_to_sweep(plans_dir: Path) -> List[Path]:
+    """The plan directories that have something to reap.
+
+    Both file names are looked for: a plan started before the switch
+    still has the retired ledger, and the services it names have to be
+    reaped too. The plan directory is the unit, not the file — a plan
+    that has both is swept once.
+
+    A plan whose ledger says it has nothing running is left out: the
+    common case is that no plan ever started anything, and a sweep that
+    visited every plan in the directory would grow without bound.
+    """
+    plan_dirs = set()
+    for name in (LEDGER_FILENAME, process_ledger.LEGACY_LEDGER_FILENAME):
+        for ledger_file in plans_dir.glob(f"*/{name}"):
+            plan_dirs.add(ledger_file.parent)
+
+    sweepable: List[Path] = []
+    for plan_dir in sorted(plan_dirs):
+        if read_ledger(plan_dir).get("services"):
+            sweepable.append(plan_dir)
+            continue
+        # A plan with no services may still own processes from the
+        # other layers — the executor, the sub-agents, the tools. They
+        # are reaped too, or the shutdown sweep would leave the tree
+        # standing.
+        if process_ledger.live_records(plan_dir):
+            sweepable.append(plan_dir)
+    return sweepable
 
 
 def reap_all_plans(
@@ -5954,11 +6606,16 @@ def reap_all_plans(
     *,
     reason: str = "",
     grace_seconds: float = 10.0,
+    roles: Optional[Sequence[str]] = None,
     release_own_owners: bool = False,
+    adopt_scheduler_runs: bool = False,
     caller: str = "service_manager.reap_all_plans",
 ) -> List[ReapReport]:
-    """Sweep every plan's ledger. Used on backend startup, so a crash
-    that left orphans behind is cleaned up by the next boot.
+    """Sweep every plan's ledger — the one place that looks at plans.
+
+    Used on backend startup, so a crash that left orphans behind is
+    cleaned up by the next boot, and on shutdown, so a plan's whole
+    tree goes with the backend.
 
     A plan whose ledger is missing or empty is skipped silently — the
     common case is that no plan ever started a service.
@@ -5975,13 +6632,64 @@ def reap_all_plans(
     event stream before the signal goes out, so a service that is
     stopped by a sweep says on the record that a sweep stopped it
     (2026-10-26, repair-r1-49).
+
+    Args:
+        plans_dir: The directory the plans live in.
+        reason: Why the sweep is running; it is written into the
+            ledger's events.
+        grace_seconds: How long a process may take to die before the
+            reaper escalates to SIGKILL.
+        roles: What the sweep may touch. ``None`` — the default — means
+            every role in the tree: the shutdown sweep has to take the
+            executor and the sub-agents with it, and it must not need a
+            second way of walking the plan directories to do it.
+        release_own_owners: Whether the rounds this process registered
+            are over. The shutdown sweep says yes; the startup sweep
+            says no.
+        adopt_scheduler_runs: Whether a plan the **scheduler** holds is
+            left alone. The startup sweep says yes: the scheduler
+            adopts a run that outlived the previous backend, and a
+            sweep that reaped it would take away a plan that is still
+            working. The shutdown sweep says no — the backend is going
+            away, and the runs go with it.
+        caller: Who is doing the sweeping.
+
+    Returns:
+        One report per plan that was swept. A plan that raised is
+        logged and skipped: one broken plan must not cost the others
+        their sweep, and the tolerance for that lives here and only
+        here.
     """
     plans_dir = Path(plans_dir)
     reports: List[ReapReport] = []
     if not plans_dir.is_dir():
         return reports
-    for ledger_file in sorted(plans_dir.glob(f"*/{LEDGER_FILENAME}")):
-        plan_dir = ledger_file.parent
+    for plan_dir in _plan_dirs_to_sweep(plans_dir):
+        if adopt_scheduler_runs and scheduler_holds(plan_dir.name):
+            # The scheduler owns this plan's run: it admitted the plan
+            # and it adopts the run that outlived the previous backend
+            # (its own recovery re-times the slot from the moment of
+            # the restart).  A sweep that reaped the run would take
+            # away a plan that is still working — so the whole plan is
+            # left alone, tree and all: reaping its children under a
+            # live parent would break the run it is meant to protect.
+            logger.info(
+                "[service_manager] %s is held by the scheduler; left alone",
+                plan_dir.name,
+            )
+            reports.append(
+                ReapReport(
+                    plan_id=plan_dir.name,
+                    reason=reason,
+                    skipped=[
+                        {
+                            "name": "executor",
+                            "reason": "scheduler_adopted",
+                        }
+                    ],
+                )
+            )
+            continue
         if release_own_owners:
             released = release_owners_of_process(plan_dir, os.getpid())
             # The rounds of the process that is going away are over, so
@@ -5989,12 +6697,14 @@ def reap_all_plans(
             # started would outlive the backend that started them.
             for token in released:
                 unpin_services_for_round(plan_dir, token)
-        if not read_ledger(plan_dir).get("services"):
-            continue
         try:
             reports.append(
                 reap_services(
-                    plan_dir, reason=reason, grace_seconds=grace_seconds,
+                    plan_dir,
+                    plan_dir.name,
+                    reason=reason,
+                    grace_seconds=grace_seconds,
+                    roles=roles,
                     caller=caller,
                 )
             )
@@ -6004,3 +6714,5 @@ def reap_all_plans(
                 "[service_manager] reap failed for %s: %s", plan_dir.name, exc,
             )
     return reports
+
+

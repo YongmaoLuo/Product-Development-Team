@@ -34,8 +34,9 @@ The three worlds these tests set up
   checkpoint says ``server_shutdown`` and it is fresh, so the run was
   interrupted rather than broken, and the plan comes back as
   ``queued``.
-* ``p-crash`` — the same dead executor, but no checkpoint: the work
-  died, the plan is ``failed``, and a failed plan is nobody's
+* ``p-crash`` — the same dead executor, but no checkpoint: nothing
+  proves the server went down, so the run is parked as ``stopped``
+  (the startup reconcile's verdict) and a parked plan is nobody's
   business.
 * ``p-stopped`` — somebody pressed stop.  That is a third thing
   again: the run was cancelled on purpose, its phase is ``stopped``,
@@ -194,7 +195,8 @@ def _crashed(sample_plan_factory, db_path, plan_id="p-crash"):
     """The same dead executor, but no checkpoint: the work died.
 
     Without a checkpoint there is no evidence that the *server* went
-    away — only that the executor is gone — so this run is a crash.
+    away — only that the executor is gone — so this run is parked as
+    ``stopped`` rather than queued for another attempt.
     """
     plan_dir = _seed_plan(sample_plan_factory, db_path, plan_id, "executing")
     _seed_execution(
@@ -307,8 +309,10 @@ def test_a_crash_is_not_in_the_queue(
     _execution_state.clear()
     _recover_execution_states(plans_root)
 
-    assert _phase_of(db_path, "p-crash") == "failed", (
-        "without a checkpoint there is no evidence the server went down"
+    assert _phase_of(db_path, "p-crash") == "stopped", (
+        "without a checkpoint there is no evidence the server went down, "
+        "so the run is parked — not queued, and not claimed to have "
+        "died unexpectedly"
     )
     assert _queued_plan_ids(db_path, plans_root) == [], (
         "a crashed plan is not waiting for anybody"

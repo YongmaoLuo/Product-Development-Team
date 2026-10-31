@@ -69,7 +69,7 @@ SNAPSHOT_PATH = _TESTS_DIR / "openapi_snapshot.json"
 #: anchor: it travels with the code, so the gate still bites on a machine
 #: that has never seen the snapshot file.  Change it **only** together with
 #: a deliberate, reviewed change to the public HTTP contract.
-BASELINE_FINGERPRINT = "c7af51dd5432cd64368313b3c073691e3603b16bc26a24caff68976e559f3687"
+BASELINE_FINGERPRINT = "40bb815495fe4481e0b1cd880990ac5e09bdb595d9b77ac3ffc870ce8bf80eef"
 
 #: The capture runs in its own process so the schema is the one a clean
 #: start produces: debug routes off, no schema cache carried over from

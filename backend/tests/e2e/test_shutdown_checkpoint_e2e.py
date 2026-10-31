@@ -24,19 +24,49 @@
   的是什么：计划列表里**没有**那条被停掉的计划（执行行的裁决是终局的），
   而**调度面板的队列**里列着它，带着可执行的操作。
 
-唯一的替身仍然是模型（``PDT_LLM_MODE=scripted``，磁盘上的固定回答），
-这跟同目录的 ``test_plan_lifecycle_ui_e2e.py`` 是同一条缝。
+唯一的替身仍然是模型（``PDT_LLM_MODE=scripted``，磁盘上的固定回答）
+和**执行器**（``PDT_EXECUTOR_CMD`` 指向的确定性替身，
+``tests/e2e/fixtures/deterministic_executor.py``），这跟同目录的
+``test_plan_lifecycle_ui_e2e.py`` 和 ``plan_scheduler/`` 下的兄弟用例是
+同一条缝。执行器是**服务器自己 spawn 的**：服务器写 ``plan_execution``
+行，也写台账（``plans/<id>/`` 下的进程台账）里那条"这个 pid 属于这条
+计划"的记录。
+
+本分支的启动对账契约（2026-10-31 起的唯一真相）
+--------------------------------------------------
+
+开机扫描（``routes/execution._recover_execution_states``）对一条
+``running`` 行做**对账**，而对账问的不是"这个 pid 活着吗"，而是
+"**台账认不认这个 pid**"：
+
+* 台账里**有**这条 pid 的 spawn 记录，且身份（pid + create_time +
+  cmdline）对得上 → 这是**我们自己的**执行器，它活过了启动它的后端，
+  而现在没人拥有它了 → 按台账的规则回收它（子先父后，每次发信号前
+  重新核对身份），计划被 park 成 ``stopped``；
+* 台账里**没有**这条 pid（或者身份对不上）→ 这是个**陌生人的 pid**：
+  **一个信号都不发**，台账里写下 ``identity_mismatch``，计划被 park 成
+  ``stopped``（没有证据证明它是"服务器挂了"）；
+* 只有**关机检查点**能证明"是服务器挂了"→ 那就 park 成相位 ``queued``，
+  等着被重新捡起来。
+
+所以：**手工写一行 ``running`` + 一个活着的陌生 pid 的做法在新契约下
+不成立** —— 开机扫描会当场把它 park 成 ``stopped``，本用例要验的那条
+链（关机 → 检查点 → 重启 → queued）根本走不到。这份用例因此改成
+**经 API 启动一条真的 run**：服务器 spawn 执行器、写行、写台账，第二
+次启动对账时看到的是**台账背书过的**执行器，于是走的是"回收 + 有检查
+点 → queued"这条路径。
 
 这个用例证明的那条链
 --------------------
 
-1. 第一次启动时，计划 ``shutdown-e2e`` 的 ``plan_execution`` 行写着
-   ``running``，pid 指向一个**还活着**的占位进程 —— 所以开机扫描不会判它死，
-   相位也不动；
+1. 第一次启动后，测试**经 API 启动**这条计划：服务器 spawn 执行器
+   （替身），写 ``plan_execution`` 行（``running`` + 那个 pid）和台账
+   的 spawn 记录 —— 所以开机扫描面对的是**台账认得**的 pid；
 2. ``SIGTERM`` 之后，第一段进程在退出前把检查点写下来：
    ``reason='server_shutdown'``、``kind='execution'``，
    ``unfinished_tasks`` 里是 t2（当时在飞）和 t3（还没做）；
-3. 占位进程被回收（它不是执行器，服务器不认它，所以得**手动**杀）；
+3. 执行器随服务器一起被回收（它是服务器的孩子，服务器的关闭路径
+   ``_shutdown_all_executions`` 负责杀它）；
 4. 第二次启动读到那份检查点，把行落成 ``stopped`` + ``server_shutdown`` +
    pid 为空，把相位落成 ``queued`` —— 不是 ``failed``；
 5. 调度器看得见它（``PlanFactsReader.queued_plans()`` 里有它）；
@@ -112,7 +142,6 @@ import os
 import signal
 import subprocess
 import sys
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -173,6 +202,14 @@ ARTIFACTS_ROOT = _H.ARTIFACTS_ROOT
 
 #: The plan this story is about.
 PLAN_ID = "shutdown-e2e"
+
+#: The stand-in executor, installed through the named production seam
+#: (``PDT_EXECUTOR_CMD``).  It is a real process with a real pid and a
+#: real process group; it is spawned by the **server**, so the server
+#: owns it and the ledger records it.
+EXECUTOR_FIXTURE = (
+    BACKEND_DIR / "tests" / "e2e" / "fixtures" / "deterministic_executor.py"
+)
 
 #: An unrelated plan, seeded so the operator's list is **not** empty.
 #:
@@ -334,27 +371,33 @@ def _seed_other_plan_dir(work: Path) -> Path:
     return plan_dir
 
 
-def _seed_state_db(work: Path, *, exec_pid: int, started_at: str) -> None:
-    """Write the rows a *running* plan leaves behind.
+def _seed_state_db(work: Path) -> None:
+    """Write the rows a *waiting* plan leaves behind.
 
-    Three rows, all of them the ones the product itself writes:
+    Two rows, both of them the ones the product itself writes:
 
-    * ``plan_routing`` —— the phase of the plan (``executing``: it is
-      running);
-    * ``plan_execution`` —— the run: ``running``, the pid of the stand-in
-      process, the moment the run started, the directory the work
-      happens in;
+    * ``plan_routing`` —— the phase of the plan (``queued``: it is
+      waiting for an executor, and ``queued`` is one of the phases a
+      start may be issued from — see
+      ``server._EXECUTION_START_SOURCE_PHASES``);
     * ``plan_tasks`` —— the per-task runtime state, so the checkpoint
       the shutdown writes knows which task was in flight.
+
+    **There is no ``plan_execution`` row here, and that is the point.**
+    The run this story is about is started through the API, by the
+    server, so the server owns it: the server spawns the executor, the
+    server writes the row, and the server writes the ledger record that
+    says which pid belongs to this plan.  A hand-written row naming a
+    pid the server never spawned is a *stranger's* pid, and the startup
+    reconcile refuses to claim one (see the module docstring: the
+    ledger is the only ownership record, so a pid the ledger does not
+    back is not signalled and its plan is parked as ``stopped``).
 
     The unrelated plan gets a routing row of its own (and no execution
     row at all) — it is the plan that stays in the operator's list.
     """
     from state_machine.db.connection import open as db_open
     from state_machine.db.schema import migrate
-    from state_machine.repositories.execution_repository import (
-        ExecutionRepository,
-    )
     from state_machine.repositories.plan_task_repository import (
         PlanTaskRepository,
     )
@@ -363,21 +406,30 @@ def _seed_state_db(work: Path, *, exec_pid: int, started_at: str) -> None:
     conn = db_open(work / "state.db")
     try:
         migrate(conn)
-        RoutingRepository(conn).insert(PLAN_ID, "executing")
+        RoutingRepository(conn).insert(PLAN_ID, "queued")
         RoutingRepository(conn).insert(OTHER_PLAN_ID, "interview")
-        ExecutionRepository(conn).update_fields(
-            PLAN_ID,
-            create_if_missing=True,
-            exec_status="running",
-            exec_pid=exec_pid,
-            started_at=started_at,
-            project_dir=str(work / "project"),
-        )
         tasks = PlanTaskRepository(conn)
         for task in _TASKS:
             tasks.update_task(PLAN_ID, str(task["id"]), {"status": task["status"]})
     finally:
         conn.close()
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is that pid still a process?
+
+    ``os.kill(pid, 0)`` asks the kernel the question without sending
+    anything.  It is used here only to observe that the executor the
+    server owned is gone -- it never decides what the server does with
+    a pid (that is the ledger's job, in production code).
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _read_execution_row(work: Path) -> Dict[str, Any]:
@@ -811,21 +863,25 @@ def test_shutdown_writes_a_checkpoint_and_restart_parks_queued(tmp_path, monkeyp
         ).rstrip(os.pathsep),
     )
 
-    # The stand-in for the executor: a process that is alive, holds a
-    # pid the recovery scan can probe, and does nothing else.  The
-    # server never learns about it (it is not the server's child), so
-    # the server will not kill it -- the test has to.
-    stand_in = subprocess.Popen(
-        [str(VENV_PYTHON), "-c", "import time; time.sleep(600)"],
-        start_new_session=True,
+    # The executor is a **stand-in installed through the named
+    # production seam** (``PDT_EXECUTOR_CMD``), and it is the *server*
+    # that spawns it: the server writes the ``plan_execution`` row and
+    # the ledger record that says which pid belongs to this plan.  A
+    # hand-written row naming a pid the server never spawned would be a
+    # stranger's pid, and the startup reconcile refuses to claim one --
+    # see the module docstring.
+    #
+    # The stand-in stays alive until it is signalled (no
+    # ``PDT_E2E_EXIT_AFTER``), so the run is really in flight when the
+    # server is asked to shut down.
+    monkeypatch.setenv(
+        "PDT_EXECUTOR_CMD",
+        "{0} -u {1}".format(VENV_PYTHON, EXECUTOR_FIXTURE),
     )
-    started_at = (datetime.now() - timedelta(seconds=60)).isoformat()
-    _seed_state_db(work, exec_pid=stand_in.pid, started_at=started_at)
+    _seed_state_db(work)
 
     interpreter = _playwright_interpreter()
     if interpreter is None:
-        stand_in.kill()
-        stand_in.wait(timeout=10)
         pytest.skip("playwright interpreter not found")
 
     artifacts = ARTIFACTS_ROOT / PLAN_ID
@@ -852,6 +908,22 @@ def test_shutdown_writes_a_checkpoint_and_restart_parks_queued(tmp_path, monkeyp
         # --- step 1: a real backend, and a plan that is really running --
         base_url, proc = _boot_server(work, script_dir)
         servers.append((proc, base_url))
+
+        # The run is started the way an operator starts it: through the
+        # API.  The server spawns the executor, writes the
+        # ``plan_execution`` row and writes the ledger record that owns
+        # the pid -- so the second boot finds a pid the ledger backs,
+        # and the startup reconcile has something real to reconcile.
+        start_status, start_body = _http(
+            "POST",
+            f"{base_url}/api/execution/{PLAN_ID}/start",
+            {"project_dir": str(work / "project")},
+            timeout=120,
+        )
+        report["start_status_before_shutdown"] = start_status
+        assert start_status == 200, (
+            f"the start was refused: {start_status} {start_body!r}"
+        )
         state = _plan_state(base_url, PLAN_ID)
         report["phase_before_shutdown"] = state.get("current_phase")
         report["execution_status_before_shutdown"] = _execution_status(state)
@@ -861,6 +933,9 @@ def test_shutdown_writes_a_checkpoint_and_restart_parks_queued(tmp_path, monkeyp
         )
 
         # --- step 2: SIGTERM, then the executor is taken away -----------
+        exec_pid = _read_execution_row(work).get("exec_pid")
+        report["exec_pid_before_shutdown"] = exec_pid
+        assert exec_pid, "the run has no pid; the executor was never spawned"
         proc.terminate()
         proc.wait(timeout=30)
         # A SIGTERM'd uvicorn exits *because of* the signal: after the
@@ -873,14 +948,15 @@ def test_shutdown_writes_a_checkpoint_and_restart_parks_queued(tmp_path, monkeyp
         assert proc.returncode in (0, -signal.SIGTERM), (
             f"the server did not exit on SIGTERM: {proc.returncode}"
         )
-        # The server does not own this process (``_execution_state`` has
-        # no ``process`` for it), so it does not kill it either.  A pid
-        # that is still alive would make the second boot see a *live*
-        # run and judge nothing -- the whole point of the second half of
-        # this test is that the pid is gone.
-        stand_in.kill()
-        stand_in.wait(timeout=10)
-        assert stand_in.poll() is not None, "the stand-in executor survived"
+        # The executor is the server's own child now, and the shutdown
+        # path takes it down with the server (``_shutdown_all_executions``
+        # kills the process tree it holds a handle for).  A pid that is
+        # still alive would make the second boot see a *live* run and
+        # judge nothing -- the whole point of the second half of this
+        # test is that the executor is gone.
+        assert not _pid_alive(int(exec_pid)), (
+            f"the executor {exec_pid} outlived the server that owned it"
+        )
 
         # --- step 3: the checkpoint the shutdown left behind -------------
         checkpoint = _read_checkpoint(work)
@@ -1098,9 +1174,15 @@ def test_shutdown_writes_a_checkpoint_and_restart_parks_queued(tmp_path, monkeyp
                 _teardown_server(a_proc, a_url, PLAN_ID)
             except Exception:  # noqa: BLE001 - teardown must not raise
                 pass
-        if stand_in.poll() is None:
-            stand_in.kill()
+        # The executor belongs to the server that started it, and that
+        # server's shutdown path takes it down; a stand-in that outlived
+        # its server would be residue this test has to clean up.
+        try:
+            leftover = _read_execution_row(work).get("exec_pid")
+        except Exception:  # noqa: BLE001 - the run may never have started
+            leftover = None
+        if leftover and _pid_alive(int(leftover)):
             try:
-                stand_in.wait(timeout=10)
-            except Exception:  # noqa: BLE001
+                os.kill(int(leftover), signal.SIGKILL)
+            except OSError:
                 pass
