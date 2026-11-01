@@ -23,6 +23,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -130,6 +131,7 @@ from config_paths import (
     STATE_DB,
     STATE_DB_ENV,
     resolve_config_dir,
+    resolve_plans_dir,
     resolve_scheduler_file,
     resolve_server_host,
     resolve_state_db_path,
@@ -172,6 +174,13 @@ try:  # pragma: no cover - the repo always ships service_manager.py
 except Exception:  # noqa: BLE001
     _reap_services = None
 
+# ``ReapReport`` is only ever needed to *name* a type in a signature, so it
+# is imported for the type checker alone: the annotation is a string and
+# nothing is resolved at runtime. Keeping it out of the import blocks above
+# leaves this module's runtime dependency exactly what it was — one
+# callable per sweep, one try/except.
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from service_manager import ReapReport
 #: The one function that signals a service.  Resolved at import time for
 #: the same reason the reaps above are: the shutdown path runs from an
 #: ``atexit`` hook, after the interpreter has begun tearing down, and an
@@ -261,12 +270,14 @@ except Exception:  # noqa: BLE001 - a missing module must not break startup
 # tree's real plans/ directory (hundreds of plan dirs to recover)
 # against an empty git-archive baseline — an apples-to-oranges gap
 # that has nothing to do with code regressions.
-_PLANS_DIR_OVERRIDE = _os.environ.get("PDT_PLANS_DIR")
-PLANS_DIR = (
-    Path(_PLANS_DIR_OVERRIDE)
-    if _PLANS_DIR_OVERRIDE
-    else Path(__file__).parent.parent / "plans"
-)
+#
+# 2026-10-31: the root comes from ``config_paths.resolve_plans_dir()``
+# instead of being read here. The server used to keep a *relative*
+# ``PDT_PLANS_DIR`` exactly as it was, so the root named one directory
+# for the backend and another for the executor it starts (whose
+# working directory is ``backend/``). The resolver anchors a relative
+# value on the repository root, so both processes mean the same tree.
+PLANS_DIR = resolve_plans_dir()
 PLANS_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -1886,6 +1897,13 @@ def _run_boot_sweeps() -> None:
     # ours can legitimately be running, which makes it the safe place to
     # clean up after a previous life. Only ledger-recorded, still
     # identifiable processes are stopped — see ``service_manager``.
+    #
+    # 2026-11-01: "nothing of ours can legitimately be running" is not
+    # quite true any more. A plan the **scheduler** holds is running on
+    # purpose across a restart of the backend: the scheduler adopts it
+    # and re-times its slot from the moment of the restart. So the sweep
+    # is told to leave those plans alone (``adopt_scheduler_runs``) —
+    # everything else is still cleaned up after the previous life.
     if _reap_all_plans is None:
         logger.warning(
             "[service_manager] unavailable; startup orphan sweep skipped"
@@ -1894,6 +1912,12 @@ def _run_boot_sweeps() -> None:
         try:
             _swept = _reap_all_plans(
                 PLANS_DIR, reason="startup_sweep",
+                # The scheduler adopts the runs that outlived the
+                # previous backend: a plan it holds is still working,
+                # and the sweep must not take it away.  The shutdown
+                # sweep does not say so — there the backend is going
+                # away and the runs go with it.
+                adopt_scheduler_runs=True,
                 caller="server.startup_sweep",
             )
             _swept_reaped = [r for r in _swept if r.reaped or not r.clean]
@@ -4197,6 +4221,57 @@ def _kill_process_tree(
     return True
 
 
+def _sweep_process_ledgers(
+    plans_dir: Path, *, reason: str, **sweep_options: Any
+) -> List["ReapReport"]:
+    """Reap every plan's processes through the ledger, and report what went.
+
+    The memory handles are not the truth.  ``_execution_state`` holds a
+    ``Popen`` for the plans this backend started *and still remembers*;
+    a backend that is stopped with SIGTERM, restarted, or killed loses
+    them, while the ledger on disk keeps naming the processes.  A sweep
+    that only walks the memory therefore leaves exactly the orphans it
+    was written to prevent.
+
+    It does not walk the ledger itself: ``service_manager.reap_all_plans``
+    is the one place that knows how to find a plan's ledger and how to
+    reap what it names — the identity check against the kernel (a pid we
+    cannot vouch for is reported, never signalled) and children before
+    parents.  What no ledger names is not touched at all, and every plan
+    is read from its own ledger: that is how the backend itself, Docker
+    and every other plan stay out of this one.  A second copy of those
+    rules here would be a second set of rules to drift apart.
+
+    ``roles`` is left at its default (``None`` — every role in the tree):
+    a plan's executor, its sub-agents and its services all have to go
+    with the backend that started them.
+
+    ``_reap_all_plans`` is the import-time reference (see the note where
+    it is bound, at the top of this module).  This runs from ``atexit``,
+    i.e. after teardown has begun, so it must not resolve an import here
+    — that is exactly the failure this reference exists to avoid.
+
+    Args:
+        plans_dir: The directory the plans live in.
+        reason: Why the sweep is running; it is written into the
+            ledger's events.
+        **sweep_options: The sweep's own options, handed to
+            ``reap_all_plans`` unchanged — ``release_own_owners`` and
+            ``caller`` among them.  The wrapper owns *where* the sweep
+            is called from; it does not get a second opinion about what
+            the sweep does.
+
+    Returns:
+        One report per plan that was swept.  A plan that raised is
+        logged and skipped — that tolerance belongs to
+        ``reap_all_plans``, once, and is not repeated here.
+    """
+    if _reap_all_plans is None:
+        logger.warning("[service_manager] unavailable; ledger sweep skipped")
+        return []
+    return _reap_all_plans(plans_dir, reason=reason, **sweep_options)
+
+
 def _shutdown_all_executions() -> None:
     """Terminate all running execution and verification subprocesses.
 
@@ -4215,6 +4290,10 @@ def _shutdown_all_executions() -> None:
     shutdown every remaining plan its SIGTERM.  So the writer's own
     failures (it reports them in ``report['failed']``) and a writer that
     raises outright are both logged and stepped over.
+    Two passes, in this order: the in-memory handles first (they know
+    the process object and can be killed directly), then the ledgers —
+    which is what covers the plans whose handle the backend no longer
+    has.
     """
     try:
         from shutdown_checkpoint import write_shutdown_checkpoints
@@ -4254,10 +4333,11 @@ def _shutdown_all_executions() -> None:
     # startup — is what makes "no orphan" hold across a crash, not just
     # across a clean exit.
     #
-    # ``_reap_all_plans`` is the import-time reference (see the note where
-    # it is bound, at the top of this module). This runs from ``atexit``,
-    # i.e. after teardown has begun, so it must not resolve an import here
-    # — that is exactly the failure this reference exists to avoid.
+    # The sweep goes through ``_sweep_process_ledgers``, which
+    # delegates to ``service_manager.reap_all_plans``: the one place
+    # that knows how to walk a plans directory and how to reap what a
+    # ledger names.  It runs after the in-memory handles above, so a
+    # plan whose handle is gone is still covered.
     #
     # ``release_own_owners=True`` (2026-10-24): this process is going
     # away, so the rounds it registered are over and the services they
@@ -4265,14 +4345,15 @@ def _shutdown_all_executions() -> None:
     # tokens still name this (live) pid and the sweep would consider
     # those entries the property of a running round — and leave the
     # backend's own services holding their ports after it exited.
-    if _reap_all_plans is not None:
-        try:
-            _reap_all_plans(
-                PLANS_DIR, reason="server_shutdown", release_own_owners=True,
-                caller="server.shutdown_sweep",
-            )
-        except Exception:  # pragma: no cover - shutdown must never raise
-            logger.exception("[service_manager] shutdown service reap failed")
+    try:
+        _sweep_process_ledgers(
+            PLANS_DIR,
+            reason="server_shutdown",
+            release_own_owners=True,
+            caller="server.shutdown_sweep",
+        )
+    except Exception:  # pragma: no cover - shutdown must never raise
+        logger.exception("[service_manager] shutdown ledger sweep failed")
 
 # Ensure subprocess cleanup even on abrupt process exit (SIGKILL bypasses
 # this, but SIGTERM / unhandled exception / sys.exit all trigger atexit).

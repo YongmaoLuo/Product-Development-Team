@@ -2733,6 +2733,64 @@ def _handle_stuck_sub_agent(plan_id: str, handle) -> None:
     )
 
 
+def _repair_exit_writer(
+    plan_id: str,
+    plan_dir: Path,
+) -> Callable[[Any, Optional[int], str], None]:
+    """Return the one-shot writer for a repair round's exit event.
+
+    Both repair paths — the synchronous :func:`_run_repair_execution`
+    and the asynchronous :func:`_run_repair_execution_async` — have to
+    close the pid they opened. A pid the backend has stopped tracking
+    must not stay live in the ledger: the reaper goes on believing a
+    process nobody watches is still running, and goes on collecting it,
+    round after round, for a process that ended long ago.
+
+    One writer, one rule, so the two paths cannot drift apart:
+
+    * the first call wins, and every later call is a no-op — the exit
+      of a round is written once, not once per branch;
+    * the ledger is evidence, not a gate. A read-only plan directory
+      or a full disk must not cost the operator the repair round they
+      asked for. The failure is logged and the round continues.
+    """
+    written = False
+
+    def _write(
+        process: Any,
+        exit_code: Optional[int],
+        detail: str,
+    ) -> None:
+        nonlocal written
+        if written:
+            return
+        pid = getattr(process, "pid", None) if process is not None else None
+        if not pid:
+            # No pid means nothing was spawned — there is no process to
+            # close, and an exit for it would be a phantom.
+            return
+        written = True
+        try:
+            # Imported lazily, not at module level: ``server`` imports
+            # this module, so a module-level import of
+            # ``routes.execution`` (which ``server`` imports too) would
+            # add a second edge to a cycle that already exists — and
+            # importing this module first already trips it. The lazy
+            # import resolves the name at call time, when both modules
+            # are loaded.
+            from routes.execution import _ledger_write_exit
+            _ledger_write_exit(plan_dir, pid, exit_code, detail=detail)
+        except Exception:  # noqa: BLE001 — the ledger must never break a round
+            _server.logger.warning(
+                "repair_executor_exit_ledger_write_failed plan=%s pid=%s",
+                plan_id,
+                pid,
+                exc_info=True,
+            )
+
+    return _write
+
+
 def _run_repair_execution(plan_id: str, project_dir: Path, tool: Optional[str] = None) -> bool:
     """Run repair task execution via CLI.
 
@@ -2764,12 +2822,33 @@ def _run_repair_execution(plan_id: str, project_dir: Path, tool: Optional[str] =
     The ``verification_tasks_file`` parameter is gone — the
     ``verification_tasks_round_N.json`` snapshot is no longer read
     by the executor subprocess.
+
+    2026-10-30 (process ledger):
+
+    The repair round is recorded on the process ledger under its own
+    role, ``repair_executor``. The reaper reaps by role and in a fixed
+    order (children first, parents last), so a repair executor
+    recorded as a plain ``executor`` is indistinguishable from the
+    plan's main executor — and the ordering that lets the repair round
+    be torn down *before* the main executor is lost.
+
+    The exit is written after ``process.wait()``: a process that has
+    not ended cannot have exited. The ``finally`` writes it even when
+    the round blows up before or during the wait — a pid the backend
+    has stopped tracking must not stay live in the ledger, or the
+    reaper goes on believing a process nobody watches is still
+    running. A ledger that cannot be written never breaks the round:
+    the ledger is evidence, not a gate.
     """
     backend_dir = _server._BACKEND_DIR
     plan_dir = _server._plan_dir(plan_id)
     tasks_file = plan_dir / "tasks.json"
 
     log_path = plan_dir / "logs" / f"repair_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    process: Optional[subprocess.Popen] = None
+    # One writer for both repair paths — see :func:`_repair_exit_writer`.
+    write_exit = _repair_exit_writer(plan_id, plan_dir)
 
     try:
         # Single shared helper — same drain strategy as
@@ -2781,6 +2860,9 @@ def _run_repair_execution(plan_id: str, project_dir: Path, tool: Optional[str] =
         # ``--verification-tasks``): repair tasks live in
         # ``state.db`` and the executor reconciles them via
         # ``_load_tasks`` Phase 2.
+        #
+        # ``role="repair_executor"``: this executor is the plan's
+        # child, and the reaper has to be able to say so.
         process, _log = _server._spawn_executor_subprocess(
             plan_id=plan_id,
             backend_dir=backend_dir,
@@ -2789,14 +2871,22 @@ def _run_repair_execution(plan_id: str, project_dir: Path, tool: Optional[str] =
             tool=tool,
             extra_args=None,
             log_path=log_path,
+            role="repair_executor",
         )
         # Synchronous wait is safe here: the subprocess writes to a
         # log file, not a PIPE, so it never blocks waiting for a
         # reader. This mirrors how a supervisor handles long-running
         # agent subprocesses — see ``cmd.WaitDelay = 3 * time.Second`` for the Go reference.
         returncode = process.wait()
+        # The process really has ended — the exit is written here and
+        # nowhere earlier.
+        write_exit(process, returncode, "repair_finished")
         return returncode == 0
     finally:
+        # The exit for a round that died before or during the wait:
+        # the pid is not live any more, so the ledger must not say it
+        # is. No-op after the normal path already wrote it.
+        write_exit(process, None, "repair_aborted")
         # Belt-and-suspenders: if any legacy ``tasks_with_repair_round_*.json``
         # file is still sitting in the plan directory from a pre-2026-09-08
         # run, remove it so it doesn't get picked up by a future read.
@@ -3095,6 +3185,15 @@ def _run_repair_execution_async(
     # stdout→log-file redirect + no-PIPE-buffer deadlock fix from
     # plan 2026-09-06 carries over.
     #
+    # ``role="repair_executor"``: this executor is the plan's child,
+    # and the reaper has to be able to say so. It reaps by role and in
+    # a fixed order (children first, parents last), so a repair
+    # executor recorded as a plain ``executor`` is indistinguishable
+    # from the plan's main executor — and the ordering that lets the
+    # repair round be torn down *before* the main executor is lost.
+    # This is the path production actually runs: the synchronous
+    # :func:`_run_repair_execution` has no production caller.
+    #
     # ``extra_env`` carries the scene (see the docstring): the executor is
     # a child process, so the environment is the only channel that reaches
     # it.  ``None`` means "no scene" — the helper adds nothing then, and
@@ -3109,6 +3208,7 @@ def _run_repair_execution_async(
             tool=tool,
             extra_args=None,
             log_path=log_path,
+            role="repair_executor",
             extra_env=extra_env,
         )
     except OSError as exc:
@@ -3185,6 +3285,12 @@ def _run_repair_execution_async(
             plan_id,
         )
 
+    # One writer for both repair paths — see :func:`_repair_exit_writer`.
+    # The exit is written from the background thread, because the exit
+    # happens there: this function returns while the subprocess is
+    # still running.
+    write_exit = _repair_exit_writer(plan_id, plan_dir)
+
     def _run() -> None:
         try:
             # ``process.wait()`` is safe — stdout/stderr redirected to
@@ -3194,6 +3300,11 @@ def _run_repair_execution_async(
             # updated ``_execution_state[plan_id].pid`` and will fire
             # ``_mark_failed_dead`` if the subprocess crashes.
             process.wait()
+            # The process really has ended — the exit is written here
+            # and nowhere earlier. Without it the pid stays in the
+            # live set of the ledger forever, and the reaper goes on
+            # collecting a process that ended long ago.
+            write_exit(process, process.returncode, "repair_finished")
             with _server._execution_state_lock:
                 # 2026-10-23: the "finished cleanly" flag is the executor
                 # watchdog's yield signal — ``_lazy_check_execution``
@@ -3338,6 +3449,11 @@ def _run_repair_execution_async(
                         "[repair_async] on_complete(-1) crashed plan=%s",
                         plan_id,
                     )
+        finally:
+            # The exit for a round that died before or during the wait:
+            # the pid is not live any more, so the ledger must not say
+            # it is. No-op after the normal path already wrote it.
+            write_exit(process, None, "repair_aborted")
 
     # Usage-registry attribution: bind plan_id for every LLM call the
     # repair async path makes (repair generation + verification round).

@@ -15,6 +15,7 @@ construction.
 """
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import List, Dict, Optional, Iterable
@@ -26,6 +27,26 @@ from orphan_rules import (
     has_mergeable_content as _orphan_has_mergeable_content,
     merged_subtask_kwargs as _orphan_merged_subtask_kwargs,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class TasksFileMissingError(FileNotFoundError):
+    """The plan's tasks file is not there — there is nothing to run.
+
+    Raised instead of quietly yielding an empty task list.
+
+    **Why (2026-10-31).** The executor's recovery path (``--recover``)
+    skips the load and runs on whatever the manager holds. A missing
+    ``tasks.json`` used to mean an empty list, so the executor started,
+    found no tasks, and exited **successfully** — and the backend, which
+    reads "the executor ended" as "the run finished", reported the plan
+    as failed and had no process tree to kill when the run was asked
+    to stop.
+
+    Inherits from :class:`FileNotFoundError` so a caller that already
+    handles "the file is not there" keeps working.
+    """
 
 
 class CycleInTaskGraph(ValueError):
@@ -275,9 +296,24 @@ class TaskManager:
         tasks_file: Optional[Path] = None,
         runtime_overrides: Optional[Dict[str, Dict]] = None,
     ):
+        """Manage the plan's tasks.
+
+        Args:
+            project_dir: the directory the work happens in.
+            tasks_file: the plan's ``tasks.json``.
+            runtime_overrides: runtime state read from SQLite, overlaid
+                on the static rows read from disk.
+
+        A missing ``tasks.json`` does not stop the manager from being
+        built — a caller may be about to *write* it (the fast-lane
+        import creates a plan's ``tasks.json`` from an imported PRD).
+        It arms a refusal instead, which fires when the task list is
+        read; see :attr:`tasks`.
+        """
         self.tasks_file = tasks_file or project_dir / "tasks.json"
         self.runtime_overrides: Dict[str, Dict] = runtime_overrides or {}
-        self.tasks: List[SubTask] = []
+        self._tasks: List[SubTask] = []
+        self._tasks_file_missing = False
         self.requirement: str = ""
         self.stop_reason: Optional[str] = None
         self.reason_detail: Optional[str] = None
@@ -298,7 +334,55 @@ class TaskManager:
             )
         except ValueError:
             self.plan_id = None
-        self.load_tasks()
+        try:
+            self.load_tasks()
+        except TasksFileMissingError:
+            # The refusal is *armed*, not raised: the manager may be
+            # built for a plan whose tasks file is about to be written.
+            # It fires when the task list is read — see ``tasks``.
+            self._tasks_file_missing = True
+
+    @property
+    def tasks(self) -> List[SubTask]:
+        """The plan's tasks.
+
+        Reading this raises :class:`TasksFileMissingError` when the
+        plan's ``tasks.json`` is not there.
+
+        **Why the refusal waits for the read (2026-10-31).** A manager
+        is built both to *read* a plan and to *write* one, and the two
+        are told apart by what the caller does next, not by how the
+        manager was constructed: the executor is handed the plan's own
+        ``tasks.json`` and runs it, while the fast-lane import builds a
+        manager for a plan whose ``tasks.json`` does not exist yet and
+        writes it. So the missing file is recorded at construction and
+        the refusal fires on the read — a caller that takes over the
+        task list (assignment, :meth:`set_tasks`) clears it.
+
+        Without this, a missing file read as "a plan with no tasks":
+        the executor's recovery path skips the load, starts, finds
+        nothing to do and exits **successfully** — and the backend,
+        which reads "the executor ended" as "the run finished", had no
+        process tree to kill when the run was asked for it to stop.
+        """
+        if self._tasks_file_missing:
+            logger.error(
+                "task_manager: the tasks file is missing path=%s — a plan "
+                "without its tasks file cannot be run",
+                self.tasks_file,
+            )
+            raise TasksFileMissingError(
+                f"tasks file not found: {self.tasks_file}"
+            )
+        return self._tasks
+
+    @tasks.setter
+    def tasks(self, value: List[SubTask]) -> None:
+        self._tasks = value
+        # The caller has taken over the task list — it is about to
+        # write the file. The missing-file refusal does not apply to
+        # it any more.
+        self._tasks_file_missing = False
 
     def load_tasks(self):
         """Load tasks from tasks.json file.
@@ -309,9 +393,20 @@ class TaskManager:
         ``self.runtime_overrides`` if supplied. Without the
         override map, runtime fields fall back to the ``SubTask``
         default (``status="pending"`` / ``updated_time=None`` / etc).
+
+        Raises:
+            TasksFileMissingError: the tasks file is not there. A
+                missing file is never the same thing as an empty plan
+                (2026-10-31) — the executor would otherwise start, find
+                nothing to do, and exit successfully. The constructor
+                catches this and arms the refusal on :attr:`tasks`
+                instead of raising it, because a manager may be built
+                for a plan whose tasks file is about to be written.
         """
         if not self.tasks_file.exists():
-            return
+            raise TasksFileMissingError(
+                f"tasks file not found: {self.tasks_file}"
+            )
 
         with open(self.tasks_file, "r") as f:
             data = json.load(f)
@@ -383,7 +478,10 @@ class TaskManager:
         2026-09-05) cannot persist and silently break the next
         executor restart.
         """
-        _ensure_acyclic(self.tasks)
+        # The private list, not the property: saving is a *write*, and a
+        # write must not be blocked by the read-side refusal that fires
+        # when the plan's tasks file is missing.
+        _ensure_acyclic(self._tasks)
         # 2026-09-16: ``agent._load_tasks`` Phase 2 may have appended
         # placeholder SubTask objects to ``self.tasks`` for status-only
         # rows that exist in DB but not on disk.  Placeholders have no
@@ -392,7 +490,7 @@ class TaskManager:
         # the source of truth for static fields.  Filter by the
         # ``_origin`` tag the hydrate step sets.
         persistable = [
-            t for t in self.tasks
+            t for t in self._tasks
             if getattr(t, "_origin", None) != "db_orphan"
         ]
         tasks_data = []
@@ -438,7 +536,7 @@ class TaskManager:
             requirement: Optional requirement string
         """
         new_tasks = []
-        existing_tasks_map = {t.id: t for t in self.tasks}
+        existing_tasks_map = {t.id: t for t in self._tasks}
 
         for new_task_dict in tasks:
             task_id = new_task_dict.get("id")

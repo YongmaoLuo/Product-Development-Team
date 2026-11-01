@@ -73,6 +73,15 @@ class TestRecoverExecutionStates:
         assert _execution_state[plan_id]["status"] == "running"
 
     def test_recover_running_dead(self, sample_plan_factory, monkeypatch):
+        """A pid that is gone: the run is parked, not failed.
+
+        The startup reconcile (2026-10-31) parks a plan whose executor
+        is gone as ``stopped``: the restart interrupted the run, but
+        nothing proves *how* it ended, so nothing claims that it died
+        unexpectedly.  A shutdown checkpoint is the evidence that says
+        "the server went down", and it parks the plan in ``queued``
+        instead (``routes.execution._shutdown_interrupted_this_run``).
+        """
         plan_dir = sample_plan_factory(phase="executing")
         plan_id = plan_dir.name
         _seed_execution_row(
@@ -86,10 +95,10 @@ class TestRecoverExecutionStates:
         _execution_state.clear()
         _recover_execution_states(plan_dir.parent)
 
-        assert _execution_state[plan_id]["status"] == "failed"
-        assert _execution_state[plan_id]["stop_reason"] == "process_died_unexpectedly"
+        assert _execution_state[plan_id]["status"] == "stopped"
+        assert _execution_state[plan_id]["stop_reason"] == "startup_reconcile"
         ps = PlanState(plan_dir)
-        assert ps.get_current_phase() == "failed"
+        assert ps.get_current_phase() == "stopped"
 
     def test_recover_missing_pid(self, sample_plan_factory):
         plan_dir = sample_plan_factory(phase="executing")

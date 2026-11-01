@@ -69,6 +69,16 @@ ac_server_boot_id
 logs/
 bridge.out
 
+# The executor's single-instance lock.
+#
+# It is a runtime artifact: `backend/executor_lock.py` flocks it while a
+# plan's executor runs, so the file's *content* changes from run to run
+# and it means nothing outside the machine that wrote it. It was tracked
+# by accident and every `git add -A` would have shipped whatever the last
+# run left in it. The file itself stays on disk — only the index entry
+# goes.
+executor.lock
+
 # A plan artefact written into the wrong place.
 #
 # The canonical home for a plan's ``verification_plan.json`` is

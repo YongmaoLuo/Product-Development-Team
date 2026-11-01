@@ -1,4 +1,4 @@
-"""HTTP contract: a crashed execution is still failed after a restart.
+"""HTTP contract: a crashed execution is parked after a restart.
 
 The criterion this file pins
 ----------------------------
@@ -19,12 +19,14 @@ evidence.
 
 This file turns the criterion into a repeatable HTTP contract test:
 
-  * ``test_crashed_running_execution_is_marked_failed``
+  * ``test_crashed_running_execution_is_parked_stopped``
     The whole application boots — the real FastAPI lifespan, which is
     what calls ``routes.execution._recover_execution_states`` — and the
-    crashed plan is then read over HTTP.  The answer must be ``failed``
-    with ``stop_reason='process_died_unexpectedly'``.  A crash is not a
-    quota wait: nothing about the run may read as ``waiting_for_quota``.
+    crashed plan is then read over HTTP.  The answer must be
+    ``stopped`` with ``stop_reason='startup_reconcile'``: the boot scan
+    parks a run whose executor is gone instead of failing it.  A crash
+    is not a quota wait: nothing about the run may read as
+    ``waiting_for_quota``.
 
   * ``test_crash_verdict_survives_a_restart``
     The crash verdict has to outlive the process that noticed it.  The
@@ -33,19 +35,28 @@ This file turns the criterion into a repeatable HTTP contract test:
     restart must read back the *same* verdict from the row — not
     ``running``, not ``not_started``, and not a lost ``stop_reason``.
 
-  * ``test_vp_009_crashed_execution_without_marker_stays_failed``
+  * ``test_vp_009_crashed_execution_without_marker_is_parked_stopped``
     The negative control of the capacity-wait criterion, as a contract
     test: a process that really died and carries no wait marker must
-    still be judged ``failed`` — it must never be washed into "waiting
-    for quota".  It also pins the half that made the criterion fail in
-    the first place: the verdict has to be *written* when it is reached
-    and *replayable* afterwards, so a reader that holds nothing but the
-    row reads back the same verdict with the same end time.
+    never be washed into "waiting for quota" — the boot scan parks it
+    as ``stopped`` / ``startup_reconcile``.  It also pins the half that
+    made the criterion fail in the first place: the verdict has to be
+    *written* when it is reached and *replayable* afterwards, so a
+    reader that holds nothing but the row reads back the same verdict
+    with the same end time.
 
 One rule, two homes: **only a ``running`` execution is probed for
 liveness, and a probe that finds the process gone is a crash.**  The
-boot-time recovery and the runtime watchdog both carry that rule, and
-both must leave a crashed plan failed.
+boot-time recovery and the runtime watchdog both carry that rule.
+
+The two homes do not stop at the same word.  The boot scan
+(``routes.execution._park_reconciled_plan``) parks the crashed plan as
+``stopped`` with ``stop_reason='startup_reconcile'`` — the run is over
+for this process and the plan is left parked rather than failed.  The
+runtime watchdog (``verification_loop._lazy_check_execution``) judges
+the crash itself and writes ``failed`` /
+``process_died_unexpectedly``.  Both verdicts are terminal, and
+neither of them is a quota wait.
 
 The fixtures are hermetic: the plans tree and the state database live
 under the test's own ``tmp_path`` — the autouse ``isolated_plans_dir``
@@ -266,30 +277,30 @@ def _running_in_memory_state(
 
 
 # ---------------------------------------------------------------------------
-# 1. A crashed execution reads as failed — never as a quota wait
+# 1. A crashed execution reads as parked — never as a quota wait
 # ---------------------------------------------------------------------------
 
 
-def test_crashed_running_execution_is_marked_failed(
+def test_crashed_running_execution_is_parked_stopped(
     crashed_execution: SimpleNamespace,
 ) -> None:
-    """A crashed execution is ``failed``, and says why.
+    """A crashed execution is parked as ``stopped``, and says why.
 
     The whole application boots here — the real FastAPI lifespan — and
     the lifespan is what calls
     ``routes.execution._recover_execution_states``.  That scan walks the
     plans tree and probes the PID of every row that claims to be
     ``running``.  This one claims to be running and its process is gone,
-    so the probe must find it dead and the run must be marked failed.
+    so the probe must find it dead and the run must be parked.
 
     The verdict has to be legible from the interface, because that is
     the only place an operator can see it:
 
-      * ``status`` is ``failed`` — a crash is not a quota wait, and the
+      * ``status`` is ``stopped`` — a crash is not a quota wait, and the
         answer must not read as ``waiting_for_quota``;
-      * ``stop_reason`` is ``process_died_unexpectedly`` — the reason the
-        run ended, which is the whole difference between "we are waiting
-        for capacity" and "this died";
+      * ``stop_reason`` is ``startup_reconcile`` — the boot scan found
+        the executor gone and parked the plan rather than failing it,
+        and the reason says which of the two happened;
       * no live pid is reported.  A pid belongs to a process that is
         gone; every "is this execution alive?" reader believes a pid
         means alive.
@@ -299,15 +310,16 @@ def test_crashed_running_execution_is_marked_failed(
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["status"] == "failed", (
+    assert body["status"] == "stopped", (
         f"the crash was read as {body['status']!r}; a crashed run is "
-        f"failed — and it is certainly not a quota wait — {body!r}"
+        f"parked as stopped — and it is certainly not a quota wait — "
+        f"{body!r}"
     )
-    assert body["stop_reason"] == "process_died_unexpectedly", (
+    assert body["stop_reason"] == "startup_reconcile", (
         f"the interface does not say why the run ended: {body!r}"
     )
     assert body["ended_at"] is not None, (
-        f"a failed execution has ended, so it must carry an end time: "
+        f"a stopped execution has ended, so it must carry an end time: "
         f"{body!r}"
     )
     assert body["pid"] is None, (
@@ -318,10 +330,10 @@ def test_crashed_running_execution_is_marked_failed(
     # And the row says the same thing, so the verdict outlives this
     # process.
     row = _execution_row(PLAN_ID)
-    assert row["exec_status"] == "failed", (
+    assert row["exec_status"] == "stopped", (
         f"the row still says {row['exec_status']!r}: {row!r}"
     )
-    assert row["stop_reason"] == "process_died_unexpectedly", (
+    assert row["stop_reason"] == "startup_reconcile", (
         f"the row does not record why the run ended: {row!r}"
     )
     assert row["exec_pid"] is None, (
@@ -423,16 +435,21 @@ def test_crash_verdict_survives_a_restart(
 # ---------------------------------------------------------------------------
 
 
-def test_vp_009_crashed_execution_without_marker_stays_failed(
+def test_vp_009_crashed_execution_without_marker_is_parked_stopped(
     crashed_execution: SimpleNamespace,
 ) -> None:
-    """A dead process with no wait marker is ``failed`` — and stays failed.
+    """A dead process with no wait marker is parked — and stays parked.
 
     This is the negative control of the capacity-wait criterion:
 
-        *a process that really died and carries no wait marker must still
-        be judged ``failed`` — it must never be washed into "waiting for
-        quota"*.
+        *a process that really died and carries no wait marker must
+        never be washed into "waiting for quota"*.
+
+    The boot scan parks such a run as ``stopped`` /
+    ``startup_reconcile`` — the run is over for this process, and the
+    plan is parked rather than failed — but the criterion's half is
+    unchanged: it is not a capacity wait, and it is not a run that
+    never started.
 
     The earlier rounds fixed *which* inputs the recovery scan and the
     watchdog judge from.  This round fixes **when the verdict is written
@@ -450,9 +467,9 @@ def test_vp_009_crashed_execution_without_marker_stays_failed(
     Four halves, one contract:
 
     1. **The write happens when the verdict is reached.**  The row says
-       ``failed`` / ``process_died_unexpectedly`` with the pid cleared
-       and the write stamped — not a row that still says ``running``
-       while the process is gone.
+       ``stopped`` / ``startup_reconcile`` with the pid cleared and the
+       write stamped — not a row that still says ``running`` while the
+       process is gone.
     2. **The verdict replays.**  A reader that holds no in-memory state
        (another process, or the next boot) reads the same verdict off
        the row, with the *same* end time — one verdict, one timestamp,
@@ -479,15 +496,16 @@ def test_vp_009_crashed_execution_without_marker_stays_failed(
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["status"] == "failed", (
+    assert body["status"] == "stopped", (
         f"the crashed run reads as {body['status']!r}; a process that died "
-        f"is failed — and it is certainly not a quota wait — {body!r}"
+        f"is parked as stopped — and it is certainly not a quota wait — "
+        f"{body!r}"
     )
-    assert body["stop_reason"] == "process_died_unexpectedly", (
+    assert body["stop_reason"] == "startup_reconcile", (
         f"the interface does not say why the run ended: {body!r}"
     )
     assert body["ended_at"] is not None, (
-        f"a failed execution has ended, so it must carry an end time: "
+        f"a stopped execution has ended, so it must carry an end time: "
         f"{body!r}"
     )
     assert body["pid"] is None, (
@@ -496,11 +514,11 @@ def test_vp_009_crashed_execution_without_marker_stays_failed(
     )
 
     row = _execution_row(plan_id)
-    assert row["exec_status"] == "failed", (
+    assert row["exec_status"] == "stopped", (
         f"the row still says {row['exec_status']!r} although the process "
         f"is gone: {row!r}"
     )
-    assert row["stop_reason"] == "process_died_unexpectedly", (
+    assert row["stop_reason"] == "startup_reconcile", (
         f"the row does not record why the run ended: {row!r}"
     )
     assert row["exec_pid"] is None, (
@@ -543,11 +561,11 @@ def test_vp_009_crashed_execution_without_marker_stays_failed(
 
     assert resp.status_code == 200, resp.text
     replay = resp.json()
-    assert replay["status"] == "failed", (
+    assert replay["status"] == "stopped", (
         f"the crash reads as {replay['status']!r} for a reader that only "
         f"has the row — the verdict did not replay: {replay!r}"
     )
-    assert replay["stop_reason"] == "process_died_unexpectedly", (
+    assert replay["stop_reason"] == "startup_reconcile", (
         f"the replayed verdict lost its reason: {replay!r}"
     )
     assert replay["ended_at"] == row["updated_at"], (
@@ -673,9 +691,9 @@ def test_crash_verdict_is_persisted_with_a_timestamp(
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["status"] == "failed", (
+    assert body["status"] == "stopped", (
         f"the crash reads as {body['status']!r}; a process that died is "
-        f"failed — {body!r}"
+        f"parked as stopped — {body!r}"
     )
 
     row = _execution_row(plan_id)
@@ -1071,17 +1089,17 @@ def _restart_the_round_service(db_path: Path) -> Path:
     return backup
 
 
-def test_a_failed_execution_stays_answerable_after_the_round_service_outlives_its_starter(
+def test_a_stopped_execution_stays_answerable_after_the_round_service_outlives_its_starter(
     crashed_execution: SimpleNamespace,
 ) -> None:
-    """A crashed run is still ``failed`` after the round's service restarts.
+    """A crashed run is still parked after the round's service restarts.
 
     The negative control of the capacity-wait criterion, across the
     restart: a process that really died and carries no wait marker must
-    be judged ``failed`` — ``process_died_unexpectedly`` — no matter
-    which instance of the service answers, and no matter that the
-    database was closed, checkpointed, backed up and opened again in
-    between.
+    never be washed into a quota wait — the boot scan parks it as
+    ``stopped`` / ``startup_reconcile`` — no matter which instance of
+    the service answers, and no matter that the database was closed,
+    checkpointed, backed up and opened again in between.
 
     The half that used to be missing is the *answerability*: the answer
     must be about the run that happened, and it must be attributable.
@@ -1118,12 +1136,13 @@ def test_a_failed_execution_stays_answerable_after_the_round_service_outlives_it
     body = resp.json()
 
     # --- the verdict ----------------------------------------------------
-    assert body["status"] == "failed", (
+    assert body["status"] == "stopped", (
         f"after the restart the crash reads as {body['status']!r}; a "
-        f"process that died is failed — and it is certainly not a quota "
-        f"wait, and certainly not a run that never started: {body!r}"
+        f"process that died is parked as stopped — and it is certainly "
+        f"not a quota wait, and certainly not a run that never started: "
+        f"{body!r}"
     )
-    assert body["stop_reason"] == "process_died_unexpectedly", (
+    assert body["stop_reason"] == "startup_reconcile", (
         f"after the restart the interface does not say why the run "
         f"ended: {body!r}"
     )
@@ -1134,11 +1153,11 @@ def test_a_failed_execution_stays_answerable_after_the_round_service_outlives_it
     )
 
     row = _execution_row(plan_id)
-    assert row["exec_status"] == "failed", (
+    assert row["exec_status"] == "stopped", (
         f"the row still says {row['exec_status']!r} although the process "
         f"is gone: {row!r}"
     )
-    assert row["stop_reason"] == "process_died_unexpectedly", (
+    assert row["stop_reason"] == "startup_reconcile", (
         f"the row does not record why the run ended: {row!r}"
     )
     assert body["ended_at"] == row["updated_at"], (

@@ -25,6 +25,15 @@ from config_registry import ConfigRegistry
 from config_loader import load_config_by_name
 from coding_tool import stop_all_live_dispatches
 from execution_logger import get_logger
+from executor_lock import LOCK_FILENAME, ExecutorLock, acquire
+from process_reaper import EXECUTOR_SIGNALS, reap_plan
+
+# The plan's ledger vocabulary.  The executor sweeps the plan's tree
+# when it is asked to stop, and it has to write the same words into the
+# plan's ledger as the backend's sweep writes: one ledger that holds
+# two vocabularies cannot say whether the plan's tree was collected.
+# Importing the registry installs that vocabulary.
+import sub_agent_registry  # noqa: F401
 from request_guard import REQUEST_HEADER, REQUEST_HEADER_VALUE
 
 #: What ``secrets show`` prints in place of a keychain index the
@@ -85,6 +94,16 @@ SUBCOMMANDS = (
     "verification",
 )
 
+#: The exit code the CLI uses when the single-instance guard refuses to
+#: start a second executor on a plan that already has one.
+#:
+#: It is not 1. 1 means "the run started and failed"; this means "the
+#: run was refused before it started". Those call for different
+#: responses from whatever watches the exit code — the first is a
+#: failure to retry, the second is a duplicate to ignore — so they get
+#: different codes.
+EXIT_ALREADY_RUNNING = 3
+
 
 def _leading_subcommand(argv) -> Optional[str]:
     """Return the subcommand ``argv`` opens with, or None.
@@ -101,6 +120,51 @@ def _leading_subcommand(argv) -> Optional[str]:
         return None
     first = argv[0]
     return first if first in SUBCOMMANDS else None
+
+
+def _executor_scope(tasks_file: Path) -> Tuple[Path, str]:
+    """The plan directory an executor run belongs to, and the plan id.
+
+    The guard lives on ``<plan>/executor.lock`` — the directory the
+    plan is named after. The executor is launched with ``--tasks-file
+    <plan>/tasks.json`` (``server.py``'s ``_spawn_executor``), and that
+    file's parent directory *is* the plan directory, by the same
+    convention ``server._plan_dir()`` and
+    ``task_manager.derive_plan_id_from_tasks_file()`` use. So the plan
+    id is that directory's name.
+
+    The path is resolved, because two executors that spell the same
+    plan differently — one with a relative path, one absolute, or one
+    through a symlinked ``/tmp`` — must land on one lock file and not
+    two.
+    """
+    plan_dir = Path(tasks_file).expanduser().resolve().parent
+    return plan_dir, plan_dir.name or str(plan_dir)
+
+
+def _lock_holder_pid(plan_dir: Path) -> Optional[int]:
+    """The pid of the process holding ``<plan>/executor.lock``.
+
+    The lock file's content is attribution only — the guard itself is
+    the kernel's ``flock`` — so this never decides whether the lock is
+    held. It makes the refusal specific ("pid 61791 already has it")
+    instead of vague, and a file that cannot be read, or that carries
+    no pid, leaves the refusal without a holder rather than turning it
+    into a different answer.
+    """
+    try:
+        content = (plan_dir / LOCK_FILENAME).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in content.splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() != "pid":
+            continue
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
 
 
 def build_parser(argv=None) -> argparse.ArgumentParser:
@@ -343,6 +407,21 @@ _STOP_SEQUENCE_WAIT_FRACTION = 0.9
 #: The exit code of a SIGTERM-stopped executor: 128 + SIGTERM(15).
 _STOP_EXIT_CODE = 143
 
+#: The exit code of a SIGINT-stopped executor: 128 + SIGINT(2).
+_STOP_SIGINT_EXIT_CODE = 130
+
+#: The plan the executor is running, and the lock it holds.
+#:
+#: The stop handler needs both when the signal arrives: the plan's
+#: directory is where the ledger lives (the tree is collected out of
+#: it), and the lock is what says "this plan is being worked on".
+#: They are set by :func:`main` before the run starts, so a handler
+#: installed outside a run — a test, a tool — simply has nothing to
+#: sweep and leaves the process alone.
+_executor_plan_dir: Optional[Path] = None
+_executor_plan_id: str = ""
+_executor_lock: Optional[ExecutorLock] = None
+
 #: Whether the handler is installed.  Installing twice must not stack a
 #: second handler on top of the first — the second would call the first,
 #: and the stop sequence would run twice over the same children.
@@ -425,6 +504,60 @@ def _stop_live_dispatches(budget: float) -> None:
         )
 
 
+def _sweep_executor_tree(signum: int) -> None:
+    """Collect the plan's tree out of the ledger, then release the lock.
+
+    The order is the point, and it is the branch's: **sweep, release,
+    exit**.  The sweep goes first because the lock is what says "this
+    plan is being worked on", and releasing it before the tree was
+    collected would let a second executor start against a tree that is
+    still running.  The release follows because a clean release is what
+    lets the next executor start at once instead of waiting for the
+    kernel to notice.
+
+    The sweep is the ledger's own: it stops only the pids the plan's
+    ledger has vouched for, it checks every one of them against the
+    kernel before it signals anything, and it kills children before
+    parents.  The cooperative stop above is a different thing — it
+    stops the dispatches this process is running — so the two do not
+    step on each other.
+
+    Never raises: a stop path that fails here still has to leave.
+    """
+    global _executor_lock
+
+    plan_dir = _executor_plan_dir
+    if plan_dir is None:
+        # Nothing is running under this handler (a test, a tool): there
+        # is no tree to collect.
+        return
+    reason = "executor_{}".format(
+        "sigterm" if signum == signal.SIGTERM else "sigint",
+    )
+    try:
+        # ``include_self=False``: the executor is the caller, and a
+        # sweep that signals its own caller is how a collection turns
+        # into an outage.
+        reap_plan(
+            plan_dir,
+            _executor_plan_id,
+            reason=reason,
+            include_self=False,
+        )
+    except Exception:  # noqa: BLE001 - a shutdown that raises stops half way
+        _stop_logger.exception("[stop] the %s sweep failed", reason)
+    finally:
+        lock = _executor_lock
+        _executor_lock = None
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:  # noqa: BLE001 - the exit must still happen
+                _stop_logger.exception(
+                    "[stop] the %s sweep could not release the lock", reason,
+                )
+
+
 def _on_sigterm(signum, frame) -> None:
     """Stop the children, then leave.  Installed as the SIGTERM handler.
 
@@ -461,7 +594,52 @@ def _on_sigterm(signum, frame) -> None:
             exc_info=True,
         )
 
+    # The plan's tree is collected out of the ledger before the process
+    # leaves.  The ledger sweep stops only the pids the plan's ledger
+    # has vouched for, and it is what writes the exit events the
+    # backend reads — so the plan's own tree does not outlive the
+    # executor that started it.
+    _sweep_executor_tree(signum)
+
     _exit_now(_STOP_EXIT_CODE)
+
+
+def _on_sigint(signum, frame) -> None:
+    """Answer SIGINT the way SIGTERM is answered: collect, release, go.
+
+    The exit code is 130 — ``128 + 2`` — the shell's own convention,
+    so whatever watches the executor can tell an interrupt from a
+    termination.  The work is the same work: the dispatches are
+    stopped, the plan's tree is collected out of the ledger, the lock
+    is released, and the process leaves.
+    """
+    global _stop_in_progress
+
+    if _stop_in_progress:
+        _exit_now(_STOP_SIGINT_EXIT_CODE)
+        return
+
+    _stop_in_progress = True
+
+    try:
+        budget = _stop_grace_seconds()
+        worker = threading.Thread(
+            target=_stop_live_dispatches,
+            args=(budget,),
+            name="pdt-stop-sequence",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=budget * _STOP_SEQUENCE_WAIT_FRACTION)
+    except Exception:  # noqa: BLE001 — the executor must still leave
+        _stop_logger.warning(
+            "[stop] could not run the stop sequence; exiting anyway",
+            exc_info=True,
+        )
+
+    _sweep_executor_tree(signum)
+
+    _exit_now(_STOP_SIGINT_EXIT_CODE)
 
 
 def install_stop_handler() -> None:
@@ -480,6 +658,7 @@ def install_stop_handler() -> None:
 
     try:
         signal.signal(signal.SIGTERM, _on_sigterm)
+        signal.signal(signal.SIGINT, _on_sigint)
     except (ValueError, OSError, RuntimeError):
         # Not the main thread, or the platform refuses.  A handler that
         # cannot be installed is no reason to refuse to run.
@@ -494,6 +673,7 @@ def install_stop_handler() -> None:
 
 def main():
     """Main entry point for CLI."""
+    global _executor_plan_dir, _executor_plan_id, _executor_lock
     from env_config import load_env
 
     load_env()
@@ -538,29 +718,135 @@ def main():
 
     tasks_file = Path(args.tasks_file) if args.tasks_file else None
 
+    # The single-instance guard.
+    #
+    # The lock is taken HERE, by the executor's own process, and not by
+    # whatever started it. An ``flock`` is released by the kernel when
+    # the holder's descriptor closes, so only the holder can be sure
+    # the lock goes away when it dies — a lock taken by the parent
+    # would outlive a killed executor, which is the case the guard
+    # exists for. Taking it here also means the refusal arrives at the
+    # door: before the orchestrator has claimed a provider connection
+    # or a task file, so the second run costs a second, not a crash
+    # halfway through.
+    plan_dir, plan_id = _executor_scope(
+        tasks_file if tasks_file is not None else Path(workspace_dir) / "tasks.json"
+    )
+
+    # The plan's own directory, handed to everything this run starts.
+    #
+    # The executor is the only process in the tree that knows which plan
+    # it is running: it was handed the plan's ``tasks.json``, and the
+    # directory that file lives in *is* the plan's directory. Its
+    # working directory is ``backend/`` and the plans root it resolves
+    # can be relative, so a process below the executor that rebuilds
+    # the plan's directory from the environment can name a different
+    # directory than the one the backend reads — and two ledgers for one
+    # plan is not a cosmetic problem. The backend's sweep cannot see
+    # the sub-agents, so the plan's live set never reaches zero and the
+    # order the tree was collected in cannot be read off the ledger.
+    #
+    # The absolute path removes the guesswork: every descendant writes
+    # its records into the one directory the backend sweeps.
+    os.environ["PDT_PLAN_DIR"] = str(plan_dir)
+
+    lock: Optional[ExecutorLock] = acquire(plan_dir)
+    if lock is None:
+        holder_pid = _lock_holder_pid(plan_dir)
+        print(
+            "already_running plan={} holder_pid={}".format(
+                plan_id, "unknown" if holder_pid is None else holder_pid
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_ALREADY_RUNNING)
+    # The executor's own signal handlers.
+    #
+    # Installed HERE — after the lock, and never at import time. The
+    # backend runs under uvicorn, which owns the SIGTERM/SIGINT
+    # handlers of the process it is in; a handler installed by an
+    # import would replace the server's own the moment anything
+    # imported this module, and the server would stop shutting down the
+    # way it was written to. The executor is a process of its own, and
+    # this is that process's handler: on SIGTERM/SIGINT it collects the
+    # plan's tree out of the ledger, releases the lock, and exits with
+    # the code the signal implies.
+    #
+    # The handlers belong to the *run*. Once the run is over the process
+    # belongs to whoever runs it next, and a handler left behind would
+    # answer signals on their behalf — so the handlers that were in
+    # place before the install are put back on the way out.
+    previous_handlers = {
+        signum: signal.getsignal(signum) for signum, _ in EXECUTOR_SIGNALS
+    }
+
+    # What the handler has to work with when the signal arrives: the
+    # plan's directory (where the ledger lives) and the lock the run
+    # holds.  The handler reads them when it fires, not when it is
+    # installed, so a run that starts later still sweeps the right
+    # tree.
+    global _executor_plan_dir, _executor_plan_id, _executor_lock
+    _executor_plan_dir = plan_dir
+    _executor_plan_id = plan_id
+    _executor_lock = lock
+
     # Install the stop handler *before* the run starts.  The executor is
     # the process the server signals, and a handler installed after the
     # first task had begun would miss the very signal it exists to
     # answer — leaving the ``claude`` child running with nobody left to
     # stop it.
+    #
+    # The handler does both halves of the stop, in that order: the
+    # cooperative stop first (it stops the dispatches this process is
+    # running), then the ledger sweep (it collects the plan's tree out
+    # of the one ledger the backend reads, and it stops only the pids
+    # that ledger has vouched for), then the release of the
+    # single-instance lock, and then the exit.  The exit is
+    # ``os._exit``, so the ``finally`` below never runs — the handler
+    # releases the lock itself, because it is the only place that
+    # still can.
     install_stop_handler()
 
-    autonomous_coding(
-        requirement=args.requirement,
-        project_dir=workspace_dir,
-        recover=args.recover,
-        max_tasks=args.max_tasks,
-        config_name=args.config,
-        tool=args.tool,
-        logger=logger,
-        tasks_file=tasks_file,
-        # ``args.verification_tasks`` is intentionally NOT forwarded
-        # to ``autonomous_coding``: server.py's ``_run_repair_execution``
-        # already merges the verification round's repair tasks into the
-        # canonical tasks.json before spawning this subprocess (audit
-        # 2026-08-26). The flag is accepted on the CLI for backwards
-        # compatibility with operators that pass it manually.
-    )
+    try:
+        autonomous_coding(
+            requirement=args.requirement,
+            project_dir=workspace_dir,
+            recover=args.recover,
+            max_tasks=args.max_tasks,
+            config_name=args.config,
+            tool=args.tool,
+            logger=logger,
+            tasks_file=tasks_file,
+            # ``args.verification_tasks`` is intentionally NOT forwarded
+            # to ``autonomous_coding``: server.py's ``_run_repair_execution``
+            # already merges the verification round's repair tasks into the
+            # canonical tasks.json before spawning this subprocess (audit
+            # 2026-08-26). The flag is accepted on the CLI for backwards
+            # compatibility with operators that pass it manually.
+        )
+    finally:
+        # Released on every way out, including a crash: a lock held by
+        # a process that died on its way through would need somebody to
+        # clear it. The lock *file* stays — deleting it would let the
+        # next acquirer lock a fresh inode nobody else is watching.
+        lock.release()
+        # The run is over, so the handler has nothing left to sweep and
+        # nothing left to release.  (The signal path never reaches this
+        # block — it ends the process with ``os._exit`` — and it
+        # releases the lock itself, because it is the only place that
+        # still can.)
+        _executor_plan_dir = None
+        _executor_plan_id = ""
+        _executor_lock = None
+        # The handlers go back with the run. A failure here must not
+        # mask the outcome being reported, so it is swallowed.
+        for signum, handler in previous_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                # Not the main thread, or the platform refuses. There is
+                # nothing to restore into and nothing to report to.
+                pass
 
 
 def handle_rollback_command(args):

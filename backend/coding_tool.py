@@ -36,6 +36,10 @@ from contextlib import contextmanager
 
 from utils.process import kill_process_group
 from utils.secret_files import private_dir, redact_all, write_private_json
+# The one resolver for the plans root (stdlib only, no backend imports),
+# so this module and the backend agree on which tree "the plans root"
+# means even when the environment names it relatively.
+from config_paths import resolve_plans_dir
 # Sub-agent sandbox wrapping (2026-10-06). Dependency-free (stdlib only)
 # and it imports nothing from this module, so a top-level import is safe.
 import claude_sandbox
@@ -181,6 +185,18 @@ def _register_dispatch(scoped_tool, plan_id: Optional[str]):
     Registration is best-effort by construction: the registry is a
     watchdog aid, and a dispatch that cannot be watched must still run.
 
+    **The process is recorded too.** The dispatch has just started a
+    subprocess, and the facts that identify it — the pid, the process
+    group it leads, the kernel's start time and the command line — are
+    only knowable *now*. They go onto the handle and onto the plan's
+    process ledger, so a backend that dies leaves a record of what it
+    started instead of an orphan nobody can name. The record is
+    written whether or not this call is the one that *created* the
+    handle: the VP sub-agent, the binary-rebuild agent and the
+    service-restart agent all register their own handle before they
+    dispatch, and the process that is running belongs to that handle
+    either way.
+
     **Why the ``vp_id`` is unique per dispatch.** ``register_sub_agent``
     is idempotent on ``(plan_id, vp_id, attempt)``: re-registering the
     same pair does *not* add a second handle, it REFRESHES the existing
@@ -207,23 +223,40 @@ def _register_dispatch(scoped_tool, plan_id: Optional[str]):
     second handle for the same tool would double the watchdog's view of
     one subprocess and break the invariant that one live handle means
     one live subprocess. When the tool already has a live handle under
-    this plan, the dispatch leaves the registry alone.
+    this plan, the dispatch leaves the registry alone — the handle
+    stays the owner's, and the process is recorded against *it*.
     """
     if not plan_id:
         return None, None
     try:
         from sub_agent_registry import sub_agent_registry
 
+        owner_handle = None
         for existing in sub_agent_registry.all_handles(plan_id):
             if getattr(existing, "scoped_tool", None) is scoped_tool:
-                return None, None
+                owner_handle = existing
+                break
 
-        handle = sub_agent_registry.register_sub_agent(
-            plan_id,
-            f"llm-dispatch-{next(_DISPATCH_SEQ)}",
-            0,
-            scoped_tool=scoped_tool,
-        )
+        if owner_handle is not None:
+            # The tool's owner registered this handle already. It stays
+            # theirs — the watchdog reaches the subprocess through it —
+            # so the dispatch registers nothing of its own. The process
+            # is still recorded, against the owner's handle.
+            handle = owner_handle
+            owned = False
+        else:
+            handle = sub_agent_registry.register_sub_agent(
+                plan_id,
+                f"llm-dispatch-{next(_DISPATCH_SEQ)}",
+                0,
+                scoped_tool=scoped_tool,
+            )
+            owned = True
+
+        _record_dispatch_process(plan_id, handle, scoped_tool)
+
+        if not owned:
+            return None, None
         return sub_agent_registry, handle
     except Exception:  # noqa: BLE001 — a watchdog aid must never break a call
         logger.warning(
@@ -234,12 +267,104 @@ def _register_dispatch(scoped_tool, plan_id: Optional[str]):
         return None, None
 
 
+def _dispatch_process_facts(scoped_tool) -> Optional[Dict[str, Any]]:
+    """The facts that identify the process the dispatch just started.
+
+    Read from the kernel rather than guessed:
+
+    * the **pid** comes from the ``Popen`` the dispatch just made;
+    * the **process group** comes from ``getpgid`` — the dispatch
+      starts the child with ``start_new_session=True``, so it leads a
+      group of its own and a kill has to target that group rather than
+      the process alone, or the child's own children survive;
+    * the **start time** and the **command line** come from the
+      identity probe. Pids are recycled, so the pid alone does not
+      name a process: the start time is what tells our process from
+      somebody else's process that happens to have the same number.
+
+    ``None`` when there is no process to describe — the dispatch has
+    not started one, or the tool does not expose it.
+    """
+    process = getattr(scoped_tool, "_current_process", None)
+    pid = getattr(process, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        # Not a pid the kernel can be asked about: the tool has no
+        # process, or it is a stand-in whose ``pid`` is not a number.
+        # There is nothing to identify, so there is nothing to record.
+        return None
+
+    pgid: Optional[int]
+    try:
+        pgid = os.getpgid(int(pid))
+    except (OSError, TypeError, ValueError):
+        pgid = None
+    if not pgid:
+        # ``start_new_session=True`` makes the child a session leader,
+        # so its group is its own pid.
+        pgid = int(pid)
+
+    create_time: Optional[float] = None
+    cmdline: Tuple[str, ...] = ()
+    cwd = getattr(scoped_tool, "cwd", "") or ""
+    try:
+        import process_identity
+
+        identity = process_identity.probe(int(pid))
+    except Exception:  # noqa: BLE001 — a probe is best-effort
+        identity = None
+    if identity is not None:
+        create_time = getattr(identity, "create_time", None)
+        cmdline = tuple(getattr(identity, "cmdline", ()) or ())
+        cwd = getattr(identity, "cwd", None) or cwd
+
+    return {
+        "pid": int(pid),
+        "pgid": int(pgid),
+        "create_time": create_time,
+        "cmdline": cmdline,
+        "cwd": str(cwd),
+    }
+
+
+def _record_dispatch_process(plan_id: str, handle, scoped_tool) -> None:
+    """Put the process the dispatch just started on the handle and the ledger.
+
+    Best-effort throughout: a ledger that cannot be written must not
+    stop a dispatch that is otherwise fine. The handle is still given
+    the process facts even when the ledger write fails — the exit
+    event needs the pid, and the watchdog needs to know which process
+    the handle owns.
+    """
+    facts = _dispatch_process_facts(scoped_tool)
+    if facts is None:
+        return
+    try:
+        from sub_agent_registry import sub_agent_registry
+
+        sub_agent_registry.attach_process(plan_id, handle, **facts)
+    except Exception:  # noqa: BLE001 — the ledger must never break a call
+        logger.warning(
+            "[dispatch-register] could not record the dispatch process "
+            "for plan %s; continuing",
+            plan_id, exc_info=True,
+        )
+
+
 def _unregister_dispatch(registry, plan_id: Optional[str], handle) -> None:
     """Drop a handle registered by :func:`_register_dispatch`.
 
     Best-effort and idempotent: ``unregister`` removes by identity and
     tolerates a handle that is already gone, so calling it twice (once
     on the read loop's exit and once on the exception arm) is safe.
+
+    **The ledger's ``exit`` event is written by the registry's own
+    cleanup** — ``registry.unregister`` — which this function calls.
+    It is deliberately not written here: the registry's unregister is
+    the one place every sub-agent's exit passes through, including the
+    owners that register their own handle (the VP sub-agent, the
+    rebuild agent, the service-restart agent) and the watchdog's kill
+    path. A second writer here would be a second place to keep in
+    step with the ledger.
     """
     if registry is None or handle is None or not plan_id:
         return
@@ -1117,9 +1242,17 @@ _REPO_ROOT = _THIS_DIR.parent
 _FORMAL_REPO_PATH = Path(os.environ.get(
     "PDT_FORMAL_REPO_PATH", str(_REPO_ROOT)
 )).resolve()
-_PLANS_DIR = Path(os.environ.get(
-    "PDT_PLANS_DIR", str(_FORMAL_REPO_PATH / "plans")
-)).resolve()
+# The plans root, resolved the one way every process agrees on.
+#
+# It used to be read straight from the environment and resolved against
+# *this* process's working directory — which is ``backend/`` for the
+# executor and the plan's own checkout for a sub-agent. A relative
+# ``PDT_PLANS_DIR`` therefore named one directory for the backend and
+# another for everything the backend started, and the sub-agent was
+# handed the wrong one. ``resolve_plans_dir`` anchors a relative value
+# on the repository root instead, so the root means the same tree to
+# every process that reads it.
+_PLANS_DIR = resolve_plans_dir()
 
 # PreToolUse hook that enforces "edit inside your own project_dir only",
 # and then asks the file-lock broker for the file before allowing it.
@@ -3923,6 +4056,15 @@ class ClaudeCodingTool(CodingTool):
                     settings_data["env"]["PDT_LOCK_TASK_ID"] = str(lock_task_id)
             settings_data["env"]["PDT_FORMAL_REPO_PATH"] = str(_FORMAL_REPO_PATH)
             settings_data["env"]["PDT_PLANS_DIR"] = str(_PLANS_DIR)
+            # The plan's own directory, when this run was told where the
+            # plan lives. The sub-agent's children write their ledger
+            # records into the plan's directory, and the plans root
+            # alone is not enough to name it: the root can be relative,
+            # and the sub-agent's working directory is not the
+            # backend's.
+            plan_dir_env = os.environ.get("PDT_PLAN_DIR")
+            if plan_dir_env:
+                settings_data["env"]["PDT_PLAN_DIR"] = plan_dir_env
             settings_data.setdefault("hooks", {})
             settings_data["hooks"].setdefault("PreToolUse", [])
             guard_hook = _build_guard_hook()
