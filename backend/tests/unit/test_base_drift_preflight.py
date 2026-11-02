@@ -297,10 +297,10 @@ def test_repair_mode_calls_persist_and_stamps_id(monkeypatch, tmp_path):
     assert len(calls) == 1, calls
     plan_id, task = calls[0]
     assert plan_id == PLAN_DIR_NAME
-    assert task["id"] == "repair-r3-01"
+    assert task["id"] == "repair-01"
     assert task["files_to_modify"] == ["app.py"]
     assert task["task_group"] == "repair"
-    assert blocked["base_drift_repair_task_id"] == "repair-r3-01"
+    assert blocked["base_drift_repair_task_id"] == "repair-01"
 
 
 def test_repair_mode_without_task_falls_back_to_report(monkeypatch, tmp_path):

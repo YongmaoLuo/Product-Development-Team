@@ -110,7 +110,7 @@ def test_persist_uses_repository_add_task(monkeypatch, tmp_path):
     assert len(calls) == 1, calls
     written_plan_id, written_task = calls[0]
     assert written_plan_id == PLAN_ID
-    assert written_task["id"] == task["id"] == "repair-r3-01"
+    assert written_task["id"] == task["id"] == "repair-01"
     # The payload is narrowed to the table's static allow-list — no
     # ``status`` (that column belongs to ``update_task``'s runtime
     # mirror), no stray key the table would reject.
@@ -137,9 +137,9 @@ def test_persist_is_idempotent(tmp_path):
     ) is True
 
     rows = _rows(db_path)
-    assert list(rows) == ["repair-r3-01"], rows
-    assert rows["repair-r3-01"]["task_group"] == "repair"
-    assert rows["repair-r3-01"]["status"] == "pending"
+    assert list(rows) == ["repair-01"], rows
+    assert rows["repair-01"]["task_group"] == "repair"
+    assert rows["repair-01"]["status"] == "pending"
 
 
 def test_persist_returns_false_on_error(monkeypatch, tmp_path):
@@ -182,7 +182,7 @@ def test_row_is_visible_to_pending_repair_query(tmp_path):
     A row the executor cannot see is a row that never runs: the round
     reports "the repair batch drained" while the repair is still
     queued.  ``verification_loop._is_repair_task_id`` is the predicate
-    that decides visibility — the id shape ``repair-r3-01`` and the
+    that decides visibility — the id shape ``repair-01`` and the
     ``repair`` group are what it matches on.
     """
     db_path = tmp_path / "state.db"
@@ -193,8 +193,8 @@ def test_row_is_visible_to_pending_repair_query(tmp_path):
     ) is True
 
     rows = _rows(db_path)
-    assert list(rows) == ["repair-r3-01"], rows
-    row = rows["repair-r3-01"]
+    assert list(rows) == ["repair-01"], rows
+    row = rows["repair-01"]
     assert verification_loop._is_repair_task_id(
-        "repair-r3-01", row.get("task_group")
+        "repair-01", row.get("task_group")
     ) is True

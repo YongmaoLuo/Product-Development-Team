@@ -2,13 +2,19 @@
 
 The mode gate is gone: a conflict now becomes a merge task in **every**
 mode, which is what makes the conflict resolvable at all.  But the same
-change opened a hole.  The task id is ``repair-r<round>-<seq>``, so every
-round that hits the conflict writes a *new* row — ``repair-r3-01``,
+change opened a hole.  The task id used to be ``repair-r<round>-<seq>``,
+so every round that hits the conflict wrote a *new* row — ``repair-r3-01``,
 ``repair-r4-01``, ``repair-r5-01`` …  A merge that keeps failing (a
 conflict the agent cannot resolve on its own) therefore produced one new
 task per round, forever.  The plan never converged: it kept dispatching
 work that could not succeed, and each round's task was a fresh id, so
 nothing ever looked "already handled".
+
+2026-11-02: the id no longer carries the round — it is ``repair-<seq>``
+and the number is allocated **plan-globally** (see
+:func:`repair_generator.next_repair_seq_base`).  So the "a later drift
+gets its own task" property is now expressed as "a later drift gets the
+*next* number", not "a later round gets a different prefix".
 
 The guard is a read of ``plan_tasks`` **before** the row is written:
 
@@ -61,7 +67,12 @@ PLAN_DIR_NAME = "plan-20261031"
 PLAN_ID = PLAN_DIR_NAME
 OTHER_PLAN_ID = "plan-20261030"
 ROUND = 4
-TASK_ID = f"repair-r{ROUND}-01"
+#: The id this plan's merge task gets when the plan owns no repair id
+#: yet.  The number is plan-global, so it does not depend on the round.
+TASK_ID = "repair-01"
+#: The id the merge task gets when the plan already owns ``repair-r3-01``
+#: (sequence 1): the allocator hands out the next number, 2.
+TASK_ID_AFTER_PRIOR = "repair-02"
 PRIOR_TASK_ID = "repair-r3-01"
 
 
@@ -261,7 +272,7 @@ def test_completed_row_allows_a_new_task(monkeypatch, tmp_path):
 
     blocked = orch._run_base_drift_preflight()
 
-    assert blocked["base_drift_repair_task_id"] == TASK_ID
+    assert blocked["base_drift_repair_task_id"] == TASK_ID_AFTER_PRIOR
     rows = _base_drift_rows(db_path, PLAN_ID)
     assert len(rows) == 2, rows
     assert rows[1]["status"] == "pending", rows
@@ -299,7 +310,7 @@ def test_no_prior_row_creates_the_task(monkeypatch, tmp_path):
 
     The positive control: the four cases above must not pass because the
     guard blocks everything.  A plan that has never seen a conflict gets
-    its merge task, with the id the round number gives it.
+    its merge task, with the first number of the plan's repair sequence.
     """
     db_path = _use_db(tmp_path, monkeypatch)
 
@@ -333,7 +344,7 @@ def test_skipped_row_allows_a_new_task(monkeypatch, tmp_path):
 
     blocked = orch._run_base_drift_preflight()
 
-    assert blocked["base_drift_repair_task_id"] == TASK_ID
+    assert blocked["base_drift_repair_task_id"] == TASK_ID_AFTER_PRIOR
     assert len(_base_drift_rows(db_path, PLAN_ID)) == 2
 
 

@@ -359,7 +359,7 @@ def test_chain_blocks_rust_write_end_to_end(tmp_path, state_db):
 
     # The Rust row never became a repair task.
     assert "VP-1" not in _vp_ids(result)
-    assert _task_ids(result) == ["repair-r1-01"]
+    assert _task_ids(result) == ["repair-01"]
     assert _vp_ids(result) == ["VP-2"]
 
     # The conflict is reported, and the report says why: the model and
@@ -390,7 +390,7 @@ def test_no_import_json_keeps_task(tmp_path, state_db):
     )
 
     assert _vp_ids(result) == ["VP-1", "VP-2"]
-    assert _task_ids(result) == ["repair-r1-01", "repair-r1-02"]
+    assert _task_ids(result) == ["repair-01", "repair-02"]
     assert result["intent_conflicts"] == []
     assert result["needs_operator_decision"] is False
 

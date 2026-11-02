@@ -74,7 +74,7 @@ class TestRepairTaskAssemblerBasics(unittest.TestCase):
 },
         ])
         self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0]["id"], "repair-r1-01")
+        self.assertEqual(tasks[0]["id"], "repair-01")
         self.assertEqual(tasks[0]["depends_on"], [])
 
     def test_round_two_first_task_has_no_cross_round_dependency(self):
@@ -94,7 +94,7 @@ class TestRepairTaskAssemblerBasics(unittest.TestCase):
   "files_to_modify": ["src/remote.rs"],
 },
         ])
-        self.assertEqual(tasks[0]["id"], "repair-r2-01")
+        self.assertEqual(tasks[0]["id"], "repair-01")
         self.assertEqual(tasks[0]["depends_on"], [])
 
     def test_every_dependency_resolves_inside_its_own_round(self):
@@ -133,7 +133,7 @@ class TestRepairTaskAssemblerBasics(unittest.TestCase):
         """W1 (2026-10-11): a repair batch is a forest of roots.
 
         Replaces ``test_round_two_second_task_chains_to_first``, which
-        asserted ``tasks[1]["depends_on"] == ["repair-r2-01"]``. That
+        asserted ``tasks[1]["depends_on"] == ["repair-01"]``. That
         edge was justified in ``_infer_depends_on``'s own docstring by
         "protects against racing two repair tasks against the same
         ``verification_plan.json`` write" — and the code path it
@@ -164,7 +164,7 @@ class TestRepairTaskAssemblerBasics(unittest.TestCase):
 },
         ])
         self.assertEqual([t["id"] for t in tasks],
-                         ["repair-r2-01", "repair-r2-02"])
+                         ["repair-01", "repair-02"])
         self.assertEqual(tasks[1]["depends_on"], [])
         # …and the whole batch, not just the second row.
         for task in tasks:
@@ -341,7 +341,7 @@ class TestRepairTaskAssemblerDefensive(unittest.TestCase):
 },
         ])
         self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0]["id"], "repair-r1-01")
+        self.assertEqual(tasks[0]["id"], "repair-01")
 
 
 class TestRepairTaskAssemblerLLMCallCount(unittest.TestCase):
@@ -366,7 +366,7 @@ class TestRepairTaskAssemblerLLMCallCount(unittest.TestCase):
             for i in range(1, 4)
         ])
         self.assertEqual([t["id"] for t in tasks],
-                         ["repair-r2-01", "repair-r2-02", "repair-r2-03"])
+                         ["repair-01", "repair-02", "repair-03"])
 
     def test_priority_enum_is_validated(self):
         a = _asm(round_number=1, failed_vps=[_vp("VP-1")])
@@ -436,7 +436,7 @@ class TestRepairTaskCommandAndScope(unittest.TestCase):
         ])
         self.assertEqual(len(tasks), 1)
         self.assertEqual(tasks[0]["test_command"], "")
-        self.assertEqual(a.test_command_sources["repair-r2-01"], "missing")
+        self.assertEqual(a.test_command_sources["repair-01"], "missing")
         self.assertEqual(a.unverifiable_no_test_command, 1)
         self.assertEqual(a.dropped_empty_files_to_modify, 0)
 
@@ -503,7 +503,7 @@ class TestRepairTaskCommandAndScope(unittest.TestCase):
                 self.assertEqual(len(tasks), 1)
                 self.assertEqual(tasks[0]["test_command"], "")
                 self.assertEqual(
-                    a.test_command_sources["repair-r1-01"], "audit_style",
+                    a.test_command_sources["repair-01"], "audit_style",
                 )
                 self.assertEqual(a.unverifiable_no_test_command, 1)
 
@@ -565,7 +565,7 @@ class TestRepairTaskCommandAndScope(unittest.TestCase):
         2. ``agent._build_micro_layers`` derives its conflict graph from
            ``files_to_modify``. With W1's intra-batch chain gone, that
            graph is the *only* thing serialising two repairs that touch
-           the same file (``repair-r4-01`` and ``repair-r4-05`` both
+           the same file (``repair-01`` and ``repair-05`` both
            wanted ``native/src/e2e.rs``). A ``[]`` hands it
            nothing, and the two agents then run concurrently over one
            file.
@@ -736,7 +736,7 @@ class TestRepairTaskGenerationGates(unittest.TestCase):
             [t["failed_vp_id"] for t in tasks], ["VP-1", "VP-3"],
         )
         self.assertEqual(
-            [t["id"] for t in tasks], ["repair-r2-01", "repair-r2-02"],
+            [t["id"] for t in tasks], ["repair-01", "repair-02"],
         )
         self.assertEqual(a.dropped_empty_files_to_modify, 1)
         self.assertEqual(a.unverifiable_no_test_command, 1)
@@ -744,8 +744,8 @@ class TestRepairTaskGenerationGates(unittest.TestCase):
     def test_a_refused_row_consumes_no_task_id(self):
         """Ids stay contiguous over what was actually emitted.
 
-        A refused row must not burn a ``seq``: ``repair-r1-01`` missing
-        from ``plan_tasks`` with ``repair-r1-02`` present reads as "a
+        A refused row must not burn a ``seq``: ``repair-01`` missing
+        from ``plan_tasks`` with ``repair-02`` present reads as "a
         task vanished", which is precisely the failure mode this gate
         exists to make visible rather than to reproduce.
         """
@@ -756,7 +756,7 @@ class TestRepairTaskGenerationGates(unittest.TestCase):
             {"failed_vp_id": "VP-2", "title": "ok", "description": "d",
              "files_to_modify": ["src/b.rs"]},
         ])
-        self.assertEqual([t["id"] for t in tasks], ["repair-r1-01"])
+        self.assertEqual([t["id"] for t in tasks], ["repair-01"])
         self.assertEqual(a.dropped_empty_files_to_modify, 1)
 
     def test_a_refused_row_does_not_shift_later_ids_off_seq_base(self):
@@ -767,7 +767,7 @@ class TestRepairTaskGenerationGates(unittest.TestCase):
             {"failed_vp_id": "VP-2", "title": "ok", "description": "d",
              "files_to_modify": ["src/b.rs"]},
         ])
-        self.assertEqual([t["id"] for t in tasks], ["repair-r4-07"])
+        self.assertEqual([t["id"] for t in tasks], ["repair-07"])
 
     def test_counters_are_per_assembler_and_start_at_zero(self):
         a = _asm(round_number=1, failed_vps=[_vp("VP-1")])

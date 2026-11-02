@@ -222,11 +222,15 @@ def test_select_repairable_failed_vps_splits_and_explains():
 # ---------------------------------------------------------------------------
 
 def test_filtering_does_not_change_the_task_id_rule(tmp_path):
-    """The id rule is untouched: ``repair-r{round}-{seq:02d}``, contiguous.
+    """The id rule is untouched: ``repair-{seq:02d}``, contiguous.
 
     Filtering happens upstream of the assembler, so the tasks that ARE
     emitted keep the ids they always had — the same rule, the same
     format — and no gap is left behind by a refused VP.
+
+    The id carries the number, not the round (2026-11-02): the round
+    counter resets, and a reset round reissued the ids the plan already
+    owned.
     """
     gen = _generator(tmp_path, [
         _task("VP-2", files_to_modify=["src/remote.rs"]),
@@ -254,7 +258,7 @@ def test_filtering_does_not_change_the_task_id_rule(tmp_path):
         seq_base=1,
     ).assemble(contents)
 
-    assert [task["id"] for task in tasks] == ["repair-r3-01", "repair-r3-02"]
+    assert [task["id"] for task in tasks] == ["repair-01", "repair-02"]
     assert [task["failed_vp_id"] for task in tasks] == ["VP-2", "VP-4"]
 
 
