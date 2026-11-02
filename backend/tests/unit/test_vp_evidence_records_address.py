@@ -428,7 +428,6 @@ def test_the_pre_dispatch_identity_check_fills_the_answering_boot_id(
         url = f"http://127.0.0.1:{service.port}/items"
 
         # The round's own gate: it reads the instance block of the
-        # The round's own gate: it reads the instance block of the
         # service the VP is about to talk to, and compares it with the
         # instance the round **recorded**.  This round recorded no
         # instance block for the service, so there is nothing to

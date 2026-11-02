@@ -77,6 +77,10 @@ pytestmark = [pytest.mark.e2e]
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = BACKEND_DIR.parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from tests import _readiness  # noqa: E402
 
 # Prefer the project venv: the backend subprocess these tests boot must
 # run on the interpreter this suite was installed into.  A checkout with
@@ -138,7 +142,12 @@ def _utcnow_iso() -> str:
 #: ``server at http://127.0.0.1:55739 did not start in 30.0s`` — a red
 #: that says the machine was busy, not that the code was broken.  120 s
 #: still catches a hang and no longer blames the delivery for the load.
-_SERVER_READY_TIMEOUT = 120.0
+#:
+#: The number itself has ONE home — ``tests/_readiness.py`` — because
+#: every suite that waits for a backend to answer asks the same
+#: question of the same machine and must not carry a second copy of the
+#: answer.  The value is that module's ``READY_TIMEOUT_SECONDS``.
+_SERVER_READY_TIMEOUT = _readiness.READY_TIMEOUT_SECONDS
 
 
 def test_the_server_ready_timeout_is_sized_for_a_busy_machine() -> None:

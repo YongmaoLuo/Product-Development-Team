@@ -809,23 +809,65 @@ class SlowDict(dict):
         return super().get(key, default)
 
 
+#: The real ``threading.Thread``, captured while this module is imported
+#: -- i.e. before any test patches it away.  ``FakeThread`` builds the
+#: threads it does *not* take over out of this one, so patching
+#: ``threading.Thread`` globally no longer swallows the background
+#: threads the verification round starts for itself.
+_REAL_THREAD = threading.Thread
+
+
+def _is_route_worker(target) -> bool:
+    """True iff *target* is the route's verification worker.
+
+    ``POST /api/verification/{id}/start`` spawns the round in a thread
+    whose target is ``server._run_in_plan_ctx`` -- that is the ONE thread
+    this double exists to run inline.  Every other thread the round
+    starts for itself (the workflow lease's heartbeat, the round lease's
+    heartbeat) exists precisely to run **in the background**; inlining
+    one of those is what used to hang the request (see
+    :class:`FakeThread`).
+    """
+    import server
+
+    return target is getattr(server, "_run_in_plan_ctx", None)
+
+
 class FakeThread:
-    """Thread replacement that runs ONLY the verification loop inline.
+    """Runs the route's verification worker inline; leaves the rest alone.
+
+    The double exists because ``POST /api/verification/{id}/start``
+    answers before its round is done: the round runs in a thread, and a
+    test that does not own that thread would let it escape into the
+    pytest process (spawning services, calling models).  Running it
+    inline keeps the round inside the request.
+
+    It used to replace ``threading.Thread`` **globally** and run *every*
+    thread's target inline -- including the ones the round starts for
+    itself.  The verification workflow lease starts a heartbeat thread
+    whose target waits for a stop event that only ``release()`` can set,
+    and ``release()`` runs after the heartbeat.  Inlining that heartbeat
+    therefore blocked forever, and the request never answered: the
+    ``/start`` tests timed out at the 300 s pytest timeout instead of
+    returning 200.
 
     A background daemon thread's semantics are "run concurrently".
     Executing such a body synchronously on the calling thread
     deadlocks whenever the body waits for an event that only a later
-    step of the *caller* can set — and the lease heartbeats are exactly
-    that case: ``_beat`` waits on ``self._stop``, and ``_stop`` is
-    only set by ``lease.release()``, which the caller cannot reach
-    until ``start_heartbeat()`` has returned, i.e. until the inlined
-    heartbeat has returned. Inlining the heartbeat made
+    step of the *caller* can set -- and the lease heartbeats are exactly
+    that case: ``_beat`` waits on ``self._stop``, and ``_stop`` is only
+    set by ``lease.release()``, which the caller cannot reach until
+    ``start_heartbeat()`` has returned, i.e. until the inlined heartbeat
+    has returned.  Inlining the heartbeat made
     ``POST /api/verification/{id}/start`` hang forever.
 
-    So this double runs the verification loop thread inline (these
-    tests need the loop to have progressed before the response is
-    asserted) and turns every other thread into a no-op — the "it ran
-    and finished" stand-in for a background worker.
+    So the double takes over exactly one thread -- the route's worker --
+    and hands every other thread to the real ``threading.Thread``, which
+    is what those threads were written for.  The one thread that runs
+    inline is recognised two ways, and the two name the *same* thread:
+    by its target (``server._run_in_plan_ctx``) and by its name prefix
+    (``verification-loop-`` -- the name
+    ``backend/routes/verification.py`` gives the thread it spawns).
 
     ``created_names`` / ``inlined_names`` record what the double saw,
     so a test can assert that the loop really ran inline and that no
@@ -833,7 +875,7 @@ class FakeThread:
     ``test_start_inlines_only_the_verification_loop_thread``).
     """
 
-    #: Name prefix of the one thread this double runs inline — the
+    #: Name prefix of the one thread this double runs inline -- the
     #: verification loop thread created in ``backend/routes/verification.py``.
     INLINE_NAME_PREFIX = "verification-loop-"
 
@@ -856,20 +898,52 @@ class FakeThread:
         self._name = kwargs.pop("name", None) or ""
         self._target_args = kwargs.pop("args", ())
         self._target_kwargs = kwargs.pop("kwargs", {})
+        self._delegate = None
+        if not self._runs_inline():
+            # A background worker: hand it to the real thread, so it
+            # behaves as it was written to behave.
+            self._delegate = _REAL_THREAD(
+                target=target,
+                args=self._target_args,
+                kwargs=self._target_kwargs,
+                name=self._name,
+                daemon=daemon,
+            )
+
+    def _runs_inline(self) -> bool:
+        """True iff this thread is the route's verification worker.
+
+        The route's worker is the one thread the double runs inline:
+        these tests need the round to have progressed before the
+        response is asserted.  It is recognised by its target
+        (``server._run_in_plan_ctx``) and by its name prefix
+        (``verification-loop-``) -- the two name the same thread.
+        """
+        if self._name.startswith(FakeThread.INLINE_NAME_PREFIX):
+            return True
+        return _is_route_worker(self._target)
 
     def start(self):
         FakeThread.created_names.append(self._name)
-        if not self._name.startswith(FakeThread.INLINE_NAME_PREFIX):
-            # Not the verification loop: a background worker this double
-            # does not run. Returning immediately stands in for "it ran
-            # and finished".
+        if self._delegate is not None:
+            # Not the route's worker: a background worker this double
+            # does not run inline.  It is handed to the real thread --
+            # it was written to run in the background, and running it
+            # here is what used to hang the request.
+            self._delegate.start()
             return
         FakeThread.inlined_names.append(self._name)
         if self._target:
             self._target(*self._target_args, **self._target_kwargs)
 
     def join(self, timeout=None):
-        pass
+        if self._delegate is not None:
+            self._delegate.join(timeout)
+
+    def is_alive(self):
+        if self._delegate is not None:
+            return self._delegate.is_alive()
+        return False
 
 
 class NoOpFakeThread:

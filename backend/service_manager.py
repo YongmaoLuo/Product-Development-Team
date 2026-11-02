@@ -2561,6 +2561,13 @@ def _register_spawned_service(runtime: ServiceRuntime) -> None:
             pgid=runtime.pgid,
             kind=module.KIND_SERVICE,
             name=runtime.name,
+            # When the service started, in the unit an observer reads
+            # it in.  The spawn path knows without asking: measuring it
+            # by running ``ps`` would create a process the spawn is
+            # not allowed to create.
+            start_epoch=module.spawn_start_epoch(
+                runtime.pid, spawned_at=runtime.start_epoch,
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - a record never blocks a start
         logger.debug(
@@ -2663,10 +2670,6 @@ def start_service(
 
     runtime.pid = proc.pid
     runtime.pgid = _detached_pgid_of(proc.pid)
-    # The service leads a session of its own, so the run that started
-    # it is the only thing that can give it back.  The record is what
-    # makes that possible.
-    _register_spawned_service(runtime)
     # Our own clock, not the system's. `proc` was created by the line
     # above, so we know when it started without asking anyone, and that
     # matters twice over: the `ps -o lstart=` probe is unavailable or
@@ -2677,6 +2680,11 @@ def start_service(
     # `ps lstart` only has 1-second granularity, so a wall-clock reading
     # taken microseconds after the fork is well inside it.
     runtime.start_epoch = time.time()
+    # The service leads a session of its own, so the run that started
+    # it is the only thing that can give it back.  The record is what
+    # makes that possible -- and it is written after the clock above,
+    # because the record says when the service started.
+    _register_spawned_service(runtime)
     runtime.origin = "spawned"
 
     # The address is spoken for from here on: say so, before anything
