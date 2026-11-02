@@ -2546,17 +2546,18 @@ jobs:
   nightly-regression:
     name: Nightly regression (daily full suite)
     runs-on: ubuntu-latest
-    # Runs on the daily cron schedule, plus ad-hoc workflow_dispatch
-    # (with ``layer=nightly``) for manual verification of the runner
-    # pool after infrastructure-level failures. ``workflow_dispatch``
-    # bypasses the schedule-pool deprioritization that has been
-    # causing the cron-triggered job to lose its runner VM at the
-    # "Run nightly regression suite" step on a consistent 46-minute
-    # pattern (see the 5 consecutive failures logged under runs
-    # five consecutive failures). If the manual run also fails, the issue is in
-    # the test code or the workflow; if it passes, the issue is
+    # Runs on the daily cron schedule, plus an ad-hoc workflow_dispatch
+    # with ``layer=nightly`` for manual verification of the runner
+    # pool after infrastructure-level failures. A normal dispatch
+    # (``-f layer=all``, used by the repo-wide gate) does NOT trigger
+    # this job any more: only the ``schedule`` event, or a dispatch
+    # with ``layer=nightly``, starts it. The manual dispatch bypasses
+    # the schedule-pool deprioritization that has been causing the
+    # cron-triggered job to lose its runner VM at the "Run nightly
+    # regression suite" step. If the manual run also fails, the issue
+    # is in the test code or the workflow; if it passes, the issue is
     # specifically the schedule pool.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.layer == 'nightly')
     # Hard-cap the job so it fails fast with a clear timeout error
     # (instead of the ambiguous "hosted runner lost communication"
     # at the ~46-minute runner-image hang documented in
