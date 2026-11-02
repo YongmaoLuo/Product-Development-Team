@@ -243,6 +243,37 @@ def _narrow_criterion_section(case_ids: Sequence[str]) -> List[str]:
     return parts
 
 
+#: Heading of the "these are the cases that failed" section inside the
+#: repair-content prompt. Named here for the same reason as
+#: :data:`PLAN_INTENT_HEADING`: the section is referred to by name.
+FAILING_CASES_HEADING = "## 本轮失败的用例（修复必须让它们转绿，且不得削弱它们）"
+
+
+def _failing_cases_section(case_ids: Sequence[str]) -> List[str]:
+    """The node ids of the cases that failed this round.
+
+    2026-10-30 — the ids used to reach the model only through the
+    narrowing rule ("上面给了 node id 就用它们"), which names them
+    without ever saying what has to happen to them. This section states
+    it: these cases are red now, the repair has to turn them green, and
+    a repair that weakens them (deleting the assertion, skipping the
+    test) is not a repair. Without it a model that cannot read the ids
+    as a narrowing instruction has nothing to anchor on.
+
+    No ids means nothing failed that can be named, so the section is
+    left out entirely — an empty list of failures would read as "you
+    must not weaken anything", which is a different instruction.
+    """
+    if not case_ids:
+        return []
+    parts: List[str] = [FAILING_CASES_HEADING]
+    parts.extend(
+        f"{index}. {case_id}" for index, case_id in enumerate(case_ids, start=1)
+    )
+    parts.append("")
+    return parts
+
+
 class RepairGenerationError(RuntimeError):
     """The repair LLM call ran but produced nothing usable.
 
@@ -2703,6 +2734,13 @@ def _build_repair_contents_prompt(
         parts.append("")
         parts.extend(PLAN_INTENT_CONFLICT_RULES)
         parts.append("")
+    # 2026-10-30 — the ids of the cases that failed this round, as their
+    # own section: the repair has to turn *these* cases green, and it
+    # must not weaken them. The ids are read out of the round's run
+    # output, which the orchestrator attaches (and, for a whole-repo
+    # gate, fills from the gate's own ``ci_output.json``).
+    case_ids = failing_case_ids(_run_output_text(failed_vps))
+    parts.extend(_failing_cases_section(case_ids))
     if previous_failure_feedback:
         # Filter to VPs that still appear in this round's failures —
         # otherwise we'd show feedback for already-fixed VPs which
@@ -2757,9 +2795,7 @@ def _build_repair_contents_prompt(
     # description it writes is what reaches the executor — a description
     # that demands the whole-repository gate turns every repair round
     # into an hour. So the rule goes here as well as on the re-ask.
-    parts.extend(_narrow_criterion_section(
-        failing_case_ids(_run_output_text(failed_vps)),
-    ))
+    parts.extend(_narrow_criterion_section(case_ids))
     parts.append(
         "任务描述与验收标准里**不要**要求把整仓门禁整轮跑完 —— "
         "验收以 `test_command` 的退出码为准。"

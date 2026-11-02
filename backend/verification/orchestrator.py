@@ -925,9 +925,58 @@ def _accepts_plan_intent(generator: Any) -> bool:
     )
 
 
+def _failing_case_lines(plan_dir: Optional[Path], vp_id: str) -> List[str]:
+    """The failing node ids of one VP, as pytest-summary lines.
+
+    2026-10-30 — the whole-repository gate writes the node ids of the
+    cases that failed into
+    ``plans/<plan_id>/vp_artifacts/<vp_id>/ci_output.json`` (the
+    ``junit_failures`` list), but nothing read that file: the ids the
+    repair prompt needs were on nobody's path. This turns them back into
+    the shape the rest of the codebase already understands — pytest's
+    short summary — so the ids reach
+    :func:`test_command_quality.failing_case_ids` and the criterion can
+    be narrowed to the cases that actually failed.
+
+    The node id is copied **verbatim**: downstream narrows the repair
+    command by matching it, so a rewritten id would silently narrow to
+    nothing.
+
+    Best-effort by contract: a missing artifact, an unreadable file, a
+    malformed JSON, a payload without ``junit_failures`` — all of them
+    yield no lines and change nothing. An artifact is an audit trail,
+    never a precondition of a round.
+    """
+    if plan_dir is None:
+        return []
+    artifact = Path(plan_dir) / "vp_artifacts" / str(vp_id) / "ci_output.json"
+    try:
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - a missing/broken artifact is not a verdict
+        return []
+    if not isinstance(payload, dict):
+        return []
+    failures = payload.get("junit_failures")
+    if not isinstance(failures, list):
+        return []
+    lines: List[str] = []
+    for item in failures:
+        if not isinstance(item, dict):
+            continue
+        node_id = item.get("node_id")
+        if not node_id:
+            continue
+        kind = str(item.get("kind") or "")
+        marker = "ERROR" if kind == "error" else "FAILED"
+        first_line = str(item.get("first_line") or kind or "")
+        lines.append(f"{marker} {node_id} - {first_line}")
+    return lines
+
+
 def _attach_round_run_output(
     candidates: List[Dict[str, Any]],
     round_evidence: Mapping[str, Mapping[str, Any]],
+    plan_dir: Optional[Path] = None,
 ) -> int:
     """Attach the round's own run output to the failed-VP records.
 
@@ -947,6 +996,15 @@ def _attach_round_run_output(
     handing that rule the whole output would change which files a repair
     task is allowed to touch — a different change, with a different
     reason.
+
+    2026-10-30 — for a ``full_ci`` VP the two fields above are
+    summaries, and a summary names no case: the ids are in the gate's
+    own artifact (``vp_artifacts/<vp_id>/ci_output.json``). When
+    ``plan_dir`` is given, those ids are appended to the attached
+    output as pytest-summary lines, so the ids that are already on disk
+    reach the generator without changing how the round runs. Without
+    ``plan_dir`` — or without the artifact — the attached output is
+    byte-for-byte what it was before.
     """
     attached = 0
     for candidate in candidates or []:
@@ -960,6 +1018,17 @@ def _attach_round_run_output(
             for key in ("actual_result", "evidence")
             if entry.get(key)
         )
+        vp_id = str(candidate.get("id") or "")
+        case_lines = _failing_case_lines(plan_dir, vp_id)
+        if case_lines:
+            sections = []
+            if text.strip():
+                sections.append(text)
+            sections.append(
+                f"--- failing cases (from vp_artifacts/{vp_id}/ci_output.json) ---"
+            )
+            sections.extend(case_lines)
+            text = "\n".join(sections)
         if not text.strip():
             continue
         candidate["run_output"] = text
@@ -3958,7 +4027,7 @@ class VerificationOrchestrator:
             # instead (that is what keeps the prompt bounded), so the
             # output is attached here. Only the ids reach the prompt.
             attached_output = _attach_round_run_output(
-                repair_candidates, round_failed_vps,
+                repair_candidates, round_failed_vps, plan_dir=self.plan_dir,
             )
             if attached_output:
                 print(
