@@ -44,6 +44,8 @@ from typing import Any, Dict, Iterator, List, Optional
 import httpx
 import pytest
 
+from tests import _readiness
+
 #: ``backend/`` 在 ``sys.path`` 上，``state_machine.*`` / ``server`` 才
 #: import 得到（与同目录其它用例同一套路）。
 _BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -80,13 +82,14 @@ def _loopback_client(timeout: float = 10.0) -> httpx.Client:
     return httpx.Client(timeout=timeout, trust_env=False)
 
 #: 服务就绪的等待上限（秒）。超时即断言失败，并把服务日志的尾巴打出来。
+#: 预算只有一个出处：``tests/_readiness.py``。
 #:
 #: 这个上限的作用是「抓住挂死」，不是「证明机器快」。它原来是 30 s ——
 #: 按空闲机器标定的数字；满载机器上真服务器起得慢，2026-10-31 那轮整仓门禁
 #: 的 4 个 error 全在这里（`the spawned server did not become ready within
 #: 30.0s (status 502)`）。放宽到 120 s：仍然是「挂死会被抓住」，但不再把
 #: 「机器忙」读成「服务坏了」。
-_READY_TIMEOUT = 120.0
+_READY_TIMEOUT = _readiness.READY_TIMEOUT_SECONDS
 
 #: 进程回收的等待上限（秒）。
 _STOP_TIMEOUT = 10.0

@@ -86,6 +86,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -100,6 +101,8 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 import server  # noqa: E402
+from plan_lifecycle_service import PlanLifecycleService  # noqa: E402
+from plan_scheduler.engine import PlanSchedulerEngine  # noqa: E402
 
 
 client = TestClient(server.app)
@@ -117,6 +120,68 @@ MIN_RUNTIME_SECONDS = 600.0
 #: interrupted, and long enough not to be.
 ELAPSED_EVICTABLE = 700.0
 ELAPSED_PROTECTED = 100.0
+
+#: How long the jammed handshake is allowed to wait for the worker's
+#: announcement before it gives the wait up anyway.  This is **not** the
+#: case's mechanism — it is a safety net that keeps a worker that never
+#: answers from hanging the suite.
+HANDSHAKE_SAFETY_SECONDS = 30.0
+
+
+# ---------------------------------------------------------------------------
+# The jammed handshake
+# ---------------------------------------------------------------------------
+#
+# The engine's handshake is a **bounded** wait: the caller waits for the
+# worker to announce "the command has a record now", and it stops
+# waiting when the bound is up.  On a busy machine the bound can be up
+# before the worker has written the command down — and the case below
+# needs exactly that state, on every machine, every time.
+#
+# So the case makes the handshake give up **on purpose**: the wait lasts
+# until the worker has announced the handshake (the id is assigned just
+# before the announcement) and then reports "not set", which is what a
+# timed-out wait reports.  The command is on the record and the caller
+# did not hear it — the state the CI failure was made of.
+
+
+class JammedHandshake(threading.Event):
+    """A handshake whose wait gives up, however the worker answers.
+
+    ``wait`` behaves like the timed wait it stands in for: it returns
+    ``False`` — "not set" — even though the event *is* set by then.
+    """
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the worker's announcement, and then give the wait up."""
+        super().wait(timeout=HANDSHAKE_SAFETY_SECONDS)
+        return False
+
+
+class JammedHandshakeEngine(PlanSchedulerEngine):
+    """The engine whose handshake always gives up.
+
+    The worker writes the command down and *then* announces it, so a
+    handshake that waits for the announcement and then gives up is a
+    handshake that gave up **after** the command was written down.
+    """
+
+    def _new_recorded_event(self) -> threading.Event:
+        """Hand out the handshake that gives up."""
+        return JammedHandshake()
+
+
+class SlowLifecycle(PlanLifecycleService):
+    """The real lifecycle, with a pause that takes its time."""
+
+    def __init__(self, delay: float) -> None:
+        super().__init__()
+        self._delay = delay
+
+    def pause_plan(self, plan_id: str):
+        """Pause the plan, slowly."""
+        time.sleep(self._delay)
+        return super().pause_plan(plan_id)
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +494,7 @@ def scheduler(monkeypatch):
         min_runtime_seconds: float = MIN_RUNTIME_SECONDS,
         command_timeout_seconds: float = 10.0,
         lifecycle: Any = None,
+        engine_class: Any = None,
     ) -> World:
         engine_conn = _open_state_db()
         case_conn = _open_state_db()
@@ -447,7 +513,7 @@ def scheduler(monkeypatch):
             min_runtime_seconds=min_runtime_seconds,
             clock=clock,
         )
-        engine = PlanSchedulerEngine(
+        engine = (engine_class or PlanSchedulerEngine)(
             _StaticConfig(
                 SchedulerConfig(
                     enabled=True,
@@ -807,22 +873,22 @@ def test_202_is_pending_and_carries_the_command_id(
     202 with the command's id, the command is still carried out by the
     worker, and the row the id names ends up with a final outcome the
     caller can read.
+
+    The **handshake** is bounded as well: it is the wait that says "the
+    command has a record now", and a bounded wait on a busy machine
+    gives up before the worker has written the command down.  That is
+    the state this case is about, so the case **makes it happen**: the
+    engine waits on a handshake that gives up (see
+    ``JammedHandshake``), the way a timed-out wait gives up, and it
+    gives up after the worker has written the command down.  So the
+    answer under test is the answer a *timed-out* handshake produces,
+    on every machine — and the id in it is the id of a record that is
+    already there.
     """
-    from plan_lifecycle_service import PlanLifecycleService
-
-    class SlowLifecycle(PlanLifecycleService):
-        """The real lifecycle, with a pause that takes its time."""
-
-        def __init__(self, delay: float) -> None:
-            super().__init__()
-            self._delay = delay
-
-        def pause_plan(self, plan_id: str):
-            time.sleep(self._delay)
-            return super().pause_plan(plan_id)
-
     world = scheduler(
-        command_timeout_seconds=0.01, lifecycle=SlowLifecycle(0.4)
+        command_timeout_seconds=0.01,
+        lifecycle=SlowLifecycle(0.4),
+        engine_class=JammedHandshakeEngine,
     )
     _build_world(world, "queued", "free", live_pid)
 
@@ -848,6 +914,31 @@ def test_202_is_pending_and_carries_the_command_id(
         "{0!r}".format(body["command_id"])
     )
     assert row["outcome"] == "done", row
+
+
+def test_pending_answer_carries_the_id_when_the_handshake_gave_up(
+    scheduler: Any, live_pid: int
+) -> None:
+    """The engine's own pending answer carries the id, handshake or not.
+
+    The 202 above is the HTTP face of the engine's answer; this is the
+    answer itself.  The handshake gave up — the case makes it give up,
+    the way a timed-out wait gives up — and the engine still hands out
+    the id of the command's record.  The id is the only handle the
+    caller has on a command that is still in flight, so an answer
+    without it is an answer the caller cannot come back to.
+    """
+    world = scheduler(
+        command_timeout_seconds=0.01,
+        lifecycle=SlowLifecycle(0.4),
+        engine_class=JammedHandshakeEngine,
+    )
+    _build_world(world, "queued", "free", live_pid)
+
+    result = world.engine.submit_command("pause", "p-target")
+
+    assert result.outcome == "pending", result
+    assert isinstance(result.command_id, int), result
 
 
 # ---------------------------------------------------------------------------

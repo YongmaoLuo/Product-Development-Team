@@ -943,6 +943,13 @@ class PlanSchedulerEngine:
         the outcome the worker reaches lands in that row, and the caller
         can read it by the id it was handed.
 
+        A handshake that **ran out** does not cost the caller the id.
+        The worker writes the row down *before* it carries the action
+        out, so a command that is still running is a command whose row
+        is already there; the id is therefore read when the answer is
+        built, and a slow handshake does not turn an id that exists
+        into a missing one.
+
         There are **two** waits, and each of them is bounded by the same
         bound: the handshake, which says the command has been written
         down, and the answer, which says what the action did.  The
@@ -1010,20 +1017,19 @@ class PlanSchedulerEngine:
         limit = self._command_timeout() if timeout is None else float(timeout)
 
         # The handshake: the worker writes the command down, and the id
-        # comes with it.
-        if request.recorded_event.wait(timeout=limit):
-            command_id = request.command_id
-        else:
-            # The worker has not even reached the command yet.  It will
-            # write it down when it does, and the caller can come back
-            # for the outcome; there is no id to hand out yet.
-            command_id = None
+        # comes with it.  The wait is bounded, but a handshake that ran
+        # out is **not** a lost id: the worker writes the row down
+        # *before* it carries the action out, so the id may well be
+        # there by the time the answer is built.  The id is therefore
+        # read from the request when the answer is built, and not
+        # remembered from the handshake.
+        request.recorded_event.wait(timeout=limit)
 
         # The answer, once, with the bound.
         if not request.result_event.wait(timeout=limit):
             return EngineCommandResult(
                 outcome=PENDING_ANSWER,
-                command_id=command_id,
+                command_id=request.command_id,
                 detail="the command is still in the mailbox",
                 plan_id=plan_id,
                 action=action,
@@ -1031,7 +1037,7 @@ class PlanSchedulerEngine:
         if request.result is None:  # pragma: no cover - defensive
             return EngineCommandResult(
                 outcome=PENDING_ANSWER,
-                command_id=command_id,
+                command_id=request.command_id,
                 detail="the command produced no result",
                 plan_id=plan_id,
                 action=action,

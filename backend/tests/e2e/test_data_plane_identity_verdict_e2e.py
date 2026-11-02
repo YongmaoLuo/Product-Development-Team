@@ -40,17 +40,19 @@ R1--R4 各自的单测都绿，但原症状是**报告写 PASSED、前端显示 
 * ``#verification-overall-result`` → 「⚠️ 循环停止」
 * 整页**不出现**「验证通过」
 
-**这个文件依赖 Playwright。** CI 的 e2e lane（``.github/workflows/ci.yml``
-的 ``e2e-on-demand``）目前**不**安装 ``playwright``（它不在
-``backend/pyproject.toml`` 的依赖里），所以那条 lane 上本文件会**失败**而不是
-跳过 —— 这是「不许 skip」的直接代价，也是有意的：一条在 CI 上偷偷跳过、
-在本地才跑绿的测试，证明不了任何事。真要让这条 lane 绿，得把 ``playwright``
-加进 backend 的 dev 依赖并在 e2e job 里 ``playwright install chromium``。
+**这个文件依赖 Playwright，而且拒绝在缺它的时候跳过。** ``playwright``
+在 backend 的 dev 依赖里（``backend/pyproject.toml``），CI 的 e2e lane
+（``.github/workflows/ci.yml`` 的 ``e2e-on-demand``）在跑测试之前装
+``playwright install --with-deps chromium`` —— 驱动包和浏览器二进制是两回事，
+前者随依赖装上，后者要单独下载。
+
+所以这条 lane 上本文件要么跑、要么**失败**，没有「跳过」这一档：一条在 CI 上
+偷偷跳过、在本地才跑绿的测试，证明不了任何事。缺浏览器时驱动以非零退出码
+结束，测试把这个退出码变成一次失败。
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import subprocess
@@ -359,25 +361,10 @@ def _run_driver(
 ) -> Dict[str, Any]:
     """Run the browser pass; return the report it printed.
 
-    Two different things can go wrong, and they are not the same thing:
-
-      * **No browser at all** — ``playwright`` is not importable by the
-        interpreter this driver runs on.  That is the same condition the
-        other browser walks in this directory meet with a skip
-        ("playwright is not importable here …"), and the PR gate never
-        installs one, so failing here would report a missing capability
-        as a broken product.  Skipped, with the same wording.
-      * **A browser that cannot start** — once ``playwright`` is there,
-        a driver that dies is a **failure**, not a skip: the exit code
-        of a skipped test and the exit code of a passing test are the
-        same number, and this file exists to produce evidence.
+    A driver that cannot start is a **failure**, not a skip: the exit code
+    of a skipped test and the exit code of a passing test are the same
+    number, and this file exists to produce evidence.
     """
-    if importlib.util.find_spec("playwright") is None:
-        pytest.skip(
-            "playwright is not importable here (install it, or put a "
-            "'playwright' command on PATH); the acceptance walk needs a "
-            "real browser"
-        )
     script = work / "drive_verdict.py"
     script.write_text(_DRIVER, encoding="utf-8")
     result = subprocess.run(

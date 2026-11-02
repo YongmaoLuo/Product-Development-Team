@@ -34,8 +34,10 @@ way the wiring can quietly go wrong:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -44,6 +46,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import orphan_reaper as reaper
 import server as server_mod
 
 #: The repository root — the directory that holds the ``backend`` package.
@@ -473,3 +476,356 @@ def test_missing_reaper_module_is_a_no_op(monkeypatch, clean_spawn_env):
     assert server_mod._install_orphan_reaper_marks() is None
     assert server_mod._start_orphan_reaper() is None
     assert "PDT_SPAWN_OWNER_PID" not in os.environ
+
+
+# --------------------------------------------------------------------------
+# The scan the backend starts must not cost the machine a probe per process
+# --------------------------------------------------------------------------
+#
+# The startup scan runs on the *readiness path*: uvicorn binds the
+# socket only after the lifespan returns, so every second the scan
+# spends is a second in which the API does not answer.  The scan reads
+# the environment of every process on the machine, and the way it used
+# to do that — two ``ps`` children per process — made the scan outlive
+# the processes it was judging.
+#
+# So the *number of probes* is a property of the wiring, and it is
+# pinned here: a scan that asks the machine once per process cannot
+# finish before the processes it judges have exited.
+
+
+#: How many processes the bulk-read fixtures describe.
+BULK_PROCESS_COUNT = 200
+
+#: The first pid the bulk fixtures use.  High enough not to collide
+#: with a real process on the machine running the test.
+BULK_FIRST_PID = 900000
+
+
+def _bulk_process_table(count=BULK_PROCESS_COUNT):
+    """A ``ps -axo`` table with *count* processes."""
+    rows = []
+    for index in range(count):
+        pid = BULK_FIRST_PID + index
+        rows.append(
+            "%7d %5d %7d %5d %7d /usr/bin/python3 -m worker --slot %d"
+            % (pid, 1, pid, os.getuid(), 4096, index)
+        )
+    return "\n".join(rows) + "\n"
+
+
+def _bulk_env_table(count=BULK_PROCESS_COUNT):
+    """A ``ps -E -A`` listing with *count* processes and their environments."""
+    lines = ["  PID TTY           TIME CMD"]
+    for index in range(count):
+        pid = BULK_FIRST_PID + index
+        lines.append(
+            "%7d ??         0:00.03 /usr/bin/python3 -m worker --slot %d "
+            "PATH=/usr/bin:/bin BULK_SLOT=%d" % (pid, index, index)
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _fake_ps_machine(monkeypatch, count=BULK_PROCESS_COUNT):
+    """Replace ``ps`` with a machine that answers both questions at once.
+
+    The returned list records every call, so a case can count how many
+    times the machine was asked.
+    """
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        if "-E" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_bulk_env_table(count), stderr="")
+        if "-axo" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_bulk_process_table(count), stderr="")
+        if "-o" in cmd:
+            pid = int(cmd[cmd.index("-p") + 1])
+            index = pid - BULK_FIRST_PID
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout="/usr/bin/python3 -m worker --slot %d\n" % index,
+                stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(reaper.subprocess, "run", fake_run)
+    monkeypatch.setattr(reaper, "_IS_DARWIN", True)
+    return calls
+
+
+def test_the_bulk_read_answers_for_every_process_at_once(monkeypatch):
+    """One ``ps -E -A`` answers for every process, and the environment
+    is the one that belongs to the process that was asked about.
+
+    The command line the process table carries says where the
+    environment starts inside the line; the environment after it is
+    that process' own, and not the environment of the line above or
+    below it.
+    """
+    calls = _fake_ps_machine(monkeypatch)
+    procs = reaper.list_processes()
+
+    envs = reaper.read_process_environ_bulk(procs)
+
+    assert envs is not None, "the bulk read did not happen at all"
+    bulk_calls = [call for call in calls if "-E" in call]
+    assert len(bulk_calls) == 1, (
+        "the bulk read asked the machine %d times; it is supposed to ask "
+        "once" % len(bulk_calls)
+    )
+    assert set(envs) == {BULK_FIRST_PID + index for index in range(BULK_PROCESS_COUNT)}
+    assert envs[BULK_FIRST_PID]["BULK_SLOT"] == "0"
+    last = BULK_FIRST_PID + BULK_PROCESS_COUNT - 1
+    assert envs[last]["BULK_SLOT"] == str(BULK_PROCESS_COUNT - 1)
+
+
+def test_a_scan_asks_the_machine_a_constant_number_of_times(monkeypatch, tmp_path):
+    """A scan of two hundred processes must not ask ``ps`` four hundred times.
+
+    The per-process read costs two ``ps`` children per process.  A scan
+    that asks the machine once per process is *right* and useless: it
+    spends longer asking than the processes live, so the processes it
+    judges have already gone, and their environment reads back as
+    unreadable rather than as the unmarked environment it was.
+
+    This pins the number of probes, because the number of probes is
+    what the cost is.
+    """
+    calls = _fake_ps_machine(monkeypatch)
+    config = reaper.ReaperConfig(plans_root=tmp_path, dry_run=True)
+
+    result = reaper.scan(config, self_uid=os.getuid())
+
+    assert len(result.verdicts) == BULK_PROCESS_COUNT
+    assert len(calls) <= 5, (
+        "the scan asked the machine %d times for %d processes; a scan that "
+        "asks once per process cannot finish before the processes it "
+        "judges have exited"
+        % (len(calls), BULK_PROCESS_COUNT)
+    )
+    reasons = {verdict.proc.pid: verdict.reason for verdict in result.verdicts}
+    assert reasons[BULK_FIRST_PID] == reaper.REASON_UNMARKED, (
+        "the bulk read did not deliver the environment: the first process "
+        "was judged %r, which says its environment could not be read"
+        % reasons[BULK_FIRST_PID]
+    )
+
+
+def test_an_injected_environment_reader_is_not_second_guessed(monkeypatch, tmp_path):
+    """A caller that brings its own reader keeps it.
+
+    The bulk read is an optimisation of the *default* reader, not a
+    replacement for a decision the caller made: a caller that injects a
+    reader is asking a specific question, and the scan must answer that
+    question.
+    """
+    asked = []
+
+    def fake_reader(pid):
+        asked.append(pid)
+        return {"BULK_SLOT": "injected"}
+
+    _fake_ps_machine(monkeypatch)
+    config = reaper.ReaperConfig(plans_root=tmp_path, dry_run=True)
+
+    result = reaper.scan(config, env_reader=fake_reader, self_uid=os.getuid())
+
+    assert asked, "the injected reader was never asked"
+    assert len(asked) == BULK_PROCESS_COUNT
+    reasons = {verdict.proc.pid: verdict.reason for verdict in result.verdicts}
+    assert reasons[BULK_FIRST_PID] == reaper.REASON_UNMARKED
+
+
+def test_a_failed_bulk_read_falls_back_to_the_per_process_reader(monkeypatch, tmp_path):
+    """A ``ps -E -A`` that cannot be read costs the bulk read and nothing else.
+
+    The fallback is the per-process reader, which is slower but answers
+    the same question.  Without it a failed bulk read would report every
+    process on the machine as *unreadable* — a silent, total loss of the
+    reaper's evidence, dressed up as a scan that ran.
+    """
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        if "-E" in cmd and "-A" in cmd:
+            # The bulk read fails.
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no")
+        if "-E" in cmd:
+            pid = int(cmd[cmd.index("-p") + 1])
+            index = pid - BULK_FIRST_PID
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout="%7d ??         0:00.03 /usr/bin/python3 -m worker "
+                "--slot %d PATH=/usr/bin:/bin BULK_SLOT=%d\n"
+                % (pid, index, index),
+                stderr="")
+        if "-axo" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_bulk_process_table(), stderr="")
+        if "-o" in cmd:
+            pid = int(cmd[cmd.index("-p") + 1])
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout="/usr/bin/python3 -m worker --slot %d\n"
+                % (pid - BULK_FIRST_PID),
+                stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(reaper.subprocess, "run", fake_run)
+    monkeypatch.setattr(reaper, "_IS_DARWIN", True)
+    config = reaper.ReaperConfig(plans_root=tmp_path, dry_run=True)
+
+    result = reaper.scan(config, self_uid=os.getuid())
+
+    assert any("-A" in call for call in calls), (
+        "the bulk read was never attempted, so this case proves nothing "
+        "about what happens when it fails"
+    )
+    reasons = {verdict.proc.pid: verdict.reason for verdict in result.verdicts}
+    assert reasons[BULK_FIRST_PID] == reaper.REASON_UNMARKED, (
+        "the per-process reader did not take over after the bulk read "
+        "failed; the process was judged %r instead"
+        % reasons[BULK_FIRST_PID]
+    )
+
+
+# --------------------------------------------------------------------------
+# Reading a thousand environments must not cost a thousand shell lexers
+# --------------------------------------------------------------------------
+#
+# The bulk read asks the machine once, but it still has to read what the
+# machine said: one blob of ``KEY=VALUE`` tokens per process.  Splitting
+# that is the expensive part — the shell lexer builds a word one
+# character at a time, which is quadratic in the length of the word, and
+# an environment is full of long values — and most of what it is asked to
+# split needs no lexer at all: a blob with no quote and no backslash is
+# split by whitespace alone, and the lexer gives exactly that answer.
+#
+# Three cases carry the win, and all three are pinned here: a blob
+# without a quote, a line that cannot hold a variable at all, and the
+# split itself, which has to keep answering what the lexer answers.
+
+
+def test_a_quote_free_blob_is_split_without_the_lexer(monkeypatch):
+    """A blob with no quote and no backslash is split by whitespace alone.
+
+    The lexer would give the same answer, and it costs a great deal
+    more: on a machine with a thousand processes the bulk read spends
+    most of its time in the lexer.
+    """
+    def explode(*args, **kwargs):
+        raise AssertionError(
+            "the lexer was used for a blob that needs no lexer"
+        )
+
+    monkeypatch.setattr(reaper, "_posix_split", explode)
+
+    assert reaper._split_env_blob("PATH=/usr/bin:/bin HOME=/root") == [
+        "PATH=/usr/bin:/bin",
+        "HOME=/root",
+    ]
+
+
+def test_the_cheap_split_is_the_same_split_the_lexer_gives():
+    """The cheap split must be the lexer's answer, token for token.
+
+    A cheaper split that splits differently is not a cheaper split, it
+    is a different reading of the machine's answer — and the reaper
+    reads the environment out of that answer.
+    """
+    for text in (
+        "PATH=/usr/bin:/bin HOME=/root",
+        "A=1  B=2",
+        "A=1\tB=2",
+        "A=1\nB=2",
+        "A=1 B=2",
+        "",
+        "   ",
+        "A=1 'B=2'",
+        "A=1 B=\"2 3\"",
+    ):
+        assert reaper._split_env_blob(text) == shlex.split(text), (
+            "the cheap split and the shell lexer disagree about %r" % text
+        )
+
+    # An unbalanced quote falls back to a plain split rather than raising:
+    # an apostrophe inside a value is not a reason to lose the whole blob.
+    assert reaper._split_env_blob("A=it's B=2") == "A=it's B=2".split()
+
+
+def test_the_split_is_the_shell_lexers_split():
+    """The lexer is the specification; the split has to match it.
+
+    The reaper reads a machine's answer out of a blob of variables, and
+    the blob is split the way a shell would split it.  The lexer is
+    what defines that, so the lexer is what the split is checked
+    against — on the shapes a quote and a backslash make, and on every
+    short combination of them, because those are the shapes where two
+    readers of the same text can part ways.
+
+    A disagreement is not a slower answer, it is a different answer: the
+    environment a process was launched with would be read as something
+    else, and the reaper decides what to kill from what it reads.
+    """
+    def outcome(text):
+        try:
+            return ("words", shlex.split(text))
+        except ValueError as exc:
+            return ("error", type(exc).__name__)
+
+    def ours(text):
+        try:
+            return ("words", reaper._posix_split(text))
+        except ValueError as exc:
+            return ("error", type(exc).__name__)
+
+    shapes = [
+        "", " ", "  ", "\t", "\n",
+        "A=1", "A=1 B=2", "A=1  B=2", "A=1\tB=2", "A=1\nB=2",
+        "A='x y'", 'A="x y"', "A='x", 'A="x', "A=x\\ y", "A=x\\",
+        "A=''", 'A=""', "A='a'\"b\"", "A='a'b'c'", "A=\"a\\\"b\"",
+        "A=\"a\\\\b\"", "A=\"a\\nb\"", "A='a\\'b'", "A=\\x", "A=x\\'y",
+        "A='a b' 'c d'", "A=\"a b\"'c d'", "a'b'c", 'a"b"c',
+    ]
+    for text in shapes:
+        assert ours(text) == outcome(text), (
+            "the split and the shell lexer disagree about %r: %r vs %r"
+            % (text, ours(text), outcome(text))
+        )
+
+    # Every combination of the shapes that make quoting hard, up to
+    # three characters long: 4**3 is small enough to be exhaustive, and
+    # exhaustive is the point — the interesting disagreements are short.
+    alphabet = ("a", " ", "'", '"', "\\")
+    for length in range(1, 4):
+        for combination in itertools.product(alphabet, repeat=length):
+            text = "".join(combination)
+            assert ours(text) == outcome(text), (
+                "the split and the shell lexer disagree about %r: %r vs %r"
+                % (text, ours(text), outcome(text))
+            )
+
+
+def test_a_line_without_an_equals_sign_costs_no_tokenising(monkeypatch):
+    """A line that cannot hold a variable is *unreadable*, and saying so
+    must cost nothing.
+
+    Most process lines on a macOS machine carry no environment at all —
+    the binary is protected by SIP — so there is no ``k=v`` in them to
+    find.  A line with no ``=`` cannot yield a single pair, in the
+    segment or in the whole line, so the answer is the same whether the
+    blob is tokenised or not.
+    """
+    def explode(*args, **kwargs):
+        raise AssertionError(
+            "the blob was tokenised even though the line carries no '='"
+        )
+
+    monkeypatch.setattr(reaper, "_posix_split", explode)
+
+    line = "  123 ??         0:00.01 /usr/bin/python3 -m worker"
+    assert reaper._environ_from_darwin_line(line, "/usr/bin/python3 -m worker") is None

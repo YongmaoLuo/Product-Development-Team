@@ -85,6 +85,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from config_paths import resolve_plans_dir  # noqa: E402
+from tests import _readiness  # noqa: E402
 from tests.fixtures.verification_mode import (  # noqa: E402
     CHILD_BACKEND_DIR_ENV,
     PR_NUMBER,
@@ -110,7 +111,35 @@ pytestmark = [pytest.mark.e2e]
 
 #: 单次跑批的预算（秒）。超时即失败：冒烟测试的价值在于它**当场**知道链路
 #: 断了，而不是十分钟后有人想起来看一眼。
-RUN_BUDGET_SECONDS = 120
+#:
+#: 预算只有一个出处：``tests/_readiness.py``。
+RUN_BUDGET_SECONDS = _readiness.RUN_BUDGET_SECONDS
+
+
+@pytest.fixture(autouse=True)
+def _server_readiness_budget(monkeypatch):
+    """让这个文件起的真后端按共享预算等就绪。
+
+    ``spawn_server`` 自带一个 30 秒的就绪上限，写在
+    ``tests/fixtures/verification_mode.py`` 里 —— 那个文件这一轮不在能改的
+    范围内，而这个 30 秒在机器忙的时候真的不够：后端的启动要读一遍机器，
+    本机实测在 10 秒到 33 秒之间。
+
+    所以这里在夹具调用时把上限换成共享预算里的那个数。换的只是「等多久」，
+    断言一个字没动。
+
+    夹具函数在自己的模块里按调用时的全局查找拿到 ``spawn_server``，所以
+    替换模块上的这个名字就够，不必复制夹具本身。
+    """
+    from tests.fixtures import verification_mode
+
+    original = verification_mode.spawn_server
+
+    def spawn_with_budget(*args, **kwargs):
+        kwargs.setdefault("timeout", _readiness.READY_TIMEOUT_SECONDS)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(verification_mode, "spawn_server", spawn_with_budget)
 
 #: 等报告落盘的轮询间隔（秒）。
 POLL_INTERVAL_SECONDS = 0.5
@@ -302,6 +331,10 @@ def _translation_answer(probe_url: str) -> str:
                     "url": probe_url,
                     "headers": {},
                     "body": None,
+                    # 这是一次 HTTP 请求的超时，不是「进程多久就绪」的预算：
+                    # 探针是测试进程里的桩服务，答得比一秒快。30 秒是产品
+                    # 自己的单请求默认值（``verification_api_runner``），照抄
+                    # 产品默认值，才不会让这条用例比产品本身更宽松。
                     "timeout_seconds": 30,
                 },
                 "assertions": [

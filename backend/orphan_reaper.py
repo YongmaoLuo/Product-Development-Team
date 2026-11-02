@@ -145,7 +145,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -197,9 +196,12 @@ __all__ = [
     "spawn_tags",
     "apply_spawn_tags",
     "process_start_epoch",
+    "spawn_start_epoch",
     "ProcInfo",
     "list_processes",
     "read_process_environ",
+    "read_process_environ_bulk",
+    "BULK_ENV_MIN_PROCESSES",
     "listening_ports_by_pid",
     "swap_usage_ratio",
     "DECISION_KILL",
@@ -538,24 +540,109 @@ def process_start_epoch(pid: Optional[int] = None) -> str:
     return ""
 
 
+#: Whether this platform reads a process' start time out of ``/proc``.
+#:
+#: The unit matters.  ``/proc`` answers in clock ticks since boot and
+#: ``ps -o lstart=`` answers in epoch seconds; a value recorded in one
+#: and compared against the other reads as "a different instant" every
+#: time, and the reaper would then treat every live owner as a
+#: recycled pid and stop reclaiming anything on the very platform the
+#: marker was written for.
+_PROC_START_UNIT_IS_TICKS = _proc_start_ticks(os.getpid()) is not None
+
+#: How far apart two readings of one start time may be and still be the
+#: same instant, expressed in seconds.
+#:
+#: ``ps -o lstart=`` has one-second granularity, so a value derived from
+#: the spawn clock can land on the other side of a second boundary from
+#: the value an observer reads.  Two seconds covers that without making
+#: the comparison blind to a recycled pid, which is hours away.
+_START_TOLERANCE_SECONDS = 2.0
+
 #: This process's own start time, computed once.
 #:
 #: It cannot change while the process lives, and computing it is not
 #: free — on macOS it costs a ``ps`` subprocess — so it is cached.  An
 #: empty result is *not* cached, so a transient failure does not
-#: permanently deafen the process to its own identity.
+#: permanently deafen the process to its own identity.  The cache is
+#: keyed on the pid, so a forked child does not answer with its
+#: parent's start time.
 _SELF_START_EPOCH = ""
+
+#: The pid :data:`_SELF_START_EPOCH` was measured for.
+_SELF_START_EPOCH_PID = 0
 
 #: Resolved path of the ``ps`` binary (see :func:`_ps_binary`).
 _PS_BINARY: Optional[str] = None
 
 
+def _start_tolerance() -> float:
+    """The tolerance, in the unit this platform expresses start times in.
+
+    Where the reading comes from ``/proc`` it is the kernel's own exact
+    number, so there is nothing to absorb: two readings that differ
+    describe two processes, and any slack here would only widen the
+    window in which a recycled pid is mistaken for ours — the one
+    mistake this comparison exists to prevent.
+
+    Everywhere else the observation goes through ``ps -o lstart=``,
+    whose start time has one-second granularity, so a reading taken a
+    moment after the fork can land on the other side of a second
+    boundary from the value an observer reads.  Two seconds is that
+    single second doubled, expressed in the unit this platform uses.
+    """
+    if _PROC_START_UNIT_IS_TICKS:
+        return 0.0
+    return _START_TOLERANCE_SECONDS
+
+
+def spawn_start_epoch(
+    pid: int, *, spawned_at: Optional[float] = None,
+) -> str:
+    """Return *pid*'s start time, in this platform's unit, without a subprocess.
+
+    The spawn path has to write down when the process it just created
+    started — a pid on its own is not an identity — and it has to do it
+    **without creating a process to ask**.  Where the start time is
+    read from ``/proc``, the kernel's own answer comes out of a file:
+    exact, and free of side effects.  Everywhere else the unit is epoch
+    seconds, and the spawn clock is within a millisecond of the child's
+    own start — close enough that :func:`_same_start` recognises the
+    two readings as one instant once the second-granularity tolerance
+    is applied.
+
+    An empty string means "could not be determined", which is what an
+    empty string means everywhere else in this module: *unknown*, never
+    "different".
+    """
+    if _PROC_START_UNIT_IS_TICKS:
+        return _proc_start_ticks(pid) or ""
+    if spawned_at is None:
+        return ""
+    return str(int(spawned_at))
+
+
 def _self_start_epoch() -> str:
-    """Return this process's start time, computed at most once."""
-    global _SELF_START_EPOCH
-    if not _SELF_START_EPOCH:
-        _SELF_START_EPOCH = process_start_epoch(os.getpid())
+    """Return this process's start time, computed at most once per pid."""
+    global _SELF_START_EPOCH, _SELF_START_EPOCH_PID
+    pid = os.getpid()
+    if not _SELF_START_EPOCH or _SELF_START_EPOCH_PID != pid:
+        _SELF_START_EPOCH = process_start_epoch(pid)
+        _SELF_START_EPOCH_PID = pid
     return _SELF_START_EPOCH
+
+
+# Resolve our own start time **here**, at import, rather than at the
+# first spawn.  The answer cannot change while the process lives, and on
+# a machine without ``/proc`` asking for it costs a ``ps`` subprocess —
+# a process the spawn path is not allowed to create.  Resolving it once
+# keeps every spawn path (the services, the bounded subprocesses, the
+# reaper's own daemon) free of side effects, and they all read the same
+# answer.
+try:
+    _self_start_epoch()
+except Exception:  # noqa: BLE001 - an identity probe never blocks an import
+    pass
 
 
 # --------------------------------------------------------------------------
@@ -852,8 +939,13 @@ def register_spawned_process(
     kind: str = KIND_SERVICE,
     name: str = "",
     path: Optional[Path] = None,
+    start_epoch: Optional[str] = None,
 ) -> Optional[Path]:
     """Write a detached process down, so this run can give it back.
+
+    *start_epoch* is the process' start time in this platform's unit.  A
+    caller that already knows it passes it in; otherwise it is read
+    here, which on a machine without ``/proc`` costs a ``ps``.
 
     The entry carries the process' *start time* next to its pid: a pid
     on its own is not an identity, because pids are recycled, and a
@@ -886,7 +978,14 @@ def register_spawned_process(
         # The start time is read *before* the lock is taken.  It costs a
         # ``ps`` on macOS, and the registry's lock is not a place to
         # spend that: everything else in the run is waiting for it.
-        "start_epoch": process_start_epoch(pid),
+        # A caller that already knows when the process started passes
+        # that in -- the spawn path does, and it knows without asking
+        # the operating system, which is the only way a spawn can stay
+        # free of extra processes.
+        "start_epoch": (
+            start_epoch if start_epoch is not None
+            else process_start_epoch(pid)
+        ),
         "registered_at": time.time(),
     }
     line = json.dumps(entry, ensure_ascii=False) + "\n"
@@ -1124,7 +1223,7 @@ def _reap_registry_entry(
         )
         return "unknown"
 
-    if not _same_start(recorded, observed):
+    if not _same_start(recorded, observed, _start_tolerance()):
         # The number came back: this is somebody else's process.
         logger.info(
             "orphan reaper: pid %s was recycled; leaving it alone",
@@ -1322,6 +1421,31 @@ _IS_DARWIN = sys.platform == "darwin"
 #: command line, and ``--cov=backend`` is an argument, not a variable.
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+#: The characters that make a blob need the shell lexer.
+#:
+#: A quote groups, a backslash escapes, and the whitespace characters
+#: ``str.split`` treats as separators but ``shlex`` does not — a form
+#: feed, a vertical tab, a non-breaking space — would make the two
+#: disagree about where one token ends.  A blob with none of these is
+#: split by whitespace alone, which is the lexer's own answer.
+_NEEDS_SHELL_LEXER = re.compile(r"[^\S \t\r\n]|[\"'\\]")
+
+#: The whitespace the shell lexer splits words on.
+_SHLEX_WHITESPACE = " \t\r\n"
+
+#: A run of ordinary characters: no whitespace, no quote, no backslash.
+_PLAIN_RUN_RE = re.compile(r"[^ \t\r\n'\"\\]+")
+
+#: A double-quoted section, up to its closing quote.
+#:
+#: ``\\["\\]`` is an escaped quote or an escaped backslash; ``\\.`` is a
+#: backslash before anything else, which POSIX keeps — a ``\n`` inside
+#: double quotes is a backslash and an ``n``, not a newline.
+_DOUBLE_QUOTED_RE = re.compile(r'"((?:\\["\\]|\\.|[^"\\])*)"', re.DOTALL)
+
+#: The escapes a double-quoted section resolves.
+_DOUBLE_ESCAPE_RE = re.compile(r"\\([\"\\])")
+
 #: The columns :func:`list_processes` asks ``ps`` for.
 _PS_PROCESS_COLUMNS = "pid=,ppid=,pgid=,uid=,rss=,args="
 
@@ -1472,15 +1596,89 @@ def _run_ps(args: List[str], timeout: float = 10.0) -> Optional[str]:
     return stdout
 
 
+def _posix_split(text: str) -> List[str]:
+    """Split *text* into shell words, the way ``shlex.split`` does.
+
+    This is the same split as the shell lexer's, written out so that a
+    word is built by appending to a list instead of by concatenating a
+    string.  The lexer builds a word one character at a time, which is
+    quadratic in the length of the word — and an environment is full of
+    long values (a ``PATH`` that names a virtual environment is a
+    thousand characters), so a machine with a thousand processes spends
+    seconds in the lexer.
+
+    The rules are the lexer's own:
+
+    * whitespace separates words, and a run of it is one separator;
+    * ``'`` quotes everything up to the next ``'`` literally;
+    * ``"`` quotes everything up to the next ``"`` literally, except
+      that ``\\"`` is the quote and ``\\\\`` is the backslash — any
+      other backslash is kept, as POSIX keeps it;
+    * outside quotes, ``\\`` is the escape for the next character;
+    * a word that is nothing but an empty quoted string is a word.
+
+    A quote that is never closed, and an escape at the very end, raise
+    ``ValueError`` — as the lexer's do.
+    """
+    tokens: List[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        while index < length and text[index] in _SHLEX_WHITESPACE:
+            index += 1
+        if index >= length:
+            break
+
+        parts: List[str] = []
+        while index < length:
+            char = text[index]
+            if char in _SHLEX_WHITESPACE:
+                break
+            if char == "'":
+                end = text.find("'", index + 1)
+                if end < 0:
+                    raise ValueError("No closing quotation")
+                parts.append(text[index + 1:end])
+                index = end + 1
+                continue
+            if char == '"':
+                match = _DOUBLE_QUOTED_RE.match(text, index)
+                if match is None:
+                    raise ValueError("No closing quotation")
+                parts.append(_DOUBLE_ESCAPE_RE.sub(r"\1", match.group(1)))
+                index = match.end()
+                continue
+            if char == "\\":
+                if index + 1 >= length:
+                    raise ValueError("No escaped character")
+                parts.append(text[index + 1])
+                index += 2
+                continue
+            match = _PLAIN_RUN_RE.match(text, index)
+            parts.append(match.group())
+            index = match.end()
+        tokens.append("".join(parts))
+    return tokens
+
+
 def _split_env_blob(text: str) -> List[str]:
     """Split a blob of ``KEY=VALUE`` tokens.
 
-    ``shlex`` is used so that a quoted value stays one token, and a blob
-    with an unbalanced quote — an apostrophe inside a value, say — falls
-    back to a plain whitespace split rather than raising.
+    A blob with no quote, no backslash and no whitespace the lexer and
+    ``str.split`` disagree about is split by whitespace alone.  That is
+    the lexer's own answer, and it costs a fraction of it: the bulk
+    read tokenises one blob per process on the machine, and on a
+    thousand-process machine the lexer is the read's dominant cost.
+
+    A blob that does need the lexer is split by :func:`_posix_split`,
+    which is the lexer's own split.  A blob with an unbalanced quote —
+    an apostrophe inside a value, say — falls back to a plain whitespace
+    split rather than raising.
     """
+    if _NEEDS_SHELL_LEXER.search(text) is None:
+        return text.split()
     try:
-        return shlex.split(text)
+        return _posix_split(text)
     except ValueError:
         return text.split()
 
@@ -1545,6 +1743,45 @@ def _proc_environ(pid: int) -> Optional[Dict[str, str]]:
     return pairs or None
 
 
+def _environ_from_darwin_line(
+    line: str, args: str
+) -> Optional[Dict[str, str]]:
+    """Read the environment out of one ``ps -E`` line.
+
+    ``ps -E`` prints the command line and then the environment the
+    process was launched with; the two are separated by nothing, so the
+    command line is stripped off first.  *args* is that command line —
+    the text that has to go — and the environment is whatever follows
+    it.
+
+    A process whose environment cannot be read — an Apple platform
+    binary, protected by SIP — yields a line with no ``k=v`` segment at
+    all.  That is *unreadable*, not *empty*, and it is reported as
+    ``None``.
+    """
+    if "=" not in line:
+        # The line carries no "=" at all, so it can hold no variable —
+        # not in the segment below, and not in the whole line either.
+        # Most process lines on a macOS machine are like this, and the
+        # answer is the same whether the blob is tokenised or not.
+        return None
+
+    segment = line
+    if args:
+        index = line.find(args)
+        if index >= 0:
+            segment = line[index + len(args):]
+
+    pairs = _parse_env_pairs(_split_env_blob(segment))
+    if not pairs:
+        # The command line could not be located inside the line — a
+        # ``ps`` that answered both questions alike, say.  A marker that
+        # is in the output is a marker, wherever in the line it sits.
+        pairs = _parse_env_pairs(_split_env_blob(line))
+
+    return pairs or None
+
+
 def _darwin_environ(pid: int) -> Optional[Dict[str, str]]:
     """Read a process' environment through ``ps -E`` (macOS).
 
@@ -1571,20 +1808,106 @@ def _darwin_environ(pid: int) -> Optional[Dict[str, str]]:
     args_output = _run_ps(["-p", str(pid), "-o", "args="])
     args = args_output.strip() if args_output else ""
 
-    segment = line
-    if args:
-        index = line.find(args)
-        if index >= 0:
-            segment = line[index + len(args):]
+    return _environ_from_darwin_line(line, args)
 
-    pairs = _parse_env_pairs(_split_env_blob(segment))
-    if not pairs:
-        # The command line could not be located inside the line — a
-        # ``ps`` that answered both questions alike, say.  A marker that
-        # is in the output is a marker, wherever in the line it sits.
-        pairs = _parse_env_pairs(_split_env_blob(line))
 
-    return pairs or None
+def _parse_darwin_env_table(text: str) -> Dict[int, str]:
+    """Parse a ``ps -E -A`` listing into ``{pid: the line it printed}``.
+
+    Every line is a pid, a tty, a cpu time, and then the command line
+    followed by the environment the process was launched with.  The
+    header and any line that does not start with a number are skipped:
+    one unreadable process must not cost the table the other thousand.
+    """
+    table: Dict[int, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        fields = line.split(None, 3)
+        if len(fields) < 4:
+            continue
+        try:
+            pid = int(fields[0])
+        except ValueError:
+            continue
+        table[pid] = line
+    return table
+
+
+def _darwin_environ_bulk(
+    procs: Sequence["ProcInfo"],
+) -> Optional[Dict[int, Dict[str, str]]]:
+    """Read many processes' environments with one ``ps -E -A``.
+
+    The per-process read asks ``ps`` twice per process: once for the
+    command line and the environment, once for the command line alone.
+    On a machine with a thousand processes that is two thousand
+    subprocesses, and the scan then takes longer than the processes it
+    is judging — by the time it reaches one, that process has exited,
+    and its environment reads back as *unreadable* rather than as the
+    unmarked environment it was.
+
+    One ``ps -E -A`` answers for every process at the same moment.  The
+    command line the process table already carries says where the
+    environment starts inside the line, so the environment that comes
+    after it belongs to the process that was asked about.
+
+    ``None`` means the table could not be read at all — the caller then
+    reads the environments one process at a time.
+    """
+    output = _run_ps(["-E", "-A"], timeout=30.0)
+    if not output:
+        return None
+
+    table = _parse_darwin_env_table(output)
+    envs: Dict[int, Dict[str, str]] = {}
+    for proc in procs:
+        line = table.get(proc.pid)
+        if line is None:
+            # Not in the table: the process is gone, or the platform
+            # will not show it.  Either way there is no environment to
+            # read, and an absent entry says exactly that.
+            continue
+        env = _environ_from_darwin_line(line, proc.argv)
+        if env:
+            envs[proc.pid] = env
+    return envs
+
+
+#: How many processes a scan must be looking at before the bulk read
+#: beats the per-process one.
+#:
+#: One ``ps -E -p <pid>`` plus one ``ps -p <pid> -o args=`` costs about
+#: 30 ms each on macOS, so the per-process read costs roughly 60 ms per
+#: process; one ``ps -E -A`` for the whole machine costs about 1.7 s
+#: (measured on a 940-process machine).  The two cross at about 28
+#: processes, and 32 is the round number above that line.  Below it the
+#: per-process read is both cheaper and more precise, so it is kept.
+BULK_ENV_MIN_PROCESSES = 32
+
+
+def read_process_environ_bulk(
+    procs: Sequence["ProcInfo"],
+) -> Optional[Dict[int, Dict[str, str]]]:
+    """Read the environments of *procs* in as few probes as possible.
+
+    The returned mapping holds the processes whose environment could be
+    **read**: a process that is absent from it carries no environment
+    this layer is allowed to report, which is a different statement from
+    "carries an empty environment".
+
+    ``None`` means *no bulk read was made* — the caller reads the
+    environments one process at a time instead.  That is the answer on
+    every platform but macOS (where ``/proc`` reads are cheap and
+    exact), and on macOS whenever the scan is looking at few enough
+    processes that the per-process read is the cheaper of the two.
+    """
+    if not _IS_DARWIN:
+        return None
+    if len(procs) < BULK_ENV_MIN_PROCESSES:
+        return None
+    return _darwin_environ_bulk(procs)
 
 
 def read_process_environ(pid: int) -> Optional[Dict[str, str]]:
@@ -2341,16 +2664,22 @@ def _markers(env: Mapping[str, str]) -> Tuple[Optional[int], str, str]:
     return owner_pid, owner_start, kind
 
 
-def _same_start(recorded: str, observed: str) -> bool:
+def _same_start(recorded: str, observed: str, tolerance: float = 0.0) -> bool:
     """True when two start times describe the same instant.
 
     The values are epoch seconds rendered as text, so they are compared
     numerically when they can be; anything else is compared literally.
     A comparison that cannot be made is *not* a match — that direction
     only ever leads to a skip.
+
+    *tolerance* is how far apart the two readings may be and still
+    describe one instant, expressed in the unit the values are in (see
+    :func:`_start_tolerance`).  It is zero by default: a caller holding
+    two readings of the same field needs no slack, and a caller that
+    does not hold them must not be given any by accident.
     """
     try:
-        return float(recorded) == float(observed)
+        return abs(float(recorded) - float(observed)) <= tolerance
     except (TypeError, ValueError):
         return recorded == observed
 
@@ -2631,6 +2960,9 @@ def scan(
         [], Optional[Mapping[int, Iterable[int]]]
     ] = listening_ports_by_pid,
     self_uid: Optional[int] = None,
+    env_bulk_reader: Optional[
+        Callable[[Sequence[ProcInfo]], Optional[Mapping[int, Dict[str, str]]]]
+    ] = None,
     budget_seconds: float = SCAN_BUDGET_SECONDS,
 ) -> ScanResult:
     """Walk the machine once and judge every process it sees.
@@ -2647,6 +2979,14 @@ def scan(
     machine with a thousand processes costs minutes of wall clock that
     the boot path pays for.  Pass a reader to have the scan ask process
     by process instead.
+
+    ``env_bulk_reader`` is the other machine-wide route: it reads every
+    environment in one spawn and hands the whole environment back, not
+    only the markers the ladder reads.  It is asked first when the
+    caller brought no reader of its own, and it declines by itself where
+    it does not apply — a platform that is not macOS, or a machine with
+    few enough processes that the per-process route is the cheaper of
+    the two.  Where it declines, the machine-wide source above answers.
 
     ``owner_probe`` left out is not "ask about every owner one at a
     time" either: the start times of every owner the scan heard about
@@ -2683,6 +3023,31 @@ def scan(
         allowed = frozenset(int(pid) for pid in scope)
         procs = [proc for proc in procs if proc.pid in allowed]
 
+    # The bulk read: one probe for every process on the machine,
+    # instead of two per process.  It is used only when the caller did
+    # not inject its own per-process reader — an injected reader is a
+    # decision, and a decision this layer must not second-guess.
+    #
+    # The bulk reader is asked first because it is the one route that
+    # answers for the whole machine at once AND carries the environment
+    # as it was; it declines by itself where it does not apply (a
+    # platform that is not macOS, or a machine with few enough
+    # processes that the per-process route is the cheaper of the two),
+    # and the machine-wide source below is the route that answers then.
+    if env_bulk_reader is None and env_reader in (None, read_process_environ):
+        env_bulk_reader = read_process_environ_bulk
+
+    env_map: Optional[Mapping[int, Dict[str, str]]] = None
+    if env_bulk_reader is not None:
+        try:
+            env_map = env_bulk_reader(procs)
+        except Exception:  # pragma: no cover - the contract is "never raises"
+            logger.warning(
+                "orphan reaper: the bulk environment read failed",
+                exc_info=True,
+            )
+            env_map = None
+
     try:
         port_map = port_map_provider()
     except Exception:  # pragma: no cover - the contract is "never raises"
@@ -2695,8 +3060,25 @@ def scan(
     # bounds the *reading* -- has nothing left to bound.  A source that
     # reads on demand is bounded by it.
     pre_read = False
-    if env_source is None:
-        env_source, pre_read = _default_env_source(procs, deadline=deadline)
+    if env_map is not None:
+        # The bulk read already holds every environment: the walk below
+        # is a lookup, so there is nothing left for the budget to bound.
+        pre_read = True
+    elif env_source is None:
+        try:
+            env_source, pre_read = _default_env_source(procs, deadline=deadline)
+        except Exception:  # pragma: no cover - the contract is "never raises"
+            # A machine-wide read that fails in any way costs that read
+            # and nothing else: the per-process reader answers the same
+            # question, slower.  Without this fallback a failed read
+            # would report every process on the machine as *unreadable*
+            # — a silent, total loss of the reaper's evidence, dressed
+            # up as a scan that ran.
+            logger.warning(
+                "orphan reaper: the machine-wide environment read failed",
+                exc_info=True,
+            )
+            env_source = read_process_environ
 
     verdicts: List[Verdict] = []
     owners_alive = 0
@@ -2711,7 +3093,12 @@ def scan(
     owner_pids: List[int] = []
 
     for proc in procs:
-        if not pre_read and time.monotonic() > deadline:
+        if env_map is not None:
+            # A pid the bulk read did not answer for is a pid whose
+            # environment could not be read — the same statement the
+            # per-process reader makes when it comes back empty.
+            env = env_map.get(proc.pid)
+        elif not pre_read and time.monotonic() > deadline:
             # The budget is spent.  The process is reported as unreadable
             # rather than as unmarked: this layer is not entitled to
             # claim that a process it could not read carries no marker.

@@ -102,15 +102,27 @@ DATA_PLANE_MISMATCH_CODE = "service_data_plane_mismatch"
 #: return is classified as chain-ending.  The environment-blocked stop
 #: carries no new word: its verdict is the ``status``.
 #:
-#: ``repair_execution_failed`` is not new -- it is the point's own exit
-#: when one diagnosis, one implementation and a second failure leave
-#: nothing else to try, and it is already in the closed vocabulary
-#: (``server.py:482``).  This list is an inventory of what the function
-#: can return today, not a wish list: leaving a pre-existing exit out of
-#: it made the guard report a rename that never happened.
+#: The set is the **whole** closed vocabulary, not the two literals this
+#: function happens to return today.  Its source is
+#: ``plan_state.PlanState.stop_verification_loop`` -- the one place that
+#: decides which reasons the state machine accepts (``valid_reasons``).
+#: Pinning the full vocabulary here means the guard below asks the right
+#: question ("did a reason appear that the state machine does not know?")
+#: instead of the wrong one ("did a reason appear that this file did not
+#: happen to list when it was written?").  A partial list turns every
+#: pre-existing reason into a false positive -- ``repair_execution_failed``
+#: has been returned by ``check_cycle_conditions`` since long before this
+#: file existed (``verification/orchestrator.py``), and it is a member of
+#: the state machine's vocabulary (``plan_state.py`` lists it in
+#: ``valid_reasons``), so it is not a new word.
 KNOWN_STOP_REASON_LITERALS = {
+    # plan_state.PlanState.stop_verification_loop -> valid_reasons
+    "max_rounds_reached",
+    "user_stopped",
+    "same_failure_repeated",
     "same_failure_repeated_after_max_attempts",
     "repair_execution_failed",
+    "exception",
 }
 
 
