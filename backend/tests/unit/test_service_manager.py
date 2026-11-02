@@ -18,8 +18,10 @@ Covers:
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
+import re
 import select
 import shlex
 import signal
@@ -41,6 +43,7 @@ if str(_BACKEND_DIR) not in sys.path:
 import service_manager as sm  # noqa: E402
 from service_declaration import ServiceDeclaration  # noqa: E402
 from service_freshness import PortProbe  # noqa: E402
+from tests import _host_load  # noqa: E402
 
 
 def _decl(**overrides) -> ServiceDeclaration:
@@ -428,10 +431,28 @@ def test_start_service_reports_a_missing_cwd(project):
     assert "does not exist" in runtime.detail
 
 
+def _is_the_service_spawn(argv) -> bool:
+    """Is this argv the spawn of the declared service?
+
+    ``subprocess.Popen`` is what *every* subprocess in this process goes
+    through -- including the ``ps`` probe that writing the CI gate's
+    spawn registry costs.  A recorder that read "the call it caught"
+    would read the probe instead of the spawn, so the spawn is told
+    apart by its shape: the detached wrapper runs under this
+    interpreter and is a program of its own.
+    """
+    argv = list(argv or [])
+    return (
+        len(argv) >= 2
+        and argv[0] == (sys.executable or "/usr/bin/python3")
+        and argv[1] == "-c"
+    )
+
+
 def test_start_service_launches_detached_and_waits(project, monkeypatch):
     """A real (tiny) detached process, so the Popen wiring — detached
     session, log redirection, cwd — is exercised rather than mocked."""
-    spawned = {}
+    spawned = []
 
     class _FakeProc:
         pid = 999999
@@ -440,8 +461,7 @@ def test_start_service_launches_detached_and_waits(project, monkeypatch):
             return None   # still running, as a real spawn would be
 
     def _fake_popen(argv, **kwargs):
-        spawned["argv"] = argv
-        spawned["kwargs"] = kwargs
+        spawned.append((argv, kwargs))
         return _FakeProc()
 
     monkeypatch.setattr(sm.subprocess, "Popen", _fake_popen)
@@ -454,18 +474,26 @@ def test_start_service_launches_detached_and_waits(project, monkeypatch):
     assert runtime.ready is True
     assert runtime.origin == "spawned"
     assert runtime.pid == 999999
+    # The spawn is told apart from every other subprocess by its shape:
+    # the CI gate's spawn registry costs one ``ps`` on this path, and
+    # that ``ps`` is a ``Popen`` call too.
+    spawns = [call for call in spawned if _is_the_service_spawn(call[0])]
+    assert len(spawns) == 1, (
+        "the spawn path started a different number of services: "
+        f"{spawned!r}"
+    )
     # The command is started through the wrapper: the wrapper's own
     # program comes first, and the declared command follows it verbatim
     # -- never re-parsed, never re-quoted.
-    argv = spawned["argv"]
+    argv, kwargs = spawns[0]
     assert argv[0] == (sys.executable or "/usr/bin/python3")
     assert argv[1] == "-c"
     assert argv[3:] == ["/bin/bash", "-lc", "npx next dev -p 3000"]
     # The wrapper makes the session itself, so Popen must not ask for one
     # as well: the child would already be a group leader and the
     # wrapper's own ``setsid`` would fail with EPERM.
-    assert "start_new_session" not in spawned["kwargs"]
-    assert spawned["kwargs"]["cwd"] == str(project)
+    assert "start_new_session" not in kwargs
+    assert kwargs["cwd"] == str(project)
 
 
 def test_detached_argv_hands_the_command_over_verbatim():
@@ -666,20 +694,160 @@ def test_stop_service_reports_a_free_port_when_there_is_nothing_to_stop(
 # ---------------------------------------------------------------------------
 
 
-def _free_port() -> int:
-    """A port the kernel says is currently unused.
+#: The first port of the first worker's block.
+#:
+#: The blocks sit below the ephemeral range of every platform this runs
+#: on (32768 and up on Linux, 49152 and up on macOS and Windows), so the
+#: kernel cannot hand one of them out for an outgoing connection while
+#: the service is binding it.
+_PORT_BLOCK_START = 20000
 
-    Note what this does *not* promise: that the port will still be unused
-    when the caller gets around to binding it. The probe socket is closed
-    before this returns, so the port is unowned from here on, and in a
-    full unit run another test can take it in the gap. Callers that bind
-    must therefore handle EADDRINUSE — see :func:`_spawn_http_server`.
+#: How many ports one worker owns.
+_PORT_BLOCK_SIZE = 64
+
+#: How many workers have a block of their own.
+#:
+#: A run started with ``-n auto`` starts one worker per CPU, and how
+#: many CPUs the machine reports is not a number the allocator may
+#: assume: the machine that runs the tests and the machine the run is
+#: sized for are not the same machine, and a limit derived from the
+#: reported CPU count leaves two workers sharing a block -- the
+#: collision this partition exists to remove, back through the front
+#: door.  So the number of blocks is fixed and generous instead, and
+#: the whole range stays below the ephemeral range.
+_PORT_WORKER_COUNT = 128
+
+#: The next port of this worker's block to be handed out.
+#:
+#: The cursor is per process, and a worker is a process of its own, so
+#: two ports are never handed out twice inside one worker -- not even to
+#: two callers in two different modules, which is why the other service
+#: tests borrow this one instead of keeping a counter of their own.
+_port_cursor = itertools.count()
+
+#: The ports this process has handed out already.
+_ports_handed_out: set = set()
+
+
+def _worker_index() -> int:
+    """Which worker of this run this is (``0`` when there is not one)."""
+    worker = os.environ.get("PYTEST_XDIST_WORKER") or ""
+    digits = "".join(ch for ch in worker if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def _port_block_base(worker_index: int) -> int:
+    """The first port of *worker_index*'s block.
+
+    The block is the unit of ownership: it is what keeps two workers
+    apart, so a port from outside the block belongs to somebody else.
     """
-    import socket
+    return _PORT_BLOCK_START + (
+        worker_index % _PORT_WORKER_COUNT
+    ) * _PORT_BLOCK_SIZE
 
+
+def _port_is_free(port: int) -> bool:
+    """Is *port* free to bind right now?"""
+    with socket.socket() as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def _free_port() -> int:
+    """A port this worker owns and that nothing is serving on.
+
+    A port the kernel hands out is not a port a test keeps: the probe
+    socket is closed before the number is returned, so from that moment
+    on the port belongs to nobody and anybody may take it.  In a
+    parallel run that anybody is the worker next door -- running the
+    same test, with the same fixture -- and the two of them then fight
+    over one port.  The service that loses that fight never comes up,
+    and the stop that follows does not only take the loser: a stop
+    re-probes the port it declared, and the process it finds there
+    matches the declaration, so the neighbour's stop takes the winner
+    with it.  A service stopped by somebody else's stop is a service
+    that *died*, and the round is told it died.
+
+    So the ports of a run are partitioned: every worker owns a block of
+    its own, and one counter per process hands them out, so two callers
+    in the same worker never get the same number.
+
+    Note what this still does *not* promise: that the port will be
+    unused when the caller gets around to binding it.  The check above
+    closes the window between two calls of this function, not the one
+    between this function and the bind.  Callers that bind must
+    therefore still handle EADDRINUSE -- see :func:`_spawn_http_server`.
+    """
+    base = _port_block_base(_worker_index())
+    for _ in range(_PORT_BLOCK_SIZE):
+        port = base + (next(_port_cursor) % _PORT_BLOCK_SIZE)
+        if port in sm.PROTECTED_PORTS:
+            continue
+        if port in _ports_handed_out:
+            continue
+        if _port_is_free(port):
+            _ports_handed_out.add(port)
+            return port
+    # Every port of this worker's block is spoken for: fall back to the
+    # kernel's own choice, which at least is free right now.
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+        port = int(sock.getsockname()[1])
+    _ports_handed_out.add(port)
+    return port
+
+
+# ---------------------------------------------------------------------------
+# The deadline this module's services are given
+# ---------------------------------------------------------------------------
+#
+# A service is a real process on a real port, and both its start-up and
+# the cost of one probe get slower when the machine is busy.  A literal
+# number of seconds is a threshold written for one machine on one quiet
+# afternoon: on a host that carries a whole run's worth of workers,
+# each of them starting a service, the same service needs longer to
+# come up, and a deadline that knows nothing about the host measures
+# the host instead of the service.
+#
+# So the deadline is the shared gate's answer.  The gate
+# (``backend/tests/_host_load.py``) owns the limit that says how loaded
+# this host is allowed to be, so one limit and one message format apply
+# everywhere -- and the case is not skipped on a busy host: what is
+# asserted here is what the service *does*, not how long it took, and
+# the host that is too busy to measure is exactly the host whose case
+# still has to run.
+
+#: The readiness budget a quiet host is given.
+READY_BUDGET_SECONDS = 20.0
+
+#: The ceiling: a scaled budget is still a budget.
+#:
+#: The ceiling stays below the shortest per-test timeout this module
+#: carries.  A budget that outlasts the case's own watchdog is a budget
+#: the watchdog cuts, and that turns "the service was slow" into "the
+#: case timed out" -- a different failure, with a different fix.
+READY_BUDGET_MAX_SECONDS = 90.0
+
+
+def _readiness_budget_seconds(base: float = READY_BUDGET_SECONDS) -> float:
+    """How long a service is given to come up, decided by the shared gate.
+
+    The budget follows the host's load average, because both the
+    child's own start-up and the cost of one probe scale with it.  The
+    scale is the shared gate's limit: a host at the limit gets twice
+    the base budget, and the budget stops at a ceiling, because a
+    scaled budget is still a budget.
+    """
+    limit = _host_load.host_load_limit()
+    load = _host_load.current_host_load()
+    if limit <= 0:
+        return float(base)
+    scaled = base * (1.0 + max(0.0, load) / limit)
+    return min(scaled, READY_BUDGET_MAX_SECONDS)
 
 
 class _StubServer(NamedTuple):
@@ -1187,7 +1355,10 @@ def test_wait_until_ready_polls_a_real_port():
         stdin=subprocess.DEVNULL, start_new_session=True,
     )
     try:
-        assert sm.wait_until_ready(_decl(port=port), timeout_seconds=20) is True
+        assert sm.wait_until_ready(
+            _decl(port=port),
+            timeout_seconds=int(_readiness_budget_seconds(20)),
+        ) is True
     finally:
         _force_cleanup(proc.pid)
         _time.sleep(0.2)
@@ -1210,7 +1381,7 @@ def test_start_service_end_to_end(tmp_path: Path):
         # Quoted: a checkout path with a space would otherwise split
         # here, and the shell would try to run the path prefix.
         start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
-        ready_timeout_seconds=20,
+        ready_timeout_seconds=int(_readiness_budget_seconds(20)),
     )
 
     runtime = sm.start_service(decl, tmp_path)
@@ -1241,7 +1412,7 @@ def test_health_url_drives_readiness(tmp_path: Path):
         name="stub", port=port,
         start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
         health_url=f"http://127.0.0.1:{port}/",
-        ready_timeout_seconds=20,
+        ready_timeout_seconds=int(_readiness_budget_seconds(20)),
     )
 
     runtime = sm.start_service(decl, tmp_path)
@@ -1809,7 +1980,7 @@ def test_reap_end_to_end_frees_a_real_port(tmp_path: Path):
         decl = _decl(
             name="stub", port=port,
             start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
-            ready_timeout_seconds=20,
+            ready_timeout_seconds=int(_readiness_budget_seconds(20)),
         )
         # Held, so the declared port is unusable and the service must
         # land elsewhere — the exact situation `_relocate_service` is for.
@@ -2364,7 +2535,7 @@ def test_declared_service_stays_healthy_until_the_last_vp(tmp_path: Path):
         start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
         cwd=".",
         health_url=f"http://127.0.0.1:{port}/",
-        ready_timeout_seconds=30,
+        ready_timeout_seconds=int(_readiness_budget_seconds(30)),
     )
 
     plan_dir = tmp_path / "plan"
@@ -4097,7 +4268,7 @@ def test_end_to_end_relocation_around_a_stranger_ends_ready(
                 f"--db {shlex.quote(str(service_db))}"
             ),
             health_url=f"http://127.0.0.1:{declared_port}/health",
-            ready_timeout_seconds=30,
+            ready_timeout_seconds=int(_readiness_budget_seconds(30)),
         )
 
         result = sm.ensure_services(
@@ -4752,7 +4923,7 @@ def test_stopping_a_relocated_service_never_reaches_the_test_session(
         decl = _decl(
             name="stub", port=declared_port,
             start_cmd=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
-            ready_timeout_seconds=20,
+            ready_timeout_seconds=int(_readiness_budget_seconds(20)),
         )
         runtime = sm._relocate_service(
             decl, tmp_path, foreign_cmdline="the test's own holder socket",
@@ -4791,3 +4962,267 @@ def test_stopping_a_relocated_service_never_reaches_the_test_session(
         os.kill(os.getpid(), 0)
     finally:
         _force_cleanup(runtime.pid)
+
+
+# ---------------------------------------------------------------------------
+# The port a test's service gets
+# ---------------------------------------------------------------------------
+#
+# A port the kernel hands out is not a port a test keeps: the probe
+# socket is closed before the number is returned, so from that moment on
+# the port belongs to nobody and anybody may take it.  In a parallel run
+# that anybody is the worker next door -- running the same test, with the
+# same fixture -- and the two of them then fight over one port.
+#
+# The service that loses that fight never comes up.  And the stop that
+# follows does not only take the loser: a stop re-probes the port it
+# declared, and the process it finds there matches the declaration, so
+# the neighbour's stop takes the winner with it.  A service that was
+# stopped by somebody else's stop is a service that *died*, and the
+# round is told it died.
+#
+# So the ports of a run are partitioned.  Every worker owns a block of
+# its own, and one counter per process hands the ports out, so two
+# callers in the same worker never get the same number -- not even two
+# callers in two different modules.  That is why the counter lives here
+# and the other service tests borrow it: a counter per module would hand
+# the same number to two modules of the same worker, which is the
+# collision this is here to remove.
+#
+# The blocks sit below the ephemeral range of every platform this runs
+# on (32768 and up on Linux, 49152 and up on macOS and Windows), so the
+# kernel cannot hand one of them out for an outgoing connection while
+# the service is binding it.
+
+
+def test_two_workers_do_not_draw_the_same_port(monkeypatch):
+    """The port of one worker must not be the port of another.
+
+    A port the kernel hands out is not a port a test keeps: the probe
+    socket is closed before the number is returned, so the port is
+    unowned from that moment on and anybody can take it.  In a parallel
+    run that anybody is the worker next door -- running the same test,
+    with the same fixture -- and the two of them then fight over one
+    port, which is how a service ends up not serving at all.
+
+    So the ports of a run are partitioned by worker, and this pins that
+    the two partitions do not meet.
+    """
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    first = _free_port()
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw3")
+    second = _free_port()
+
+    assert first != second, (
+        f"two workers drew the same port {first}; the ports of a run are "
+        f"partitioned by worker so that they cannot compete for one"
+    )
+
+
+def test_a_worker_only_draws_ports_from_its_own_block(monkeypatch):
+    """A worker's ports come from its own block, and from nowhere else.
+
+    The block is the unit of ownership: it is what keeps two workers
+    apart, so a port from outside the block belongs to somebody else.
+    """
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw5")
+    port = _free_port()
+
+    base = _PORT_BLOCK_START + 5 * _PORT_BLOCK_SIZE
+    assert base <= port < base + _PORT_BLOCK_SIZE, (
+        f"worker 5 drew port {port}, which is outside its own block "
+        f"{base}-{base + _PORT_BLOCK_SIZE - 1}"
+    )
+
+
+def test_a_port_is_never_handed_out_twice():
+    """One process hands every port out once.
+
+    The counter is shared by every module of the worker, so a port that
+    one module has taken is not offered to the next one -- two modules
+    of the same worker drawing the same number is the collision that
+    made one module's stop kill the other's service.
+    """
+    ports = [_free_port() for _ in range(8)]
+
+    assert len(set(ports)) == len(ports), (
+        f"the same port was handed out twice: {ports}"
+    )
+
+
+def test_the_port_is_below_the_ephemeral_range(monkeypatch):
+    """The port is one the kernel will not hand out on its own.
+
+    The ephemeral range is where the kernel takes ports from for an
+    outgoing connection (32768 and up on Linux, 49152 and up on macOS
+    and Windows).  A port out of that range cannot be taken away from
+    the service while the service is binding it.
+    """
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    port = _free_port()
+
+    assert port < 32768, (
+        f"port {port} is inside the ephemeral range; a port of this "
+        f"partition has to sit below it"
+    )
+
+
+def test_a_port_that_something_answers_on_is_not_handed_out(monkeypatch):
+    """A port somebody is serving on is not handed out.
+
+    The check is what makes the number usable: a port that something
+    answers on is not a port the service can bind, and a service that
+    cannot bind never comes up.
+    """
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw9")
+    taken = _free_port()
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", taken))
+        sock.listen(1)
+        port = _free_port()
+
+    assert port != taken, (
+        f"port {taken} was handed out while something was serving on it"
+    )
+
+
+def test_a_protected_port_is_never_handed_out(monkeypatch):
+    """The backend's own ports are never handed out.
+
+    Those three ports carry the backend's control plane; a service on
+    one of them is a service that takes the backend down.
+    """
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    for _ in range(16):
+        assert _free_port() not in sm.PROTECTED_PORTS
+
+
+def test_the_blocks_of_the_workers_of_a_run_do_not_meet():
+    """Every worker of a run must get a block of its own.
+
+    The partition is only a partition while there are enough blocks for
+    the workers a run can have.  A run started with ``-n auto`` starts
+    one worker per CPU, and how many CPUs the machine reports is not a
+    number the allocator gets to assume: the machine that runs the
+    tests and the machine the run is sized for are not the same
+    machine, and a limit derived from the reported CPU count would
+    hand two workers the same block -- the collision this partition
+    exists to remove, back through the front door.
+    """
+    worker_count = 64
+    bases = {_port_block_base(index) for index in range(worker_count)}
+
+    assert len(bases) == worker_count, (
+        f"{worker_count} workers share only {len(bases)} blocks; a run "
+        f"needs one block per worker for the ports of the run to be "
+        f"partitioned"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The deadline this module's services are given
+# ---------------------------------------------------------------------------
+#
+# A service is a real process on a real port, and both its start-up and
+# the cost of one probe get slower when the machine is busy.  A literal
+# number of seconds is a threshold written for one machine on one quiet
+# afternoon: on a host that carries a whole run's worth of workers,
+# each of them starting a service, the same service needs longer to
+# come up, and a deadline that knows nothing about the host measures
+# the host instead of the service.
+#
+# So the deadline is the shared gate's answer.  The gate
+# (``backend/tests/_host_load.py``) owns the limit that says how loaded
+# this host is allowed to be, so one limit and one message format apply
+# everywhere -- and the case is not skipped on a busy host: what is
+# asserted here is what the service *does*, not how long it took, and
+# the host that is too busy to measure is exactly the host whose case
+# still has to run.
+
+
+def test_the_readiness_budget_scales_with_the_host_load(monkeypatch):
+    """A busy host must not be measured by a fixed deadline.
+
+    The service is a real process on a real port, and both its
+    start-up and the cost of one probe get slower when the machine is
+    busy.  A deadline that knows nothing about the host measures the
+    host instead of the service, and the case fails for a reason that
+    has nothing to do with the code under test.
+
+    So the budget follows the load -- and it follows the **shared
+    gate's** limit, so that one limit and one message format apply
+    everywhere.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (50.0, 40.0, 30.0))
+
+    budget = _readiness_budget_seconds()
+
+    assert budget > READY_BUDGET_SECONDS, (
+        f"the readiness budget was {budget}s on a host whose load average "
+        f"was 50; it must scale with the load"
+    )
+
+
+def test_the_readiness_budget_is_never_shorter_than_the_base(monkeypatch):
+    """Scaling the budget must not shorten it.
+
+    The budget a quiet host gets is the budget the deadline used to be.
+    A longer wait for a service that is on its way up is patience, not
+    a weaker assertion -- but a *shorter* one would be the opposite.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0))
+
+    assert _readiness_budget_seconds() == READY_BUDGET_SECONDS
+
+
+def test_the_readiness_budget_stays_inside_its_ceiling(monkeypatch):
+    """A scaled budget is still a budget.
+
+    Without a ceiling a host that never settles would keep the case
+    waiting; the ceiling keeps a service that is never coming up a
+    failing case instead of a hanging one.
+    """
+    monkeypatch.setattr(
+        os, "getloadavg", lambda: (100000.0, 100000.0, 100000.0)
+    )
+
+    assert _readiness_budget_seconds() <= READY_BUDGET_MAX_SECONDS
+
+
+def test_no_readiness_deadline_in_this_module_is_a_wall_clock_literal():
+    """Every readiness deadline in this module is the gate's answer.
+
+    Two shapes of a deadline live in this module, and only one of them
+    is allowed to be a literal:
+
+      * a wait that has to **succeed** -- the service has to come up,
+        and how long that takes is a property of the host, not of the
+        code under test.  Such a wait is the shared gate's budget.
+      * a wait that has to **fail** -- the service must *not* answer,
+        and the point of the case is that it does not.  Such a wait is
+        a second or two, and it stays a literal: a budget that grows
+        with the load would make the case wait longer the busier the
+        host is, which is the opposite of what it is about.
+
+    So a literal of ten seconds or more is a wall-clock threshold
+    written for one machine, and this pins that there is none.
+    """
+    source = Path(__file__).read_text(encoding="utf-8")
+
+    declared = re.findall(r"ready_timeout_seconds\s*=\s*\d+", source)
+    assert not declared, (
+        "a readiness deadline in this module is a literal number of "
+        f"seconds: {declared!r}; the deadline has to be the one the "
+        "shared gate works out for the host the case is running on"
+    )
+
+    waited = [
+        value
+        for value in re.findall(r"timeout_seconds\s*=\s*(\d+)", source)
+        if int(value) >= 10
+    ]
+    assert not waited, (
+        "a readiness wait in this module is a wall-clock literal of ten "
+        f"seconds or more: {waited!r}; a wait that has to succeed is the "
+        "shared gate's budget"
+    )

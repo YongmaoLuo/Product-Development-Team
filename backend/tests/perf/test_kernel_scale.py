@@ -99,6 +99,7 @@ for _entry in (BACKEND_DIR, REPO_ROOT):
     if str(_entry) not in sys.path:
         sys.path.insert(0, str(_entry))
 
+from tests import _host_load  # noqa: E402
 from verification.failure_fingerprint import failure_fingerprint  # noqa: E402
 from verification.scan import scan_plans  # noqa: E402
 from verification.topic_relevance import (  # noqa: E402
@@ -128,6 +129,33 @@ requires_serial = pytest.mark.skipif(
         f"measurement of the workers; this run is distributed ({_XDIST_WORKER})"
     ),
 )
+
+
+# =============================================================================
+# The host-load gate
+# =============================================================================
+#
+# A wall-clock budget measured on a host that is already carrying someone
+# else's work is a measurement of the machine, not of the code under test.
+# The question "is this host too loaded to measure on?" is therefore asked
+# before the budget is asserted -- and it is asked the same way everywhere,
+# because a decision that is made twice is a decision that drifts.
+#
+# The decision lives in one place: ``backend/tests/_host_load.py``.  One
+# limit, one message format, one place to change them.  On CI the gate
+# stands down: a hosted runner's load is not the runner's own doing, and a
+# lane that quietly skipped would report green while asserting nothing.
+
+
+def _skip_if_host_too_busy() -> None:
+    """Skip this case when the host is too loaded to measure a budget on.
+
+    The budget itself is not weakened: it is asserted at exactly the value
+    it always had, wherever the host is measurable.
+    """
+    reason = _host_load.skip_reason()
+    if reason is not None:
+        pytest.skip(reason)
 
 
 # =============================================================================
@@ -347,6 +375,9 @@ def test_judge_scale_under_200ms():
     point of the ceiling is the *shape* of the work, and only the
     expensive shape can go quadratic.
     """
+
+    _skip_if_host_too_busy()
+
     criteria = _judge_criteria()
 
     by_id_ms, by_id_verdicts = _fastest_ms(
@@ -395,6 +426,9 @@ def test_judge_scale_under_200ms():
 @requires_serial
 def test_fingerprint_10k_under_500ms():
     """10 000 fingerprints must stay under the 500 ms ceiling."""
+
+    _skip_if_host_too_busy()
+
     fingerprints: List[str] = []
 
     def produce() -> List[str]:
@@ -436,6 +470,9 @@ def test_fingerprint_10k_under_500ms():
 @requires_serial
 def test_scan_27_plans_under_2s(tmp_path):
     """27 plans must be aggregated under the 2 s ceiling."""
+
+    _skip_if_host_too_busy()
+
     plans_dir = _build_plans(tmp_path / "plans")
 
     elapsed_ms, report = _fastest_ms(lambda: scan_plans(plans_dir))

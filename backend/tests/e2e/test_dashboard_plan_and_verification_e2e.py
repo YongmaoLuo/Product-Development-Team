@@ -527,7 +527,16 @@ def dashboard(tmp_path_factory, repo_status_before) -> Dict[str, Any]:
         _wait_ready(base_url, proc)
         try:
             report = _drive(base_url, screenshot_path, work)
-        except BaseException as exc:  # noqa: BLE001 - the server log is context
+        except Exception as exc:  # noqa: BLE001 - the server log is context
+            # ``Exception``, not ``BaseException``: pytest's ``Skipped``
+            # inherits from ``BaseException`` (``Skipped -> OutcomeException
+            # -> BaseException``), so a wider net here rewrote
+            # ``pytest.skip("chromium is not installed")`` into an
+            # ``AssertionError`` -- a machine without a browser reported a
+            # product failure instead of skipping.  ``AssertionError`` /
+            # ``TimeoutExpired`` / a failed subprocess are all ``Exception``
+            # subclasses, so they still arrive here with the backend's own
+            # output attached.
             raise AssertionError(
                 f"{exc}\n--- tail of the backend's own output ---\n"
                 f"{_server_output(proc)}"

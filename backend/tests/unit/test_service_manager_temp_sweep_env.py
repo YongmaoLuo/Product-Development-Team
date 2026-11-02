@@ -96,6 +96,25 @@ def project(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _is_the_service_spawn(argv) -> bool:
+    """Is this argv the spawn of the declared service?
+
+    ``subprocess.Popen`` is what *every* subprocess in this process goes
+    through -- including the ``ps`` probe that writing the CI gate's
+    spawn registry costs.  A recorder that read "the call it caught"
+    would read the probe instead of the spawn, and the probe hands on
+    the *parent's* environment -- which is exactly what these pins are
+    about.  So the spawn is told apart by its shape: the detached
+    wrapper runs under this interpreter and is a program of its own.
+    """
+    argv = list(argv or [])
+    return (
+        len(argv) >= 2
+        and argv[0] == (sys.executable or "/usr/bin/python3")
+        and argv[1] == "-c"
+    )
+
+
 @pytest.fixture
 def spawn(monkeypatch, project):
     """Start a declared service and hand back what it was given.
@@ -103,13 +122,14 @@ def spawn(monkeypatch, project):
     ``Popen`` is replaced, so nothing is really started -- but the
     replacement captures the ``env`` the child would have inherited,
     which is the only thing these pins are about.
+
+    Every call the replacement caught is kept, and the service's own
+    spawn is picked out of them by its shape.
     """
-    captured = {}
+    calls = []
 
     def _fake_popen(argv, **kwargs):
-        captured["argv"] = argv
-        captured["kwargs"] = kwargs
-        captured["env"] = dict(kwargs.get("env") or {})
+        calls.append((argv, kwargs))
         return _FakeProc()
 
     monkeypatch.setattr(sm.subprocess, "Popen", _fake_popen)
@@ -125,7 +145,17 @@ def spawn(monkeypatch, project):
 
     def _start(**kwargs):
         runtime = sm.start_service(_decl(), project, **kwargs)
-        assert captured.get("env") is not None, "the service was never started"
+        spawns = [call for call in calls if _is_the_service_spawn(call[0])]
+        assert len(spawns) == 1, (
+            "the service was never started: "
+            f"{calls!r}"
+        )
+        argv, spawn_kwargs = spawns[0]
+        captured = {
+            "argv": argv,
+            "kwargs": spawn_kwargs,
+            "env": dict(spawn_kwargs.get("env") or {}),
+        }
         return runtime, captured
 
     return _start

@@ -24,12 +24,16 @@ What this pins
    to ask.
 4. The wall-clock cases no longer read the load average themselves: one
    module reads it, so one limit and one message format apply.
+5. At least six wall-clock modules ask the shared gate, and none of them
+   keeps a gate of its own.  One gate means one limit and one message; a
+   second gate answering the same question is a second answer that drifts.
 """
 
 from __future__ import annotations
 
 import importlib
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Iterable, List
@@ -50,7 +54,36 @@ _conftest = importlib.import_module("tests.conftest")
 _WALL_CLOCK_FILES = (
     Path("tests") / "perf" / "plan_scheduler" / "test_scheduler_perf_budget.py",
     Path("tests") / "performance" / "test_backend_startup_perf.py",
+    Path("tests") / "perf" / "test_hitl_concurrency.py",
+    Path("tests") / "perf" / "test_kernel_scale.py",
+    Path("tests") / "perf" / "test_perf_verification.py",
+    Path("tests") / "perf" / "test_repo_scheduler_refiner_watchdog.py",
+    Path("tests") / "perf" / "test_verification_mode_scaling.py",
 )
+
+#: How many of the wall-clock modules have to ask the shared gate.
+#:
+#: The PRD asks for six.  The perf directory holds seven, and the number is
+#: a floor rather than an exact count: a module that stops measuring the
+#: clock may drop out of the list, but a module that starts measuring it
+#: has to join it.
+_MIN_ADOPTERS = 6
+
+#: The import every adopting module has to use to reach the shared gate.
+_ADOPTION_IMPORT = "from tests import _host_load"
+
+#: The call every adopting module has to make.
+_ADOPTION_CALL = "_host_load.skip_reason("
+
+#: The name of the constant that the local, parallel gate used to define.
+#:
+#: It is spelled in two pieces on purpose: this file is itself scanned for
+#: the token, and a file that carried the whole of it would look like the
+#: second gate it is here to forbid.
+_PARALLEL_GATE_CONSTANT = "HOST_PROBE_MAX_SLEEP" + "_SEC"
+
+#: A module-level constant that names a load limit of the module's own.
+_LOCAL_LOAD_LIMIT = re.compile(r"^\s*[A-Z][A-Z0-9_]*LOAD[A-Z0-9_]*\s*=", re.MULTILINE)
 
 
 class _FakeMarker:
@@ -188,4 +221,51 @@ def test_the_inline_host_load_check_is_gone() -> None:
         )
         assert "_host_load" in source, (
             "%s does not ask the shared gate" % (relative,)
+        )
+
+
+def test_at_least_six_wall_clock_modules_ask_the_shared_gate() -> None:
+    """The perf directory asks the one gate, in the one way.
+
+    A module that measures the clock asks the shared gate before it
+    asserts a bound: the import reaches the helper, and the call asks it.
+    Six modules have to do this — the PRD's floor — so that a module
+    cannot quietly grow a gate of its own without the count falling below
+    what was agreed.
+    """
+    adopters = []
+    for relative in _WALL_CLOCK_FILES:
+        source = (BACKEND_DIR / relative).read_text(encoding="utf-8")
+        if _ADOPTION_IMPORT in source and _ADOPTION_CALL in source:
+            adopters.append(relative)
+
+    assert len(adopters) >= _MIN_ADOPTERS, (
+        "at least %d wall-clock modules must ask the shared gate; only %d of "
+        "%d do: %r"
+        % (
+            _MIN_ADOPTERS,
+            len(adopters),
+            len(_WALL_CLOCK_FILES),
+            [str(relative) for relative in _WALL_CLOCK_FILES],
+        )
+    )
+
+
+def test_no_wall_clock_module_keeps_a_gate_of_its_own() -> None:
+    """A second gate answering the same question is a second answer.
+
+    The local gate this replaced had its own threshold, its own message and
+    its own idea of when a host was busy — and it had no CI exception, so a
+    busy CI runner skipped a case that the shared gate would have asserted.
+    None of that may come back.
+    """
+    for relative in _WALL_CLOCK_FILES:
+        source = (BACKEND_DIR / relative).read_text(encoding="utf-8")
+
+        assert _PARALLEL_GATE_CONSTANT not in source, (
+            "%s still defines the local, parallel gate's threshold" % (relative,)
+        )
+        assert not _LOCAL_LOAD_LIMIT.search(source), (
+            "%s still defines a load limit of its own; the limit belongs to "
+            "the shared gate" % (relative,)
         )

@@ -59,6 +59,12 @@ if str(_BACKEND_DIR) not in sys.path:
 
 import service_manager as sm  # noqa: E402
 from service_declaration import ServiceDeclaration  # noqa: E402
+from tests import _host_load  # noqa: E402
+from tests.unit.test_service_manager import (  # noqa: E402
+    _PORT_BLOCK_SIZE,
+    _free_port,
+    _port_block_base,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +126,73 @@ _FIXTURE_ROWS = 4
 # ---------------------------------------------------------------------------
 
 
-def _free_port() -> int:
-    port = sm.allocate_free_port()
-    assert port is not None, "could not allocate a free port"
-    return port
+# ---------------------------------------------------------------------------
+# The port this module's service gets
+# ---------------------------------------------------------------------------
+#
+# A port the kernel hands out is not a port a test keeps: the probe
+# socket is closed before the number is returned, so the port is
+# unowned from that moment on and anybody can take it.  In a parallel
+# run that anybody is the worker next door -- running the same test,
+# with the same fixture -- and the two of them then fight over one
+# port, which is how a service ends up not serving at all.
+#
+# So the ports of a run are partitioned by worker: worker ``gw0`` owns
+# one block, ``gw1`` the next, and no two workers ever draw the same
+# number.  A port that something is serving on is skipped, so the
+# number that comes back is one this worker owns and nothing answers
+# on.
+#
+# The counter that hands the ports out belongs to the **process**, not
+# to this module: a worker runs many modules, and two modules of the
+# same worker that drew the same number would be two services fighting
+# over one port.  So the allocator is borrowed from the sibling module
+# that owns it, and this module's service gets a port out of the run's
+# partition -- the same partition every other service of this run gets
+# its port from.
+
+
+# ---------------------------------------------------------------------------
+# The deadline this module's service is given
+# ---------------------------------------------------------------------------
+#
+# The service is a real process on a real port, and both its start-up
+# and the cost of one probe get slower when the machine is busy.  A
+# literal number of seconds is a threshold written for one machine on
+# one quiet afternoon; on a host carrying eighteen workers, each of
+# them starting a service, it measures the host instead of the
+# service.
+#
+# So the deadline is the shared gate's answer.  The gate
+# (``backend/tests/_host_load.py``) owns the limit that says how loaded
+# this host is allowed to be, so one limit and one message format
+# apply everywhere -- and the case is not skipped on a busy host: what
+# is asserted here is what the service *does*, not how long it took,
+# and the host that is too busy to measure is exactly the host whose
+# case still has to run.
+
+#: The readiness budget a quiet host is given.
+READY_BUDGET_SECONDS = 30.0
+
+#: The ceiling: a scaled budget is still a budget.
+READY_BUDGET_MAX_SECONDS = 120.0
+
+
+def _readiness_budget_seconds(base: float = READY_BUDGET_SECONDS) -> float:
+    """How long the service is given to come up, decided by the shared gate.
+
+    The budget follows the host's load average, because both the
+    child's own start-up and the cost of one probe scale with it.  The
+    scale is the shared gate's limit: a host at the limit gets twice
+    the base budget, and the budget stops at a ceiling, because a
+    scaled budget is still a budget.
+    """
+    limit = _host_load.host_load_limit()
+    load = _host_load.current_host_load()
+    if limit <= 0:
+        return float(base)
+    scaled = base * (1.0 + max(0.0, load) / limit)
+    return min(scaled, READY_BUDGET_MAX_SECONDS)
 
 
 def _write_service(project_dir: Path) -> Path:
@@ -145,7 +214,7 @@ def _declaration(
         ),
         cwd=".",
         health_url=f"http://127.0.0.1:{port}/health",
-        ready_timeout_seconds=30,
+        ready_timeout_seconds=int(_readiness_budget_seconds()),
         log_path="tmp/api.log",
     )
 
@@ -567,3 +636,117 @@ def test_a_service_the_round_stopped_is_not_reported_as_a_death(
     exits = [e for e in events if e.get("event") == sm.PROCESS_EVENT_EXITED]
     assert len(exits) == 1, events
     assert "stopped by the round" in exits[0]["reason"], exits[0]
+
+
+# ---------------------------------------------------------------------------
+# The port and the deadline this module's services get
+# ---------------------------------------------------------------------------
+#
+# Two things about the service this module watches are hostage to the
+# machine it runs on, and both of them used to be fixed numbers:
+#
+#   * the **port** -- the kernel hands one out and gives it back the
+#     moment the probe socket is closed, so between choosing it and
+#     binding it the port belongs to nobody, and in a parallel run
+#     "nobody" is the worker next door, which is running the same test
+#     with the same fixture.  Two workers that draw the same number
+#     fight over one port, and the service that loses never comes up.
+#   * the **deadline** -- thirty seconds of wall clock is a threshold
+#     written for one machine on one quiet afternoon.  On a host that
+#     carries eighteen workers, each of them starting a service, the
+#     same service needs longer to come up, and a deadline that knows
+#     nothing about the host measures the host instead of the service.
+#
+# So the ports are partitioned by worker, and the deadline is the
+# shared gate's answer -- ``backend/tests/_host_load.py`` owns the
+# limit that says how loaded this host is allowed to be, so one limit
+# and one message format apply everywhere.
+
+
+def test_the_port_of_this_module_comes_from_the_runs_partition(monkeypatch):
+    """The port this module's service gets is one the run partitioned.
+
+    The allocator belongs to the **process**, not to this module: two
+    modules of one worker must never be handed the same number, or the
+    stop of one takes the service of the other down with it -- a
+    service stopped by somebody else's stop is a service that *died*,
+    and the round is told it died.  So this module borrows the run's
+    allocator instead of keeping a counter of its own, and this pins
+    that the port it gets is out of that partition: below the
+    ephemeral range, where the kernel cannot take the number away
+    while the service is binding it.
+    """
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw5")
+    port = _free_port()
+
+    base = _port_block_base(5)
+    assert base <= port < base + _PORT_BLOCK_SIZE, (
+        f"the port {port} is not in worker gw5's block "
+        f"[{base}, {base + _PORT_BLOCK_SIZE})"
+    )
+    assert port < 32768, (
+        f"port {port} is inside the ephemeral range; a port of this "
+        f"partition has to sit below it"
+    )
+
+
+def test_the_readiness_budget_scales_with_the_host_load(monkeypatch):
+    """A busy host must not be measured by a fixed deadline.
+
+    The service is a real process on a real port, and both its
+    start-up and the cost of one probe get slower when the machine is
+    busy.  A deadline that knows nothing about the host measures the
+    host instead of the service, and the case fails for a reason that
+    has nothing to do with the code under test.
+
+    So the budget follows the load -- and it follows the **shared
+    gate's** limit, so that one limit and one message format apply
+    everywhere.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (50.0, 40.0, 30.0))
+
+    budget = _readiness_budget_seconds()
+
+    assert budget > READY_BUDGET_SECONDS, (
+        f"the readiness budget was {budget}s on a host whose load average "
+        f"was 50; it must scale with the load"
+    )
+
+
+def test_the_readiness_budget_is_never_shorter_than_the_base(monkeypatch):
+    """Scaling the budget must not shorten it.
+
+    The budget a quiet host gets is the budget the deadline used to be.
+    A longer wait for a service that is on its way up is patience, not
+    a weaker assertion -- but a *shorter* one would be the opposite.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0))
+
+    assert _readiness_budget_seconds() == READY_BUDGET_SECONDS
+
+
+def test_the_readiness_budget_stays_inside_its_ceiling(monkeypatch):
+    """A scaled budget is still a budget.
+
+    Without a ceiling a host that never settles would keep the case
+    waiting; the ceiling keeps a service that is never coming up a
+    failing case instead of a hanging one.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (100000.0, 100000.0, 100000.0))
+
+    assert _readiness_budget_seconds() <= READY_BUDGET_MAX_SECONDS
+
+
+def test_the_declaration_is_given_the_shared_budget(tmp_path, monkeypatch):
+    """The deadline the service is given is the gate's answer.
+
+    A literal in the declaration would be a deadline written for one
+    machine; the deadline has to be the one the shared gate works out
+    for the host the case is running on.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (50.0, 40.0, 30.0))
+
+    script = _write_service(tmp_path / "project")
+    declaration = _declaration(_free_port(), script)
+
+    assert declaration.ready_timeout_seconds == int(_readiness_budget_seconds())

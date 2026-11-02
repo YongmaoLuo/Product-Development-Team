@@ -56,6 +56,13 @@ if str(_BACKEND_DIR) not in sys.path:
 #: The harness under test.
 _HARNESS_PATH = Path(__file__).resolve().parents[1] / "manual" / "spawn_repro.py"
 
+# The port this module's services get.  The allocator belongs to the
+# **process**, not to this module: two modules of one worker must never
+# be handed the same number, or the stop of one takes the service of
+# the other down with it.  So this module borrows the run's allocator
+# instead of keeping a counter of its own.
+from tests.unit.test_service_manager import _free_port  # noqa: E402
+
 
 def _load_harness() -> ModuleType:
     """Import the harness from its file."""
@@ -73,13 +80,6 @@ spawn_repro = _load_harness()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _free_port() -> int:
-    """A port nothing is listening on right now."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _listen_after(port: int, delay: float, stop: threading.Event) -> threading.Thread:
@@ -156,6 +156,24 @@ def _config(tmp_path: Path, **overrides):
 # ---------------------------------------------------------------------------
 
 
+def _is_the_service_spawn(args) -> bool:
+    """Is this argv the spawn of a declared service?
+
+    ``subprocess.Popen`` is what *every* subprocess in this process goes
+    through -- including the ``ps`` probe that writing the CI gate's
+    spawn registry costs.  A recorder that read "the calls it caught"
+    would read the probe as well, so the spawn is told apart by its
+    shape: the detached wrapper runs under this interpreter and is a
+    program of its own.
+    """
+    args = list(args or [])
+    return (
+        len(args) >= 2
+        and args[0] == (sys.executable or "/usr/bin/python3")
+        and args[1] == "-c"
+    )
+
+
 def test_popen_kwargs_mirror_service_manager(tmp_path, monkeypatch):
     """The harness must spawn the way ``service_manager`` spawns.
 
@@ -204,8 +222,14 @@ def test_popen_kwargs_mirror_service_manager(tmp_path, monkeypatch):
         name="repro", port=_free_port(), start_cmd="true", cwd=".",
     )
     service_manager.start_service(decl, tmp_path)
-    assert len(captured) == 1, "production did not spawn"
-    prod_args, prod_kwargs = captured[0]
+    spawns = [
+        call for call in captured if _is_the_service_spawn(call[0])
+    ]
+    assert len(spawns) == 1, (
+        "production did not spawn exactly one service: "
+        f"{captured!r}"
+    )
+    prod_args, prod_kwargs = spawns[0]
 
     cfg = spawn_repro.SpawnConfig(
         start_cmd=decl.start_cmd,
@@ -215,8 +239,14 @@ def test_popen_kwargs_mirror_service_manager(tmp_path, monkeypatch):
         env_extra=service_manager.service_env(decl),
     )
     spawn_repro.spawn_child(cfg)
-    assert len(captured) == 2, "the harness did not spawn"
-    harness_args, harness_kwargs = captured[1]
+    spawns = [
+        call for call in captured if _is_the_service_spawn(call[0])
+    ]
+    assert len(spawns) == 2, (
+        "the harness did not spawn exactly one service: "
+        f"{captured!r}"
+    )
+    harness_args, harness_kwargs = spawns[1]
 
     assert harness_args == prod_args
     assert set(harness_kwargs) - set(prod_kwargs) == {"close_fds"}

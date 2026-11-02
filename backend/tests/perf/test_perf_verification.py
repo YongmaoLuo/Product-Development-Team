@@ -97,6 +97,13 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+# ``backend/`` -- the shared host-load gate lives in ``backend/tests/``,
+# so the backend directory has to be importable from here.
+_BACKEND_DIR = Path(__file__).resolve().parents[2]
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
+from tests import _host_load  # noqa: E402
 from verification_agent import (  # noqa: E402
     FakeVerifierBackend,
     VerificationAgent,
@@ -114,6 +121,33 @@ from verification_config import TimeoutPolicy  # noqa: E402
 #   pytest -m perf           # only perf
 #   pytest -m "not perf"     # everything else
 pytestmark = pytest.mark.perf
+
+
+# =============================================================================
+# The host-load gate
+# =============================================================================
+#
+# A wall-clock budget measured on a host that is already carrying someone
+# else's work is a measurement of the machine, not of the code under test.
+# The question "is this host too loaded to measure on?" is therefore asked
+# before the budget is asserted -- and it is asked the same way everywhere,
+# because a decision that is made twice is a decision that drifts.
+#
+# The decision lives in one place: ``backend/tests/_host_load.py``.  One
+# limit, one message format, one place to change them.  On CI the gate
+# stands down: a hosted runner's load is not the runner's own doing, and a
+# lane that quietly skipped would report green while asserting nothing.
+
+
+def _skip_if_host_too_busy() -> None:
+    """Skip this case when the host is too loaded to measure a budget on.
+
+    The budget itself is not weakened: it is asserted at exactly the value
+    it always had, wherever the host is measurable.
+    """
+    reason = _host_load.skip_reason()
+    if reason is not None:
+        pytest.skip(reason)
 
 
 # =============================================================================
@@ -312,6 +346,8 @@ def test_perf_wall_time_under_15s(
     own; it would also leave group events missing or
     malformed, which the e2e suite already pins).
     """
+    _skip_if_host_too_busy()
+
     agent = VerificationAgent(
         plan_dir=temp_plan_dir,
         project_dir=temp_project_dir,
@@ -415,6 +451,8 @@ def test_perf_parallelism_observed_via_timestamps(
     AND would also eliminate the cross-group overlap,
     failing the assertion below.
     """
+    _skip_if_host_too_busy()
+
     agent = VerificationAgent(
         plan_dir=temp_plan_dir,
         project_dir=temp_project_dir,

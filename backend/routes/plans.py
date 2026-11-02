@@ -546,6 +546,17 @@ def _mark_listing_degraded(
         response.headers[LIST_DEGRADED_HEADER] = LIST_DEGRADED_REASON
 
 
+#: The prefix that marks a directory under the plans root as the
+#: framework's own runtime state rather than a plan.
+#:
+#: Plan ids are ``<YYYYMMDD>-<slug>`` (``framework.ids.derive_plan_id``)
+#: and ``slugify_plan_id`` strips leading and trailing ``-`` and ``.``, so
+#: no plan directory can start with a dot.  The reaper's runtime
+#: directory (``orphan_reaper.REAPER_DIRNAME``) does, and it is hidden on
+#: purpose.
+_INTERNAL_DIR_PREFIX = "."
+
+
 # ---------------------------------------------------------------------------
 # When the data plane does not describe the tree
 # ---------------------------------------------------------------------------
@@ -592,9 +603,37 @@ def _plan_dir_names(plans_dir: Path) -> List[str]:
     A directory that cannot be read contributes nothing: an unreadable
     tree is not evidence of a mismatch, and treating it as one would
     turn a permissions problem into a refusal.
+
+    A directory whose name starts with a DOT is the framework's own
+    runtime state, not a plan.  A generated plan id is
+    ``<YYYYMMDD>-<slug>`` (``framework.ids.derive_plan_id``): the date
+    stamp leads, and ``slugify_plan_id`` strips leading and trailing
+    ``-`` and ``.`` from the slug, so a GENERATED plan directory never
+    begins with a dot.  The dot-prefixed names under the plans root are
+    the framework's own runtime state — the reaper's directory
+    (``orphan_reaper.REAPER_DIRNAME``, holding ``reaper.lock`` and
+    ``daemon.log``) is the one that lives there — and they are hidden on
+    purpose.
+
+    Counting one of them as a plan made the mismatch check below refuse
+    an instance that simply had no plans: the tree "held a plan" the
+    database knew nothing about, so the answer was a 503 where the truth
+    was an empty list.  The rejection contract itself is untouched — it
+    still refuses a database that knows none of the REAL plans in the
+    tree.
+
+    What the rule costs: a plan created under a caller-supplied id that
+    starts with a dot (``validate_plan_id`` allows dots) is not counted
+    as tree evidence either.  It is still LISTED — the listing is built
+    from the database's rows, not from this scan — so the only thing it
+    loses is its ability to prove the database describes the tree.
     """
     try:
-        return sorted(entry.name for entry in plans_dir.iterdir() if entry.is_dir())
+        return sorted(
+            entry.name
+            for entry in plans_dir.iterdir()
+            if entry.is_dir() and not entry.name.startswith(_INTERNAL_DIR_PREFIX)
+        )
     except OSError:
         return []
 

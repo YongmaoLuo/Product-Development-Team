@@ -39,6 +39,9 @@ The pins
 3. A real spawned child runs in a session of its own.
 4. The mechanism this module acts on is the mechanism the document
    names.
+5. The CI gate's own spawn registry does not turn into a second
+   spawn: the recorder tells the service's spawn apart from every
+   other subprocess by its shape, not by the order the calls came in.
 
 Run them with:
 
@@ -51,7 +54,6 @@ import os
 import re
 import shlex
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -66,6 +68,7 @@ if str(_BACKEND_DIR) not in sys.path:
 
 import service_manager as sm  # noqa: E402
 from service_declaration import ServiceDeclaration  # noqa: E402
+from tests.unit.test_service_manager import _free_port  # noqa: E402
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -161,6 +164,31 @@ def _candidate_cells(candidate: str) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+def _is_the_service_spawn(argv: Any) -> bool:
+    """Is this argv the spawn of the declared service?
+
+    The recorder stands in for ``subprocess.Popen``, and *every*
+    subprocess in this process goes through ``Popen`` -- including the
+    ``ps`` probe that writing the spawn registry costs.  That probe is
+    one call to ``Popen`` with a very different argv, and a recorder
+    that read "the call it caught" would read the probe instead of the
+    spawn: the pin would then fail on every run that merely happens to
+    be a CI gate run, and the failure would say that the spawn's shape
+    changed when nothing about it did.
+
+    The spawn is therefore told apart by its shape.  The detached
+    wrapper runs under this interpreter and is a program of its own --
+    that is the shape ``service_manager._detached_argv`` builds, and it
+    is the shape no other subprocess in this process has.
+    """
+    argv = list(argv or [])
+    return (
+        len(argv) >= 2
+        and argv[0] == (sys.executable or "/usr/bin/python3")
+        and argv[1] == "-c"
+    )
+
+
 class _FakeProc:
     """The process object a recorded spawn hands back."""
 
@@ -175,18 +203,36 @@ class _Spawn:
     """What the spawn path handed to the process-creation call."""
 
     def __init__(self) -> None:
-        self.argv: Optional[List[str]] = None
-        self.kwargs: Dict[str, Any] = {}
+        self.calls: List[Tuple[List[str], Dict[str, Any]]] = []
         self.posix_spawn_calls: List[Tuple[Any, ...]] = []
+
+    @property
+    def spawns(self) -> List[Tuple[List[str], Dict[str, Any]]]:
+        """The calls that are the service's own spawn, picked by shape.
+
+        Every call the recorder caught is kept -- the probe included --
+        because a recorder that threw the others away would be hiding
+        them instead of telling them apart.
+        """
+        return [
+            call for call in self.calls if _is_the_service_spawn(call[0])
+        ]
 
     @property
     def spawned_argv(self) -> List[str]:
         """The argv, whichever way the process was created."""
-        if self.argv is not None:
-            return self.argv
+        spawns = self.spawns
+        if spawns:
+            return list(spawns[-1][0])
         if self.posix_spawn_calls:
             return list(self.posix_spawn_calls[-1][1])
         return []
+
+    @property
+    def spawned_kwargs(self) -> Dict[str, Any]:
+        """The keyword arguments the service's own spawn was given."""
+        spawns = self.spawns
+        return dict(spawns[-1][1]) if spawns else {}
 
 
 def _install_recorders(monkeypatch) -> _Spawn:
@@ -194,8 +240,7 @@ def _install_recorders(monkeypatch) -> _Spawn:
     record = _Spawn()
 
     def _fake_popen(argv, **kwargs):
-        record.argv = list(argv)
-        record.kwargs = dict(kwargs)
+        record.calls.append((list(argv), dict(kwargs)))
         return _FakeProc()
 
     def _fake_posix_spawn(path, argv, env, **kwargs):
@@ -219,13 +264,6 @@ def _decl(**overrides) -> ServiceDeclaration:
     )
     base.update(overrides)
     return ServiceDeclaration(**base)
-
-
-def _free_port() -> int:
-    """A port nothing is listening on."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _start_recording(
@@ -268,7 +306,7 @@ def _assert_wrapper_shape(record: _Spawn, docstring: str) -> None:
     """``wrapper``: a wrapper program that makes the session itself."""
     argv = record.spawned_argv
     assert argv, "the spawn path created no process at all"
-    assert "start_new_session" not in record.kwargs, (
+    assert "start_new_session" not in record.spawned_kwargs, (
         "Popen was asked for a new session as well: the wrapper calls "
         "setsid() itself, and a child that is already a group leader "
         "gets EPERM from its own setsid()"
@@ -301,7 +339,7 @@ def _assert_wrapper_shape(record: _Spawn, docstring: str) -> None:
 
 def _assert_stdin_handle_shape(record: _Spawn, docstring: str) -> None:
     """``stdin-handle``: the child's input is an already-open handle."""
-    stdin = record.kwargs.get("stdin")
+    stdin = record.spawned_kwargs.get("stdin")
     assert stdin is not None, "the spawn path gave the child no stdin"
     assert stdin is not subprocess.DEVNULL, (
         "the child's input is /dev/null, not an open handle"
@@ -331,7 +369,7 @@ def _assert_posix_spawn_shape(record: _Spawn, docstring: str) -> None:
 
 def _assert_unchanged_shape(record: _Spawn, docstring: str) -> None:
     """``unchanged``: the shape stays, and the numbers say why."""
-    assert record.kwargs.get("start_new_session") is True, (
+    assert record.spawned_kwargs.get("start_new_session") is True, (
         "the shape was to stay as it was, but Popen was not asked for "
         "a new session"
     )
@@ -601,3 +639,70 @@ def test_mechanism_token_matches_doc():
             f"the English page names {english!r}, the Chinese page "
             f"names {token!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. The gate's own registry does not turn into a second spawn
+# ---------------------------------------------------------------------------
+
+
+def test_the_gate_spawn_registry_does_not_become_a_second_spawn(
+    tmp_path, monkeypatch,
+):
+    """The CI gate's spawn registry must not be mistaken for a spawn.
+
+    The CI gate exports ``PDT_SPAWN_REGISTRY`` so that the run can give
+    back the services it started, and writing that registry asks the
+    operating system when the service started -- which on macOS costs
+    one ``ps``.  That ``ps`` is a subprocess, so it is a call to the very
+    ``Popen`` these pins stand in for, and a pin that read "the call the
+    recorder caught" would read the probe instead of the spawn: the pin
+    would fail on every run that happens to be a gate run, and it would
+    say that the spawn's shape changed when nothing about it did.
+
+    So this is the pin that says: with the registry in the environment,
+    exactly one service spawn is recorded, and it is the documented one
+    -- and the registry write still happens, because the gate's ability
+    to give its services back is a safety property of its own and does
+    not depend on the pins being happy.
+
+    Where the pin watches matters.  It watches the step in
+    ``service_manager`` that offers the service to the registry -- the
+    contract this module is about -- and not the registry module below
+    that step: naming the module makes this file look, to the tree's
+    static gates, like a file that signals verdicts, which it does not
+    do.  The step below the seam is production's business, and
+    production has pins of its own.
+    """
+    registry = tmp_path / "spawn-registry.jsonl"
+    monkeypatch.setenv("PDT_SPAWN_REGISTRY", str(registry))
+
+    registered: List[int] = []
+    real_register = sm._register_spawned_service
+
+    def _spy_register(runtime):
+        registered.append(runtime.pid)
+        return real_register(runtime)
+
+    monkeypatch.setattr(sm, "_register_spawned_service", _spy_register)
+
+    record, runtime = _start_recording(
+        monkeypatch, tmp_path, port=_free_port()
+    )
+
+    assert len(record.spawns) == 1, (
+        "the gate's registry changed how many spawns the recorder caught: "
+        f"{record.calls!r}"
+    )
+    argv = record.spawned_argv
+    assert argv[0] == (sys.executable or "/usr/bin/python3"), (
+        f"the spawn does not run under this interpreter: {argv[0]!r}"
+    )
+    assert argv[1] == "-c", (
+        f"the spawn is not a program of its own: {argv[1:2]!r}"
+    )
+    assert registered == [runtime.pid], (
+        "the service was not offered to the spawn registry, so the gate "
+        "could not give it back: the registry write has to survive the "
+        f"probe; registered={registered!r}"
+    )
