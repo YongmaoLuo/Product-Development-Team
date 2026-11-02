@@ -78,6 +78,7 @@ _BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+from tests import _host_load  # noqa: E402
 from tests.fixtures.verification_mode import register_worktree  # noqa: E402
 from verification_plan_doc import parse_plan_doc  # noqa: E402
 from verification_plan_translator import validate_equivalence  # noqa: E402
@@ -89,6 +90,38 @@ from verification_workspace import Baseline, ensure_workspace  # noqa: E402
 # themselves; see the module docstring for why the marker is the whole
 # of the serial-lane contract.
 pytestmark = pytest.mark.perf
+
+
+# =============================================================================
+# The host-load gate
+# =============================================================================
+#
+# A wall-clock budget measured on a host that is already carrying someone
+# else's work is a measurement of the machine, not of the code under test.
+# The question "is this host too loaded to measure on?" is therefore asked
+# before the budget is asserted -- and it is asked the same way everywhere,
+# because a decision that is made twice is a decision that drifts.
+#
+# The decision lives in one place: ``backend/tests/_host_load.py``.  One
+# limit, one message format, one place to change them.  On CI the gate
+# stands down: a hosted runner's load is not the runner's own doing, and a
+# lane that quietly skipped would report green while asserting nothing.
+#
+# The dispersion check further down this file is a *different* question --
+# whether the samples of this one measurement agree with each other -- and
+# it stays: the load gate says the host is not busy, the dispersion check
+# says the numbers came off the clock cleanly.
+
+
+def _skip_if_host_too_busy() -> None:
+    """Skip this case when the host is too loaded to measure a budget on.
+
+    The budget itself is not weakened: it is asserted at exactly the value
+    it always had, wherever the host is measurable.
+    """
+    reason = _host_load.skip_reason()
+    if reason is not None:
+        pytest.skip(reason)
 
 
 # =============================================================================
@@ -417,6 +450,9 @@ def test_parse_and_validate_budget() -> None:
     generous (the measured cost is a small fraction of it); what it
     catches is a comparison that turned quadratic.
     """
+
+    _skip_if_host_too_busy()
+
     elapsed_ms, divergences = measure_parse_and_validate(200)
 
     print({"200_vp_ms": round(elapsed_ms, 3)})
@@ -450,6 +486,9 @@ def test_scaling_is_not_quadratic() -> None:
         that say so — instead of reporting a shape regression that was
         not there, and instead of passing one that was.
     """
+
+    _skip_if_host_too_busy()
+
     base_document = build_plan_doc(SCALE_BASE)
     base_plan = build_plan_json(SCALE_BASE)
     large_document = build_plan_doc(SCALE_LARGE)
@@ -525,6 +564,9 @@ def test_render_budget_and_linear_size() -> None:
     ends: the *time* a render takes and the *size* of what it produces
     must both scale with the number of verification points.
     """
+
+    _skip_if_host_too_busy()
+
     render_ms, size_200 = measure_render(200)
     _, size_100 = measure_render(100)
     _, size_500 = measure_render(500)
@@ -567,6 +609,9 @@ def test_repeated_workspace_call_faster(upstream_repo, workspace_root) -> None:
     and it must not cost what materialising one costs.  The materialising
     call writes a checkout; the reusing call only reads the registration.
     """
+
+    _skip_if_host_too_busy()
+
     baseline = Baseline(
         repo_dir=upstream_repo.repo,
         ref=upstream_repo.pr_ref,

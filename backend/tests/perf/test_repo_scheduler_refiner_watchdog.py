@@ -88,9 +88,16 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+# ``backend/`` -- the shared host-load gate lives in ``backend/tests/``,
+# so the backend directory has to be importable from here.
+_BACKEND_DIR = Path(__file__).resolve().parents[2]
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
 from base_executor import _build_layers  # noqa: E402
 from refiner import TaskRefiner  # noqa: E402
 from task_repository import TaskRepository  # noqa: E402
+from tests import _host_load  # noqa: E402
 from watchdog import compute_progress_token  # noqa: E402
 
 
@@ -102,6 +109,33 @@ from watchdog import compute_progress_token  # noqa: E402
 # marker in one place so individual tests don't have to decorate
 # themselves. CI can opt in / out by selecting the marker.
 pytestmark = pytest.mark.perf
+
+
+# =============================================================================
+# The host-load gate
+# =============================================================================
+#
+# A wall-clock budget measured on a host that is already carrying someone
+# else's work is a measurement of the machine, not of the code under test.
+# The question "is this host too loaded to measure on?" is therefore asked
+# before the budget is asserted -- and it is asked the same way everywhere,
+# because a decision that is made twice is a decision that drifts.
+#
+# The decision lives in one place: ``backend/tests/_host_load.py``.  One
+# limit, one message format, one place to change them.  On CI the gate
+# stands down: a hosted runner's load is not the runner's own doing, and a
+# lane that quietly skipped would report green while asserting nothing.
+
+
+def _skip_if_host_too_busy() -> None:
+    """Skip this case when the host is too loaded to measure a budget on.
+
+    The budget itself is not weakened: it is asserted at exactly the value
+    it always had, wherever the host is measurable.
+    """
+    reason = _host_load.skip_reason()
+    if reason is not None:
+        pytest.skip(reason)
 
 
 # =============================================================================
@@ -192,6 +226,9 @@ def test_repo_update_status_wall_time_under_2s(tmp_path):
         loses the lock or re-reads the file O(n) times per write
         would push the wall time past 30s on this workload.
     """
+
+    _skip_if_host_too_busy()
+
     n_rows = 200
     tasks_file = tmp_path / "tasks.json"
     _write_envelope(tasks_file, _make_tasks_envelope(n_rows))
@@ -278,6 +315,9 @@ def test_scheduler_build_layers_wall_time_under_2s():
     per emitted layer finishes in O(n + e) ≈ O(n) wall time on
     this workload.
     """
+
+    _skip_if_host_too_busy()
+
     n = 500
     items = _make_diamond_layers(n)
 
@@ -335,6 +375,9 @@ def test_refiner_rewrite_split_depends_on_wall_time_under_1s():
         for some ``Pi`` — those are the stale refs the rewrite
         must fix.
     """
+
+    _skip_if_host_too_busy()
+
     n_surviving = 200
     n_stale_refs = 40
     n_splits = 5
@@ -425,6 +468,9 @@ def test_watchdog_compute_progress_token_wall_time_under_1s():
       * A progress-bearing change (different ``status``) flips the
         hash.
     """
+
+    _skip_if_host_too_busy()
+
     n_rows = 1000
     rows: list[dict] = [
         {"id": str(i), "status": "pending", "commit_sha": ""}

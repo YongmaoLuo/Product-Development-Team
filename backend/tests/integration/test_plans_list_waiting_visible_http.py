@@ -74,6 +74,16 @@ from fastapi.testclient import TestClient
 
 import server
 
+# The reaper keeps its own runtime state beside the plan artifacts, in a
+# directory whose name starts with a dot.  The constants are imported
+# rather than spelled out, so this test cannot drift away from the
+# directory the reaper actually creates.
+from orphan_reaper import (  # noqa: E402
+    DAEMON_LOG_FILENAME,
+    LOCK_FILENAME,
+    REAPER_DIRNAME,
+)
+
 
 # ---------------------------------------------------------------------------
 # The fixture plans
@@ -1069,4 +1079,84 @@ def test_the_plans_list_refuses_instead_of_answering_an_empty_array_when_the_dat
     )
     assert body.get("plans_dir") == str(plans_dir), (
         f"the refusal must name the tree it could not describe; got {body!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The hidden runtime directory is not a plan
+# ---------------------------------------------------------------------------
+#
+# The reaper keeps its own runtime state beside the plan artifacts, in a
+# directory whose name starts with a dot (``.orphan_reaper`` — see
+# ``orphan_reaper.REAPER_DIRNAME``).  It holds the reaper's lock and its
+# log; it is not a plan, and it is hidden on purpose.
+#
+# The listing counted EVERY directory under the plans root as a plan, so
+# an instance whose tree held nothing but the reaper's directory was told
+# its data plane did not describe the tree — a 503 for an instance that
+# simply had no plans.  The dashboard's home page cannot render its
+# empty state against a refusal, so the empty tree has to answer.
+
+
+def test_a_reaper_state_dir_under_the_plans_root_does_not_make_the_listing_refuse(
+    tmp_path: Path,
+) -> None:
+    """A tree holding only the reaper's own directory answers ``[]``.
+
+    This instance has no plans: the only directory under its plans root
+    is the reaper's runtime state, whose name starts with a dot precisely
+    so that it is not mistaken for plan content.
+
+    So the listing must answer 200 with an empty array — the same answer
+    an instance with an empty tree gives — instead of refusing.  The
+    refusal would be a lie about the instance: it says "the database
+    behind this port is somebody else's", when the truth is "this
+    instance has no plans".
+    """
+    plans_dir = tmp_path / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+
+    assert REAPER_DIRNAME.startswith("."), (
+        f"the reaper's runtime directory is hidden by its leading dot; "
+        f"if that ever changes, the listing has to learn the new name "
+        f"instead of relying on the dot — got {REAPER_DIRNAME!r}"
+    )
+
+    reaper_dir = plans_dir / REAPER_DIRNAME
+    reaper_dir.mkdir(parents=True, exist_ok=True)
+    (reaper_dir / LOCK_FILENAME).write_text("", encoding="utf-8")
+    (reaper_dir / DAEMON_LOG_FILENAME).write_text("", encoding="utf-8")
+
+    # The state database EXISTS and holds no plan row: this instance
+    # really has no plans — it is not the "another instance's database"
+    # case the refusal above is about.
+    db_path = server._state_db_path()
+    _seed_state_db(db_path, ())
+    assert db_path.exists(), (
+        "this case is about an instance with no plans, not about a "
+        "missing database; the file must exist"
+    )
+
+    client = _client()
+    # The request carries the guard's first-party header, exactly as the
+    # verification probe that found the 503 sent it.
+    resp = client.get("/api/plans", headers={"X-PDT-Request": "1"})
+
+    assert resp.status_code == 200, (
+        f"an instance whose tree holds no plans must answer, not refuse; "
+        f"got {resp.status_code}: {resp.text!r}"
+    )
+    assert resp.json() == [], (
+        f"the reaper's runtime directory is not a plan, so the list must "
+        f"be empty; got {resp.json()!r}"
+    )
+    assert resp.headers.get(DATA_SOURCE_HEADER) == SOURCE_STATE_DB, (
+        f"the answer must say it read the state database — the database "
+        f"exists and holds no plan row — and not that it degraded to a "
+        f"directory scan; got "
+        f"{DATA_SOURCE_HEADER}={resp.headers.get(DATA_SOURCE_HEADER)!r}"
+    )
+    assert resp.headers.get(PLANS_DIR_HEADER) == str(plans_dir), (
+        f"the answer must name the tree it read; got "
+        f"{PLANS_DIR_HEADER}={resp.headers.get(PLANS_DIR_HEADER)!r}"
     )
