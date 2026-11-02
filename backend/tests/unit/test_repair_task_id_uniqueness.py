@@ -22,10 +22,25 @@ The children — still present in ``tasks.json`` — now hang off a task
 written later that repairs a different verification point.
 
 ``next_repair_seq_base`` fixes this by making ``seq`` an allocation
-counter for ``(plan, round)`` that only ever increases, so an id is
-never reissued. ``cross_store_task_conflicts`` is the check that would
-have made the split visible: it compares ``tasks.json`` against
-``plan_tasks`` and reports ids the two stores disagree about.
+counter that only ever increases, so an id is never reissued.
+``cross_store_task_conflicts`` is the check that would have made the
+split visible: it compares ``tasks.json`` against ``plan_tasks`` and
+reports ids the two stores disagree about.
+
+2026-11-02 (post-mortem)
+--------------------------
+
+The counter was still scoped to ``(plan, round)``, and the id still
+carried the round (``repair-r{N}-{seq}``).  A plan whose round counter
+resets therefore re-issued the ids it already owned one round later —
+and because ``plan_tasks``' upsert keeps a row's runtime state, the
+fresh task was born ``completed`` and the round idled.  It happened
+twice on live plans (the 429 plan and the mcode plan).
+
+So the id lost the round (``repair-107``) and the counter lost the
+round with it: the sequence is now **plan-global**.  The legacy shape
+is still parsed and still counted in the maximum — old ids are
+history, and they are neither rewritten nor migrated.
 """
 
 from __future__ import annotations
@@ -112,6 +127,19 @@ class TestParseRepairTaskId:
     def test_double_digit_round_and_seq(self):
         assert parse_repair_task_id("repair-r12-07") == (12, 7)
 
+    def test_the_current_shape_carries_no_round(self):
+        """``repair-107`` → ``(0, 107)``.
+
+        The id no longer carries the round (2026-11-02): the round
+        counter resets, and a reset round re-issued the ids the plan
+        already owned.  The round travels with the task in its own
+        ``round`` field, so ``0`` here means "this id names no round",
+        not "the round is missing".
+        """
+        assert parse_repair_task_id("repair-107") == (0, 107)
+        assert parse_repair_task_id("repair-07") == (0, 7)
+        assert parse_repair_task_id("repair-07-1") == (0, 7)
+
     def test_non_repair_ids_are_none(self):
         for task_id in ("1-1", "11-5-1-1", "RP-004", "", None, "repair-rX-01"):
             assert parse_repair_task_id(task_id) is None, (
@@ -128,16 +156,35 @@ class TestNextRepairSeqBase:
     def test_empty_history_starts_at_one(self):
         assert next_repair_seq_base([], 1) == 1
 
-    def test_continues_after_the_highest_seq_of_this_round(self):
+    def test_continues_after_the_highest_seq(self):
         ids = ["repair-r1-01", "repair-r1-02", "repair-r1-03"]
         assert next_repair_seq_base(ids, 1) == 4
 
-    def test_other_rounds_do_not_shift_the_base(self):
+    def test_other_rounds_do_shift_the_base(self):
+        """The sequence is **plan-global**, so another round counts too.
+
+        This is the 2026-11-02 change.  Under the old rule — allocate
+        within the round — a plan that reset its round counter started
+        numbering from 1 again, and the row it re-issued was already
+        finished, so the fresh task was born ``completed``.
+        """
         ids = ["repair-r2-01", "repair-r2-99"]
-        assert next_repair_seq_base(ids, 1) == 1
+        assert next_repair_seq_base(ids, 1) == 100
+        assert next_repair_seq_base(ids, 2) == 100
+
+    def test_both_shapes_share_one_maximum(self):
+        """A legacy id and a current id are counted together.
+
+        Old ids are history: they are parsed, they are counted, and they
+        are never rewritten.  The *number* they hold is still spent.
+        """
+        assert next_repair_seq_base(["repair-r2-07"], 1) == 8
+        assert next_repair_seq_base(["repair-07"], 1) == 8
+        assert next_repair_seq_base(["repair-r2-07", "repair-09"], 1) == 10
 
     def test_breakdown_children_count(self):
         assert next_repair_seq_base(["repair-r1-06-1"], 1) == 7
+        assert next_repair_seq_base(["repair-06-1"], 1) == 7
 
     def test_original_stream_ids_are_ignored(self):
         ids = ["1-1", "11-5-1-1", "RP-004", "repair-rX-01"]
@@ -212,19 +259,19 @@ class TestAssemblerSeqBase:
         tasks = _assembler(
             [_vp("VP-1"), _vp("VP-2")], round_number=1,
         ).assemble(_contents("VP-1", "VP-2"))
-        assert [t["id"] for t in tasks] == ["repair-r1-01", "repair-r1-02"]
+        assert [t["id"] for t in tasks] == ["repair-01", "repair-02"]
 
     def test_base_shifts_the_whole_batch(self):
         tasks = _assembler(
             [_vp("VP-1"), _vp("VP-2")], round_number=1, seq_base=19,
         ).assemble(_contents("VP-1", "VP-2"))
-        assert [t["id"] for t in tasks] == ["repair-r1-19", "repair-r1-20"]
+        assert [t["id"] for t in tasks] == ["repair-19", "repair-20"]
 
     def test_first_task_of_a_shifted_batch_has_no_dependency(self):
         """A shifted batch's first task has no predecessor.
 
         2026-10-11: it no longer *has* predecessors at all. ``seq - 1``
-        here (``repair-r1-18``) belongs to an earlier batch, so linking
+        here (``repair-18``) belongs to an earlier batch, so linking
         to it would make this task wait on an unrelated repair from days
         ago. Every task in a batch is now a root — see
         ``test_every_task_in_a_batch_is_a_root``.
@@ -237,7 +284,7 @@ class TestAssemblerSeqBase:
     def test_second_task_of_a_shifted_batch_has_no_dependency(self):
         """2026-10-11 (W1): the intra-batch chain is gone.
 
-        It used to read ``["repair-r1-19"]``. The edge existed to stop
+        It used to read ``["repair-19"]``. The edge existed to stop
         two repair agents racing on ``verification_plan.json``, and the
         two code paths that could do that were deleted on 2026-09-18 —
         the only remaining writers run in-process inside a verification
@@ -280,7 +327,7 @@ class TestAssemblerSeqBase:
 def test_a_second_batch_never_reissues_an_id():
     """Replaying the failure: reset the counter, re-run round 1.
 
-    Before the fix the second batch emitted ``repair-r1-01`` … verbatim,
+    Before the fix the second batch emitted ``repair-01`` … verbatim,
     and ``plan_tasks`` (keyed on ``(plan_id, task_id)``) overwrote the
     first batch's rows. Here the first batch's ids — including a
     breakdown child — are fed back in as the existing allocation, and
@@ -291,7 +338,7 @@ def test_a_second_batch_never_reissues_an_id():
     ).assemble(_contents("VP-1", "VP-2", "VP-3"))
     first_ids = {t["id"] for t in first}
     # A breakdown of the third task exists by the time the plan is reset.
-    existing = first_ids | {"repair-r1-03-1", "repair-r1-03-2"}
+    existing = first_ids | {"repair-03-1", "repair-03-2"}
 
     second = _assembler(
         [_vp("VP-9")],
@@ -312,10 +359,15 @@ def test_a_second_batch_never_reissues_an_id():
             assert dep in emitted
 
 
-def test_a_second_batch_for_a_different_round_is_unaffected():
-    """Round 2 keeps its own numbering — only the *same* round collides."""
-    existing = {"repair-r1-01", "repair-r1-02"}
-    assert next_repair_seq_base(existing, 2) == 1
+def test_a_second_batch_for_a_different_round_continues_the_sequence():
+    """Round 2 continues the plan's numbering (2026-11-02).
+
+    The sequence is plan-global, so a round change does not reset it.
+    Under the old, round-scoped rule the second batch started at 1
+    again — and re-issued the ids round 1 already owned.
+    """
+    existing = {"repair-01", "repair-02"}
+    assert next_repair_seq_base(existing, 2) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -568,10 +620,10 @@ def test_cycle_does_not_reissue_an_id_that_is_already_taken(
 ):
     """The observed shape, through the real orchestrator.
 
-    Three ``repair-r1-*`` rows are already in ``plan_tasks`` and
-    ``repair-r1-01`` is in ``tasks.json``. Before the fix the new batch
-    emitted ``repair-r1-01`` for the new failure — overwriting the row
-    and re-parenting ``repair-r1-01-1`` onto an unrelated task.
+    Three legacy ``repair-r1-*`` rows are already in ``plan_tasks`` and
+    ``repair-r1-01`` is in ``tasks.json``.  The new batch must not
+    reissue any of them — and it must not start over at 1 either: the
+    sequence is plan-global, so it resumes at 4.
     """
     result = _run_cycle(tmp_path)
 
@@ -583,7 +635,7 @@ def test_cycle_does_not_reissue_an_id_that_is_already_taken(
         f"the new batch reused {sorted(taken & set(ids))} — plan_tasks is "
         f"keyed on (plan_id, task_id), so those rows would be overwritten"
     )
-    assert ids == ["repair-r1-04"], (
+    assert ids == ["repair-04"], (
         "the batch should resume at the next free slot, not restart at 01"
     )
 
@@ -611,4 +663,4 @@ def test_cycle_keeps_seq_one_when_nothing_is_allocated(tmp_path, monkeypatch):
     conn.close()
 
     result = _run_cycle(tmp_path, disk_tasks=[])
-    assert [t["id"] for t in result["repair_tasks"]] == ["repair-r1-01"]
+    assert [t["id"] for t in result["repair_tasks"]] == ["repair-01"]

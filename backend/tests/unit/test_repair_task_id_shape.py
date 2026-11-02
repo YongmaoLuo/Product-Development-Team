@@ -1,9 +1,12 @@
 """2026-10-23: the repair-task id predicate must know the REAL id shape.
 
-``RepairTaskAssembler`` produces LOWERCASE ids of the shape
-``repair-r<round>-<seq>`` (``repair-r1-01``) and its breakdown children
-(``repair-r1-06-1``, ``repair-r3-03-1-1-2``). Those rows carry NO
-``task_group`` on the breakdown children.
+``RepairTaskAssembler`` produces LOWERCASE ids.  The current shape is
+``repair-<seq>`` (``repair-07``, since 2026-11-02 — the id no longer
+carries the round); the legacy shape is ``repair-r<round>-<seq>``
+(``repair-r1-01``), and its breakdown children
+(``repair-r1-06-1``, ``repair-r3-03-1-1-2``) exist in the plans written
+before that change. Those rows carry NO ``task_group`` on the breakdown
+children.
 
 The predicate in ``verification_loop._get_pending_repair_tasks`` matched
 neither branch for them:
@@ -65,7 +68,9 @@ def test_a_verification_point_is_not_a_repair_task():
 @pytest.mark.parametrize(
     "tid",
     [
-        "repair-r1-01",       # the assembler's own shape
+        "repair-07",          # the assembler's current shape (2026-11-02)
+        "repair-07-1",        # a breakdown child of the current shape
+        "repair-r1-01",       # the assembler's legacy shape
         "repair-r3-01-1",     # a breakdown child
         "repair-r3-03-1-1-2", # a third-level child
         "RP-12",              # the legacy pre-v9 shape

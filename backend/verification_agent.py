@@ -300,6 +300,41 @@ def persist_conflict_repair_task(
 TERMINAL_TASK_STATUSES = frozenset({"completed", "skipped"})
 
 
+def _read_plan_task_rows(
+    plan_id: str,
+    *,
+    db_path: Optional[Path] = None,
+) -> Tuple[Dict[str, Any], Optional[Exception]]:
+    """Read the plan's task rows through the repository.
+
+    One read path for everything that asks what this plan already owns:
+    the convergence guard below and the id allocator in
+    :meth:`Orchestrator._persist_base_drift_repair_task`.  The rows come
+    from :meth:`PlanTaskRepository.load_all` — never from raw SQL here,
+    so there is one place that knows the table's shape.
+
+    Returns ``(rows, None)`` on success and ``({}, error)`` when the
+    read failed.  Never raises: a read that fails is a warning, not a
+    block (see :func:`has_open_base_drift_merge_task`).
+    """
+    plan = str(plan_id or "").strip()
+    if not plan:
+        return {}, None
+    try:
+        target = (
+            Path(db_path) if db_path is not None else resolve_state_db_path()
+        )
+        conn = _open_state_db(target)
+        try:
+            _migrate_state_db(conn)
+            rows = PlanTaskRepository(conn).load_all(plan)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — a failed read never blocks
+        return {}, exc
+    return dict(rows or {}), None
+
+
 def has_open_base_drift_merge_task(
     plan_id: str,
     *,
@@ -348,23 +383,14 @@ def has_open_base_drift_merge_task(
     plan = str(plan_id or "").strip()
     if not plan:
         return False
-    try:
-        target = (
-            Path(db_path) if db_path is not None else resolve_state_db_path()
-        )
-        conn = _open_state_db(target)
-        try:
-            _migrate_state_db(conn)
-            rows = PlanTaskRepository(conn).load_all(plan)
-        finally:
-            conn.close()
-    except Exception as exc:  # noqa: BLE001 — a failed read never blocks
+    rows, error = _read_plan_task_rows(plan, db_path=db_path)
+    if error is not None:
         logger.warning(
-            "[base_drift] could not read the tasks of plan %r: %s", plan, exc,
+            "[base_drift] could not read the tasks of plan %r: %s", plan, error,
         )
         return False
 
-    for entry in (rows or {}).values():
+    for entry in rows.values():
         if not isinstance(entry, Mapping):
             continue
         if str(entry.get("failed_vp_id") or "") != base_drift.BASE_DRIFT_VP_ID:
@@ -374,6 +400,38 @@ def has_open_base_drift_merge_task(
             continue
         return True
     return False
+
+
+def load_plan_task_ids(
+    plan_id: str,
+    *,
+    db_path: Optional[Path] = None,
+) -> List[str]:
+    """The ids of every task row this plan already owns.
+
+    The id allocator needs to see the plan's existing ids before it can
+    hand out a number: ``plan_tasks`` is keyed on
+    ``(plan_id, task_id)``, so a number that is already taken produces
+    a row that is **born finished** — the upsert keeps the old row's
+    runtime state — and the executor then skips the task as
+    ``superseded`` without a word.
+
+    A read that fails is a warning, not a block: the empty list means
+    the allocator falls back to the first number of the round, exactly
+    as it did before this function existed.  Losing the row would be
+    worse than the collision it prevents.
+    """
+    plan = str(plan_id or "").strip()
+    if not plan:
+        return []
+    rows, error = _read_plan_task_rows(plan, db_path=db_path)
+    if error is not None:
+        logger.warning(
+            "[base_drift] could not read the task ids of plan %r: %s",
+            plan, error,
+        )
+        return []
+    return list(rows.keys())
 
 
 class ApiTestSchemaViolation(RuntimeError):
@@ -11810,6 +11868,18 @@ class Orchestrator:
         merge that keeps failing would then be re-dispatched every round
         forever.  Handing the loop no task id is what makes it stop.
 
+        The task's **id** is allocated, not written out: the plan's own
+        task ids are read first and handed to
+        :func:`base_drift.build_conflict_repair_task`, which asks
+        :func:`repair_generator.next_repair_seq_base` for the next free
+        number in this round.  A hard-coded ``repair-r<round>-01``
+        collides with the row a previous cycle wrote for the same round
+        number — the upsert keeps that row's runtime state, so the new
+        task is born ``completed`` and the executor skips it as
+        ``superseded`` without a word.  That is how a plan whose round
+        counter resets every cycle burned four rounds doing nothing at
+        all.
+
         Returns the task id, or ``None`` when there was nothing to
         repair (the report names no conflicting file), the task could
         not be built, or the plan already has an unfinished merge task.
@@ -11835,12 +11905,19 @@ class Orchestrator:
             round_number = int(getattr(self, "_current_round", 0) or 0)
         except (TypeError, ValueError):
             round_number = 0
+        # The ids this plan already owns.  A read that fails yields an
+        # empty list, and the allocator then falls back to the first
+        # number of the round — the pre-existing behaviour.  A read
+        # failure must not block the round: the conflict still needs
+        # somebody to resolve it.
+        existing_task_ids = load_plan_task_ids(plan_id)
         try:
             task = base_drift.build_conflict_repair_task(
                 report,
                 plan_id=plan_id,
                 project_dir=getattr(self, "project_dir", None),
                 round_number=round_number,
+                existing_task_ids=existing_task_ids,
             )
         except Exception as exc:  # noqa: BLE001 — a lost task never blocks
             logger.warning(

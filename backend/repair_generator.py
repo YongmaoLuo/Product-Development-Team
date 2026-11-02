@@ -46,7 +46,9 @@ import re
 import os
 import sys
 from pathlib import Path
-from typing import Iterator, Optional, List, Dict, Any, Sequence, Set, Tuple
+from typing import (
+    Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple,
+)
 
 from coding_tool import CodingTool, JsonSession, query_json_in_session
 # ``stable_session_id`` is re-exported from ``plan_sessions`` rather than
@@ -1296,7 +1298,7 @@ class RepairTaskGenerator:
         task_id = str(task.get("id") or "").strip()
         if not task_id:
             seq = next_repair_seq_base(list(used_ids), round_number)
-            task_id = f"repair-r{round_number}-{seq:02d}"
+            task_id = format_repair_task_id(seq)
         elif task_id in used_ids:
             raise ValueError(f"任务 id 冲突：{task_id}")
 
@@ -1473,24 +1475,58 @@ TEST_COMMAND_FILL_SYSTEM_PROMPT = """你是一位资深工程师，为**已经�
 
 
 #: Matches the part of a generated repair-task id that carries its
-#: round and sequence — ``repair-r1-06`` and the breakdown children it
-#: spawns (``repair-r1-06-1``, ``repair-r3-03-1-1-2``) all resolve to
-#: round 1 / seq 6 and round 3 / seq 3 respectively.
-_REPAIR_TASK_ID_RE = re.compile(r"^repair-r(\d+)-(\d+)")
+#: **sequence** — and, for the legacy shape, its round as well.
+#:
+#: Two shapes are recognised, and **both** are live:
+#:
+#: * ``repair-r1-06`` — the legacy, round-scoped shape.  Every id written
+#:   before 2026-11-02 has this shape and every one of those rows stays
+#:   where it is: they are history, and ``plan_tasks`` is keyed on
+#:   ``(plan_id, task_id)``, so rewriting them would rewrite history too.
+#: * ``repair-107`` — the current shape.  The id no longer carries the
+#:   round, because the round counter **resets** (2026-11-02: both the
+#:   429 plan and the mcode plan reset it), and a reset round re-issued
+#:   the very same ids.  ``plan_tasks``' upsert keeps a row's runtime
+#:   state, so the fresh task was born ``completed`` and the round did
+#:   nothing at all.
+#:
+#: The breakdown children (``repair-r1-06-1``, ``repair-107-1``) resolve
+#: to their parent: round 1 / seq 6 and seq 107 respectively.
+_REPAIR_TASK_ID_RE = re.compile(r"^repair-(?:r(\d+)-)?(\d+)")
 
 
 def parse_repair_task_id(task_id: Any) -> Optional[Tuple[int, int]]:
-    """``"repair-r1-06"`` → ``(1, 6)``; ``None`` for anything else."""
+    """``"repair-r1-06"`` → ``(1, 6)``; ``"repair-107"`` → ``(0, 107)``.
+
+    ``None`` for anything else.
+
+    The round is ``0`` for the round-less shape.  That is not "missing":
+    it is the fact that this id carries no round, which is exactly what
+    the round-scoped shape used to say and what the current shape no
+    longer says.  A caller that needs the round reads the task's own
+    ``round`` column, not its id.
+    """
     match = _REPAIR_TASK_ID_RE.match(str(task_id or ""))
     if not match:
         return None
-    return int(match.group(1)), int(match.group(2))
+    round_group, seq_group = match.group(1), match.group(2)
+    return int(round_group or 0), int(seq_group)
+
+
+def format_repair_task_id(seq: Any) -> str:
+    """The current repair-task id shape: ``repair-07``.
+
+    One place formats the id, so every writer in the repair chain emits
+    the same shape.  The legacy ``repair-r<round>-<seq>`` shape stays
+    readable (see :func:`parse_repair_task_id`) but is no longer written.
+    """
+    return f"repair-{int(seq):02d}"
 
 
 def next_repair_seq_base(
-    existing_task_ids: Any, round_number: int,
+    existing_task_ids: Any, round_number: Any = None,
 ) -> int:
-    """Lowest ``seq`` this round's batch can use without colliding.
+    """The next free sequence number in this **plan's** repair sequence.
 
     2026-09-20 (post-mortem). Repair ids were ``repair-r{N}-{seq}``
     with ``seq`` always starting at 1, so every *batch* for the same
@@ -1501,26 +1537,51 @@ def next_repair_seq_base(
     children left behind then described a parent whose row had become an
     unrelated task.
 
-    Every counter reset hands the plan a fresh round 1, so batches from
-    different rounds end up numbered from ``repair-r1-01`` again; the
-    earlier batch's children then sit in ``tasks.json`` under a parent
-    written later.
+    2026-11-02 (post-mortem). The ids carried the **round**, and the
+    round counter resets.  A reset round produced ``repair-r1-01``
+    again — an id the plan already owns — and the upsert kept that
+    row's runtime state, so the new task was born ``completed`` and the
+    round idled.  It happened twice (the 429 plan and the mcode plan)
+    before anyone said the word "round" out loud.
 
-    Returns a base such that seq keeps increasing monotonically for a
-    given ``(plan, round)`` forever, so an id is never reused. ``1``
-    when nothing has been allocated yet — the pre-existing behaviour,
-    which is correct for a plan's first repair batch.
+    So the sequence is **plan-global**, not round-scoped: the number is
+    allocated over *every* repair id the plan owns, in both shapes, and
+    the highest one wins.  The round is no longer part of the id, so it
+    cannot be part of the allocation either.
+
+    Both shapes are scanned on purpose.  A plan written before
+    2026-11-02 owns legacy ids (``repair-r2-07``); a plan that has run
+    since owns current ones (``repair-07``).  They are different
+    strings, so they cannot collide with each other — but the *number*
+    must not be reissued either, because ``repair-07`` and
+    ``repair-r2-07`` both mean "the seventh repair of this plan" to
+    whoever reads the history.
+
+    ``round_number`` is accepted and **ignored**: it used to select the
+    round's own subsequence, which is the behaviour this change removes.
+    It is kept so every existing caller keeps working.
     """
     highest = 0
     for task_id in existing_task_ids or ():
         parsed = parse_repair_task_id(task_id)
         if parsed is None:
             continue
-        task_round, seq = parsed
-        if task_round != int(round_number):
-            continue
+        _task_round, seq = parsed
         highest = max(highest, seq)
     return highest + 1
+
+
+def _seq_base_seed(round_number: int, seq_base: int) -> str:
+    """Encode ``seq_base`` as an id, so the allocator can read it back.
+
+    The allocator only knows about ids — it has no concept of "start
+    here".  Writing the start number as a legacy-shaped id
+    (``repair-r{round}-{seq_base-1}``) means the allocator reads a
+    maximum of ``seq_base - 1`` and hands out ``seq_base``.  There is
+    then exactly **one** allocation rule in the repair chain:
+    :func:`next_repair_seq_base`, never a second local counter.
+    """
+    return f"repair-r{int(round_number)}-{max(int(seq_base) - 1, 0):02d}"
 
 
 #: Halfwidth/fullwidth punctuation pairs the two stores render
@@ -1638,17 +1699,24 @@ class RepairTaskAssembler:
     ``priority`` enum, or a circular ``depends_on`` graph.
 
     Args:
-        round_number: Current verification round (1-based). Used as the
-            task ID prefix so round 1 → ``repair-r1-01``, round 2 →
-            ``repair-r2-01``, etc.
+        round_number: Current verification round (1-based). It names the
+            task's ``round`` field and its ``task_group``
+            (``repair-round-<N>``) — it is **not** part of the task id
+            any more (2026-11-02: a reset round reissued the same ids).
         failed_vps: The list returned by
             :func:`extract_failed_vps_from_report`. Used as the
             priority fallback source and the ``failed_vp_id`` ↔
             priority lookup table.
         seq_base: First sequence number this batch may use. Defaults to
             ``1`` (a plan's first repair batch). Callers that may be
-            emitting a *second* batch for the same round must pass
+            emitting a *second* batch must pass
             :func:`next_repair_seq_base`'s result so ids never repeat.
+        existing_task_ids: The repair ids the plan already owns. When
+            given, they are the allocation base and ``seq_base`` is
+            ignored (it is derived from them instead). This is the
+            production path: the orchestrator hands over the ids it read
+            from ``tasks.json`` and ``plan_tasks`` so every writer in the
+            chain allocates from the same pool.
         project_dir: Where the repairs of this batch run. Defaults to
             ``None``, which means "ask the plan's execution row" — the
             field the execution chain reads, and where a verification
@@ -1657,16 +1725,24 @@ class RepairTaskAssembler:
             :func:`resolve_repair_project_dir`.
 
     Note:
-        Task IDs use the ``repair-r{N}-{seq}`` prefix (not the legacy
+        Task IDs use the ``repair-{seq}`` prefix (not the legacy
         ``R{N}-{seq}``). Both forms coexist on disk because the
         executor's TaskManager does not parse IDs — but the new prefix
         lets the dashboard and watchdog grep for repair tasks
         distinctly from the original-stream tasks.
 
+        The id does **not** carry the round.  The round counter resets
+        (2026-11-02: twice, on the 429 plan and on the mcode plan), and
+        a reset round reissued the ids the plan already owned; the
+        upsert kept those rows' runtime state, so the fresh tasks were
+        born ``completed`` and the rounds idled.  The legacy
+        ``repair-r{N}-{seq}`` shape stays readable — the allocator
+        counts it — but is no longer written.
+
         ``seq`` is **not** the task's position in the batch — it is a
-        never-reused allocation counter for ``(plan, round)``. A second
-        batch for round 1 might therefore start at ``repair-r1-19``.
-        That is deliberate: the number is an identity, not a label.
+        never-reused allocation counter for the **plan**. A second batch
+        might therefore start at ``repair-19``.  That is deliberate: the
+        number is an identity, not a label.
     """
 
     #: Where an assembled task's ``test_command`` came from. Recorded in
@@ -1718,17 +1794,29 @@ class RepairTaskAssembler:
         plan_path: Optional[str] = None,
         seq_base: int = 1,
         project_dir: Optional[str] = None,
+        existing_task_ids: Optional[Iterable[str]] = None,
     ):
         if round_number < 1:
             raise ValueError(f"round_number must be >= 1, got {round_number}")
         if seq_base < 1:
             raise ValueError(f"seq_base must be >= 1, got {seq_base}")
         self.round = round_number
-        #: First ``seq`` this batch may use. ``1`` unless the caller has
-        #: seen prior batches for this ``(plan, round)`` — see
-        #: :func:`next_repair_seq_base` for why reusing seq 1 corrupts
-        #: the persisted task history.
-        self.seq_base = seq_base
+        #: The ids this assembler knows about, and allocates from.  When
+        #: the caller hands them over (``existing_task_ids``) the base is
+        #: read out of them by :func:`next_repair_seq_base` — the same
+        #: allocator the root-cause tasks and the base-drift task use, so
+        #: all four writers share one counter.  Otherwise the caller's
+        #: ``seq_base`` is encoded as a seed id (see
+        #: :func:`_seq_base_seed`) and the very same allocator reads it
+        #: back — there is no second, local counter anywhere.
+        self._allocated_ids: Set[str] = set(existing_task_ids or ())
+        if existing_task_ids is None:
+            self._allocated_ids = {_seq_base_seed(round_number, seq_base)}
+            self.seq_base = seq_base
+        else:
+            self.seq_base = next_repair_seq_base(
+                self._allocated_ids, round_number,
+            )
         self.failed_vps: Dict[str, Dict[str, Any]] = {
             str(vp.get("id", "")): vp for vp in failed_vps if vp.get("id")
         }
@@ -1780,6 +1868,36 @@ class RepairTaskAssembler:
         self.project_dir: str = str(project_dir).strip() if project_dir else ""
         #: Lazy cache for :meth:`_plan_points`. ``_UNSET`` until first read.
         self._plan_points_cache: Any = _UNSET
+
+    def _allocate_repair_task_id(self) -> Tuple[str, int]:
+        """Allocate the next repair id in this **plan's** sequence.
+
+        The number comes from :func:`next_repair_seq_base` — the one
+        allocator the whole repair chain shares — applied to the ids this
+        assembler knows about: the ones the caller handed over plus the
+        ones this batch has already emitted.  Returns ``(task_id, seq)``.
+
+        2026-11-02.  This used to be a local ``emitted_seq += 1`` with
+        ``repair-r{round}-{seq}`` as the shape.  A local counter cannot
+        see the plan's history, so it reissued an id the plan already
+        owned the moment the round counter reset — and ``plan_tasks``'
+        upsert keeps a row's runtime state, so the fresh task was born
+        ``completed`` and the round idled.  Allocating through the shared
+        allocator is what makes the number plan-global.
+        """
+        allocated = getattr(self, "_allocated_ids", None)
+        if allocated is None:
+            # An assembler built without ``__init__`` (the stub helpers
+            # in the test suite do) has no pool yet.  Start one from the
+            # batch's base — the same seed ``__init__`` would have used.
+            allocated = {_seq_base_seed(
+                self.round, getattr(self, "seq_base", 1),
+            )}
+            self._allocated_ids = allocated
+        seq = next_repair_seq_base(allocated, self.round)
+        task_id = format_repair_task_id(seq)
+        allocated.add(task_id)
+        return task_id, seq
 
     def assemble(self, contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Stamps schema-stable fields onto each content dict.
@@ -1870,7 +1988,6 @@ class RepairTaskAssembler:
         if not contents:
             return []
         tasks: List[Dict[str, Any]] = []
-        emitted_seq = self.seq_base - 1
         for content in contents:
             if not isinstance(content, dict):
                 continue
@@ -1989,8 +2106,7 @@ class RepairTaskAssembler:
                     source=test_command_source,
                 )
 
-            emitted_seq += 1
-            task_id = f"repair-r{self.round}-{emitted_seq:02d}"
+            task_id, emitted_seq = self._allocate_repair_task_id()
             # The source is booked on the assembler rather than on the task
             # dict: ``PlanTaskRepository.add_task`` rejects any key outside
             # ``ALLOWED_STATIC_TASK_FIELDS`` and there is no

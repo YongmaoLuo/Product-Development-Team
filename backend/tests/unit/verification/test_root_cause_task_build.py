@@ -152,7 +152,12 @@ def test_implementation_task_requires_files():
 # 3. 任务 id 复用既有 repair 序列
 # ---------------------------------------------------------------------------
 def test_task_id_global_unique():
-    """新任务的 id 在既有 repair 序列里，不另起一套编号。"""
+    """新任务的 id 在既有 repair 序列里，不另起一套编号。
+
+    既有 id 是**旧形状**（``repair-r3-02``）—— 那是历史，不迁移、不重写。
+    新任务的 id 是新形状（``repair-03``），但号仍然接在旧序列后面：
+    分配器扫的是**两种形状**的最大值，所以旧 id 占掉的号不会被重发。
+    """
     existing = ["repair-r3-01", "repair-r3-02"]
 
     root_task = build_root_cause_task(
@@ -163,7 +168,8 @@ def test_task_id_global_unique():
     # 不与既有 id 冲突。
     assert root_task["id"] not in existing
     # 且它占的是 repair 序列里的一个号（能被既有解析器读出来）。
-    assert parse_repair_task_id(root_task["id"]) == (3, 3)
+    # 新形状不带轮次 —— 轮次用 0 表示「无轮次」（2026-11-02）。
+    assert parse_repair_task_id(root_task["id"]) == (0, 3)
     # 序列分配器看得见它 —— 下一个任务不会复用这个号。
     assert next_repair_seq_base([root_task["id"]], 3) == 4
 
@@ -174,7 +180,7 @@ def test_task_id_global_unique():
     )
     assert impl_task["id"] != root_task["id"]
     assert impl_task["id"] not in existing + [root_task["id"]]
-    assert parse_repair_task_id(impl_task["id"]) == (3, 4)
+    assert parse_repair_task_id(impl_task["id"]) == (0, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +232,8 @@ def test_append_path_accepts_new_kinds(tmp_plan):
     assert payload[0]["kind"] == ROOT_CAUSE_KIND
     assert payload[1]["kind"] == IMPLEMENTATION_KIND
     # 两个 id 都落在 repair 序列里，且互不相同。
-    assert parse_repair_task_id(payload[0]["id"]) == (3, 1)
-    assert parse_repair_task_id(payload[1]["id"]) == (3, 2)
+    assert parse_repair_task_id(payload[0]["id"]) == (0, 1)
+    assert parse_repair_task_id(payload[1]["id"]) == (0, 2)
     assert payload[0]["id"] != payload[1]["id"]
 
 

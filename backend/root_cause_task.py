@@ -43,6 +43,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any, Dict, List, Optional
 
 from repair_generator import (
+    format_repair_task_id,
     next_repair_seq_base,
     normalise_declared_files,
     parse_repair_task_id,
@@ -143,12 +144,19 @@ def _allocate_task_id(
 
     显式 ``task_id`` 优先；否则用 ``seq_base``（调用方已经算好的号），
     再否则用 :func:`repair_generator.next_repair_seq_base` 在既有 id 里
-    找下一个空号。产出的形状是 ``repair-r{round}-{seq}`` —— 既有解析器
+    找下一个空号。产出的形状是 ``repair-{seq}`` —— 既有解析器
     :func:`repair_generator.parse_repair_task_id` 读得出来，所以它占的号
     会被后来的分配看见。
 
+    编号是 **plan 级**的，不是轮次级的（2026-11-02）：轮次计数会重置，
+    重置后的轮次会重新发出同一批 id，而 ``plan_tasks`` 的 upsert 保留
+    旧行的运行时状态，于是新任务一出生就是 ``completed``，整轮空转。
+    所以 id 里不再带轮次，号在整个 plan 内单调递增。
+
     显式给的 ``task_id`` 也要读得出来才收：读不出来的 id 属于另一套编号
-    空间，会绕开序列分配器 —— 那正是这个模块要避免的事。
+    空间，会绕开序列分配器 —— 那正是这个模块要避免的事。两种形状都收：
+    新的 ``repair-{seq}`` 与旧的 ``repair-r{round}-{seq}``（旧 id 是历史，
+    不迁移、不重写）。
     """
     round_number = int(round_no)
     if round_number < 1:
@@ -158,7 +166,8 @@ def _allocate_task_id(
     if explicit:
         if parse_repair_task_id(explicit) is None:
             raise ValueError(
-                f"task_id 必须落在既有 repair 序列里（repair-r<round>-<seq>），"
+                f"task_id 必须落在既有 repair 序列里"
+                f"（repair-<seq> 或 repair-r<round>-<seq>），"
                 f"收到 {explicit}"
             )
         return explicit
@@ -169,7 +178,7 @@ def _allocate_task_id(
             raise ValueError(f"seq_base must be >= 1, got {seq_base}")
     else:
         seq = next_repair_seq_base(list(existing_task_ids or ()), round_number)
-    return f"repair-r{round_number}-{seq:02d}"
+    return format_repair_task_id(seq)
 
 
 def _report_paths(root_cause_report: Any) -> List[str]:

@@ -44,6 +44,9 @@ from repair_generator import (
     # from becoming a repair task.
     _plan_intent,
     apply_intent_gate,
+    # 2026-11-02: one place formats the repair id, so the chain's tasks
+    # and the plain rows' are written in the same shape.
+    format_repair_task_id,
 )
 # 2026-10-22: the type a cancelled round raises. Dependency-free, so a
 # top-level import carries no cycle risk.
@@ -1937,17 +1940,17 @@ class VerificationOrchestrator:
         """The tasks the chain owes this round.
 
         The ids come from the same repair sequence the plain rows use
-        (``repair-r<round>-<seq>``), and they are allocated **before**
-        the plain rows' — so the two never collide. The chain's tasks
-        carry their own ``kind`` and their own fields (a diagnosis has no
-        blast radius; an implementation has exactly one), so they do not
-        go through the repair assembler — that one drops the rows without
+        (``repair-<seq>``), and they are allocated **before** the plain
+        rows' — so the two never collide. The chain's tasks carry their
+        own ``kind`` and their own fields (a diagnosis has no blast
+        radius; an implementation has exactly one), so they do not go
+        through the repair assembler — that one drops the rows without
         files to change, and a diagnosis is precisely such a row.
         """
         tasks: List[Dict[str, Any]] = []
         for index, action in enumerate(actions):
             vp_id = str(action["vp_id"])
-            task_id = f"repair-r{int(round_number)}-{seq_base + index:02d}"
+            task_id = format_repair_task_id(seq_base + index)
             evidence = dict(evidence_by_vp.get(vp_id) or {})
             if action["action"] == _CHAIN_STAGE_IMPLEMENTATION:
                 report = {
@@ -4206,10 +4209,21 @@ class VerificationOrchestrator:
         # children are still on disk pointing at the 2026-09-20 task that
         # took its id.
         #
-        # So: read what has already been allocated for this (plan, round)
-        # from both stores, start above it, and report it if the two
-        # stores disagree about what an existing id means.
+        # So: read what has already been allocated for this **plan** from
+        # both stores, start above it, and report it if the two stores
+        # disagree about what an existing id means.
+        #
+        # 2026-11-02: the sequence is plan-global, not round-scoped.  The
+        # round counter resets (it did, twice, on live plans), and a reset
+        # round re-issued the ids the plan already owned; the upsert keeps
+        # a row's runtime state, so the fresh task was born ``completed``
+        # and the round idled.  The ids no longer carry the round, and the
+        # allocation therefore no longer filters by it either.
         seq_base = 1
+        #: Every repair id the plan already owns, in either shape.  The
+        #: chain's tasks and the plain rows both allocate from this pool,
+        #: so the four writers of the repair chain share one counter.
+        existing_repair_ids: Set[str] = set()
         try:
             from repair_generator import (
                 cross_store_task_conflicts,
@@ -4242,9 +4256,8 @@ class VerificationOrchestrator:
                         f"(round {round_number})",
                         data={"conflicts": {k: list(v) for k, v in sample}},
                     )
-            seq_base = next_repair_seq_base(
-                set(disk_titles) | set(db_titles), round_number,
-            )
+            existing_repair_ids = set(disk_titles) | set(db_titles)
+            seq_base = next_repair_seq_base(existing_repair_ids, round_number)
             if seq_base > 1:
                 print(
                     f"[Repair] round {round_number}: {len(db_titles)} prior "
@@ -4260,6 +4273,7 @@ class VerificationOrchestrator:
                 f"check skipped ({id_exc})"
             )
             seq_base = 1
+            existing_repair_ids = set()
         vp_test_commands = extract_vp_test_commands(_plan_file)
         # 2026-10-27 (root-cause chain): the chain's tasks are allocated
         # from the repair sequence **before** the plain rows', so the two
@@ -4280,6 +4294,14 @@ class VerificationOrchestrator:
             vp_test_commands=vp_test_commands,
             plan_path=str(_plan_file),
             seq_base=seq_base + len(chain_tasks),
+            # 2026-11-02: the assembler allocates from the plan's own id
+            # pool — the ids both stores know about, plus the chain tasks
+            # that were just allocated.  One counter for the whole repair
+            # chain; the local ``seq_base`` above is only what that
+            # counter reads out.
+            existing_task_ids=existing_repair_ids | {
+                str(t.get("id") or "") for t in chain_tasks
+            },
         ).assemble(repair_contents)
         repair_tasks = chain_tasks + repair_tasks
         if chain_decision["active"]:

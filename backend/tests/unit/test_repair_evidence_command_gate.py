@@ -204,7 +204,7 @@ def test_a_code_review_repair_is_gated_by_the_vps_evidence_command(tmp_path):
     assert len(tasks) == 1, "the task must be emitted, not refused"
     assert tasks[0]["test_command"] == _EVIDENCE_CMD
     assert tasks[0]["files_to_modify"] == ["native/src/e2e.rs"]
-    assert assembler.test_command_sources["repair-r1-01"] == "vp"
+    assert assembler.test_command_sources["repair-01"] == "vp"
     assert assembler.unverifiable_no_test_command == 0
     assert assembler.dropped_empty_files_to_modify == 0
 
@@ -248,5 +248,5 @@ def test_a_vp_with_no_command_anywhere_is_emitted_and_labelled(tmp_path):
 
     assert len(tasks) == 1, "an artifact-deliverable point still needs repairing"
     assert tasks[0]["test_command"] == ""
-    assert assembler.test_command_sources["repair-r2-01"] == "audit_style"
+    assert assembler.test_command_sources["repair-01"] == "audit_style"
     assert assembler.unverifiable_no_test_command == 1
