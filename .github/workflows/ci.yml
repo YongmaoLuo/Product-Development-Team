@@ -218,7 +218,13 @@ jobs:
     runs-on: ubuntu-latest
     # Style gate. The bandit + provider-ID + legacy-URL-map scans are
     # static and finish in well under a minute.
-    if: github.event_name == 'pull_request'
+    # A manual dispatch must be able to answer "is this code good?" with
+    # no PR open: dispatch run 41397008793 skipped every gate below and
+    # started only `nightly-regression`, so it bought no coverage of the
+    # tree it was aimed at. The privacy/attribution jobs and merge-gate
+    # stay pull_request-only: they judge *this release*, not *this code*,
+    # and need PR base/title/body that a dispatch does not have.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -367,7 +373,7 @@ jobs:
     # Static sweep. Cheap enough to always run, and gating on PR means
     # a developer never has to wait for the unit gate to discover that
     # they reintroduced a forbidden filename pattern.
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -459,7 +465,7 @@ jobs:
   static-gates:
     name: Static gates (contracts)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -866,7 +872,18 @@ jobs:
     # commit on main now arrives through a PR, and the push run was a
     # second full pass over a tree that had just been green. See the
     # ``on:`` block for the dependency this rests on.
-    if: github.event_name == 'pull_request'
+    #
+    # 2026-11-02 — a manual dispatch skips the three release-scoped jobs
+    # (commit-hygiene, commit-range-privacy, pr-metadata-privacy), and the
+    # default ``needs`` semantics propagate that skip downstream: dispatch
+    # run 41398903289 started the three code gates and skipped
+    # unit-tests and everything under it. The explicit ``result`` checks
+    # below replace the implicit dependency — on a PR all six gates must
+    # pass, on a dispatch only the three code gates do.
+    # It stays on ONE physical line on purpose: the PR-predicate gates in
+    # backend/tests read the ``if:`` line literally, so a folded block
+    # scalar would read as ``>-`` and look like "no pull request".
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.lint.result == 'success' && needs.grep-guard.result == 'success' && needs.static-gates.result == 'success' && (github.event_name != 'pull_request' || (needs.commit-hygiene.result == 'success' && needs.commit-range-privacy.result == 'success' && needs.pr-metadata-privacy.result == 'success')) }}
     # Chain the layered gates: lint (style) + grep-guard (fast
     # static scan) BOTH must pass before unit runs. A grep-guard
     # failure on a forbidden filename pattern fails fast (seconds)
@@ -1677,7 +1694,7 @@ jobs:
     name: Coverage gate (≥80%)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     needs: unit-tests
     steps:
       - name: Checkout
@@ -1838,7 +1855,7 @@ jobs:
     # Kept in lockstep with ``unit-tests`` on purpose: the e2e job needs
     # this one, so a divergence here silently removes e2e from the
     # merge gate.
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     # Chain the layered gates: unit, the combined coverage floor, and
     # grep-guard must all pass before integration runs. If any upstream
     # gate fails (style violation, grep-guard regex hit, unit test
@@ -2101,7 +2118,7 @@ jobs:
     # `pull_request` appear in the condition. Narrowing it to match the
     # other gating jobs is a separate, deliberate change; leaving it costs
     # nothing but the reader has to know why the two differ.
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: [static-gates]
     timeout-minutes: 20
     steps:
@@ -2446,7 +2463,7 @@ jobs:
     # Pull requests only, like the other PR gates: the controls exist to
     # close a merge, and the merge gate this job feeds is itself
     # pull_request-only (see the merge-gate job's comment).
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     # After the unit lane: the controls run behavioural suites of their
     # own, and running them beside the shards would spend a second
     # matrix on a tree whose unit lane has not been shown to be green.
