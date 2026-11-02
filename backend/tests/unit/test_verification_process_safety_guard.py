@@ -124,11 +124,13 @@ def test_guard_rule_is_registered() -> None:
 
 
 def test_guard_rule_sits_after_basic_and_before_extended() -> None:
-    """Basic 6 in front, Extended 3 last — the order is pinned."""
+    """Basic 6 in front, Extended 3 next, the write-scope guards last."""
     names = [rule["name"] for rule in _HOOK_RULES]
     assert names.index(GUARD_NAME) == 5, names
     assert names.index("plans_delete_block") > names.index(GUARD_NAME), names
-    assert len(_HOOK_RULES) == 9, names
+    # 2026-11-02: 9 → 11 — the two verifier write-scope guards were added
+    # at the end, so the position of the process-safety guard is unchanged.
+    assert len(_HOOK_RULES) == 11, names
 
 
 def test_guard_rule_matches_bash() -> None:
