@@ -32,6 +32,21 @@ expressions' text: two expressions can look disjoint and still overlap on
 the cases that carry both markers.  The collection is done once per module
 (the whole suite takes a while to import) and the markers of every case are
 read out of it.
+
+Why this file lives in the static-gates lane
+--------------------------------------------
+It used to live in ``backend/tests/contract/``, which the ``misc`` lane
+collects — and the ``misc`` lane is **parallel**.  The partition case below
+collects the whole suite in a subprocess, and that subprocess runs inside
+an xdist worker: on a two-vCPU runner the collection took 56.73 seconds,
+which is 95% of the 60-second budget the lane allows per case, and the
+worker then disappeared without leaving a trace.
+
+The static-gates job is serial (no ``-n``), and it is the prerequisite
+every other lane depends on.  It is also where the repository keeps the
+cases that are about the repository's own shape, which is what this file
+is.  A whole-suite collection belongs there, not in a lane that has
+nineteen other runners' worth of work to get through.
 """
 
 from __future__ import annotations
@@ -55,7 +70,7 @@ import pytest
 # quietly changing what "the lane expression" means.
 from _pytest.mark.expression import Expression
 
-#: The repository root — this file lives at ``backend/tests/contract/``.
+#: The repository root — this file lives at ``backend/tests/static_gates/``.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 #: The gate script under contract.
@@ -721,4 +736,33 @@ def test_the_host_probe_reports_a_verdict_on_this_host(tmp_path: Path) -> None:
     ), (
         "the gate ran the wall-clock lane without saying whether the host "
         "could be measured:\n" + completed.stdout
+    )
+
+
+def test_this_case_lives_in_the_static_gates_lane() -> None:
+    """This file must stay out of the parallel lanes.
+
+    The partition case above collects the whole suite in a subprocess.  In
+    a parallel lane that subprocess runs inside an xdist worker, shares the
+    runner with its neighbours, and costs more than the lane's per-case
+    budget — which is how a worker disappeared without leaving a trace.
+
+    The static-gates job is serial and is every lane's prerequisite, so a
+    whole-suite collection is affordable there.  This case says so out
+    loud: if the file is moved back into ``tests/contract/``, it fails
+    instead of quietly costing a runner its worker again.
+    """
+    here = Path(__file__).resolve()
+    assert here.parent.name == "static_gates", (
+        "this file has to live in backend/tests/static_gates/ — it collects "
+        "the whole suite, and a parallel lane cannot afford that: {0}".format(
+            here.relative_to(REPO_ROOT)
+        )
+    )
+    old_path = (
+        REPO_ROOT / "backend" / "tests" / "contract" / "test_gate_lane_contract.py"
+    )
+    assert not old_path.exists(), (
+        "{0} still exists — the case would be collected twice, once of them "
+        "in a parallel lane".format(old_path.relative_to(REPO_ROOT))
     )

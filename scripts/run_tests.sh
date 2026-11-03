@@ -581,7 +581,7 @@ gate_started_ms=$(gate_now_ms)
 #
 # ``PDT_HOST_TIMING_PROBE`` forces the verdict (``pass`` / ``fail``) so both
 # branches can be exercised deterministically — by the contract test in
-# ``backend/tests/contract/test_gate_lane_contract.py``, and by an operator
+# ``backend/tests/static_gates/test_gate_lane_contract.py``, and by an operator
 # who knows what their machine is doing.  ``auto`` (the default) measures.
 # ``PDT_HOST_TIMING_PROBE_MAX_SLEEP`` moves the threshold.
 #
