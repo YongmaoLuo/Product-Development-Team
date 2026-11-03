@@ -34,6 +34,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -169,6 +171,29 @@ def latest_context_pack(plan_dir: Path) -> Optional[Path]:
 def context_pack_reference_line(pack_path: Path) -> str:
     """The one line a brief uses to point at the context pack."""
     return CONTEXT_PACK_REFERENCE_INSTRUCTION.format(pack_path=str(pack_path))
+
+
+def plan_dir_of_artifact_dir(artifact_dir: Any) -> str:
+    """The plan directory that owns ``artifact_dir``.
+
+    2026-11-02: the orchestrator sets ``evidence_artifact_dir`` to
+    ``<plan_dir>/vp_artifacts/<vp_id>`` (``verification_agent``), so the
+    plan directory — the verification sub-agent's one writable root — is
+    two levels up. A layout without the ``vp_artifacts`` level falls back
+    to the directory that holds the artifacts.
+
+    Empty string when there is nothing to derive: the caller then names
+    the plan directory *without* a path rather than naming the wrong one.
+    """
+    text = str(artifact_dir or "").strip()
+    if not text:
+        return ""
+    parent = Path(text).parent
+    candidate = parent.parent if parent.name == "vp_artifacts" else parent
+    result = str(candidate)
+    if not result or result == os.sep:
+        return ""
+    return result
 
 
 def _marshal_safe_on_worker_thread(func: Any) -> Any:
@@ -952,6 +977,8 @@ class VerificationSubAgent:
         log_dir: Optional[Path] = None,
         project_dir: Optional[Path] = None,
         plan_id: str = "default",
+        plan_dir: Optional[Path] = None,
+        round_no: int = 0,
     ) -> "Verdict":
         """Run a verification sub-agent invocation with self-heal retry.
 
@@ -970,6 +997,17 @@ class VerificationSubAgent:
                 used in the default no-op self-heal).
             plan_id: Plan ID, used to name the temp settings.json and
                 tag the log entries.
+            plan_dir: The plan's own directory — the verification
+                sub-agent's single writable root. When it is given,
+                the built settings.json declares the write scope (see
+                :meth:`SettingsJsonBuilder._scope_env`): the sub-agent
+                may write inside this directory (or a temp one) and
+                nowhere else — the repository under verification is
+                read-only for it. ``None`` (the default) means "no
+                scope declared": the two scope guards stay inert.
+            round_no: The round this run belongs to. It decides which
+                ``round-<n>/`` directory the refusal evidence lands in.
+                Only meaningful together with ``plan_dir``.
 
         Returns:
             A :class:`Verdict` with ``verdict`` ∈ ``{"PASSED",
@@ -988,13 +1026,25 @@ class VerificationSubAgent:
                 vp_node, log_dir, project_dir,
             )
 
-        builder = SettingsJsonBuilder(vp_id=vp_id, plan_id=plan_id or "default")
+        # 2026-11-02（写入范围落地）：有 plan 目录才有一份可写范围要声明，
+        # 也就才有轮次可言 —— 这时把两个值交给 builder，它据此算出
+        # settings.json 里的 scope env。没有 plan_dir 时**不传**这两个
+        # kwarg：没有范围要声明，也就没必要多传参数（旧调用方与窄签名的
+        # 测试替身不该因为多出来的 kwarg 炸掉）。
+        builder_kwargs: Dict[str, Any] = {
+            "vp_id": vp_id,
+            "plan_id": plan_id or "default",
+        }
+        if plan_dir is not None:
+            builder_kwargs["plan_dir"] = plan_dir
+            builder_kwargs["round_no"] = round_no
+        builder = SettingsJsonBuilder(**builder_kwargs)
         settings_path: Optional[str] = None
         log_path: Optional[Path] = None
         last_blocked: Optional[BlockedPathError] = None
 
         try:
-            # Step 1 — build temp settings.json with the 9 security hooks
+            # Step 1 — build temp settings.json with the 11 security hooks
             settings_path = builder.build()
 
             # Per-VP retry-attempt logs use the ``vp_attempt_`` prefix so
@@ -1946,6 +1996,42 @@ class VerificationSubAgent:
             return ""
         return context_pack_reference_line(pack)
 
+    def _write_scope_block(self, vp_node: Dict[str, Any]) -> List[str]:
+        """The visible write scope — what the sub-agent may not write.
+
+        2026-11-02 (task 8): the mechanical guard
+        (``verification_write_guard``) refuses a write outside the plan
+        directory and the temp dirs, but it speaks **after** the fact:
+        the sub-agent writes, and only then gets refused. That costs one
+        retry of the budget (three attempts by default), and the attempt
+        itself may already have touched the tree under verification —
+        "verification" rewritten by the verifier.
+
+        So the boundary is stated up front, in the prompt: the repository
+        under verification is read-only; scripts, logs and evidence go to
+        the plan directory or to /tmp.
+
+        The paths come from the VP node: ``project_root`` (the tree under
+        verification) and ``evidence_artifact_dir`` (whose parent chain
+        leads to the plan directory). A missing path does not remove the
+        block — it only makes the wording pathless ("the verified
+        repository" / "the plan directory"). A prompt without any boundary
+        is exactly the failure mode this block exists to prevent.
+        """
+        project_root = str(vp_node.get("project_root") or "").strip()
+        repository = project_root or "the verified repository"
+        plan_dir = plan_dir_of_artifact_dir(
+            vp_node.get("evidence_artifact_dir")
+        )
+        plan = plan_dir or "the plan directory"
+        return [
+            "",
+            f"WRITE SCOPE: {repository} is READ-ONLY. Write scripts, logs "
+            f"and evidence only under {plan} or /tmp. Any write inside "
+            "the repository is refused by a hook and recorded as "
+            "verifier_mutated_tree.",
+        ]
+
     def _build_prompt(self, vp_node: Dict[str, Any], attempt: int) -> str:
         """Build the LLM prompt from a verification point node.
 
@@ -1967,6 +2053,12 @@ class VerificationSubAgent:
         round's context pack — the file the environment facts live in —
         so the verifier reads them instead of re-deriving them with
         ``ls`` / ``find`` / ``git log``.
+
+        Since 2026-11-02 it also carries the WRITE SCOPE declaration:
+        the repository under verification is read-only, scripts / logs /
+        evidence go to the plan directory or to /tmp. The sub-agent has
+        to learn that boundary *before* it writes, not from a hook
+        refusal afterwards (see :meth:`_write_scope_block`).
         """
         parts = [
             f"Verification point: {vp_node.get('id', 'unknown')}",
@@ -1975,6 +2067,10 @@ class VerificationSubAgent:
             f"Priority: {vp_node.get('priority', 'medium')}",
             f"Expected result: {vp_node.get('expected_result', '')}",
         ]
+        # 2026-11-02（任务 8）：可写范围必须在**写之前**就摆在子 agent 眼前。
+        # 护栏只在写下去之后才拒绝它 —— 那时候重试预算已经烧掉一次，而被验证
+        # 仓库的工作区可能已经被改过。
+        parts.extend(self._write_scope_block(vp_node))
         prd_criteria = str(vp_node.get("related_prd_criteria") or "").strip()
         if prd_criteria:
             parts.append(f"PRD criterion: {prd_criteria}")
@@ -2415,7 +2511,7 @@ class BlockedPathError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# SettingsJsonBuilder — temporary settings.json with 9 hard PreToolUse hooks
+# SettingsJsonBuilder — temporary settings.json with 11 hard PreToolUse hooks
 # ---------------------------------------------------------------------------
 #
 # PRD Decision Point 2 pins 9 hard PreToolUse hooks for the verification
@@ -2430,8 +2526,19 @@ class BlockedPathError(Exception):
 #     sub-agent's own workspace. These guard the project a sub-agent
 #     was pointed at against accidental destruction.
 #
-# The order of the 9 rules is stable: basic 6 in front, extended 3 last.
-# Tests pin the order so the SDLC audit trail is reproducible.
+# 2026-11-02 — the 10th and 11th hook (verifier write scope, Edit|Write
+# and Bash) close the last hole in that list: ``exec_path_block`` treats
+# the whole project directory as writable, which is right for an
+# EXECUTION sub-agent and wrong for a VERIFICATION one — the repository
+# under verification is exactly what the latter must not touch (VP-055
+# rewrote ``backend/verification_agent.py`` mid-verification on
+# 2026-11-02). Those two hooks point at the guard script
+# ``backend/verification_write_guard.py``, whose scope is declared
+# through the environment: no scope, no enforcement.
+#
+# The order of the 11 rules is stable: basic 6 in front, extended 3,
+# then the two write-scope guards last. Tests pin the order so the
+# SDLC audit trail is reproducible.
 #
 # Each rule's command is a one-liner that reads a JSON payload from
 # stdin (the Claude Code SDK supplies ``tool_input`` keyed by tool
@@ -2514,6 +2621,26 @@ _EXT_EXEC_PATH_BLOCK = (
 )
 
 
+#: The guard script that enforces the verification sub-agent's write scope.
+#:
+#: Its absolute path is resolved from THIS file's own directory, so the
+#: command keeps pointing at the right script no matter which checkout
+#: (or worktree) the backend runs from.
+_WRITE_GUARD_SCRIPT = (
+    Path(__file__).resolve().parent / "verification_write_guard.py"
+)
+
+#: The command that runs the guard.
+#:
+#: ``sys.executable`` rather than a bare ``python3``: the hook must run
+#: under the same interpreter as the backend that wrote the settings file.
+#: Both halves go through ``shlex.quote`` — a checkout path with a space
+#: in it would otherwise split into two arguments.
+_WRITE_GUARD_COMMAND = (
+    f"{shlex.quote(sys.executable)} {shlex.quote(str(_WRITE_GUARD_SCRIPT))}"
+)
+
+
 _HOOK_RULES: Tuple[Dict[str, str], ...] = (
     # Basic 6 — system-level safety nets
     {
@@ -2562,17 +2689,42 @@ _HOOK_RULES: Tuple[Dict[str, str], ...] = (
         "name": "exec_path_block",
         "command": _EXT_EXEC_PATH_BLOCK,
     },
+    # Verifier write scope — 2 rules.
+    #
+    # The verification sub-agent may write inside the plan directory or a
+    # temporary directory; the repository under verification is read-only
+    # for it. The scope is declared through the environment
+    # (``PDT_VP_WRITE_SCOPE`` and friends — see
+    # :meth:`SettingsJsonBuilder._scope_env`), so the very same command
+    # stays inert for every caller that does not declare a scope: the
+    # execution sub-agents, the refiners, and every other place that
+    # writes its own settings.json are unaffected.
+    #
+    # One script, two matchers: the guard reads the payload and decides
+    # for itself whether it is looking at an Edit/Write or at a Bash
+    # command (``tool_input.command``).
+    {
+        "matcher": "Edit|Write",
+        "name": "verifier_write_scope_block",
+        "command": _WRITE_GUARD_COMMAND,
+    },
+    {
+        "matcher": "Bash",
+        "name": "verifier_bash_write_block",
+        "command": _WRITE_GUARD_COMMAND,
+    },
 )
 
 
 @dataclass
 class SettingsJsonBuilder:
-    """Build a temporary ``settings.json`` with 9 PreToolUse security hooks.
+    """Build a temporary ``settings.json`` with 11 PreToolUse security hooks.
 
-    The 9 hooks are pinned by PRD Decision Point 2 of the verification
-    sub-agent work-package. Each rule is identified by a short ``name``
-    (≤ 30 Chinese characters) and the ``command`` is a one-liner shell
-    that blocks (exit 2) or allows (exit 0) a given tool invocation.
+    The first 9 hooks are pinned by PRD Decision Point 2 of the
+    verification sub-agent work-package; the last 2 (verifier write
+    scope) were added on 2026-11-02. Each rule is identified by a short
+    ``name`` (≤ 30 Chinese characters) and the ``command`` is a one-liner
+    shell that blocks (exit 2) or allows (exit 0) a given tool invocation.
 
     Attributes:
         vp_id: Verification-point ID, e.g. ``"VP-001"``. Used in the
@@ -2580,10 +2732,27 @@ class SettingsJsonBuilder:
         plan_id: Plan ID (see ``framework.ids.validate_plan_id``
             for what one may contain). Also used in the temp file
             path.
+        plan_dir: The plan's own directory. When it is given, the built
+            settings file **declares the write scope** of the verification
+            sub-agent (see :meth:`_scope_env`): it may write inside this
+            directory or a temporary one, and nowhere else — the
+            repository under verification is read-only for it. When it is
+            ``None`` (the default) no scope is declared, the two scope
+            guards stay inert, and the file looks exactly like it did
+            before they existed.
+        round_no: The round this build belongs to. It decides which
+            ``round-<n>/`` directory the refusal evidence lands in.
     """
 
     vp_id: str
     plan_id: str
+
+    #: The plan's own directory — the one writable root of the verification
+    #: sub-agent. ``None`` means "no scope declared" (old behaviour).
+    plan_dir: Optional[Path] = None
+
+    #: Which round this build belongs to; part of the refusal evidence path.
+    round_no: int = 0
 
     #: Memoised temp path. ``build()`` writes it and ``cleanup()`` removes
     #: it, so the two must agree — see :meth:`_temp_path`.
@@ -2597,17 +2766,64 @@ class SettingsJsonBuilder:
         The temp file path follows the pattern
         ``<private tmpdir>/verif_settings_{vp_id}_{plan_id}.json``.
 
+        The ``env`` section carries the write scope (when there is one):
+        Claude Code folds a settings file's ``env`` into the process
+        environment and the hook subprocesses inherit it — that is how
+        the two scope guards learn where the writable root is.
+
         Returns:
             Absolute path to the temp settings file.
         """
         path = self._temp_path()
-        settings = {
+        settings: Dict[str, Any] = {
             "hooks": {
                 "PreToolUse": [self._rule_to_hook(r) for r in _HOOK_RULES],
             }
         }
+        scope_env = self._scope_env()
+        if scope_env:
+            settings["env"] = scope_env
         write_private_json(Path(path), settings)
         return path
+
+    def _scope_env(self) -> Dict[str, str]:
+        """The environment variables that declare the write scope.
+
+        Empty when there is no plan directory: the scope guards then find
+        no scope and allow everything, exactly like before they existed.
+
+        The names are the ones the guard script itself reads
+        (``backend/verification_write_guard.py``):
+
+        * ``PDT_VP_WRITE_SCOPE`` — the **plan directory**. The guard
+          treats the value as the single writable root, so it has to be
+          the directory itself and not a flag: a flag would leave the
+          guard comparing write targets against ``<cwd>/1``.
+        * ``PDT_VP_ID`` — which VP the refusals belong to.
+        * ``PDT_VP_ROUND`` — which round they happened in; the guard
+          derives the ``round-<n>/`` marker directory from it.
+
+        ``PDT_VP_PLAN_DIR`` and ``PDT_VP_REFUSAL_DIR`` spell the same two
+        facts out for whoever reads the evidence back later.
+        """
+        if self.plan_dir is None:
+            return {}
+
+        plan_dir = absolute_path(Path(self.plan_dir))
+        try:
+            round_no = int(self.round_no)
+        except (TypeError, ValueError):
+            round_no = 0
+        refusal_dir = (
+            plan_dir / "vp_write_scope" / "refusals" / f"round-{round_no}"
+        )
+        return {
+            "PDT_VP_WRITE_SCOPE": str(plan_dir),
+            "PDT_VP_ID": str(self.vp_id),
+            "PDT_VP_ROUND": str(round_no),
+            "PDT_VP_PLAN_DIR": str(plan_dir),
+            "PDT_VP_REFUSAL_DIR": str(refusal_dir),
+        }
 
     def cleanup(self) -> None:
         """Remove the temp settings file and its private directory.

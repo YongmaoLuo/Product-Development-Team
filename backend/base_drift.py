@@ -68,8 +68,9 @@ Status semantics
 ``none``       The branch is in sync with its base.  Nothing to do.
 ``merged``     The branch was behind; the base was merged in.
 ``conflicts``  The merge hit conflicts.  **The only blocking status.**
-``dirty_tree`` The working tree had uncommitted changes, so the merge
-               was skipped (not an error — the round continues).
+``dirty_tree`` The merge was refused: uncommitted work is in the way
+               of it, and git named the files.  Not an error — the
+               round continues.
 ``failed``     A git call failed.  ``stderr_excerpt`` says why.
 ``disabled``   The check was switched off by configuration.
 ``skipped``    The directory is in no git repository at all.  An
@@ -394,6 +395,23 @@ def resolve_base_ref(base_ref: str) -> str:
 def _excerpt(text: str, limit: int = STDERR_EXCERPT_LIMIT) -> str:
     """Git's own complaint, stripped and cut to ``limit`` characters."""
     return (text or "").strip()[:limit]
+
+
+MAX_DETAIL_PATHS = 10
+"""How many paths a detail line names before it says "and more"."""
+
+
+def _path_list(paths: Sequence[str], limit: int = MAX_DETAIL_PATHS) -> str:
+    """The paths for a detail line, cut short with an ellipsis.
+
+    A detail line is read in an event log, so it names a handful of
+    paths and — when there are more — says so with an ellipsis.  The
+    count next to it is always the true one.
+    """
+    shown = ", ".join(list(paths)[:limit])
+    if len(paths) > limit:
+        shown += ", ..."
+    return shown
 
 
 def _never_raise(runner: Any) -> Any:
@@ -803,6 +821,75 @@ def _conflict_complaint(completed: subprocess.CompletedProcess) -> str:
     return _excerpt("\n".join(lines))
 
 
+DIRTY_REFUSAL_MARKERS = (
+    "would be overwritten by",
+)
+"""The phrase that marks a git complaint as a dirty-tree refusal.
+
+Git refuses a merge that would overwrite uncommitted work, and it
+always says it the same way — "… would be overwritten by merge" —
+whether the blocking files are locally modified or untracked.  Matching
+that tail catches both refusals and nothing else: no other complaint
+git prints contains it.
+"""
+
+
+def _dirty_refusal_paths(complaint: str) -> Optional[List[str]]:
+    """The paths git named when it refused to merge over a dirty tree.
+
+    A refusal is not a conflict.  A conflict means two histories
+    disagree and somebody has to resolve it; a refusal means the
+    **working tree** disagrees with the merge — there is uncommitted
+    work in the way, and git will not touch it::
+
+        error: Your local changes to the following files would be
+        overwritten by merge:
+        \ta.txt
+        Please commit your changes or stash them before you merge.
+
+    Both end in a non-zero exit code, so the exit code alone cannot
+    tell them apart — only git's own complaint can.
+
+    The three answers are deliberately different values:
+
+    * ``None`` — this is **not** a refusal.  The caller goes on looking
+      for a conflict, or for a plain failure.
+    * ``[]`` — git refused but named no path.  Still a refusal, and
+      still the caller's to report; only the names are missing.
+    * a list of paths — the files git named, in the order it named
+      them.
+
+    "Not a refusal" and "a refusal without names" must not look alike:
+    they send the caller down different paths, and collapsing them
+    would let a dirty tree be reported as a conflict.
+
+    The paths sit on the lines right below the complaint's head, each
+    one indented by a tab.  The first line that is not indented ends
+    the list.
+
+    This function only reads: it runs no git and touches no working
+    tree.  The complaint is the whole input.
+    """
+    if not complaint:
+        return None
+    lines = complaint.splitlines()
+    head = None
+    for index, line in enumerate(lines):
+        if any(marker in line for marker in DIRTY_REFUSAL_MARKERS):
+            head = index
+            break
+    if head is None:
+        return None
+    paths: List[str] = []
+    for line in lines[head + 1:]:
+        if not line.startswith("\t"):
+            break
+        path = line[1:].strip()
+        if path:
+            paths.append(path)
+    return paths
+
+
 def _work_tree_report(
     project_dir: Any,
     inside: subprocess.CompletedProcess,
@@ -906,21 +993,28 @@ def check_and_merge_base(
                    The base is read again after the fetch, so a base
                    that caught up with ``HEAD`` while the fetch was
                    running lands here too,
-    ``dirty_tree`` the branch is behind, but the working tree has
-                   uncommitted changes — the merge is skipped and the
-                   round continues,
     ``conflicts``  the merge left unmerged paths behind — the only
                    blocking outcome.  The conflicting files are listed
                    with their block counts, and the merge attempt is
                    aborted, so the working tree is clean again,
+    ``dirty_tree`` the merge was **refused**: uncommitted work is in
+                   the way of it.  Git names the files, and the report
+                   names them too.  Nothing was merged and nothing was
+                   started — the round continues,
     ``merged``     the base was merged into the branch; the report
                    carries the merge commit and the HEAD before and
                    after it.
 
     A branch that is *behind* its base is measured here; merging it in
-    takes a clean working tree, a fetch that works and a merge that
-    works.  Every one of those three can fail, and every failure is
-    reported with git's own complaint rather than guessed at.
+    takes a fetch that works and a merge that works.  Every one of
+    those two can fail, and every failure is reported with git's own
+    complaint rather than guessed at.
+
+    A working tree with uncommitted changes is **not** a reason to
+    skip the merge.  Git knows whether that work is in the way of the
+    merge, and it says so in its own words when it is; the merge is
+    therefore attempted and git decides.  Work the merge does not
+    touch is left exactly as it was.
     """
     cfg = BaseDriftConfig.from_env() if config is None else config
     runner = _never_raise(run_git if git_runner is None else git_runner)
@@ -975,13 +1069,14 @@ def check_and_merge_base(
 
     # ── the branch is behind its base ──
     #
-    # Before anything is merged the working tree has to be clean.
-    # Merging into a tree with uncommitted work folds that work into
-    # the merge: the result is neither the branch nor the base, and
-    # the operator's changes end up inside a merge commit they never
-    # saw.  A dirty tree is therefore reported and skipped — it is a
-    # normal state of a working repository, not a failure, and it does
-    # not block the round.
+    # The working tree does not have to be clean to merge into it.
+    # Git refuses a merge only when the uncommitted work is *in the
+    # way* — when the merge would overwrite it — and it refuses in its
+    # own words, naming the files.  So the tree is asked about, not
+    # judged: the merge is attempted and git decides.  Uncommitted work
+    # that the merge does not touch survives it untouched, and a branch
+    # that really is behind does not stay behind for the sake of a file
+    # nobody touched.
 
     dirty = _dirty_paths(project_dir, timeout_sec, runner)
     if dirty.stderr:
@@ -996,20 +1091,6 @@ def check_and_merge_base(
             stderr_excerpt=dirty.stderr,
             mode=cfg.mode,
             detail="could not read the working tree status",
-        )
-
-    if dirty:
-        return BaseDriftReport(
-            status=STATUS_DIRTY_TREE,
-            base_ref=resolved,
-            base_sha=base_sha,
-            behind=behind,
-            ahead=ahead,
-            mode=cfg.mode,
-            detail=(
-                f"the working tree has {len(dirty)} uncommitted change(s) "
-                f"({', '.join(dirty[:3])}); {resolved} was not merged"
-            ),
         )
 
     # ── fetch the base ──
@@ -1088,6 +1169,49 @@ def check_and_merge_base(
         timeout_sec,
     )
     if merged.returncode != 0:
+        # ── did git refuse to start the merge? ──
+        #
+        # A refusal is not a conflict.  Git refuses when the merge would
+        # overwrite uncommitted work, and it says so in its own words,
+        # naming the files that are in the way.  Nothing was merged and
+        # nothing was started: there is no MERGE_HEAD, no unmerged
+        # path, and nothing to abort.
+        #
+        # So the refusal is read *first*, before the conflict lookup:
+        # a conflict lookup would find nothing (a refusal leaves no
+        # unmerged path behind) and an abort would fail (a refusal
+        # never wrote a MERGE_HEAD).  Reading the refusal first is
+        # what keeps the two failures apart.
+        complaint = merged.stderr or merged.stdout or ""
+        refusal_paths = _dirty_refusal_paths(complaint)
+        if refusal_paths is not None:
+            # Git named the files that are in the way; when it named
+            # none — git's single-file variants carry no tab-indented
+            # list — the working tree is asked which files are dirty.
+            paths = list(refusal_paths) or list(
+                _dirty_paths(project_dir, timeout_sec, runner)
+            )
+            if paths:
+                return BaseDriftReport(
+                    status=STATUS_DIRTY_TREE,
+                    base_ref=resolved,
+                    base_sha=base_sha,
+                    behind=behind,
+                    ahead=ahead,
+                    head_before=head_before,
+                    stderr_excerpt=_excerpt(complaint),
+                    mode=cfg.mode,
+                    detail=(
+                        f"the working tree has {len(paths)} uncommitted "
+                        f"change(s) ({_path_list(paths)}) that {resolved} "
+                        f"would overwrite; {resolved} was not merged"
+                    ),
+                )
+            # The complaint carried the marker, but there is nothing
+            # uncommitted in the tree that a merge could overwrite:
+            # there is no dirty tree to report, so this goes on to be
+            # an ordinary failure like any other.
+
         # A failed merge comes in two kinds.  Only one of them leaves
         # unmerged paths behind; the others leave nothing behind and
         # must not be dressed up as a conflict — a conflict stops the
