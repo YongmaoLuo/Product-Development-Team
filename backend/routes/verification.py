@@ -3849,6 +3849,29 @@ def _persist_round_snapshot(
     return report
 
 
+def _interrupted_tasks_with_reason(
+    interrupted_tasks: List[Dict[str, Any]], reason: Optional[str]
+) -> List[Dict[str, Any]]:
+    """Stamp the pause's reason onto every interrupted task.
+
+    A task-level reason that contradicts the checkpoint-level one is a
+    lie inside the document: the resume reads both as the same fact.
+    The caller's reason therefore wins — the rows are re-stamped rather
+    than trusted, because a row that says "user_stopped" next to a
+    checkpoint that says "base_drift_conflicts" cannot both be true.
+    """
+    stamped: List[Dict[str, Any]] = []
+    for task in interrupted_tasks or []:
+        if isinstance(task, dict):
+            stamped.append({**task, "reason": reason})
+        else:
+            # Not a mapping: ``pause_state`` turns such an entry into a
+            # row of nulls anyway — keep it one, but with the reason
+            # filled in, so every row tells the same story.
+            stamped.append({"reason": reason})
+    return stamped
+
+
 def _write_verification_checkpoint(
     plan_dir: Path,
     *,
@@ -3856,6 +3879,7 @@ def _write_verification_checkpoint(
     round_n: int,
     verdicts: List[Dict[str, Any]],
     interrupted_tasks: List[Dict[str, Any]],
+    reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Record the interrupted verification round in ``pause_state.json``.
 
@@ -3868,16 +3892,35 @@ def _write_verification_checkpoint(
 
     The verdict list is what makes the pause worth anything: it is the
     round's work, already done, that a resume must not redo.
+
+    ``reason`` is the caller's own truth about *why* the round was
+    interrupted: ``/stop`` says ``user_stopped``, another caller may
+    say something else entirely (the base drifted, the verdicts
+    conflict). It is written verbatim — this function does not get to
+    rewrite the caller's reason into its own favourite. A missing
+    reason is written as ``null`` and logged as
+    ``pause_reason_unavailable`` rather than guessed at, because a
+    guessed reason is indistinguishable from a real one once it is on
+    disk.
     """
     from pause_state import checkpoint_path, write_pause_checkpoint
     from utils.atomic_io import atomic_write_json
+
+    if reason is None:
+        _server.logger.warning(
+            "pause_reason_unavailable: the verification pause of round %s "
+            "records no reason; the checkpoint stores null",
+            round_n,
+        )
 
     checkpoint = write_pause_checkpoint(
         plan_dir,
         kind="verification",
         project_dir=project_dir,
-        reason="user_stopped",
-        interrupted_tasks=interrupted_tasks,
+        reason=reason,
+        interrupted_tasks=_interrupted_tasks_with_reason(
+            interrupted_tasks, reason,
+        ),
         unfinished_tasks=[],
         verification_round=int(round_n),
     )
@@ -4157,6 +4200,9 @@ def stop_verification(plan_id: str):
         project_dir=_project_dir,
         round_n=round_n,
         verdicts=verdicts,
+        # The operator pressed stop — that is the caller's truth about
+        # why this round was interrupted, and the checkpoint says so.
+        reason="user_stopped",
         interrupted_tasks=[
             {
                 "task_id": vp_id,

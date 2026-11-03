@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
 __all__ = ["VerificationRepository"]
+
+logger = logging.getLogger(__name__)
+
+# A verification round in one of these states has already reached its
+# end — no further transition is expected.
+_TERMINAL_VERIFICATION_STATUSES = frozenset({"passed", "failed", "loop_stopped"})
 
 _COLUMNS = (
     "plan_id",
@@ -412,6 +419,14 @@ class VerificationRepository:
     def mark_stopped(self, plan_id: str, reason: str, status: str = "loop_stopped") -> None:
         """Mark the verification cycle as stopped.
 
+        The stop reason of an already-terminated round is write-once
+        (2026-11-03): a plan had already ended its round with
+        ``base_drift_conflicts``, and the later ``POST /stop`` rewrote
+        ``verification_stop_reason`` to ``user_stopped``, erasing the
+        real cause of the termination.  When the round is already
+        terminal *and* it already carries a stop reason, the first
+        reason wins; the attempted overwrite is only logged.
+
         Args:
             plan_id: The plan whose verification cycle is being stopped.
             reason: One of the canonical stop reasons (max_rounds_reached,
@@ -424,6 +439,31 @@ class VerificationRepository:
         """
         if status not in {"passed", "failed", "loop_stopped", "running", "pending"}:
             raise ValueError(f"invalid verification status: {status!r}")
+
+        # Write-once guard: a terminal round keeps the reason it was
+        # given first.  A missing row is NOT treated as "already
+        # terminal" — it falls through to ``_update`` below, which
+        # raises ``KeyError`` as it always has.
+        row = self.current(plan_id)
+        if row is not None:
+            kept_reason = row.get("verification_stop_reason")
+            if (
+                row.get("verification_status") in _TERMINAL_VERIFICATION_STATUSES
+                and kept_reason
+            ):
+                logger.info(
+                    "verification_stop_reason_kept plan=%s kept=%s attempted=%s",
+                    plan_id,
+                    kept_reason,
+                    reason,
+                )
+                # Early return — skip the write, the ``plan_closed``
+                # re-publish (a second close for a round that is
+                # already closed) and the post-write invariant check
+                # (which would assert against a status we are not
+                # writing any more).
+                return
+
         self._update(
             plan_id,
             verification_status=status,
