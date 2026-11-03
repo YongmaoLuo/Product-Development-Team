@@ -5,16 +5,20 @@ A drift check is only useful if it survives the situations that are
 that are easy to get wrong, and every one of them has a way of
 pretending to be fine:
 
-* a **dirty working tree** looks like a merge that went through,
+* a **dirty working tree** whose uncommitted work the merge does not
+  touch — the merge goes through, and the uncommitted work is left
+  alone,
 * a **failed ``git status``** looks like a clean working tree,
 * a **failed fetch** looks like a base that simply has nothing new,
 * a **failed merge** looks like a conflict — or worse, like a merge.
 
 This file pins what the check does with each of them.  The rule
 throughout: a git call that does not work is *reported*, never
-guessed at and never allowed to pass for success.  The one case that
-is explicitly **not** an error is the dirty working tree — it means
-"there is work in progress here", and the round continues.
+guessed at and never allowed to pass for success.  The dirty working
+tree is explicitly **not** an error — it means "there is work in
+progress here", and git itself says whether that work is in the way of
+the merge.  Only a real overlap stops the merge; work that the merge
+does not touch is none of the check's business.
 
 Every repository here is built from scratch in a temporary directory.
 The base is a **local bare repository** (``git clone --bare``), so the
@@ -33,8 +37,8 @@ if str(BACKEND_DIR) not in sys.path:
 
 import base_drift  # noqa: E402
 from base_drift import (  # noqa: E402
-    STATUS_DIRTY_TREE,
     STATUS_FAILED,
+    STATUS_MERGED,
     STATUS_SKIPPED,
     BaseDriftConfig,
 )
@@ -131,38 +135,47 @@ def _commands(calls: list, name: str) -> list:
     return [call for call in calls if call and call[0] == name]
 
 
-def test_dirty_tree_skips_merge(tmp_path):
-    """A dirty working tree is reported — and nothing is merged.
+def test_dirty_tree_outside_scope_merges(tmp_path):
+    """Uncommitted work the merge does not touch does not stop the merge.
 
-    Merging into a tree with uncommitted work folds that work into
-    the merge: the result is neither the branch nor the base, and the
-    operator's changes are now part of a merge commit they never saw.
-    So the merge is skipped.  The drift itself is still reported —
-    the branch *is* behind — and the round is not blocked, because a
-    dirty tree is a normal state of a working repository, not a
-    failure of the check.
+    Git knows whether the uncommitted work is in the way: it refuses
+    the merge only when the merge would overwrite it.  Here the base
+    moved on with an empty commit, so the untracked file is not in the
+    way at all — the merge goes through, and the file is left exactly
+    as it was.
+
+    Skipping *every* merge because the tree is dirty is what left four
+    rounds standing on a stale base: the uncommitted work was never in
+    the way, and the drift was real.
     """
     work = _repo_behind_by_one(tmp_path)
     (work / "untracked.txt").write_text("x")
-    head_before = _git(work, "rev-parse", "HEAD").stdout.strip()
+    # The merge inside the check creates a commit, and that commit is
+    # made by a plain ``git`` call — so the work tree needs a local
+    # identity of its own.
+    _git(work, "config", "user.email", "t@example.com")
+    _git(work, "config", "user.name", "t")
+    _git(work, "config", "commit.gpgsign", "false")
 
     calls: list = []
     report = base_drift.check_and_merge_base(work, git_runner=_recording_runner(calls))
 
-    assert report.status == STATUS_DIRTY_TREE
-    assert report.event == "base_drift_dirty_tree"
+    assert report.status == STATUS_MERGED
+    assert report.event == "base_drift_merged"
     assert report.blocked is False
     assert report.behind >= 1
     assert len(report.base_sha) == 40
     assert report.base_ref == "origin/main"
+    assert report.merge_commit != ""
 
-    # Neither the fetch nor the merge may run: the dirty tree is
-    # checked *before* the fetch.
-    assert not _commands(calls, "fetch"), calls
-    assert not _commands(calls, "merge"), calls
+    # The base was really fetched and really merged.
+    assert _commands(calls, "fetch"), calls
+    assert _commands(calls, "merge"), calls
 
-    # And no merge commit was produced.
-    assert _git(work, "rev-parse", "HEAD").stdout.strip() == head_before
+    # The untracked file is untouched — and still untracked: it did not
+    # sneak into the merge commit.
+    assert (work / "untracked.txt").read_text() == "x"
+    assert "?? untracked.txt" in _git(work, "status", "--porcelain").stdout
 
 
 def test_fetch_failure_records_stderr(tmp_path):
