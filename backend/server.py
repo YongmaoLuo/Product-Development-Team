@@ -1620,7 +1620,19 @@ def _start_orphan_reaper() -> Optional[int]:
     _start_orphan_reaper_scan(config)
 
     try:
-        return orphan_reaper.ensure_daemon(config)
+        # The daemon is *asked* to be exempted from the owner rule: it
+        # would have to outlive the server, because "the server died"
+        # is the situation it exists for.  Every other caller of
+        # ``ensure_daemon`` gets the default -- a daemon that leaves
+        # with the process that started it.
+        #
+        # The ask is only an ask.  The configuration decides, and by
+        # default it refuses: ``PDT_ORPHAN_REAPER_DETACH_OWNER`` has to
+        # be set for the exemption to be granted.  The exemption is the
+        # kind of decision that has to be made out loud -- taken by
+        # accident, for every backend on the machine, it left
+        # twenty-four daemons walking one machine on 2026-11-02.
+        return orphan_reaper.ensure_daemon(config, detach_owner=True)
     except Exception:
         logger.warning(
             "[orphan_reaper] could not start the daemon; continuing",
@@ -1753,7 +1765,12 @@ def _orphan_reaper_reensure_loop(
             if ensure_fn is None:
                 if orphan_reaper is None:
                     return
-                orphan_reaper.ensure_daemon(config)
+                # The same daemon the boot started: it is asked to
+                # outlive the server.  Whether it may is the
+                # configuration's answer -- see
+                # ``PDT_ORPHAN_REAPER_DETACH_OWNER`` -- and the default
+                # is no.
+                orphan_reaper.ensure_daemon(config, detach_owner=True)
             else:
                 ensure_fn(config)
         except Exception:  # noqa: BLE001 - a failed round must not end the loop

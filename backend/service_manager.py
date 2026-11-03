@@ -107,6 +107,7 @@ import process_ledger
 # The identity probe — the same reading the executor's spawn record and
 # the reaper's own check use. One identity rule, not two: the record
 # written here has to be the one the check can match.
+from process_identity import CREATE_TIME_TOLERANCE
 from process_identity import probe as probe_process_identity
 
 # The one reaper. The VP services are reaped through it, because the
@@ -617,6 +618,20 @@ class DataPlaneEvidence:
     verdict: str = DATA_PLANE_ABSENT
     #: Why the verdict came out the way it did.
     error: str = ""
+    #: How long the readiness wait actually ran, in seconds.
+    #:
+    #: ``None`` when the observation did not come from this module's own
+    #: readiness wait: a caller that answered the readiness question
+    #: some other way (a test's stub) leaves no measurement behind, and
+    #: a number nobody measured must not be printed as one that was
+    #: (2026-11-03, VP-018, L3).
+    waited_seconds: Optional[float] = None
+    #: True when the readiness wait ended because the child was gone.
+    #:
+    #: "It died" and "it is slow" are two different failures, and the
+    #: second one used to be reported in the words of the first (or
+    #: rather, in the words of neither: the declared timeout).
+    child_died: bool = False
 
     @property
     def proved(self) -> bool:
@@ -1214,6 +1229,47 @@ def _process_start_epoch(pid: int) -> Optional[float]:
     return _parse_ps_lstart(raw)
 
 
+def _spawn_anchor(pid: int) -> Optional[float]:
+    """When the child *actually* started, according to the kernel.
+
+    Our own clock is not that record.  Between the fork and the
+    reading the parent can be descheduled — the root-cause report
+    caught the anchor five seconds late once, and the identity
+    comparison only tolerates two — so a reading of our clock would
+    make the stop path call our own service "recycled" and refuse to
+    stop it: the port stays held and the next round waits for a
+    service that is not coming (2026-11-03, VP-018, L2).
+
+    The kernel knows when the child started, and :mod:`process_identity`
+    is the one place that knows how to ask it
+    (:func:`process_identity.probe`), so the anchor is taken from there
+    and the identity rule stays in one place.  The ``ps`` fallback
+    inside that module only resolves the second — still inside the
+    tolerance, and still the *kernel's* second rather than ours.
+
+    Our own clock is the fallback for the one case where the kernel
+    cannot say: the ``ps`` probe can lose the race against the process
+    table and answer with nothing.  That reading is taken **before**
+    the probe, so it is the closest to the fork it can be — the child
+    cannot have started before the fork, so the earliest reading is
+    the least wrong one.  It is not a value the report's L2 has to
+    reject: that rule is about an anchor that is *known* to be off
+    (five seconds late, behind the group wait), and this one is taken
+    at the earliest moment the fork allows.
+    """
+    fallback = time.time()
+    try:
+        identity = probe_process_identity(int(pid))
+    except Exception as exc:  # noqa: BLE001 - a probe is best-effort
+        logger.debug(
+            "[service_manager] could not read the anchor of pid=%s: %s", pid, exc
+        )
+        identity = None
+    if identity is not None and identity.create_time is not None:
+        return float(identity.create_time)
+    return fallback
+
+
 def _run(argv: Sequence[str], timeout: int = 10) -> Optional[str]:
     """Best-effort subprocess helper; never raises."""
     try:
@@ -1273,6 +1329,11 @@ def kill_events_path(plan_dir: Path) -> Path:
     return Path(plan_dir) / ADDRESS_EVENTS_DIRNAME / KILL_EVENTS_FILENAME
 
 
+def kill_event_directory(plan_dir: Path) -> Path:
+    """The directory a plan's kill event stream lives in."""
+    return Path(plan_dir) / ADDRESS_EVENTS_DIRNAME
+
+
 def record_kill_event(plan_dir: Path, payload: Dict[str, Any]) -> bool:
     """Append one kill request to the plan's stream.
 
@@ -1280,7 +1341,22 @@ def record_kill_event(plan_dir: Path, payload: Dict[str, Any]) -> bool:
     ``False`` — a round must not die because its log could not be
     written, and the signal that follows must not be held back by it.
     """
-    path = kill_events_path(plan_dir)
+    return record_kill_event_in(kill_event_directory(plan_dir), payload)
+
+
+def record_kill_event_in(directory: Path, payload: Dict[str, Any]) -> bool:
+    """Append one kill request to the stream in *directory*.
+
+    The directory is the plan's own address-event directory when the
+    round that stopped the service named a plan, and the service's own
+    log directory when it did not (see
+    :func:`_kill_event_fallback_dir`).  Either way the request is
+    written down: "there is no kill request" must never be the reason a
+    death cannot be explained (2026-11-03, VP-018).
+
+    Never raises, for the same reason :func:`record_kill_event` does.
+    """
+    path = Path(directory) / KILL_EVENTS_FILENAME
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -1302,7 +1378,16 @@ def read_kill_events(plan_dir: Path) -> List[Dict[str, Any]]:
     A line that is not a JSON object is skipped rather than fatal: one
     torn line must not hide the requests around it.
     """
-    path = kill_events_path(plan_dir)
+    return read_kill_events_in(kill_event_directory(plan_dir))
+
+
+def read_kill_events_in(directory: Path) -> List[Dict[str, Any]]:
+    """Read the kill event stream in *directory*.
+
+    See :func:`read_kill_events`; this is the same read, with the
+    directory named instead of the plan it belongs to.
+    """
+    path = Path(directory) / KILL_EVENTS_FILENAME
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:
@@ -1319,6 +1404,35 @@ def read_kill_events(plan_dir: Path) -> List[Dict[str, Any]]:
         if isinstance(payload, dict):
             events.append(payload)
     return events
+
+
+def _kill_event_fallback_dir(runtime: Any) -> Optional[Path]:
+    """Where a kill request goes when the round named no plan.
+
+    The plan directory is where the round's own event stream lives, and
+    a caller that stops a service outside a round names no plan — the
+    tests do it, and so does anything that stops a service it found
+    rather than started.  Those requests used to be dropped on the
+    floor, because the plan directory was the only place a request
+    could be written to.
+
+    The service's own log directory is the one place the service is
+    sure to exist, so the request goes there.  The spawn registry is
+    the second choice: it is where this run writes its processes down,
+    and a kill request belongs next to the record of what it stopped.
+    """
+    log_path = str(getattr(runtime, "log_path", "") or "")
+    if log_path:
+        return Path(log_path).parent
+    module = orphan_reaper
+    if module is not None:
+        try:
+            registry = module.spawn_registry_path()
+        except Exception:  # noqa: BLE001 - a registry is a nicety
+            registry = None
+        if registry is not None:
+            return Path(registry).parent
+    return None
 
 
 def _kill_stack_hint(depth: int = 5) -> str:
@@ -1343,6 +1457,266 @@ def _kill_stack_hint(depth: int = 5) -> str:
 #: already resolved the group (and already found it to be *our* own
 #: group, which must never be signalled) has to be able to say so.
 _UNSET_PGID = object()
+
+
+# ---------------------------------------------------------------------------
+# The identity gate of the stop path (2026-11-03, VP-018)
+# ---------------------------------------------------------------------------
+#
+# A pid is not an identity: the kernel recycles them, and a service that
+# died a moment ago hands its number to the next process the kernel
+# makes.  On a busy machine that next process is another service that
+# has just come up -- and a stop that is one second late kills it, on
+# the strength of a record about a different process.
+#
+# The reaping path has always had an answer to "is this pid still the
+# process the ledger recorded?" (``_pid_reused``); the **stop** path
+# had none, and the two answers disagreed.  That disagreement is what
+# turned one late stop into a service that died two seconds after it
+# came up and was reported as "stopped by the round".
+#
+# The gate below is the stop path's answer, and it is asked through
+# :mod:`process_identity` -- one identity rule, not two.
+#
+# What the gate refuses is a pid it cannot place in time: one the
+# kernel has handed to somebody else (the anchor says another start
+# time), and one it cannot place **at all**, because the runtime never
+# recorded a start time for it.  The report is explicit about the
+# second case (2026-11-03, VP-018, L2): when the start time cannot be
+# recorded, record ``None`` and let the stop path refuse to signal --
+# an answer that is five seconds out is worse than no answer, because
+# it looks like an answer.
+#
+# One case is not a refusal: a pid that names **no live process**
+# cannot be a stranger, and the kernel refuses the signal itself.
+
+
+#: The pid is still the process the runtime recorded.
+_STOP_IDENTITY_OK = "ok"
+
+#: The pid is alive, but it started at another time: the kernel has
+#: handed the number to somebody else.
+_STOP_IDENTITY_RECYCLED = "recycled"
+
+#: The pid is alive and the runtime recorded **no** start time, so the
+#: number cannot be placed in time: it is nobody's until proven
+#: otherwise (2026-11-03, VP-018, L2).
+_STOP_IDENTITY_UNANCHORED = "unanchored"
+
+#: No live process holds the number -- there is nothing to protect.
+_STOP_IDENTITY_UNCONFIRMED = "unconfirmed"
+
+
+def _identity_started_at(
+    identity: Any,
+    *,
+    create_time: Optional[float],
+    tolerance: float = CREATE_TIME_TOLERANCE,
+) -> bool:
+    """True when *identity* is the process that started at *create_time*.
+
+    The start time **is** the identity.  A pid is a number the kernel
+    hands out and hands back again; the start time says which life a
+    number belonged to.  The rules, in the order they are applied:
+
+    * no identity, no match -- an unreadable pid is never a match;
+    * pid 1 and this process never match -- the caller decides whether
+      to signal, and these are never the intended target;
+    * both sides must have a start time, and they must be within
+      *tolerance* seconds -- a pid that has been recycled reports a
+      start time from a different life.
+
+    Every check can only **prevent** a match.  There is no reading of
+    the arguments that makes a mismatched identity match.
+
+    The stop path is the caller that needs this question answered on
+    its own terms: it recorded *when* it spawned the service and never
+    wrote down the command line, so the command line cannot be part of
+    the answer here.  The probe it reads is the same one the executor's
+    spawn record and the reaper's own check use -- one identity rule,
+    not two.
+    """
+    if identity is None:
+        return False
+    pid = getattr(identity, "pid", None)
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return False
+    if pid <= 1:
+        return False
+    if pid == os.getpid():
+        return False
+    live = getattr(identity, "create_time", None)
+    if live is None or create_time is None:
+        return False
+    try:
+        return abs(float(live) - float(create_time)) <= float(tolerance)
+    except (TypeError, ValueError):
+        return False
+
+
+def _stop_identity(runtime: Any, pid: int) -> Tuple[str, str]:
+    """Is *pid* still the process *runtime* names?
+
+    Returns ``(verdict, detail)``.  The verdict is one of
+    :data:`_STOP_IDENTITY_OK`, :data:`_STOP_IDENTITY_RECYCLED`,
+    :data:`_STOP_IDENTITY_UNANCHORED` and
+    :data:`_STOP_IDENTITY_UNCONFIRMED`; the detail says why, in words
+    that can be written into a kill request.
+
+    The comparison is the one :mod:`process_identity` makes: the live
+    process' start time against the one the runtime recorded, with the
+    same two-second tolerance.  The answer is "recycled" only when the
+    two **disagree** -- a number nobody holds is "unconfirmed", which
+    is not a reason to kill and not a reason to refuse.
+
+    A runtime with **no** anchor is "unanchored": it never recorded
+    when its process started, so it cannot place the number in time
+    (2026-11-03, VP-018, L2).  A *live* pid in that state is nobody's
+    until proven otherwise, and is refused.
+    """
+    try:
+        anchor = getattr(runtime, "start_epoch", None)
+    except Exception:  # pragma: no cover - a runtime is a dataclass
+        anchor = None
+    try:
+        anchor = float(anchor) if anchor is not None else None
+    except (TypeError, ValueError):
+        anchor = None
+    try:
+        identity = probe_process_identity(int(pid))
+    except Exception:  # noqa: BLE001 - a probe is best-effort
+        identity = None
+    if identity is None:
+        return (
+            _STOP_IDENTITY_UNCONFIRMED,
+            f"pid {pid} names no live process",
+        )
+    if anchor is None:
+        # No anchor at all (2026-11-03, VP-018, L2): the record cannot
+        # say whose process this is, and a live pid that cannot be
+        # placed is somebody else's until proven otherwise.
+        return (
+            _STOP_IDENTITY_UNANCHORED,
+            f"no start time was recorded for this service, so pid {pid} "
+            f"cannot be placed in time",
+        )
+    if not _identity_started_at(identity, create_time=float(anchor)):
+        live = identity.create_time
+        return (
+            _STOP_IDENTITY_RECYCLED,
+            f"pid {pid} was recycled: it started at {live}, not at "
+            f"{float(anchor)}",
+        )
+    return (
+        _STOP_IDENTITY_OK,
+        f"pid {pid} is still the process that was started",
+    )
+
+
+def _group_still_ours(runtime: Any, group: Optional[int]) -> Tuple[bool, str]:
+    """True when the runtime's own pid still leads *group*.
+
+    A group is a number, and numbers are recycled too: the group the
+    service led when it was started may since have been given to a
+    different set of processes -- and a group signal reaches every one
+    of them.
+
+    So the recorded group is used only while the pid we started still
+    leads it, and a group is never **guessed** from whatever process
+    happens to be holding the port: that process belongs to whoever
+    owns it.
+
+    A group signal reaches every member of the group, so it needs the
+    wider proof: the leader must be placeable in time as well.  A
+    runtime that never recorded a start time cannot place it, and the
+    group is refused (2026-11-03, VP-018, L2).
+    """
+    if not group:
+        return False, "there is no group to check"
+    try:
+        pid = int(getattr(runtime, "pid", 0) or 0)
+    except (TypeError, ValueError):
+        return False, "the service names no pid"
+    if pid <= 0:
+        return False, "the service names no pid"
+
+    verdict, detail = _stop_identity(runtime, pid)
+    if verdict == _STOP_IDENTITY_RECYCLED:
+        return False, detail
+    if verdict == _STOP_IDENTITY_UNANCHORED:
+        return False, detail
+
+    identity = probe_process_identity(pid)
+    if identity is None:
+        return False, f"pid {pid} names no live process"
+    if identity.pgid is None:
+        return False, f"the group of pid {pid} could not be read"
+    if int(identity.pgid) != int(group):
+        return False, (
+            f"pid {pid} leads group {int(identity.pgid)}, not group "
+            f"{int(group)}"
+        )
+    return True, f"pid {pid} still leads group {int(group)}"
+
+
+def _pid_in_our_group(
+    runtime: Any, pid: int, *,
+    protected_groups: Optional[Set[int]] = None,
+) -> Tuple[bool, str]:
+    """Is *pid* a member of the group the service led?
+
+    A pid that is **not** the one the runtime names is a process that
+    was *found on the port* (see the re-probe in :func:`stop_service`).
+    Matching the declaration says "the same program", not "ours": two
+    suites on one machine declare the same port, the neighbour's service
+    wins the bind, and the neighbour's stop then finds the winner and
+    signals it — a service killed by somebody else's stop, and the round
+    told it lost its own.
+
+    The proof is the **group**: the service led a group of its own, and
+    a member of that group is a descendant of ours.  This is the proof
+    the reaping path already uses for a port holder
+    (:func:`reap_services`, rule 5).
+
+    Without a recorded group there is no proof to offer, and a candidate
+    that cannot show one is not signalled: a stranger is worse than an
+    orphan.
+
+    One group is never a proof of anything: the caller's own group,
+    and the group of any of the caller's ancestors (see
+    :func:`_protected_groups`).  Every member of those is something
+    the caller owns, the caller included — signalling one takes the
+    backend down, and under pytest the whole session with it.  A
+    candidate that sits there is refused whatever the recorded group
+    says, because the recorded group is not ours to signal either.
+    """
+    try:
+        group = int(getattr(runtime, "pgid", 0) or 0)
+    except (TypeError, ValueError):
+        group = 0
+    if group <= 1:
+        return False, "the service recorded no group of its own"
+    if protected_groups is None:
+        protected_groups = _protected_groups()
+    try:
+        identity = probe_process_identity(int(pid))
+    except Exception:  # noqa: BLE001 - a probe is best-effort
+        identity = None
+    if identity is None:
+        return False, f"pid {pid} names no live process"
+    if identity.pgid is None:
+        return False, f"the group of pid {pid} could not be read"
+    if int(identity.pgid) in protected_groups:
+        return False, (
+            f"pid {pid} is in group {int(identity.pgid)}, which holds the "
+            f"caller; that group is never signalled"
+        )
+    if int(identity.pgid) != group:
+        return False, (
+            f"pid {pid} is in group {int(identity.pgid)}, not in the "
+            f"service's own group {group}"
+        )
+    return True, f"pid {pid} is a member of the service's own group {group}"
 
 
 def kill_service(
@@ -1384,7 +1758,11 @@ def kill_service(
         correlated with the round's other events.
     ``pids``
         The individual pids to signal.  Defaults to the runtime's own
-        pid.
+        pid.  A pid that is **not** the one the runtime names is a
+        process that was found on the port, and it is signalled only
+        when it is a member of the service's own group; a candidate that
+        cannot show that is refused and the refusal is written down
+        (2026-11-03, VP-018, L1).
     ``pgid``
         The process group to signal.  By default it is the runtime's
         group, or the group of the first pid.
@@ -1421,10 +1799,75 @@ def kill_service(
         if value > 1 and value not in targets:
             targets.append(value)
 
+    # The refusals, computed **before** the request is written down, so
+    # that the record says what was *not* signalled and why (2026-11-03,
+    # VP-018).  A request that says "nothing was signalled" without
+    # saying why is the same hole as no request at all.
+    refused: List[Dict[str, Any]] = []
+    signallable: List[int] = []
+    # The groups a signal must never reach, read once for this call:
+    # the group signal and the candidate checks below ask the same
+    # question, and the question is answered by the process table.
+    protected_groups = _protected_groups()
+    for pid in targets:
+        if pid == runtime.pid:
+            # The pid the runtime names is checked against the runtime's
+            # own anchor: the process behind the number must still be
+            # the one that was started (2026-11-03, VP-018, L1).
+            verdict, detail = _stop_identity(runtime, pid)
+            if verdict == _STOP_IDENTITY_RECYCLED:
+                refused.append({
+                    "pid": int(pid),
+                    "reason": "pid_recycled",
+                    "detail": detail,
+                })
+                continue
+            if verdict == _STOP_IDENTITY_UNANCHORED:
+                # The runtime recorded **no** start time, so it cannot
+                # say whose process this number is now.  A live pid
+                # that cannot be placed is somebody else's until
+                # proven otherwise, and the record must say that
+                # instead of staying silent (2026-11-03, VP-018, L2).
+                refused.append({
+                    "pid": int(pid),
+                    "reason": "no_start_time_recorded",
+                    "detail": detail,
+                })
+                continue
+        else:
+            # Every other target is a process that was **found on the
+            # port** by the re-probe.  A command line says "the same
+            # program" and not "ours" -- and a stop that reads it as
+            # ours takes the neighbour's service with it
+            # (2026-11-03, VP-018, L1).  The proof is the group the
+            # service led.
+            ours, why = _pid_in_our_group(
+                runtime, pid, protected_groups=protected_groups,
+            )
+            if not ours:
+                refused.append({
+                    "pid": int(pid),
+                    "reason": "not_in_our_group",
+                    "detail": why,
+                })
+                continue
+        signallable.append(pid)
+
     if pgid is _UNSET_PGID:
         group = runtime.pgid
-        if group is None and targets:
-            group = _process_group_of(targets[0])
+        if group is not None:
+            # The recorded group is used only while the pid we started
+            # still leads it; a group nobody can confirm is not ours to
+            # signal, and it is never **guessed** from whatever process
+            # happens to be holding the port.
+            ours, why = _group_still_ours(runtime, group)
+            if not ours:
+                refused.append({
+                    "pgid": int(group),
+                    "reason": "group_not_ours",
+                    "detail": why,
+                })
+                group = None
     else:
         group = pgid
     try:
@@ -1439,7 +1882,7 @@ def kill_service(
     # (``fallback_to_pids``); a caller that does not allow it gets no
     # signal at all, which is its own choice and not this one's.
     refused_pgid: Optional[int] = None
-    if group is not None and group in _protected_groups():
+    if group is not None and group in protected_groups:
         refused_pgid = group
         group = None
     if group is not None and group <= 1:
@@ -1459,19 +1902,19 @@ def kill_service(
         "reason": str(reason or ""),
         "round_token": str(round_token or ""),
         "stack_hint": _kill_stack_hint(),
+        "refused": list(refused),
     }
 
     # The request goes down **before** the signal goes out.
     recorded = False
-    if plan_dir is not None:
-        recorded = record_kill_event(Path(plan_dir), request)
-
-    # This stop is **ours** (2026-10-26, repair-r1-47).  The watcher on
-    # this service is going to see the process exit, and the exit it
-    # writes down has to say "the round stopped it" rather than "the
-    # service died" — a stop is not a crash, and a stream that cannot
-    # tell the two apart teaches the round to ignore it.
-    runtime.stopped = True
+    directory = (
+        kill_event_directory(Path(plan_dir))
+        if plan_dir is not None
+        else _kill_event_fallback_dir(runtime)
+    )
+    if directory is not None:
+        recorded = record_kill_event_in(directory, request)
+        request["recorded_at"] = str(directory / KILL_EVENTS_FILENAME)
 
     signalled: List[str] = []
     signalled_pids: List[int] = []
@@ -1491,7 +1934,7 @@ def kill_service(
             )
 
     def _signal_pids() -> None:
-        for pid in targets:
+        for pid in signallable:
             try:
                 os.kill(pid, sig)
                 signalled.append(f"pid {pid} {_signal_name(sig)}")
@@ -1506,6 +1949,14 @@ def kill_service(
         _signal_group()
         if not signalled_group and fallback_to_pids:
             _signal_pids()
+
+    # This stop is **ours** (2026-10-26, repair-r1-47) — but only when a
+    # signal actually went out.  A stop that refused to signal (the pid
+    # was recycled, the group was somebody else's) stopped nothing, and
+    # a process that died on its own must not be recorded as "stopped by
+    # the round" (2026-11-03, VP-018, L4).
+    if signalled:
+        runtime.stopped = True
 
     request["signalled"] = list(signalled)
     request["recorded"] = recorded
@@ -1523,6 +1974,7 @@ def kill_service(
         "pids": signalled_pids,
         "group_signalled": signalled_group,
         "recorded": recorded,
+        "refused": list(refused),
     }
 
 
@@ -1601,23 +2053,48 @@ def stop_service(
         targets.append(runtime.pid)
     # Re-probe: the recorded PID may be gone while a sibling still
     # holds the port (that is exactly the wrapper-survives case).
+    #
+    # Every process on the port is a **candidate** now (2026-11-03,
+    # VP-018).  The candidate set used to be "the holders whose command
+    # line matches our declaration", and that filter fails on two
+    # platforms that are both ordinary: macOS's framework launcher
+    # rewrites the child's ``argv[0]`` to the resolved interpreter
+    # path, and ``ps`` truncates the command line at 80 columns on a
+    # Linux box without a terminal.  When the filter failed the gate
+    # never ran at all — our own leftover was left running with the
+    # port still held, and a stranger's refusal was never written
+    # down, so the event stream said that nothing had happened.
+    #
+    # The command line is a **rendering**; the group is the proof, and
+    # the proof is applied to every candidate where the verdict is
+    # written down (:func:`kill_service`).  So the set is complete
+    # here and the verdict is made there.
     if decl is not None:
         probe = probe_port(runtime.port)
-        for pid, cmdline in zip(probe.pids, probe.cmdlines or []):
-            if pid not in targets and cmdline and matches_declaration(
-                decl, PortProbe(
-                    port=runtime.port, listening=True, pids=[pid],
-                    cmdlines=[cmdline],
-                ),
-            ):
-                targets.append(pid)
+        for pid in probe.pids:
+            if pid not in targets:
+                targets.append(int(pid))
 
     if not targets:
         result["port_free"] = not probe_port(runtime.port).listening
         result["detail"] = "no process to stop"
         return result
 
-    pgid = runtime.pgid or _process_group_of(targets[0])
+    # The group this stop may signal is the one the service led, and
+    # only while the pid we started still leads it (2026-11-03, VP-018,
+    # L1).  It is never **guessed** from whatever process happens to be
+    # holding the port: that process belongs to whoever owns it, and a
+    # group signal reaches every member of the group.
+    pgid = runtime.pgid
+    if pgid is not None:
+        ours, why = _group_still_ours(runtime, pgid)
+        if not ours:
+            result["refused"] = [{
+                "pgid": int(pgid),
+                "reason": "group_not_ours",
+                "detail": why,
+            }]
+            pgid = None
     # Never our own group: that is the caller, and everything it owns.
     # Signalling it would take down the backend — or, under pytest, the
     # whole session, which is a failure with no trace of its cause. A
@@ -1625,15 +2102,13 @@ def stop_service(
     own_pgid = os.getpgrp()
     if pgid is not None and pgid == own_pgid:
         pgid = None
-    # This stop is **ours** (2026-10-26, repair-r1-47).  The watcher on
-    # this service is going to see the process exit, and the exit it
-    # writes down has to say "the round stopped it" rather than "the
-    # service died" — a reap is not a crash, and a stream that cannot
-    # tell the two apart teaches the round to ignore it.
-    runtime.stopped = True
     # The signal goes out through the one function that owns it, so the
     # request is on the record before the process hears about it
-    # (2026-10-26, repair-r1-49).
+    # (2026-10-26, repair-r1-49).  It is also the function that marks
+    # the stop as **ours** — but only when a signal actually went out
+    # (2026-11-03, VP-018, L4): a stop that refused to signal stopped
+    # nothing, and a process that died on its own must not be recorded
+    # as "stopped by the round".
     outcome = kill_service(
         runtime,
         caller,
@@ -1645,6 +2120,7 @@ def stop_service(
         pgid=pgid,
     )
     result["signalled"].extend(outcome["signalled"])
+    result.setdefault("refused", []).extend(outcome.get("refused") or [])
 
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
@@ -1959,6 +2435,47 @@ def _take_data_plane(port: int) -> Optional[DataPlaneEvidence]:
         return _DATA_PLANE_OBSERVATIONS.pop(int(port), None)
 
 
+#: The child the readiness wait is waiting for.
+#:
+#: The wait has to be able to say "it died", and it can only say that
+#: if it can see the child.  It cannot be *given* the child:
+#: :func:`wait_until_ready` is a seam the whole test suite stubs
+#: (``lambda decl, t=None: True``), and a new argument would break
+#: every one of those stubs — and with them the meaning of "ready" for
+#: every caller.  So the child is **published** for the duration of the
+#: wait, and the wait reads it when it is there (2026-11-03, VP-018,
+#: L3).
+_READINESS_CHILD: ContextVar[Optional[Any]] = ContextVar(
+    "readiness_child", default=None,
+)
+
+
+@contextmanager
+def _readiness_child(proc: Any):
+    """Publish *proc* as the child the readiness wait is waiting for."""
+    token = _READINESS_CHILD.set(proc)
+    try:
+        yield proc
+    finally:
+        _READINESS_CHILD.reset(token)
+
+
+def _child_exit_code(child: Any) -> Optional[int]:
+    """The child's exit code — or ``None`` while it is still running.
+
+    ``None`` also means "cannot be asked": a fake child without a
+    ``poll`` is not evidence of a death.
+    """
+    poll = getattr(child, "poll", None)
+    if poll is None:
+        return None
+    try:
+        code = poll()
+    except Exception:  # noqa: BLE001 - a poll never raises in practice
+        return None
+    return code if isinstance(code, int) else None
+
+
 def wait_until_ready(
     decl: ServiceDeclaration, timeout_seconds: Optional[int] = None,
 ) -> bool:
@@ -2265,14 +2782,31 @@ def _wait_ready_with_evidence(
     """
     timeout = timeout_seconds or decl.ready_timeout_seconds
     deadline = time.monotonic() + timeout
+    started = time.monotonic()
     expected_rows = _expected_routing_rows()
     evidence = DataPlaneEvidence()
+    # The child, when the wait runs inside :func:`start_service`.  It is
+    # the other half of the question (2026-11-03, VP-018, L3): a child
+    # that is gone will never answer, so waiting out the rest of the
+    # budget only makes the round slower and the failure line less
+    # true.
+    child = _READINESS_CHILD.get()
     while True:
         if _service_is_answering(decl):
             evidence = data_plane_evidence(decl.port)
             if _data_plane_is_acceptable(evidence, expected_rows, decl):
+                evidence.waited_seconds = time.monotonic() - started
                 return True, evidence
+        if child is not None:
+            code = _child_exit_code(child)
+            if code is not None:
+                # It died.  Say so, and stop waiting for an answer that
+                # is never coming.
+                evidence.waited_seconds = time.monotonic() - started
+                evidence.child_died = True
+                return False, evidence
         if time.monotonic() >= deadline:
+            evidence.waited_seconds = time.monotonic() - started
             return False, evidence
         time.sleep(_READY_POLL_INTERVAL)
 
@@ -2669,17 +3203,26 @@ def start_service(
         return runtime
 
     runtime.pid = proc.pid
+    # The anchor — the moment the service started — is the kernel's own
+    # record of it, taken through the one identity rule in
+    # :mod:`process_identity` (2026-11-03, VP-018, L2).  It is taken
+    # **here**, immediately after the fork, and not after the group wait
+    # below: that wait blocks for up to five seconds while the child
+    # makes itself a group leader, and an anchor recorded after it
+    # would be up to five seconds late.
+    #
+    # It is *not* a reading of our own clock either.  Our clock says
+    # when the parent was scheduled to look, not when the child began;
+    # a descheduled parent makes the two differ by however long the
+    # child waited for it — five seconds once, which is more than twice
+    # the tolerance the identity comparison allows.  An anchor that late
+    # makes the stop path call our own service "recycled" and refuse to
+    # stop it, so the port stays held and the next round waits for a
+    # service that is not coming.  The kernel does not have that
+    # failure mode; our clock is only the fallback for when the kernel
+    # cannot say.
+    runtime.start_epoch = _spawn_anchor(proc.pid)
     runtime.pgid = _detached_pgid_of(proc.pid)
-    # Our own clock, not the system's. `proc` was created by the line
-    # above, so we know when it started without asking anyone, and that
-    # matters twice over: the `ps -o lstart=` probe is unavailable or
-    # racy on a machine that restricts subprocesses (the unit test
-    # environment does), and a `None` here silently disables the PID-reuse
-    # guard in `_pid_reused` — a recycled PID would then be signalled as
-    # if it were still ours. The comparison tolerates 2 seconds and
-    # `ps lstart` only has 1-second granularity, so a wall-clock reading
-    # taken microseconds after the fork is well inside it.
-    runtime.start_epoch = time.time()
     # The service leads a session of its own, so the run that started
     # it is the only thing that can give it back.  The record is what
     # makes that possible -- and it is written after the clock above,
@@ -2739,7 +3282,18 @@ def start_service(
             rendered=start_cmd,
         )
 
-    ready = wait_until_ready(decl, timeout_seconds)
+    # A stale observation from an earlier wait on this port must not be
+    # read as this wait's (2026-11-03, VP-018, L3).
+    _take_data_plane(decl.port)
+    # The child is published for the duration of the wait so that the
+    # wait can see the death instead of waiting out the rest of the
+    # budget for an answer that is never coming (2026-11-03, VP-018,
+    # L3).  The wait is still called through the seam the test suite
+    # stubs, so a stubbed wait simply does not see a child — and leaves
+    # no measurement behind, which is what keeps the failure line
+    # honest about what it does and does not know.
+    with _readiness_child(proc):
+        ready = wait_until_ready(decl, timeout_seconds)
     # The evidence is recorded on the runtime whatever the verdict is:
     # "it came up" and "it came up serving data" are two different
     # facts, and the round's log has to be able to tell them apart.
@@ -2748,6 +3302,13 @@ def start_service(
     # ``wait_until_ready`` is a seam the whole test suite stubs.
     evidence = _take_data_plane(decl.port)
     runtime.data_plane = evidence
+    # How long the wait actually took, as this module's own wait
+    # measured it.  ``None`` when the wait was somebody else's (a
+    # stub): a number nobody measured must not be printed as one that
+    # was (2026-11-03, VP-018, L3).
+    waited_seconds = (
+        evidence.waited_seconds if evidence is not None else None
+    )
     if ready:
         # "Something answers on this port" is not "our service is up".
         # The two come apart when the port is taken by something else in
@@ -2779,6 +3340,8 @@ def start_service(
                 timeout_seconds=decl.ready_timeout_seconds,
                 rc=rc,
                 log_file=log_file,
+                waited_seconds=waited_seconds,
+                answered=True,
             )
             _record_what_the_restart_kept()
             return runtime
@@ -2806,6 +3369,7 @@ def start_service(
         timeout_seconds=decl.ready_timeout_seconds,
         rc=proc.poll(),
         log_file=log_file,
+        waited_seconds=waited_seconds,
     )
     runtime.detail += _data_plane_detail(evidence)
     _record_what_the_restart_kept()
@@ -3246,6 +3810,11 @@ def _runtime_from_ledger_entry(entry: Dict[str, Any]) -> ServiceRuntime:
         runtime.pid = int(entry["pid"])
     if isinstance(entry.get("pgid"), int):
         runtime.pgid = int(entry["pgid"])
+    if isinstance(entry.get("start_epoch"), (int, float)):
+        # When the service started.  The stop path's identity gate
+        # compares the live process' start time with this one, so the
+        # anchor has to travel with the row (2026-11-03, VP-018).
+        runtime.start_epoch = float(entry["start_epoch"])
     return runtime
 
 
@@ -3532,6 +4101,25 @@ def _fd_count(pid: int) -> Optional[int]:
             count += 1
     return count or None
 
+def _exit_signal_phrase(rc: Optional[int]) -> str:
+    """The signal that ended the process, in words — or nothing.
+
+    ``rc=-15`` is "killed by SIGTERM"; a shell that reports the death
+    the way shells report it (``143``) means the same thing, and
+    :func:`exit_signal_of` reads both conventions (2026-11-03, VP-018,
+    L3).  The name is what an operator can act on: a number has to be
+    looked up, and the lookup is the step that gets skipped.
+    """
+    number = exit_signal_of(rc)
+    if number is None:
+        return ""
+    try:
+        name = signal.Signals(number).name
+    except (ValueError, AttributeError, TypeError):
+        name = f"SIG{number}"
+    return f" (killed by {name})"
+
+
 def _failure_detail(
     *,
     pid: int,
@@ -3540,19 +4128,37 @@ def _failure_detail(
     timeout_seconds: int,
     rc: Optional[int],
     log_file: Path,
+    waited_seconds: Optional[float] = None,
+    answered: bool = False,
 ) -> str:
     """The one-line diagnosis of a service that did not come up.
 
     The shape is fixed, because the reader of this line is a human
     with the log open in another window::
 
-        started (pid 24057, pgid 24057, fds 37) but not ready after 8s;
-        rc=None; first error at line 9: ...; log tail: ...
+        started (pid 24057, pgid 24057, fds 37) died before it was
+        ready after 1.9s; rc=-15 (killed by SIGTERM); first error at
+        line 9: ...; log tail: ...
 
     *pid* / *pgid* say which process to look at; *fds* says how many
     descriptors it held when it failed, and is **omitted** when the
     count could not be taken; *rc* is the exit code when the child has
-    already exited and ``None`` while it is still running.
+    already exited and ``None`` while it is still running, with the
+    signal named when the exit was one.
+
+    The seconds are the ones **actually waited** (2026-11-03, VP-018,
+    L3).  The declared budget was what the round hoped for, and a line
+    that reports it says "it was still starting" about a process that
+    died in the first two seconds — which is how a seven-times-killed
+    service was reported as "not ready after 30s".  When no
+    measurement is available (the readiness question was answered by
+    something other than this module's own wait) the declared budget
+    is what is printed, because it is the only number there is.
+
+    "It died", "it never came up" and "it answered and then died" are
+    three different failures, and they get three different sentences:
+    the last one is not "it never came up" even though both end in a
+    service that is not serving.
 
     The log half is :func:`_diagnosable_log` and not a second copy of
     it: the first error line, the five lines before it, then the tail,
@@ -3561,9 +4167,24 @@ def _failure_detail(
     would be whichever the reader did not have open.
     """
     fd_part = f", fds {fds}" if fds is not None else ""
+    if waited_seconds is None:
+        # Nothing measured the wait: the only number there is the
+        # declared one, and the line keeps the shape it always had.
+        return (
+            f"started (pid {pid}, pgid {pgid}{fd_part}) but not ready after "
+            f"{timeout_seconds}s; rc={rc}; "
+            f"{_diagnosable_log(log_file, tail_lines=15)}"
+        )
+
+    if answered:
+        headline = "reported ready and then died"
+    elif rc is not None:
+        headline = "died before it was ready"
+    else:
+        headline = "but not ready"
     return (
-        f"started (pid {pid}, pgid {pgid}{fd_part}) but not ready after "
-        f"{timeout_seconds}s; rc={rc}; "
+        f"started (pid {pid}, pgid {pgid}{fd_part}) {headline} after "
+        f"{waited_seconds:.1f}s; rc={rc}{_exit_signal_phrase(rc)}; "
         f"{_diagnosable_log(log_file, tail_lines=15)}"
     )
 
@@ -3625,6 +4246,11 @@ def _ledger_holder_evidence(
             "project_dir": str(ledger.get("project_dir") or ""),
             "pid": pid,
             "pgid": entry.get("pgid"),
+            # When the service started (2026-11-03, VP-018).  The stop
+            # path's identity gate compares the live process' start
+            # time with this one; without it the gate has nothing to
+            # compare against and cannot refuse a recycled pid.
+            "start_epoch": entry.get("start_epoch"),
             "cwd": str(entry.get("cwd") or ""),
             "start_cmd": str(entry.get("start_cmd") or ""),
             "owner_token": str(entry.get("owner_token") or ""),
@@ -3850,8 +4476,22 @@ def _reclaim_leftover(
         )
     except (TypeError, ValueError):
         runtime.pgid = None
-    if runtime.pgid is None and pid is not None:
-        runtime.pgid = _process_group_of(pid)
+    # The anchor: when the leftover started.  The ledger recorded it
+    # when the service was spawned, and the stop path's identity gate
+    # compares the live process' start time with it — without it the
+    # gate cannot tell a leftover from a pid the kernel has handed to
+    # somebody else (2026-11-03, VP-018).
+    try:
+        runtime.start_epoch = (
+            float(evidence["start_epoch"])
+            if evidence.get("start_epoch") is not None else None
+        )
+    except (TypeError, ValueError):
+        runtime.start_epoch = None
+    # The group is the one the **ledger** recorded, never one read off
+    # the process table: the number in the ledger may belong to a
+    # different process by now, and the group that process leads is
+    # that process' group, not ours (2026-11-03, VP-018).
     stop_info = stop_service(
         runtime, None, grace_seconds=10.0,
         caller="service_manager._reclaim_leftover",
@@ -4140,6 +4780,12 @@ def _ensure_services(
                 )
                 runtime.origin = "ready_foreign"
                 runtime.pid = probe.pids[0] if probe.pids else None
+                # The probe measured when this listener started, so the
+                # identity gate has an anchor to compare the live
+                # process against — the group below is then the group
+                # of a process we have identified, not a group read
+                # off an unidentified holder (2026-11-03, VP-018).
+                runtime.start_epoch = probe.process_start_epoch
                 runtime.pgid = (
                     _process_group_of(runtime.pid) if runtime.pid else None
                 )
@@ -6429,6 +7075,11 @@ def reap_services(
             runtime = ServiceRuntime(
                 name=name, port=port, pid=recorded_pid,
                 pgid=entry.get("pgid"),
+                # When the service started: the ledger recorded it at
+                # the spawn, and the stop path's identity gate compares
+                # the live process' start time with it (2026-11-03,
+                # VP-018).
+                start_epoch=entry.get("start_epoch"),
                 start_cmd=str(entry.get("start_cmd") or ""),
             )
             stop_info = stop_service(
@@ -6454,6 +7105,10 @@ def reap_services(
                     name=name, port=port,
                     pid=after.pids[0] if after.pids else None,
                     pgid=_process_group_of(after.pids[0]) if after.pids else None,
+                    # The probe measured when this holder started, so
+                    # the identity gate has an anchor to compare the
+                    # live process against (2026-11-03, VP-018).
+                    start_epoch=after.process_start_epoch,
                     start_cmd=str(entry.get("start_cmd") or ""),
                 )
                 second = stop_service(
