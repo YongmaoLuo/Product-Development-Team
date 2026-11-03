@@ -382,3 +382,103 @@ def test_different_failure_classes_get_different_fingerprints():
     assert failure_fingerprint(
         failure_class="deliverable_defect", **kwargs
     ) != failure_fingerprint(failure_class="criterion_defect", **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# 5. 规则 id —— 指纹是「哪条规则算出来的」
+# ---------------------------------------------------------------------------
+#
+# 指纹的值是一个 16 位 hex,形状是契约(见上面的
+# ``test_the_fingerprint_is_16_lowercase_hex``),所以规则塞不进值里:塞进去
+# 就改掉了形状,历史里每一个指纹也跟着作废。
+#
+# 规则是另一件事 —— **两个指纹能不能拿来比**。旧五段式量的是「这一轮跑成
+# 什么样」,身份态量的是「哪个缺陷」。同一个失败,两条规则给出两个不同的值;
+# 把这两个值放在一起比,读出来的「根因演进」是**量具换了**,不是缺陷变了。
+#
+# 所以规则必须能被读出来,并且跟着指纹一起被记下来。
+
+#: 根因报告 §4 判据 5 点名的 9 条失败用例 —— 身份态的可复算证人。
+_REPORT_NINE_CASES = (
+    "tests/unit/test_quota_wait_wall_clock_c.py::TestTheHardCapOnThePathThatHadNone::test_a_call_that_keeps_printing_is_killed_by_the_cap",
+    "tests/e2e/plan_scheduler/test_scheduler_operator_e2e.py::test_operator_full_flow",
+    "tests/e2e/plan_scheduler/test_scheduler_operator_e2e.py::test_queue_survives_kill9",
+    "tests/e2e/test_execution_status_logs_ui_e2e.py::test_plan_page_shows_logs_after_restart",
+    "tests/e2e/test_execution_status_restart_e2e.py::test_logs_survive_real_backend_restart",
+    "tests/e2e/test_execution_status_restart_e2e.py::test_started_at_has_offset_after_restart",
+    "tests/e2e/test_shutdown_checkpoint_e2e.py::test_shutdown_writes_a_checkpoint_and_restart_parks_queued",
+    "tests/e2e/test_verification_mode_repair_round.py::test_pr_head_and_checkouts_immutable",
+    "tests/integration/test_orphan_reaper_e2e.py::test_child_reaped_after_owner_killed",
+)
+
+
+def test_the_module_says_which_rule_hashed_the_value():
+    """模块必须能说出「这个值是哪条规则算出来的」。"""
+    import verification.failure_fingerprint as module
+
+    assert hasattr(module, "fingerprint_rule"), (
+        "the module must expose the rule a fingerprint was computed under"
+    )
+    assert hasattr(module, "FINGERPRINT_RULE_IDENTITY"), (
+        "the identity rule needs a name of its own"
+    )
+    assert hasattr(module, "FINGERPRINT_RULE_LEGACY"), (
+        "the legacy rule needs a name of its own"
+    )
+
+
+def test_the_rule_follows_the_rule_that_would_hash_the_value():
+    """有失败用例集合 -> 身份态;没有 -> 旧五段式。"""
+    import verification.failure_fingerprint as module
+
+    fingerprint_rule = module.fingerprint_rule
+
+    assert fingerprint_rule(failed_cases=list(_REPORT_NINE_CASES)) == (
+        module.FINGERPRINT_RULE_IDENTITY
+    )
+    assert fingerprint_rule() == module.FINGERPRINT_RULE_LEGACY
+    assert fingerprint_rule(failed_cases=[]) == module.FINGERPRINT_RULE_LEGACY
+    assert fingerprint_rule(failed_cases=None) == module.FINGERPRINT_RULE_LEGACY
+    assert fingerprint_rule(failed_cases=["  "]) == module.FINGERPRINT_RULE_LEGACY
+
+
+def test_the_identity_canonical_input_is_pinned():
+    """身份态的规范输入必须逐字节固定 —— 它是「指纹可比」的地基。"""
+    sep = "\x1f"
+    canon = canonical_fingerprint_input(
+        vp_id="VP-014",
+        failure_class="deliverable_defect",
+        failed_cases=list(_REPORT_NINE_CASES),
+    )
+    assert canon == sep.join(
+        [
+            "vp_id=vp-014",
+            "failure_class=deliverable_defect",
+            "failed_cases=" + sep.join(sorted(_REPORT_NINE_CASES)),
+        ]
+    ), (
+        "the identity input is the contract fingerprints are comparable "
+        "under — a silent change here makes every stored fingerprint "
+        "incomparable with the next round's"
+    )
+
+
+def test_the_identity_fingerprint_of_the_reported_nine_cases_is_pinned():
+    """根因报告 §4 判据 5 点名的 9 条用例 -> 一个钉死的指纹。
+
+    报告钉的是 ``3eaf8a26c4bad048``。那个值**复算不出来**:把规则写成
+    「vp_id + failure_class + 失败用例集合」之后,规范输入的字节形态(段名、
+    分隔符、大小写、顺序)有上千种,没有一种哈希成它 —— 报告只钉了结果,没
+    钉**怎么算**,那个常数因此不可复算。这里钉的是**可复算**的那一个:规
+    范输入的字节形态与它对应的指纹,两者一起钉住,下次有人改规则时会红。
+    """
+    fingerprint = failure_fingerprint(
+        vp_id="VP-014",
+        failure_class="deliverable_defect",
+        failed_cases=list(_REPORT_NINE_CASES),
+    )
+    assert fingerprint == "d2416ecf3d6a4c93", (
+        "the identity fingerprint of the nine reported cases changed — the "
+        "canonical form moved, and every stored fingerprint becomes "
+        "incomparable with the next round's"
+    )

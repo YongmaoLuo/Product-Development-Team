@@ -65,6 +65,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -304,6 +305,99 @@ def verify_checkpoints(checkpoints: Any) -> List[EvidenceIssue]:
 
 def artifact_dir_for(plan_dir: Path, vp_id: str) -> Path:
     return Path(plan_dir) / "vp_artifacts" / str(vp_id)
+
+
+# ---------------------------------------------------------------------------
+# Staging the plan directory's forensic artifacts
+# ---------------------------------------------------------------------------
+#
+# 2026-11-01（VP-017 第 1 轮）：一条 code_review 引用是
+# ``(file, line, snippet)``，框架按 ``project_dir`` 解析它
+# （``verify_citations``：``target = (project_dir / rel)``）。计划目录
+# （``citations.json`` 的所在地）一般在**另一个 checkout** 里，那里的取证
+# 产物在 ``project_dir`` 下没有对应文件 —— 于是引用被逐条判成
+# ``missing_file``，而执行方按计划目录自检得到的是"unresolved=0"。同一个
+# 判据，两个基准，两个答案。
+#
+# 暂存把计划目录的取证产物**逐字节**复制到 ``project_dir`` 内的一份副本
+# 上，让引用有一棵能解析的树。位置两个条件缺一不可：
+#
+#   * 在 ``project_dir`` 之内 —— 框架解析引用的基准；
+#   * 不在被服务的 plans 树之下 —— plans 树里多出一个目录会让 api 服务的
+#     ``_refuse_when_data_source_does_not_describe_the_tree`` 答 503
+#     （``state_db_does_not_describe_plans_dir``），把 UI 验证点顶成失败。
+
+#: Where the plan directory's artifacts are staged, relative to the
+#: project dir.  Dot-prefixed and inside ``.pdt/`` on purpose: it is
+#: runtime state, gitignored, and not a tree the api service serves.
+EVIDENCE_STAGING_ROOT_PARTS = (".pdt", "evidence")
+
+
+def evidence_staging_root(
+    project_dir: Path, plan_id: str, plans_dir: Optional[Path] = None,
+) -> Path:
+    """The root the plan's forensic artifacts are staged under.
+
+    ``plans_dir`` is the tree the api service serves.  When the staging
+    root would land inside it, the root moves: a plan directory there
+    that the state db does not know makes ``GET /api/plans`` answer 503.
+    """
+    project_dir = Path(project_dir)
+    root = project_dir.joinpath(*EVIDENCE_STAGING_ROOT_PARTS) / str(plan_id)
+    if plans_dir is None:
+        return root
+    try:
+        root.resolve().relative_to(Path(plans_dir).resolve())
+    except ValueError:
+        return root
+    return project_dir / ".pdt" / "evidence-staging" / str(plan_id)
+
+
+def stage_plan_artifacts(
+    plan_dir: Path, project_dir: Path, plan_id: str = "",
+    plans_dir: Optional[Path] = None,
+) -> Path:
+    """Copy the plan directory's forensic artifacts into the project dir.
+
+    Byte-for-byte, and idempotent: a staged copy that differs by a byte
+    carries different line numbers, so the plan's own line anchors would
+    stop resolving; a copy that already matches is left alone, so a second
+    round does not rewrite the tree again.
+
+    Returns the staging root — the tree a citation may name.
+    """
+    plan_dir = Path(plan_dir)
+    root = evidence_staging_root(
+        project_dir, plan_id or plan_dir.name, plans_dir,
+    )
+    sources: List[tuple] = []
+    artifacts = plan_dir / "vp_artifacts"
+    if artifacts.is_dir():
+        for path in sorted(artifacts.rglob("*")):
+            if path.is_file():
+                # Relative to the PLAN directory, so the staged tree keeps
+                # the shape the citation names (``vp_artifacts/<vp_id>/...``).
+                sources.append((path, root / path.relative_to(plan_dir)))
+    plan_file = plan_dir / "verification_plan.json"
+    if plan_file.is_file():
+        sources.append((plan_file, root / plan_file.name))
+    for source, target in sources:
+        _stage_one(source, target)
+    return root
+
+
+def _stage_one(source: Path, target: Path) -> None:
+    """Copy one file into the staging tree, unless it is already there."""
+    try:
+        if target.is_file() and target.stat().st_size == source.stat().st_size:
+            if target.read_bytes() == source.read_bytes():
+                return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    except OSError as exc:
+        logger.warning(
+            "[verification_evidence] staging %s failed: %s", source, exc,
+        )
 
 
 def verify_evidence(

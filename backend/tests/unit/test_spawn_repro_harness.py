@@ -207,7 +207,39 @@ def test_popen_kwargs_mirror_service_manager(tmp_path, monkeypatch):
         def wait(self, timeout=None):
             return 0
 
-    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    def _is_service_spawn(args) -> bool:
+        """Whether *args* is the spawn of a declared service.
+
+        The start path spawns subprocesses of its own besides the
+        service -- the ``ps`` probes that read a pid's start time (the
+        spawn marker before the spawn, the registry entry after it) and
+        the machine's process table.  A capture that takes those as
+        well leaves the comparison below comparing a probe against the
+        harness' spawn, and the probe's argv is the ``ps`` binary's own
+        path (an absolute one, because the reaper resolves ``ps`` once
+        and keeps it).
+
+        So the capture is by **shape**: the wrapper's own argv is the
+        one that is captured -- production's and the harness' alike,
+        because the harness builds its argv with production's own
+        builder -- and every other spawn is handed to the real
+        ``Popen``.
+        """
+        shape = list(args) if isinstance(args, (list, tuple)) else []
+        return (
+            len(shape) > 2
+            and shape[:2] == [sys.executable or "/usr/bin/python3", "-c"]
+            and shape[2] == service_manager._DETACHED_WRAPPER_SOURCE
+        )
+
+    real_popen = subprocess.Popen
+
+    def _fake_popen(args, **kwargs):
+        if not _is_service_spawn(args):
+            return real_popen(args, **kwargs)
+        return _FakePopen(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _fake_popen)
     # The readiness probe and the exit check are not what this test is
     # about, and both of them would otherwise spend real seconds.
     monkeypatch.setattr(

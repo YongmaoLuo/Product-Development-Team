@@ -21,7 +21,12 @@ the caller's ancestors:
 
 * the caller's own group — ``os.getpgrp()``;
 * the group of any ancestor of the caller, read out of the process
-  table (``ps -axo pid=,ppid=,pgid=``).
+  table (``/proc/<pid>/stat`` on Linux, ``libproc`` on macOS, ``ps``
+  as the fallback).
+
+A process tree that cannot be read is not an empty one: it means the
+tree is *unknown*, and an unknown tree makes the stop refuse
+everything — the group and the individual pids alike.
 
 A refused group degrades to the individual pids when the caller allows
 that (``fallback_to_pids``); a caller that does not allow it gets no
@@ -45,7 +50,9 @@ like.
 
 The ``ps`` call that *builds* the table is replaced too, in the tests
 that exercise the parsing itself: no ``ps`` is run, and the output the
-parser sees is written out in the test.
+parser sees is written out in the test.  The native reader is switched
+off in those tests as well, so they exercise the ``ps`` path and
+nothing else.
 """
 
 from __future__ import annotations
@@ -139,12 +146,13 @@ def signals(monkeypatch: pytest.MonkeyPatch) -> _SignalRecorder:
 
 @pytest.fixture
 def empty_table(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A process table that says nothing.
+    """A process tree that could not be read.
 
-    This is what a platform without ``ps`` contributes: the ancestor
-    walk has nothing to walk and contributes nothing.
+    This is what a sandbox that refuses ``ps`` (and a platform with no
+    native reader) produces: the table comes back ``None``, the tree
+    is unknown, and the stop fails closed.
     """
-    monkeypatch.setattr(sm, "_process_groups_table", lambda: {})
+    monkeypatch.setattr(sm, "_process_groups_table", lambda: None)
 
 
 def _fake_table(self_pgid: int, parent_pgid: int) -> Dict[int, Tuple[int, int]]:
@@ -174,7 +182,7 @@ def _runtime(pid: int = _FAKE_SERVICE_PID) -> sm.ServiceRuntime:
 
 
 def test_the_callers_own_group_is_refused_and_degrades_to_pids(
-    round_dirs, signals, empty_table,
+    round_dirs, signals, monkeypatch,
 ) -> None:
     """The caller's own group is never signalled — the pids are.
 
@@ -187,9 +195,18 @@ def test_the_callers_own_group_is_refused_and_degrades_to_pids(
     dropped (``pgid`` is ``None``), no group signal goes out, and the
     stop degrades to the individual pids — which are the processes this
     call is about.
+
+    The process tree is **available** here: the refusal comes from the
+    protected-group rule, not from an unknown tree (an unknown tree
+    refuses everything, pids included — see
+    ``test_without_a_process_table_everything_is_refused``).
     """
     plan_dir, _ = round_dirs
     own_group = os.getpgrp()
+    monkeypatch.setattr(
+        sm, "_process_groups_table",
+        lambda: _fake_table(os.getpgrp(), _ANCESTOR_GROUP),
+    )
     runtime = _runtime()
 
     outcome = sm.kill_service(
@@ -370,75 +387,135 @@ def test_a_refused_group_without_fallback_signals_nothing(
 # ---------------------------------------------------------------------------
 
 
-def test_without_a_process_table_the_ancestor_protection_disappears(
+def test_without_a_process_table_everything_is_refused(
     round_dirs, signals, monkeypatch,
 ) -> None:
-    """No ``ps`` means no ancestor protection — **by design**.
+    """No process tree means **no signal at all**.
 
-    ``_process_groups_table`` returns ``{}`` on a platform that has no
-    ``ps``, on a timeout, or on a non-zero exit.  The ancestor walk
-    then has nothing to walk and contributes nothing, so the group
-    that the ancestor rule would have refused is signalled as usual.
+    ``_process_groups_table`` returns ``None`` when the tree could not
+    be read — no ``ps``, a timeout, a sandbox that refuses the
+    subprocess.  The old behaviour was to read that as "there is no
+    ancestor to protect" and carry on signalling, which is fail-open:
+    the very group the ancestor rule exists to refuse was the group
+    that got signalled.
 
-    This is an **intentional degradation, not a bug**: the module
-    documents it ("every step of it is optional: a platform that cannot
-    answer contributes nothing, and the caller then keeps the behaviour
-    it had").  It is pinned here so the day somebody reads it as an
-    accident, this test is the argument against that reading — and so
-    a change that *does* make the degradation loud shows up as a
-    failure here first.
-
-    The caller's **own** group is refused either way: that protection
-    needs no process table, and it is the one that is not optional.
+    Now the answer is fail-closed.  The group is refused and named
+    (``refused_reason``), and the degradation to the individual pids is
+    switched off as well — a pid that cannot be placed in the tree is
+    no safer than the group.  Nothing goes out, and the runtime is not
+    marked as stopped, because nothing was stopped.
     """
     plan_dir, _ = round_dirs
-    # The table that *would* have put the caller's parent in this group.
-    monkeypatch.setattr(
-        sm, "_process_groups_table",
-        lambda: _fake_table(os.getpgrp(), _ANCESTOR_GROUP),
-    )
+    monkeypatch.setattr(sm, "_process_groups_table", lambda: None)
     runtime = _runtime()
 
-    # First: with the table, the ancestor's group is refused.
-    with_table = sm.kill_service(
-        runtime, CALLER, "the ancestor's group, with a process table",
-        ROUND_TOKEN, plan_dir=plan_dir, pgid=_ANCESTOR_GROUP,
-    )
-    assert with_table["refused_pgid"] == _ANCESTOR_GROUP, with_table
-    assert signals.killpg_calls == [], signals.killpg_calls
-
-    # Then: without it (no ``ps``, a timeout, a non-zero exit), the
-    # ancestor protection is gone and the group is signalled.
-    monkeypatch.setattr(sm, "_process_groups_table", lambda: {})
-    signals.killpg_calls.clear()
-    signals.kill_calls.clear()
-
-    without_table = sm.kill_service(
+    outcome = sm.kill_service(
         runtime, CALLER, "the same group, without a process table",
         ROUND_TOKEN, plan_dir=plan_dir, pgid=_ANCESTOR_GROUP,
     )
 
-    assert without_table["refused_pgid"] is None, without_table
-    assert without_table["group_signalled"] is True, without_table
-    assert signals.killpg_calls == [(_ANCESTOR_GROUP, signal.SIGTERM)], (
-        f"without a process table the ancestor rule cannot fire, so the "
-        f"group goes out; got {signals.killpg_calls!r}"
+    assert outcome["refused_pgid"] == _ANCESTOR_GROUP, outcome
+    assert outcome["pgid"] is None, outcome
+    assert outcome["group_signalled"] is False, outcome
+    assert signals.killpg_calls == [], (
+        f"an unknown tree must not signal the group; got "
+        f"{signals.killpg_calls!r}"
+    )
+    assert signals.kill_calls == [], (
+        f"an unknown tree must not fall back to the pids either; got "
+        f"{signals.kill_calls!r}"
+    )
+    assert outcome["process_tree"] == "unavailable", outcome
+    assert outcome["refused_reason"] == "process_tree_unavailable", outcome
+    assert runtime.stopped is not True, (
+        f"nothing was signalled, so nothing was stopped; got "
+        f"{runtime.stopped!r}"
     )
 
-    # The caller's own group is refused either way — that one needs no
-    # process table.
-    signals.killpg_calls.clear()
-    signals.kill_calls.clear()
-    own_group = os.getpgrp()
+    # And the refusal is on the record, with the reason.
+    events = sm.read_kill_events(plan_dir)
+    assert len(events) == 1, events
+    assert events[0]["process_tree"] == "unavailable", events[0]
+    assert events[0]["refused_reason"] == "process_tree_unavailable", events[0]
 
-    own = sm.kill_service(
-        runtime, CALLER, "the caller's own group, without a process table",
-        ROUND_TOKEN, plan_dir=plan_dir, pgid=own_group,
+
+def test_immediate_parent_group_is_protected_without_table(
+    round_dirs, signals, monkeypatch,
+) -> None:
+    """The caller's own parent is protected even with no process table.
+
+    The kernel knows the parent's group without anybody reading a
+    table, so that one protection survives an unreadable tree: the
+    parent is the process that most often forwards a signal to the
+    caller, and its group must never be signalled.
+
+    The caller's **own** group is moved out of the way first (it is
+    faked to a group of its own), so that the assertion below can only
+    be explained by the parent fallback and not by the "own group" rule
+    — on many machines the parent shares the caller's group.
+    """
+    plan_dir, _ = round_dirs
+    ppid = os.getppid()
+    if ppid <= 1:
+        pytest.skip("no usable immediate parent on this machine")
+    parent_group = os.getpgid(ppid)
+
+    monkeypatch.setattr(sm, "_process_groups_table", lambda: None)
+    # The caller's own group is no longer the parent's group.
+    monkeypatch.setattr(sm.os, "getpgrp", lambda: parent_group + 1)
+    runtime = _runtime()
+
+    # The parent is in the protected groups without any table.
+    assert parent_group in sm._protected_groups(table=None)
+    assert parent_group + 1 in sm._protected_groups(table=None)
+
+    outcome = sm.kill_service(
+        runtime, CALLER, "the parent's group, without a process table",
+        ROUND_TOKEN, plan_dir=plan_dir, pgid=parent_group,
     )
 
-    assert own["refused_pgid"] == own_group, own
-    assert own["group_signalled"] is False, own
-    assert signals.killpg_calls == [], signals.killpg_calls
+    assert outcome["refused_pgid"] == parent_group, outcome
+    assert outcome["process_tree"] == "unavailable", outcome
+    assert outcome["refused_reason"] == "process_tree_unavailable", outcome
+    assert signals.killpg_calls == [], (
+        f"the parent's group must never be signalled; got "
+        f"{signals.killpg_calls!r}"
+    )
+
+
+def test_an_unavailable_tree_is_read_once(
+    round_dirs, signals, monkeypatch,
+) -> None:
+    """An unreadable tree is read **once**, not once per question.
+
+    ``None`` means "already read, and unavailable" — not "no table, go
+    and read one".  A stop asks for the protected groups *and* the
+    protected pids, and each of those walks the ancestors; if every
+    one of them read the table again, an unavailable tree would cost
+    several reads, and each read that falls back to ``ps`` can sit in
+    its timeout.
+    """
+    plan_dir, _ = round_dirs
+    reads: List[int] = []
+
+    def counting_table():
+        reads.append(1)
+        return None
+
+    monkeypatch.setattr(sm, "_process_groups_table", counting_table)
+    runtime = _runtime()
+
+    outcome = sm.kill_service(
+        runtime, CALLER, "the ancestor's group, with an unreadable tree",
+        ROUND_TOKEN, plan_dir=plan_dir, pgid=_ANCESTOR_GROUP,
+    )
+
+    assert len(reads) == 1, (
+        f"the process table must be read exactly once per stop; got "
+        f"{len(reads)} reads"
+    )
+    assert outcome["process_tree"] == "unavailable", outcome
+    assert outcome["refused_reason"] == "process_tree_unavailable", outcome
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +560,7 @@ def test_ps_output_is_parsed_into_pid_ppid_pgid(monkeypatch) -> None:
     what ``ps -axo pid=,ppid=,pgid=`` prints; the parser splits on
     whitespace and reads three integers.
     """
+    monkeypatch.setattr(sm, "_process_groups_table_native", lambda: None)
     calls: List[Tuple[List[str], dict]] = []
     monkeypatch.setattr(
         sm.subprocess, "run",
@@ -517,6 +595,7 @@ def test_unparseable_ps_lines_are_skipped(monkeypatch) -> None:
         "\n"
         "  101     1   101\n"
     )
+    monkeypatch.setattr(sm, "_process_groups_table_native", lambda: None)
     monkeypatch.setattr(sm.subprocess, "run", _fake_ps(stdout))
 
     table = sm._process_groups_table()
@@ -534,6 +613,7 @@ def test_a_failing_ps_still_has_its_output_parsed(monkeypatch) -> None:
     report: the module's own prose elsewhere reads a non-zero exit as a
     table that says nothing, which is not what the code does.
     """
+    monkeypatch.setattr(sm, "_process_groups_table_native", lambda: None)
     monkeypatch.setattr(
         sm.subprocess, "run",
         _fake_ps("  100   200   300\n", returncode=1),
@@ -545,27 +625,31 @@ def test_a_failing_ps_still_has_its_output_parsed(monkeypatch) -> None:
 
 
 def test_a_missing_ps_contributes_nothing(monkeypatch) -> None:
-    """No ``ps`` on the platform: the table is empty, not an error.
+    """No ``ps`` on the platform: the table is unknown, not empty.
 
     ``OSError`` is the "there is no such program" answer.  The table
-    comes back empty and the caller keeps the behaviour it had — the
-    ancestor walk simply has nothing to walk.
+    comes back ``None`` — *not* ``{}`` — because an empty table would
+    say "this machine has no other processes", and the caller would
+    then believe that no group holds the caller's own shell.
     """
+    monkeypatch.setattr(sm, "_process_groups_table_native", lambda: None)
 
     def run(argv, **kwargs):
         raise OSError(2, "No such file or directory: 'ps'")
 
     monkeypatch.setattr(sm.subprocess, "run", run)
 
-    assert sm._process_groups_table() == {}
+    assert sm._process_groups_table() is None
 
 
 def test_a_ps_that_times_out_contributes_nothing(monkeypatch) -> None:
     """A ``ps`` that times out contributes nothing, and raises nothing.
 
     A timeout is a ``SubprocessError``, and it is caught by the same
-    branch that catches the missing program: the table comes back empty.
+    branch that catches the missing program: the table comes back
+    ``None``.
     """
+    monkeypatch.setattr(sm, "_process_groups_table_native", lambda: None)
     calls: List[Tuple[List[str], dict]] = []
 
     def run(argv, **kwargs):
@@ -574,8 +658,81 @@ def test_a_ps_that_times_out_contributes_nothing(monkeypatch) -> None:
 
     monkeypatch.setattr(sm.subprocess, "run", run)
 
-    assert sm._process_groups_table() == {}
+    assert sm._process_groups_table() is None
     assert len(calls) == 1, calls
+
+
+# ---------------------------------------------------------------------------
+# The native reader
+# ---------------------------------------------------------------------------
+#
+# The ``ps`` reader is a fallback: on Linux the table comes from
+# ``/proc/<pid>/stat`` and on macOS from ``libproc``.  Both answer the
+# same question without starting a process, which is what makes the
+# table readable in a sandbox where ``ps`` is refused.
+
+
+def test_native_reader_wins_over_ps(monkeypatch) -> None:
+    """The native reader answers first; ``ps`` is never run.
+
+    The native reader needs no subprocess, so it is both cheaper and
+    the one that works where ``ps`` is not allowed to run at all.
+    """
+    native = {1: (0, 1)}
+    monkeypatch.setattr(sm, "_process_groups_table_native", lambda: native)
+
+    def run(argv, **kwargs):
+        raise AssertionError(
+            f"ps must not be run when the native reader answered: {argv!r}"
+        )
+
+    monkeypatch.setattr(sm.subprocess, "run", run)
+
+    assert sm._process_groups_table() == native
+
+
+def test_proc_stat_parser_handles_comm_with_spaces_and_parens(
+    tmp_path: Path,
+) -> None:
+    """``/proc/<pid>/stat`` is parsed from the **last** ``)``.
+
+    The executable name is the text in parentheses and it may contain
+    spaces *and* parentheses, so the fields after the state character
+    are found after the last ``)`` — not by splitting the whole line.
+    """
+    root = tmp_path / "proc"
+    (root / "123").mkdir(parents=True)
+    (root / "123" / "stat").write_text("123 (a b) (c) S 45 67 89 0 0\n")
+    # A line without a closing parenthesis is not a stat line at all.
+    (root / "456").mkdir()
+    (root / "456" / "stat").write_text("456 (broken S 45 67\n")
+    # A line whose fields are not integers is skipped too.
+    (root / "789").mkdir()
+    (root / "789" / "stat").write_text("789 (ok) S pp 89 0 0\n")
+
+    table = sm._read_proc_table(root)
+
+    assert table == {123: (45, 67)}, table
+
+
+def test_native_reader_matches_kernel_for_own_pid() -> None:
+    """The native reader agrees with the kernel about this process.
+
+    ``os.getppid()`` and ``os.getpgrp()`` are the kernel's own
+    answers; the table is what the ancestor walk reads.  If the two
+    disagreed, every group the guard refuses would be the wrong one.
+    """
+    if sys.platform != "darwin":
+        pytest.skip("the native reader checked here is macOS's libproc")
+
+    table = sm._process_groups_table_native()
+
+    assert table is not None, "the macOS native reader must answer"
+    me = os.getpid()
+    assert table.get(me) == (os.getppid(), os.getpgrp()), (
+        f"the native table must agree with the kernel about pid {me}; "
+        f"got {table.get(me)!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

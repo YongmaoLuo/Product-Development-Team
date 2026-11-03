@@ -39,9 +39,11 @@ The pins
 3. A real spawned child runs in a session of its own.
 4. The mechanism this module acts on is the mechanism the document
    names.
-5. The CI gate's own spawn registry does not turn into a second
-   spawn: the recorder tells the service's spawn apart from every
-   other subprocess by its shape, not by the order the calls came in.
+5. The capture holds the **service's** spawn, even after the start
+   path has run a probe of its own: the CI gate's own spawn registry
+   does not turn into a second spawn, because the recorder tells the
+   service's spawn apart from every other subprocess by its shape,
+   not by the order the calls came in.
 
 Run them with:
 
@@ -179,13 +181,20 @@ def _is_the_service_spawn(argv: Any) -> bool:
     The spawn is therefore told apart by its shape.  The detached
     wrapper runs under this interpreter and is a program of its own --
     that is the shape ``service_manager._detached_argv`` builds, and it
-    is the shape no other subprocess in this process has.
+    is the shape no other subprocess in this process has.  The probes
+    are the production's business, and the production is not what this
+    test is about: they are handed to the real ``Popen`` rather than
+    recorded as the service's spawn.  Their own argv gives them away
+    anyway -- it is the ``ps`` binary's own path (an absolute one,
+    because the reaper resolves ``ps`` once and keeps it), and its last
+    element is the pid that was probed.
     """
     argv = list(argv or [])
     return (
-        len(argv) >= 2
+        len(argv) > 2
         and argv[0] == (sys.executable or "/usr/bin/python3")
         and argv[1] == "-c"
+        and argv[2] == sm._DETACHED_WRAPPER_SOURCE
     )
 
 
@@ -205,6 +214,8 @@ class _Spawn:
     def __init__(self) -> None:
         self.calls: List[Tuple[List[str], Dict[str, Any]]] = []
         self.posix_spawn_calls: List[Tuple[Any, ...]] = []
+        #: Every service spawn the capture took, in order.
+        self.wrapper_spawns: List[List[str]] = []
 
     @property
     def spawns(self) -> List[Tuple[List[str], Dict[str, Any]]]:
@@ -234,13 +245,42 @@ class _Spawn:
         spawns = self.spawns
         return dict(spawns[-1][1]) if spawns else {}
 
+    @property
+    def argv(self) -> List[str]:
+        """The argv of the service's own spawn, read the flat way.
+
+        The same answer as :attr:`spawned_argv`, under the name the
+        pins that watch one spawn read.
+        """
+        return self.spawned_argv
+
+    @property
+    def kwargs(self) -> Dict[str, Any]:
+        """The keyword arguments, read the flat way.
+
+        The same answer as :attr:`spawned_kwargs`, under the name the
+        pins that watch one spawn read.
+        """
+        return self.spawned_kwargs
+
 
 def _install_recorders(monkeypatch) -> _Spawn:
     """Record what the spawn path asks for, without starting anything."""
     record = _Spawn()
+    real_popen = sm.subprocess.Popen
 
     def _fake_popen(argv, **kwargs):
+        # Every call the recorder caught is kept -- the probe included
+        # -- because a recorder that threw the others away would be
+        # hiding them instead of telling them apart.
         record.calls.append((list(argv), dict(kwargs)))
+        if not _is_the_service_spawn(argv):
+            # Not the service: a probe of the production's own.  It is
+            # handed to the real ``Popen`` so that the production sees
+            # what it would see, and so that the capture holds the
+            # service's spawn and nothing else.
+            return real_popen(argv, **kwargs)
+        record.wrapper_spawns.append(list(argv))
         return _FakeProc()
 
     def _fake_posix_spawn(path, argv, env, **kwargs):
@@ -282,6 +322,13 @@ def _start_recording(
     )
     decl = _decl(**overrides)
     runtime = sm.start_service(decl, tmp_path)
+    # Exactly one spawn is the service's own.  A start that spawned the
+    # service twice, or none at all, would leave the assertions below
+    # reading something that is not the service.
+    assert len(record.wrapper_spawns) == 1, (
+        "the capture took %d service spawns; the start path spawns the "
+        "service exactly once" % len(record.wrapper_spawns)
+    )
     return record, runtime
 
 
@@ -642,7 +689,69 @@ def test_mechanism_token_matches_doc():
 
 
 # ---------------------------------------------------------------------------
-# 5. The gate's own registry does not turn into a second spawn
+# 5. The capture survives a probe that comes later
+# ---------------------------------------------------------------------------
+
+
+def test_wrapper_capture_survives_a_later_probe_spawn(tmp_path, monkeypatch):
+    """The capture holds the service's spawn, even after a probe runs.
+
+    The start path spawns subprocesses of its own besides the service:
+    the ``ps`` probes that read a pid's start time -- the spawn marker
+    before the spawn, the registry entry after it -- and the machine's
+    process table.  ``sm.subprocess`` is the **process-global**
+    ``subprocess`` module, so a capture that replaces ``Popen`` in it
+    takes those probes as well -- and ``subprocess.run``, which calls
+    ``Popen`` internally, is one of them.
+
+    A capture that took a probe would end up holding the probe: the
+    probe's argv is the ``ps`` binary's own path -- an absolute one,
+    because the reaper resolves ``ps`` once and keeps it -- and its last
+    element is the pid that was probed.  Every assertion about the
+    service's spawn would then read the probe instead, and the case
+    would fail on a shape the production never used.
+
+    So the probe runs **after** the start returns, in this same
+    process, and the capture must still be the service's.
+    """
+    record, _runtime = _start_recording(
+        monkeypatch, tmp_path, port=_free_port()
+    )
+
+    # The probe the start path itself makes after the spawn: the start
+    # time of the process it has just registered.
+    sm._process_start_epoch(999999)
+
+    assert len(record.wrapper_spawns) == 1, (
+        "the capture took %d service spawns; the start path spawns the "
+        "service exactly once" % len(record.wrapper_spawns)
+    )
+    argv = record.spawned_argv
+    assert argv[:5] == [
+        sys.executable or "/usr/bin/python3",
+        "-c",
+        sm._DETACHED_WRAPPER_SOURCE,
+        "/bin/bash",
+        "-lc",
+    ], (
+        "the capture no longer holds the service's spawn: %r" % (argv,)
+    )
+    assert argv[-1] == "npx next dev -p 3000", (
+        f"the declared command was not handed over verbatim: {argv[-1]!r}"
+    )
+    assert "start_new_session" not in record.kwargs, (
+        "Popen was asked for a new session as well: the wrapper calls "
+        "setsid() itself, and a child that is already a group leader "
+        "gets EPERM from its own setsid()"
+    )
+    assert str(record.kwargs.get("cwd")) == str(tmp_path), (
+        "the service was not started in the project directory: "
+        f"{record.kwargs.get('cwd')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. The gate's own registry does not turn into a second spawn
 # ---------------------------------------------------------------------------
 
 

@@ -608,3 +608,96 @@ def test_repair_decision_forks_on_fingerprint(
         assert orch2._failure_fingerprints[VP_ID][0] == (
             orch2._failure_fingerprints[VP_ID][1]
         ), "the same failure has the same fingerprint"
+
+
+# ---------------------------------------------------------------------------
+# 5. 规则跟着指纹一起过一轮
+# ---------------------------------------------------------------------------
+
+def test_the_rule_pair_round_trips_with_the_fingerprints(plan_dir, project_dir):
+    """The rule each fingerprint was made under rides along with it.
+
+    The fingerprint is the only input to "did the root cause evolve?".
+    Two fingerprints made under different rules are not comparable — the
+    instrument changed, not the defect — so the rule has to survive the
+    round trip through the payload. Without it, the next round compares a
+    legacy fingerprint with an identity one and reads that as an evolved
+    root cause, which re-opens a root-cause task for a failure nobody
+    touched.
+    """
+    orch = _orchestrator(plan_dir, project_dir)
+
+    # The gate's artifact: the machine-written failing set of this round.
+    artifact_dir = plan_dir / "vp_artifacts" / VP_ID
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "ci_output.json").write_text(
+        json.dumps({
+            "junit_failures": [
+                {"node_id": "tests/unit/test_x.py::test_one", "first_line": "boom"},
+                {"node_id": "tests/unit/test_x.py::test_two", "first_line": "bang"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    report = {
+        "verification_results": [
+            {
+                "id": VP_ID,
+                "status": "FAILED",
+                "actual_result": "boom",
+                "evidence": "boom",
+            },
+        ],
+    }
+
+    orch._record_round_fingerprints(report, set())
+
+    rules = getattr(orch, "_failure_fingerprint_rules", None)
+    assert rules is not None, (
+        "the orchestrator must remember which rule each fingerprint was "
+        "computed under"
+    )
+    assert rules[VP_ID][1] == "identity-v1", (
+        "a fingerprint computed from the gate's failing set is an identity "
+        "fingerprint — the rule says so"
+    )
+    assert orch._failure_fingerprints[VP_ID][0] is None, (
+        "the point failed for the first time — there is no previous "
+        "fingerprint to compare against"
+    )
+
+    orch._save_loop_tracking()
+    payload = _read_payload(plan_dir)
+    assert payload["failure_fingerprint_rules"] == {VP_ID: [None, "identity-v1"]}, (
+        "the rule pair rides in the payload next to the fingerprint pair"
+    )
+
+    fresh = _orchestrator(plan_dir, project_dir)
+    assert fresh._failure_fingerprint_rules == {VP_ID: [None, "identity-v1"]}, (
+        "what the round wrote is what the next round's orchestrator reads"
+    )
+
+
+def test_a_payload_without_rules_is_read_as_unknown(plan_dir, project_dir):
+    """A payload written before the rules existed knows no rule.
+
+    "We do not know" must not be spelled as "it was the same" and must not
+    raise — a record the reader cannot make sense of degrades.
+    """
+    (plan_dir / TRACKING_FILENAME).write_text(
+        json.dumps({
+            "version": 2,
+            "previous_failed_keys": [DECISION_KEY],
+            "same_failure_counts": {DECISION_KEY: 2},
+            "last_round": 1,
+            "failure_fingerprints": {VP_ID: ["aaa", "bbb"]},
+        }),
+        encoding="utf-8",
+    )
+
+    orch = _orchestrator(plan_dir, project_dir)
+    assert orch._failure_fingerprint_rules == {}, (
+        "a payload without rules knows none — that is not an error"
+    )
+    assert orch._failure_fingerprints == {VP_ID: ["aaa", "bbb"]}

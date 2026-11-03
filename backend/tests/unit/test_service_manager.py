@@ -18,6 +18,7 @@ Covers:
 
 from __future__ import annotations
 
+import importlib.util
 import itertools
 import json
 import os
@@ -44,6 +45,28 @@ import service_manager as sm  # noqa: E402
 from service_declaration import ServiceDeclaration  # noqa: E402
 from service_freshness import PortProbe  # noqa: E402
 from tests import _host_load  # noqa: E402
+
+
+#: The readiness budget for the tests that really start a service.
+#:
+#: The budget is a **wall-clock** deadline (see
+#: ``service_manager._wait_ready_with_evidence``), and the gate runs the
+#: suite with ``-n auto`` -- 18 workers on the 2026-11-01 run -- on a
+#: host whose load average was 22.46.  On that host a
+#: ``time.sleep(0.05)`` measured **0.129s**: the clock was running
+#: **2.6x** slow, and every deadline in the suite was 2.6x shorter in
+#: real work.  A 20- or 30-second readiness budget is therefore 20 or
+#: 30 seconds of a machine that is too busy to start a process in a
+#: second, and the service's own start (the interpreter's boot, the
+#: wrapper's ``setsid``, the spawn marker's ``ps`` probe) eats a good
+#: part of it.
+#:
+#: 120 seconds is the explicit budget: it is what a machine under that
+#: load is given to bring a service up.  It does **not** change what is
+#: asserted -- ``assert runtime.ready is True`` still has to hold, and a
+#: service that never comes up still fails the test (it just fails it
+#: later, and with the whole budget rather than a fraction of it).
+READY_TIMEOUT_SECONDS = 120
 
 
 def _decl(**overrides) -> ServiceDeclaration:
@@ -439,13 +462,16 @@ def _is_the_service_spawn(argv) -> bool:
     spawn registry costs.  A recorder that read "the call it caught"
     would read the probe instead of the spawn, so the spawn is told
     apart by its shape: the detached wrapper runs under this
-    interpreter and is a program of its own.
+    interpreter and is a program of its own -- that is the shape
+    ``service_manager._detached_argv`` builds, and it is the shape no
+    other subprocess in this process has.
     """
     argv = list(argv or [])
     return (
-        len(argv) >= 2
+        len(argv) > 2
         and argv[0] == (sys.executable or "/usr/bin/python3")
         and argv[1] == "-c"
+        and argv[2] == sm._DETACHED_WRAPPER_SOURCE
     )
 
 
@@ -453,6 +479,7 @@ def test_start_service_launches_detached_and_waits(project, monkeypatch):
     """A real (tiny) detached process, so the Popen wiring — detached
     session, log redirection, cwd — is exercised rather than mocked."""
     spawned = []
+    intercepted = []
 
     class _FakeProc:
         pid = 999999
@@ -460,8 +487,24 @@ def test_start_service_launches_detached_and_waits(project, monkeypatch):
         def poll(self):
             return None   # still running, as a real spawn would be
 
+    real_popen = sm.subprocess.Popen
+
     def _fake_popen(argv, **kwargs):
+        # Every call the recorder caught is kept -- the probe included
+        # -- because a recorder that threw the others away would be
+        # hiding them instead of telling them apart.
         spawned.append((argv, kwargs))
+        # Only the *service* spawn is captured.  The start path spawns
+        # subprocesses of its own besides the service -- the ``ps``
+        # probes that read a pid's start time and the machine's process
+        # table -- and a capture that takes those too leaves the
+        # assertions below reading a probe instead of the service.  The
+        # probes are handed to the real ``Popen``: they are the
+        # production's business, and the production is not what this
+        # test is about.
+        if not _is_the_service_spawn(argv):
+            return real_popen(argv, **kwargs)
+        intercepted.append(list(argv))
         return _FakeProc()
 
     monkeypatch.setattr(sm.subprocess, "Popen", _fake_popen)
@@ -481,6 +524,13 @@ def test_start_service_launches_detached_and_waits(project, monkeypatch):
     assert len(spawns) == 1, (
         "the spawn path started a different number of services: "
         f"{spawned!r}"
+    )
+    # Exactly one spawn is the service's own: the start path also probes
+    # the machine (``ps -o lstart=``), and a probe that is captured as
+    # the spawn leaves the assertions below reading the probe.
+    assert len(intercepted) == 1, (
+        "the capture took %d spawns; only the service's own is meant to "
+        "be captured" % len(intercepted)
     )
     # The command is started through the wrapper: the wrapper's own
     # program comes first, and the declared command follows it verbatim
@@ -1365,6 +1415,130 @@ def test_stop_service_escalates_when_sigterm_is_ignored():
         _force_cleanup(pid)
 
 
+#: The service the stop-path pin starts: it answers on its port, and on
+#: SIGTERM it **releases the port at once** while the process stays a
+#: little longer -- the shape of a service that is still shutting down.
+#:
+#: The port is what the stop used to wait for, and the port is free
+#: long before the process is gone: a service can let go of its address
+#: and still be finishing its work.  That gap is what this pin is about.
+_SHUTTING_DOWN_SERVICE_SOURCE = '''\
+import signal, socket, sys, threading, time
+
+PORT = int(sys.argv[1])
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("127.0.0.1", PORT))
+sock.listen(8)
+finished = threading.Event()
+
+
+def _answer():
+    while True:
+        try:
+            conn, _addr = sock.accept()
+        except OSError:
+            return
+        try:
+            conn.sendall(b"HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok")
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+
+def _linger():
+    time.sleep(3.0)
+    finished.set()
+
+
+def _on_term(signum, frame):
+    # The address is released at once.  The process is not gone: it is
+    # still shutting down, and it says so by staying alive.
+    sock.close()
+    threading.Thread(target=_linger, daemon=True).start()
+
+
+threading.Thread(target=_answer, daemon=True).start()
+signal.signal(signal.SIGTERM, _on_term)
+finished.wait()
+'''
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Is the pid still a process this machine knows?"""
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+@pytest.mark.timeout(300)
+def test_a_stop_that_returns_has_taken_the_service_with_it(tmp_path):
+    """The stop does not return while the service is still shutting down.
+
+    A service that has released its port is not yet stopped: the
+    process behind it can still be running -- finishing its shutdown,
+    writing its last state, unwinding -- and the watcher thread that
+    watches it is still running with it.
+
+    That thread is an application worker, and the suite's containment
+    rule says a worker may not outlive the test that started it
+    (``tests/conftest.py``: "1 application worker thread(s) outlived
+    their test").  A stop that returns while the service is still there
+    hands the next test a thread that is still running, and the failure
+    it causes lands on an unrelated test, at an unrelated moment.
+
+    So a stop waits for the service to be **gone**, not only for its
+    port to be free.
+    """
+    script = tmp_path / "shutting_down_service.py"
+    script.write_text(_SHUTTING_DOWN_SERVICE_SOURCE, encoding="utf-8")
+    port = _free_port()
+    decl = ServiceDeclaration(
+        name="shutting-down",
+        port=port,
+        start_cmd=(
+            f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} {port}"
+        ),
+        cwd=".",
+        ready_timeout_seconds=READY_TIMEOUT_SECONDS,
+        log_path="tmp/service.log",
+    )
+    runtime = sm.start_service(decl, tmp_path)
+    try:
+        assert runtime.ready is True, runtime.detail
+        assert runtime.pid
+
+        result = sm.stop_service(runtime, decl, grace_seconds=20.0)
+
+        assert result["port_free"] is True
+        assert not _pid_is_alive(runtime.pid), (
+            "the stop returned while the service's process was still "
+            f"running (pid {runtime.pid})"
+        )
+        assert not [
+            thread for thread in threading.enumerate()
+            if thread.name.startswith("pdt-service-watch-")
+        ], "the watcher thread outlived the stop that was supposed to end it"
+        assert runtime.exit is not None, (
+            "the exit of the service was not recorded"
+        )
+        assert "stopped by the round" in runtime.exit.reason
+        assert result["killed"] == [], (
+            "the service finished its own shutdown inside the grace; "
+            f"nothing had to be killed: {result!r}"
+        )
+    finally:
+        _force_cleanup(runtime.pid)
+
+
 @pytest.mark.timeout(120)
 def test_wait_until_ready_polls_a_real_port():
     import subprocess
@@ -1394,7 +1568,7 @@ def test_wait_until_ready_polls_a_real_port():
         _time.sleep(0.2)
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_start_service_end_to_end(tmp_path: Path):
     """Real detached launch → ready, including the pid/pgid capture the
     C3 ledger depends on."""
@@ -1411,7 +1585,7 @@ def test_start_service_end_to_end(tmp_path: Path):
         # Quoted: a checkout path with a space would otherwise split
         # here, and the shell would try to run the path prefix.
         start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
-        ready_timeout_seconds=int(_readiness_budget_seconds(20)),
+        ready_timeout_seconds=READY_TIMEOUT_SECONDS,
     )
 
     runtime = sm.start_service(decl, tmp_path)
@@ -1427,7 +1601,7 @@ def test_start_service_end_to_end(tmp_path: Path):
             _force_cleanup(runtime.pid)
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_health_url_drives_readiness(tmp_path: Path):
     """A declared health_url is the readiness signal when present."""
     import sys as _sys
@@ -1442,7 +1616,7 @@ def test_health_url_drives_readiness(tmp_path: Path):
         name="stub", port=port,
         start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
         health_url=f"http://127.0.0.1:{port}/",
-        ready_timeout_seconds=int(_readiness_budget_seconds(20)),
+        ready_timeout_seconds=READY_TIMEOUT_SECONDS,
     )
 
     runtime = sm.start_service(decl, tmp_path)
@@ -1464,6 +1638,101 @@ def test_health_url_fails_when_nothing_serves_it():
 
 
 # ---------------------------------------------------------------------------
+# The readiness budget is declared, and the production default has not moved
+# ---------------------------------------------------------------------------
+
+
+def _declared_readiness_budget(module_name: str) -> int:
+    """The readiness budget a sibling fixture declares.
+
+    The sibling is loaded from its file rather than imported by name:
+    pytest collects a test module under the package it lives in
+    (``backend.tests.unit.…``), and the name a module can be *imported*
+    under is not the name it is collected under.
+    """
+    path = Path(__file__).resolve().parent / f"{module_name}.py"
+    spec = importlib.util.spec_from_file_location(
+        f"_pdt_readiness_{module_name}", path
+    )
+    assert spec is not None and spec.loader is not None, (
+        f"the sibling fixture {path} could not be read"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return int(module.READY_TIMEOUT_SECONDS)
+
+
+@pytest.mark.timeout(300)
+def test_readiness_budget_is_declared_not_default(tmp_path: Path):
+    """The cases that assert readiness declare the budget they run on.
+
+    The readiness budget is a **wall-clock** deadline, so a fixture
+    that asserts "the service came up" has to say how long it is
+    willing to wait.  On a host that cannot start a process in a
+    second -- the gate's own host measured a clock running 2.6x slow
+    under a load average of 22 -- a 20-second budget is twenty seconds
+    of a machine that is too busy, and the case fails on the clock
+    rather than on the service.
+
+    So the four cases that really start a service declare a budget of
+    their own.  This pins three things: that they do, that the budget
+    is one a loaded host can honour, and that the **production**
+    default has not moved along with them -- the fixtures declare
+    their own, and the field's declarations must keep the default they
+    have always had.
+    """
+    # The production default, unchanged.
+    default = ServiceDeclaration(
+        name="chart", port=3000, start_cmd="npx next dev -p 3000", cwd=".",
+    )
+    assert default.ready_timeout_seconds == 60, (
+        "the production default readiness budget moved to "
+        f"{default.ready_timeout_seconds!r}; the fixtures declare their "
+        "own budget, and the default has to stay where it was"
+    )
+
+    # Every fixture that really starts a service, and the budget it
+    # declares.  The two sibling modules are read here because the four
+    # cases are spread over three files, and a budget that only one of
+    # them declares is a budget the other two do not have.
+    for name, budget in (
+        ("test_service_manager", READY_TIMEOUT_SECONDS),
+        (
+            "test_service_address_events",
+            _declared_readiness_budget("test_service_address_events"),
+        ),
+        (
+            "test_service_kill_attribution",
+            _declared_readiness_budget("test_service_kill_attribution"),
+        ),
+    ):
+        assert budget >= 90, (
+            f"{name} declares a readiness budget of {budget}s; a fixture "
+            "that asserts readiness needs a budget the host can honour "
+            "even while it is busy"
+        )
+
+    # And the budget is enough: a service started on it comes up.
+    import sys as _sys
+
+    port = _free_port()
+    script = (
+        "import http.server,socketserver;"
+        f"socketserver.TCPServer(('127.0.0.1',{port}),"
+        "http.server.SimpleHTTPRequestHandler).serve_forever()"
+    )
+    decl = _decl(
+        name="stub", port=port,
+        start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
+        ready_timeout_seconds=READY_TIMEOUT_SECONDS,
+    )
+
+    runtime = sm.start_service(decl, tmp_path)
+    try:
+        assert runtime.ready is True, runtime.detail
+    finally:
+        if runtime.pid:
+            _force_cleanup(runtime.pid)
 # The readiness wait has to see the death (2026-11-03, VP-018, L3)
 # ---------------------------------------------------------------------------
 #
@@ -2048,7 +2317,7 @@ def test_pid_reused_tolerates_ps_granularity(monkeypatch):
     assert sm._pid_reused({"pid": 1}) is False
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_reap_end_to_end_frees_a_real_port(tmp_path: Path):
     """The whole C3 promise: a service the backend started is gone after the
     workflow exits, and the ledger that recorded it is cleared."""
@@ -2085,7 +2354,7 @@ def test_reap_end_to_end_frees_a_real_port(tmp_path: Path):
         decl = _decl(
             name="stub", port=port,
             start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
-            ready_timeout_seconds=int(_readiness_budget_seconds(20)),
+            ready_timeout_seconds=READY_TIMEOUT_SECONDS,
         )
         # Held, so the declared port is unusable and the service must
         # land elsewhere — the exact situation `_relocate_service` is for.
@@ -2630,7 +2899,7 @@ def test_a_live_rounds_service_is_not_reclaimed_even_when_it_looks_like_ours(
 # and the service must still be serving when the last VP is done.
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(300)
 def test_declared_service_stays_healthy_until_the_last_vp(tmp_path: Path):
     """The service the round ensured serves every VP, and is still up
     after the last one."""
@@ -2650,7 +2919,7 @@ def test_declared_service_stays_healthy_until_the_last_vp(tmp_path: Path):
         start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
         cwd=".",
         health_url=f"http://127.0.0.1:{port}/",
-        ready_timeout_seconds=int(_readiness_budget_seconds(30)),
+        ready_timeout_seconds=READY_TIMEOUT_SECONDS,
     )
 
     plan_dir = tmp_path / "plan"
@@ -4298,7 +4567,7 @@ def _wait_for_a_listener(port: int, proc, timeout: float = 20.0) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_end_to_end_relocation_around_a_stranger_ends_ready(
     tmp_path: Path, monkeypatch,
 ):
@@ -4383,7 +4652,7 @@ def test_end_to_end_relocation_around_a_stranger_ends_ready(
                 f"--db {shlex.quote(str(service_db))}"
             ),
             health_url=f"http://127.0.0.1:{declared_port}/health",
-            ready_timeout_seconds=int(_readiness_budget_seconds(30)),
+            ready_timeout_seconds=READY_TIMEOUT_SECONDS,
         )
 
         result = sm.ensure_services(
@@ -4584,7 +4853,17 @@ def test_a_real_marked_child_is_still_recognised(tmp_path):
     )
     try:
         result = reaper.run_once(
-            reaper.ReaperConfig(plans_root=tmp_path, pid_scope=(child.pid,))
+            reaper.ReaperConfig(plans_root=tmp_path, pid_scope=(child.pid,)),
+            # The default budget is ten seconds, and the macOS batch route
+            # reads the environment of EVERY process on the machine in one
+            # spawn -- whose cost grows with the machine.  On a loaded one
+            # that spawn outlives the budget, the batch yields nothing, the
+            # scan falls back to the per-process route, and the budget is
+            # already spent: the child is then reported *unreadable* -- a
+            # skip -- even though its marker is right there.  What this
+            # test is about is the marker being read, so the read is given
+            # a budget that fits the machine instead of the machine's size.
+            scan_fn=lambda config: reaper.scan(config, budget_seconds=60.0),
         )
         verdicts = {verdict.proc.pid: verdict for verdict in result.verdicts}
         assert child.pid in verdicts, (
@@ -4983,7 +5262,7 @@ def test_kill_service_refuses_a_group_that_holds_the_callers_ancestor(
     )
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(600)
 def test_stopping_a_relocated_service_never_reaches_the_test_session(
     tmp_path: Path, monkeypatch,
 ):
@@ -5038,7 +5317,7 @@ def test_stopping_a_relocated_service_never_reaches_the_test_session(
         decl = _decl(
             name="stub", port=declared_port,
             start_cmd=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
-            ready_timeout_seconds=int(_readiness_budget_seconds(20)),
+            ready_timeout_seconds=READY_TIMEOUT_SECONDS,
         )
         runtime = sm._relocate_service(
             decl, tmp_path, foreign_cmdline="the test's own holder socket",
@@ -5077,6 +5356,183 @@ def test_stopping_a_relocated_service_never_reaches_the_test_session(
         os.kill(os.getpid(), 0)
     finally:
         _force_cleanup(runtime.pid)
+
+
+# ---------------------------------------------------------------------------
+# The kill audit, and the pids a stop must never name.
+#
+# A gate run that ends with the pytest process killed by a SIGTERM names
+# no sender: the stderr says ``Terminated: 15`` and nothing else, and
+# "who sent it" has nothing to look at.  Two things close that gap.
+#
+# The first is the audit: every ``os.kill`` and every ``os.killpg`` a
+# process makes is written down -- target, signal, and the stack that
+# asked for it -- *before* the signal goes out, because a signal can take
+# the evidence with it.
+#
+# The second is the narrowing: a stop must never signal the process that
+# asked for it, nor one of its ancestors.  A group is already refused
+# when it holds them (see
+# ``test_kill_service_refuses_a_group_that_holds_the_callers_ancestor``);
+# the pids were not, and a pid is what a stop falls back to when the
+# group is refused.
+# ---------------------------------------------------------------------------
+
+
+def _kill_audit_records(directory: Path) -> List[dict]:
+    """Every kill record written under *directory*, oldest first."""
+    records: List[dict] = []
+    for path in sorted(directory.glob("*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                continue
+    return records
+
+
+def test_every_kill_is_written_down_with_its_target_and_signal(
+    tmp_path: Path, monkeypatch,
+):
+    """A plain ``os.kill`` must leave a record naming what it aimed at.
+
+    Signal 0 -- the existence check -- so that proving the recorder works
+    costs no process its life.
+    """
+    monkeypatch.setenv("PDT_KILL_AUDIT_DIR", str(tmp_path))
+
+    os.kill(os.getpid(), 0)
+
+    records = _kill_audit_records(tmp_path)
+    mine = [
+        r
+        for r in records
+        if r.get("kind") == "kill" and r.get("target") == os.getpid()
+    ]
+    assert mine, (
+        "os.kill reached the kernel and nothing was written down about "
+        f"it; the records under {tmp_path} were: {records!r}"
+    )
+    assert mine[-1].get("signal") == 0
+
+
+def test_every_group_kill_is_written_down_with_its_target_and_signal(
+    tmp_path: Path, monkeypatch,
+):
+    """A group kill is written down too.
+
+    ``pgid=2`` and signal 0: an ordinary group, and a call that resolves
+    the group without delivering anything to it.
+    """
+    monkeypatch.setenv("PDT_KILL_AUDIT_DIR", str(tmp_path))
+
+    try:
+        os.killpg(2, 0)
+    except OSError:
+        pass
+
+    records = _kill_audit_records(tmp_path)
+    mine = [
+        r for r in records if r.get("kind") == "killpg" and r.get("target") == 2
+    ]
+    assert mine, (
+        "os.killpg reached the kernel and nothing was written down "
+        f"about it; the records under {tmp_path} were: {records!r}"
+    )
+    assert mine[-1].get("signal") == 0
+
+
+def test_the_kill_record_names_the_caller_and_not_the_hook(
+    tmp_path: Path, monkeypatch,
+):
+    """The stack in the record is the caller's, so the record is evidence.
+
+    A record that only said "the audit hook saw it" would name no call
+    site, and the whole point of the file is to name one.
+    """
+    monkeypatch.setenv("PDT_KILL_AUDIT_DIR", str(tmp_path))
+
+    os.kill(os.getpid(), 0)
+
+    records = _kill_audit_records(tmp_path)
+    mine = [r for r in records if r.get("kind") == "kill"]
+    assert mine, "nothing was written down"
+    assert "test_service_manager" in (mine[-1].get("stack") or ""), (
+        "the record's stack does not name the calling test: "
+        f"{mine[-1].get('stack')!r}"
+    )
+
+
+def test_kill_service_never_signals_the_caller_itself(
+    tmp_path: Path, monkeypatch,
+):
+    """A stop must never signal the process that asked for it.
+
+    The group is already refused when it holds the caller; the pid is
+    what the stop falls back to, and a fallback that lands on the caller
+    is the caller killing itself with a signal it never sent.
+    """
+    signalled: List[tuple] = []
+    monkeypatch.setattr(
+        sm.os, "kill", lambda pid, sig: signalled.append(("kill", pid, sig))
+    )
+    monkeypatch.setattr(
+        sm.os, "killpg", lambda pgid, sig: signalled.append(("killpg", pgid, sig))
+    )
+
+    runtime = sm.ServiceRuntime(name="self", port=0, pid=os.getpid())
+    result = sm.kill_service(
+        runtime,
+        caller="test_service_manager",
+        reason="the caller is the target",
+        plan_dir=tmp_path,
+    )
+
+    assert signalled == [], (
+        f"the stop signalled the process that asked for it: {signalled!r}"
+    )
+    assert result["signalled"] == []
+    assert os.getpid() in result.get("refused_pids", []), (
+        f"the refusal was not recorded: {result!r}"
+    )
+
+
+def test_kill_service_never_signals_an_ancestor_of_the_caller(
+    tmp_path: Path, monkeypatch,
+):
+    """A stop must never signal one of the caller's ancestors either.
+
+    The shell that owns the test session is an ancestor of the process
+    that asks for the stop; a signal that reaches it takes the session
+    with it.
+    """
+    signalled: List[tuple] = []
+    monkeypatch.setattr(
+        sm.os, "kill", lambda pid, sig: signalled.append(("kill", pid, sig))
+    )
+    monkeypatch.setattr(
+        sm.os, "killpg", lambda pgid, sig: signalled.append(("killpg", pgid, sig))
+    )
+
+    parent = os.getppid()
+    runtime = sm.ServiceRuntime(name="parent", port=0, pid=parent)
+    result = sm.kill_service(
+        runtime,
+        caller="test_service_manager",
+        reason="the caller's ancestor is the target",
+        plan_dir=tmp_path,
+    )
+
+    assert signalled == [], (
+        f"the stop signalled an ancestor of the caller: {signalled!r}"
+    )
+    assert result["signalled"] == []
+    assert parent in result.get("refused_pids", []), (
+        f"the refusal was not recorded: {result!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

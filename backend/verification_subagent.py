@@ -2219,6 +2219,41 @@ class VerificationSubAgent:
                     "citations against the project root above and refuses "
                     "every citation that does not match it.",
                 ]
+            # 2026-11-01 (the forensic artifacts are staged): the plan
+            # directory's forensic products -- the audit ledger, the
+            # session census, the two trap rounds -- live in a checkout the
+            # framework never resolves citations against.  They are staged
+            # under this root: inside the project root (the tree the
+            # framework resolves against) and outside the plans tree the
+            # api service serves.  A citation naming one of them must use
+            # the staged path, relative to the project root.
+            staging_root = str(
+                vp_node.get("evidence_staging_root") or "").strip()
+            staging_rules: List[str] = []
+            if staging_root:
+                staging_rel = ""
+                if project_root:
+                    try:
+                        staging_rel = str(
+                            Path(staging_root).relative_to(Path(project_root))
+                        )
+                    except ValueError:
+                        staging_rel = ""
+                staging_rules = [
+                    "- The plan directory's own forensic artifacts (the "
+                    "audit ledger, the session census, the trap rounds) are "
+                    "staged for you under this root:",
+                    f"    {staging_root}",
+                    "- Cite THOSE artifacts from the staged copy: `file` is "
+                    "the staged path relative to the project root"
+                    + (
+                        f" (e.g. `{staging_rel}/vp_artifacts/VP-014/...`)."
+                        if staging_rel else "."
+                    ),
+                    "- The plan directory is NOT a citable tree: a citation "
+                    "that names a path inside it cannot be resolved by the "
+                    "framework and is downgraded to unverifiable.",
+                ]
             return [
                 "",
                 "## EVIDENCE CONTRACT — write citations.json (MANDATORY)",
@@ -2252,6 +2287,7 @@ class VerificationSubAgent:
                 "— the framework rejects them as `outside_project` and the "
                 "citation is treated as unverifiable.",
                 *project_root_rules,
+                *staging_rules,
                 "- A verdict of PASSED with no citations, or with citations "
                 "that do not resolve, is NOT honoured — it is downgraded to "
                 "FAILED.",

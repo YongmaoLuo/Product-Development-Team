@@ -57,6 +57,26 @@ RELOCATED_PORT = 58396
 #: exists to make traceable.
 THE_PORT_NOBODY_LISTENED_ON = 51725
 
+#: The readiness budget for the test that really starts a service.
+#:
+#: The budget is a **wall-clock** deadline (see
+#: ``service_manager._wait_ready_with_evidence``), and the gate runs the
+#: suite with ``-n auto`` -- 18 workers on the 2026-11-01 run -- on a
+#: host whose load average was 22.46.  On that host a
+#: ``time.sleep(0.05)`` measured **0.129s**: the clock was running
+#: **2.6x** slow, and every deadline in the suite was 2.6x shorter in
+#: real work.  A 20-second readiness budget is therefore 20 seconds of
+#: a machine that is too busy to start a process in a second, and the
+#: service's own start (the interpreter's boot, the wrapper's
+#: ``setsid``, the spawn marker's ``ps`` probe) eats a good part of it.
+#:
+#: 120 seconds is the explicit budget: it is what a machine under that
+#: load is given to bring a service up.  It does **not** change what is
+#: asserted -- ``assert runtime.ready`` still has to hold, and a service
+#: that never comes up still fails the test (it just fails it later,
+#: and with the whole budget rather than a fraction of it).
+READY_TIMEOUT_SECONDS = 120
+
 #: The event schema the criterion names.  Exactly these keys, one JSON
 #: object per line.
 EVENT_KEYS = {
@@ -531,7 +551,7 @@ def test_start_service_records_the_allocation_it_made(
             f"{shlex.quote(sys.executable)} -m http.server {port}"
         ),
         cwd=".",
-        ready_timeout_seconds=20,
+        ready_timeout_seconds=READY_TIMEOUT_SECONDS,
     )
 
     with sm.address_event_context(

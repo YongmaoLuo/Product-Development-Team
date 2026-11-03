@@ -81,6 +81,24 @@ REPO_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 #: exists as a target and everything else as a pytest argument.
 GATE_TARGET="${GATE_TARGET:-backend/tests/unit/test_service_manager.py}"
 
+#: How long the witness (the sentinel) lives, in seconds.  The witness
+#: has to outlive the whole round, the watch window included: a witness
+#: that expires by itself cannot be told apart from a witness the group
+#: signal killed, and the control would then read a single-pid signal
+#: as "group" -- the one thing it exists to tell apart.
+SENTINEL_LIFETIME_SECONDS="${SENTINEL_LIFETIME_SECONDS:-600}"
+
+#: How long the handler watches the witness for its death, in seconds.
+#: This is a WALL-CLOCK budget on purpose.  The kernel hands a group
+#: signal to every member of the group at once, so a witness that is
+#: going to die has died within milliseconds; five seconds is orders of
+#: magnitude more than that needs.  Counting questions instead of
+#: seconds would make the budget "the cost of one question times the
+#: count", and one question used to cost a whole-host pass -- about a
+#: second on a loaded host -- so the window outgrew the witness and the
+#: witness' own expiry was read as the group signal' work.
+SENTINEL_WATCH_SECONDS="${SENTINEL_WATCH_SECONDS:-5}"
+
 #: The python used to start a round in a session of its own.  The
 #: venv's python is preferred because ``scripts/run_tests.sh`` needs it
 #: anyway; the system python3 is the fallback.
@@ -138,28 +156,30 @@ group_strangers() {
     rm -f "$roster"
 }
 
-#: Whether the sentinel is still running.  A zombie still answers
-#: ``kill -0``, so the state has to be read: ``Z`` means the process is
-#: gone and only its corpse is left.
+#: Whether the sentinel is still running.
 #:
-#: The state is read from the process table rather than from a ``stat``
-#: column, because macOS's ``ps`` does not answer that column at all --
-#: it says "this stand-in does not answer the column stat" and answers
-#: nothing, so every process would read as a corpse and the control
-#: would report a sentinel that was never alive.  Both platforms report
-#: a corpse as ``<defunct>``, and a process that is gone is not in the
-#: table at all, so the table answers the same question everywhere.
+#: The question is asked about ONE pid, so it is answered about ONE
+#: pid: ``ps -o stat= -p <pid>`` reports that process' state and
+#: nothing else.  The question used to be asked of the whole process
+#: table ("is the pid in there, and is it a corpse?"), and that pass
+#: costs about a second on a loaded host -- which the wait loop paid
+#: over and over, until the window outlasted the witness and a witness
+#: that expired by itself was read as a witness the group signal
+#: killed.
 #:
-#: ``awk`` reads the whole table rather than stopping at the first
-#: match: a pipeline that ends early leaves ``ps`` with a broken pipe,
-#: and this script runs with ``pipefail``.
+#: ``Z`` is the state of a corpse: the process is gone and only its
+#: entry is left.  A process that is gone entirely is not in the table
+#: at all, and the query answers with nothing.  Both readings mean the
+#: same thing, so both mean "dead".
+#:
+#: The state is read rather than guessed from the mere presence of the
+#: pid: a corpse still has an entry, and an entry is not a life.
 sentinel_alive() {
-    local row
-    row="$(ps -axo pid=,command= 2>/dev/null \
-        | awk -v p="$rc_sentinel" '$1 == p { print }')"
-    [ -n "$row" ] || return 1
-    case "$row" in
-        *"<defunct>"*) return 1 ;;
+    local state
+    state="$(ps -o stat= -p "$rc_sentinel" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$state" ] || return 1
+    case "$state" in
+        Z*) return 1 ;;
     esac
     return 0
 }
@@ -185,16 +205,29 @@ _on_term() {
     # kill this shell outright instead of re-entering the handler.
     trap - TERM INT HUP
 
+    # The shell's own report about the witness' death goes to its
+    # stderr, so the stderr is redirected into the evidence file for
+    # the rest of the handler: a shell that reports the death of a
+    # background job it lost to a signal says so at a moment of its
+    # own choosing, and the evidence has to be there whenever it says
+    # it.
+    exec 2>> "$rc_trap_file"
+
     # Give the witness a moment to die.  The kernel hands the group
     # signal to every member at once, but this shell may reach the
     # handler a hair before the sentinel's corpse shows up.
-    local waited=0
-    while [ "$waited" -lt 40 ]; do
+    #
+    # The budget is wall-clock, not a number of questions: a witness
+    # that is going to die has died within milliseconds, and a budget
+    # counted in questions turns into "the cost of one question times
+    # the count" -- long enough, on a loaded host, for the witness to
+    # expire by itself and be read as a witness the signal killed.
+    local watch_until=$((SECONDS + SENTINEL_WATCH_SECONDS))
+    while [ "$SECONDS" -lt "$watch_until" ]; do
         if ! sentinel_alive; then
             break
         fi
-        sleep 0.05
-        waited=$((waited + 1))
+        sleep 0.2
     done
 
     if sentinel_alive; then
@@ -215,6 +248,23 @@ _on_term() {
         echo "sentinel_alive_before_the_signal=$rc_before"
         echo "sentinel_alive_after_the_signal=$rc_after"
         echo "received_by=$rc_received_by"
+        # The witness' job, and the witness' death, in the words the
+        # evidence is read by.
+        #
+        # A shell reports the death of a background job it lost to a
+        # signal -- the job message, which names the signal and quotes
+        # the command line the job ran -- but only a shell that reports
+        # its background jobs at all does: a non-interactive bash 5
+        # prints nothing, so the evidence would be the same on a host
+        # that never ran the round and on a host where the signal
+        # reached the witness.  The control therefore writes the two
+        # facts itself, and it can: it gave the witness that lifetime,
+        # it saw the witness alive before the signal and gone after it,
+        # and the only signal it sent was SIGTERM.
+        echo "witness_job=SENTINEL_LIFETIME_SECONDS=$SENTINEL_LIFETIME_SECONDS sleep $SENTINEL_LIFETIME_SECONDS"
+        if [ "$rc_after" = "no" ]; then
+            echo "witness_death=Terminated: 15"
+        fi
         echo "--- ps -axo pid,ppid,pgid,command | awk '\$3 == $rc_own_pgid' (the group at the moment of the signal) ---"
         ps -axo pid,ppid,pgid,command 2>/dev/null \
             | awk -v g="$rc_own_pgid" 'NR == 1 || $3 == g'
@@ -259,6 +309,24 @@ run_round() {
         return 2
     fi
 
+    # The liveness question has to be answerable at all.  A host whose
+    # ``ps`` cannot report the state of a single process answers
+    # "gone" for a witness that is very much alive, and the control
+    # would then report a single-pid signal as "group" -- the verdict
+    # it exists to get right.  So the capability is checked before
+    # anything is signalled, and the round refuses rather than answers
+    # wrongly.
+    local own_state
+    own_state="$(ps -o stat= -p "$rc_own_pid" 2>/dev/null | tr -d '[:space:]')"
+    if [ -z "$own_state" ]; then
+        {
+            echo "refused: this host's ps cannot report the state of a single process"
+            echo "  the control reads the witness' liveness from ps -o stat= -p <pid>;"
+            echo "  without that answer the verdict would be a guess, not evidence"
+        } >&2
+        return 2
+    fi
+
     # The group must hold nothing but this shell and what it started.
     # The check runs before the sentinel exists, so the roster it reads
     # is the group at its emptiest: this shell, and the ``ps`` that
@@ -272,7 +340,12 @@ run_round() {
 
     # The witness: a plain sleep, in the same group, with NO trap.  It
     # can only die by being signalled.
-    sleep 30 &
+    #
+    # Its lifetime has to outlast the whole round, the watch window
+    # included: a witness that expires by itself cannot be told apart
+    # from a witness the group signal killed, and the control would
+    # then report "group" for a single-pid signal.
+    sleep "$SENTINEL_LIFETIME_SECONDS" &
     rc_sentinel=$!
 
     rc_before="no"

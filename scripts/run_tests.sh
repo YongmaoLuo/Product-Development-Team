@@ -59,6 +59,26 @@ else
     SPAWN_REGISTRY_IS_OURS=0
 fi
 
+# ---------------------------------------------------------------------------
+# PDT_KILL_AUDIT_DIR: where the kill audit records go
+# ---------------------------------------------------------------------------
+#
+# Every signal a process sends is written down, so that "who sent the
+# signal" is a thing the next round can read instead of a thing it has
+# to infer.  The records are written by the processes that send the
+# signals -- the reaper, the service manager -- and two records can only
+# be read together when they land in the same place, so the gate names
+# the directory and exports it: everything this run starts inherits it.
+#
+# The directory is not removed when the run is over.  It is evidence,
+# and evidence that is deleted on the way out is evidence nobody reads.
+if [ -z "${PDT_KILL_AUDIT_DIR:-}" ]; then
+    KILL_AUDIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pdt-kill-audit.XXXXXX")"
+    export PDT_KILL_AUDIT_DIR="$KILL_AUDIT_DIR"
+else
+    KILL_AUDIT_DIR="$PDT_KILL_AUDIT_DIR"
+fi
+
 # Give back every process the registry names.  The registry is emptied as it
 # goes, so the gate's cleanup and the CI runner's cleanup do not signal the
 # same process twice.
@@ -70,7 +90,14 @@ import sys
 
 sys.path.insert(0, sys.argv[2])
 
+from backend import kill_audit
 from backend import orphan_reaper
+
+# The signals this process is about to send are written down before it
+# sends them.  The reaper never imports the service manager, so the
+# service manager's audit hook never saw these signals -- and the
+# signals that end a service are the ones the next round needs to read.
+kill_audit.install_kill_audit()
 
 for entry in orphan_reaper.reap_spawned_processes(
     sys.argv[1], reason="the gate is over"
@@ -86,16 +113,95 @@ for entry in orphan_reaper.reap_spawned_processes(
 PYTHON
 }
 
+# ---------------------------------------------------------------------------
+# The session census: what was in the session when the gate ended
+# ---------------------------------------------------------------------------
+#
+# ``Terminated: 15`` says that something was killed and not what.  This
+# writes down the two things that answer it: the processes that were in
+# the gate's process group, and the signals that were sent.  It is
+# written on the way out -- the normal way out and the way out a signal
+# forces -- so the next round reads the answer instead of inferring it.
+write_session_census() {
+    local reason="$1"
+    local pgid=""
+    local census=""
+    local file=""
+    local record=""
+    pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')" || pgid=""
+    [ -n "$pgid" ] || pgid="$$"
+    census="$(ps -o pid,ppid,pgid,command -g "$pgid" 2>&1 || true)"
+    if [ -z "$(printf '%s' "$census" | tr -d '[:space:]')" ]; then
+        # On Linux ``ps -g`` selects by *session* and ``-G`` selects by
+        # process group; on macOS ``-g`` is the process group and ``-G``
+        # wants a group *name*.  Where the first says nothing, the
+        # second is tried, so the census is not empty because the flag
+        # means something else on this machine.
+        census="$(ps -o pid,ppid,pgid,command -G "$pgid" 2>&1 || true)"
+    fi
+    mkdir -p "$KILL_AUDIT_DIR" 2>/dev/null || true
+    file="$KILL_AUDIT_DIR/session-census-$$.txt"
+    {
+        printf '=== gate session census ===\n'
+        printf 'gate pid: %s\n' "$$"
+        printf 'gate pgid: %s\n' "$pgid"
+        printf 'reason: %s\n' "$reason"
+        printf 'recorded at: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf 'audit dir: %s\n' "$KILL_AUDIT_DIR"
+        printf '\n--- process group census ---\n'
+        printf '%s\n' "$census"
+        printf '\n--- kill audit records ---\n'
+        for record in "$KILL_AUDIT_DIR"/kill-audit-*.jsonl; do
+            [ -f "$record" ] || continue
+            printf '# %s\n' "$(basename "$record")"
+            cat "$record" 2>/dev/null || true
+        done
+    } > "$file" 2>/dev/null || true
+    # On stderr, not on stdout: the argv a dry run prints is a contract,
+    # and a line that does not belong to it makes the block harder to
+    # read than it has to be.
+    printf 'session census: %s\n' "$file" >&2
+}
+
+# What the gate does on its way out: give back what it started, and
+# write down what was in the session.  It is the same work whether the
+# gate ended on its own or was interrupted -- and it is the work the
+# gate has always done on its way out, so it happens on both.
+GATE_SIGNALLED=""
+gate_leave() {
+    local reason="$1"
+    reap_spawn_registry || true
+    if [ -n "$GATE_SIGNALLED" ]; then
+        reason="the gate was interrupted by SIG$GATE_SIGNALLED and then ended"
+    fi
+    write_session_census "$reason" || true
+    if [ "$SPAWN_REGISTRY_IS_OURS" -eq 1 ]; then
+        rm -f "$SPAWN_REGISTRY"
+    fi
+}
+
+# A signal interrupts the gate.  The gate gives back what it started and
+# writes down the census, and the signal is then re-raised with its
+# default disposition: the gate dies of it exactly as it did before this
+# trap existed, so the exit status stays 128+signal.
+gate_on_signal() {
+    local sig="$1"
+    GATE_SIGNALLED="$sig"
+    trap - EXIT
+    trap - "$sig"
+    gate_leave "the gate was interrupted by SIG$sig"
+    kill -"$sig" "$$"
+}
+trap 'gate_on_signal TERM' TERM
+trap 'gate_on_signal INT' INT
+
 # The gate's own way out.  It runs on every exit -- the normal one, the
 # early ones, and the one a signal causes -- and it keeps the exit code the
 # gate decided on.
 gate_cleanup() {
     local status=$?
     trap - EXIT
-    reap_spawn_registry || true
-    if [ "$SPAWN_REGISTRY_IS_OURS" -eq 1 ]; then
-        rm -f "$SPAWN_REGISTRY"
-    fi
+    gate_leave "the gate ended"
     exit "$status"
 }
 trap gate_cleanup EXIT

@@ -224,7 +224,12 @@ class TestFullCiWiring:
 
     def test_verdict_has_the_executor_shape(self, tmp_path):
         verdict = _make_agent(tmp_path)._run_full_ci_vp(_ci_vp())
-        assert set(verdict) == {"status", "reasons", "evidence"}
+        # The gate's verdict carries the failing cases as well: the
+        # report entry and the failure fingerprint read them by name.
+        assert set(verdict) == {
+            "status", "reasons", "evidence", "failed_assertions",
+        }
+        assert verdict["failed_assertions"] == [], verdict
 
     def test_audit_artifact_is_written(self, tmp_path):
         agent = _make_agent(tmp_path)
