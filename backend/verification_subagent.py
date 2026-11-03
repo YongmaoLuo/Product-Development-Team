@@ -42,7 +42,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 # 2026-09-08: HardTimeoutError is raised by coding_tool when
 # the inner adaptive timer SIGKILLs a silent subprocess. The
@@ -979,6 +979,7 @@ class VerificationSubAgent:
         plan_id: str = "default",
         plan_dir: Optional[Path] = None,
         round_no: int = 0,
+        excluded_providers: Optional[Iterable[str]] = None,
     ) -> "Verdict":
         """Run a verification sub-agent invocation with self-heal retry.
 
@@ -1008,6 +1009,16 @@ class VerificationSubAgent:
             round_no: The round this run belongs to. It decides which
                 ``round-<n>/`` directory the refusal evidence lands in.
                 Only meaningful together with ``plan_dir``.
+            excluded_providers: Providers this call must NOT use (any
+                iterable of provider names). The exclusion set reaches
+                the dispatch, which skips those providers when it picks
+                one — that is how a retry gets a *different* provider
+                after the previous one failed for infra reasons (arch
+                decision point 2). ``None`` (the default) and an empty
+                collection both mean "exclude nobody", and neither adds
+                the keyword to the dispatch call: a stand-in tool with
+                the old narrow ``query_json`` signature must not blow
+                up on a keyword it never learned about.
 
         Returns:
             A :class:`Verdict` with ``verdict`` ∈ ``{"PASSED",
@@ -1075,6 +1086,7 @@ class VerificationSubAgent:
                     settings_path=settings_path,
                     log_path=log_path,
                     project_dir=project_dir,
+                    excluded_providers=excluded_providers,
                 )
         except BlockedPathError as e:
             # Security net intercepted an action; surface as a BLOCKED
@@ -1188,6 +1200,7 @@ class VerificationSubAgent:
         settings_path: str,
         log_path: Path,
         project_dir: Optional[Path] = None,
+        excluded_providers: Optional[Iterable[str]] = None,
     ) -> "Verdict":
         """Run the self-heal retry loop, returning the final Verdict.
 
@@ -1234,6 +1247,7 @@ class VerificationSubAgent:
                     log_path=log_path,
                     attempt=attempt,
                     project_dir=project_dir,
+                    excluded_providers=excluded_providers,
                 )
             except BlockedPathError:
                 # Propagate to the outer handler in run() so the
@@ -1433,6 +1447,7 @@ class VerificationSubAgent:
         log_path: Path,
         attempt: int,
         project_dir: Optional[Path] = None,
+        excluded_providers: Optional[Iterable[str]] = None,
     ) -> "Verdict":
         """Execute one verification attempt.
 
@@ -1441,6 +1456,15 @@ class VerificationSubAgent:
         :class:`BlockedPathError` if the security net blocks an
         action; the caller (``_self_heal_loop``) will propagate it
         to :meth:`run` for structured verdict construction.
+
+        ``excluded_providers`` is the set of providers this attempt must
+        not use. It is handed to the dispatch, which skips them when it
+        picks one — that is the "re-select the provider" half of arch
+        decision point 2. The set is only passed on when it is
+        non-empty: a stand-in tool with the old narrow ``query_json``
+        signature would raise ``TypeError`` on a keyword it never
+        learned about, and that error would be swallowed as a transport
+        failure.
         """
         if coding_tool is None:
             # Lazy import so the module remains importable in
@@ -1605,15 +1629,32 @@ class VerificationSubAgent:
                     # A thread that cannot start must never block the VP —
                     # the watchdog's second-chance checks still cover it.
                     _pump_thread = None
+                # 2026-11-03 (arch decision point 2 — provider
+                # re-selection): the provider that just failed must
+                # not be picked again. The exclusion set only becomes a
+                # keyword when it is non-empty: a stand-in tool with
+                # the old narrow ``query_json`` signature would raise
+                # ``TypeError`` on a keyword it never learned about,
+                # and that error would be swallowed by the
+                # transport-error arm below and reported as a FAILED
+                # verification point.
+                query_kwargs: Dict[str, Any] = {
+                    "prompt": prompt,
+                    "system_instruction": self.template,
+                    "timeout": None,
+                }
+                excluded: List[str] = [
+                    str(p) for p in (excluded_providers or []) if p
+                ]
+                if excluded:
+                    query_kwargs["excluded_providers"] = excluded
                 try:
                     response_dict = await _await_under_work_clock(
                         asyncio.to_thread(
                             _marshal_safe_on_worker_thread(
                                 scoped_tool.query_json,
                             ),
-                            prompt=prompt,
-                            system_instruction=self.template,
-                            timeout=None,
+                            **query_kwargs,
                         ),
                         work_clock,
                     )
@@ -1714,6 +1755,12 @@ class VerificationSubAgent:
                             f"coding tool call failed: {e}",
                         ],
                         evidence=[],
+                        # The provider that was serving the attempt when
+                        # the watchdog killed it — the retry has to know
+                        # which provider to skip.
+                        provider=getattr(
+                            scoped_tool, "current_call_provider", "",
+                        ) or "",
                         model_complexity=self.model_complexity,
                         failure_class=INFRA_FAILURE_CLASS,
                         failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
@@ -1737,6 +1784,14 @@ class VerificationSubAgent:
                     verdict="FAILED",
                     reasons=[f"coding tool call failed: {e}"],
                     evidence=[],
+                    # The provider that was serving the attempt when the
+                    # call blew up. An infra verdict that does not name
+                    # its provider cannot tell the ledger "this provider
+                    # is broken" from "this deliverable is broken" —
+                    # and the retry has nothing to exclude without it.
+                    provider=getattr(
+                        scoped_tool, "current_call_provider", "",
+                    ) or "",
                     model_complexity=self.model_complexity,
                     failure_class=INFRA_FAILURE_CLASS,
                     failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
@@ -1754,7 +1809,17 @@ class VerificationSubAgent:
                 # check (``verification_evidence`` for code_review /
                 # ui_validation, ``verification_api_runner`` for api_test)
                 # is what decides whether a PASSED is honoured.
-                return parse_verdict_to_dataclass(raw)
+                verdict = parse_verdict_to_dataclass(raw)
+                # 2026-11-03 (arch decision point 2): the sub-agent
+                # does not always declare which provider served it, and
+                # the dispatch does know. Fill the gap — but only the
+                # gap: a provider the payload DID declare is its own
+                # claim and is never overwritten.
+                if not verdict.provider:
+                    verdict.provider = getattr(
+                        scoped_tool, "current_call_provider", "",
+                    ) or ""
+                return verdict
             # NEGCTL-P0-1-BEGIN
             except VerdictParseError as e:
                 # 2026-10-22 (P0-1): a payload that cannot be parsed is

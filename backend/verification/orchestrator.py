@@ -30,6 +30,10 @@ from verification_agent import (
     # criterion layer that decides whether a round judged anything at
     # all. The orchestrator does not get a second, looser copy of it.
     _entry_is_environment_blocked,
+    # 2026-11-03: the same rule for the infra terminal — "did the
+    # environment never let the round judge this entry?"  ONE rule, the
+    # one the report builder wrote it with.
+    _entry_is_infrastructure_unresolved,
     # 2026-10-31: the evidence travels as a JSON **string** on the
     # report's entries, so every reader has to parse it before it can
     # ask a question of it.  ONE rule for that, the same one the agent
@@ -54,6 +58,7 @@ from verification_cancel import VerificationCancelled
 from verification.failure_triage import (
     CRITERION_DEFECT,
     DELIVERABLE_DEFECT,
+    INFRA,
     Disposition,
     disposition_for,
     is_not_looser,
@@ -892,6 +897,121 @@ def _judged_nothing_cycle_result(report: Mapping) -> dict:
         # report to read — the field is present on every return path so
         # a consumer can read it without guarding for its absence.
         "root_cause_scope_missing": [],
+    }
+
+
+def _all_failed_are_exhausted_infra(report: Any) -> bool:
+    """Did the environment swallow **every** failure of this round?
+
+    The infra terminal (2026-11-03) says a point was **never asked**:
+    its environment kept breaking until the cross-round retry budget
+    ran out, so the product was never judged.  Such a point carries no
+    verdict about the deliverable, and a round whose failures are all
+    of that kind has no verdict to give either.
+
+    Two conditions, and **both** of them:
+
+      * at least one entry carries the terminal
+        (:func:`verification_agent._entry_is_infrastructure_unresolved`
+        reads it off the marker, the terminal and the reason code), and
+      * no entry is a ``FAILED`` failure without the terminal — a real
+        defect is somebody's to fix, and it wins over this exit.
+
+    The second condition is what keeps the predicate from being
+    vacuously true: an all-``PASSED`` round and an empty round have no
+    failure at all, and a round that judged nothing must keep saying
+    so.  ``all()`` over an empty sequence would say "no real failure"
+    for every round in the world, including the ones that never failed
+    because they never ran.
+
+    A report that is not a mapping, or that carries no
+    ``verification_results``, is read as "no infra terminal" — the exit
+    is the rare thing, and the rare thing has to be *proved*.
+
+    Args:
+        report: The round's report.
+
+    Returns:
+        ``True`` when the round's failures are all exhausted infra
+        terminals.
+    """
+    if not isinstance(report, Mapping):
+        return False
+    entries = report.get("verification_results")
+    if not isinstance(entries, (list, tuple)):
+        return False
+    has_infra_terminal = False
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        if _entry_is_infrastructure_unresolved(entry):
+            has_infra_terminal = True
+            continue
+        if str(entry.get("status") or "") == "FAILED":
+            # A real defect: the chain has something to work on, so it
+            # keeps its repair path.
+            return False
+    return has_infra_terminal
+
+
+def _infrastructure_unresolved_cycle_result(report: Mapping) -> dict:
+    """The exit a round whose infra never resolved takes.
+
+    **Pure**: it reads the round's report and nothing else, so the exit
+    can be reasoned about — and tested — without standing up an
+    orchestrator and carrying its instance state around.
+    :meth:`VerificationOrchestrator.check_cycle_conditions` returns it
+    verbatim, so there is exactly one place where this exit is written
+    down.
+
+    The shape is the sibling exit's
+    (:func:`_judged_nothing_cycle_result`): both are rounds that judged
+    nothing, and both stop the chain with the verdict in the ``status``
+    and no new word in the closed reason vocabulary.
+
+    The two are **mutually exclusive**.  ``environment_blocked`` says
+    one outage took the round out; ``infrastructure_unresolved`` says
+    the environment kept breaking until the retry budget ran out.  A
+    consumer that reads one of them must never read both, so this exit
+    says ``environment_blocked: False`` and the sibling does not mention
+    the infra terminal at all.
+
+    Args:
+        report: The round's report.
+
+    Returns:
+        The round's exit dict.
+    """
+    if not isinstance(report, Mapping):
+        report = {}
+    return {
+        "should_continue": False,
+        "should_stop": True,
+        # The verdict is the ``status``; the reason vocabulary is
+        # closed, so this stop carries no new word.
+        "stop_reason": None,
+        "repair_tasks": [],
+        "waiting_for_user": False,
+        "status": "loop_stopped",
+        "intent_conflicts": [],
+        # 2026-10-31: an inconclusive round is the operator's turn —
+        # only a human can say whether the gate gets a bigger budget.
+        "needs_operator_decision": _round_needs_operator_decision(report),
+        # 2026-11-03: NOT environment-blocked.  The round was not taken
+        # out by one outage — the environment kept breaking until the
+        # infra budget ran out.  The two flags are mutually exclusive.
+        "environment_blocked": False,
+        # 2026-10-31: which phase ran out of budget — the evidence the
+        # operator needs to decide what happens next.
+        "budget_exhausted_in": _round_budget_exhausted_in(report),
+        # 2026-10-30: a round that judged nothing has no root-cause
+        # report to read — the field is present on every return path so
+        # a consumer can read it without guarding for its absence.
+        "root_cause_scope_missing": [],
+        # 2026-11-03: the round's own verdict — the environment never
+        # let it judge the deliverable, so there is nothing to repair
+        # and the chain does not iterate.
+        "infrastructure_unresolved": True,
     }
 
 
@@ -2335,6 +2455,11 @@ class VerificationOrchestrator:
           **no** repair task and **no** criterion delta — the question
           goes to a human (:meth:`_ask_a_human_about`).
 
+        2026-11-03: the infra terminal (``infrastructure_unresolved``) is
+        the environment's own verdict, and it wins over the class the
+        entry names: the point was never judged, so it buys **no** repair
+        task either.
+
         The split happens *before* the repair model is asked anything,
         so a failure that must not be repaired never reaches the model
         at all — not even as a row the parser has to drop.
@@ -2359,6 +2484,25 @@ class VerificationOrchestrator:
                 continue
             failure_class = failure_class_of(vp)
             disposition = disposition_for(failure_class)
+            if _entry_is_infrastructure_unresolved(vp):
+                # 2026-11-03 (arch decision point 3): the infra terminal
+                # is not a verdict about the deliverable — the point was
+                # **never asked**, because its environment kept breaking
+                # until the retry budget ran out.  It must not buy a
+                # repair task, whatever class the entry names: a rework
+                # cannot fix an environment that never let the round
+                # look, and a stale ``deliverable_defect`` sitting next
+                # to the terminal is exactly the ambiguity the terminal
+                # exists to remove.
+                #
+                # The record is still written down — the operator reads
+                # it to see which point the environment ate.
+                deferred.append({
+                    "id": str(vp.get("id") or ""),
+                    "failure_class": INFRA,
+                    "disposition": Disposition.RETRY_NOT_COUNTED,
+                })
+                continue
             if disposition == Disposition.RETRY_COUNTED:
                 repairable.append(vp)
                 continue
@@ -3544,6 +3688,11 @@ class VerificationOrchestrator:
           whose root-cause report named no file to change — the ones the
           chain handed to a human because nobody could act on the
           diagnosis
+        - infrastructure_unresolved: bool   2026-11-03: True when the
+          round's failures are all exhausted infra terminals — the
+          environment never let the round judge the deliverable, so the
+          chain stops instead of iterating.  Mutually exclusive with
+          ``environment_blocked``
         """
         overall_status = report.get("overall_status", "FAILED")
 
@@ -3641,6 +3790,41 @@ class VerificationOrchestrator:
                     f"took this round out — no verdict, nothing to repair"
                 )
             return _judged_nothing_cycle_result(report)
+
+        # 2026-11-03 (arch decision point 3 — 基础设施未解决就停，不进迭代):
+        # a round whose failures are all **exhausted infra terminals**.
+        #
+        # The point was never asked: its environment kept breaking until
+        # the cross-round retry budget ran out, so the product was never
+        # judged.  A round like that has no verdict about the deliverable
+        # — exactly like the environment-blocked round above — so it must
+        # not fall into the failure path.  There, the round asked the
+        # repair model to rework a deliverable for a defect nobody found,
+        # and the round after it asked the same question again, until the
+        # chain ran out of rounds and ended as ``max_rounds_reached``.
+        # That ending says "the deliverable never got through N tries";
+        # this round says "the environment never let us look".  Only the
+        # second one is true, and the chain has to stop on it.
+        #
+        # The exit is the sibling's: ``loop_stopped``, no repair task, no
+        # new word in the closed reason vocabulary — the verdict is the
+        # ``status`` and the flag beside it.  A real defect still wins:
+        # the predicate is false while any failure without the terminal
+        # is left, so a mixed round keeps its repair path.
+        if _all_failed_are_exhausted_infra(report):
+            # This round recorded no verdict, so it must not leave the
+            # same-cause counter pointing at the previous round's
+            # failures — same bookkeeping as a passing round.
+            self._previous_failed_ids = None
+            self._consecutive_same_failure_rounds = 0
+            self._last_round = round_number
+            self._save_loop_tracking()
+            print(
+                f"[Verification] round {round_number}: the environment "
+                f"never let this round judge the deliverable — no verdict, "
+                f"nothing to repair"
+            )
+            return _infrastructure_unresolved_cycle_result(report)
 
         # PASSED or PARTIAL with no real failures → treat as passed
         if overall_status == "PASSED" or (overall_status == "PARTIAL" and failed_count == 0 and deviation_count == 0):
