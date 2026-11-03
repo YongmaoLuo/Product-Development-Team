@@ -72,6 +72,13 @@ from verification_cancel import VerificationCancelled
 # error, and this dispatch must say so *before* it stamps the plan
 # ``executing`` and spawns a subprocess that can only fail.
 from project_dir_guard import ProjectDirInvalidError, validate_project_dir
+# 2026-11-02: the parked-for-capacity phase.  A repair round that ran
+# out of provider quota is parked under this word — the SAME word the
+# main execution path parks under (``routes.execution``), so the two
+# paths cannot drift apart on what "parked" means.  ``plan_status`` is
+# stdlib-only with no import-time side effects, so a top-level import
+# carries no cycle risk.
+from plan_status import QUOTA_WAIT_PHASE
 
 # The human-in-the-loop side of a verification round.  Imported by value
 # — ``expire_due`` in particular — so that the deadline sweep this
@@ -3825,7 +3832,37 @@ def _run_repair_execution_async(
                     # ------------------------------------------------------------
                     _unfinished = _count_unfinished_tasks(plan_id, tasks_file)
                     _left = int(_unfinished.get("pending_or_unstarted", 0) or 0)
-                    if _left > 0:
+                    if _left > 0 and _repair_parked_for_quota(tasks_file):
+                        # 2026-11-02: the executor parked the plan for
+                        # quota — every provider ran out of capacity — and
+                        # exited 0.  The leftover repair tasks are not
+                        # "work that failed to happen": nobody COULD run
+                        # them.  Recording that as a failure told the
+                        # operator their plan was broken when the only
+                        # thing that had happened was that the providers
+                        # ran dry, so the round is PARKED instead, under
+                        # the same word the main execution path parks
+                        # under (``plan_status.QUOTA_WAIT_PHASE``).
+                        #
+                        # Accounting only, exactly like the failure branch
+                        # below: the unfinished rows stay as they are
+                        # (``pending`` / ``in_progress`` / ``failed``) and
+                        # are NOT marked ``skipped``.  ``skipped`` is a
+                        # terminal SUCCESS status that unlocks downstream
+                        # under ``agent.is_dependency_ready``, so it would
+                        # let a downstream task start without the
+                        # upstream's output.
+                        state["status"] = QUOTA_WAIT_PHASE
+                        state["stop_reason"] = QUOTA_WAIT_PHASE
+                        state["repair_unfinished_tasks"] = _left
+                        _server.logger.warning(
+                            "[repair_async] executor exited 0 with %d repair "
+                            "task(s) still pending because every provider ran out "
+                            "of quota plan=%s round=%s — parking the plan, not "
+                            "failing it",
+                            _left, plan_id, state.get("round"),
+                        )
+                    elif _left > 0:
                         # Accounting only. The unfinished rows stay exactly
                         # as they are (``pending`` / ``in_progress`` /
                         # ``failed``) — they genuinely did not run and are
@@ -3865,7 +3902,15 @@ def _run_repair_execution_async(
                     state["executor_finished_cleanly"] = False
                     state["status"] = "failed"
                     state["stop_reason"] = "repair_non_zero_exit"
-                state["ended_at"] = datetime.now().isoformat()
+                # A parked round is not over — ``ended_at`` stays None so
+                # the readers that ask "did this run end?" are not told
+                # it did.  Every other outcome (completed, failed) ends
+                # the round.
+                state["ended_at"] = (
+                    None
+                    if state["status"] == QUOTA_WAIT_PHASE
+                    else datetime.now().isoformat()
+                )
 
             # Persist terminal status to plan_execution.
             try:
@@ -4716,6 +4761,110 @@ def _repair_path_stop_reason(plan_id: str) -> Optional[str]:
     if not isinstance(reason, str):
         return None
     return reason or None
+
+
+def _park_repair_for_quota(plan_id: str) -> bool:
+    """Park a quota-starved repair round under ``waiting_for_quota``.
+
+    The repair executor parks the plan when every provider ran out of
+    capacity: it writes ``stop_reason="waiting_for_quota"`` into the top
+    level of ``tasks.json`` and exits 0.  The marker is the same one the
+    main execution path parks under, so this reuses the main path's
+    disposition verbatim (``routes.execution._enter_quota_wait``) rather
+    than growing a second, repair-only spelling of "parked".
+
+    Returns ``True`` when the plan carries the park, and the caller MUST
+    return immediately — a parked round is not a failed round, so nothing
+    terminal may be written for it.  ``False`` means "no park" (no
+    marker, or the park itself failed) and the caller keeps its normal
+    disposition.
+
+    Idempotent: the plan is already parked when the PHASE ON DISK
+    already says ``waiting_for_quota``, so the park is not written a
+    second time.  The phase is written exactly once per park, and
+    whoever owns that write must be the only one to do it.
+
+    The idempotence check reads DISK, not the in-memory execution
+    state, and that distinction is the whole point: the runner writes
+    ``state["status"] = QUOTA_WAIT_PHASE`` into
+    ``_execution_state[plan_id]`` BEFORE it calls this function (see
+    the repair-async exit path).  Trusting that field would make this
+    guard return ``True`` on the very FIRST park — the "already
+    parked" evidence would be the caller's own in-memory decision,
+    made moments earlier and never persisted.  The park would then live
+    only in memory: the phase on disk would stay ``executing``,
+    ``stop_reason`` would stay NULL, no
+    ``execution_waiting_for_quota`` event would be written, and the
+    plan could never be started again (``executing`` is not outside
+    the 409 whitelist).  Disk is the only witness that a park actually
+    happened.
+
+    Why the park can fail: the marker lives in ``tasks.json``, and the
+    plan directory is not guaranteed to still be there (the plan was
+    deleted, the tree moved) or to still carry the marker (something
+    rewrote the file).  A park that could not happen must not look like
+    a park that did — hence ``False`` rather than an exception.
+    """
+    try:
+        plan_dir = _server._plan_dir(plan_id)
+        tasks_file = plan_dir / "tasks.json"
+        # The idempotence check must read what was PERSISTED, not the
+        # caller's in-memory decision: the runner writes
+        # ``state["status"] = QUOTA_WAIT_PHASE`` *before* it calls here,
+        # so trusting that field makes this guard return True on the
+        # very first park and the phase is never persisted at all.
+        # Disk is the only witness that the park actually happened.
+        try:
+            persisted_phase = _server.PlanState(plan_dir).get_current_phase()
+        except Exception:  # noqa: BLE001 — unreadable means "not parked yet"
+            persisted_phase = None
+        if persisted_phase == QUOTA_WAIT_PHASE:
+            # Already parked — the phase is written once.
+            return True
+        with _server._execution_state_lock:
+            state = _server._execution_state.setdefault(plan_id, {})
+        # Imported lazily, not at module level: ``server`` imports this
+        # module, so a module-level import of ``routes.execution`` (which
+        # ``server`` imports too) would add a second edge to a cycle that
+        # already exists.  The lazy import resolves the name at call
+        # time, when both modules are loaded.
+        from routes.execution import _enter_quota_wait
+        return bool(_enter_quota_wait(plan_id, plan_dir, state, tasks_file))
+    except Exception:  # noqa: BLE001 — a park that cannot happen is not a park
+        return False
+
+
+def _repair_parked_for_quota(tasks_file: Path) -> bool:
+    """Has this repair run parked itself for quota?
+
+    When every provider runs out of capacity the executor parks the plan
+    instead of failing it: it writes ``stop_reason="waiting_for_quota"``
+    into the top level of ``tasks.json`` and exits with rc=0.  The main
+    execution path reads that marker through
+    ``routes.execution._quota_wait_detail``; the repair path had no
+    reader at all, so a repair round that was parked for quota looked
+    exactly like a repair round that really had nothing left to do.
+
+    This is the repair path's only marker reader.  It answers "is this
+    parked?", never "why" — the detail is the server side's business
+    (see ``routes.execution._quota_wait_detail``).
+
+    ``False`` is the answer for everything that is not a marker: no file,
+    an unreadable file, broken JSON, no ``stop_reason``, or a different
+    ``stop_reason``.  A marker whose ``reason_detail`` is missing or not
+    JSON still counts — the detail is normalised to an empty dict, but
+    the marker itself stands.
+    """
+    try:
+        # Imported lazily, not at module level: ``server`` imports this
+        # module, so a module-level import of ``routes.execution`` (which
+        # ``server`` imports too) would add a second edge to a cycle that
+        # already exists. The lazy import resolves the name at call time,
+        # when both modules are loaded.
+        from routes.execution import _quota_wait_detail
+        return _quota_wait_detail(tasks_file) is not None
+    except Exception:  # noqa: BLE001 — an unreadable plan is not a marker
+        return False
 
 
 def _bump_repair_not_drained_guard(plan_id: str) -> int:
@@ -7930,6 +8079,17 @@ def _make_repair_on_complete(
         # ------------------------------------------------------------------
         _repair_stop_reason = _repair_path_stop_reason(plan_id)
         if _repair_stop_reason:
+            # 2026-11-02: a repair round PARKED for capacity is not a
+            # round that failed to drain — the guard below reads ANY
+            # non-empty stop reason that way.  A park is not a terminal
+            # verdict, and the undrained guard is not bumped either.
+            if _repair_stop_reason == QUOTA_WAIT_PHASE:
+                if _park_repair_for_quota(plan_id):
+                    _clear_repair_not_drained_guard(plan_id)
+                    return
+                # The park could not happen — fall through to the
+                # guard: a park that did not happen must not look like
+                # one that did.
             _still_pending = _get_pending_repair_tasks(plan_id)
             if _still_pending:
                 _guard_hits = _bump_repair_not_drained_guard(plan_id)
