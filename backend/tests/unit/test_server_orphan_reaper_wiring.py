@@ -42,6 +42,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -221,7 +222,7 @@ def test_lifespan_really_starts_the_reaper_outside_a_test_process(monkeypatch):
     monkeypatch.setattr(
         server_mod.orphan_reaper,
         "ensure_daemon",
-        lambda cfg: calls.append("ensure_daemon"),
+        lambda cfg, **kwargs: calls.append("ensure_daemon"),
     )
 
     _drive_lifespan(monkeypatch)
@@ -367,7 +368,7 @@ def test_start_calls_run_once_and_ensure_daemon(monkeypatch):
     monkeypatch.setattr(
         server_mod.orphan_reaper,
         "ensure_daemon",
-        lambda cfg: calls.append(("ensure_daemon", cfg)) or 4321,
+        lambda cfg, **kwargs: calls.append(("ensure_daemon", cfg)) or 4321,
     )
 
     server_mod._start_orphan_reaper()
@@ -396,7 +397,7 @@ def test_disabled_env_skips_both(monkeypatch, clean_spawn_env):
     monkeypatch.setattr(
         server_mod.orphan_reaper,
         "ensure_daemon",
-        lambda cfg: calls.append("ensure_daemon"),
+        lambda cfg, **kwargs: calls.append("ensure_daemon"),
     )
 
     server_mod._install_orphan_reaper_marks()
@@ -429,7 +430,7 @@ def test_run_once_failure_does_not_abort_startup(monkeypatch, caplog):
     monkeypatch.setattr(
         server_mod.orphan_reaper,
         "ensure_daemon",
-        lambda cfg: calls.append("ensure_daemon"),
+        lambda cfg, **kwargs: calls.append("ensure_daemon"),
     )
 
     with caplog.at_level(logging.WARNING):
@@ -443,7 +444,7 @@ def test_ensure_daemon_failure_does_not_abort_startup(monkeypatch, caplog):
     """A daemon that cannot be started costs the daemon and nothing else."""
     config = _Config(enabled=True)
 
-    def boom(_config):
+    def boom(_config, **kwargs):
         raise RuntimeError("the daemon cannot be started")
 
     monkeypatch.setattr(
@@ -476,6 +477,88 @@ def test_missing_reaper_module_is_a_no_op(monkeypatch, clean_spawn_env):
     assert server_mod._install_orphan_reaper_marks() is None
     assert server_mod._start_orphan_reaper() is None
     assert "PDT_SPAWN_OWNER_PID" not in os.environ
+
+
+# --------------------------------------------------------------------------
+# The daemon the backend starts does not outlive the backend
+# --------------------------------------------------------------------------
+#
+# The backend's daemon is *asked* to outlive the server — and the answer
+# is the configuration's, not the caller's.  The question "may this
+# daemon survive its owner?" has two answers when it is asked in two
+# places, and only one of them is a decision somebody made on purpose.
+#
+# On 2026-11-03 the answer was hard-coded: every backend on the machine
+# started a daemon that outlived it, and twenty-four of them were
+# walking the process table every thirty seconds, for ever.  The switch
+# is what makes it a decision again.
+
+
+def _launched_daemon(monkeypatch, tmp_path):
+    """Start the backend's reaper and return the daemon's command line.
+
+    The launcher is replaced by a recorder, so the daemon is never
+    really started — but everything else is the real thing: the real
+    configuration, read from the environment, and the real decision
+    about whether the daemon may outlive its owner.
+    """
+    launched = []
+
+    class _Popen:
+        pid = 4242
+
+        def __call__(self, args, **kwargs):
+            launched.append(list(args))
+            return SimpleNamespace(pid=self.pid)
+
+    real_ensure = server_mod.orphan_reaper.ensure_daemon
+
+    def _ensure(config, **kwargs):
+        return real_ensure(config, popen=_Popen(), **kwargs)
+
+    monkeypatch.setenv("PDT_PLANS_DIR", str(tmp_path))
+    monkeypatch.setattr(server_mod.orphan_reaper, "run_once", lambda cfg: None)
+    monkeypatch.setattr(server_mod.orphan_reaper, "ensure_daemon", _ensure)
+
+    server_mod._start_orphan_reaper()
+
+    assert launched, "the backend started no daemon at all"
+    return launched[0]
+
+
+def test_the_daemon_does_not_outlive_the_server_by_default(monkeypatch, tmp_path):
+    """The backend's daemon leaves with the backend, unless somebody says so.
+
+    The exemption from the owner rule is a decision somebody has to make
+    out loud.  Made by accident — for every backend on the machine, by a
+    single argument — it left twenty-four daemons walking one machine on
+    2026-11-02.
+    """
+    cmd = _launched_daemon(monkeypatch, tmp_path)
+
+    assert "--survive-owner" not in cmd, (
+        "the daemon must not outlive the backend unless the switch says so"
+    )
+    assert "--owner-pid" in cmd, (
+        "a daemon that leaves with its owner has to know who the owner is"
+    )
+
+
+def test_the_detach_switch_is_explicit(monkeypatch, tmp_path):
+    """``PDT_ORPHAN_REAPER_DETACH_OWNER=1`` is what says it out loud.
+
+    The switch is what makes the exemption a decision: without it the
+    daemon is attached, and with it the daemon is told that it may
+    outlive the server — which is a real answer, taken on purpose.
+    """
+    monkeypatch.setenv("PDT_ORPHAN_REAPER_DETACH_OWNER", "1")
+
+    cmd = _launched_daemon(monkeypatch, tmp_path)
+
+    assert "--survive-owner" in cmd
+    assert "--owner-pid" not in cmd, (
+        "a daemon that survives its owner must not also record one"
+    )
 
 
 # --------------------------------------------------------------------------

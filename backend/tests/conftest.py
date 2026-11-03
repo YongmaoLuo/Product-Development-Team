@@ -16,6 +16,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -100,6 +101,17 @@ from tests.fixtures.verification_mode import (  # noqa: E402
     upstream_repo,
     verification_plan,
     workspace_root,
+)
+
+# The census of the reaper daemons running right now, and the reclaim that
+# takes back the ones this run started.  They live in their own module
+# because the *rule* — which daemons belong to this run — is the part worth
+# having exactly one copy of: a second copy is a copy that drifts, and the
+# drift is invisible (it either stops the developer's own daemon, or leaves
+# the suite's behind).  See ``tests/reaper_daemon_guard.py``.
+from tests.reaper_daemon_guard import (  # noqa: E402
+    reclaim_new_daemons,
+    snapshot_daemons,
 )
 
 
@@ -396,6 +408,64 @@ def _hermetic_state_db_dir():
         shutil.rmtree(_TEST_STATE_DB_DIR, ignore_errors=True)
     if os.getpid() == _LOCK_ROOT_OWNER_PID:
         shutil.rmtree(_LOCK_ROOT, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# The reaper daemons this session started
+# ---------------------------------------------------------------------------
+#
+# A reaper daemon is written to outlive the process that started it — that
+# is what a daemon *is*.  The suite drives real servers, and a real server
+# starts a reaper daemon on the plan root it was given; when the test
+# terminates that server, the daemon is still there, because it was asked
+# to survive and it did.
+#
+# So every test that starts a server leaves a daemon behind, and the
+# daemons accumulate for as long as the machine lives.  The obvious fix —
+# stop every reaper daemon on the machine — is the wrong one: it would
+# take the developer's own services down with it, and those daemons are
+# indistinguishable from the suite's.
+#
+# ``tests/reaper_daemon_guard.py`` holds the rule that is not wrong.  A
+# daemon belongs to this run when it was **not** running when the run took
+# its census, and it serves a root **this run made** — a root pytest made,
+# or a root inside this session's own temporary tree.  Both halves are
+# necessary and neither is enough on its own: the census alone would claim
+# the developer's own daemon on the next run, and the root alone would
+# claim the daemon an earlier run left behind on the same tree.
+#
+# The session tree is in the rule for the daemons the **backend** starts:
+# they serve the session's plan root and are started with
+# ``--survive-owner``, so they outlive the server that started them.  The
+# fixture is session-scoped, and under xdist every worker is its own
+# process with its own session root — so each worker takes back its own
+# daemons and leaves the other workers' alone.
+#
+# So the census goes in at session start and the reclaim goes out at
+# session end.  The census is what makes "not higher than before the run"
+# a fact about the run and not a fact about the machine.
+#
+# Nothing here raises: a cleanup that failed must not take the whole run
+# down over litter.
+@pytest.fixture(scope="session", autouse=True)
+def _reclaim_reaper_daemons():
+    """Take back the reaper daemons this session started, and only those.
+
+    The daemons that were already running when the session started belong
+    to somebody else — the developer's own server, most often — and the
+    daemons of a root this session did not make are not this session's
+    either.  The guard module applies both rules; this fixture only asks
+    the question and hands back the answer.
+    """
+    before = snapshot_daemons()
+    yield
+    try:
+        reclaim_new_daemons(before)
+    except Exception:  # noqa: BLE001 - cleanup must not fail the session
+        warnings.warn(
+            "the reaper daemons this session started could not be reclaimed",
+            RuntimeWarning,
+        )
 
 
 # ---------------------------------------------------------------------------

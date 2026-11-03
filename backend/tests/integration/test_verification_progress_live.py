@@ -38,6 +38,7 @@ import socket
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -52,6 +53,10 @@ _BACKEND_DIR = Path(__file__).resolve().parents[2]
 _REPO_ROOT = _BACKEND_DIR.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
+
+# 守护进程的回收入口。守护是「活得比启动它的进程更久」的东西，所以
+# 收掉 server 不会带走它 —— 收守护得单独收。
+import orphan_reaper  # noqa: E402
 
 
 #: 计划 id。每个用例各有各的 tmp 目录与 ``state.db``，所以同一个 id
@@ -221,12 +226,17 @@ class _LiveServer:
         proc: subprocess.Popen,
         requested_port: int,
         log_path: Path,
+        plans_root: Path,
         log_handle: Any = None,
     ) -> None:
         self.proc = proc
         self.requested_port = requested_port
         self.port = requested_port
         self.log_path = log_path
+        #: The plan root this server was given.  The reaper daemon it
+        #: started serves that root, so the teardown needs to know which
+        #: root's daemons are this server's own.
+        self.plans_root = plans_root
         self.log_handle = log_handle
         self._stopped = False
 
@@ -397,7 +407,7 @@ def _spawn_server(
         stdout=log,
         stderr=subprocess.STDOUT,
     )
-    server = _LiveServer(proc, port, log_path, log_handle=log)
+    server = _LiveServer(proc, port, log_path, plans_root, log_handle=log)
     try:
         _wait_until_ready(server)
     except AssertionError:
@@ -470,18 +480,35 @@ def live_server(tmp_path: Path, register_child_process) -> Iterator[_LiveServer]
 
     Function 级：每个用例各自起停，不共享 module 级实例。夹具的
     ``finally`` 负责回收 —— 就算用例自己先崩了，进程也不会留在机器上。
+
+    守护也在这里收：守护是「活得比启动它的进程更久」的东西，所以收掉
+    server 并不带走它。
     """
     plans_root = tmp_path / "plans"
     state_db = tmp_path / "state.db"
     _write_plan(plans_root / _PLAN_ID)
     _seed_verdicts(state_db)
     log_path = tmp_path / "server.log"
-    server = _start_live_server(plans_root, state_db, log_path)
-    register_child_process(server.proc)
+    server: Optional[_LiveServer] = None
     try:
+        server = _start_live_server(plans_root, state_db, log_path)
+        register_child_process(server.proc)
         yield server
     finally:
-        server.stop()
+        if server is not None:
+            server.stop()
+        # 回收守护。守护是被要求「活得比启动它的进程更久」的，所以收掉
+        # server 并不带走它 —— 守护还在机器上占着内存、占着 plan root 的
+        # 锁。这个 server 的守护服务的是 pytest 造出来的 root，按 root
+        # 收，收回的是本夹具自己的垃圾，不是别人的。
+        root = server.plans_root if server is not None else plans_root
+        try:
+            orphan_reaper.stop_daemons_for_plans_root(root)
+        except Exception:  # noqa: BLE001 - teardown must not fail the test
+            warnings.warn(
+                "the reaper daemons of {0} could not be stopped".format(root),
+                RuntimeWarning,
+            )
 
 
 # ---------------------------------------------------------------------------
