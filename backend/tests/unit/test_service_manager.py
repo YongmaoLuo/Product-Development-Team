@@ -700,7 +700,16 @@ def test_stop_service_reports_a_free_port_when_there_is_nothing_to_stop(
 #: on (32768 and up on Linux, 49152 and up on macOS and Windows), so the
 #: kernel cannot hand one of them out for an outgoing connection while
 #: the service is binding it.
-_PORT_BLOCK_START = 20000
+#:
+#: The range starts **above** the one the pre-fix allocator used (20000
+#: plus one block per worker, for 128 workers -- see
+#: :data:`_PRE_FIX_PORT_RANGE`).  The partition keeps two workers of
+#: one run apart; it did not keep two *runs* apart, and two suites that
+#: draw the same port also share a stop: the neighbour's stop re-probes
+#: the port, finds the winner, and takes it with it (2026-11-03,
+#: VP-018).  A suite that still runs the pre-fix allocator must not be
+#: able to reach a port of this one, so the two ranges do not meet.
+_PORT_BLOCK_START = 28192
 
 #: How many ports one worker owns.
 _PORT_BLOCK_SIZE = 64
@@ -715,7 +724,18 @@ _PORT_BLOCK_SIZE = 64
 #: collision this partition exists to remove, back through the front
 #: door.  So the number of blocks is fixed and generous instead, and
 #: the whole range stays below the ephemeral range.
-_PORT_WORKER_COUNT = 128
+#:
+#: Sixty-four workers is the number the range above carries with room
+#: to spare: the blocks have to start above the pre-fix range
+#: (20000 .. 28191) and end below the ephemeral range (32768), and
+#: sixty-four blocks of sixty-four ports fit in what is left of it.
+_PORT_WORKER_COUNT = 64
+
+#: The range the pre-fix allocator used: 20000, one block of 64 ports
+#: per worker, 128 workers.  Kept as a number so that the range above
+#: can be checked against it -- the two must not meet, or two suites on
+#: one machine draw the same ports and take each other's services.
+_PRE_FIX_PORT_RANGE = (20000, 20000 + 128 * _PORT_BLOCK_SIZE)
 
 #: The next port of this worker's block to be handed out.
 #:
@@ -1253,6 +1273,11 @@ def test_stop_service_releases_a_real_port():
     try:
         runtime = sm.ServiceRuntime(
             name="stub", port=port, pid=pid, pgid=sm._process_group_of(pid),
+            # The runtime says when its process started: that is the
+            # anchor the stop path's identity gate compares the live
+            # process against, and a runtime that cannot place its own
+            # pid is not signalled (2026-11-03, VP-018, L2).
+            start_epoch=time.time(),
         )
         result = sm.stop_service(runtime, grace_seconds=10.0)
         assert result["port_free"] is True
@@ -1327,6 +1352,11 @@ def test_stop_service_escalates_when_sigterm_is_ignored():
         runtime = sm.ServiceRuntime(
             name="stubborn", port=port, pid=pid,
             pgid=sm._process_group_of(pid),
+            # The runtime says when its process started: that is the
+            # anchor the stop path's identity gate compares the live
+            # process against, and a runtime that cannot place its own
+            # pid is not signalled (2026-11-03, VP-018, L2).
+            start_epoch=time.time(),
         )
         result = sm.stop_service(runtime, grace_seconds=2.0)
         assert result["port_free"] is True
@@ -1431,6 +1461,81 @@ def test_health_url_fails_when_nothing_serves_it():
     )
 
     assert sm.wait_until_ready(decl, timeout_seconds=2) is False
+
+
+# ---------------------------------------------------------------------------
+# The readiness wait has to see the death (2026-11-03, VP-018, L3)
+# ---------------------------------------------------------------------------
+#
+# The wait used to ask the port and nothing else, so a child that died
+# a second after it was started still cost the round the whole declared
+# budget -- 30 seconds in the incident -- and the failure line then
+# said "not ready after 30s", which is the one number an operator
+# reads as "it was still starting".
+#
+# The wait can only end early if it can see the child, and it cannot be
+# *given* the child: ``wait_until_ready`` is a seam the whole test
+# suite stubs as ``lambda decl, t=None: True``, and a new argument
+# would break every one of those stubs.  So the child is published for
+# the duration of the wait, and the wait reads it when it is there.
+
+
+def _doomed_declaration(port: int, budget: int = 60):
+    """A declared service whose shell kills itself with SIGTERM.
+
+    ``kill -TERM $$`` is the shell's own pid, so the child dies **from
+    the signal** -- ``rc`` is ``-15`` -- rather than exiting with a
+    code, which is what the incident's seven dead services did.
+    """
+    return _decl(
+        name="doomed", port=port,
+        start_cmd="kill -TERM $$",
+        ready_timeout_seconds=budget,
+    )
+
+
+def _waited_seconds(detail: str) -> Optional[float]:
+    """The number of seconds the failure line reports, or ``None``."""
+    match = re.search(r"after (\d+(?:\.\d+)?)s", detail)
+    return float(match.group(1)) if match else None
+
+
+@pytest.mark.timeout(120)
+def test_the_readiness_wait_ends_when_the_child_dies(tmp_path: Path):
+    """A child that dies at once must not burn the declared budget."""
+    port = _free_port()
+    decl = _doomed_declaration(port, budget=60)
+
+    started = time.monotonic()
+    runtime = sm.start_service(decl, tmp_path)
+    elapsed = time.monotonic() - started
+
+    assert runtime.ready is False, runtime.detail
+    assert elapsed < 20, (
+        f"the wait burned {elapsed:.1f}s of a declared 60s budget"
+    )
+    # The declared budget is not what happened, and the line must not
+    # claim it was.
+    assert "60s" not in runtime.detail, runtime.detail
+    waited = _waited_seconds(runtime.detail)
+    assert waited is not None, runtime.detail
+    assert waited < 10, runtime.detail
+
+
+@pytest.mark.timeout(120)
+def test_the_failure_line_states_the_actual_wait_and_the_signal(tmp_path: Path):
+    """The failure line says what happened, not what was declared."""
+    port = _free_port()
+    decl = _doomed_declaration(port, budget=60)
+
+    runtime = sm.start_service(decl, tmp_path)
+
+    assert runtime.ready is False, runtime.detail
+    assert "SIGTERM" in runtime.detail, runtime.detail
+    assert "60s" not in runtime.detail, runtime.detail
+    waited = _waited_seconds(runtime.detail)
+    assert waited is not None, runtime.detail
+    assert waited < 10, runtime.detail
 
 
 # ---------------------------------------------------------------------------
@@ -2044,6 +2149,11 @@ def test_stop_reports_the_port_free_despite_a_lingering_client(tmp_path):
     try:
         runtime = sm.ServiceRuntime(
             name="stub", port=port, pid=pid, pgid=sm._process_group_of(pid),
+            # The runtime says when its process started: that is the
+            # anchor the stop path's identity gate compares the live
+            # process against, and a runtime that cannot place its own
+            # pid is not signalled (2026-11-03, VP-018, L2).
+            start_epoch=time.time(),
         )
         result = sm.stop_service(runtime, grace_seconds=10.0)
         assert result["port_free"] is True, (
@@ -2066,6 +2176,11 @@ def test_reap_clears_the_ledger_despite_a_lingering_client(tmp_path):
             name="stub", port=port, pid=pid, pgid=sm._process_group_of(pid),
             start_cmd="stub", cwd=str(tmp_path),
             origin="spawned",
+            # The runtime says when its process started: that is the
+            # anchor the stop path's identity gate compares the live
+            # process against, and a runtime that cannot place its own
+            # pid is not signalled (2026-11-03, VP-018, L2).
+            start_epoch=time.time(),
         )
         # The ledger is written directly: a pin means "a live round is
         # using this process", and this test is about the reaping of an
@@ -4995,6 +5110,37 @@ def test_stopping_a_relocated_service_never_reaches_the_test_session(
 # the service is binding it.
 
 
+def test_the_port_range_does_not_meet_the_range_of_the_pre_fix_allocator(
+    monkeypatch,
+) -> None:
+    """Two suites on one machine must not draw the same port.
+
+    The partition above keeps two **workers of one run** apart.  It does
+    not keep two **runs** apart: the blocks are numbered from a fixed
+    start, so a suite that still runs the pre-fix allocator draws the
+    same numbers as this one.  The two suites then fight over one port,
+    and the fight has the shape described above -- the neighbour's stop
+    re-probes the port, finds the winner, sees a command line that
+    matches its own declaration, and takes it with it (2026-11-03,
+    VP-018).
+
+    So the allocator works in a range of its own, above the one the
+    pre-fix allocator used.  The two must not meet; that is the whole
+    of the fix, and it is a fix in the *harness*: the stop path can only
+    refuse to kill a stranger once the stop path knows about it, and a
+    suite that runs the pre-fix code does not.
+    """
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    port = _free_port()
+
+    low, high = _PRE_FIX_PORT_RANGE
+    assert not (low <= port < high), (
+        f"port {port} is inside the range the pre-fix allocator used "
+        f"({low}-{high - 1}); two allocators that share a port also share "
+        f"a stop, and one suite's stop takes the other's service"
+    )
+
+
 def test_two_workers_do_not_draw_the_same_port(monkeypatch):
     """The port of one worker must not be the port of another.
 
@@ -5226,3 +5372,252 @@ def test_no_readiness_deadline_in_this_module_is_a_wall_clock_literal():
         f"seconds or more: {waited!r}; a wait that has to succeed is the "
         "shared gate's budget"
     )
+
+
+# ---------------------------------------------------------------------------
+# The anchor has to travel with the record (2026-11-03, VP-018)
+# ---------------------------------------------------------------------------
+#
+# The stop path's identity gate compares the start time of the live
+# process with the start time the **record** carries.  A record that
+# does not carry one leaves the gate nothing to compare against, and a
+# gate with nothing to compare against is a gate that cannot refuse:
+# the pid is signalled on the strength of the number alone.
+#
+# The ledger already knows when every service started — the row is
+# written from the runtime, which took the anchor right after the
+# spawn.  What was missing was the last step of the journey: the row's
+# start time has to reach the runtime that the stop path builds.
+
+
+def test_a_ledger_row_carries_its_start_time_into_the_runtime() -> None:
+    """The runtime rebuilt from a ledger row knows when its service started.
+
+    Without it the identity gate has nothing to compare the live
+    process against, and a pid that the kernel has handed to somebody
+    else is signalled on the strength of the number alone.
+    """
+    entry = _entry(pid=4242, pgid=4242, start_epoch=1_700_000_000.5)
+
+    runtime = sm._runtime_from_ledger_entry(entry)
+
+    assert runtime.start_epoch == 1_700_000_000.5, (
+        "the start time of the service must survive the trip through the "
+        f"ledger; got {runtime.start_epoch!r}"
+    )
+
+
+def test_the_ledger_evidence_carries_the_start_time_of_the_holder(tmp_path: Path) -> None:
+    """The evidence about a leftover says when that leftover started.
+
+    The reclaim path builds its runtime out of this evidence, so the
+    start time has to be part of it — otherwise the reclaim stops a pid
+    it cannot identify.
+    """
+    plan_dir = tmp_path / "plan"
+    _write_ledger(plan_dir, [
+        _entry(port=3000, pid=4242, start_epoch=1_700_000_000.5),
+    ])
+    decl = _decl(port=3000)
+    probe = PortProbe(
+        port=3000, listening=True, pids=[4242],
+        cmdlines=["npx next dev -p 3000"],
+    )
+
+    evidence = sm._ledger_holder_evidence(plan_dir, decl, probe)
+
+    assert evidence is not None, "the ledger row was not matched"
+    assert evidence["start_epoch"] == 1_700_000_000.5, (
+        "the evidence must say when the holder started; got "
+        f"{evidence!r}"
+    )
+
+
+def test_the_reclaim_path_refuses_a_pid_the_ledger_says_was_recycled(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The ledger's start time is the reclaim path's anchor.
+
+    The ledger says "pid 4242 started at 1.0".  The number is alive,
+    but it started just now: the kernel handed the number to somebody
+    else.  A reclaim that signals it kills an unrelated process on the
+    strength of a row that is about a different life.
+    """
+    port = _free_port()
+    decl = _decl(port=port, name="chart")
+
+    # A live process that is not the one the ledger row is about.
+    other = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+    try:
+        # The identity of the process has to be readable, or there is
+        # nothing to compare the ledger's start time against.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            identity = sm.probe_process_identity(other.pid)
+            if identity is not None and identity.create_time is not None:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("the other process never became readable")
+
+        evidence = {
+            "source": "ledger",
+            "plan_id": "plan-1",
+            "pid": other.pid,
+            "pgid": None,
+            "start_epoch": 1.0,
+            "start_cmd": decl.start_cmd,
+            "cwd": str(tmp_path),
+        }
+        monkeypatch.setattr(
+            sm, "start_service",
+            lambda decl, project_dir: sm.ServiceRuntime(
+                name=decl.name, port=decl.port,
+            ),
+        )
+
+        sm._reclaim_leftover(decl, tmp_path, evidence)
+
+        assert other.poll() is None, (
+            "a pid the ledger says was recycled must not be signalled; it "
+            f"was killed (exit code {other.poll()})"
+        )
+    finally:
+        try:
+            other.kill()
+        except OSError:
+            pass
+        try:
+            other.wait(timeout=5)
+        except subprocess.TimeoutExpired:  # pragma: no cover - cleanup only
+            pass
+
+
+# ---------------------------------------------------------------------------
+# The anchor is the kernel's record, not our clock (2026-11-03, VP-018, L2)
+# ---------------------------------------------------------------------------
+#
+# The anchor — ``runtime.start_epoch`` — is the number the stop path
+# compares the live process against, and that comparison tolerates two
+# seconds (:data:`process_identity.CREATE_TIME_TOLERANCE`).
+#
+# The anchor is read on the **parent's** clock, right after the fork.
+# Between the fork and that reading the parent can be descheduled: the
+# root-cause report caught the anchor five seconds late once, which is
+# more than twice the tolerance, and moving the reading up next to the
+# fork only narrowed that window — it did not remove it.
+#
+# The kernel knows when the child started.  The anchor has to be its
+# answer, and our own clock only when the kernel has none.
+
+
+class _LateClock:
+    """``time`` with the clock reading five seconds in the future.
+
+    Only :mod:`service_manager` sees this clock — the rest of the
+    process keeps the real one — so the test measures the service
+    manager's own reading and nothing else.
+    """
+
+    def __init__(self, clock, delay: float) -> None:
+        self._clock = clock
+        self._delay = delay
+
+    def time(self) -> float:
+        return self._clock() + self._delay
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
+def _late_clock(monkeypatch, delay: float = 5.0) -> None:
+    """Make the service manager's own clock read five seconds late."""
+    monkeypatch.setattr(sm, "time", _LateClock(time.time, delay))
+
+
+def _stub_declaration(port: int):
+    import sys as _sys
+
+    script = (
+        "import http.server,socketserver;"
+        f"socketserver.TCPServer(('127.0.0.1',{port}),"
+        "http.server.SimpleHTTPRequestHandler).serve_forever()"
+    )
+    return _decl(
+        name="stub", port=port,
+        start_cmd=f"{shlex.quote(_sys.executable)} -c {shlex.quote(script)}",
+        ready_timeout_seconds=int(_readiness_budget_seconds(20)),
+    )
+
+
+@pytest.mark.timeout(120)
+def test_the_anchor_is_the_kernel_s_own_record_and_not_our_clock(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A late reading of our own clock must not become the identity.
+
+    The parent is descheduled for five seconds between the fork and the
+    clock read — the shape of the failure the report found.  The anchor
+    the service is recorded with still has to be the moment the service
+    really started: an anchor five seconds late makes the identity gate
+    call our own service "recycled" and refuse to stop it.
+    """
+    decl = _stub_declaration(_free_port())
+
+    _late_clock(monkeypatch)
+
+    runtime = sm.start_service(decl, tmp_path)
+    try:
+        assert runtime.pid, runtime.detail
+        identity = sm.probe_process_identity(runtime.pid)
+        if identity is None or identity.create_time is None:
+            pytest.skip("the kernel cannot describe the process here")
+        drift = abs(float(runtime.start_epoch) - float(identity.create_time))
+        assert drift <= sm.CREATE_TIME_TOLERANCE, (
+            "the anchor must be the kernel's own record of the child's "
+            f"start, not a late reading of our clock: it is {drift:.3f}s "
+            f"away from it, and the identity comparison only tolerates "
+            f"{sm.CREATE_TIME_TOLERANCE}s"
+        )
+    finally:
+        if runtime.pid:
+            _force_cleanup(runtime.pid)
+
+
+@pytest.mark.timeout(120)
+def test_the_stop_path_still_signals_a_service_whose_clock_read_was_late(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A late anchor must not turn our own service into a stranger.
+
+    The gate compares the live start time with the recorded one and
+    refuses when the two disagree by more than the tolerance.  An anchor
+    that is five seconds late makes the gate call our own service
+    "recycled" — and then the service is never stopped, the port stays
+    held, and the next round waits for a service that is not coming.
+    """
+    decl = _stub_declaration(_free_port())
+
+    _late_clock(monkeypatch)
+
+    runtime = sm.start_service(decl, tmp_path)
+    try:
+        assert runtime.ready is True, runtime.detail
+        if sm.probe_process_identity(runtime.pid) is None:
+            pytest.skip("the kernel cannot describe the process here")
+        outcome = sm.kill_service(
+            runtime, "test.late_clock", "the service is ours",
+            plan_dir=tmp_path,
+        )
+        assert outcome["signalled"], (
+            "our own service must still be signalled; it was refused: "
+            f"{outcome['refused']!r}"
+        )
+    finally:
+        if runtime.pid:
+            _force_cleanup(runtime.pid)

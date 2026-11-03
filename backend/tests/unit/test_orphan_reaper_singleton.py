@@ -190,10 +190,18 @@ def test_ensure_daemon_command_line_and_detachment(tmp_path):
     the backend dying is exactly the situation the daemon exists for.
     The working directory is the repository root so that
     ``python -m backend.orphan_reaper`` resolves.
+
+    The call asks for a **detached owner** (``detach_owner=True``), so
+    the daemon is exempted from the owner rule and outlives whoever
+    started it.  That is the server's daemon; the default call — one
+    that records its owner and leaves with it — is pinned in
+    ``test_ensure_daemon_owner.py``.
     """
     fake = _FakePopen()
 
-    reaper.ensure_daemon(_config(tmp_path), repo_root=tmp_path, popen=fake)
+    reaper.ensure_daemon(
+        _config(tmp_path), repo_root=tmp_path, popen=fake, detach_owner=True
+    )
 
     args, kwargs = fake.only
     cmd = list(args[0])
@@ -206,6 +214,7 @@ def test_ensure_daemon_command_line_and_detachment(tmp_path):
         "17",
         "--plans-root",
         str(tmp_path),
+        "--survive-owner",
     ]
     assert kwargs["start_new_session"] is True
     assert Path(kwargs["cwd"]) == tmp_path

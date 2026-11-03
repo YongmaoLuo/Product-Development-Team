@@ -101,6 +101,9 @@ Variable                     Default    Meaning
                                         which the same applies
 ``PDT_ORPHAN_REAPER_PID_SCOPE``  (none)  restrict the scan to these pids
                                         (a testing scope gate)
+``PDT_ORPHAN_REAPER_MAX_DAEMONS``  ``8``  most reaper daemons the
+                                        machine may run at once (0
+                                        disables the ceiling)
 ===========================  =========  ====================================
 
 A malformed value never raises: it falls back to the default, because a
@@ -130,8 +133,40 @@ second) and prints it.  Two modes do the work:
     holds the reaper's lock while it runs, and a second one stands
     down immediately.
 
+    That lock is scoped to one root and can be defeated by deleting
+    the lock file, so the daemon also reads the machine's own process
+    table before it starts scanning.  It stands down when **another
+    daemon is already serving its root**, and when **the machine is
+    already running its quota of daemons**
+    (``PDT_ORPHAN_REAPER_MAX_DAEMONS``).  The quota counts the
+    daemons that are watching a root which is still there: a daemon
+    watching a deleted root is watching nothing, and is on its way
+    out.  A quota of zero turns the ceiling off.
+
+    The quota is a bound on the machine's *resident* daemons, so it
+    is asked of a daemon that is starting on its own — one that keeps
+    running after the process that started it is gone.  A daemon whose
+    lifetime its caller owns is not one of those: it leaves with the
+    caller, and it does not add to the population the ceiling bounds.
+
+    A daemon also leaves when the process that **started it** is
+    gone: it was started for that process, and once that process is
+    over there is nothing left for it to do.  The owner is recorded as
+    a pid *and* a start time, so that a recycled pid is not mistaken
+    for the owner.  The owner is the parent by default
+    (``--owner-pid`` / ``--owner-start`` say otherwise), and
+    ``--survive-owner`` exempts the daemon entirely — which is what
+    the daemon the *server* starts uses, because it exists for the
+    case where the server dies.
+
 ``--dry-run`` turns the deciding on and the acting off: every verdict
 is reached and written down, and not one signal is sent.
+
+``--status``
+    the machine-level census of the reaper daemons, printed as JSON:
+    how many there are, which root each serves, how long each has been
+    running.  The lock says whether *this* root is held; this says
+    what the machine is actually running.
 """
 
 from __future__ import annotations
@@ -188,6 +223,10 @@ __all__ = [
     "KIND_REAPER",
     "ALL_KINDS",
     "DEFAULT_PROTECT_PORTS",
+    "DEFAULT_MAX_DAEMONS",
+    "DEFAULT_DETACHED_LEASE",
+    "MAX_EVENTS_BYTES",
+    "ENV_DETACH_OWNER",
     "ReaperConfig",
     "default_plans_root",
     "config_from_env",
@@ -238,12 +277,18 @@ __all__ = [
     "events_path",
     "alerts_path",
     "write_events",
+    "write_skipped_summary",
+    "write_pass_events",
     "should_force_cleanup",
     "emit_alert",
     "lock_path",
     "acquire_lock",
     "daemon_alive",
     "ensure_daemon",
+    "ReaperDaemon",
+    "list_reaper_daemons",
+    "daemon_status",
+    "stop_daemons_for_plans_root",
     "run_once",
     "run_daemon",
     "build_arg_parser",
@@ -306,6 +351,17 @@ ENV_DRY_RUN = "PDT_ORPHAN_REAPER_DRY_RUN"
 ENV_BURST_THRESHOLD = "PDT_ORPHAN_REAPER_BURST_THRESHOLD"
 ENV_SWAP_THRESHOLD = "PDT_ORPHAN_REAPER_SWAP_THRESHOLD"
 ENV_PID_SCOPE = "PDT_ORPHAN_REAPER_PID_SCOPE"
+ENV_MAX_DAEMONS = "PDT_ORPHAN_REAPER_MAX_DAEMONS"
+
+#: The environment variable that says a daemon may outlive the process
+#: that started it.
+#:
+#: The exemption from the owner rule is a decision somebody has to make
+#: out loud.  Made by accident — for every backend on the machine, by a
+#: single argument in the source — it left twenty-four daemons walking
+#: one machine on 2026-11-02, each of them scanning every process on
+#: the box every thirty seconds, for ever.
+ENV_DETACH_OWNER = "PDT_ORPHAN_REAPER_DETACH_OWNER"
 
 #: Environment variable that redirects the plan-artifact root.
 ENV_PLANS_DIR = "PDT_PLANS_DIR"
@@ -327,6 +383,44 @@ DEFAULT_SWAP_THRESHOLD = 90.0
 #: backend may run for days — and it is the *last* door out, behind
 #: the idle streak and behind the "my world has been deleted" check.
 DEFAULT_MAX_LIFETIME = 86400
+
+#: The most reaper daemons that may run on one machine at the same time.
+#:
+#: The lock makes the daemon a singleton *per plan root*, and nothing
+#: more: a daemon on another root neither excludes this one nor is
+#: excluded by it, and the lock file itself can be recreated — deleting
+#: it and starting a new daemon hands the new one a fresh inode to
+#: lock, so two daemons end up watching one root.  On 2026-11-02 this
+#: machine was running 145 daemons at once, most of them watching
+#: temporary directories nobody used any more.
+#:
+#: A ceiling on the machine as a whole is what stops the accumulation:
+#: a daemon that would push the machine past the ceiling stands down
+#: instead of starting.  Zero turns the ceiling off.
+DEFAULT_MAX_DAEMONS = 8
+
+#: The lease a daemon that may outlive its owner is given, in seconds.
+#:
+#: A daemon that leaves with the process that started it has an end
+#: already: the owner goes, the daemon goes.  A **detached** daemon has
+#: no such end — that is the whole point of the exemption — so it is
+#: given one here instead.  An hour is long enough to reclaim what a
+#: backend leaves behind, and short enough that a machine does not
+#: accumulate them.
+DEFAULT_DETACHED_LEASE = 3600
+
+#: The ceiling on the live kill-event log, in bytes.
+#:
+#: The log is the reaper's record of what it decided, and it was also
+#: the biggest file on the machine: every pass wrote a line for every
+#: process it looked at, every thirty seconds, and the processes it
+#: looked at were every process on the box.  1.1 GB on 2026-11-02.
+#:
+#: The ceiling is a rotation, not a truncation: the live log is moved
+#: aside when the next write would carry it past this size, and one
+#: generation is kept.  What is on disk is therefore bounded at twice
+#: this number, whatever the machine does.
+MAX_EVENTS_BYTES = 5 * 1024 * 1024
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -2363,6 +2457,42 @@ class ReaperConfig:
     swap_threshold: float = DEFAULT_SWAP_THRESHOLD
     #: When set, only these pids are considered (a testing scope gate).
     pid_scope: Optional[Tuple[int, ...]] = None
+    #: The pid of the process that started this daemon.
+    #:
+    #: The daemon leaves when that process is gone: a daemon whose
+    #: parent has died has outlived the only reason it existed.  It is
+    #: ``None`` when the daemon was not told who its owner is.
+    owner_pid: Optional[int] = None
+    #: The start time of that owner — tells a live owner from a
+    #: recycled pid (see :func:`_same_start`).
+    owner_start: str = ""
+    #: Whether the daemon is allowed to outlive its owner.
+    #:
+    #: The daemon the *server* starts is the one exception: it exists
+    #: for the case where the server dies, so it is exempted
+    #: explicitly rather than by accident.
+    survive_owner: bool = False
+    #: Whether the daemon may outlive the process that started it.
+    #:
+    #: This is the **decision**; the caller's request is only a
+    #: request.  ``None`` — the default — means the configuration does
+    #: not speak about it, and the caller's request stands.  ``False``
+    #: is a refusal: the daemon leaves with the process that started
+    #: it, whatever that process asked for.  ``True`` is the
+    #: permission.
+    #:
+    #: A configuration read from the environment says ``False`` unless
+    #: :data:`ENV_DETACH_OWNER` says otherwise.  The default is the
+    #: safe one: a daemon that outlives the process that asked for it
+    #: has nothing left to do, and the twenty-four daemons that were
+    #: walking one machine on 2026-11-02 all began here.
+    detach_owner: Optional[bool] = None
+    #: The most reaper daemons that may run on this machine at once.
+    #:
+    #: The lock makes one daemon per *root*; this makes one per
+    #: *machine*.  Zero disables the ceiling, which is how a
+    #: deployment that wants a daemon on every root says so.
+    max_daemons: int = DEFAULT_MAX_DAEMONS
 
 
 def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
@@ -2499,6 +2629,10 @@ def config_from_env(environ: Optional[Mapping[str, str]] = None) -> ReaperConfig
             env, ENV_SWAP_THRESHOLD, DEFAULT_SWAP_THRESHOLD, minimum=0.0, maximum=100.0
         ),
         pid_scope=_env_pid_scope(env, ENV_PID_SCOPE),
+        max_daemons=_env_int(
+            env, ENV_MAX_DAEMONS, DEFAULT_MAX_DAEMONS, minimum=0
+        ),
+        detach_owner=_env_bool(env, ENV_DETACH_OWNER, False),
     )
 
 
@@ -3598,11 +3732,70 @@ def daemon_alive(plans_root: Path) -> bool:
     return False
 
 
+def _detach_is_granted(config: ReaperConfig, requested: bool) -> bool:
+    """Decide whether a daemon may outlive the process that started it.
+
+    The caller *requests*; the configuration *decides*.
+
+    * ``None`` — the configuration does not speak about it, so the
+      caller's request stands.  This is the answer for a config built
+      in code: the caller knows whether its daemon needs to outlive
+      it.
+    * ``False`` — a refusal.  The daemon leaves with the process that
+      started it, whatever that process asked for.  This is the
+      answer for a config read from the environment: the exemption
+      has to be said out loud (:data:`ENV_DETACH_OWNER`), because the
+      cost of granting it by accident is a daemon nobody owns.
+    * ``True`` — the permission.  The caller still has to ask, so a
+      config that grants the exemption does not detach every daemon
+      on the machine.
+
+    The refusal is the one that matters.  On 2026-11-02 a single
+    ``detach_owner=True`` in the server left twenty-four daemons
+    walking one machine, each scanning every process on the box every
+    thirty seconds, for ever: the exemption had never been *decided*,
+    it had only been *typed*.
+    """
+    decision = getattr(config, "detach_owner", None)
+    if decision is None:
+        return bool(requested)
+    return bool(requested) and bool(decision)
+
+
+def _daemon_lease(config: ReaperConfig, *, detached: bool) -> int:
+    """Return how many seconds the daemon is allowed to live.
+
+    A daemon that outlives its owner needs a bound, or "outlives its
+    owner" is just a slower way of saying "for ever".  The bound is
+    the lease, and it travels to the child in its environment.
+
+    A configured lifetime is the operator's own answer and is kept as
+    it is — including an answer of *no ceiling*, for a daemon that
+    leaves with its owner anyway: the owner rule is its bound, and
+    this function is not here to override what somebody asked for.
+
+    A **detached** daemon is the exception, because it has no owner to
+    leave with.  An unbounded detached daemon is the leak — twenty-four
+    of them, for ever — so it gets the default lease even where the
+    configuration says "no ceiling".
+    """
+    try:
+        lifetime = int(getattr(config, "max_lifetime", DEFAULT_MAX_LIFETIME) or 0)
+    except (TypeError, ValueError):  # pragma: no cover - a malformed config
+        lifetime = 0
+    if lifetime > 0:
+        return lifetime
+    if detached:
+        return DEFAULT_DETACHED_LEASE
+    return 0
+
+
 def ensure_daemon(
     config: ReaperConfig,
     *,
     repo_root: Optional[Path] = None,
     popen: Optional[Callable[..., Any]] = None,
+    detach_owner: bool = False,
 ) -> Optional[int]:
     """Start the reaper daemon unless one is already running.
 
@@ -3620,6 +3813,30 @@ def ensure_daemon(
     The child carries the ``reaper`` marker, so that the reaper never
     reaps itself: a process marked ``PDT_SPAWN_KIND=reaper`` is not a
     candidate, whatever else is true about it.
+
+    **Who the daemon belongs to** is the caller's decision, and the
+    default is the safe one.  By default the daemon is *attached*: it
+    is told that this process is its owner (pid **and** start time, so
+    that a recycled pid is not mistaken for the owner), and it leaves
+    when that owner is gone — a daemon that outlives the process that
+    asked for it has nothing left to do.  ``detach_owner=True`` is the
+    exemption: the daemon is told to survive its owner, which is what
+    the **server** asks for, because "the server died" is the case its
+    daemon exists for.
+
+    The request is a request, not a decision.  The **configuration**
+    decides: :attr:`ReaperConfig.detach_owner` refuses the exemption
+    unless somebody said it out loud (see :data:`ENV_DETACH_OWNER`).
+    A caller that asks to be exempted without the switch being set
+    gets an attached daemon, because the exemption is the kind of
+    decision that has to be made deliberately — the twenty-four
+    daemons that walked one machine on 2026-11-02 all began as an
+    argument in a source file nobody was reading.
+
+    A daemon that is allowed to outlive its owner is given a **lease**:
+    the number of seconds it may live, carried in its environment.  A
+    lease is what makes "outlive the owner" a bounded statement rather
+    than "for ever".
 
     Nothing here raises.  The daemon is started as a side effect of
     starting the backend, and a failure to start it must not take the
@@ -3648,8 +3865,30 @@ def ensure_daemon(
             str(config.plans_root),
         ]
 
+        # The two answers to "who does this daemon belong to".  An
+        # attached daemon records its owner and leaves when that owner
+        # is gone; a detached one is exempt.  They are alternatives,
+        # not a pair: a daemon that survives its owner must not also
+        # record one.
+        detached = _detach_is_granted(config, detach_owner)
+        if detached:
+            cmd.append("--survive-owner")
+        else:
+            cmd.extend(
+                [
+                    "--owner-pid",
+                    str(os.getpid()),
+                    "--owner-start",
+                    _self_start_epoch(),
+                ]
+            )
+
         env = dict(os.environ)
         apply_spawn_tags(env, KIND_REAPER)
+        # The lease travels in the environment rather than on the
+        # command line: the command line of a daemon is a public
+        # record of what it is, and a lease is not part of that.
+        env[ENV_MAX_LIFETIME] = str(_daemon_lease(config, detached=detached))
 
         directory = Path(config.plans_root) / REAPER_DIRNAME
         directory.mkdir(parents=True, exist_ok=True)
@@ -3685,6 +3924,604 @@ def ensure_daemon(
     except Exception as exc:  # noqa: BLE001 - a reaper must not crash its host
         logger.warning("[orphan_reaper] could not start the reaper daemon: %s", exc)
         return None
+
+
+# --------------------------------------------------------------------------
+# The daemon census
+# --------------------------------------------------------------------------
+#
+# The lock answers one question: "is a daemon holding *this* root?".  It
+# answers it honestly — the kernel drops an ``flock`` when the holder
+# dies — but it is a question about one root, and the leak is a
+# question about the machine.
+#
+# The lock file is the weak point.  Delete it and the next daemon takes
+# a *different* inode: the flock is honoured, the singleton is broken,
+# and every daemon believes it is alone.  Nothing in the reaper's own
+# bookkeeping notices, because the bookkeeping is exactly what a leaked
+# daemon leaves behind.  So the machine-level count has to come from
+# the machine — from the process table and the kernel's own start
+# times.
+#
+# Everything below is read from the operating system.  Nothing is read
+# from the reaper's own state, because the reaper's own state is what
+# cannot be trusted.
+
+
+@dataclass(frozen=True)
+class ReaperDaemon:
+    """One live reaper daemon, as the machine reports it.
+
+    ``started_at`` is the platform's own start token for the process:
+    epoch seconds where the platform reports epoch seconds, clock ticks
+    since boot where it reports those.  It is ``None`` when the kernel
+    would not say at all.
+
+    ``age_seconds`` is always real seconds — how long the daemon has
+    been running — and is ``None`` only when the start time could not
+    be read.
+
+    ``plans_root`` is the root named on the command line, which is
+    ``None`` when the daemon was started on the default one.  It is
+    ``plans_root_exists`` that says whether that root is still there.
+
+    ``survive_owner`` says whether the daemon was exempted from the
+    owner rule — whether it was started with ``--survive-owner``, and
+    may therefore outlive the process that started it.  It is the
+    batch that leaked on 2026-11-02, and a census that cannot tell it
+    apart from the others cannot count it.
+    """
+
+    pid: int
+    ppid: int
+    plans_root: Optional[str]
+    started_at: Optional[str]
+    age_seconds: Optional[float]
+    plans_root_exists: bool
+    survive_owner: bool = False
+
+
+def _argv_tokens(argv: str) -> List[str]:
+    """Split a command line into words, tolerating a broken one.
+
+    A command line that never closes a quote is a command line some
+    other program wrote; it still has to be read rather than raise,
+    because the census runs over every process on the machine.
+    """
+    if not argv:
+        return []
+    try:
+        return _posix_split(argv)
+    except ValueError:
+        return argv.split()
+
+
+def _program_basename(token: str) -> str:
+    """Return the bare program name of one command-line word.
+
+    ``backend.orphan_reaper``, ``orphan_reaper`` and
+    ``/opt/app/backend/orphan_reaper.py`` all name the same program;
+    the census has to recognise every one of them, and none of the
+    neighbours (``orphan_reaper_tests``, ``some_other_daemon``).
+    """
+    name = token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if name.endswith(".py"):
+        name = name[:-3]
+    return name.rsplit(".", 1)[-1]
+
+
+def _is_reaper_daemon(argv: str) -> bool:
+    """Return whether *argv* is a reaper daemon's command line.
+
+    Two things have to hold: the command line has to name the reaper,
+    and it has to ask for the daemon mode.  A process that carries
+    ``--daemon`` for some other program is not a reaper daemon, and a
+    reaper asked for a single pass is not one either.
+    """
+    tokens = _argv_tokens(argv)
+    if "--daemon" not in tokens:
+        return False
+    return any(_program_basename(token) == "orphan_reaper" for token in tokens)
+
+
+def _argv_plans_root(tokens: Sequence[str]) -> Optional[str]:
+    """Return the ``--plans-root`` value in *tokens*, if it has one.
+
+    Both spellings are understood — ``--plans-root VALUE`` and
+    ``--plans-root=VALUE`` — because both are what shells and humans
+    produce, and a census that understood only one of them would
+    report half the daemons as rootless.
+
+    A flag with no value behind it has no root: the daemon was started
+    on the default one, which the command line does not name.
+    """
+    for index, token in enumerate(tokens):
+        if token == "--plans-root":
+            if index + 1 < len(tokens):
+                value = tokens[index + 1]
+                if value and not value.startswith("-"):
+                    return value
+            return None
+        if token.startswith("--plans-root="):
+            return token.split("=", 1)[1] or None
+    return None
+
+
+def _proc_uptime() -> Optional[float]:
+    """Return the machine's uptime in seconds, or ``None``."""
+    try:
+        with open("/proc/uptime", "rb") as handle:
+            return float(handle.read().split()[0])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _clock_ticks_per_second() -> Optional[float]:
+    """Return the kernel's clock frequency, or ``None``."""
+    try:
+        return float(os.sysconf("SC_CLK_TCK"))
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def _start_epoch_seconds(started_at: str, now: float) -> Optional[float]:
+    """Return the epoch second a start token refers to, or ``None``.
+
+    The token is epoch seconds where the platform reports epoch
+    seconds.  Where it reports clock ticks since boot — Linux reads
+    them out of ``/proc`` — the boot time is recovered from the
+    machine's uptime, because a tick count is not a time and reading
+    one as an epoch would put the daemon's start in the year 1970.
+    """
+    try:
+        raw = float(started_at)
+    except (TypeError, ValueError):
+        return None
+    if not _PROC_START_UNIT_IS_TICKS:
+        return raw
+    uptime = _proc_uptime()
+    ticks_per_second = _clock_ticks_per_second()
+    if uptime is None or not ticks_per_second:
+        return None
+    return (now - uptime) + raw / ticks_per_second
+
+
+def _plans_root_exists(plans_root: Optional[str]) -> bool:
+    """Return whether the root a daemon serves is still on disk."""
+    if not plans_root:
+        return False
+    try:
+        return Path(plans_root).expanduser().exists()
+    except OSError:
+        return False
+
+
+def list_reaper_daemons(
+    procs: Optional[Sequence[ProcInfo]] = None,
+    now: Optional[float] = None,
+    self_pid: Optional[int] = None,
+) -> List[ReaperDaemon]:
+    """Return the reaper daemons running on this machine.
+
+    *procs* is the process table to read — the live one is read when it
+    is not given.  *now* is the current time in epoch seconds, and
+    *self_pid* is the pid to leave out: the caller's own, so that a
+    reaper asking about the machine does not count itself.
+
+    A process is a daemon when its command line names the reaper and
+    asks for the daemon mode.  A process that cannot be understood is
+    skipped rather than guessed at, and a start time that cannot be
+    read leaves the daemon listed with an unknown age — the daemon is
+    still running, which is the fact that matters.
+
+    Nothing here raises.  A census that cannot be taken is an empty
+    census, and the caller reads the count off it — so an empty census
+    is a count of zero and never an error.
+    """
+    if procs is None:
+        procs = list_processes()
+    if now is None:
+        now = time.time()
+    if self_pid is None:
+        self_pid = os.getpid()
+
+    daemons: List[ReaperDaemon] = []
+    for proc in procs:
+        if proc.pid == self_pid:
+            continue
+        if not _is_reaper_daemon(proc.argv):
+            continue
+
+        tokens = _argv_tokens(proc.argv)
+        plans_root = _argv_plans_root(tokens)
+        try:
+            started_at = process_start_epoch(proc.pid) or None
+        except Exception:  # noqa: BLE001 - one unreadable pid is not a census
+            started_at = None
+        epoch = _start_epoch_seconds(started_at, now) if started_at else None
+        age = None if epoch is None else max(now - epoch, 0.0)
+
+        daemons.append(
+            ReaperDaemon(
+                pid=proc.pid,
+                ppid=proc.ppid,
+                plans_root=plans_root,
+                started_at=started_at,
+                age_seconds=age,
+                plans_root_exists=_plans_root_exists(plans_root),
+                survive_owner="--survive-owner" in tokens,
+            )
+        )
+    return daemons
+
+
+def daemon_status(
+    procs: Optional[Sequence[ProcInfo]] = None,
+    now: Optional[float] = None,
+    self_pid: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Return the machine's reaper daemon census as plain data.
+
+    The shape is ``{"count": int, "daemons": [...]}`` — the count and
+    the list it counts, so that a caller can read the number without
+    walking the list and the list without counting it again.
+    """
+    daemons = list_reaper_daemons(procs=procs, now=now, self_pid=self_pid)
+    return {
+        "count": len(daemons),
+        "daemons": [
+            {
+                "pid": daemon.pid,
+                "ppid": daemon.ppid,
+                "plans_root": daemon.plans_root,
+                "started_at": daemon.started_at,
+                "age_seconds": daemon.age_seconds,
+                "plans_root_exists": daemon.plans_root_exists,
+                "survive_owner": daemon.survive_owner,
+            }
+            for daemon in daemons
+        ],
+    }
+
+
+# --------------------------------------------------------------------------
+# One daemon per root, and a ceiling on the machine
+# --------------------------------------------------------------------------
+#
+# The lock answers "is a daemon holding *this* root?".  It does not
+# answer the two questions that matter on a machine that has been
+# running PDT for months:
+#
+# * "is somebody *else* already watching this root?" — the lock cannot
+#   say, because deleting the lock file and starting a new daemon gives
+#   the new daemon a fresh inode to lock while the old daemon keeps
+#   the old one.  Two daemons, one root, both reaping.
+# * "how many daemons is this machine running?" — the lock is scoped to
+#   one root, so a daemon on another root neither excludes this one
+#   nor is excluded by it.  Nothing stopped them from accumulating:
+#   145 of them on one machine on 2026-11-02.
+#
+# The census answers both, because it reads the machine rather than
+# one root's directory.
+
+
+def _another_daemon_for_root(
+    plans_root: Path,
+    *,
+    procs: Optional[Sequence[ProcInfo]] = None,
+    self_pid: Optional[int] = None,
+) -> Optional[int]:
+    """Return the pid of a daemon already serving *plans_root*, if any.
+
+    The lock could not catch that one, so the census does: two
+    command lines naming the same root are two daemons on one root,
+    whatever the lock file says.  The pid comes back because "somebody
+    else is already watching this root" is a fact an operator wants to
+    see in the log.
+
+    ``None`` means nobody else is watching it — which includes the
+    case of a daemon whose command line names no root at all: an
+    unknown root is never the root that was asked for.
+
+    *procs* is the process table to read — the live one when it is not
+    given — and *self_pid* is the pid to leave out, so that a daemon
+    asking about its own root does not find itself.
+    """
+    target = _resolved_root(plans_root)
+    if target is None:
+        return None
+    for daemon in list_reaper_daemons(procs=procs, self_pid=self_pid):
+        if _daemon_serves_root(daemon, target):
+            return daemon.pid
+    return None
+
+
+def _daemon_budget_exhausted(
+    config: ReaperConfig,
+    *,
+    procs: Optional[Sequence[ProcInfo]] = None,
+) -> bool:
+    """Return whether the machine is already running its quota of daemons.
+
+    The ceiling is on the machine, not on one root: a dozen daemons on
+    a dozen roots is still a dozen daemons walking the whole process
+    table every thirty seconds, and the machine they share is the one
+    that runs out of memory.
+
+    Only daemons that are **watching a root that is still there** are
+    counted.  A daemon whose root has been deleted is watching
+    nothing, and it leaves by itself as soon as it notices; making it
+    occupy a slot would let a machine full of dying daemons refuse to
+    start a live one.
+
+    A ceiling of zero is no ceiling: the check is off, and the machine
+    may run as many daemons as it has roots to watch.
+    """
+    limit = getattr(config, "max_daemons", DEFAULT_MAX_DAEMONS)
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = DEFAULT_MAX_DAEMONS
+    if limit <= 0:
+        return False
+    live = [
+        daemon
+        for daemon in list_reaper_daemons(procs=procs)
+        if daemon.plans_root_exists
+    ]
+    return len(live) >= limit
+
+
+# --------------------------------------------------------------------------
+# Stopping the daemons of one root
+# --------------------------------------------------------------------------
+#
+# The census says what the machine is running; this says how a caller
+# that started a daemon gives it back.  A daemon serves exactly one plan
+# root, and the caller that started it knows which root that was — so
+# the helper is addressed by *root*, not by pid.  It stops the daemons
+# of that root and leaves every other daemon on the machine alone: two
+# daemons on two roots are two different services, and the whole reason
+# the helper takes a root instead of a pid is that a caller must never
+# stop something it did not start.
+#
+# The escalation is the one the reaper itself uses — SIGTERM, the grace
+# period, then SIGKILL.  Nothing here decides *whether* a process
+# should die: the census has already established that these are reaper
+# daemons.  So the helper only has to be careful about which ones it
+# touches, and about not falling over when one of them misbehaves.
+
+
+def _resolved_root(plans_root: object) -> Optional[Path]:
+    """Return *plans_root* as one absolute path, or ``None``.
+
+    The comparison is made after resolution, because a root can be
+    written down in more than one way — through a symlink, relatively,
+    with a trailing separator — and all of them name one directory.
+    """
+    try:
+        return Path(str(plans_root)).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _daemon_serves_root(daemon: ReaperDaemon, target: Path) -> bool:
+    """Whether *daemon* serves the root *target*.
+
+    A daemon whose command line names no root is not counted: its root
+    is unknown, and an unknown root is never the root that was asked
+    for.
+    """
+    root = getattr(daemon, "plans_root", None)
+    if not root:
+        return False
+    resolved = _resolved_root(root)
+    if resolved is None:
+        return False
+    return resolved == target
+
+
+def _default_daemon_signal(pid: int, sig_name: str) -> None:
+    """Send one signal to one daemon process."""
+    _default_send(pid, sig_name, None)
+
+
+def _child_has_exited(pid: int) -> bool:
+    """Whether *pid* is our own child that has already exited.
+
+    A process that has exited but has not been waited for is a
+    **zombie**: the kernel keeps its process table entry, so
+    ``kill(pid, 0)`` still succeeds and the pid reads as alive.  It is
+    not alive — it runs no code and holds no memory; what is left of it
+    is the entry.
+
+    Only the parent can tell the difference, and the parent is us
+    whenever the daemon being stopped is one this process started —
+    which is the case this helper exists for.  ``waitpid`` with
+    ``WNOHANG`` answers that without blocking, and it reaps the child
+    on the way: a daemon nobody waits for would stay in the process
+    table for as long as this process lives, which is the very leak
+    the reaper exists to close.
+
+    The price is the exit status, which the caller no longer sees.  A
+    caller that needs it should not ask this helper to stop a child it
+    wants to wait for itself.
+    """
+    try:
+        waited, _status = os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        # Not our child (or the kernel will not say): nothing to tell.
+        return False
+    return waited == pid
+
+
+def _running_probe(
+    probe: Callable[[int], Optional[bool]]
+) -> Callable[[int], Optional[bool]]:
+    """Return a probe that calls an exited child gone.
+
+    The plain liveness probe cannot tell a zombie from a running
+    process, and this helper skips dead processes — so the parent is
+    asked as well.
+    """
+
+    def _probe(pid: int) -> Optional[bool]:
+        alive = _probe_alive(probe, pid)
+        if alive is not True:
+            return alive
+        if _child_has_exited(pid):
+            return False
+        return alive
+
+    return _probe
+
+
+def _stop_one_daemon(
+    pid: int,
+    *,
+    sender: Callable[[int, str], None],
+    probe: Callable[[int], Optional[bool]],
+    napper: Callable[[float], None],
+    timeout: float,
+) -> bool:
+    """Stop one daemon, and say whether a signal was sent.
+
+    SIGTERM first, the grace period, then SIGKILL.  A daemon that
+    survives the SIGKILL is logged and left alone: the caller asked for
+    the daemon to be stopped, not for the helper to fight it.
+    """
+    try:
+        sender(pid, SIGNAL_TERM)
+    except ProcessLookupError:
+        # Already gone: there is nothing left to signal.
+        return False
+    except Exception:  # noqa: BLE001 - one daemon must not stop the rest
+        logger.warning(
+            "orphan reaper: could not signal daemon pid %s", pid, exc_info=True
+        )
+        return False
+
+    if _wait_for_exit(pid, probe, timeout, napper):
+        return True
+
+    try:
+        sender(pid, SIGNAL_KILL)
+    except ProcessLookupError:
+        # Gone between the check and the kill.
+        return True
+    except Exception:  # noqa: BLE001 - one daemon must not stop the rest
+        logger.warning(
+            "orphan reaper: could not kill daemon pid %s", pid, exc_info=True
+        )
+        return True
+
+    if not _wait_for_exit(pid, probe, timeout, napper):
+        logger.warning(
+            "orphan reaper: daemon pid %s did not exit after SIGKILL", pid
+        )
+    return True
+
+
+def stop_daemons_for_plans_root(
+    plans_root: Path,
+    *,
+    timeout: float = 5.0,
+    lister: Optional[Callable[[], Sequence[ReaperDaemon]]] = None,
+    signal_fn: Optional[Callable[[int, str], None]] = None,
+    alive_fn: Optional[Callable[[int], Optional[bool]]] = None,
+    sleep_fn: Optional[Callable[[float], None]] = None,
+) -> List[int]:
+    """Stop the reaper daemons that serve *plans_root*, and report them.
+
+    The returned list holds the pids that were actually signalled — the
+    daemons this call reached.  A daemon that was already gone, one that
+    serves another root, and one whose signal failed are all absent from
+    it, because none of them was stopped by this call.
+
+    *timeout* is the grace period: how long a daemon may take to react
+    to the SIGTERM before it is sent the SIGKILL.  The same window
+    bounds the wait after the SIGKILL, so a daemon that ignores even
+    that is reported rather than waited on forever.
+
+    The seams are the same ones the reaping stage uses, so the ladder
+    can be exercised without a single real signal:
+
+    *lister*
+        returns the daemons to consider; the module's own
+        :func:`list_reaper_daemons` when it is not given.
+    *signal_fn*
+        is called as ``signal_fn(pid, "TERM"|"KILL")``.
+    *alive_fn*
+        is called with a pid and answers ``True`` (alive), ``False``
+        (gone) or ``None`` (could not be checked).  A pid that has
+        exited but has not been waited for is *gone* — and waiting for
+        it is what the helper does on the way out, so the exit status
+        of a daemon this process started is consumed here.
+    *sleep_fn*
+        is called with the poll step.
+
+    Nothing here raises.  A daemon that refuses to be signalled is
+    logged and skipped, and one that survives the SIGKILL is logged and
+    reported — a caller that is tearing down its own fixtures must not
+    be taken down by a process that misbehaves.
+    """
+    census = list_reaper_daemons if lister is None else lister
+    sender = _default_daemon_signal if signal_fn is None else signal_fn
+    probe = _running_probe(_pid_alive if alive_fn is None else alive_fn)
+    napper = time.sleep if sleep_fn is None else sleep_fn
+
+    target = _resolved_root(plans_root)
+    if target is None:
+        logger.warning(
+            "orphan reaper: cannot resolve plans root %r", plans_root
+        )
+        return []
+
+    try:
+        daemons = list(census())
+    except Exception:  # noqa: BLE001 - a census that fails is an empty one
+        logger.warning(
+            "orphan reaper: could not read the daemon census", exc_info=True
+        )
+        return []
+
+    stopped: List[int] = []
+    seen: set = set()
+    for daemon in daemons:
+        try:
+            if not _daemon_serves_root(daemon, target):
+                continue
+
+            pid = getattr(daemon, "pid", None)
+            if not isinstance(pid, int) or pid <= 1:
+                continue
+            if pid == os.getpid():
+                # The caller is never one of the daemons it stops.
+                continue
+            if pid in seen:
+                # The same daemon listed twice is one daemon.
+                continue
+            seen.add(pid)
+
+            if probe(pid) is False:
+                # Already gone: there is nothing to stop.
+                continue
+
+            if _stop_one_daemon(
+                pid,
+                sender=sender,
+                probe=probe,
+                napper=napper,
+                timeout=timeout,
+            ):
+                stopped.append(pid)
+        except Exception:  # noqa: BLE001 - one daemon must not stop the rest
+            logger.warning(
+                "orphan reaper: stopping daemon pid %s failed",
+                getattr(daemon, "pid", "?"),
+                exc_info=True,
+            )
+    return stopped
 
 
 # --------------------------------------------------------------------------
@@ -3780,6 +4617,14 @@ def write_events(
     thirty seconds ago.  The parent directory is created when it is
     missing.
 
+    The log has a **ceiling**.  It is rotated aside when the next line
+    would carry it past :data:`MAX_EVENTS_BYTES`, and one generation is
+    kept — so the log on disk is bounded even when the machine is not.
+    A reaper that ran every thirty seconds for a month, writing one
+    line per process it looked at, had produced 1.1 GB of it on
+    2026-11-02; the count is the information, and the file does not
+    have to be bigger than the answer.
+
     A write that fails is a warning and nothing else.  The reaper exists
     to give memory back; a full disk or a directory that is not a
     directory must not stop it from doing that.
@@ -3788,15 +4633,175 @@ def write_events(
     stamp = _event_timestamp(ts)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("a", encoding="utf-8") as handle:
-            for verdict in verdicts:
-                handle.write(json.dumps(_event_record(verdict, stamp)) + "\n")
+        lines = [
+            json.dumps(_event_record(verdict, stamp)) + "\n" for verdict in verdicts
+        ]
+        _append_event_lines(target, lines)
     except (OSError, TypeError, ValueError):
         logger.warning(
             "orphan reaper: the kill events could not be written to %s",
             target,
             exc_info=True,
         )
+
+
+def _events_cap() -> int:
+    """Return the ceiling on the event log, in bytes.
+
+    Zero means "no ceiling": a deployment that has to keep every
+    record of every pass can say so, and the log then grows the way it
+    always did.
+    """
+    try:
+        cap = int(MAX_EVENTS_BYTES)
+    except (TypeError, ValueError):  # pragma: no cover - a malformed constant
+        return 0
+    return cap if cap > 0 else 0
+
+
+def _events_size(target: Path) -> int:
+    """Return the size of the live event log, or zero when there is none."""
+    try:
+        return target.stat().st_size
+    except OSError:
+        return 0
+
+
+def _rotate_events(target: Path) -> None:
+    """Move the live event log aside, keeping one generation.
+
+    The older generation is dropped: a log that keeps its own history
+    is a log with no ceiling, which is the thing this rotation exists
+    to prevent.
+    """
+    rotated = target.with_name(target.name + ".1")
+    try:
+        if rotated.exists():
+            rotated.unlink()
+        target.replace(rotated)
+    except OSError:  # pragma: no cover - a log that cannot be rotated is a log
+        logger.warning(
+            "orphan reaper: the event log %s could not be rotated",
+            target,
+            exc_info=True,
+        )
+
+
+def _append_event_lines(target: Path, lines: Sequence[str]) -> None:
+    """Append *lines* to the event log, rotating it when it would grow too big.
+
+    The rotation happens **before** the line that would cross the
+    ceiling is written, so the live log never passes it — not even for
+    the length of one line.
+    """
+    cap = _events_cap()
+    handle = None
+    try:
+        for line in lines:
+            if handle is None:
+                handle = target.open("a", encoding="utf-8")
+            if cap:
+                size = _events_size(target)
+                if size and size + len(line.encode("utf-8")) > cap:
+                    handle.close()
+                    handle = None
+                    _rotate_events(target)
+                    handle = target.open("a", encoding="utf-8")
+            handle.write(line)
+    finally:
+        if handle is not None:
+            handle.close()
+
+
+def _is_ours(verdict: object) -> bool:
+    """Return whether *verdict* is about a process that carried our marker.
+
+    A verdict about one of our own processes is a decision somebody may
+    have to explain later, so it keeps a record of its own.  A verdict
+    about a process that never carried the marker is noise: every
+    machine has hundreds of those, and the reaper looks at them all,
+    every thirty seconds, for ever.
+    """
+    if getattr(verdict, "owner_pid", None) is not None:
+        return True
+    return bool(getattr(verdict, "kind", ""))
+
+
+def write_skipped_summary(
+    path: Path,
+    verdicts: Iterable[Verdict],
+    *,
+    ts: Optional[object] = None,
+) -> int:
+    """Write one line counting the verdicts that were skipped.
+
+    The count is the information.  A thousand lines spelling out that
+    a thousand processes were skipped are not — and they are what grew
+    the log to 1.1 GB on 2026-11-02.
+
+    The summary line carries no pid, no reason of its own and no
+    signal: it is not about any one process, and a reader that is
+    looking for a kill must not find one here.  The reasons it counts
+    are in ``reasons``, keyed by the same reason codes the individual
+    records use.
+
+    The number of skipped verdicts is returned; zero means nothing was
+    written.
+    """
+    target = Path(path)
+    counts: Dict[str, int] = {}
+    total = 0
+    for verdict in verdicts:
+        reason = str(getattr(verdict, "reason", "") or "")
+        counts[reason] = counts.get(reason, 0) + 1
+        total += 1
+    if not total:
+        return 0
+
+    record = {
+        "ts": _event_timestamp(ts),
+        "type": "summary",
+        "skipped": total,
+        "reasons": counts,
+    }
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _append_event_lines(target, [json.dumps(record) + "\n"])
+    except (OSError, TypeError, ValueError):
+        logger.warning(
+            "orphan reaper: the kill events could not be written to %s",
+            target,
+            exc_info=True,
+        )
+    return total
+
+
+def write_pass_events(
+    path: Path,
+    verdicts: Iterable[Verdict],
+    *,
+    ts: Optional[object] = None,
+) -> None:
+    """Write down what one pass decided.
+
+    The decisions about **our own** processes — the ones that carried
+    the marker — are written one by one, because each of them is a
+    decision somebody may have to explain later.  The rest are written
+    as one count, because they are the same answer over and over: the
+    machine is full of processes that are not ours, and the reaper
+    looks at every one of them, every thirty seconds, for ever.
+    """
+    ours = []
+    theirs = []
+    for verdict in verdicts:
+        if _is_ours(verdict):
+            ours.append(verdict)
+        else:
+            theirs.append(verdict)
+    if ours:
+        write_events(path, ours, ts=ts)
+    if theirs:
+        write_skipped_summary(path, theirs, ts=ts)
 
 
 def _swap_threshold_ratio(config: ReaperConfig) -> float:
@@ -4146,7 +5151,7 @@ def _cleanup_pass(
         logger.warning("orphan reaper: the reaping stage failed", exc_info=True)
         reaped = verdicts
 
-    write_events(events_path(config.plans_root), reaped)
+    write_pass_events(events_path(config.plans_root), reaped)
     return reaped
 
 
@@ -4221,6 +5226,130 @@ def _plans_root_gone(config: ReaperConfig) -> bool:
         return False
 
 
+def _plans_root_identity(root: object) -> Optional[Tuple[int, int]]:
+    """Return the filesystem's own name for *root*, or ``None``.
+
+    A path is not an identity.  The directory a daemon was started for
+    can be deleted and another one created in its place, and the new
+    directory has the same path -- so the existence check
+    (:func:`_plans_root_gone`) sees nothing wrong while the daemon
+    goes on guarding a directory it was never started for.  On
+    2026-11-02 that is how one root ended up carrying fifteen daemons:
+    ``.orphan_reaper/reaper.lock`` was deleted and recreated, and every
+    daemon saw a lock file that was not the one it held.
+
+    What tells two directories apart is the filesystem's own name for
+    them: the device they live on and the inode they have.  The pair
+    is recorded when the daemon starts and compared on every pass.
+
+    ``None`` means "no identity could be read" -- the root does not
+    exist, or it could not be stat'ed.  A daemon holding no identity
+    cannot judge anything, and says so rather than guessing.
+    """
+    if root is None:
+        return None
+    try:
+        st = Path(root).stat()
+    except (OSError, TypeError, ValueError):
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _plans_root_replaced(root: object, identity: Optional[Tuple[int, int]]) -> bool:
+    """True when *root* is no longer the directory that was recorded.
+
+    *identity* is the pair recorded by :func:`_plans_root_identity`
+    when the daemon started; ``None`` means no identity was ever
+    recorded, and a daemon with nothing to compare against cannot
+    conclude that anything was replaced.
+
+    The two failure modes are kept apart on purpose:
+
+    * a root that is **not there** reads as replaced.  That is the
+      same thing the existence check reports, and the daemon leaves for
+      it in either case -- the two checks have to agree, or the daemon
+      would keep running for one of them.
+    * a root that **cannot be read** reads as *not* replaced.  The
+      filesystem declined to answer, which is unknown, and unknown is
+      not a reason to stop reclaiming memory on a machine that still
+      needs it.
+    """
+    if identity is None:
+        return False
+    try:
+        st = Path(root).stat()
+    except FileNotFoundError:
+        # The root is gone -- the same thing the existence check sees.
+        return True
+    except (OSError, TypeError, ValueError):
+        # Unreadable: unknown, not replaced.
+        return False
+    return (st.st_dev, st.st_ino) != identity
+
+
+def _owner_gone(config: ReaperConfig) -> bool:
+    """True when the process that started this daemon is gone.
+
+    A daemon is started by something — a test fixture, a verification
+    round, the server — and that something is the reason it exists.
+    When it is over, the daemon has outlived the only reason it
+    existed: the machine is left with daemons re-parented to ``pid
+    1``, each of them walking the whole process table every thirty
+    seconds for ever.
+
+    The judgement is the judgement the reaper makes everywhere else:
+
+    * A pid on its own is not an identity — the kernel recycles pids.
+      The owner is therefore recorded as a pid **and** a start time,
+      and a live pid whose start time differs from the recorded one is
+      somebody else's process: the owner is gone.
+    * Uncertainty resolves towards *staying*.  An owner that cannot be
+      checked, an owner whose start time was never recorded, an owner
+      whose start time cannot be read now — none of them is a dead
+      owner, and a daemon that leaves on a guess stops reclaiming
+      memory on a machine that still needs it.
+    * The daemon the **server** starts is exempt (``survive_owner``):
+      "the backend died" is precisely the situation it exists for, so
+      it has to outlive the process that started it.
+
+    A dead pid needs no start time to be conclusive: the kernel said
+    "no such process", and that is the end of it.
+    """
+    if getattr(config, "survive_owner", False):
+        return False
+
+    owner_pid = getattr(config, "owner_pid", None)
+    if owner_pid is None:
+        return False
+    try:
+        owner_pid = int(owner_pid)
+    except (TypeError, ValueError):
+        return False
+    if owner_pid <= 1:
+        # ``pid 1`` is the kernel's own reaper, not a process that
+        # started anything -- and it never dies.
+        return False
+
+    alive = _pid_alive(owner_pid)
+    if alive is None:
+        # Could not be checked: unknown, not dead.
+        return False
+    if alive is False:
+        return True
+
+    # The pid is alive.  It is only *our* owner if the recorded start
+    # time is the one the pid has now.
+    owner_start = getattr(config, "owner_start", "") or ""
+    if not owner_start:
+        return False
+    observed = process_start_epoch(owner_pid)
+    if not observed:
+        # The platform declined to say when the process started.  That
+        # is not the same as saying it started at a different moment.
+        return False
+    return not _same_start(owner_start, observed, _start_tolerance())
+
+
 def _daemon_loop(
     config: ReaperConfig,
     *,
@@ -4234,7 +5363,7 @@ def _daemon_loop(
 ) -> int:
     """The daemon's body: scan, reap, wait, and do it again.
 
-    The loop ends in one of five ways, and every one of them is a
+    The loop ends in one of seven ways, and every one of them is a
     return of zero:
 
     * it is asked to stop — the stop event is set, and the loop leaves
@@ -4248,8 +5377,16 @@ def _daemon_loop(
     * the plan-artifact root it was started for has been deleted, in
       which case it leaves: a daemon watching a directory that is not
       there is watching nothing;
+    * the plan-artifact root it was started for has been **replaced**
+      -- deleted and re-created, so the path is the same but the
+      directory is not -- in which case it leaves too: a daemon
+      watching a directory it was never started for is watching the
+      wrong thing (see :func:`_plans_root_replaced`);
     * it has reached ``max_lifetime``, in which case it leaves: a
-      daemon of any age has to have an end.
+      daemon of any age has to have an end;
+    * the process that started it is gone, in which case it leaves:
+      the daemon was started for that process, and it is over (see
+      :func:`_owner_gone`; the daemon the server starts is exempt).
 
     The idle streak is reset by the machine being **in use** — by the
     candidates (the processes this daemon would actually reclaim) and
@@ -4325,8 +5462,25 @@ def _daemon_loop(
     # reclaim.
     owner_seen = False
 
+    # The identity of the plan-artifact root: the filesystem's own
+    # name for the directory this daemon was started for.  Existence
+    # is not identity -- a root that is deleted and re-created has the
+    # same path but a different inode -- so the daemon records the
+    # pair here and compares it on every pass.
+    root_identity = _plans_root_identity(getattr(config, "plans_root", None))
+
     while True:
         if _stop_event_is_set(event):
+            return 0
+
+        # The process that started this daemon is gone.  There is
+        # nothing left to watch: the daemon was started for that
+        # process, and it is over.
+        if _owner_gone(config):
+            logger.info(
+                "orphan reaper: the owner %s is gone; leaving",
+                getattr(config, "owner_pid", None),
+            )
             return 0
 
         now = _read_clock(reader, last_now)
@@ -4337,6 +5491,21 @@ def _daemon_loop(
         if _plans_root_gone(config):
             logger.info(
                 "orphan reaper: the plan-artifact root %s is gone; leaving",
+                getattr(config, "plans_root", None),
+            )
+            return 0
+
+        # The root is still there -- but it is not the same root.  It
+        # was deleted and re-created while this daemon was watching it,
+        # so the daemon is now guarding a directory it was never
+        # started for, and the lock it holds is a lock on a file that
+        # is no longer there.
+        if _plans_root_replaced(
+            getattr(config, "plans_root", None), root_identity
+        ):
+            logger.info(
+                "orphan reaper: the plan-artifact root %s has been replaced; "
+                "leaving",
                 getattr(config, "plans_root", None),
             )
             return 0
@@ -4459,6 +5628,29 @@ def run_daemon(
     immediately.  Two reapers would race over the same candidates and
     apply the same grace period twice, independently.
 
+    The lock is per *root*, though, and it can be defeated by deleting
+    the lock file — so the daemon checks the machine as well, after it
+    has taken the lock and before it starts scanning: it stands down
+    when another daemon is already serving its root, and when the
+    machine is already running its quota of daemons
+    (:data:`DEFAULT_MAX_DAEMONS`).  Both are answered with the same
+    thing the lock is: a return of zero, and a line in the log saying
+    why.
+
+    The two checks answer two different questions, and they are asked
+    of two different populations.  "Is somebody else already watching
+    this root?" is about *correctness*: two daemons on one root reap
+    the same candidates and apply the same grace period twice, so it
+    is asked of every daemon, embedded or not.  "Is the machine full?"
+    is about the machine's resident daemons — the processes of their
+    own that outlive whoever started them — so it is asked of a daemon
+    that is about to *become* one of them, which is a daemon that was
+    given no stop event and therefore keeps running on its own.  A
+    caller that brings its own stop event runs the loop inside a
+    process it owns: that daemon leaves with the caller, it is not in
+    the census the quota counts, and it does not add to the population
+    the ceiling exists to bound.
+
     *stop* is the event the loop watches; when it is not given, the
     daemon makes one and arranges for ``SIGTERM`` and ``SIGINT`` to set
     it.  *clock* is the time the idle streak is measured against.
@@ -4486,21 +5678,54 @@ def run_daemon(
 
     owned = stop is None
     event = threading.Event() if owned else stop
-    previous = _install_stop_handlers(event) if owned else {}
 
     try:
-        return _daemon_loop(
-            config,
-            event=event,
-            clock=clock,
-            scan_fn=scan_fn,
-            reap_fn=reap_fn,
-            alert_fn=alert_fn,
-            send=send,
-            swap_ratio=swap_ratio,
-        )
+        # One reading of the machine serves both checks.  A machine
+        # that cannot be read yields an empty census, which is the
+        # permissive answer: a reaper that refuses to start over an
+        # unreadable process table would leave the memory it exists to
+        # reclaim unreclaimed.
+        procs = list_processes()
+
+        other_pid = _another_daemon_for_root(config.plans_root, procs=procs)
+        if other_pid is not None:
+            logger.info(
+                "another reaper is already watching %s; standing down",
+                config.plans_root,
+            )
+            return 0
+
+        # The quota is a bound on the machine's *resident* daemons: the
+        # ones that are processes of their own, that outlive whoever
+        # started them, and that nothing shuts down.  A caller that
+        # hands in its own stop event is running the loop inside a
+        # process it owns -- that daemon is not a member of the
+        # population the quota counts, it does not show up in the
+        # census, and it leaves together with its caller.  So the
+        # quota is checked where that population is: on the daemon that
+        # is about to join it.
+        if owned and _daemon_budget_exhausted(config, procs=procs):
+            logger.info(
+                "daemon budget %s exhausted; standing down",
+                getattr(config, "max_daemons", DEFAULT_MAX_DAEMONS),
+            )
+            return 0
+
+        previous = _install_stop_handlers(event) if owned else {}
+        try:
+            return _daemon_loop(
+                config,
+                event=event,
+                clock=clock,
+                scan_fn=scan_fn,
+                reap_fn=reap_fn,
+                alert_fn=alert_fn,
+                send=send,
+                swap_ratio=swap_ratio,
+            )
+        finally:
+            _restore_stop_handlers(previous)
     finally:
-        _restore_stop_handlers(previous)
         try:
             handle.close()
         except Exception:  # pragma: no cover - closing a handle we opened
@@ -4553,6 +5778,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="stay resident and scan every interval until told to stop",
     )
+    modes.add_argument(
+        "--status",
+        action="store_true",
+        help=(
+            "print the reaper daemons running on this machine as JSON "
+            "(pid, root, age) and exit"
+        ),
+    )
     parser.add_argument(
         "--plans-root",
         default=None,
@@ -4568,6 +5801,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="decide but never signal",
+    )
+    parser.add_argument(
+        "--owner-pid",
+        type=int,
+        default=None,
+        help=(
+            "the pid of the process that started this daemon; the daemon "
+            "leaves when that process is gone (default: the parent)"
+        ),
+    )
+    parser.add_argument(
+        "--owner-start",
+        default="",
+        help=(
+            "the start time of that owner, so that a recycled pid is not "
+            "mistaken for it (default: read from the machine)"
+        ),
+    )
+    parser.add_argument(
+        "--survive-owner",
+        action="store_true",
+        help=(
+            "stay resident even when the process that started this daemon "
+            "is gone (the daemon the server starts)"
+        ),
     )
     return parser
 
@@ -4585,6 +5843,10 @@ def _config_as_dict(config: ReaperConfig) -> Dict[str, object]:
         "burst_threshold": config.burst_threshold,
         "swap_threshold": config.swap_threshold,
         "pid_scope": list(config.pid_scope) if config.pid_scope is not None else None,
+        "owner_pid": config.owner_pid,
+        "owner_start": config.owner_start,
+        "survive_owner": config.survive_owner,
+        "detach_owner": config.detach_owner,
     }
 
 
@@ -4596,8 +5858,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     the rest of the backend is unavailable.
 
     Without a mode the configuration is printed and nothing else
-    happens; ``--once`` makes a single pass and ``--daemon`` stays
-    resident.  Both answer with an exit code of zero: the reaper ran.
+    happens; ``--once`` makes a single pass, ``--daemon`` stays
+    resident and ``--status`` prints the census of the reaper daemons
+    running on this machine as JSON.  All three answer with an exit
+    code of zero: the reaper ran.
     """
     args = build_arg_parser().parse_args(list(argv) if argv is not None else None)
 
@@ -4609,10 +5873,25 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.dry_run:
         config.dry_run = True
 
+    if args.status:
+        print(json.dumps(daemon_status(), indent=2))
+        return 0
     if args.once:
         run_once(config)
         return 0
     if args.daemon:
+        config.owner_pid = args.owner_pid
+        config.owner_start = args.owner_start or ""
+        config.survive_owner = bool(args.survive_owner)
+        if not config.survive_owner and config.owner_pid is None:
+            # Nobody said who the owner is, so the owner is the process
+            # that started this one.  A daemon that has already been
+            # orphaned has no owner to record -- ``pid 1`` is the
+            # kernel's own reaper, and it never dies.
+            parent = os.getppid()
+            if parent > 1:
+                config.owner_pid = parent
+                config.owner_start = process_start_epoch(parent)
         return run_daemon(config)
 
     print(json.dumps(_config_as_dict(config), indent=2, sort_keys=True))

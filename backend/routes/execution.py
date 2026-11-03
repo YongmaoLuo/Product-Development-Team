@@ -9,7 +9,7 @@ from __future__ import annotations
 from utils.atomic_io import atomic_write_json
 from fastapi import APIRouter
 
-from typing import Dict, List, NamedTuple, Optional, Tuple, Any, Literal
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple, Any, Literal
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from pathlib import Path
@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 
 # Late binding into the application module: ``server`` owns the shared
 # helpers, request models and module globals, and the suite monkeypatches
@@ -43,6 +44,7 @@ from project_dir_guard import ProjectDirInvalidError, validate_project_dir
 # identity probe reads the kernel's own answer about a pid -- pids are
 # recycled, so the number alone does not identify a process, the start
 # time does.
+from process_identity import CREATE_TIME_TOLERANCE
 from process_identity import matches as identity_matches
 from process_identity import probe as probe_process_identity
 from process_ledger import ProcessRecord
@@ -243,7 +245,9 @@ def _recover_execution_states(plans_dir: Path) -> List[Tuple[str, str]]:
                     # answer, and the plan keeps running with the
                     # process it was running with.
                     _restore_execution_state_from_row(plan_id, row)
-                elif _shutdown_interrupted_this_run(plan_dir, row):
+                elif _shutdown_interrupted_this_run(
+                    plan_dir, (row or {}).get("started_at")
+                ):
                     # The checkpoint is the evidence that the *server*
                     # went down under this run: the work was interrupted,
                     # not broken.  That is a stronger statement than the
@@ -283,6 +287,19 @@ def _recover_execution_states(plans_dir: Path) -> List[Tuple[str, str]]:
                 # reconcile, so the reconcile is skipped — but the
                 # claim is still a claim, and it is still answered.
                 _judge_process_dead(plan_id, row)
+            elif _shutdown_park_needs_phase(plan_dir, row):
+                # The parking of a run the shutdown interrupted did not
+                # finish: the row says the run was stopped by the
+                # shutdown, but the plan's phase was never written.
+                # The row is not running, so there is no reconcile to
+                # do — and without this the phase stays ``executing``
+                # for ever, and the scheduler never sees the plan
+                # again.  The parking is finished here instead.
+                _park_shutdown_interrupted(
+                    plan_id,
+                    plan_dir=plan_dir,
+                    execution_repo=execution_repo,
+                )
             actions.append((plan_id, ACTION_SKIPPED))
     finally:
         # 2026-09-23: this connection is opened once for the whole scan
@@ -415,7 +432,7 @@ def _reconcile_exec_pid(plan_dir: Path, plan_id: str, pid: int) -> str:
 
 
 def _shutdown_interrupted_this_run(
-    plan_dir: Path, row: Dict[str, Any]
+    plan_dir: Path, started_at: Optional[str]
 ) -> bool:
     """Did the *server* go down under this run?
 
@@ -430,6 +447,11 @@ def _shutdown_interrupted_this_run(
     say yes to a shutdown it can prove, and "cannot prove it" means
     "park it as stopped", never "the server went down".
 
+    ``started_at`` is the run's own start stamp — the row's for the
+    recovery scan, the in-memory run's for the watcher.  It is what
+    makes the checkpoint *fresh*: a checkpoint left over from an
+    earlier run of the same plan says nothing about this one.
+
     Never raises: this runs on the recovery path, where one plan's
     failure must not cost every other plan its recovery.
     """
@@ -439,14 +461,60 @@ def _shutdown_interrupted_this_run(
         return bool(is_shutdown_interrupted(
             plan_dir,
             kind="execution",
-            run_started_at=(row or {}).get("started_at"),
+            run_started_at=started_at,
         ))
     except Exception:  # noqa: BLE001 — an unreadable checkpoint is no evidence
         _server.logger.warning(
-            "[startup_reconcile] could not read the shutdown checkpoint "
+            "[shutdown_checkpoint] could not read the shutdown checkpoint "
             "plan=%s", plan_dir.name, exc_info=True,
         )
         return False
+
+
+#: The phases an execution run is in while it is in flight.
+#:
+#: A run that the shutdown interrupted leaves its plan in one of these
+#: phases; the parking writes ``queued`` over them.  A plan in any
+#: other phase was not parked mid-run — it had already moved on — and
+#: must not be moved back.
+_IN_FLIGHT_EXECUTION_PHASES = ("executing", "waiting_for_quota")
+
+
+def _shutdown_park_needs_phase(plan_dir: Path, row: Dict[str, Any]) -> bool:
+    """True when a shutdown parking was cut short and the phase is still owed.
+
+    Parking writes the row first and the plan's phase second, and the
+    process that was parking may die in between: the shutdown path is
+    the last code to run before the process goes away, and the executor
+    it kills is what the watcher is watching.  A plan caught in that
+    gap carries a row that says the run was stopped by the shutdown and
+    a phase that still says the run is in flight.
+
+    Nothing else will ever move it.  The next boot restores the row's
+    verdict and finds a row that is not running — there is no reconcile
+    to do, and the phase is never written.  So the recovery finishes
+    the parking: the phase becomes ``queued``, the phase the scheduler
+    waits on, and the plan is visible to the scheduler again.
+
+    Never raises: this runs on the recovery path, where one plan's
+    failure must not cost every other plan its recovery.
+    """
+    from shutdown_checkpoint import SHUTDOWN_STOP_REASON
+
+    row = row or {}
+    if row.get("exec_status") != "stopped":
+        return False
+    if row.get("stop_reason") != SHUTDOWN_STOP_REASON:
+        return False
+    try:
+        phase = _server.PlanState(plan_dir).get_current_phase()
+    except Exception:  # noqa: BLE001 — an unreadable phase is no evidence
+        _server.logger.warning(
+            "[shutdown_checkpoint] could not read the phase of a parked plan "
+            "plan=%s", plan_dir.name, exc_info=True,
+        )
+        return False
+    return phase in _IN_FLIGHT_EXECUTION_PHASES
 
 
 def _park_reconciled_plan(
@@ -591,7 +659,7 @@ def _adopt_run_project_dir(
 # (``backend/process_ledger.py``) is the durable answer: a ``spawn``
 # event at the moment the process starts, an ``exit`` event when it ends.
 #
-# Two rules govern the writing:
+# Three rules govern the writing:
 #
 # * **A ledger failure never blocks an execution.** The ledger is
 #   evidence, not a gate. A read-only plan directory or a full disk must
@@ -600,6 +668,14 @@ def _adopt_run_project_dir(
 # * **The identity is read from the kernel, not guessed.** pids are
 #   recycled, so the number alone does not identify a process; the start
 #   time does. ``process_identity.probe`` supplies it.
+# * **The identity recorded is the *settled* one.** A process may
+#   rewrite its own ``argv[0]`` a few milliseconds after it starts — on
+#   macOS the framework launcher re-executes the interpreter and
+#   replaces ``argv[0]`` with the resolved path. A command line read
+#   *right after* the spawn is therefore not the command line the
+#   kernel gives a moment later, and the strict identity comparison
+#   (``process_identity.matches``) then refuses to signal a process
+#   this backend started itself. See :func:`_settled_identity`.
 
 
 #: The roles a spawned executor may carry.
@@ -614,6 +690,119 @@ def _adopt_run_project_dir(
 SPAWN_ROLES = ("executor", "repair_executor")
 
 
+#: How long the settled-identity probe waits between two readings.
+#:
+#: The ``argv[0]`` rewrite lands a few milliseconds after the spawn
+#: (measured at 12-18 ms on macOS with the framework build of CPython
+#: 3.11), so the probe looks often enough to catch the rewrite as it
+#: lands: a reading per millisecond costs the spawn path about a dozen
+#: milliseconds and no more.
+#:
+#: The interval used to be 50 ms, and that cost was not cosmetic.  The
+#: scheduler admits the plans it can in one tick, and every one of them
+#: is spawned from its own request: a probe that spent a twentieth of a
+#: second on each spawn spread the starts of four plans across a second
+#: and a half, so the plan clock each of them runs on no longer ticked
+#: together and the scheduler panel never drew the same thing twice in a
+#: row.  The probe waits for the rewrite, not for a moment.
+SETTLED_IDENTITY_INTERVAL = 0.001
+
+#: How long the settled-identity probe watches a command line that has
+#: not moved before it takes the reading it has.
+#:
+#: The window is the fallback for the platforms where the program does
+#: not rewrite its command line at all: there is nothing to wait for,
+#: and the first reading is the settled one.  The window is long
+#: enough for the rewrite to land on a loaded machine — and the probe
+#: does not pay it twice for the same program (see
+#: :data:`_UNREWRITTEN_ARGV0`).
+SETTLED_IDENTITY_WINDOW = 0.1
+
+#: The programs whose command line was seen to stand still.
+#:
+#: A launcher that rewrites its ``argv[0]`` does so within a few
+#: milliseconds of the spawn, and it does it every time.  A program
+#: that keeps its command line never rewrites it.  Once a program has
+#: been seen to keep its command line, the probe does not wait for it
+#: again: the wait would cost every spawn and buy nothing.
+_UNREWRITTEN_ARGV0: Set[str] = set()
+
+
+def _settled_identity(pid: int, requested_argv0: Optional[str] = None) -> Optional[Any]:
+    """The identity of ``pid`` as the kernel still describes it a moment later.
+
+    A process may rewrite its own ``argv[0]`` shortly after it starts —
+    on macOS the framework launcher re-executes the interpreter and
+    replaces ``argv[0]`` with the resolved path (``process_identity``'s
+    module docstring says so). The rewrite lands a few milliseconds
+    after the spawn, so the command line read *right after* the spawn
+    is not the command line the kernel gives a moment later — and the
+    strict identity comparison (``process_identity.matches``) then
+    refuses to signal a process this backend started itself. That is
+    what made the startup reconcile report a mismatch and leave the
+    executor alone, and what made the reaper skip it.
+
+    The reading worth recording is the **settled** one, and there are
+    two ways to recognise it:
+
+    * the kernel's ``argv[0]`` no longer names the program that was
+      asked for — the rewrite has landed, and the reading is the one
+      the kernel gives from now on;
+    * the command line has been standing still for
+      :data:`SETTLED_IDENTITY_WINDOW` — nothing is rewriting it any
+      more, which is the case on every platform where the program does
+      not rewrite itself.
+
+    This is the same rule the repository's own identity helpers use —
+    see ``_stable_identity`` in
+    ``tests/unit/test_process_ownership_positive_controls.py``: the
+    recorded one has to be the settled one.
+
+    The wait ends as soon as the rewrite lands, so the cost of the
+    settle is the rewrite's own latency and not the window.
+
+    Never raises: the ledger is evidence, not a gate.
+    """
+    identity = probe_process_identity(pid)
+    if identity is None:
+        return None
+    cmdline = tuple(identity.cmdline or ())
+    if not requested_argv0 or not cmdline:
+        # There is nothing to compare the reading against: it is the
+        # best evidence there is.
+        return identity
+    if cmdline[0] != requested_argv0:
+        # The rewrite has already landed: this is the command line the
+        # kernel gives from now on.
+        return identity
+    if requested_argv0 in _UNREWRITTEN_ARGV0:
+        # This program has been seen to keep its command line: there is
+        # no rewrite to wait for.
+        return identity
+
+    last = identity
+    deadline = time.monotonic() + SETTLED_IDENTITY_WINDOW
+    while True:
+        time.sleep(SETTLED_IDENTITY_INTERVAL)
+        probed = probe_process_identity(pid)
+        if probed is None:
+            # The process is gone.  The last reading is still the best
+            # evidence there is, and the record still has to be written.
+            break
+        last = probed
+        cmdline = tuple(probed.cmdline or ())
+        if cmdline and cmdline[0] != requested_argv0:
+            # The rewrite has landed: this is the command line the
+            # kernel gives from now on.
+            return probed
+        if time.monotonic() >= deadline:
+            # The command line has stood still for the whole window:
+            # nothing is rewriting it, and this program will not either.
+            _UNREWRITTEN_ARGV0.add(requested_argv0)
+            break
+    return last
+
+
 def _ledger_write_spawn(
     plan_dir: Path,
     plan_id: str,
@@ -625,14 +814,19 @@ def _ledger_write_spawn(
     """Write the ``spawn`` event for a process this backend just started.
 
     The record names the pid, the process group the process can be
-    killed through, the identity the kernel gave it, and the backend
-    process that owns it.
+    killed through, the identity the kernel still gives it (the settled
+    one — see :func:`_settled_identity`), and the backend process that
+    owns it.
 
     Never raises: the ledger is evidence, not a gate.
     """
     try:
         pid = int(getattr(process, "pid", 0) or 0)
-        identity = probe_process_identity(pid) if pid > 0 else None
+        identity = (
+            _settled_identity(pid, requested_argv0=(cmd[0] if cmd else None))
+            if pid > 0
+            else None
+        )
 
         if identity is not None:
             # ``start_new_session=True`` makes the child the leader of a
@@ -1617,10 +1811,17 @@ def _park_shutdown_interrupted(
 
     # The task rows still have to go back — before the phase write, so
     # a failing phase write cannot leave the plan stuck in_progress.
-    _reap_orphaned_in_progress_tasks(plan_id)
+    try:
+        _reap_orphaned_in_progress_tasks(plan_id)
+    except Exception:  # noqa: BLE001 — a failed task write is not a failed park
+        _server.logger.exception("park: task write failed plan=%s", plan_id)
 
-    if plan_dir is None:
-        plan_dir = _server._plan_dir(plan_id)
+    try:
+        if plan_dir is None:
+            plan_dir = _server._plan_dir(plan_id)
+    except Exception:  # noqa: BLE001 — an unknown plan dir is not a failed park
+        _server.logger.exception("park: plan dir lookup failed plan=%s", plan_id)
+        return
     if not plan_dir.exists():
         return
     try:
@@ -1665,12 +1866,8 @@ def _judge_process_dead(
     if not state or state.get("status") != "running":
         return False
     # The server went down under this run?  Then it is not a crash.
-    from shutdown_checkpoint import is_shutdown_interrupted
-
-    if is_shutdown_interrupted(
-        _server._plan_dir(plan_id),
-        kind="execution",
-        run_started_at=(row or {}).get("started_at"),
+    if _shutdown_interrupted_this_run(
+        _server._plan_dir(plan_id), (row or {}).get("started_at")
     ):
         _park_shutdown_interrupted(plan_id)
         return True
@@ -2243,6 +2440,34 @@ START_ERROR_ALREADY_RUNNING = "already_running"
 START_ERROR_KILL_INCOMPLETE = "kill_incomplete"
 
 
+def _record_still_names_the_process(identity: Any, record: ProcessRecord) -> bool:
+    """Whether the process behind a pid is still the one the ledger recorded.
+
+    Pids are recycled: the process that owns a pid now may have nothing
+    to do with this plan.  The ledger recorded when the process it
+    started began, and the kernel says when the process behind the pid
+    began — two start times that differ by more than the tolerance name
+    two different processes.  That is the same bound
+    ``service_manager._pid_reused`` uses, so the two subsystems agree on
+    what "recycled" means.
+
+    The command line is deliberately not part of this question.  A
+    process may rewrite its own ``argv[0]`` after it starts — the macOS
+    framework launcher re-execs the interpreter — and a command line
+    that changed is still the same process: the start time does not
+    move when it does.  The command line is what says whether a pid may
+    be *signalled*; that is the reaper's question, and the reaper asks
+    it before it signals anything.
+    """
+    if not record.create_time or identity.create_time is None:
+        # The record cannot disprove anything: the kernel's answer stands.
+        return True
+    return (
+        abs(float(identity.create_time) - float(record.create_time))
+        <= CREATE_TIME_TOLERANCE
+    )
+
+
 def _live_executor_pids(plan_dir: Path) -> List[int]:
     """The pids the ledger says are still running as this plan's executor.
 
@@ -2254,12 +2479,24 @@ def _live_executor_pids(plan_dir: Path) -> List[int]:
     the leftover of a run that ended without writing its exit event.
     The kernel is asked, not the record: a pid on its own does not say
     whether the process behind it is still running.
+
+    A pid that names a process is not the whole answer either: the
+    process behind it may be a stranger that inherited the number.  The
+    ledger's own record of when the process began is what says so — see
+    :func:`_record_still_names_the_process`.  A recycled pid left in
+    the ledger would otherwise refuse every start of this plan for good.
     """
     pids: List[int] = []
     for pid, record in sorted(ledger_live_records(plan_dir).items()):
         if record.role not in SPAWN_ROLES:
             continue
-        if probe_process_identity(pid) is None:
+        identity = probe_process_identity(pid)
+        if identity is None:
+            continue
+        if not _record_still_names_the_process(identity, record):
+            # The pid is alive, but it is not the process this ledger
+            # recorded: the pid was recycled.  Refusing a start on it
+            # would block the plan on a stranger.
             continue
         pids.append(int(pid))
     return pids
@@ -3170,6 +3407,35 @@ def start_execution(
                     state["stop_reason"] = "non_zero_exit"
                     state["ended_at"] = datetime.now().isoformat()
                     _server.PlanState(plan_dir).transition_to("failed")
+                elif _shutdown_interrupted_this_run(
+                    plan_dir, state.get("started_at")
+                ):
+                    # The executor died by a signal, and the shutdown
+                    # checkpoint says the *server* went down under this
+                    # run: the work was interrupted, not broken.  The
+                    # run is parked — ``stopped``, phase ``queued`` —
+                    # instead of being failed, because a plan parked as
+                    # ``failed`` is in nobody's waiting set and is never
+                    # picked up again.
+                    #
+                    # The checkpoint is written by the shutdown path
+                    # *before* the tree is killed, so it is already on
+                    # disk by the time the signal reaches the executor.
+                    # The watchdog asks the same question when it finds
+                    # a dead executor (``_judge_process_dead``): the
+                    # plan has to come back the same way whichever of
+                    # the two noticed the death first.
+                    try:
+                        _park_shutdown_interrupted(plan_id, plan_dir=plan_dir)
+                    except Exception:  # noqa: BLE001 — a failed park is not a failed run
+                        # The run was interrupted, not broken: a park that
+                        # could not be written leaves the row as it was,
+                        # and the next boot reconciles it from the
+                        # checkpoint.  Marking it ``failed`` here would
+                        # be a lie about a run that was not broken.
+                        _server.logger.exception(
+                            "executor_shutdown_park_failed plan=%s", plan_id
+                        )
                 else:
                     state["status"] = "failed"
                     state["stop_reason"] = "process_died_unexpectedly"

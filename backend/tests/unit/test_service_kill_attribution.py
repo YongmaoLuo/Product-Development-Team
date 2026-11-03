@@ -56,6 +56,7 @@ import ast
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -568,6 +569,11 @@ def test_the_kill_request_is_written_before_the_signal_is_sent(
     try:
         runtime = sm.ServiceRuntime(
             name="api", port=_free_port(), pid=child.pid,
+            # The runtime says when its process started: that is the
+            # anchor the stop path's identity gate compares the live
+            # process against, and a runtime that cannot place its own
+            # pid is not signalled (2026-11-03, VP-018, L2).
+            start_epoch=time.time(),
         )
         seen: List[bool] = []
         real_kill = os.kill
@@ -715,3 +721,849 @@ def test_no_service_kill_is_sent_outside_kill_service() -> None:
         f"that the request is written down first; stray signals: "
         f"{violations!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The identity gate: a pid that was recycled is not ours to kill
+# ---------------------------------------------------------------------------
+#
+# The stop path used to signal the pid the runtime recorded, whoever was
+# holding that number by then.  PIDs are recycled: a service that died a
+# moment ago hands its number to the next process the kernel makes —
+# and on a busy machine that next process is another service that has
+# just come up.
+#
+# The reaping path already had an answer for this question ("is this pid
+# still the process the ledger recorded?"); the stop path did not, and
+# the two answers disagreed.  On 2026-11-03 the two answers disagreed
+# in the worst possible way: a stop that was one second late killed a
+# service that had been up for two, and the victim was reported as
+# "stopped by the round".
+#
+# These tests pin the stop path's answer: a pid whose identity cannot
+# be confirmed is not signalled, and the refusal is written down.
+
+
+def _live_child() -> subprocess.Popen:
+    """A process that is alive and does nothing at all."""
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def test_the_stop_path_does_not_signal_a_pid_that_was_recycled(
+    tmp_path, monkeypatch,
+) -> None:
+    """A pid the kernel gave to somebody else is not signalled.
+
+    The runtime says "service X is pid 4242".  The kernel says pid 4242
+    started ninety seconds ago, while the runtime recorded a start time
+    of a hundred seconds ago — so the number was recycled and the
+    process behind it is somebody else's.
+
+    Signalling it would kill an unrelated process on the strength of a
+    record about a different one.  The stop therefore refuses, and says
+    so in the request and in the return value: "no kill request was
+    written" must never be the reason a death cannot be explained.
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    child = _live_child()
+    real_kill = os.kill
+    try:
+        runtime = sm.ServiceRuntime(name="api", port=_free_port(), pid=child.pid)
+        # The anchor says the pid was started a hundred seconds ago; the
+        # live process started a moment ago.  The number was recycled.
+        runtime.start_epoch = time.time() - 100.0
+
+        sent: List[Tuple[int, int]] = []
+        monkeypatch.setattr(
+            sm.os, "kill", lambda pid, sig: sent.append((int(pid), int(sig)))
+        )
+
+        outcome = sm.kill_service(
+            runtime, "test.identity_gate", "the pid was recycled",
+            ROUND_TOKEN, plan_dir=plan_dir,
+        )
+
+        assert sent == [], (
+            f"a pid that was recycled must not be signalled; got {sent!r}"
+        )
+        assert outcome["signalled"] == [], outcome
+        assert outcome["pids"] == [], outcome
+        refused = outcome.get("refused") or []
+        assert refused, (
+            f"the refusal must be in the return value; got {outcome!r}"
+        )
+        assert refused[0]["pid"] == child.pid, refused
+        assert refused[0]["reason"] == "pid_recycled", refused
+
+        # And it is on the record, not just in the return value.
+        events = sm.read_kill_events(plan_dir)
+        assert len(events) == 1, events
+        recorded = events[0].get("refused") or []
+        assert recorded, (
+            f"the request must say why no signal went out; got {events[0]!r}"
+        )
+        assert recorded[0]["pid"] == child.pid, recorded
+        assert recorded[0]["reason"] == "pid_recycled", recorded
+    finally:
+        real_kill(child.pid, signal.SIGKILL)
+        child.wait(timeout=5)
+
+
+def test_the_stop_path_still_signals_a_pid_that_is_still_ours(tmp_path) -> None:
+    """The gate refuses a recycled pid — and nothing else.
+
+    A service that is alive, and is the process the runtime recorded,
+    is stopped as before.  A gate that refused everything would leave
+    every service running, which is a worse failure than the one it
+    prevents.
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    child = _live_child()
+    try:
+        runtime = sm.ServiceRuntime(name="api", port=_free_port(), pid=child.pid)
+        # The anchor is the child's own start time: the process behind
+        # the pid is the one the runtime started.
+        runtime.start_epoch = time.time()
+
+        outcome = sm.kill_service(
+            runtime, "test.identity_gate", "the pid is still ours",
+            ROUND_TOKEN, plan_dir=plan_dir,
+        )
+
+        assert outcome["signalled"], outcome
+        assert outcome["pids"] == [child.pid], outcome
+        assert not outcome.get("refused"), outcome
+    finally:
+        try:
+            os.kill(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        child.wait(timeout=5)
+
+
+def test_the_stop_path_does_not_signal_a_group_the_pid_no_longer_leads(
+    tmp_path, monkeypatch,
+) -> None:
+    """A group the recorded pid does not lead is not signalled.
+
+    The recorded group is a number, and numbers are recycled too: the
+    group the service led when it was started may since have been
+    handed to a completely different set of processes.  A group signal
+    reaches every one of them.
+
+    The stop therefore uses the recorded group only while the recorded
+    pid still leads it, and never guesses a group from whatever process
+    happens to be holding the port.
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    child = _live_child()
+
+    try:
+        runtime = sm.ServiceRuntime(name="api", port=_free_port(), pid=child.pid)
+        runtime.start_epoch = time.time()
+        # A group the service never led: the child's own group is the
+        # test session's, and this number is nobody's.
+        runtime.pgid = 987654
+
+        groups: List[Tuple[int, int]] = []
+        monkeypatch.setattr(
+            sm.os, "killpg", lambda pgid, sig: groups.append((int(pgid), int(sig)))
+        )
+
+        outcome = sm.kill_service(
+            runtime, "test.identity_gate", "the group is not ours",
+            ROUND_TOKEN, plan_dir=plan_dir,
+        )
+
+        assert groups == [], (
+            f"a group the pid does not lead must not be signalled; got "
+            f"{groups!r}"
+        )
+        assert outcome["group_signalled"] is False, outcome
+    finally:
+        try:
+            os.kill(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        child.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# No anchor at all: the pid cannot be identified, so it is not ours
+# ---------------------------------------------------------------------------
+#
+# The anchor (``runtime.start_epoch``) is the answer to "whose process
+# is this number?".  The report is explicit about the trade: when the
+# start time cannot be recorded, record ``None`` and let the stop path
+# refuse to signal -- an answer that is five seconds out is worse than
+# no answer, because it looks like an answer (2026-11-03, VP-018, L2).
+#
+# So a runtime without an anchor must not be signalled blindly.  What
+# it may be signalled is the case where **nothing is there**: a pid that
+# names no live process cannot be a stranger, and the kernel refuses
+# the signal itself.
+
+
+def test_the_stop_path_refuses_a_live_pid_it_cannot_identify(
+    tmp_path, monkeypatch,
+) -> None:
+    """A pid with no recorded start time is not ours to kill.
+
+    The runtime says "service X is pid 4242" and never says when that
+    process started.  The number is alive, so there is a process behind
+    it -- but nothing in the record says it is ours, and the number may
+    well have been handed to somebody else since the runtime was
+    written.
+
+    The stop therefore refuses to signal it, and writes the refusal
+    down: a pid that is alive and unidentified is somebody else's until
+    proven otherwise (2026-11-03, VP-018, L2).
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    child = _live_child()
+    real_kill = os.kill
+    try:
+        runtime = sm.ServiceRuntime(name="api", port=_free_port(), pid=child.pid)
+        # No anchor: this runtime never recorded when its process
+        # started, so it cannot place the pid in time.
+        runtime.start_epoch = None
+
+        sent: List[Tuple[int, int]] = []
+        monkeypatch.setattr(
+            sm.os, "kill", lambda pid, sig: sent.append((int(pid), int(sig)))
+        )
+
+        outcome = sm.kill_service(
+            runtime, "test.identity_gate", "the pid cannot be identified",
+            ROUND_TOKEN, plan_dir=plan_dir,
+        )
+
+        assert sent == [], (
+            f"a pid that cannot be identified must not be signalled; got "
+            f"{sent!r}"
+        )
+        assert outcome["signalled"] == [], outcome
+        assert outcome["pids"] == [], outcome
+        refused = outcome.get("refused") or []
+        assert refused, (
+            f"the refusal must be in the return value; got {outcome!r}"
+        )
+        assert refused[0]["pid"] == child.pid, refused
+        assert refused[0]["reason"] == "no_start_time_recorded", refused
+
+        # And it is on the record, not just in the return value.
+        events = sm.read_kill_events(plan_dir)
+        assert len(events) == 1, events
+        recorded = events[0].get("refused") or []
+        assert recorded, (
+            f"the request must say why no signal went out; got {events[0]!r}"
+        )
+        assert recorded[0]["pid"] == child.pid, recorded
+        assert recorded[0]["reason"] == "no_start_time_recorded", recorded
+    finally:
+        try:
+            real_kill(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        child.wait(timeout=5)
+
+
+def test_the_stop_path_still_signals_a_pid_that_names_no_live_process(
+    tmp_path, monkeypatch,
+) -> None:
+    """The refusal is about live processes, not about numbers.
+
+    A pid that names nothing cannot be a stranger, and the kernel
+    refuses the signal itself.  Refusing to even try would change
+    nothing about the world and would put a refusal on the record that
+    describes a stranger where there is none.
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    runtime = sm.ServiceRuntime(
+        name="api", port=_free_port(), pid=_dead_pid(),
+    )
+    runtime.start_epoch = None
+
+    sent: List[Tuple[int, int]] = []
+    monkeypatch.setattr(
+        sm.os, "kill", lambda pid, sig: sent.append((int(pid), int(sig)))
+    )
+
+    outcome = sm.kill_service(
+        runtime, "test.identity_gate", "the pid names no process",
+        ROUND_TOKEN, plan_dir=plan_dir,
+    )
+
+    assert sent == [(runtime.pid, signal.SIGTERM)], (
+        f"a pid that names no live process is not a stranger; got {sent!r}"
+    )
+    assert not outcome.get("refused"), outcome
+
+
+def test_the_stop_path_does_not_signal_a_group_it_cannot_identify(
+    tmp_path, monkeypatch,
+) -> None:
+    """A group whose leader cannot be identified is not signalled.
+
+    A group signal reaches every member of the group, so it is the
+    wider of the two signals and needs the wider proof.  When the
+    recorded pid cannot be placed in time there is no proof that the
+    recorded group is still the group of our own process -- the number
+    may have been recycled along with the pid.
+
+    The group is therefore refused, and the refusal is written down.
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    real_kill = os.kill
+    try:
+        runtime = sm.ServiceRuntime(name="api", port=_free_port(), pid=child.pid)
+        runtime.start_epoch = None
+        # The child leads a group of its own: the group the service
+        # would have led.
+        runtime.pgid = child.pid
+
+        groups: List[Tuple[int, int]] = []
+        monkeypatch.setattr(
+            sm.os, "killpg", lambda pgid, sig: groups.append((int(pgid), int(sig)))
+        )
+        sent: List[Tuple[int, int]] = []
+        monkeypatch.setattr(
+            sm.os, "kill", lambda pid, sig: sent.append((int(pid), int(sig)))
+        )
+
+        outcome = sm.kill_service(
+            runtime, "test.identity_gate", "the group cannot be identified",
+            ROUND_TOKEN, plan_dir=plan_dir,
+        )
+
+        assert groups == [], (
+            f"a group whose leader cannot be identified must not be "
+            f"signalled; got {groups!r}"
+        )
+        assert outcome["group_signalled"] is False, outcome
+        assert sent == [], (
+            f"nor may the pid behind it be signalled; got {sent!r}"
+        )
+        refused = outcome.get("refused") or []
+        assert refused, (
+            f"the refusal must be in the return value; got {outcome!r}"
+        )
+        # Both refusals are on the record: the pid that cannot be
+        # placed, and the group it no longer proves.
+        kinds = {
+            ("pid" if entry.get("pid") else "pgid"): entry.get("reason")
+            for entry in refused
+        }
+        assert kinds == {
+            "pid": "no_start_time_recorded",
+            "pgid": "group_not_ours",
+        }, refused
+    finally:
+        try:
+            real_kill(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        child.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# The request is written down even when there is no plan directory
+# ---------------------------------------------------------------------------
+#
+# "There is no kill request in the log" used to be read as "nobody
+# killed it".  It is not: the requests of the tests that stop a service
+# without naming a plan directory were dropped on the floor, because
+# the plan directory was the only place a request could be written to.
+#
+# A dropped request is a death with no question beside it.  The request
+# is therefore written wherever the service's own record lives, so that
+# "who asked" always has an answer.
+
+
+def test_a_kill_request_is_recorded_without_a_plan_directory(tmp_path) -> None:
+    """A stop that names no plan directory still leaves a record.
+
+    The service knows where its own log lives; the request goes next to
+    it.  The caller and the call site are in it, because those are the
+    two things the reader of a death needs.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    runtime = sm.ServiceRuntime(name="api", port=_free_port(), pid=_dead_pid())
+    runtime.log_path = str(log_dir / "api.log")
+
+    outcome = sm.kill_service(
+        runtime, "test.no_plan_dir", "no plan directory", ROUND_TOKEN,
+    )
+
+    assert outcome["recorded"] is True, outcome
+    events = sm.read_kill_events_in(log_dir)
+    assert len(events) == 1, events
+    event = events[0]
+    assert event["event"] == sm.KILL_EVENT_REQUESTED, event
+    assert event["caller"] == "test.no_plan_dir", event
+    assert event["reason"] == "no plan directory", event
+    assert event["stack_hint"], event
+
+
+# ---------------------------------------------------------------------------
+# The stranger on the port
+# ---------------------------------------------------------------------------
+#
+# The stop re-probes the port it declared, because a service can leave a
+# sibling behind: the wrapper is gone, the server it started is still
+# holding the address.  That re-probe finds a **candidate** — a process
+# that answers on the port and whose command line matches the
+# declaration.
+#
+# A candidate is not proof.  Two suites on one machine declare the same
+# port; the neighbour's service wins the bind, and the neighbour's stop
+# re-probes the port, finds the winner, sees a command line that matches
+# its own declaration, and signals it.  The winner dies, and the round
+# that started it is told its service died — "stopped by the round",
+# written by a round that never started it.
+#
+# So the candidate is signalled only when it is a **member of the
+# service's own group**: the proof this codebase already uses for a port
+# holder (see ``reap_services``).  A candidate that cannot show it is
+# refused, and the refusal is written down like every other refusal.
+
+
+def _group_leader() -> subprocess.Popen:
+    """A process that leads a group of its own, in this session."""
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        preexec_fn=lambda: os.setpgid(0, 0),
+    )
+
+
+def _service_on_port(
+    port: int, script: Path, group: Optional[int] = None,
+) -> subprocess.Popen:
+    """The fixture service, holding *port*.
+
+    With *group* it joins that group — a sibling of ours, the case the
+    re-probe exists for.  Without one it leads a session of its own:
+    a stranger.
+    """
+    preexec = None
+    if group is not None:
+        preexec = lambda: os.setpgid(0, group)  # noqa: E731
+    return subprocess.Popen(
+        [sys.executable, str(script), str(_FIXTURE_ROWS), str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        preexec_fn=preexec,
+    )
+
+
+def _stop_everything(*procs: subprocess.Popen) -> None:
+    for proc in procs:
+        try:
+            os.kill(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:  # pragma: no cover - cleanup only
+            pass
+
+
+def test_the_stop_path_does_not_signal_a_stranger_that_holds_the_port(
+    tmp_path,
+) -> None:
+    """A process on our port is not ours to kill just because it matches.
+
+    The runtime says "service X is pid 4242", and pid 4242 is gone: the
+    service died, and the port it declared is now held by somebody else —
+    a process whose command line matches our declaration, because the
+    neighbour declared the same port and its service won the bind.
+
+    Signalling it would kill an unrelated process on the strength of a
+    match that only says "the same program".  The stop therefore refuses,
+    and says so in the request and in the return value.
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    script = tmp_path / "fixture_service.py"
+    script.write_text(_SERVICE_SOURCE, encoding="utf-8")
+    port = _free_port()
+    decl = _declaration(port, script)
+
+    # Our service: it led a group of its own, and it is gone.
+    leader = _group_leader()
+    group = leader.pid
+    leader.kill()
+    leader.wait(timeout=5)
+
+    # The stranger: it holds the port, and it looks like ours.
+    stranger = _service_on_port(port, script)
+    try:
+        assert _wait_for(lambda: sm.probe_port(port).listening, timeout=20.0), (
+            "the stranger never took the port"
+        )
+
+        runtime = sm.ServiceRuntime(name="api", port=port, pid=leader.pid)
+        runtime.pgid = group
+        runtime.start_epoch = time.time()
+
+        outcome = sm.stop_service(
+            runtime, decl,
+            grace_seconds=1.0,
+            caller="test.stranger_on_port",
+            reason="the stranger holds the port",
+            round_token=ROUND_TOKEN,
+            plan_dir=plan_dir,
+        )
+
+        assert stranger.poll() is None, (
+            "a stranger that holds the port must not be signalled; it was "
+            f"killed by a stop that could not prove it was ours ({outcome!r})"
+        )
+        refused = outcome.get("refused") or []
+        assert any(
+            entry.get("pid") == stranger.pid for entry in refused
+        ), f"the refusal must be in the return value; got {outcome!r}"
+
+        # And it is on the record, not just in the return value.
+        events = sm.read_kill_events(plan_dir)
+        assert events, "no kill request was recorded"
+        recorded = events[0].get("refused") or []
+        assert any(
+            entry.get("pid") == stranger.pid for entry in recorded
+        ), f"the request must say why no signal went out; got {events[0]!r}"
+    finally:
+        _stop_everything(stranger, leader)
+
+
+def test_the_stop_path_still_signals_a_member_of_our_own_group(
+    tmp_path,
+) -> None:
+    """The gate refuses a stranger — and nothing else.
+
+    The re-probe exists for the sibling: the wrapper is gone, the server
+    it started is still holding the address, and that server is a member
+    of the group the service led.  It is ours, and it is still stopped.
+    A gate that refused it would leave the port held and the round
+    waiting — a worse failure than the one it prevents.
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    script = tmp_path / "fixture_service.py"
+    script.write_text(_SERVICE_SOURCE, encoding="utf-8")
+    port = _free_port()
+    decl = _declaration(port, script)
+
+    leader = _group_leader()
+    group = leader.pid
+    assert _wait_for(
+        lambda: os.getpgid(leader.pid) == group, timeout=5.0,
+    ), "the leader never became a group leader"
+
+    # The sibling: it joined our group and it holds the port.
+    sibling = _service_on_port(port, script, group=group)
+    try:
+        assert _wait_for(lambda: sm.probe_port(port).listening, timeout=20.0), (
+            "the sibling never took the port"
+        )
+        # The wrapper is gone; the group it led is not.
+        leader.kill()
+        leader.wait(timeout=5)
+
+        runtime = sm.ServiceRuntime(name="api", port=port, pid=leader.pid)
+        runtime.pgid = group
+        runtime.start_epoch = time.time()
+
+        outcome = sm.stop_service(
+            runtime, decl,
+            grace_seconds=5.0,
+            caller="test.own_group_on_port",
+            reason="our own sibling holds the port",
+            round_token=ROUND_TOKEN,
+            plan_dir=plan_dir,
+        )
+
+        assert sibling.poll() is not None, (
+            "a member of our own group must still be signalled; it was "
+            f"left running ({outcome!r})"
+        )
+        assert any(
+            "pid %s" % sibling.pid in entry for entry in outcome["signalled"]
+        ), outcome
+    finally:
+        _stop_everything(sibling, leader)
+
+
+# ---------------------------------------------------------------------------
+# The command line is a rendering, not an identity
+# ---------------------------------------------------------------------------
+#
+# The two tests above are the gate working.  They are also — on a
+# platform that renders a command line differently — two tests that
+# never exercise the gate at all, and that is exactly what happened in
+# the verification container (2026-11-03, VP-018).
+#
+# The candidate set of the stop path used to be "the holders of the
+# port **whose command line matches our declaration**".  That filter
+# fails in two ways that are both ordinary:
+#
+# * macOS's framework launcher rewrites the child's ``argv[0]`` to the
+#   resolved interpreter path, so the declared token (``python3``) is
+#   no longer part of the live command line;
+# * ``ps`` truncates the command line at 80 columns on a Linux box
+#   without a terminal, so every token past the 80th column is gone.
+#
+# When the filter failed the holder was never even looked at: our own
+# leftover was not stopped (the port stayed held and the round waited
+# for a service that was never coming) and a stranger's refusal was
+# never written down (so the event stream said that nothing had
+# happened, which is the shape of the hole this file exists to close).
+#
+# So the command line is not allowed to decide **who is a candidate**.
+# The group decides who is ours, and it is decided where the verdict
+# is written down.
+
+
+def _declaration_matching_nothing(port: int) -> ServiceDeclaration:
+    """A declaration that no live command line can match.
+
+    Deliberate: the point of the two tests below is that the stop
+    path's verdict does not depend on how the platform renders a
+    command line, so the fixture must not depend on it either.
+    """
+    return ServiceDeclaration(
+        name="api",
+        port=port,
+        start_cmd="/opt/pdt/services/never-started --port %d" % port,
+        cwd=".",
+        health_url=f"http://127.0.0.1:{port}/health",
+        ready_timeout_seconds=30,
+        log_path="tmp/api.log",
+    )
+
+
+def _declaration_matching_the_live_command_line(
+    port: int,
+) -> ServiceDeclaration:
+    """A declaration that matches whatever the platform rendered.
+
+    The command line is read back from the live holder, so the fixture
+    does not depend on the rendering: macOS rewrites the child's
+    ``argv[0]`` to the resolved interpreter path, and ``ps`` truncates
+    the line at 80 columns on a Linux box without a terminal.
+    """
+    probe = sm.probe_port(port)
+    cmdline = (probe.cmdlines or [""])[0]
+    return ServiceDeclaration(
+        name="api",
+        port=port,
+        start_cmd=cmdline or "python -m api",
+        cwd=".",
+        health_url=f"http://127.0.0.1:{port}/health",
+        ready_timeout_seconds=30,
+        log_path="tmp/api.log",
+    )
+
+
+def test_the_stop_path_refuses_a_port_holder_whose_command_line_does_not_match(
+    tmp_path,
+) -> None:
+    """The gate has to see a holder it cannot name in the command line.
+
+    A stranger holds the port.  Its command line does not match our
+    declaration — not by accident of this fixture, but because that is
+    how a command line looks on a platform that renders it its own way
+    (macOS rewrites ``argv[0]``; ``ps`` truncates at 80 columns).
+
+    The stranger must survive, and the refusal must be **written
+    down**: a stop that says nothing is a stop nobody can investigate.
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    script = tmp_path / "fixture_service.py"
+    script.write_text(_SERVICE_SOURCE, encoding="utf-8")
+    port = _free_port()
+    decl = _declaration_matching_nothing(port)
+
+    # Our service: it led a group of its own, and it is gone.
+    leader = _group_leader()
+    group = leader.pid
+    leader.kill()
+    leader.wait(timeout=5)
+
+    # The stranger: it holds the port, and it does not look like ours.
+    stranger = _service_on_port(port, script)
+    try:
+        assert _wait_for(lambda: sm.probe_port(port).listening, timeout=20.0), (
+            "the stranger never took the port"
+        )
+
+        runtime = sm.ServiceRuntime(name="api", port=port, pid=leader.pid)
+        runtime.pgid = group
+        runtime.start_epoch = time.time()
+
+        outcome = sm.stop_service(
+            runtime, decl,
+            grace_seconds=1.0,
+            caller="test.unreadable_command_line",
+            reason="the stranger holds the port",
+            round_token=ROUND_TOKEN,
+            plan_dir=plan_dir,
+        )
+
+        assert stranger.poll() is None, (
+            "a stranger that holds the port must not be signalled; it was "
+            f"killed by a stop that could not prove it was ours ({outcome!r})"
+        )
+        refused = outcome.get("refused") or []
+        assert any(
+            entry.get("pid") == stranger.pid for entry in refused
+        ), (
+            "the refusal must be written down even when the command line "
+            f"does not match; got {outcome!r}"
+        )
+
+        # And it is on the record, not just in the return value.
+        events = sm.read_kill_events(plan_dir)
+        assert events, "no kill request was recorded"
+        recorded = events[0].get("refused") or []
+        assert any(
+            entry.get("pid") == stranger.pid for entry in recorded
+        ), f"the request must say why no signal went out; got {events[0]!r}"
+    finally:
+        _stop_everything(stranger, leader)
+
+
+def test_the_stop_path_still_signals_our_own_group_when_the_command_line_does_not_match(
+    tmp_path,
+) -> None:
+    """A gate that cannot read the command line must still stop our own.
+
+    The wrapper is gone and the server it started is still holding the
+    address — that server is a member of the group the service led, and
+    it is ours.  Its command line does not match the declaration
+    (see the note above), and it must be stopped all the same: a gate
+    that refuses everything leaves the port held and the round waiting,
+    which is a worse failure than the one the gate prevents.
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    script = tmp_path / "fixture_service.py"
+    script.write_text(_SERVICE_SOURCE, encoding="utf-8")
+    port = _free_port()
+    decl = _declaration_matching_nothing(port)
+
+    leader = _group_leader()
+    group = leader.pid
+    assert _wait_for(
+        lambda: os.getpgid(leader.pid) == group, timeout=5.0,
+    ), "the leader never became a group leader"
+
+    # The sibling: it joined our group and it holds the port.
+    sibling = _service_on_port(port, script, group=group)
+    try:
+        assert _wait_for(lambda: sm.probe_port(port).listening, timeout=20.0), (
+            "the sibling never took the port"
+        )
+        # The wrapper is gone; the group it led is not.
+        leader.kill()
+        leader.wait(timeout=5)
+
+        runtime = sm.ServiceRuntime(name="api", port=port, pid=leader.pid)
+        runtime.pgid = group
+        runtime.start_epoch = time.time()
+
+        outcome = sm.stop_service(
+            runtime, decl,
+            grace_seconds=5.0,
+            caller="test.unreadable_command_line.own_group",
+            reason="our own sibling holds the port",
+            round_token=ROUND_TOKEN,
+            plan_dir=plan_dir,
+        )
+
+        assert sibling.poll() is not None, (
+            "a member of our own group must still be signalled; it was "
+            f"left running ({outcome!r})"
+        )
+        assert any(
+            "pid %s" % sibling.pid in entry for entry in outcome["signalled"]
+        ), outcome
+    finally:
+        _stop_everything(sibling, leader)
+
+
+def test_the_stop_path_never_signals_a_process_in_the_callers_own_group(
+    tmp_path,
+) -> None:
+    """The caller's own group is a proof of the opposite of ours.
+
+    The group the service led is what says "this candidate is ours" —
+    but the caller's own group says the opposite: every member of it is
+    something the caller owns, the caller included.  Signalling one
+    takes the backend down (and under pytest, the whole session), so a
+    candidate that sits in that group is never signalled, however well
+    its command line matches.
+    """
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    script = tmp_path / "fixture_service.py"
+    script.write_text(_SERVICE_SOURCE, encoding="utf-8")
+    port = _free_port()
+
+    leader = _group_leader()
+    group = leader.pid
+    leader.kill()
+    leader.wait(timeout=5)
+
+    # The stranger: it holds the port, in the caller's own group.
+    stranger = _service_on_port(port, script)
+    try:
+        assert _wait_for(lambda: sm.probe_port(port).listening, timeout=20.0), (
+            "the stranger never took the port"
+        )
+        decl = _declaration_matching_the_live_command_line(port)
+
+        runtime = sm.ServiceRuntime(name="api", port=port, pid=leader.pid)
+        # A service started in band leads no group of its own: the group
+        # it is recorded with is the caller's.
+        runtime.pgid = os.getpgrp()
+        runtime.start_epoch = time.time()
+
+        outcome = sm.stop_service(
+            runtime, decl,
+            grace_seconds=1.0,
+            caller="test.callers_own_group",
+            reason="the holder of the port sits in the caller's own group",
+            round_token=ROUND_TOKEN,
+            plan_dir=plan_dir,
+        )
+
+        assert stranger.poll() is None, (
+            "a process in the caller's own group must never be signalled; "
+            f"it was killed ({outcome!r})"
+        )
+    finally:
+        _stop_everything(stranger, leader)
