@@ -53,7 +53,10 @@ from state_machine.repositories.plan_task_repository import (  # noqa: E402
 PLAN_DIR_NAME = "plan-20261031"
 PLAN_ID = PLAN_DIR_NAME
 ROUND = 3
-TASK_ID = f"repair-r{ROUND}-01"
+#: The id the merge task gets when the plan owns no repair id yet.
+#: The number is plan-global (2026-11-02), so it does not carry the
+#: round any more.
+TASK_ID = "repair-01"
 
 
 # ---------------------------------------------------------------------------

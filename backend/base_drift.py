@@ -86,6 +86,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from repair_generator import format_repair_task_id, next_repair_seq_base
+
 # ── environment knobs ──────────────────────────────────────────────────────
 #
 # Three knobs, all optional, all with a default that keeps the check
@@ -1335,7 +1337,8 @@ def build_conflict_repair_task(
     plan_id: str,
     project_dir: Any,
     round_number: int,
-    seq: int = 1,
+    seq: Optional[int] = None,
+    existing_task_ids: Optional[Sequence[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Turn a conflicting base-drift report into one executable task.
 
@@ -1349,16 +1352,32 @@ def build_conflict_repair_task(
     is nothing to repair, and a task without a change scope sends the
     executor off to "fix" files that were never in conflict.
 
-    The id is the shape the repair round writes — ``repair-r<round>-<seq>``
+    The id is the shape the repair round writes — ``repair-<seq>``
     — because the executor recognises a repair task by that shape (and by
     a group starting with ``repair``).  A task whose id falls outside it
     is a task the executor never picks up: the round would report "the
     repair batch drained" while the repair is still queued.
 
-    The round number is *not* zero-padded, and the sequence number is:
-    ``repair-r3-01`` is the shape the rest of the repair chain writes
-    and parses back, so a task written here occupies a number the
-    sequence allocator can see.
+    The sequence number is zero-padded: ``repair-03`` is the shape the
+    rest of the repair chain writes and parses back, so a task written
+    here occupies a number the sequence allocator can see.
+
+    **The sequence number is allocated, not hard-coded.**  Passing
+    ``seq`` explicitly keeps the old behaviour (the number the caller
+    wants).  Leaving it out means the number comes from
+    :func:`repair_generator.next_repair_seq_base` — the same allocator
+    the ordinary repair tasks and the root-cause tasks use — reading
+    ``existing_task_ids``.
+
+    Why this matters (2026-11-02, post-mortem).  ``plan_tasks`` is
+    keyed on ``(plan_id, task_id)``, and its upsert updates the static
+    columns only: a row that already exists **keeps** its runtime
+    state.  A hard-coded ``repair-r<round>-01`` therefore collides
+    with the row a *previous* month wrote for the same round number,
+    and the fresh task is born ``completed``.  The executor sees a
+    terminal status and skips the task as ``superseded`` — silently.
+    A plan whose round counter resets to 1 every cycle then burns its
+    rounds doing nothing at all.
 
     Every key it emits is on the task table's static allow-list, and
     ``status`` is not among them: the status belongs to whoever writes
@@ -1375,7 +1394,15 @@ def build_conflict_repair_task(
         return None
 
     round_no = int(round_number)
-    seq_no = int(seq)
+    if seq is None:
+        # The allocator lives in ``repair_generator`` — one allocation
+        # rule for the whole repair chain, so a base-drift task cannot
+        # pick a number another repair task already owns.
+        seq_no = next_repair_seq_base(
+            list(existing_task_ids or ()), round_no,
+        )
+    else:
+        seq_no = int(seq)
     plan = str(plan_id or "").strip()
     base_ref = str(_report_field(report, "base_ref", "") or "")
     base_sha = str(_report_field(report, "base_sha", "") or "")
@@ -1406,7 +1433,7 @@ def build_conflict_repair_task(
     )
 
     task: Dict[str, Any] = {
-        "id": f"repair-r{round_no}-{seq_no:02d}",
+        "id": format_repair_task_id(seq_no),
         "task_group": REPAIR_TASK_GROUP,
         "failed_vp_id": BASE_DRIFT_VP_ID,
         "round": round_no,

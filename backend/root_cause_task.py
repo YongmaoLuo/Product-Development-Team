@@ -43,6 +43,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any, Dict, List, Optional
 
 from repair_generator import (
+    format_repair_task_id,
     next_repair_seq_base,
     normalise_declared_files,
     parse_repair_task_id,
@@ -86,35 +87,39 @@ ROOT_CAUSE_DELIVERABLE = (
 
 #: 根因报告的改动范围模板（作者侧的契约）。
 #:
-#: 读者（``verification.orchestrator._root_cause_scope_from_text``）只认
-#: 两种形态：``_ROOT_CAUSE_SCOPE_HEADINGS`` 六种标题之一开头的章节，或者
-#: JSON 里的 ``paths`` / ``files_to_modify`` / ``fix_plan``。作者不知道
-#: 这个契约，报告就写成叙事体，读者的路径数为 0，根因链停摆。
+#: 读者（``verification.orchestrator._root_cause_scope_from_text``）只读
+#: **声明**：整份报告是 JSON，或者报告里有一个语言标注为 ``json`` 的围栏
+#: 块。散文不是声明 —— 一段话、一张表、一串 bullet 都读不出「哪个路径是
+#: 这次真要新建的、哪个只是举例」，所以读者不再按行扫「改动范围」小节。
 #:
-#: 标题用「改动范围」—— 读者常量表的首项，逐字对齐，不写「改动清单」
-#: 「变更文件」这类变体：读者只按前缀匹配常量表，差一点就整节落空。
+#: 模板因此只给形状，不给路径：形状是 ``files_to_modify`` + ``fix_plan``，
+#: 路径由作者照自己这次的判断填。模板里**不能**出现任何具体路径 ——
+#: 读者会把块里的每一个路径都当成白名单，一个占位名进去就是一个假
+#: 白名单项出去。
 #:
-#: JSON 备选写成围栏块，而读者的 ``_json_body`` 只看全文**第一个**围栏块
-#: —— 所以这段正文里不能出现更早的围栏；「改动范围」这一节也必须自成
-#: 一节，能被原样切片喂回读者（回归钉子就是这么做的）。
+#: 标题用「改动范围」—— 它现在是给人看的小节标题，读者不再依赖它；但
+#: 两边仍然叫同一个名字，读报告的人才找得到那一节。
+#:
+#: 围栏块是**同一个文件**里的类型化容器：报告任务只允许写一个文件
+#: （``agent.py`` 的 ``task_report_path``），再单开一个 ``.scope.json``
+#: 会被写盘闸门拒掉。
 _SCOPE_CONTRACT_TEMPLATE = """
 
 ## 改动范围
 
-- `backend/example_scope.py`
-
-报告里必须有一节「改动范围」，逐条列出这次修复要改动的文件（相对仓库根的路径）。
-实现任务允许改动的文件集合**只**取自这一节 —— 范围写漏，实现任务就改不动；
-没有这一节，根因链会停在 root_cause_report_without_scope。
-
-也可以用等价的 JSON 写法（键为 `files_to_modify` 与 `fix_plan`）：
+报告里**必须**有一个语言标注为 `json` 的代码块，写明这次修复要改哪些文件：
 
 ```json
 {
-  "files_to_modify": ["backend/example_scope.py"],
+  "files_to_modify": ["<相对仓库根的路径>", "..."],
   "fix_plan": "改哪个文件、怎么改、为什么这样改覆盖了所有层"
 }
 ```
+
+* 块里写的**每一个**路径都会被当作本任务可以改写的文件白名单。
+  写漏了，实现任务就**改不动**那个文件；写多了，就会把不该改的文件也锁进去。
+* **新建的文件也要写进去** —— 还没存在的文件同样在白名单里。
+* **不要写示例路径**，只写这次真正要改的路径。占位名不是路径。
 """
 
 
@@ -143,12 +148,19 @@ def _allocate_task_id(
 
     显式 ``task_id`` 优先；否则用 ``seq_base``（调用方已经算好的号），
     再否则用 :func:`repair_generator.next_repair_seq_base` 在既有 id 里
-    找下一个空号。产出的形状是 ``repair-r{round}-{seq}`` —— 既有解析器
+    找下一个空号。产出的形状是 ``repair-{seq}`` —— 既有解析器
     :func:`repair_generator.parse_repair_task_id` 读得出来，所以它占的号
     会被后来的分配看见。
 
+    编号是 **plan 级**的，不是轮次级的（2026-11-02）：轮次计数会重置，
+    重置后的轮次会重新发出同一批 id，而 ``plan_tasks`` 的 upsert 保留
+    旧行的运行时状态，于是新任务一出生就是 ``completed``，整轮空转。
+    所以 id 里不再带轮次，号在整个 plan 内单调递增。
+
     显式给的 ``task_id`` 也要读得出来才收：读不出来的 id 属于另一套编号
-    空间，会绕开序列分配器 —— 那正是这个模块要避免的事。
+    空间，会绕开序列分配器 —— 那正是这个模块要避免的事。两种形状都收：
+    新的 ``repair-{seq}`` 与旧的 ``repair-r{round}-{seq}``（旧 id 是历史，
+    不迁移、不重写）。
     """
     round_number = int(round_no)
     if round_number < 1:
@@ -158,7 +170,8 @@ def _allocate_task_id(
     if explicit:
         if parse_repair_task_id(explicit) is None:
             raise ValueError(
-                f"task_id 必须落在既有 repair 序列里（repair-r<round>-<seq>），"
+                f"task_id 必须落在既有 repair 序列里"
+                f"（repair-<seq> 或 repair-r<round>-<seq>），"
                 f"收到 {explicit}"
             )
         return explicit
@@ -169,7 +182,7 @@ def _allocate_task_id(
             raise ValueError(f"seq_base must be >= 1, got {seq_base}")
     else:
         seq = next_repair_seq_base(list(existing_task_ids or ()), round_number)
-    return f"repair-r{round_number}-{seq:02d}"
+    return format_repair_task_id(seq)
 
 
 def _report_paths(root_cause_report: Any) -> List[str]:

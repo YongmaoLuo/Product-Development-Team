@@ -78,7 +78,9 @@ from state_machine.repositories.plan_task_repository import (  # noqa: E402
 PLAN_DIR_NAME = "plan-20261031"
 PLAN_ID = PLAN_DIR_NAME
 ROUND = 3
-TASK_ID = f"repair-r{ROUND}-01"
+#: The id the base-drift task gets.  Since 2026-11-02 the id is
+#: plan-global and no longer carries the round: ``repair-01``.
+TASK_ID = "repair-01"
 
 NON_CONFLICTING_STATUSES = (
     STATUS_NONE,

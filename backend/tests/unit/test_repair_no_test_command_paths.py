@@ -222,7 +222,7 @@ def test_a_command_the_first_round_could_not_give_is_retried_and_adopted(
     tasks = assembler.assemble(contents)
     assert len(tasks) == 1
     assert tasks[0]["test_command"] == "pytest -q tests/test_signals_window.py"
-    assert assembler.test_command_sources["repair-r2-01"] == "llm_retry"
+    assert assembler.test_command_sources["repair-01"] == "llm_retry"
     assert assembler.unverifiable_no_test_command == 0
 
 
@@ -337,7 +337,7 @@ def test_a_row_the_model_still_cannot_rescue_is_still_emitted(
     # is unverifiable only in the sense that the fill loop found nothing
     # extra to add; the plan itself supplied an objective criterion.
     assert "verification_api_runner" in tasks[0]["test_command"]
-    assert assembler.test_command_sources["repair-r1-01"] == "api_replay"
+    assert assembler.test_command_sources["repair-01"] == "api_replay"
     assert assembler.unverifiable_no_test_command == 0
 
 
@@ -388,7 +388,7 @@ def test_a_point_with_no_replayable_basis_is_emitted_even_when_uncued(
     # Not the audit-style label: "we could not find one" and "this class
     # needs none" are different claims, and merging them is the mistake
     # this whole split exists to avoid.
-    assert assembler.test_command_sources["repair-r1-01"] == "missing"
+    assert assembler.test_command_sources["repair-01"] == "missing"
     assert assembler.unverifiable_no_test_command == 1
 
 
@@ -438,7 +438,7 @@ def test_an_artifact_deliverable_is_emitted_and_labelled_audit_style(
         "a findings-document deliverable is still a repair that must run"
     )
     assert tasks[0]["test_command"] == ""
-    assert assembler.test_command_sources["repair-r3-01"] == "audit_style"
+    assert assembler.test_command_sources["repair-01"] == "audit_style"
     assert assembler.unverifiable_no_test_command == 1
     assert assembler.dropped_empty_files_to_modify == 0
 
@@ -476,10 +476,10 @@ def test_the_two_absences_are_not_conflated(tmp_path):
     ])
 
     assert len(tasks) == 2
-    assert assembler.test_command_sources["repair-r1-01"] == "audit_style"
+    assert assembler.test_command_sources["repair-01"] == "audit_style"
     # An unrecognised method is "unknown", never "needs no command" — the
     # whitelist is positive on purpose.
-    assert assembler.test_command_sources["repair-r1-02"] == "missing"
+    assert assembler.test_command_sources["repair-02"] == "missing"
     assert len(set(assembler.test_command_sources.values())) == 2
 
 
@@ -512,7 +512,7 @@ def test_an_api_test_point_still_gets_its_replay_command(tmp_path):
 
     assert tasks[0]["test_command"]
     assert "verification_api_runner" in tasks[0]["test_command"]
-    assert assembler.test_command_sources["repair-r1-01"] == "api_replay"
+    assert assembler.test_command_sources["repair-01"] == "api_replay"
     assert assembler.unverifiable_no_test_command == 0
 
 
@@ -679,7 +679,7 @@ def test_every_source_the_assembler_emits_is_in_its_declared_vocabulary(
     declared = set(RepairTaskAssembler.ASSEMBLER_TEST_COMMAND_SOURCES)
     assert set(assembler.test_command_sources.values()) <= declared
     # The VP's own command still wins over every derived label.
-    assert assembler.test_command_sources["repair-r1-03"] == "vp"
+    assert assembler.test_command_sources["repair-03"] == "vp"
 
 
 def test_the_empty_scope_gate_is_untouched(tmp_path):

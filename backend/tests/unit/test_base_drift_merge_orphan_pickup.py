@@ -138,7 +138,7 @@ def test_persisted_row_is_mergeable(tmp_path):
 
     assert len(rows) == 1, rows
     row = rows[0]
-    assert row["id"] == "repair-r3-01"
+    assert row["id"] == "repair-01"
     assert has_mergeable_content(row) is True
 
 
@@ -230,7 +230,10 @@ def test_task_id_is_recognized_as_a_repair_task(tmp_path):
     The id has to survive the database round trip, so the assertion is
     made against the *persisted* row and not only against a literal.
     """
+    # Both shapes are recognised: the legacy one (history) and the
+    # current one.
     assert verification_loop._is_repair_task_id("repair-r3-01", "repair") is True
+    assert verification_loop._is_repair_task_id("repair-01", "repair") is True
 
     db_path = tmp_path / "state.db"
     _persist(_task(tmp_path), db_path)

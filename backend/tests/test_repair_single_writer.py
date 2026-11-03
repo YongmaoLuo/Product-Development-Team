@@ -300,9 +300,9 @@ def test_check_cycle_conditions_writes_repair_tasks_to_state_db(
         all_entries = repo.load_all(plan_dir.name)
 
         assert set(all_entries.keys()) == {
-            "repair-r1-01",
-            "repair-r1-02",
-            "repair-r1-03",
+            "repair-01",
+            "repair-02",
+            "repair-03",
         }, f"unexpected repair task ids: {set(all_entries.keys())}"
 
         # Each entry should default to ``status='pending'`` (the

@@ -5,7 +5,7 @@ does not need *more* analysis — it needs the conflict resolved.  The
 ``repair`` mode turns the conflict report into exactly one executable
 task, and that task has to survive two gates:
 
-* the **id shape** the executor recognises (``repair-r<round>-<seq>``).
+* the **id shape** the executor recognises (``repair-<seq>``).
   A task whose id falls outside that shape is a task the executor
   never picks up: the round reports "the repair batch drained" while
   the repair is still sitting in the queue.
@@ -76,15 +76,21 @@ def _task(report=None, **over):
 def test_task_id_group_and_round():
     """The id is the shape the executor picks up; the group says why.
 
-    ``repair-r3-01`` is the id the repair round writes and the id
+    ``repair-01`` is the id the repair round writes and the id
     ``verification_loop._is_repair_task_id`` recognises.  The group
     starts with ``repair`` for the same reason — it is the fallback
     marker for rows whose id shape is unusual.
+
+    The id carries the **number**, not the round (2026-11-02): the
+    round counter resets, and a reset round reissued the ids the plan
+    already owned — the upsert kept their runtime state, so the fresh
+    task was born ``completed`` and the round idled.  The round still
+    travels with the task, in its own ``round`` field.
     """
     task = _task()
 
-    assert task["id"] == "repair-r3-01"
-    assert re.fullmatch(r"repair-r\d+-\d{2}", task["id"]), task["id"]
+    assert task["id"] == "repair-01"
+    assert re.fullmatch(r"repair-\d{2}", task["id"]), task["id"]
     assert task["task_group"] == "repair"
     assert task["round"] == 3
     assert task["failed_vp_id"] == "__base_drift__"

@@ -111,8 +111,13 @@ PLAN_ID = "plan-20261031"
 """The plan the preflight files the merge task under."""
 
 ROUND = 1
-TASK_ID = f"repair-r{ROUND}-01"
-"""The task id the round number gives the merge task."""
+#: The task id the merge task gets.  Since 2026-11-02 the id is
+#: plan-global and no longer carries the round: the round counter
+#: resets, and a reset round re-issued the ids the plan already owned
+#: (the upsert keeps the old row's runtime state, so the fresh task
+#: was born ``completed`` and the round idled).
+TASK_ID = "repair-01"
+"""The task id the plan's repair sequence gives the merge task."""
 
 
 # ---------------------------------------------------------------------------
@@ -458,8 +463,8 @@ def test_real_conflict_still_writes_the_blocked_report(
     assert event_type == "base_drift_conflicts", events
     assert data["status"] == STATUS_CONFLICTS, events
 
-    # The merge task is handed back to the loop, under the id the round
-    # number gives it.
+    # The merge task is handed back to the loop, under the id the plan's
+    # repair sequence gives it.
     assert blocked["base_drift_repair_task_id"] == TASK_ID, blocked
 
     # The task really is in the database — the report does not invent it.
@@ -470,10 +475,10 @@ def test_real_conflict_still_writes_the_blocked_report(
 def test_real_conflict_persists_one_merge_task(world_factory, monkeypatch, tmp_path):
     """The conflict becomes exactly one executable merge task.
 
-    One — not one per round and not one per conflicting file.  The id
-    carries the round number, so a second task would be a *new* id for
-    the *same* conflict, and a merge that keeps failing would then be
-    dispatched forever.  The row has to be **executable**: a title (or
+    One — not one per round and not one per conflicting file.  A second
+    task would be a *new* id for the *same* conflict, and a merge that
+    keeps failing would then be dispatched forever.  The row has to be
+    **executable**: a title (or
     the loader that reconciles orphan rows substitutes a content-free
     placeholder) and a probe command that really answers "is the merge
     done?".

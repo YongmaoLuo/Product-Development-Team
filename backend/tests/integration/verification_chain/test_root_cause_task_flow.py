@@ -231,8 +231,10 @@ def _write_report(plan_dir, report):
 def _write_root_cause_report(plan_dir, scope=None):
     """The root cause report the diagnosis task delivers.
 
-    It names the files to change under a ``改动范围`` heading — that
-    section is the implementation task's ``files_to_modify``.
+    It **declares** the files to change in a ``json`` block — that block
+    is the implementation task's ``files_to_modify``. The reader reads
+    declarations, not prose: a scope section written as bullets is not
+    a declaration and yields no scope.
     """
     paths = list(scope if scope is not None else REPORT_SCOPE)
     reports_dir = plan_dir / "reports"
@@ -244,14 +246,18 @@ def _write_root_cause_report(plan_dir, scope=None):
         "断言读到 401 而不是 200 —— 鉴权中间件在校验之前就短路了。",
         "",
         "## 改动范围",
-    ]
-    body.extend(f"- `{path}`" for path in paths)
-    body.extend([
+        "",
+        "```json",
+        "{",
+        '  "files_to_modify": %s,' % json.dumps(paths, ensure_ascii=False),
+        '  "fix_plan": "在鉴权中间件里补一条身份检查"',
+        "}",
+        "```",
         "",
         "## 验收方式",
         "pytest -q backend/tests/test_service.py",
         "",
-    ])
+    ]
     (reports_dir / ROOT_CAUSE_REPORT_NAME).write_text(
         "\n".join(body), encoding="utf-8",
     )
