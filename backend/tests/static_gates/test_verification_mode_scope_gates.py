@@ -676,8 +676,13 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # `extra_env` 实参；本分支的「修复轮退出事件的单一写入器 `_repair_exit_writer` +
     # 回收器按 `repair_executor` 角色分序回收」加的是 `role` 实参。两者互不覆盖，
     # 故两边都保留；文件内容因此再次变化，按本 gate 的既定流程重新钉住合并后的文件。
+    # 2026-11-03：本分支修「验证被判死后那一轮没有真正停下」——判死时按轮次的
+    # token 收掉这一轮拥有的全部 coding-tool 子进程、强制释放轮次租约、让僵尸
+    # 轮次写终态被拒、并给长 LLM 调用加进度行与墙上限。四处改动都落在本文件
+    # （`_cleanup_round_processes` / `_force_release_round_lease` / 终态拒绝 /
+    # 查询心跳），未改动任何既有分支的语义；按本 gate 的既定流程重新钉住该文件。
     "backend/verification_loop.py": (
-        "631630511dd85be00879c069212b69453fe903910e730ed306140dabe7f451cc"
+        "4171490553634e38ca6df7802f904fbb644003d839c218fc71ca051e44a5c7ac"
     ),
 }
 

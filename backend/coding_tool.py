@@ -1725,6 +1725,348 @@ _EDIT_WRITE_FORMAL_REPO_GUARD = _build_guard_hook()["command"]
 # Switch. Nothing in this repository invents provider ids.
 
 
+def _format_cap_seconds(value: float) -> str:
+    """Render a wall cap for a human-readable log line.
+
+    A whole cap stays whole (``2700.0`` -> ``2700``) because that is
+    the number the operator configured and the number they will read
+    back.  A fractional cap keeps up to three decimals instead of
+    being rounded to a whole second, because ``0.4`` rounded to
+    ``0`` would put ``0s`` in the log — a cap of zero seconds, which
+    never existed.
+
+    The ``rstrip`` pair is safe for round numbers: the decimal point
+    stops the first strip, so ``100.000`` -> ``100.`` -> ``100`` and
+    never ``1``.
+    """
+    return f"{float(value):.3f}".rstrip("0").rstrip(".")
+
+
+class _QueryProgressReporter:
+    """Heartbeat for a dispatch that is waiting (2026-11-01).
+
+    ``_query_json_internal`` dispatches an LLM call and writes NOTHING
+    while it waits.  A plan whose directory mtime has not moved is
+    therefore ambiguous: the round may be alive and waiting on a
+    provider, or the worker may be wedged.  From the outside the two
+    cannot be told apart, and the difference is what decides whether a
+    plan gets declared dead.
+
+    This reporter breaks the tie from the inside.  It writes one
+    ``coding_query_progress`` line per interval into the same
+    ``execution.log`` the run already uses::
+
+        coding_query_progress elapsed_sec=120 scene=verification prompt_chars=154321
+
+    so the gap between two lines is bounded and "is it still there?"
+    is answerable from the log.
+
+    The contracts:
+
+    * ``logger is None`` starts NO thread and writes nothing.  A tool
+      without a logger must not grow a background thread just because
+      it was wired up.  The ONE exception is a dispatch that carries a
+      wall cap: the cap needs a timer of its own, so a capped dispatch
+      grows a thread even with no logger — it just writes nothing.
+    * The interval is bounded on both sides — 1 s .. 120 s — so the
+      heartbeat can neither flood the log nor go quiet for longer than
+      the cap allows.  The default is 60 s and
+      ``PDT_CODING_QUERY_PROGRESS_SECONDS`` moves it.
+    * ``__exit__`` stops the thread and joins it, so the reporter never
+      outlives the dispatch it is reporting on.
+
+    2026-11-01 — the WALL CAP
+    -------------------------
+    A heartbeat says "still here".  It does not say "and I will stop
+    here".  A dispatch could keep a healthy heartbeat for hours, so the
+    reporter grew a second duty: when the dispatch has been in flight
+    for longer than ``wall_cap_seconds``, the reporter ends it — it
+    writes ``coding_query_wall_timeout`` and calls
+    ``on_wall_timeout``, which is the tool's kill path.
+
+    The cap is ``None`` for every dispatch that did not ask for one,
+    and a ``None`` cap changes nothing at all: no timer, no kill, no
+    event.
+    """
+
+    #: Environment variable that moves the interval.
+    ENV_INTERVAL = "PDT_CODING_QUERY_PROGRESS_SECONDS"
+    #: Used when neither the caller nor the environment says otherwise.
+    DEFAULT_INTERVAL_SEC = 60.0
+    #: The heartbeat may never be rarer than this.
+    MAX_INTERVAL_SEC = 120.0
+    #: …nor busier than this.
+    MIN_INTERVAL_SEC = 1.0
+    #: The event name written into the log.
+    EVENT_NAME = "coding_query_progress"
+    #: The event name written when the wall cap fires.
+    EVENT_WALL_TIMEOUT = "coding_query_wall_timeout"
+    #: How long ``stop()`` waits for the thread to finish.
+    JOIN_TIMEOUT_SEC = 2.0
+
+    def __init__(
+        self,
+        logger,
+        *,
+        tool=None,
+        scene: str = "",
+        interval: Optional[float] = None,
+        wall_cap_seconds: Optional[float] = None,
+        on_wall_timeout=None,
+    ):
+        self.logger = logger
+        self.tool = tool
+        self.scene = scene or ""
+        self.interval = self._resolve_interval(interval)
+        self.wall_cap_seconds = self._resolve_wall_cap(wall_cap_seconds)
+        self._on_wall_timeout = on_wall_timeout
+        self._wall_timeout_fired = False
+        self._wall_timeout_elapsed = 0.0
+        self._wall_lock = threading.Lock()
+        self._prompt_chars: Optional[int] = None
+        # The tool's view of the prompt is read ONCE, here: a second
+        # dispatch on the same tool must not be able to change what
+        # this reporter says about the one it is reporting on.
+        self._tool_prompt_chars = (
+            int(getattr(tool, "current_prompt_chars", 0) or 0)
+            if tool is not None
+            else 0
+        )
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._started_at = 0.0
+
+    # -- the interval ---------------------------------------------------
+
+    @classmethod
+    def _resolve_interval(cls, interval: Optional[float]) -> float:
+        """The effective interval, clamped to the allowed band.
+
+        The caller's value wins over the environment, and the clamp is
+        applied to whichever won — the knob moves the interval, it
+        does not lift the bound.  A value that is not a number falls
+        back to the default rather than to a crash inside a dispatch.
+        """
+        if interval is None:
+            raw = os.environ.get(cls.ENV_INTERVAL)
+            if raw is not None and str(raw).strip():
+                try:
+                    interval = float(str(raw).strip())
+                except (TypeError, ValueError):
+                    interval = None
+        if interval is None:
+            interval = cls.DEFAULT_INTERVAL_SEC
+        try:
+            interval = float(interval)
+        except (TypeError, ValueError):
+            interval = cls.DEFAULT_INTERVAL_SEC
+        if interval > cls.MAX_INTERVAL_SEC:
+            interval = cls.MAX_INTERVAL_SEC
+        if interval < cls.MIN_INTERVAL_SEC:
+            interval = cls.MIN_INTERVAL_SEC
+        return interval
+
+    # -- the wall cap ----------------------------------------------------
+
+    @staticmethod
+    def _resolve_wall_cap(wall_cap_seconds: Optional[float]) -> Optional[float]:
+        """The effective wall cap, or ``None`` for "no ceiling".
+
+        A cap that is not a number, or that is not positive, is treated
+        as "no opinion" rather than as a cap: a zero cap would kill
+        every dispatch on its first tick, and a cap that cannot be
+        parsed must not take the dispatch down with it.
+        """
+        if wall_cap_seconds is None:
+            return None
+        try:
+            cap = float(wall_cap_seconds)
+        except (TypeError, ValueError):
+            return None
+        if cap <= 0:
+            return None
+        return cap
+
+    @property
+    def wall_timeout_fired(self) -> bool:
+        """True once the wall cap has expired.
+
+        The flag is set BEFORE the kill, so a dispatch that dies
+        because of the cap can tell that the cap is why.
+        """
+        with self._wall_lock:
+            return self._wall_timeout_fired
+
+    @property
+    def wall_timeout_elapsed(self) -> float:
+        """How long the dispatch had been in flight when the cap fired."""
+        with self._wall_lock:
+            return self._wall_timeout_elapsed
+
+    # -- the prompt it is reporting on -----------------------------------
+
+    @property
+    def prompt_chars(self) -> int:
+        """Size of the prompt the in-flight dispatch is carrying.
+
+        The tool owns the fact (it is the one dispatching), so the
+        reporter asks it — once, at construction — and a caller that
+        knows better can override it with :meth:`set_prompt_chars`.
+        """
+        if self._prompt_chars is not None:
+            return self._prompt_chars
+        return self._tool_prompt_chars
+
+    def set_prompt_chars(self, count: int) -> None:
+        """Record the size of the prompt this dispatch is carrying."""
+        try:
+            self._prompt_chars = max(0, int(count))
+        except (TypeError, ValueError):
+            self._prompt_chars = 0
+
+    # -- the thread -----------------------------------------------------
+
+    @property
+    def thread(self) -> Optional[threading.Thread]:
+        """The heartbeat thread, or ``None`` when none was started."""
+        return self._thread
+
+    def start(self) -> "_QueryProgressReporter":
+        """Start the heartbeat.  Idempotent.
+
+        A reporter with no logger starts no thread — UNLESS it carries
+        a wall cap, which needs a timer of its own: a cap nobody can
+        enforce is not a cap.
+        """
+        if self.logger is None and self.wall_cap_seconds is None:
+            return self
+        if self._thread is not None and self._thread.is_alive():
+            return self
+        self._stop.clear()
+        self._started_at = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="pdt-query-progress",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        """Stop the heartbeat and wait for the thread to finish."""
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self.JOIN_TIMEOUT_SEC)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if self._stop.wait(self._next_wait()):
+                return
+            if self._wall_cap_expired():
+                self._fire_wall_timeout()
+                return
+            self._emit()
+
+    def _elapsed(self) -> float:
+        """How long the dispatch has been in flight, in seconds."""
+        if not self._started_at:
+            return 0.0
+        return time.monotonic() - self._started_at
+
+    def _next_wait(self) -> float:
+        """How long to sleep before the next tick.
+
+        The heartbeat interval, SHORTENED so that the tick lands on the
+        cap: a 5 s cap with a 60 s heartbeat would otherwise be
+        enforced a minute late, which is the difference between a
+        ceiling and a suggestion.
+        """
+        wait = self.interval
+        if self.wall_cap_seconds is not None:
+            remaining = self.wall_cap_seconds - self._elapsed()
+            wait = min(wait, max(0.0, remaining))
+        return wait
+
+    def _wall_cap_expired(self) -> bool:
+        """True when the dispatch has outstayed its wall cap."""
+        if self.wall_cap_seconds is None:
+            return False
+        return self._elapsed() >= self.wall_cap_seconds
+
+    def _fire_wall_timeout(self) -> None:
+        """End the dispatch: write the event, then kill the process group.
+
+        The order matters.  The flag is set first, so a dispatch that
+        dies because of the kill can tell that the cap is why; the
+        event is written before the kill, so the log says WHY the
+        dispatch died rather than only that it died.
+        """
+        elapsed = self._elapsed()
+        with self._wall_lock:
+            if self._wall_timeout_fired:
+                return
+            self._wall_timeout_fired = True
+            self._wall_timeout_elapsed = elapsed
+
+        cap_text = _format_cap_seconds(self.wall_cap_seconds)
+        try:
+            if self.logger is not None:
+                self.logger.error(
+                    self.EVENT_WALL_TIMEOUT,
+                    f"coding query outstayed its wall cap "
+                    f"({cap_text}s) and was killed",
+                    data={
+                        "scene": self.scene,
+                        "prompt_chars": self.prompt_chars,
+                        "cap_sec": self.wall_cap_seconds,
+                        "elapsed_sec": round(elapsed, 1),
+                    },
+                )
+        except Exception:
+            # The event is best-effort: a logger that raised must not
+            # stop the kill below from happening.
+            pass
+
+        if self._on_wall_timeout is not None:
+            try:
+                self._on_wall_timeout()
+            except Exception:
+                # Same: the kill is the load-bearing part, and the
+                # dispatch's own failure path reports what happened.
+                pass
+
+    def _emit(self) -> None:
+        if self.logger is None:
+            return
+        elapsed = int(time.monotonic() - self._started_at)
+        data = {
+            "elapsed_sec": elapsed,
+            "scene": self.scene,
+            "prompt_chars": self.prompt_chars,
+        }
+        try:
+            self.logger.info(
+                self.EVENT_NAME,
+                f"coding query still in flight (elapsed={elapsed}s)",
+                data=data,
+            )
+        except Exception:
+            # A heartbeat that raised would take the observability
+            # down with it, and the dispatch must not care about the
+            # log.  The next tick tries again.
+            pass
+
+    # -- context manager ------------------------------------------------
+
+    def __enter__(self) -> "_QueryProgressReporter":
+        return self.start()
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.stop()
+        return False
+
+
 class CodingTool(ABC):
     """Abstract base class for AI coding tools."""
 
@@ -3278,6 +3620,25 @@ class ClaudeCodingTool(CodingTool):
     # inner adaptive timer (DEFAULT_TOTAL_TIMEOUT=900s) is the primary
     # kill signal but can be skipped on truly pathological cases.
     HARD_WALL_CLOCK_TIMEOUT_SECONDS: int = 3600
+
+    # 2026-11-01 — the WALL CAP for one dispatch of this tool.
+    #
+    # ``None`` (the default) means "no ceiling": the tool behaves
+    # exactly as it did before this attribute existed.  A number means
+    # "a dispatch that has been in flight for this many seconds is
+    # killed and fails with a ``HardTimeoutError``" — the verification
+    # scene sets it, because a heartbeat that says "still here" for
+    # four hours is not a heartbeat, it is a slow leak.
+    #
+    # It is a CLASS attribute on purpose: a tool built without
+    # ``__init__`` (several tests do that) must not blow up on an
+    # attribute that has a default.
+    query_wall_cap_seconds: Optional[float] = None
+    # The reporter watching the dispatch in flight, when there is one.
+    # The reporter owns the cap's timer; this is how the dispatch
+    # itself finds out that the cap fired (the failure has to surface
+    # where the dispatch can see it).
+    _current_query_reporter: Optional["_QueryProgressReporter"] = None
 
     # --- Prompt compaction (mirrors Claude Code context compression) ---
     MAX_PROMPT_TOKENS = 180_000   # target ceiling; leaves 20K headroom below 200K limit
@@ -6586,6 +6947,60 @@ class ClaudeCodingTool(CodingTool):
         except Exception:
             pass
 
+    # -- the wall cap (2026-11-01) ---------------------------------------
+
+    def _kill_query_for_wall_cap(self) -> bool:
+        """Kill the in-flight dispatch because the wall cap expired.
+
+        Returns True when a process group was killed, False when there
+        was nothing to kill — no process, or a process that had already
+        exited.  The difference matters: killing a corpse is not a
+        kill, and the caller has to be able to tell "the cap ended the
+        dispatch" from "the cap found nothing to end".
+        """
+        with self._process_lock:
+            proc = self._current_process
+        if proc is None:
+            return False
+        try:
+            already_gone = proc.poll() is not None
+        except Exception:
+            already_gone = False
+        if already_gone:
+            with self._process_lock:
+                if self._current_process is proc:
+                    self._current_process = None
+            return False
+        try:
+            # ``wait_timeout=0``: the reporter's thread runs this, and a
+            # thread that waits five seconds for a corpse is a thread
+            # that cannot report the timeout on time.
+            kill_process_group(proc, wait_timeout=0)
+        except Exception:
+            pass
+        with self._process_lock:
+            if self._current_process is proc:
+                self._current_process = None
+        return True
+
+    def _query_wall_timeout_error(self) -> Optional["HardTimeoutError"]:
+        """The failure for a wall-cap expiry, or ``None``.
+
+        ``None`` when the dispatch is not under a cap, or when the cap
+        has not expired.  A ``HardTimeoutError`` when it has: that is
+        the class the verification layer routes into auto-split, and
+        the one the provider-fallback path must NOT swallow (retrying
+        on another provider does not make a query that outstayed its
+        ceiling any shorter).
+        """
+        reporter = self._current_query_reporter
+        if reporter is None or not reporter.wall_timeout_fired:
+            return None
+        cap = reporter.wall_cap_seconds or 0.0
+        return HardTimeoutError.for_wall_cap(
+            cap, reporter.wall_timeout_elapsed,
+        )
+
     def _run_interactive_resilient(
         self,
         prompt: str,
@@ -6657,6 +7072,16 @@ class ClaudeCodingTool(CodingTool):
                     _raise_if_cancelled(
                         _dispatch_plan_id(), "the dispatch was in flight",
                     )
+                # 2026-11-01 — an empty reply from a dispatch the WALL
+                # CAP killed is not an empty reply: it is the cap. The
+                # retry below would dispatch again on a fresh session,
+                # and that dispatch would outlive the ceiling too — the
+                # cap is enforced by the reporter, which has already
+                # stopped watching. So the cap's own failure is raised
+                # here, and it is not retried.
+                wall_exc = self._query_wall_timeout_error()
+                if wall_exc is not None:
+                    raise wall_exc from exc
                 # Session never produced anything — CC Switch will have
                 # no rows for it either; record it so the cross-check
                 # can distinguish "dead session" from "scanner lag".
@@ -7589,7 +8014,7 @@ class ClaudeCodingTool(CodingTool):
         # (forwarded below) is the per-call routing lever.
         return self._query_json_internal(prompt, system_instruction, timeout, retry_count=0, allowed_tools=allowed_tools, scene=scene)
 
-    def _query_json_internal(self, prompt, system_instruction, timeout, retry_count=0, excluded_providers=None, allowed_tools=None, scene=None, resume_session=None):
+    def _query_json_internal(self, prompt, system_instruction, timeout, retry_count=0, excluded_providers=None, allowed_tools=None, scene=None, resume_session=None, progress=None):
         # Resolve a caller's reusable-session opt-in here, once, at the
         # entry. An explicit ``resume_session`` is the provider-fallback
         # recursion below, and it wins outright: that path is switching
@@ -7645,6 +8070,44 @@ class ClaudeCodingTool(CodingTool):
                               f"Claude query_json started (prompt={len(compacted_prompt)} chars, interactive mode)",
                               data={"tool": "claude", "prompt_len": len(compacted_prompt), "mode": "interactive"})
         json_prompt = compacted_prompt + JSON_ONLY_SUFFIX
+
+        # 2026-11-01 — the dispatch below writes NOTHING while it waits
+        # on a provider, so a plan whose directory has not moved is
+        # ambiguous: the round may be alive, or the worker may be
+        # wedged. The reporter says which, once per interval, into the
+        # same execution.log the rest of the run uses.
+        #
+        # The prompt size is recorded HERE, on the tool, because the
+        # tool is what knows what it is dispatching; the reporter asks
+        # the tool for it. A tool with no logger starts no thread at
+        # all (see _QueryProgressReporter).
+        #
+        # The heartbeat belongs to the DISPATCH CHAIN, not to one call:
+        # the provider-fallback arm below RE-ENTERS this method, and a
+        # second reporter would restart ``elapsed_sec`` at zero — so
+        # the log would show the elapsed time going BACKWARDS in the
+        # middle of one dispatch. The outer call owns the reporter and
+        # stops it; a re-entry borrows it and leaves it alone.
+        owns_progress = progress is None
+        if owns_progress:
+            self.current_prompt_chars = len(compacted_prompt)
+            _progress = _QueryProgressReporter(
+                self.logger, tool=self, scene=scene or "",
+                # 2026-11-01 — the ceiling for THIS dispatch.  The
+                # reporter owns the timer: it is the one thread that is
+                # awake while the dispatch waits, so it is the one
+                # place the cap can be enforced from.  ``None`` (the
+                # default) means "no ceiling" and changes nothing.
+                wall_cap_seconds=self.query_wall_cap_seconds,
+                on_wall_timeout=self._kill_query_for_wall_cap,
+            )
+            # The tool remembers the reporter watching this dispatch:
+            # the cap is enforced by the reporter, but the FAILURE has
+            # to surface where the dispatch can see it (see
+            # ``_query_wall_timeout_error``).
+            self._current_query_reporter = _progress
+        else:
+            _progress = progress
 
         # The session id of the dispatch currently in flight. The
         # timeout handler below lives outside the closure that owns the
@@ -7800,6 +8263,12 @@ class ClaudeCodingTool(CodingTool):
                 "no JSON object / array boundaries found", "", 0
             )
 
+        # 2026-11-01 — the heartbeat starts here, immediately before the
+        # dispatch, so the elapsed time it reports is the time spent
+        # waiting on the provider and not the time spent preparing to
+        # wait. It is stopped in the ``finally`` below, on every path
+        # out of the dispatch — including the ones that raise.
+        _progress.start()
         try:
             if timeout is None:
                 # 2026-10-22 — NOT the execution path, and deliberately
@@ -7917,6 +8386,16 @@ class ClaudeCodingTool(CodingTool):
             # intercept it first).
             raise
         except TimeoutError as exc:
+            # 2026-11-01 — the wall cap is not a provider problem. A
+            # dispatch that outstayed its ceiling would outstay the
+            # next provider's too, and the fallback below would keep
+            # the ceiling from ever meaning anything. The cap's own
+            # failure is raised instead — and it is raised BEFORE the
+            # fallback, because the fallback is exactly what must not
+            # happen here.
+            wall_exc = self._query_wall_timeout_error()
+            if wall_exc is not None:
+                raise wall_exc from exc
             # Provider fallback on timeout: retry with next provider in priority list
             if retry_count < self.MAX_TIMEOUT_RETRIES and self.current_call_provider:
                 next_retry = retry_count + 1
@@ -7962,11 +8441,17 @@ class ClaudeCodingTool(CodingTool):
                 # Same contract as ``_query_internal_m1``: the retry
                 # resumes the session that timed out instead of paying
                 # for the whole prompt again from the top.
+                #
+                # The heartbeat is passed down with it: this retry is
+                # the SAME dispatch as far as the operator is
+                # concerned, so it must not start a second reporter
+                # (see the ownership note above).
                 return self._query_json_internal(
                     prompt, system_instruction, timeout, retry_count=next_retry,
                     excluded_providers=new_excluded,
                     scene=scene,
                     resume_session=pinned[0],
+                    progress=_progress,
                 )
             # Max retries exceeded — raise with detailed error
             providers_tried = list(excluded_providers or [])
@@ -8193,12 +8678,33 @@ class ClaudeCodingTool(CodingTool):
             # dispatch that a stop request targeted.
             raise
         except Exception as e:
+            # 2026-11-01 — same rule as the timeout arm above: a
+            # dispatch the wall cap killed fails as a HARD timeout, not
+            # as whatever the kill happened to look like from the
+            # inside (an empty reply, a broken pipe, a dead process).
+            wall_exc = self._query_wall_timeout_error()
+            if wall_exc is not None:
+                raise wall_exc from e
             duration = int(time.monotonic() - start_time)
             if self.logger:
                 self.logger.error("coding_query_json_failed",
                                   f"Claude query_json failed: {e}",
                                   data={"error": str(e)[:500], "duration_sec": duration})
             raise
+        finally:
+            # 2026-11-01 — the heartbeat must not outlive the dispatch,
+            # on ANY path out of it: the success path, the fallback
+            # path, and every path that raises. ``stop()`` sets the
+            # event and joins the thread, so the reporter is gone
+            # before this call returns.
+            #
+            # Only the call that OWNS the reporter stops it: a
+            # re-entry (the provider-fallback arm) borrows the one its
+            # caller started and must leave it running.
+            if owns_progress:
+                _progress.stop()
+                if self._current_query_reporter is _progress:
+                    self._current_query_reporter = None
 
 
 class VendorCCodingTool(CodingTool):
@@ -8830,6 +9336,27 @@ class HardTimeoutError(TimeoutError):
         exc.args = (
             f"Hard timeout after {total_sec}s of work time "
             f"(elapsed={elapsed:.1f}s of wall clock)",
+        )
+        return exc
+
+    @classmethod
+    def for_wall_cap(cls, cap_sec: float, elapsed: float) -> "HardTimeoutError":
+        """The hard cap expired on WALL-CLOCK time.
+
+        Neither of the other two flavours describes this case, and
+        claiming one of them would be a lie in the log: the dispatch
+        was not silent (it may have been printing the whole time) and
+        it was not spending "work time" on somebody's clock — it was
+        simply outstaying the ceiling the caller set for it.
+
+        The routing is the same (the auto-split path keys on the class,
+        not on the message).
+        """
+        exc = cls(total_sec=int(cap_sec), elapsed=elapsed, last_line="")
+        exc.args = (
+            f"Hard timeout after {cap_sec:.0f}s of wall clock "
+            f"(elapsed={elapsed:.1f}s) — the dispatch was killed by the "
+            f"wall cap",
         )
         return exc
 

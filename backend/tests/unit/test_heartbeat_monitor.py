@@ -32,6 +32,16 @@ from sub_agent_registry import sub_agent_registry
 
 client = TestClient(app)
 
+#: The stop_reason the watchdog records for the trigger these cases
+#: exercise — a verification thread that is no longer alive.  The
+#: assertions below read the expected value out of here instead of
+#: baking a literal into each one, so an assertion always states the
+#: reason of the TRIGGER it exercises and cannot drift into another
+#: trigger's reason (which is what the watchdog did before 2026-11-02:
+#: a round declared dead because its log went silent was recorded as a
+#: thread death).
+THREAD_DEATH_STOP_REASON = "verification_thread_died_unexpectedly"
+
 
 @pytest.fixture(autouse=True)
 def clean_state(monkeypatch, tmp_path):
@@ -115,7 +125,7 @@ class TestVerificationThreadDeath:
         _lazy_check_verification(plan_id)
 
         assert _verification_state[plan_id]["verification_status"] == "failed"
-        assert _verification_state[plan_id]["stop_reason"] == "verification_thread_died_unexpectedly"
+        assert _verification_state[plan_id]["stop_reason"] == THREAD_DEATH_STOP_REASON
         assert _verification_state[plan_id].get("ended_at") is not None
 
     def test_alive_thread_unchanged(self):
@@ -167,7 +177,7 @@ class TestVerificationThreadDeath:
         _lazy_check_verification(plan_id)
 
         assert _verification_state[plan_id]["verification_status"] == "failed"
-        assert _verification_state[plan_id]["stop_reason"] == "verification_thread_died_unexpectedly"
+        assert _verification_state[plan_id]["stop_reason"] == THREAD_DEATH_STOP_REASON
 
     def test_idempotent_when_already_failed(self, monkeypatch):
         """Calling _mark_verification_failed_dead twice is a no-op the second time."""
@@ -186,7 +196,7 @@ class TestVerificationThreadDeath:
         # Second call should not re-mutate the state (status is no longer 'running')
         _lazy_check_verification(plan_id)
         assert _verification_state[plan_id]["verification_status"] == "failed"
-        assert _verification_state[plan_id]["stop_reason"] == "verification_thread_died_unexpectedly"
+        assert _verification_state[plan_id]["stop_reason"] == THREAD_DEATH_STOP_REASON
         assert _verification_state[plan_id]["updated_at"] == first_updated_at
 
     def test_mark_function_directly(self, monkeypatch):
@@ -200,7 +210,7 @@ class TestVerificationThreadDeath:
 
         state = _verification_state[plan_id]
         assert state["verification_status"] == "failed"
-        assert state["stop_reason"] == "verification_thread_died_unexpectedly"
+        assert state["stop_reason"] == THREAD_DEATH_STOP_REASON
         assert state.get("ended_at") is not None
 
     def test_heartbeat_check_scans_verification(self, monkeypatch):
@@ -219,7 +229,7 @@ class TestVerificationThreadDeath:
         monitor._check_once()
 
         assert _verification_state[plan_id]["verification_status"] == "failed"
-        assert _verification_state[plan_id]["stop_reason"] == "verification_thread_died_unexpectedly"
+        assert _verification_state[plan_id]["stop_reason"] == THREAD_DEATH_STOP_REASON
 
     def test_check_once_early_exits_when_all_state_empty(self, monkeypatch):
         """HeartbeatMonitor._check_once must skip lazy checks entirely when
@@ -300,7 +310,7 @@ class TestVerificationThreadDeath:
 
         # Verification state was walked → thread was marked dead.
         assert _verification_state[plan_id]["verification_status"] == "failed"
-        assert _verification_state[plan_id]["stop_reason"] == "verification_thread_died_unexpectedly"
+        assert _verification_state[plan_id]["stop_reason"] == THREAD_DEATH_STOP_REASON
         # _verification_state was non-empty, so the early-exit must NOT
         # short-circuit — _lazy_check_sub_agents still fires even though
         # the registry itself is empty.

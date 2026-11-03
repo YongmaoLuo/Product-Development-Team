@@ -118,6 +118,12 @@ LOG_EVENT_TYPES = {
     'coding_query_completed': '[CODING_QUERY_COMPLETED]',
     'coding_query_failed': '[CODING_QUERY_FAILED]',
     'coding_query_timeout': '[CODING_QUERY_TIMEOUT]',
+    # 2026-11-01 — the heartbeat a dispatch writes while it waits on a
+    # provider. It is NOT a lifecycle event (it changes no state and
+    # the notifier ignores it); it is here so the line renders with a
+    # bracket prefix and can be found by `grep CODING_QUERY_PROGRESS
+    # execution.log` the way the other query events are.
+    'coding_query_progress': '[CODING_QUERY_PROGRESS]',
     'plan_started': '[PLAN_STARTED]',
     'plan_completed': '[PLAN_COMPLETED]',
     'subagent_settings_file_written': '[SUBAGENT_SETTINGS_FILE]',
