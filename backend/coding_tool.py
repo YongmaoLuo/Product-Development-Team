@@ -23,7 +23,7 @@ import uuid
 import contextvars
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 # 2026-10-26 (merge): 本分支删掉了这一行 —— 它原来只服务于
 # ``_quota_reset_seconds_for``，而那个函数被本分支删了。main 那边保留了它，
@@ -8071,7 +8071,8 @@ class ClaudeCodingTool(CodingTool):
                    retries: int = 3, timeout: Optional[int] = None,
                    model_type: Optional[str] = None,
                    allowed_tools: Optional[list] = None,
-                   scene: Optional[str] = None) -> dict:
+                   scene: Optional[str] = None,
+                   excluded_providers: Optional[Iterable[str]] = None) -> dict:
         """Run a subtask through Claude Code CLI and parse the JSON response.
 
         model_type: per-call override ("complex" | "medium"). If set AND
@@ -8086,6 +8087,14 @@ class ClaudeCodingTool(CodingTool):
         set unrestricted — existing callers are unaffected.
 
         scene: per-call workflow scene override for provider routing.
+
+        excluded_providers: providers this call must NOT use (any
+        iterable of provider names). The internal dispatch already
+        skips them when it picks a provider, so this is how a caller
+        that just watched one provider fail says "not that one again"
+        and lets the retry choose a different one. ``None`` (default)
+        and an empty collection both mean "exclude nobody" — the
+        behaviour every existing caller sees.
         """
         # 2026-10-24 — the scripted double answers from a fixture file.
         # Checked FIRST, before any part of the dispatch can spend a real
@@ -8101,10 +8110,17 @@ class ClaudeCodingTool(CodingTool):
         # it is cleared here and not inside the dispatch.
         self._quota_readmitted_providers.clear()
 
+        # An empty exclusion set excludes nobody, so it is normalized
+        # to ``None`` — the same value the internal call already treats
+        # as "no exclusions".  A non-empty list / tuple / set is
+        # forwarded as the caller wrote it; the internal call does its
+        # own ``set()``-ing.
+        excluded = excluded_providers or None
+
         # 2026-09-13: per-call model_type no longer swaps the model —
         # model management is delegated to CC Switch. The scene kwarg
         # (forwarded below) is the per-call routing lever.
-        return self._query_json_internal(prompt, system_instruction, timeout, retry_count=0, allowed_tools=allowed_tools, scene=scene)
+        return self._query_json_internal(prompt, system_instruction, timeout, retry_count=0, excluded_providers=excluded, allowed_tools=allowed_tools, scene=scene)
 
     def _query_json_internal(self, prompt, system_instruction, timeout, retry_count=0, excluded_providers=None, allowed_tools=None, scene=None, resume_session=None, progress=None):
         # Resolve a caller's reusable-session opt-in here, once, at the
@@ -9304,7 +9320,8 @@ class ScriptedCodingTool(CodingTool):
                    retries: int = 3, timeout: Optional[int] = None,
                    model_type: Optional[str] = None,
                    allowed_tools: Optional[list] = None,
-                   scene: Optional[str] = None) -> dict:
+                   scene: Optional[str] = None,
+                   excluded_providers: Optional[Iterable[str]] = None) -> dict:
         """The scripted answer for ``prompt``, parsed as JSON.
 
         Parsed with the same helper the live path uses, so a fixture
@@ -9312,6 +9329,12 @@ class ScriptedCodingTool(CodingTool):
         fixture that is not JSON raises ``json.JSONDecodeError`` — the
         same exception the live path raises, so the caller's recovery
         code is the same code.
+
+        ``excluded_providers`` is accepted for the same reason the rest
+        of the keyword surface is: the double has no provider to pick,
+        so the argument is ignored — but accepting it keeps a caller
+        that passes it from blowing up on the double instead of on the
+        answer.
         """
         from utils.json_repair import parse_llm_json
         return parse_llm_json(self.registry.response(prompt))

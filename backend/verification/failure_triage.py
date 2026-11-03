@@ -163,6 +163,39 @@ _DISPOSITIONS: Dict[str, str] = {
     OUT_OF_SCOPE: Disposition.SKIP_NOT_COUNTED,
 }
 
+#: How many times an ``infra`` failure may be retried across rounds.
+#:
+#: ``retry_not_counted`` says an environment failure does not count
+#: against the deliverable — but "not counted" is not "unlimited". A
+#: point whose environment keeps breaking would otherwise be retried
+#: forever, and every one of those rounds looks like it cost nothing.
+#: The bound is on the *retries*, so the total number of attempts a
+#: point may make is ``1 + MAX_INFRA_CROSS_ROUND_RETRIES``: the first
+#: try plus two cross-round retries.
+#:
+#: The constant lives next to the disposition table on purpose: the
+#: table says infra may be retried, and this says how many times. The
+#: per-VP bookkeeping that enforces it is
+#: :class:`verification.infra_retry.InfraRetryLedger`.
+MAX_INFRA_CROSS_ROUND_RETRIES: int = 2
+
+#: The terminal a report entry carries when the environment never let
+#: the round judge it.
+#:
+#: ``MAX_INFRA_CROSS_ROUND_RETRIES`` bounds the retries; this names
+#: where the bound ends.  A point that exhausted its infra budget has
+#: **no verdict about the deliverable** — the product was never asked
+#: — so the report has to be able to say that in a word of its own, one
+#: that cannot be mistaken for a code failure.
+#:
+#: It is deliberately **not** a stop reason.  Stopping the chain is a
+#: separate decision with its own closed vocabulary
+#: (``plan_state.PlanState.stop_verification_loop``'s ``valid_reasons``
+#: and ``server.VERIFICATION_TERMINAL_STOP_REASONS``); a new word in
+#: that vocabulary changes what ends a chain, so this one stays a
+#: report-entry field and nothing else.
+INFRA_UNRESOLVED_TERMINAL: str = "infrastructure_unresolved"
+
 #: The classes whose failure moves the same-cause counter. Exactly the
 #: classes whose disposition does NOT say "not counted". The negative
 #: form is the one tested for, because ``"retry_not_counted"`` also
@@ -765,6 +798,7 @@ __all__ = [
     "CRITERION_DEFECT",
     "OUT_OF_SCOPE",
     "METHOD_STRENGTH",
+    "INFRA_UNRESOLVED_TERMINAL",
     "classify_deterministic",
     "classify_verdict",
     "decision_key",

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Mapping, Optional, List, Dict, Any, Set, Tuple
+from typing import Callable, Iterable, Mapping, Optional, List, Dict, Any, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from coding_tool import (
@@ -1714,6 +1714,32 @@ def _entry_is_environment_blocked(entry: Any) -> bool:
     return str(evidence.get("reason_code") or "") in ENVIRONMENT_REASON_CODES
 
 
+def _entry_is_infrastructure_unresolved(entry: Any) -> bool:
+    """Is this entry one the environment never let the round judge?
+
+    The infra terminal (2026-11-03) is the report-side counterpart of
+    the environment block: the point did not fail, it was **never
+    asked** — its environment kept breaking until the cross-round
+    retry budget ran out.
+
+    It is read from the entry's own fields, the same way
+    :func:`_entry_is_environment_blocked` reads the environment block:
+    the marker itself (``infrastructure_unresolved``), the terminal it
+    names (``failure_terminal``), or the reason code it writes.  The
+    **status is not consulted** — the status says ``BLOCKED``, which
+    on its own says nothing about *why*.
+    """
+    if not isinstance(entry, dict):
+        return False
+    from verification.failure_triage import INFRA_UNRESOLVED_TERMINAL
+
+    if entry.get("infrastructure_unresolved") is True:
+        return True
+    if str(entry.get("failure_terminal") or "") == INFRA_UNRESOLVED_TERMINAL:
+        return True
+    return str(entry.get("reason_code") or "") == INFRA_UNRESOLVED_TERMINAL
+
+
 def _derive_overall_status(entries: Any) -> str:
     """The round's verdict, derived from the round's entries.
 
@@ -1730,14 +1756,23 @@ def _derive_overall_status(entries: Any) -> str:
 
       * a FAILED entry          -> ``FAILED``
       * a PARTIAL entry         -> ``PARTIAL``
-      * a DEFERRED entry, or an
-        environment-blocked one -> ``SKIPPED``
+      * a DEFERRED entry, an
+        environment-blocked one, or an infra-unresolved one
+                                 -> ``SKIPPED``
       * anything else           -> ``PASSED``
 
     An entry the round could not judge does not make the round red —
     it makes the round **unjudged**, and an unjudged round says
     ``SKIPPED``.  A plain ``SKIPPED`` is not that: it is a point the
     round did not need to ask, and it leaves the verdict alone.
+
+    The infra terminal (2026-11-03) joins the unjudged tier for the
+    same reason a DEFERRED entry does: the point carries no verdict
+    about the deliverable, because the product was never asked.  It is
+    **not** the environment block — it says the environment kept
+    breaking, not that one outage took the round out — and the two are
+    read from different fields, so neither can be mistaken for the
+    other.
 
     A round with no entry at all stays ``PASSED``: a round with no
     verification point has no verdict to give, and that behaviour is
@@ -1755,7 +1790,11 @@ def _derive_overall_status(entries: Any) -> str:
         if not status:
             continue
         statuses.append(str(status))
-        if str(status) == "DEFERRED" or _entry_is_environment_blocked(entry):
+        if (
+            str(status) == "DEFERRED"
+            or _entry_is_environment_blocked(entry)
+            or _entry_is_infrastructure_unresolved(entry)
+        ):
             unjudged = True
     if any(status == "FAILED" for status in statuses):
         return "FAILED"
@@ -1769,6 +1808,86 @@ def _derive_overall_status(entries: Any) -> str:
         # same reason DEFERRED does not make one.
         return "SKIPPED"
     return "PASSED"
+
+
+def _mark_infrastructure_unresolved(
+    report_data: dict, vp_ids: Iterable[str],
+) -> dict:
+    """Mark the listed points as infra-unresolved terminals, in place.
+
+    A point whose environment never let it be judged has **no verdict
+    about the deliverable** — the product was never asked — so the
+    report must say that in a word of its own.  The word is
+    :data:`verification.failure_triage.INFRA_UNRESOLVED_TERMINAL`, and
+    the entry carries it in three places a reader can reach:
+
+      * ``status`` becomes ``BLOCKED`` — not ``FAILED``.  A FAILED
+        entry is a verdict about the code, and this is not one;
+      * ``failure_terminal`` / ``reason_code`` name the terminal, so
+        the entry says *why* it was blocked;
+      * ``failure_class`` is ``infra`` and its source is
+        ``deterministic`` — the same two fields the failure-class
+        layer reads, so the entry is counted as an environment failure
+        and not as a broken deliverable.
+
+    The round's verdict is re-derived afterwards
+    (:func:`_derive_overall_status`), which makes the round
+    **unjudged** — ``SKIPPED``.  A passing point elsewhere in the
+    round does not turn it back into ``PASSED``: the round judged
+    something it did not manage to judge.
+
+    Only the listed points are touched.  A point that was not listed
+    keeps every field it had, and a genuine failure keeps the round
+    red — the marker must never swallow a real defect.
+
+    The report is the only thing written: no database row, no schema,
+    and no stop reason.  Stopping the chain is a different decision
+    with a different vocabulary (see
+    :data:`verification.failure_triage.INFRA_UNRESOLVED_TERMINAL`).
+
+    Args:
+        report_data: The verification report.  Mutated in place and
+            returned, the way :meth:`Orchestrator._backfill_failure_classes`
+            does it.
+        vp_ids: The ids of the points that exhausted their infra
+            budget.  An empty set is a no-op — including
+            ``overall_status``, which is left exactly as it was.
+
+    Returns:
+        The report, with the listed entries marked.
+    """
+    from verification.failure_triage import INFRA_UNRESOLVED_TERMINAL
+
+    if not isinstance(report_data, dict):
+        return report_data
+    entries = report_data.get("verification_results")
+    if not isinstance(entries, list):
+        return report_data
+    if vp_ids is None:
+        return report_data
+    targets = {str(vp_id) for vp_id in vp_ids}
+    if not targets:
+        return report_data
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("id") or "") not in targets:
+            continue
+        entry["status"] = "BLOCKED"
+        entry["infrastructure_unresolved"] = True
+        entry["failure_terminal"] = INFRA_UNRESOLVED_TERMINAL
+        entry["reason_code"] = INFRA_UNRESOLVED_TERMINAL
+        # The terminal *is* an environment failure — the point was
+        # never judged because the environment kept breaking — so the
+        # class is stated rather than inherited.  Leaving a stale
+        # ``deliverable_defect`` next to an infra terminal would be
+        # exactly the ambiguity this terminal exists to remove.
+        entry["failure_class"] = INFRA_FAILURE_CLASS
+        entry["failure_class_source"] = DETERMINISTIC_FAILURE_CLASS_SOURCE
+
+    report_data["overall_status"] = _derive_overall_status(entries)
+    return report_data
 
 
 # ---------------------------------------------------------------------------
@@ -2929,6 +3048,24 @@ class Orchestrator:
 
         # Current round number (will be set when running verification)
         self._current_round = 0
+
+        # 2026-11-03（arch 决策点 2 —— infra 的跨轮有界重试与 provider
+        # 重选）：这一轮的 infra 尝试记在哪个账本上，以及上一次尝试用的
+        # 哪家 provider。
+        #
+        # 账本落在 plan 目录里（跨轮落盘），因为自动循环的每一轮都会新建
+        # orchestrator 实例 —— 存在实例内存里的账本每轮都是空的。
+        #
+        # ``verification.infra_retry`` 在 ``verification`` 包里，而那个包的
+        # ``__init__`` 会导入 ``verification.orchestrator``，后者又导入
+        # **本模块** —— 所以模块级 import 是环。这里 import：环只在模块
+        # 导入期成立，运行时早就安全了。
+        from verification.infra_retry import InfraRetryLedger
+
+        self._infra_retry_ledger = InfraRetryLedger(self.plan_dir)
+        # VP → provider 的映射："这个 VP 上一次是用哪家 provider 试的"。
+        # 记账时要记它（下一轮换家的依据），排除集要从它算出来。
+        self._last_attempt_provider: Dict[str, str] = {}
 
         # Per-verification-round memoisation for the binary
         # freshness check.
@@ -6910,6 +7047,496 @@ class Orchestrator:
         return marked
 
     # -----------------------------------------------------------------------
+    # The failure class of a report entry (2026-11-03, infra-vs-defect)
+    # -----------------------------------------------------------------------
+    #
+    # The judgment LLM writes the report from a schema that has no slot
+    # for a failure class — ``id`` / ``status`` / ``actual_result`` /
+    # ``evidence`` — so every report entry landed on disk unclassified.
+    # The consumer downstream reads an unclassified failure as
+    # ``deliverable_defect`` (see
+    # :func:`verification.failure_history.failure_class_of`): the class
+    # that counts, the class that buys a repair task.  So an
+    # infrastructure failure — the environment was down, the product was
+    # never asked — was filed as a broken deliverable.
+    #
+    # The executor already knows which one it was: its projection
+    # (:meth:`_verdict_to_result`) carries ``failure_class`` and
+    # ``failure_class_source``.  :meth:`_backfill_failure_classes` puts
+    # that classification back into the report before the report is
+    # persisted, so the artifact every downstream reader takes its
+    # numbers from says what actually happened.
+
+    @staticmethod
+    def _backfill_failure_classes(
+        report_data: dict, execution_results: dict,
+    ) -> dict:
+        """Put the executor's failure class back into the report entries.
+
+        The rules, and why each one is what it is:
+
+          * **the executor is the authority, per entry.**  It ran the
+            command; the judgment LLM only ever saw a summary of the
+            run.  So the executor's class wins in *both* directions — an
+            ``infra`` the LLM called a defect is restored, and a real
+            defect the LLM called ``infra`` stays a defect.  The second
+            direction matters as much as the first: an ``infra`` class
+            buys **no** repair task, so a defect filed as ``infra`` is
+            retried forever while the product stays broken.
+          * **the report states what the executor said, and nothing
+            more.**  An executor entry that names no class leaves the
+            report entry **unstated** — the class stays empty and the
+            source is the default.  Writing the default
+            (:data:`DEFAULT_FAILURE_CLASS`) into the record instead
+            would be a quiet lie, and an expensive one: a record that
+            *names* a class is taken at face value by
+            :func:`verification.failure_history.classify_failure`,
+            which never asks the rules in that case.  The rules are
+            what say that an attempt cancelled in flight is ``infra``
+            (nothing was judged, so the remedy is another attempt) and
+            that a point with no usable definition is
+            ``criterion_defect``.  Stating ``deliverable_defect`` for
+            them silences both: the cancelled attempt becomes a broken
+            deliverable, the repair gate reads
+            ``retry_counted`` instead of ``retry_not_counted``, and a
+            repair task is raised against a product nobody asked.
+            The default is still what the consumer applies when no rule
+            fires — it is just not the report's to claim.
+          * **a passed point carries no class.**  The same semantics
+            :meth:`Verdict.__post_init__` gives a passed verdict: a
+            point that passed has no failure to classify, and reading
+            the empty class as "default it" would report every green
+            verification point as a broken deliverable.  A class the
+            judgment LLM made up on a passed point is cleared, and the
+            source falls back to the default — the pair the executor's
+            own projection gives a passed verdict.
+          * **a point the executor never judged is left alone.**  The
+            backfill copies what the executor said; it does not invent
+            a verdict for a point the executor has no verdict for.  Such
+            an entry keeps every field it came with.
+
+        The report dict is updated **in place** and returned, so the
+        caller may use the return value or ignore it.
+        """
+        if not isinstance(report_data, dict):
+            return report_data
+        report_results = report_data.get("verification_results")
+        if not isinstance(report_results, list):
+            return report_data
+
+        executor_entries: Dict[str, Dict[str, Any]] = {}
+        raw_results = (
+            execution_results.get("execution_results")
+            if isinstance(execution_results, dict)
+            else None
+        )
+        for result in raw_results or []:
+            if not isinstance(result, dict):
+                continue
+            entry_id = str(result.get("id") or "").strip()
+            if not entry_id:
+                continue
+            executor_entries.setdefault(entry_id, result)
+        if not executor_entries:
+            return report_data
+
+        for entry in report_results:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = str(entry.get("id") or "").strip()
+            if not entry_id:
+                continue
+            source = executor_entries.get(entry_id)
+            if source is None:
+                # The executor never judged this point — there is
+                # nothing to copy, and nothing to invent either.
+                continue
+            if str(entry.get("status") or "").strip().upper() == "PASSED":
+                # A passed point has no failure to classify.  The empty
+                # class is what the verdict record uses for that case
+                # (see ``Verdict.__post_init__``), and the default
+                # source is what the executor's projection gives it.
+                entry["failure_class"] = ""
+                entry["failure_class_source"] = DEFAULT_FAILURE_CLASS_SOURCE
+                continue
+            raw_class = source.get("failure_class")
+            failure_class = str(raw_class).strip() if raw_class else ""
+            raw_source = source.get("failure_class_source")
+            failure_class_source = str(raw_source).strip() if raw_source else ""
+            if not failure_class_source:
+                failure_class_source = DEFAULT_FAILURE_CLASS_SOURCE
+            entry["failure_class"] = failure_class
+            entry["failure_class_source"] = failure_class_source
+        return report_data
+
+    # -----------------------------------------------------------------------
+    # The cross-round infra retry ledger (2026-11-03, arch decision point 2)
+    # -----------------------------------------------------------------------
+    #
+    # ``verification.failure_triage`` gives an infra failure the
+    # disposition ``retry_not_counted``: the environment failed, the
+    # deliverable was never asked, so the attempt may be retried and the
+    # deliverable's own failure count does not move.  What that rule
+    # does not say is **how many** times "may be retried" holds — and
+    # without a bound, a verification point that times out on every
+    # provider is retried forever, each retry looking like it "did not
+    # count".
+    #
+    # The bound is ``verification.infra_retry.InfraRetryLedger``: it
+    # records, per verification point and per round, the provider that
+    # served the attempt and the reason code, and it answers the two
+    # questions the next round needs:
+    #
+    #   * how many attempts this point has already spent (the retry
+    #     budget), and
+    #   * which providers it has already been tried with (the exclusion
+    #     set — so the next round lands on a *different* provider rather
+    #     than dying in the same place again).
+    #
+    # This section is the wiring between that ledger and the round:
+    # :meth:`_record_infra_attempts` books what happened this round, and
+    # :meth:`_excluded_providers_for` hands the next round its exclusion
+    # set.
+
+    def _record_infra_attempts(self, report_data: dict) -> None:
+        """Book this round's infrastructure failures in the retry ledger.
+
+        The rules, and why each one is what it is:
+
+          * **only ``infra`` entries are booked.**  The ledger is the
+            *environment's* retry budget.  A deliverable defect does not
+            consume it: a defect needs a **repair**, not another
+            attempt, and booking it here would spend the environment's
+            budget on the product's problem — the point would be
+            declared "tried out" long before the environment misbehaved
+            again.
+          * **a passed entry is not booked.**  A green verification
+            point has no failure to classify, so there is nothing to
+            retry and nothing to book.
+          * **the class is the one the executor stated.**  The filter
+            reads ``failure_class``, which
+            :meth:`_backfill_failure_classes` copied out of the
+            executor's verdict — so this must run **after** the
+            backfill.  Before it, an entry carries no class at all and
+            cannot be told apart from a defect.
+          * **the provider is the one that actually served the attempt**
+            (recorded by :meth:`_delegate_to_sub_agent`).  A blank
+            provider is booked as a blank one: "this attempt happened
+            and we do not know who served it" is not "no provider was
+            involved", and the retry budget is counted per attempt, not
+            per provider.
+
+        The ledger books ``(vp, round)`` idempotently, so a report that
+        is generated twice in the same round is still one attempt.
+
+        **A broken ledger must not take the report down with it.**  The
+        book-keeping is an aid; the report is the deliverable.  A read
+        or write that fails is logged and skipped.
+
+        Args:
+            report_data: The verification report.  Read only — this
+                method writes the ledger, never the report.
+
+        Returns:
+            ``None``.
+        """
+        if not isinstance(report_data, dict):
+            return
+        entries = report_data.get("verification_results")
+        if not isinstance(entries, list):
+            return
+
+        ledger = getattr(self, "_infra_retry_ledger", None)
+        if ledger is None:
+            return
+
+        round_number = getattr(self, "_current_round", 0) or 0
+        providers = getattr(self, "_last_attempt_provider", {}) or {}
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("status") or "").strip().upper()
+            if status == "PASSED":
+                continue
+            failure_class = str(entry.get("failure_class") or "").strip()
+            if failure_class != INFRA_FAILURE_CLASS:
+                continue
+            vp_id = str(entry.get("id") or "").strip()
+            if not vp_id:
+                continue
+            provider = str(providers.get(vp_id, "") or "")
+            reason_code = str(entry.get("reason_code") or "")
+            try:
+                ledger.record_attempt(
+                    vp_id,
+                    round_number,
+                    provider=provider,
+                    reason_code=reason_code,
+                )
+            except Exception as exc:  # noqa: BLE001 — a broken ledger is not a broken round
+                logger.warning(
+                    "[Verification] could not book the infra attempt of "
+                    "%s (round %s) in the retry ledger: %s",
+                    vp_id, round_number, exc,
+                )
+                continue
+
+    def _exhausted_infra_vp_ids(self) -> List[str]:
+        """The points whose infra retry budget is used up.
+
+        The ledger (:class:`verification.infra_retry.InfraRetryLedger`)
+        answers ``is_exhausted`` for one point at a time and exposes no
+        way to list the points it knows, so the **id list** is read from
+        the ledger's own file — the file the ledger writes, in the shape
+        it writes it.  The **threshold** is still the ledger's call
+        (:meth:`InfraRetryLedger.is_exhausted`): this method only finds
+        the candidates, so the bound lives in exactly one place and
+        cannot drift from the one the bookkeeping used.
+
+        The list is read **after** :meth:`_record_infra_attempts`, so it
+        answers the question that matters: *this* round is the one that
+        used the budget up, and it is this round's report that has to say
+        so.  Asked before the bookkeeping, the answer would always be one
+        round late — the round that breaks the budget would still look
+        retryable, and the report would ask for one more attempt that
+        the ledger has already refused.
+
+        **A ledger that cannot be read is an empty ledger.**  A missing
+        file, a corrupt payload, a ledger object that does not even have
+        a path — all of them read as "nothing is exhausted", and the
+        round proceeds.  The opposite would be far worse: an unreadable
+        ledger must not be allowed to stamp "the environment never let
+        this be judged" onto a point the round *did* judge, and failed.
+
+        Args:
+            None — the answer comes from the ledger and the round.
+
+        Returns:
+            The ids of the points whose retry budget is used up.  Empty
+            when there is no ledger, an unreadable one, or a ledger with
+            nothing exhausted in it.
+        """
+        ledger = getattr(self, "_infra_retry_ledger", None)
+        if ledger is None:
+            return []
+        try:
+            path = getattr(ledger, "path", None)
+        except Exception as exc:  # noqa: BLE001 — a broken ledger is an empty ledger
+            logger.warning(
+                "[Verification] could not reach the infra retry ledger: %s",
+                exc,
+            )
+            return []
+        if path is None:
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            # Nothing has been booked yet — the first round of a plan.
+            return []
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[Verification] could not read the infra retry ledger at "
+                "%s: %s", path, exc,
+            )
+            return []
+        if not isinstance(payload, dict):
+            return []
+        attempts = payload.get("vp_attempts")
+        if not isinstance(attempts, dict):
+            return []
+
+        is_exhausted = getattr(ledger, "is_exhausted", None)
+        if not callable(is_exhausted):
+            return []
+
+        exhausted: List[str] = []
+        for vp_id in attempts:
+            vp_key = str(vp_id)
+            try:
+                used_up = bool(is_exhausted(vp_key))
+            except Exception as exc:  # noqa: BLE001 — a broken ledger is an empty ledger
+                logger.warning(
+                    "[Verification] could not read the retry budget of "
+                    "%s: %s", vp_key, exc,
+                )
+                continue
+            if used_up:
+                exhausted.append(vp_key)
+        return exhausted
+
+    def _excluded_providers_for(self, vp_id: str) -> List[str]:
+        """The providers this verification point must not use.
+
+        The answer comes from the ledger: the providers this point has
+        already been tried with.  The next round's attempt skips them,
+        so a retry lands on a different provider instead of dying in
+        the same place again (arch decision point 2 — *provider
+        re-selection*).
+
+        When the exclusion set covers **every** provider in the chain,
+        the situation is worth saying out loud: the next attempt has
+        nowhere else to go, and without that line the reader only sees
+        "it was retried, on the same provider, with the same error".
+
+        A ledger that cannot be read is an **empty** ledger: the round
+        proceeds without exclusions rather than dying.
+
+        Args:
+            vp_id: The verification point whose providers are excluded.
+
+        Returns:
+            The excluded provider names — empty when there is nothing to
+            exclude.
+        """
+        ledger = getattr(self, "_infra_retry_ledger", None)
+        excluded: List[str] = []
+        if ledger is not None:
+            try:
+                excluded = [
+                    str(provider)
+                    for provider in (ledger.excluded_providers(vp_id) or [])
+                    if provider
+                ]
+            except Exception as exc:  # noqa: BLE001 — a broken ledger is an empty ledger
+                logger.warning(
+                    "[Verification] could not read the retry ledger for "
+                    "%s: %s",
+                    vp_id, exc,
+                )
+                excluded = []
+
+        # Only a real sequence counts as a priority list.  A tool object
+        # that answers with an auto-generated attribute (a test double,
+        # say) hands back something truthy but not iterable, and
+        # iterating it would raise — inside a method the caller reads as
+        # "the ledger had nothing to exclude".  Anything that is not a
+        # list or a tuple is therefore **no** priority, the same way a
+        # missing attribute is no priority.
+        _priority_attr = getattr(
+            getattr(self, "coding_tool", None), "provider_priority", None,
+        )
+        priority = (
+            [str(provider) for provider in _priority_attr if provider]
+            if isinstance(_priority_attr, (list, tuple))
+            else []
+        )
+        if priority and excluded and set(priority) <= set(excluded):
+            message = (
+                f"[Verification] {vp_id}: no alternative provider left — "
+                f"every provider in the chain ({', '.join(priority)}) has "
+                "already failed for infra reasons"
+            )
+            logger.warning(message)
+            print(message)
+        return excluded
+
+    # -----------------------------------------------------------------------
+    # The report-side infra terminal (2026-11-03, "infra vs defect")
+    # -----------------------------------------------------------------------
+    #
+    # A point whose environment never let it be judged has **no verdict
+    # about the deliverable** — the product was never asked — so the
+    # report must be able to say that in a word of its own, one that
+    # cannot be mistaken for a code failure.
+    #
+    # The marking is a pure function of the report: it needs neither
+    # the plan nor the project, and it writes no database row and no
+    # schema.  So the implementation lives at module level
+    # (:func:`_mark_infrastructure_unresolved`) and is exposed here as a
+    # static method — the way the report path reaches its other report
+    # helpers.
+    _mark_infrastructure_unresolved = staticmethod(_mark_infrastructure_unresolved)
+
+    @staticmethod
+    def _failure_class_counts(report_data: Dict[str, Any]) -> Dict[str, int]:
+        """How many failures of each class the report carries.
+
+        The report says **what** happened to every point; this says **how
+        many** of each kind, so a reader does not have to read the
+        entries and split them into classes by hand.  The split that
+        matters is ``infra`` against ``deliverable_defect``: one of them
+        is the environment's fault and buys no repair task, the other is
+        the product's fault and buys one.  A report that only says
+        "3 failed" cannot tell a reader which of the three was which —
+        and the whole point of the infra terminal is that the two are
+        not the same thing.
+
+        The rules:
+
+          * **a passed entry is counted nowhere.**  A green point has no
+            failure to classify (the executor's own projection clears
+            the class of a passed verdict), and counting it would make
+            every column lie;
+          * **every other entry is counted once**, under the class it
+            carries;
+          * **an entry that names no class** is counted as
+            :data:`DEFAULT_FAILURE_CLASS` — the default the consumer
+            applies to an unclassified failure anyway.  Counting it as
+            "no failure" would lose a failure;
+          * **an entry that names a class this layer does not know** is
+            counted as ``deliverable_defect``: a class nobody
+            recognises is not a licence to lose the failure.
+
+        The four keys are **always** there, zeros included, in a fixed
+        order.  A reader that asks "how many infra failures were there?"
+        must not have to distinguish "none" from "the report did not
+        say" — and the key order is fixed so two reports' tables can be
+        compared line by line.
+
+        Args:
+            report_data: The verification report.  Read only.
+
+        Returns:
+            The four counts, in the order ``infra`` /
+            ``deliverable_defect`` / ``criterion_defect`` /
+            ``out_of_scope``.
+        """
+        from verification.failure_triage import (
+            CRITERION_DEFECT,
+            DELIVERABLE_DEFECT,
+            INFRA,
+            OUT_OF_SCOPE,
+        )
+
+        # The key order is **pinned here**, not inherited from the triage
+        # table: this table is read line by line and compared between
+        # rounds, so its shape must not drift because somebody reordered
+        # a table somewhere else.
+        counts: Dict[str, int] = {
+            INFRA: 0,
+            DELIVERABLE_DEFECT: 0,
+            CRITERION_DEFECT: 0,
+            OUT_OF_SCOPE: 0,
+        }
+        if not isinstance(report_data, dict):
+            return counts
+        entries = report_data.get("verification_results")
+        if not isinstance(entries, list):
+            return counts
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("status") or "").strip().upper()
+            if status == "PASSED":
+                continue
+            failure_class = str(entry.get("failure_class") or "").strip()
+            if failure_class not in counts:
+                # Unstated or unrecognised: the default is what the
+                # consumer applies to an unclassified failure, and an
+                # unrecognised class must not make the failure vanish.
+                failure_class = (
+                    DEFAULT_FAILURE_CLASS
+                    if DEFAULT_FAILURE_CLASS in counts
+                    else DELIVERABLE_DEFECT
+                )
+            counts[failure_class] += 1
+        return counts
+
+    # -----------------------------------------------------------------------
     # The accounting of environment-blocked entries (2026-10-25, repair-r1-32)
     # -----------------------------------------------------------------------
     #
@@ -8811,6 +9438,11 @@ class Orchestrator:
             plan_id=self.plan_dir.name,
             plan_dir=self.plan_dir,
             round_no=getattr(self, "_current_round", 0),
+            # 2026-11-03（arch 决策点 2 —— provider 重选）：这个 VP 已经
+            # 用过的 provider 不许再用。子代理把它透传到 dispatch，dispatch
+            # 挑 provider 时跳过它们 —— 不给排除集，重试还是落在同一家
+            # 身上，永远死在同一个地方。
+            excluded_providers=self._excluded_providers_for(vp_id),
         )
 
         # 2026-11-02（写入范围落地）：写护栏把这个 VP 越权写被验证仓库的
@@ -8819,6 +9451,21 @@ class Orchestrator:
         # 所以这里按拒绝证据把它改判掉（arch 决策点 3：VP 级失败原因
         # verifier_mutated_tree）。
         verdict = self._apply_refusal_evidence(verdict, vp_id)
+
+        # 2026-11-03（arch 决策点 2）：记下这次尝试真正用的 provider。
+        # 父进程里**只有这一处**拿得到它 —— verdict 是子代理交回来的，
+        # provider 是它跑的时候挑的。账本要记它（下一轮据此换家），排除集
+        # 从它算出来。拿不到就记空串：空串不是 provider，但"这一轮发生过
+        # 这次尝试"这件事仍然要记下来。
+        #
+        # ``getattr`` 而不是 ``self._last_attempt_provider``：这条路径
+        # 也被"只带必要字段"的精简 orchestrator 走着（``__init__`` 被跳过），
+        # 属性不存在时现建一个，而不是把这条路炸掉。
+        providers = getattr(self, "_last_attempt_provider", None)
+        if providers is None:
+            providers = {}
+            self._last_attempt_provider = providers
+        providers[vp_id] = getattr(verdict, "provider", "") or ""
 
         # Persist a sub-agent_completed event so the JSONL audit
         # log can correlate the sub-agent's verdict with the
@@ -9599,6 +10246,56 @@ class Orchestrator:
                     report_data["overall_status"] = _derive_overall_status(
                         report_data.get("verification_results", [])
                     )
+
+                # 2026-11-03 (infra-vs-defect): the failure class of
+                # every entry.  The judgment LLM's output schema has no
+                # slot for it, so without this the report lands on disk
+                # unclassified and every downstream reader reads an
+                # infrastructure failure as ``deliverable_defect`` — the
+                # class that buys a repair task.  The executor knows
+                # which one it was, so the executor's classification is
+                # what the report says.
+                #
+                # It runs **before** the exclusion below, because the
+                # exclusion rewrites the entries it touches (a blocked
+                # or an invalid-env entry keeps its classification), and
+                # a classification written after it would miss them.
+                report_data = self._backfill_failure_classes(
+                    report_data, execution_results,
+                )
+
+                # 2026-11-03 (arch decision point 2 — infra 的跨轮有界
+                # 重试): 把这一轮 infra 的失败记进跨轮重试账本。
+                #
+                # 它必须跑在上面的回填**之后**：过滤依据就是回填出来的
+                # ``failure_class`` —— 回填之前条目根本没有分类，一条
+                # infra 也认不出来。而认不出来就意味着这条要么漏记，
+                # 要么被当成缺陷记进去（后者更糟：把交付物的缺陷记成环境
+                # 失败，等于用产品的错误花掉环境的重试预算）。
+                #
+                # 账本坏了不打断报告生成 —— 记账是辅助，报告才是交付物。
+                self._record_infra_attempts(report_data)
+
+                # 2026-11-03（arch 决策点 3 —— 基础设施未解决就停，不进迭代）：
+                # 把这一轮用完 infra 重试预算的点落成"基础设施未解决"终态，
+                # 并把这一轮的失败按类分开数。
+                #
+                # 顺序：**先记账，再问谁超限**。用完预算的正是**这一轮**，所以
+                # 这个问题必须在记账之后问 —— 早问一轮，账本就永远慢一轮：花掉
+                # 预算的那一轮看上去还"可以重试"，报告会再要一次账本已经不肯
+                # 给的尝试。
+                #
+                # 标记把条目从 FAILED 改成 BLOCKED：FAILED 是关于交付物的判决，
+                # 而这个点**根本没被判过** —— 问都没问到产品。
+                #
+                # 它跑在下面的排除**之前**：排除会重写它碰到的条目，而在排除
+                # 之后写的分类会漏掉它们。
+                report_data = self._mark_infrastructure_unresolved(
+                    report_data, self._exhausted_infra_vp_ids(),
+                )
+                report_data["failure_class_counts"] = self._failure_class_counts(
+                    report_data,
+                )
 
                 # 2026-10-25 (repair-r1-32): the accounting of the
                 # environment-blocked entries.  It runs **after** every
