@@ -880,10 +880,17 @@ jobs:
     # unit-tests and everything under it. The explicit ``result`` checks
     # below replace the implicit dependency — on a PR all six gates must
     # pass, on a dispatch only the three code gates do.
+    # 2026-11-03 — a manual dispatch carries a ``layer`` input
+    # (all|unit|integration|e2e|time-sensitive|nightly) and it used to be
+    # dead: the dispatch branch only asked for the event name, so
+    # ``-f layer=unit`` started the integration, e2e and time-sensitive
+    # lanes as well. The layer now selects the lane: ``all`` (the
+    # default — the whole merge gate) or ``unit``. A named layer runs
+    # that lane and nothing else.
     # It stays on ONE physical line on purpose: the PR-predicate gates in
     # backend/tests read the ``if:`` line literally, so a folded block
     # scalar would read as ``>-`` and look like "no pull request".
-    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.lint.result == 'success' && needs.grep-guard.result == 'success' && needs.static-gates.result == 'success' && (github.event_name != 'pull_request' || (needs.commit-hygiene.result == 'success' && needs.commit-range-privacy.result == 'success' && needs.pr-metadata-privacy.result == 'success')) }}
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.layer == 'all' || github.event.inputs.layer == 'unit'))) && needs.lint.result == 'success' && needs.grep-guard.result == 'success' && needs.static-gates.result == 'success' && (github.event_name != 'pull_request' || (needs.commit-hygiene.result == 'success' && needs.commit-range-privacy.result == 'success' && needs.pr-metadata-privacy.result == 'success')) }}
     # Chain the layered gates: lint (style) + grep-guard (fast
     # static scan) BOTH must pass before unit runs. A grep-guard
     # failure on a forbidden filename pattern fails fast (seconds)
@@ -1855,7 +1862,18 @@ jobs:
     # Kept in lockstep with ``unit-tests`` on purpose: the e2e job needs
     # this one, so a divergence here silently removes e2e from the
     # merge gate.
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    #
+    # 2026-11-03 — the dispatch branch is narrowed by the ``layer``
+    # input: this lane runs for ``all`` (the whole merge gate) or
+    # ``integration``, and for nothing else. ``!cancelled()`` keeps the
+    # lane reachable when its upstream is skipped ON PURPOSE — a
+    # ``layer=integration`` dispatch does not run the unit shards, so
+    # unit-tests and coverage-gate are skipped, and GitHub's implicit
+    # skip would take this job with them. The upstream ``result`` checks
+    # therefore demand ``success`` only when the selected layer actually
+    # runs them: on a pull request, and on a ``layer=all`` dispatch, a
+    # red unit lane still stops integration.
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.layer == 'all' || github.event.inputs.layer == 'integration'))) && (needs.unit-tests.result == 'success' || (github.event_name == 'workflow_dispatch' && github.event.inputs.layer == 'integration')) && (needs.coverage-gate.result == 'success' || (github.event_name == 'workflow_dispatch' && github.event.inputs.layer == 'integration')) }}
     # Chain the layered gates: unit, the combined coverage floor, and
     # grep-guard must all pass before integration runs. If any upstream
     # gate fails (style violation, grep-guard regex hit, unit test
@@ -1953,7 +1971,15 @@ jobs:
     # REAL-plan migration lives in its own `real-plan-migration` job
     # below, gated behind `inputs.run_real_plan_migration == 'true'` so
     # a routine PR or the nightly cron cannot trigger a real migration.
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    #
+    # 2026-11-03 — narrowed by the dispatch ``layer`` input: this lane
+    # runs for ``all`` or ``e2e``. ``!cancelled()`` plus the conditional
+    # upstream check keep it reachable when integration-tests is skipped
+    # ON PURPOSE — a ``layer=e2e`` dispatch does not run the integration
+    # lane, and the implicit skip would otherwise take this one with it.
+    # On a pull request, and on a ``layer=all`` dispatch, a red
+    # integration lane still stops e2e.
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.layer == 'all' || github.event.inputs.layer == 'e2e'))) && (needs.integration-tests.result == 'success' || (github.event_name == 'workflow_dispatch' && github.event.inputs.layer == 'e2e')) }}
     # Chain after the layered gates: the mock-plan E2E is the
     # cheapest of the e2e jobs so it runs by default; a real-plan
     # migration lives behind `real-plan-migration` (gated by the
@@ -2345,7 +2371,15 @@ jobs:
     # scheduler contention. Chaining costs wall-clock — this job cannot
     # start until the shards finish — and buys a verdict that means
     # something.
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    #
+    # 2026-11-03 — narrowed by the dispatch ``layer`` input: this lane
+    # runs for ``all`` or ``time-sensitive``. ``!cancelled()`` keeps it
+    # reachable when unit-tests is skipped ON PURPOSE — a
+    # ``layer=time-sensitive`` dispatch does not run the unit shards, and
+    # the implicit skip would otherwise take the serial lane with them.
+    # On a pull request, and on a ``layer=all`` dispatch, a red unit lane
+    # still stops this lane.
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.layer == 'all' || github.event.inputs.layer == 'time-sensitive'))) && (needs.unit-tests.result == 'success' || (github.event_name == 'workflow_dispatch' && github.event.inputs.layer == 'time-sensitive')) }}
     needs: unit-tests
     steps:
       - name: Checkout

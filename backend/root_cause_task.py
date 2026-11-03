@@ -39,7 +39,9 @@ description 里带着一份可照抄的改动范围模板（:data:`_SCOPE_CONTRA
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from orphan_rules import report_deliverable_marker
@@ -61,6 +63,7 @@ __all__ = [
     "ROOT_CAUSE_KIND",
     "build_implementation_task",
     "build_root_cause_task",
+    "root_cause_report_contract",
     "root_cause_report_path",
 ]
 
@@ -137,6 +140,75 @@ def root_cause_report_path(plan_id: str, vp_id: str) -> str:
     if not vp:
         raise ValueError("根因任务必须带 vp_id")
     return f"plans/{plan}/reports/root-cause-{vp}.md"
+
+
+#: 根因报告路径在任务 description 里的形状：
+#: ``plans/<plan_id>/reports/root-cause-<vp_id>.md``。
+#:
+#: 报告的**地址**由 :func:`root_cause_report_path` 决定，但持久化会把
+#: ``deliverable`` / ``report_path`` 一起丢掉（``plan_tasks`` 表没有这两
+#: 列，见 ``state_machine.repositories.plan_task_repository``
+#: 的 ``ALLOWED_STATIC_TASK_FIELDS``），所以执行器加载这一行时能读到
+#: 的只有任务文字里那个地址。要把「交付物是一份报告」这条契约还原回
+#: 去，就得从文字里把它读回来。
+_ROOT_CAUSE_REPORT_PATH_RE = re.compile(
+    r"plans/[^\s`\"\u3002\uff1b\u3001]*/reports/(root-cause-[A-Za-z0-9._-]+\.md)"
+)
+
+
+def root_cause_report_contract(
+    row: Mapping[str, Any],
+    plan_dir: Any,
+) -> Optional[Dict[str, str]]:
+    """把「这一行的产出是一份根因报告」还原成执行器认得的契约。
+
+    持久化丢掉了 ``deliverable`` / ``report_path``，于是执行器加载这一行
+    时看到的只是「一个没有改动范围的任务」——它按代码任务处理，于是问了
+    一个错的问题（「仓库变了吗」），把一份写好的报告判成
+    ``empty_diff_no_changes``，一轮又一轮地重试：诊断任务没有
+    ``files_to_modify``，它的产出按定义就不是 diff。
+
+    判定用**两个**信号，缺一不可：
+
+    1. description 里点名了一份根因报告（``plans/.../reports/root-cause-*.md``）；
+    2. 这一行没有声明任何要改动的文件 —— 诊断任务的产出是判断，不是改动
+       （这是 :mod:`root_cause_task` 的契约）。
+
+    第二个信号是必须的：实现任务的 description 里**也**写着同一份报告的
+    路径（"按 <report> 的根因结论修复 ..."），只按路径判定会把「修 bug 的
+    代码任务」变成「欠一份报告的任务」，那个修复就永远做不出来。
+
+    Args:
+        row: 持久化后的任务行。
+        plan_dir: 该 plan 的目录 —— 报告落在它的 ``reports/`` 下，与
+            ``verification.orchestrator._root_cause_report_file`` 读的
+            是同一个位置。
+
+    Returns:
+        ``{"deliverable": "report", "report_path": "<绝对路径>"}``；
+        这一行不是根因报告任务时返回 ``None``。
+    """
+    if str(row.get("deliverable") or "").strip():
+        # 行上已经带着交付物声明 —— 那是权威的，不许猜。
+        return None
+    declared = row.get("files_to_modify") or []
+    concrete = [
+        f
+        for f in declared
+        if isinstance(f, str) and f and not f.startswith("__")
+    ]
+    if concrete:
+        return None
+    match = _ROOT_CAUSE_REPORT_PATH_RE.search(
+        str(row.get("description") or "")
+    )
+    if not match:
+        return None
+    report_path = Path(plan_dir).absolute() / "reports" / match.group(1)
+    return {
+        "deliverable": "report",
+        "report_path": str(report_path),
+    }
 
 
 def _allocate_task_id(
@@ -300,19 +372,25 @@ def build_root_cause_task(
         # 只读：诊断任务的产出是报告，不是改动。
         "read_only": True,
         "report_path": report_path,
-        # 2026-11-02 — 这个 ``deliverable`` 是**任务 dict** 的字段，
+        # 2026-11-02（main）— 这个 ``deliverable`` 是**任务 dict** 的字段，
         # 不是 ``SubTask`` 的那个：``plan_tasks`` 没有这一列，链在写库
-        # 时会把它连同 ``kind`` / ``read_only`` 一起丢掉，所以它对执行器
-        # 没有任何影响。执行器真正读到的那一对（``deliverable="report"``
-        # + ``report_path``）由上面 description 里的标记带过去，由
+        # 时会把它连同 ``kind`` / ``read_only`` 一起丢掉。执行器真正读到
+        # 的那一对（``deliverable="report"`` + ``report_path``）由上面
+        # description 里的标记带过去，由
         # ``orphan_rules.parse_report_deliverable`` 读回来。
         #
-        # 这里保留历史的「五个章节名」形状：仓库自己的契约测试
-        # （``tests/unit/verification/test_root_cause_task_build.py``、
-        # ``test_root_cause_scope_contract.py``）把它钉成了那个形状，
-        # 而这一行的语义在仓库里已经变了 —— 章节名单独放在
-        # ``required_sections``，那里的语义本来就是「必须包含哪几节」。
-        "deliverable": list(ROOT_CAUSE_DELIVERABLE),
+        # 2026-11-03（本分支）— 但**这一行**本身仍要自洽：
+        # ``deliverable`` 是交付物的**类型**（"code" / "report"），
+        # 执行器据此走报告分支（``is_report_task`` /
+        # ``resolve_report_path`` / 写守卫的 ``PDT_REPORT_PATH`` 豁免）；
+        # 报告必须包含的五件事是交付物的**内容**，放在另一个键上 ——
+        # 塞进 ``deliverable`` 会让这一行连 ``SubTask`` 都构造不出来
+        # （``SubTask.deliverable`` 是 ``Literal["code", "report"]``）。
+        "deliverable": "report",
+        # 交付物的**内容**：这五件事是报告里必须有的章节。
+        "report_deliverables": list(ROOT_CAUSE_DELIVERABLE),
+        # main 侧新增：章节名单独放在 ``required_sections``，那里的语义
+        # 本来就是「必须包含哪几节」。
         "required_sections": list(ROOT_CAUSE_DELIVERABLE),
         "failed_vp_id": vp,
         "round": round_number,

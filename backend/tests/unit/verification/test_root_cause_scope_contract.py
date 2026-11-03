@@ -15,15 +15,21 @@ description 里带着模板（:data:`_SCOPE_CONTRACT_TEMPLATE`），模板给出
 TDD contract — 4 cases
 -----------------------
 1. ``test_description_carries_scope_contract`` —— description 带声明模板：
-   一个 ``json`` 围栏块、``files_to_modify`` 与 ``fix_plan`` 两个键。
+   一个 ``json`` 围栏块、``files_to_modify`` 与 ``fix_plan`` 两个键；
+   模板里**不许**出现任何具体路径（读者会把块里的每一个路径都当成白名单）。
 2. ``test_heading_matches_reader_constant`` —— 模板标题与
    ``_ROOT_CAUSE_SCOPE_HEADINGS`` 首项逐字对齐（读者不再扫小节，但两边
    仍然叫同一个名字，读报告的人才找得到那一节）。
 3. ``test_template_round_trips_through_reader`` —— **回归钉子**：把模板里
    那个 ``json`` 块从**原文**切出来，把占位路径换成一条真路径，喂给
    reader，必须读出那条路径 —— 模板给的形状就是读者读的形状。
-4. ``test_deliverable_names_scope`` —— deliverable 里有「改动范围」这一项，
+4. ``test_deliverable_names_scope`` —— 交付物清单里有「改动范围」这一项，
    且任务仍然是只读诊断任务（没有 ``files_to_modify``）。
+
+   2026-11-03: 这份清单从 ``deliverable`` 挪到了 ``report_deliverables``
+   —— ``deliverable`` 现在是交付物的**类型**（"report"），这五件事是报告的
+   **内容**。两者挤在同一个键上时，那一行连 ``SubTask`` 都构造不出来
+   （``deliverable`` 是 ``Literal["code", "report"]``，装不下一个列表）。
 
 边界条件
 --------
@@ -143,15 +149,21 @@ def test_template_round_trips_through_reader():
 # 4. deliverable 点名「改动范围」
 # ---------------------------------------------------------------------------
 def test_deliverable_names_scope():
-    """deliverable 里有「改动范围」这一项，任务仍是只读诊断任务。"""
+    """交付物清单里有「改动范围」这一项，任务仍是只读诊断任务。"""
     task = build_root_cause_task("p1", "VP-3", 2)
 
-    deliverable = task["deliverable"]
-    assert len(deliverable) >= 5
-    assert "改动范围" in deliverable[4]
-    assert any("改动范围" in item for item in deliverable)
+    # 交付物的**类型**：一份报告，落在 plan 自己的 reports/ 下 ——
+    # 执行器据此走报告分支（is_report_task / resolve_report_path）。
+    assert task["deliverable"] == "report"
+    assert task["report_path"] == "plans/p1/reports/root-cause-VP-3.md"
+
+    # 交付物的**内容**：这五件事是报告里必须有的章节。
+    required = task["report_deliverables"]
+    assert len(required) >= 5
+    assert "改动范围" in required[4]
+    assert any("改动范围" in item for item in required)
     # 前四项是旧契约，一项都不能被这次改动挤掉。
-    assert deliverable[:4] == [
+    assert required[:4] == [
         "确定性复现步骤",
         "完整因果链",
         "一次覆盖所有层的修复方案",

@@ -10,6 +10,7 @@ Covers:
   * ``alive`` — the same, through the liveness shortcut.
   * ``matches`` — pid reuse, command-line drift, the create-time
     tolerance, and the pids that must never be signalled.
+  * the spawn helper — it waits for the child's identity to be readable.
 """
 
 from __future__ import annotations
@@ -40,13 +41,141 @@ _LSTART = "Fri Sep  4 09:32:01 2026"
 _LSTART_EPOCH = datetime(2026, 9, 4, 9, 32, 1).timestamp()
 
 
+#: The command the spawn helper starts: a real child that stays alive
+#: until it is killed. The command line is part of the contract — the
+#: tests compare the identity the kernel reports against it.
+_CHILD_COMMAND = (sys.executable, "-c", "import time; time.sleep(30)")
+
+
+#: How long the spawn helper waits for the child's command line to
+#: become readable, and how often it looks while it waits.
+_IDENTITY_WAIT_TIMEOUT = 5.0
+_IDENTITY_WAIT_INTERVAL = 0.01
+
+
 def _spawn_child() -> subprocess.Popen:
-    """A real child process that stays alive until it is killed."""
-    return subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(30)"],
+    """A real child process that stays alive until it is killed.
+
+    The child is not handed back until the kernel can describe it.
+    ``Popen`` returns once the child has been forked, not once it has
+    exec'd, and in between the two there is no command line to read for
+    the new process: a probe taken in that window finds an identity with
+    an empty command line, which is a legal reading and a useless one.
+    """
+    child = subprocess.Popen(
+        _CHILD_COMMAND,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    _wait_for_readable_identity(child)
+    return child
+
+
+def _wait_for_readable_identity(child: subprocess.Popen) -> None:
+    """Wait until the kernel reports the child's own command line.
+
+    The wait is bounded: a child that never becomes readable is a
+    failure worth reporting, not a reason to hang the suite.
+    """
+    deadline = time.monotonic() + _IDENTITY_WAIT_TIMEOUT
+    while True:
+        ident = probe(child.pid)
+        if ident is not None and _is_child_command_line(ident.cmdline):
+            return
+        if time.monotonic() >= deadline:
+            _terminate(child)
+            raise AssertionError(
+                "the child (pid=%s) did not report a readable command line "
+                "within %.1fs" % (child.pid, _IDENTITY_WAIT_TIMEOUT)
+            )
+        time.sleep(_IDENTITY_WAIT_INTERVAL)
+
+
+def _is_child_command_line(cmdline: tuple[str, ...]) -> bool:
+    """True when the reported command line is the one the child was given.
+
+    ``argv[0]`` is not compared: on macOS the framework launcher
+    rewrites it to the resolved interpreter path. The rest of the line
+    is what says the child has exec'd and is running its script.
+    """
+    return tuple(cmdline[1:]) == tuple(_CHILD_COMMAND[1:])
+
+
+def _terminate(child: subprocess.Popen) -> None:
+    """Kill the child and reap it, ignoring one that is already gone."""
+    try:
+        child.kill()
+    except OSError:
+        pass
+    try:
+        child.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# the spawn helper
+# ---------------------------------------------------------------------------
+
+def test_spawn_child_waits_for_a_readable_identity(monkeypatch):
+    """The spawn helper must not hand back a child whose argv is unreadable.
+
+    A child that has forked but has not yet exec'd has no command line
+    for the kernel to report, so a helper that returns straight after
+    the spawn can hand back a child whose identity cannot be read at
+    all. The helper has to wait that window out.
+    """
+    real_psutil = process_identity.psutil
+    if real_psutil is None:
+        pytest.skip("psutil is not installed; there is no psutil path to exercise")
+
+    reads = [0]
+    window = [2]
+
+    class _HalfExeced:
+        """A process whose command line cannot be read yet."""
+
+        def __init__(self, pid):
+            self._proc = real_psutil.Process(pid)
+
+        def create_time(self):
+            return self._proc.create_time()
+
+        def cwd(self):
+            return self._proc.cwd()
+
+        def cmdline(self):
+            reads[0] += 1
+            if window[0] > 0:
+                window[0] -= 1
+                return []
+            return self._proc.cmdline()
+
+    class _Stub:
+        """``psutil``, with a process whose argv is briefly unreadable."""
+
+        NoSuchProcess = real_psutil.NoSuchProcess
+        AccessDenied = real_psutil.AccessDenied
+
+        @staticmethod
+        def Process(pid):  # noqa: N802 - psutil's own spelling
+            return _HalfExeced(pid)
+
+    monkeypatch.setattr(process_identity, "psutil", _Stub)
+
+    child = _spawn_child()
+    try:
+        # The window has to have been waited out, not merely survived.
+        assert window[0] == 0, "the fork->exec window was not waited out"
+        assert reads[0] > 0, "the spawn helper never read the child's argv"
+
+        ident = probe(child.pid)
+        assert ident is not None
+        assert len(ident.cmdline) == 3
+        assert ident.cmdline[2] == "import time; time.sleep(30)"
+    finally:
+        child.kill()
+        child.wait(timeout=10)
 
 
 # ---------------------------------------------------------------------------

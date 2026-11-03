@@ -97,7 +97,13 @@ def test_root_cause_task_shape():
     assert task["kind"] == ROOT_CAUSE_KIND
     assert task["read_only"] is True
     assert task["report_path"] == "plans/p1/reports/root-cause-VP-3.md"
-    assert task["deliverable"] == [
+    # 2026-11-03 — ``deliverable`` 是交付物的**类型**（"report"），
+    # 这五件事是交付物的**内容**。两者挤在一个键上时，这一行连
+    # ``SubTask`` 都构造不出来（``deliverable`` 是
+    # ``Literal["code", "report"]``，装不下一个列表），而执行器也因此
+    # 把一份报告当成代码任务来判。
+    assert task["deliverable"] == "report"
+    assert task["report_deliverables"] == [
         "确定性复现步骤",
         "完整因果链",
         "一次覆盖所有层的修复方案",

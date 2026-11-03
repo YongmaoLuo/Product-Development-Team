@@ -747,14 +747,28 @@ def _pdt_service_mirror() -> dict:
     return {
         "name": "pdt",
         "port": port,
+        # The child is pinned to the *inherit* provider mode (2026-11-02,
+        # nightly root-cause).  The suite's own hermetic environment says
+        # ``cc-switch``, and the child inherits it: CC Switch is a plugin
+        # on one operator's machine, so on a clean runner nothing listens
+        # on its port, the provider chain cannot be resolved, and the
+        # server dies in its lifespan — before it ever binds.  A service
+        # that dies at start-up must not be able to take the whole
+        # readiness budget with it, so the mode is pinned here, in the
+        # child's own environment, where the round's spawn can see it.
         "start_cmd": (
             "source backend/.venv/bin/activate && mkdir -p .pdt/verify/plans && "
             f"export PDT_PORT={port} PDT_STATE_DB_PATH=$PWD/.pdt/verify/state.db "
-            "PDT_PLANS_DIR=$PWD/.pdt/verify/plans && exec python -m backend.server"
+            "PDT_PLANS_DIR=$PWD/.pdt/verify/plans "
+            "PDT_PROVIDER_MODE=inherit && exec python -m backend.server"
         ),
         "cwd": ".",
         "health_url": f"http://127.0.0.1:{port}/health",
-        "ready_timeout_seconds": 120,
+        # The shared budget, not a literal.  A literal equal to the
+        # suite's own ``--timeout`` is a deadline that ends the worker
+        # rather than the case: a service that is merely slow would take
+        # the whole timeout, and the worker with it.
+        "ready_timeout_seconds": int(_readiness_budget_seconds()),
         "log_path": ".pdt/verify/pdt_server.log",
         "reap_on_exit": True,
     }
@@ -1056,6 +1070,56 @@ def _pdt_declaration(project_dir: Path):
     return mirrored["pdt"]
 
 
+def _reclaim_service(runtime, declaration, *, caller: str) -> Optional[dict]:
+    """Give a service this module started back, if it is still running.
+
+    A case that starts a service has to stop it.  A service left
+    running outlives the case that started it, and a suite that leaves
+    one behind leaves one behind on **every** run: a process holding a
+    port, a log nobody reads, and a "port already in use" for the next
+    one.
+
+    The **runtime** is the handle, and the declaration is not.  A
+    declaration names a *command*; the identity of "a process of ours"
+    has to be read from a live process.  The declared command of the
+    pdt service is ``exec python -m backend.server`` — it names no
+    script file, so the leftover sweep (:func:`_stop_leftover_env_probe`
+    and the machinery behind it) finds no token to match and leaves the
+    service running.  The pid the preflight handed back is the only
+    handle that says *this* process is the one we started.
+
+    "Ours" is the whole point: the preflight also **adopts** a live,
+    fresh, matching listener instead of starting one, and the pid in
+    such a runtime belongs to a service this module never started.
+    Stopping that one would take down somebody else's server, so the
+    reclaim leaves it alone.
+
+    Best effort by design: a reclaim that fails must not replace the
+    failure the case was about.
+    """
+    if runtime is None:
+        return None
+    if not getattr(runtime, "pid", None):
+        return None
+    if getattr(runtime, "origin", None) == "adopted":
+        # The preflight **adopts** a live, fresh, matching listener
+        # instead of starting one -- that is how the round avoids
+        # taking down a service somebody else is serving.  The pid in
+        # such a runtime is *that* service's pid: it is not ours, and
+        # stopping it would take down a server this case never started.
+        # Only what the round spawned is the round's to give back.
+        return None
+    import service_manager as sm
+    try:
+        return sm.stop_service(
+            runtime, declaration,
+            caller=caller,
+            reason="the test reclaimed the service it started",
+        )
+    except Exception:  # noqa: BLE001 - cleanup must not mask a failure
+        return None
+
+
 @pytest.mark.integration
 def test_declared_pdt_service_ready_in_harness_runtime(tmp_path: Path):
     """End to end: the declared pdt service really comes up.
@@ -1067,39 +1131,47 @@ def test_declared_pdt_service_ready_in_harness_runtime(tmp_path: Path):
     never finished starting answers nothing at all.
 
     The service is started the way the round starts it (through the
-    preflight) and is left running: a declared service outlives the
-    call that started it — the round's own preflight does the same, and
-    the VPs that follow are pointed at the live instance.
+    preflight) and is **given back** before the case returns.  The
+    round's own preflight leaves its services running because the VPs
+    that follow are pointed at the live instance; this case has no VPs
+    after it, only the next test — which would inherit a port it never
+    asked for.
     """
     import urllib.request
 
     declaration = _pdt_declaration(_REPO_ROOT)
+    runtime = None
+    try:
+        # The plan directory stays in tmp — the ledger this preflight writes
+        # must not land in the live plan's tree.
+        agent = _make_agent(tmp_path)
+        agent.project_dir = _REPO_ROOT
+        agent._normalize_service_declarations(
+            {"services": [declaration.to_dict()]},
+        )
 
-    # The plan directory stays in tmp — the ledger this preflight writes
-    # must not land in the live plan's tree.
-    agent = _make_agent(tmp_path)
-    agent.project_dir = _REPO_ROOT
-    agent._normalize_service_declarations(
-        {"services": [declaration.to_dict()]},
-    )
+        runtime_map = agent._preflight_service_freshness(
+            {"services": [declaration.to_dict()]}
+        )
 
-    runtime_map = agent._preflight_service_freshness(
-        {"services": [declaration.to_dict()]}
-    )
+        runtime = runtime_map.runtimes["pdt"]
+        assert runtime.ready is True, runtime.detail
+        assert agent._blocked_service_ports == set()
 
-    runtime = runtime_map.runtimes["pdt"]
-    assert runtime.ready is True, runtime.detail
-    assert agent._blocked_service_ports == set()
+        log_file = _REPO_ROOT / declaration.log_path
+        log_text = log_file.read_text(encoding="utf-8", errors="replace")
+        assert "Application startup complete" in log_text
 
-    log_file = _REPO_ROOT / declaration.log_path
-    log_text = log_file.read_text(encoding="utf-8", errors="replace")
-    assert "Application startup complete" in log_text
-
-    url = f"http://127.0.0.1:{declaration.port}/health"
-    with urllib.request.urlopen(url, timeout=30) as response:
-        body = json.loads(response.read().decode("utf-8"))
-    assert response.status == 200
-    assert body["status"] == "ok"
+        url = f"http://127.0.0.1:{declaration.port}/health"
+        with urllib.request.urlopen(url, timeout=30) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        assert response.status == 200
+        assert body["status"] == "ok"
+    finally:
+        _reclaim_service(
+            runtime, declaration,
+            caller="test_declared_pdt_service_ready_in_harness_runtime",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1246,6 +1318,55 @@ def test_service_mirror_refuses_to_invent_a_port(monkeypatch):
         _env_probe_service_mirror()
 
 
+# ---------------------------------------------------------------------------
+# 2026-11-02 — the pdt mirror must not need a plugin that is not there
+# ---------------------------------------------------------------------------
+#
+# The nightly lane lost eight nights to one case.  The service it starts
+# died in its lifespan on a clean runner — CC Switch is a plugin on one
+# operator's machine, nothing listens on its port there, and the
+# provider chain cannot be resolved — and the readiness wait had no way
+# to hear that the child was gone, so it spent its whole budget.  The
+# budget was the suite's own timeout, so the wait ended the worker
+# rather than the case, and xdist reported the death as "failed on
+# setup".
+#
+# Two things have to hold, and both are pinned here: the child must not
+# need CC Switch at all, and the deadline it is given must be the
+# shared budget rather than a number that can outlast the worker.
+
+
+def test_the_pdt_mirror_does_not_need_cc_switch():
+    """The mirror's child is pinned to the *inherit* provider mode.
+
+    ``inherit`` is a supported configuration: the sub-agents resolve
+    their provider from Claude Code's own settings, and nothing has to
+    be listening on anything.  The suite's hermetic environment says
+    ``cc-switch`` for the *pytest* process, and the child inherits it —
+    so the mode has to be pinned in the child's own command, where the
+    spawn can see it.
+    """
+    mirror = _pdt_service_mirror()
+
+    assert "PDT_PROVIDER_MODE=inherit" in mirror["start_cmd"], mirror
+
+
+def test_the_pdt_mirror_is_given_the_shared_budget(monkeypatch):
+    """The deadline the service is given is the shared gate's answer.
+
+    A literal equal to the suite's own timeout is a deadline that ends
+    the worker rather than the case.  The shared budget is the one the
+    gate works out for the host the case runs on, and it is a budget
+    rather than a cliff.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0))
+
+    mirror = _pdt_service_mirror()
+
+    assert mirror["ready_timeout_seconds"] == int(_readiness_budget_seconds())
+    assert mirror["ready_timeout_seconds"] < READY_BUDGET_MAX_SECONDS
+
+
 def _process_environment(pid: int) -> Dict[str, str]:
     """The environment a running process is running with.
 
@@ -1367,9 +1488,12 @@ def env_probe_service(tmp_path_factory):
     """The plan's ``env-probe`` service, started once for this module.
 
     Started the way the round starts it — through the preflight, with
-    the *project's* ``service_manager`` — and left running: a declared
-    service outlives the call that started it, and the verification
-    points that follow are pointed at the live instance.
+    the *project's* ``service_manager`` — and **given back** when the
+    module is done with it.  The round leaves its declared services
+    running because the verification points that follow are pointed at
+    the live instance; this fixture has no such follower, only the
+    next run of the suite, which would find the port taken by a
+    service nobody asked for.
 
     The parent environment is poisoned with a descriptor variable
     first.  Without one the case would prove nothing: "the child does
@@ -1383,6 +1507,8 @@ def env_probe_service(tmp_path_factory):
     monkeypatch.setenv(
         credentials._FD_ENV_PREFIX + "SPAWN_PROBE", "424242",
     )
+    declaration = None
+    runtime = None
     try:
         workdir = tmp_path_factory.mktemp("env-probe")
         declaration = _env_probe_declaration(_REPO_ROOT)
@@ -1399,8 +1525,16 @@ def env_probe_service(tmp_path_factory):
         runtime_map = agent._preflight_service_freshness(
             {"services": [declaration.to_dict()]}
         )
-        yield declaration, runtime_map.runtimes["env-probe"]
+        runtime = runtime_map.runtimes["env-probe"]
+        yield declaration, runtime
     finally:
+        # The service is given back **before** the environment is
+        # restored: the reclaim asks the service manager to stop a
+        # process, and the environment that spawned it is part of what
+        # the service manager knows about it.
+        _reclaim_service(
+            runtime, declaration, caller="env_probe_service fixture",
+        )
         monkeypatch.undo()
 
 
