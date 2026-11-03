@@ -689,8 +689,13 @@ FROZEN_R10_SURFACE_SHA256: dict[str, str] = {
     # 轮次写终态被拒、并给长 LLM 调用加进度行与墙上限。四处改动都落在本文件
     # （`_cleanup_round_processes` / `_force_release_round_lease` / 终态拒绝 /
     # 查询心跳），未改动任何既有分支的语义；按本 gate 的既定流程重新钉住该文件。
+    # 2026-11-03：修「配额 park 只活在内存里」——`_park_repair_for_quota` 的幂等
+    # 判据从「内存 status」改为「磁盘相位」，让唯一落库者
+    # `routes.execution._enter_quota_wait` 重新可达；同时把「配额暂停的 repair 出口」
+    # 归到 `waiting_for_quota` 且不再给已 park 的轮次写 `ended_at`。改动只落在本文件
+    # 的 repair 出口与 park 判据，按本 gate 的既定流程重新钉住该文件。
     "backend/verification_loop.py": (
-        "4171490553634e38ca6df7802f904fbb644003d839c218fc71ca051e44a5c7ac"
+        "93a83d82e2cfb6c8eb138949d0a837d657ca1ebead1f7d0c702f3d8e68619657"
     ),
 }
 
