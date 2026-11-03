@@ -9,3 +9,14 @@ useDefault = true
 # `.env.example` is committed and was never allowlisted: it names secrets
 # only in commented `# KEY=value` form and holds no credential-shaped
 # value.
+
+# 2026-11-03: the verification loop's round token is minted as
+# `verification_loop-<pid>-<hex>` and is a liveness lease id, not a
+# credential. Fixtures and docstrings that spell one out next to the word
+# "token" trip the generic-api-key rule on entropy alone. The exemption is
+# on the SECRET value only, and only when the whole value is that shape —
+# a real credential never looks like this.
+[allowlist]
+description = "verification-loop round tokens are lease ids, not credentials"
+regexTarget = "secret"
+regexes = ['''^verification_loop-[0-9a-z-]+$''']

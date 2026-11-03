@@ -34,6 +34,26 @@ import uuid
 # import-time side effects, so a top-level import carries no cycle
 # risk.
 import base_drift
+# 2026-11-01: the round-scoped process ledger.  A coding tool's
+# subprocess is reachable only through the tool, so the ledger — which
+# remembers which tools belong to which round — is what puts a judged
+# dead round's own processes within reach of the cleanup.  Stdlib-only
+# and without import-time side effects, so a top-level import carries no
+# cycle risk.
+import round_process_ledger
+# 2026-11-01: the durable ledger of the processes a plan owns.  A kill
+# that is not recorded is a kill nobody can audit, so the cleanup writes
+# the signals it sent into this ledger — the pid, the signal and the
+# round they belonged to.  Stdlib-only and without import-time side
+# effects, so a top-level import carries no cycle risk.
+import process_ledger
+# 2026-11-01: the durable mark of a round that was declared dead.  A
+# round that was written off must not act afterwards — not write the
+# plan's terminal state, not move its phase, not push a card.  The mark
+# is the round's own token, and this module is what answers "was this
+# round declared dead?".  Stdlib-only and without import-time side
+# effects, so a top-level import carries no cycle risk.
+import zombie_rounds
 # Late binding into the application module: ``server`` owns the shared
 # helpers, request models and module globals, and the suite monkeypatches
 # them as ``server.<name>``. Reaching them through the module object —
@@ -62,6 +82,63 @@ from hitl.models import Decision, DecisionMode, DecisionStatus
 from hitl.service import expire_due, list_decisions
 from hitl.store import HitlStore
 from hitl.waiter import wait_for_decision
+
+
+#: The wall-clock cap for ONE verification LLM query (2026-11-01).
+#:
+#: The heartbeat (task 8) makes a waiting dispatch VISIBLE — one
+#: ``coding_query_progress`` line per interval — but visible is not
+#: bounded: a dispatch could keep a healthy heartbeat for hours and the
+#: operator watching the log would see nothing wrong.  This is the
+#: ceiling that ends it: a query that outstays the cap has its process
+#: group killed and fails with ``HardTimeoutError``, the class the
+#: verification layer routes into auto-split / auto-refine.
+#:
+#: The number is not arbitrary.  It sits ABOVE the 900 s silence
+#: threshold (a dispatch that keeps printing is not silent, and killing
+#: it would kill a healthy call) and BELOW the 3600 s watchdog hard
+#: cap (otherwise the outer watchdog would fire first and this cap
+#: would be decoration).
+VERIFICATION_LLM_QUERY_CAP_SECONDS: float = 2700.0
+
+#: The environment variable that overrides the cap.
+VERIFICATION_LLM_QUERY_CAP_ENV = "PDT_VERIFICATION_LLM_TIMEOUT_SECONDS"
+
+
+def _verification_query_cap_seconds() -> float:
+    """The wall cap for one verification LLM query, in seconds.
+
+    The environment override wins over the default.  A value that is
+    not a number, or that is not positive, falls back to the default
+    rather than to a dispatch that dies on its first tick.
+    """
+    raw = os.environ.get(VERIFICATION_LLM_QUERY_CAP_ENV)
+    if raw is None or not str(raw).strip():
+        return VERIFICATION_LLM_QUERY_CAP_SECONDS
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return VERIFICATION_LLM_QUERY_CAP_SECONDS
+    if value <= 0:
+        return VERIFICATION_LLM_QUERY_CAP_SECONDS
+    return value
+
+
+def _apply_verification_query_cap(tool: Any) -> None:
+    """Give a verification coding tool the wall cap for its queries.
+
+    A cap nobody sets is a cap nobody has: without this the
+    verification dispatches are unbounded, exactly as they were before.
+
+    A tool that is ``None`` is left alone — the round has no coding
+    tool at all, and that is a failure the round reports in its own
+    way.  Crashing here instead would take the round down with an
+    ``AttributeError`` that says nothing about what actually went
+    wrong.
+    """
+    if tool is None:
+        return
+    tool.query_wall_cap_seconds = _verification_query_cap_seconds()
 
 
 def _verification_event_logger(plan_dir: Path):
@@ -1296,16 +1373,35 @@ def _update_plan_state_to_terminal(
         )
 
 
-def _mark_verification_failed_dead(plan_id: str) -> None:
-    """Mark a verification as failed because its background thread died.
+def _mark_verification_failed_dead(
+    plan_id: str, stop_reason: Optional[str] = None,
+) -> None:
+    """Mark a verification as failed, and record WHY it was declared dead.
 
     Mirrors ``_mark_failed_dead`` but for the verification thread. The
     ``_verification_state`` in-memory dict is updated immediately so
     subsequent /api/verification/{id}/status calls return the real state.
     The plan_state transition is best-effort (the daemon thread may have
     died before the transition could run).
+
+    2026-11-02: ``stop_reason`` is the reason the watchdog ACTUALLY
+    fired for.  It used to be hard-wired to
+    ``verification_thread_died_unexpectedly``, so a round that was
+    declared dead because its log went silent — or because its results
+    file went stale — was written down as a *thread* death.  The
+    record lied, and the plan's own DB row (``_persist_verification_terminal``
+    was handed the real reason) disagreed with it.
+
+    The fallback is the thread-death reason: a caller that passes no
+    reason is the thread-death path, and its behaviour must not change.
     """
     from datetime import datetime
+
+    # A caller that names no reason (or names an empty one) is the
+    # thread-death path — keep the reason it has always recorded.
+    effective_reason = (
+        stop_reason.strip() if isinstance(stop_reason, str) else ""
+    ) or "verification_thread_died_unexpectedly"
 
     lock = _server._verification_locks.setdefault(plan_id, threading.Lock())
     with lock:
@@ -1313,7 +1409,7 @@ def _mark_verification_failed_dead(plan_id: str) -> None:
         if not state or state.get("verification_status") != "running":
             return
         state["verification_status"] = "failed"
-        state["stop_reason"] = "verification_thread_died_unexpectedly"
+        state["stop_reason"] = effective_reason
         state["updated_at"] = datetime.now().isoformat()
         state["ended_at"] = state["updated_at"]
         # 2026-07-19 / 2026-08-25: capture a side-channel snapshot of
@@ -1544,24 +1640,43 @@ def _kill_orphaned_vp_processes(running_vp_ids: List[str]) -> List[int]:
 
 
 def _cleanup_dead_verification_processes(
-    plan_id: str, running_vp_ids: List[str],
+    plan_id: str, running_vp_ids: List[str], round_token: str = "",
 ) -> None:
     """Kill everything left behind by a truly-dead verification.
 
-    Two populations:
+    Three populations:
 
       1. Registered sub-agent handles (the LLM tool subprocess) —
          SIGTERM→SIGKILL via the existing ``_kill_sub_agent_process``
          escalation, then unregister so the 30s tick doesn't refire;
       2. Orphaned background pytest/bash (PPID 1, disowned by the
          agent after the Bash 10-min timeout taught it to background
-         long runs) — matched by their /tmp artifact cmdline.
+         long runs) — matched by their /tmp artifact cmdline;
+      3. The round's own coding-tool subprocesses — the
+         ``coding_query_*`` child the **orchestrator** spawned, which is
+         neither a registry handle nor a ``/tmp`` orphan and therefore
+         was in neither population above.
 
     2026-09-14: flagging a verification dead WITHOUT
     killing its processes leaves zombies burning CPU forever (the
     VP-023 pytest orphan outlived its own stale flag by >1h). Kill
     first, then persist the terminal state.
+
+    2026-11-01: population 3 is what kept an LLM call alive for 1h46m
+    after the plan that made it had been written off as failed.  It is
+    killed first, because it is the population that keeps *spending*
+    while the round is being judged dead.
+
+    The scope is the **round**, not the plan: the rounds of one plan
+    share one plan directory, so a kill aimed at "the plan" would take
+    the next round's processes with it.  ``round_token`` names the round
+    to kill.  An empty token names no round — the other two populations
+    are then cleaned up exactly as they always were and nothing else is
+    touched.
     """
+    # 3. The round's own coding-tool subprocesses.
+    _kill_round_processes(plan_id, round_token)
+    # 1. Registered sub-agent handles.
     try:
         for handle in list(_server.sub_agent_registry.all_handles(plan_id)):
             try:
@@ -1580,6 +1695,7 @@ def _cleanup_dead_verification_processes(
             "[verification_watchdog] registry cleanup failed plan=%s",
             plan_id,
         )
+    # 2. Orphaned background pytest/bash.
     try:
         killed = _server._kill_orphaned_vp_processes(running_vp_ids)
         if killed:
@@ -1590,6 +1706,106 @@ def _cleanup_dead_verification_processes(
     except Exception:
         _server.logger.exception(
             "[verification_watchdog] orphan sweep failed plan=%s", plan_id,
+        )
+
+
+#: The reason recorded for a kill aimed at a judged-dead round.
+_ROUND_KILL_REASON = "verification_judged_dead"
+
+
+def _kill_round_processes(
+    plan_id: str, round_token: str,
+) -> List[Dict[str, Any]]:
+    """Kill the round's own coding-tool subprocesses, and record it.
+
+    The coding tool's ``Popen`` lives in ``tool._current_process`` and
+    is reachable only through the tool, so the round-scoped process
+    ledger — which remembers which tools belong to which round — is what
+    puts the round's processes within reach.  The kill itself is
+    :func:`round_process_ledger.kill_round`, whose scope is the round:
+    another round's processes and another plan's processes are not
+    touched.
+
+    An unnamed round (``round_token=""``) kills nothing: a kill that
+    cannot be aimed cannot be scoped either.
+
+    Never raises.  A kill that fails is a process that survives, and the
+    round is being written off either way — the failure is recorded and
+    the judgement carries on.
+
+    Returns the events, one per signal sent.
+    """
+    token = _round_token_of(round_token)
+    if not token:
+        return []
+    try:
+        plan_dir = _server._plan_dir(plan_id)
+    except Exception:
+        # The ledger is keyed by the plan directory, so a plan whose
+        # directory cannot be resolved cannot be aimed at.
+        _server.logger.exception(
+            "[verification_watchdog] could not resolve the plan dir for "
+            "the round kill plan=%s round=%s", plan_id, token,
+        )
+        return []
+    try:
+        events = round_process_ledger.kill_round(
+            plan_dir, token,
+            reason=_ROUND_KILL_REASON,
+            plan_id=plan_id,
+            logger=_server.logger,
+        )
+    except Exception:
+        _server.logger.exception(
+            "[verification_watchdog] round kill failed plan=%s round=%s",
+            plan_id, token,
+        )
+        return []
+    for event in events:
+        _record_round_kill_event(plan_dir, plan_id, token, event)
+    if events:
+        _server.logger.warning(
+            "[verification_watchdog] killed round processes plan=%s "
+            "round=%s events=%s", plan_id, token, events,
+        )
+    return events
+
+
+def _record_round_kill_event(
+    plan_dir: Path, plan_id: str, round_token: str, event: Dict[str, Any],
+) -> None:
+    """Write one round kill into the plan's durable process ledger.
+
+    The ledger is the record of what the plan's processes did, and a
+    signal that was sent is part of that story.  Three fields make the
+    entry readable afterwards: *which* round, *which* pid, and *which*
+    signal.
+
+    The event is terminal: the process it names is gone, and a ledger
+    that still reported it as alive would have the reaper chase a pid
+    that no longer exists.
+
+    A plan directory that has since been deleted is left alone: writing
+    the ledger would recreate the directory, and a plan the operator
+    removed must not come back as an empty one.
+    """
+    try:
+        if not Path(plan_dir).exists():
+            return
+        process_ledger.record_event(
+            plan_dir, "killed",
+            terminal=True,
+            pid=event.get("pid"),
+            signal=event.get("signal"),
+            round_token=event.get("round_token") or round_token,
+            reason=event.get("reason") or _ROUND_KILL_REASON,
+            plan_id=plan_id,
+        )
+    except Exception:
+        _server.logger.exception(
+            "[verification_watchdog] could not record the round kill "
+            "plan=%s round=%s pid=%s", plan_id, round_token,
+            event.get("pid"),
         )
 
 
@@ -2098,6 +2314,221 @@ def _pause_verification_for_human(
         )
 
 
+#: The actor recorded when the watchdog takes a dead round's plan away.
+#:
+#: "Who did this" is not decoration: a release that takes the plan away
+#: from a round by hand, and a mark that writes a round off, both have
+#: to be answerable afterwards.
+_WATCHDOG_ACTOR = "verification_watchdog"
+
+
+def _workflow_lease_holder_token(plan_dir: Optional[Path]) -> str:
+    """The token the plan's workflow lease is held under, or ``""``.
+
+    The lease file is the only place the holder's own name is written
+    down, so it is the only place the watchdog can learn it.  A lease
+    that is missing, unreadable, or carries no token names no holder:
+    there is then nothing to release, and the caller is told so rather
+    than being handed a token it would have to guess.
+    """
+    if plan_dir is None:
+        return ""
+    try:
+        holder = _read_verification_workflow_lease(
+            _verification_workflow_lease_path(plan_dir),
+        )
+    except Exception:  # noqa: BLE001 — an unreadable lease names no holder
+        _server.logger.exception(
+            "[verification_watchdog] the workflow lease could not be read "
+            "plan=%s", plan_dir,
+        )
+        return ""
+    return str((holder or {}).get("round_token") or "").strip()
+
+
+def _force_release_dead_round_lease(
+    plan_id: str,
+    plan_dir: Optional[Path],
+    round_token: str,
+    stop_reason: str,
+) -> bool:
+    """Take the dead round's workflow lease away — if it is really its lease.
+
+    The lease is the plan's "one round at a time" lock, and it is
+    released by exactly one thing: the holder's own ``release()``, which
+    acts only on a file that still carries ITS OWN token.  A round that
+    was killed never runs that ``release()``, so the lease outlives it
+    and the next round of the plan is refused with ``round_conflict``
+    for as long as the file is there.
+
+    Three cases, and only one of them releases anything:
+
+    * the lease file carries **this round's** token → it is released by
+      force, with the actor and the reason written down;
+    * the lease file carries **another round's** token → it is left
+      exactly as it is.  Somebody else's lease is not this watchdog's
+      to take: a round that took the plan over while this one was being
+      judged dead is the LIVE round now, and displacing it would be a
+      second — and worse — split-brain;
+    * there is **no lease** (missing, unreadable, or carrying no token)
+      → there is nothing to release, and the plan is already free.
+
+    Never raises: a lease that cannot be taken away must not cost the
+    plan its terminal state.
+    """
+    if plan_dir is None:
+        _server.logger.warning(
+            "[verification_watchdog] no plan dir — the workflow lease was "
+            "not released plan=%s", plan_id,
+        )
+        return False
+
+    holder_token = _workflow_lease_holder_token(plan_dir)
+    if not holder_token:
+        _server.logger.warning(
+            "[verification_watchdog] no lease holder token — the workflow "
+            "lease was not released plan=%s round=%s", plan_id, round_token,
+        )
+        return False
+
+    if holder_token != round_token:
+        _server.logger.warning(
+            "[verification_watchdog] the workflow lease belongs to another "
+            "round — it was not released plan=%s round=%s holder=%s",
+            plan_id, round_token, holder_token,
+        )
+        return False
+
+    try:
+        released = force_release_verification_workflow_lease(
+            plan_dir,
+            expected_token=holder_token,
+            actor=_WATCHDOG_ACTOR,
+            reason=stop_reason,
+            # The holder was just cleaned up: it is not going to give the
+            # plan back by itself, and the heartbeat thread that runs
+            # this must not stall for the wait the force release offers
+            # by default.
+            wait_seconds=0.0,
+        )
+    except Exception:  # noqa: BLE001 — a lease that stays is not a verdict
+        _server.logger.exception(
+            "[verification_watchdog] the workflow lease could not be "
+            "released plan=%s round=%s", plan_id, round_token,
+        )
+        return False
+    return bool(released)
+
+
+def _run_verification_death_sequence(
+    plan_id: str,
+    stop_reason: str,
+    running_vp_ids: List[str],
+    round_token: str,
+) -> Dict[str, Any]:
+    """Stop the round that was just judged dead, and give the plan back.
+
+    Writing the terminal state is not the same as the round being dead.
+    A round judged dead while it is still running goes on running: its
+    LLM call returns, its code carries on, and it spends the plan's
+    money long after the plan was written off.  On 2026-10-31 that is
+    what kept an LLM call alive for 1h46m after the plan that made it
+    had already been stamped ``failed`` — "declared dead" and "still
+    running" side by side, for an hour and three quarters.
+
+    So the judgement comes with three acts, in this order:
+
+    1. **cleanup** — kill what the round left behind: its own
+       coding-tool child, the registered sub-agent handles and the
+       disowned ``pytest`` orphans.  The scope is the ROUND, named by
+       its token: the rounds of one plan share one plan directory, so
+       "the plan" would take the next round's processes with it.
+    2. **force release** — hand the plan's workflow lease back.  A lease
+       is released by its holder's own ``release()``, so a killed round
+       never gives it back, and the next round of the plan is refused
+       with ``round_conflict`` for as long as the file is there.  The
+       lease is only taken away when it really is this round's lease.
+    3. **invalidate** — write the durable mark.  The round may still be
+       running (its LLM call is in flight), and the mark is what tells
+       it, when it wakes up, that it has been written off: it may not
+       take the plan's lease again, and it may not write a terminal
+       state for a plan that has moved past it.
+
+    Every step is best-effort and every step is logged.  A cleanup that
+    fails, a lease that cannot be read, a mark that cannot be written:
+    none of them may stop the terminal state from being written.  The
+    plan has to learn that its round died, whatever else went wrong.
+
+    Returns a record of what was done — for the log and for the tests.
+    """
+    record: Dict[str, Any] = {
+        "round_token": round_token,
+        "stop_reason": stop_reason,
+        "cleaned": False,
+        "lease_released": False,
+        "invalidated": False,
+    }
+
+    try:
+        plan_dir: Optional[Path] = _server._plan_dir(plan_id)
+    except Exception:  # noqa: BLE001 — a plan without a directory is rare
+        _server.logger.exception(
+            "[verification_watchdog] the plan dir could not be resolved "
+            "plan=%s", plan_id,
+        )
+        plan_dir = None
+
+    # 1. The cleanup, scoped to the round by its token.
+    try:
+        _server._cleanup_dead_verification_processes(
+            plan_id, list(running_vp_ids), round_token=round_token,
+        )
+        record["cleaned"] = True
+    except Exception:  # noqa: BLE001 — a kill that failed is not a verdict
+        _server.logger.exception(
+            "[verification_watchdog] the dead round's processes could not "
+            "be cleaned up plan=%s round=%s", plan_id, round_token,
+        )
+
+    # 2. The lease — this round's lease, and only this round's lease.
+    record["lease_released"] = _force_release_dead_round_lease(
+        plan_id, plan_dir, round_token, stop_reason,
+    )
+
+    # 3. The mark.
+    if not round_token:
+        _server.logger.warning(
+            "[verification_watchdog] the dead round has no token — there is "
+            "nothing to invalidate plan=%s stop_reason=%s",
+            plan_id, stop_reason,
+        )
+    elif plan_dir is None:
+        _server.logger.warning(
+            "[verification_watchdog] the dead round has no plan dir — there "
+            "is nothing to invalidate plan=%s round=%s", plan_id, round_token,
+        )
+    else:
+        try:
+            zombie_rounds.invalidate(
+                plan_dir, round_token,
+                reason=stop_reason, actor=_WATCHDOG_ACTOR,
+            )
+            record["invalidated"] = True
+        except Exception:  # noqa: BLE001 — the mark is bookkeeping
+            _server.logger.exception(
+                "[verification_watchdog] the dead round could not be "
+                "invalidated plan=%s round=%s", plan_id, round_token,
+            )
+
+    _server.logger.warning(
+        "[verification_watchdog] death sequence plan=%s round=%s "
+        "stop_reason=%s cleaned=%s lease_released=%s invalidated=%s",
+        plan_id, round_token, stop_reason,
+        record["cleaned"], record["lease_released"], record["invalidated"],
+    )
+    return record
+
+
 def _lazy_check_verification(plan_id: str) -> None:
     """Probe a single running verification by inspecting its background thread
     AND the freshness of its log / results files.
@@ -2166,6 +2597,18 @@ def _lazy_check_verification(plan_id: str) -> None:
       downstream of it.
 
     Both are best-effort: a failure is logged and the tick carries on.
+
+    2026-11-01: a verdict is not a death.  When the ladder fires, the
+    round is not merely *written off* — it is **stopped**, and the plan
+    is given back: the round's own processes are killed, the plan's
+    workflow lease is released, and the round is marked invalid so that
+    it cannot come back for either.  That is the death sequence
+    (:func:`_run_verification_death_sequence`), and it runs for EVERY
+    stop reason — not only for the hard-cap branch.  The order is
+    cleanup → force release → invalidate → the terminal write, and the
+    terminal write names no round: the watchdog is the thing that
+    DECLARES the death, so the mark it has just written must not
+    refuse its own verdict.
     """
     now = _hitl_now()
     _expire_hitl_decisions(now)
@@ -2196,6 +2639,10 @@ def _lazy_check_verification(plan_id: str) -> None:
     )
 
     stop_reason: Optional[str] = None
+    # The VPs the ladder found in flight.  They are handed to the death
+    # sequence, which kills them together with the rest of what the
+    # round left behind.
+    running_vp_ids: List[str] = []
 
     # --- Detection ladder ---
     # Thread-death is an immediate, unambiguous signal — if the
@@ -2228,17 +2675,22 @@ def _lazy_check_verification(plan_id: str) -> None:
             # orphaned VP pytest/bash NOW instead of leaving zombies
             # (the registry tick would get to them eventually, but the
             # plan is being declared dead this instant).
+            #
+            # 2026-11-01: the kill itself moved into the death sequence
+            # (:func:`_run_verification_death_sequence`), which runs it
+            # for EVERY stop reason and in a fixed order — the cleanup
+            # has to come before the lease is released and before the
+            # round is marked dead.  What is left here is the list of
+            # VPs that were in flight, which is what the sequence kills.
             try:
                 _dead_running = _server._running_vps_from_activity(
                     _server._read_latest_round_vp_activity(_server._plan_dir(plan_id))
                 )
-                _server._cleanup_dead_verification_processes(
-                    plan_id, sorted(_dead_running)
-                )
+                running_vp_ids = sorted(_dead_running)
             except Exception:
                 _server.logger.exception(
-                    "[verification_watchdog] cleanup after thread death "
-                    "failed plan=%s", plan_id,
+                    "[verification_watchdog] the VPs in flight could not be "
+                    "read after the thread death plan=%s", plan_id,
                 )
 
     if stop_reason is None:
@@ -2437,9 +2889,11 @@ def _lazy_check_verification(plan_id: str) -> None:
                         "— killing leftovers plan=%s age=%.1fs vps=%s",
                         plan_id, _stale_age, sorted(_triage_running),
                     )
-                    _server._cleanup_dead_verification_processes(
-                        plan_id, sorted(_triage_running)
-                    )
+                    # 2026-11-01: the kill itself moved into the death
+                    # sequence, which runs it for EVERY stop reason and
+                    # in a fixed order.  What is left here is the list of
+                    # VPs that were in flight.
+                    running_vp_ids = sorted(_triage_running)
 
     if stop_reason is None:
         return
@@ -2460,12 +2914,35 @@ def _lazy_check_verification(plan_id: str) -> None:
         )
         return
 
+    # --- The death sequence (2026-11-01) ---
+    # A verdict is not a death.  Before the plan is told that its round
+    # died, the round is actually stopped: its processes are killed, the
+    # plan's workflow lease is released, and the round is marked invalid
+    # so that it cannot come back for either.  The order is the
+    # contract, and it is the order the incident needed — "declared
+    # dead" and "still running" must not be able to be true at the same
+    # time, even for an hour and three quarters.
+    #
+    # Every step of the sequence is best-effort: a kill that fails, a
+    # lease that cannot be read and a mark that cannot be written are
+    # all logged, and none of them may stop the terminal write below.
+    _run_verification_death_sequence(
+        plan_id, stop_reason, running_vp_ids, _round_token_of_state(plan_id),
+    )
+
     # --- Existing in-memory side effect (kept for back-compat) ---
     # ``_mark_verification_failed_dead`` updates ``_verification_state``
     # in-memory + writes the side-channel ``.verification_runtime.json``
     # file. It's harmless to keep calling here — the plan_routing CAS
     # below is the new behavior this whole function adds.
-    _server._mark_verification_failed_dead(plan_id)
+    #
+    # 2026-11-02: the reason the ladder DETECTED is handed over with
+    # it.  The mark used to write ``verification_thread_died_unexpectedly``
+    # no matter which branch of the ladder fired, so a round declared
+    # dead because its log went silent was recorded as a thread death —
+    # and the side-channel file the next server start reads back
+    # carried the same lie.
+    _server._mark_verification_failed_dead(plan_id, stop_reason)
 
     # --- NEW: advance plan_routing.current_phase out of verification_* ---
     # This is the missing piece. ``_persist_verification_terminal`` does
@@ -2486,8 +2963,14 @@ def _lazy_check_verification(plan_id: str) -> None:
         # explicitly (instead of relying on ``stop_reason`` membership)
         # means a future watchdog stop reason cannot silently leave the
         # plan stuck at ``current_phase='verification_running'``.
+        #
+        # ``round_token=None`` — the watchdog names NO round.  It is the
+        # thing that DECLARES the death, and the mark it has just
+        # written would otherwise refuse its own verdict: the plan
+        # would never learn that its round died.
         _server._persist_verification_terminal(
-            plan_id, "failed", stop_reason, chain_ending=True
+            plan_id, "failed", stop_reason, chain_ending=True,
+            round_token=None,
         )
         _server._record_watchdog_action(plan_id, stop_reason)
         # Also rewrite the ``plan_routing.verification`` JSON column so
@@ -3483,17 +3966,70 @@ def _run_repair_execution_async(
 _TERMINAL_VERIFICATION_STATUSES = frozenset({"passed", "failed", "loop_stopped"})
 
 
+def _round_is_invalidated(plan_id: str, round_token: Any) -> bool:
+    """Has ``round_token`` been declared dead for this plan's round?
+
+    The mark is the round's own token, written by the watchdog into the
+    plan directory (see :mod:`zombie_rounds`).  A round that was
+    declared dead has been written off: the plan has moved past it, and
+    whatever the round does next is not the plan's business any more.
+
+    ``False`` in every case that is not an explicit "yes":
+
+    * no token — the callers that predate the round token (and the
+      watchdog itself, which is the thing that DECLARES the death and
+      therefore has to be able to write the terminal state) name no
+      round;
+    * a token that was never declared dead;
+    * a plan whose marker file cannot be read — the same degradation
+      :mod:`zombie_rounds` itself promises.  A damaged bookkeeping file
+      must not be the reason a live round cannot record its verdict.
+
+    The lookup is therefore best-effort in both directions: it raises
+    rather than deciding, and a failure is logged and answered "live".
+    """
+    token = _round_token_of(round_token)
+    if not token:
+        return False
+    try:
+        plan_dir = _server._plan_dir(plan_id)
+    except Exception:  # noqa: BLE001 — a bad plan id names no round
+        return False
+    try:
+        return bool(zombie_rounds.is_invalidated(plan_dir, token))
+    except Exception:  # noqa: BLE001 — a broken marker is not a verdict
+        _server.logger.warning(
+            "[verification_terminal] could not read the zombie-round "
+            "marker for plan=%s round=%s; treating the round as live",
+            plan_id, token, exc_info=True,
+        )
+        return False
+
+
 def _persist_verification_terminal(
     plan_id: str,
     status: str,
     stop_reason: str,
     *,
     chain_ending: Optional[bool] = None,
+    round_token: Optional[str] = None,
 ) -> None:
     """Top-level helper: persist a terminal verification outcome
     to both ``plan_verification.verification_status`` (SQLite) AND
     ``plan_routing.current_phase`` so the public /status endpoint stops
     forcing "running" on the API response.
+
+    ``round_token`` names the round this write belongs to (2026-11-01).
+    When that round was declared dead — the watchdog wrote it off while
+    it was still running — the write is REFUSED: the function returns
+    without touching ``plan_verification``, without moving
+    ``plan_routing.current_phase`` and without firing
+    ``KIND_PLAN_CLOSED``.  A round that was written off must not be able
+    to close the plan, move its phase or push a second card for it.
+
+    ``round_token=None`` (the default) means "this write names no
+    round": the watchdog's own write, and every caller that predates
+    the token, are unaffected.
 
     ``chain_ending`` overrides the "does this terminal write end the
     chain?" decision. Callers that know *by construction* that the chain
@@ -3534,7 +4070,32 @@ def _persist_verification_terminal(
     its own try/except so a failure on one path cannot prevent
     the other. Operators can recover manually via /stop and
     /reset_rounds if a step is persistently failing.
+
+    2026-11-01: a round that was declared dead does not get here at
+    all — the refusal below returns before the first write.
     """
+    # 2026-11-01: the refusal.  A round the watchdog declared dead may
+    # still be running: its LLM call returns, its code carries on, and
+    # it reaches this function to write the verdict it was going to
+    # write anyway.  The plan has already moved past that round, so
+    # the write is not the plan's to accept — it would overwrite the
+    # plan's real state with a dead round's opinion, move the phase
+    # out of the verification family, and push a SECOND "plan closed"
+    # card for a plan that was already closed.
+    #
+    # The check comes FIRST, before the entry log and before any write,
+    # so a refused terminal leaves no trace at all: no
+    # ``plan_verification`` verdict, no ``plan_routing`` phase change,
+    # no ``KIND_PLAN_CLOSED``.
+    if _round_is_invalidated(plan_id, round_token):
+        _server.logger.warning(
+            "[verification_terminal] REFUSED plan=%s status=%s "
+            "stop_reason=%s round=%s — the round was declared dead; its "
+            "verdict is not the plan's to accept",
+            plan_id, status, stop_reason, round_token,
+        )
+        return
+
     # 2026-09-07: Top-level entry log — operators need a single
     # identifiable line in server.log to confirm this function was
     # invoked, with caller context (status / stop_reason) for
@@ -4011,6 +4572,7 @@ def _dead_end_terminal(
     *,
     chain_ending: bool = True,
     rollback_to_ready: bool = True,
+    round_token: Optional[str] = None,
 ) -> None:
     """Terminate a verification dead-end: roll back to execution when
     work remains, otherwise close the chain.
@@ -4036,6 +4598,11 @@ def _dead_end_terminal(
     transition would be re-entering it through the ``force_set_phase``
     fallback.
 
+    2026-11-01: ``round_token`` names the round this verdict belongs
+    to.  A round that was declared dead must not record a dead end:
+    the plan has already moved past that round, and the verdict would
+    overwrite the state of whatever round is running now.
+
     ``rollback_to_ready=False`` (2026-09-17) suppresses the
     waiting-phase (``queued``) rollback on that same branch. The
     rollback exists so an OPERATOR can resume a parked plan via ``POST
@@ -4047,13 +4614,32 @@ def _dead_end_terminal(
     must keep its routing row inside the verification family.
     """
     final_status = "failed" if reason == "no_repair_tasks" else "loop_stopped"
+    # 2026-11-01: the refusal comes FIRST, before the verdict and before
+    # the rollback below.  Both of those are the plan's business, and the
+    # rollback in particular MOVES the routing phase back to ``queued`` —
+    # a dead round must not move the plan's phase either, and the two
+    # writes further down are guarded separately, so the guard here is
+    # what keeps the rollback from happening.
+    if _round_is_invalidated(plan_id, round_token):
+        _server.logger.warning(
+            "[verification_terminal] REFUSED plan=%s reason=%s round=%s — "
+            "the round was declared dead; it must not record a dead end "
+            "nor roll the plan's phase back",
+            plan_id, reason, round_token,
+        )
+        return
     # 2026-10-23 (accident B): this call RECORDS the verdict; whether it
     # also ENDS the chain is decided further down (the rollback branch
     # below, or the explicit ``chain_ending=True`` write at the end).
     # The status-based rule would end the chain right here, so the
     # mid-loop guard has to be said out loud.
+    #
+    # 2026-11-01: both writes below carry the round's token, so a round
+    # that was declared dead records nothing — neither the interim
+    # verdict nor the chain-ending one.
     _server._record_verification_terminal(
         plan_id, final_status, reason, chain_ending=False,
+        round_token=round_token,
     )
     unfinished = _count_unfinished_execution_tasks(plan_id)
     if unfinished > 0:
@@ -4072,6 +4658,7 @@ def _dead_end_terminal(
         return
     _server._persist_verification_terminal(
         plan_id, final_status, reason, chain_ending=True,
+        round_token=round_token,
     )
 
 
@@ -4143,7 +4730,9 @@ def _clear_repair_not_drained_guard(plan_id: str) -> None:
     _repair_not_drained_guard.pop(plan_id, None)
 
 
-def _repair_generation_failed(plan_id: str, error: str) -> None:
+def _repair_generation_failed(
+    plan_id: str, error: str, *, round_token: Optional[str] = None,
+) -> None:
     """Record a repair-task generation FAILURE without closing the chain.
 
     ``result["repair_generation_error"]`` means the generator broke
@@ -4188,6 +4777,12 @@ def _repair_generation_failed(plan_id: str, error: str) -> None:
     ``_recover_verification_states`` restores the running round; if the
     round budget runs out, the auto-loop's tail writes a proper
     ``max_rounds_reached`` terminal.
+
+    2026-11-01: ``round_token`` names the round this failure belongs
+    to.  A round that was declared dead records nothing — not on
+    ``plan_verification``, and not as a "the plan failed" card.  The
+    default (``None``) keeps the callers that name no round — the
+    watchdog's own bookkeeping — behaving as before.
     """
     reason = "repair_generation_failed"
     _server.logger.warning(
@@ -4197,7 +4792,19 @@ def _repair_generation_failed(plan_id: str, error: str) -> None:
     )
     _server._record_verification_terminal(
         plan_id, "failed", reason, chain_ending=False,
+        round_token=round_token,
     )
+
+
+#: The module-level failure recorder under a second name.
+#:
+#: 2026-11-01: the auto-loop binds a round-scoped recorder under the
+#: name ``_repair_generation_failed`` (see
+#: ``_run_auto_verification_loop_inner``) so the write can carry the
+#: round's token.  A local name shadows the module-level one, so the
+#: loop needs a name for the implementation that its own binding does
+#: not hide.
+_record_repair_generation_failed = _repair_generation_failed
 
 
 def _round_failed_vp_ids(orch: Any, report: Any) -> set:
@@ -4646,6 +5253,8 @@ def _handle_passed_round(
     plan_id: str,
     round_num: int,
     ps: Any,
+    *,
+    round_token: Optional[str] = None,
 ) -> None:
     """Handle the PASSED branch of the auto-verification loop.
 
@@ -4667,7 +5276,22 @@ def _handle_passed_round(
     Step 1 used to CAS the routing column to ``terminal_done`` while
     step 2 wrote ``completed`` to the phase column — one decision, two
     spellings, two columns.
+
+    2026-11-01: ``round_token`` names the round this verdict belongs
+    to.  A round that was declared dead must not promote the plan to
+    ``completed`` — that is the worst direction for a dead round to
+    write in, so the refusal sits at the TOP of this function, before
+    the routing CAS and before the PlanState write, not only inside
+    the terminal write at the bottom.
     """
+    if _round_is_invalidated(plan_id, round_token):
+        _server.logger.warning(
+            "[verification_terminal] REFUSED plan=%s status=passed "
+            "round=%s — the round was declared dead; it must not promote "
+            "the plan to 'completed'",
+            plan_id, round_token,
+        )
+        return
     try:
         from state_machine.repositories.routing_repository import (
             ConflictError as _RoutingConflict,
@@ -4688,13 +5312,16 @@ def _handle_passed_round(
         ps.transition_to("completed")
     except ValueError:
         ps.force_set_phase("completed")
-    _server._record_verification_terminal(plan_id, "passed", None)
+    _server._record_verification_terminal(
+        plan_id, "passed", None, round_token=round_token,
+    )
     print(f"[Auto-Verification] Round {round_num}: PASSED")
 
 
 def _record_verification_terminal(
     plan_id: str, status: str, stop_reason: Optional[str],
     *, chain_ending: Optional[bool] = None,
+    round_token: Optional[str] = None,
 ) -> None:
     """2026-09-11 plan v14: module-level wrapper that updates the
     in-memory ``_verification_state[plan_id]`` AND delegates to
@@ -4718,7 +5345,23 @@ def _record_verification_terminal(
     ``False`` — the verdict is recorded, the chain is NOT closed.
     ``None`` (the default) leaves the decision to the status-based rule
     in ``_persist_verification_terminal``.
+
+    2026-11-01: ``round_token`` names the round this verdict belongs
+    to, and it is forwarded verbatim to ``_persist_verification_terminal``.
+    When that round was declared dead, the write is REFUSED — and the
+    refusal happens HERE, before the in-memory state is touched: the
+    in-memory ``_verification_state[plan_id]`` is the PLAN's state, and
+    a dead round must not stamp its verdict onto it either.
     """
+    if _round_is_invalidated(plan_id, round_token):
+        _server.logger.warning(
+            "[verification_terminal] REFUSED plan=%s status=%s "
+            "stop_reason=%s round=%s — the round was declared dead; its "
+            "verdict is not the plan's to accept",
+            plan_id, status, stop_reason, round_token,
+        )
+        return
+
     v_state = _server._verification_state.get(plan_id)
     if v_state:
         v_state["verification_status"] = status
@@ -4728,6 +5371,7 @@ def _record_verification_terminal(
 
     _server._persist_verification_terminal(
         plan_id, status, stop_reason or "", chain_ending=chain_ending,
+        round_token=round_token,
     )
 
 
@@ -5323,8 +5967,36 @@ _VERIFICATION_WORKFLOW_LEASE_STALE_SECONDS = 120.0
 #: run must not spin on it.
 _VERIFICATION_WORKFLOW_LEASE_MAX_STALE_BREAKS = 3
 
+#: How long a force release waits for the holder to give the plan back
+#: BY ITSELF before the lease file is taken away.  The window is there
+#: because the force release kills the round's processes first: a
+#: holder that notices it is being killed runs its own ``finally`` and
+#: releases the lease gracefully, and a graceful release is always
+#: better than a file removed underneath a live round.
+_VERIFICATION_WORKFLOW_LEASE_FORCE_RELEASE_WAIT_SECONDS = 30.0
+
+#: The event a force release writes: the lease was taken away from its
+#: holder on purpose, by an actor that said who and why.
+VERIFICATION_LEASE_FORCE_RELEASE_EVENT = "verification_lease_force_release"
+
+#: The event a REFUSED force release writes: the lease the caller named
+#: was not the lease on disk, so nothing was touched.
+VERIFICATION_LEASE_FORCE_RELEASE_REFUSED_EVENT = (
+    "verification_lease_force_release_refused"
+)
+
 #: The event the refused round writes: it lost the race.
 ROUND_LEASE_DENIED_EVENT = "round_lease_denied"
+
+#: The event a REFUSED lease acquisition writes: the round that asked
+#: for the plan's lease was declared dead, so it does not get one.
+VERIFICATION_LEASE_ACQUIRE_REFUSED_EVENT = (
+    "verification_lease_acquire_refused"
+)
+
+#: Why the lease was not taken: the round was declared dead.  A round
+#: that was written off does not come back and take the plan.
+ROUND_INVALIDATED_ERROR_KIND = "round_invalidated"
 
 #: The event that marks the round BLOCKED because of the conflict.
 #: The same name the verification agent uses for an environment-blocked
@@ -5546,6 +6218,377 @@ class _VerificationWorkflowLease:
                 self.path, exc,
             )
 
+    def force_release(
+        self,
+        *,
+        expected_token: Optional[str] = None,
+        actor: str = "",
+        reason: str = "",
+        wait_seconds: float = (
+            _VERIFICATION_WORKFLOW_LEASE_FORCE_RELEASE_WAIT_SECONDS
+        ),
+        cleanup: Optional[Callable] = None,
+    ) -> bool:
+        """Take the plan back from this lease, on purpose, and say so.
+
+        The lease's own :meth:`release` gives the plan back only when
+        this object still owns the file — which is exactly why a round
+        that was killed (and never ran its ``finally``) keeps the lease
+        for ever, and why the next round of the plan is refused with
+        ``round_conflict`` for as long as the file is there.
+
+        This is the explicit way out: the caller names the token it
+        believes the lease carries, says WHO is releasing it (``actor``)
+        and WHY (``reason``), and gets the release written down in the
+        plan's own execution log.  A lease carrying a different token is
+        refused and left exactly as it was.
+
+        ``expected_token`` defaults to this lease's own token: "release
+        MY lease, but only while the file still carries my token" — so
+        a lease that was already taken over is never removed.
+
+        See :func:`force_release_verification_workflow_lease` for the
+        full contract.
+        """
+        released = force_release_verification_workflow_lease(
+            self.plan_dir,
+            expected_token=(
+                self.round_token if expected_token is None else expected_token
+            ),
+            actor=actor,
+            reason=reason,
+            wait_seconds=wait_seconds,
+            cleanup=cleanup,
+        )
+        if released:
+            # The lease is gone: this object must not keep a heartbeat
+            # on a file that is no longer its own.  The heartbeat opens
+            # the file WITHOUT ``O_CREAT``, so it cannot resurrect the
+            # lease — but it must not keep trying either.
+            self._released = True
+            self._stop.set()
+            thread = self._thread
+            self._thread = None
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=2.0)
+        return released
+
+
+def _record_verification_lease_force_release(
+    plan_dir: Path,
+    event: str,
+    message: str,
+    data: Dict[str, Any],
+) -> None:
+    """Write one force-release record into the plan's own execution log.
+
+    The plan's log is where a reader looks to find out what happened to
+    the plan's round, so the record of a lease being taken away by hand
+    belongs there — next to the round's own events, and in the same
+    shape (``event`` + ``data``) as the rest of them.
+
+    A logger that fails must not break the release: by the time the
+    record is written the file is already gone, and losing the record
+    is bad, losing the release is worse.
+    """
+    try:
+        plan_logger = _verification_event_logger(plan_dir)
+        if plan_logger is not None:
+            plan_logger.warning(event, message, data=data)
+    except Exception:  # noqa: BLE001 — logging must never break a release
+        pass
+
+
+def force_release_verification_workflow_lease(
+    plan_dir: Path,
+    *,
+    expected_token: str,
+    actor: str,
+    reason: str,
+    wait_seconds: float = (
+        _VERIFICATION_WORKFLOW_LEASE_FORCE_RELEASE_WAIT_SECONDS
+    ),
+    cleanup: Optional[Callable] = None,
+) -> bool:
+    """Take a plan's workflow lease away from its holder, explicitly.
+
+    The lease is released by exactly one thing: the holder's own
+    ``release()``, which acts only on a file that still carries ITS
+    token.  So a round that was judged dead — killed, wedged, its
+    heartbeat thread gone — keeps the lease, and the next round of the
+    same plan is refused with ``round_conflict`` for as long as the
+    file is there.  The stale-lease rule does not reach it either: a
+    lease whose holder is still ALIVE is never stale, and this call
+    does not change that.  A live holder is displaced only when
+    somebody says so, on purpose, by name.
+
+    The contract:
+
+    * ``expected_token`` IS the gate.  The lease is only removed while
+      the file carries this token; a lease carrying a different token
+      belongs to a different round (most likely the round that took
+      the plan over while this call was waiting) and is left exactly as
+      it is.  The refusal is written down as
+      ``verification_lease_force_release_refused``.
+    * ``actor`` and ``reason`` are recorded in the plan's own execution
+      log, together with the pid of the holder that was displaced and
+      how long the call waited.  A release that takes the plan away
+      from a round by hand has to be answerable afterwards: WHO decided
+      it, and on what grounds.
+    * ``cleanup`` runs BEFORE the file is removed — it is the caller's
+      own kill of the round's processes.  That order is the point: the
+      wait that follows is the holder's chance to notice it is being
+      killed and give the plan back by itself.  A cleanup that raises
+      is recorded and the release carries on: the lease is still the
+      one we were asked to release.
+    * the wait is BOUNDED (``wait_seconds``).  When it runs out and
+      the file still carries the token we were given, the file is
+      removed.  If the holder released it by itself in the meantime,
+      nothing is unlinked — and the record says so.
+
+    Returns ``True`` when the lease is no longer held afterwards
+    (this call removed the file, or the holder gave it back by itself
+    while the call was waiting) and ``False`` when it was refused
+    (the token did not match) or there was nothing to release (no lease
+    file at all).
+    """
+    plan_dir = Path(plan_dir)
+    path = _verification_workflow_lease_path(plan_dir)
+    expected = str(expected_token or "")
+    actor_name = str(actor or "")
+    reason_text = str(reason or "")
+    started = time.monotonic()
+    deadline = started + max(0.0, float(wait_seconds))
+    holder_pid: Optional[int] = None
+    cleanup_error: Optional[str] = None
+
+    def _waited() -> float:
+        """How long this call has been waiting, in seconds."""
+        return max(0.0, time.monotonic() - started)
+
+    def _classify() -> Tuple[str, Optional[Dict[str, Any]]]:
+        """What the lease file says right now.
+
+        One of ``missing`` (there is no lease), ``unreadable`` (there
+        is a file but it carries no record we can check a token
+        against), ``mismatch`` (a lease, but not the one we were named)
+        or ``match`` (the lease we were asked to release).
+        """
+        holder = _read_verification_workflow_lease(path)
+        if holder is None:
+            if not path.exists():
+                return "missing", None
+            return "unreadable", None
+        if str(holder.get("round_token") or "") != expected:
+            return "mismatch", holder
+        return "match", holder
+
+    def _refuse(state: str, holder: Optional[Dict[str, Any]]) -> bool:
+        """Write the refusal down and leave everything as it was."""
+        data = {
+            "actor": actor_name,
+            "reason": reason_text,
+            "expected_round_token": expected,
+            "holder_round_token": (holder or {}).get("round_token"),
+            "holder_pid": (holder or {}).get("pid"),
+            "waited_seconds": round(_waited(), 3),
+            "detail": state,
+            "path": str(path),
+        }
+        _record_verification_lease_force_release(
+            plan_dir,
+            VERIFICATION_LEASE_FORCE_RELEASE_REFUSED_EVENT,
+            f"{state} — the workflow lease was not released",
+            data,
+        )
+        _server.logger.warning(
+            "[verification_workflow_lease] force release refused plan=%s "
+            "path=%s actor=%s reason=%s detail=%s expected=%s holder=%s",
+            plan_dir.name, path, actor_name, reason_text, state,
+            expected, (holder or {}).get("round_token"),
+        )
+        return False
+
+    def _record_released(released_by_holder: bool) -> bool:
+        """Write the release down."""
+        data = {
+            "actor": actor_name,
+            "reason": reason_text,
+            "holder_pid": holder_pid,
+            "holder_round_token": expected,
+            "waited_seconds": round(_waited(), 3),
+            "released_by_holder": bool(released_by_holder),
+            "cleanup_error": cleanup_error,
+            "path": str(path),
+        }
+        _record_verification_lease_force_release(
+            plan_dir,
+            VERIFICATION_LEASE_FORCE_RELEASE_EVENT,
+            "the workflow lease was released",
+            data,
+        )
+        _server.logger.warning(
+            "[verification_workflow_lease] force release plan=%s path=%s "
+            "actor=%s reason=%s holder_pid=%s waited=%.3fs",
+            plan_dir.name, path, actor_name, reason_text, holder_pid,
+            data["waited_seconds"],
+        )
+        return True
+
+    state, holder = _classify()
+    if state == "missing":
+        # Nothing to release: the plan holds no lease.
+        return False
+    if state != "match":
+        return _refuse(state, holder)
+    holder_pid = (holder or {}).get("pid")
+
+    # The caller's cleanup runs FIRST.  Killing the round's processes is
+    # what gives the holder the chance to give the plan back by itself,
+    # so the lease is only taken away if the holder does not let go.
+    if cleanup is not None:
+        try:
+            cleanup()
+        except Exception as exc:  # noqa: BLE001 — a failed kill must not
+            # cost the plan its lease; it is recorded and the release
+            # carries on.
+            cleanup_error = f"{type(exc).__name__}: {exc}"
+            _server.logger.warning(
+                "[verification_workflow_lease] force release cleanup "
+                "failed plan=%s path=%s actor=%s: %s",
+                plan_dir.name, path, actor_name, cleanup_error,
+            )
+
+    # Wait for the holder to let go.  The token is re-checked on every
+    # pass: a round that took the plan over in the meantime is the live
+    # round now, and its lease is not ours to remove.
+    while True:
+        state, holder = _classify()
+        if state == "missing":
+            # The holder released the plan while we waited.
+            return _record_released(True)
+        if state != "match":
+            return _refuse(state, holder)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(_VERIFICATION_WORKFLOW_LEASE_POLL_SECONDS, remaining))
+
+    # The window is over and the lease is still the one we were asked to
+    # release: take it away.
+    state, holder = _classify()
+    if state == "missing":
+        return _record_released(True)
+    if state != "match":
+        return _refuse(state, holder)
+    try:
+        os.unlink(str(path))
+    except FileNotFoundError:
+        # Somebody took it away in the meantime.
+        return _record_released(True)
+    except OSError as exc:
+        _server.logger.warning(
+            "[verification_workflow_lease] force release could not remove "
+            "%s: %s", path, exc,
+        )
+        return False
+    return _record_released(False)
+
+
+def _round_token_is_invalidated(plan_dir: Path, round_token: str) -> bool:
+    """Has this round been declared dead for this plan?
+
+    The mark is the round's own ``round_token``, written by the watchdog
+    into the plan directory (see :mod:`zombie_rounds`).  A round that
+    was declared dead has been written off: the plan has moved past it,
+    and whatever it does next is not the plan's business any more.
+
+    ``False`` in every case that is not an explicit "yes": no token, a
+    token that was never declared dead, and a plan whose marker file
+    cannot be read.  The last one is the important one: a damaged
+    bookkeeping file must never be the reason a live round is locked
+    out of the plan.  The lookup is therefore best-effort in both
+    directions -- it raises rather than decides, and a failure is
+    logged and answered "live".
+    """
+    token = str(round_token or "").strip()
+    if not token:
+        return False
+    try:
+        return bool(zombie_rounds.is_invalidated(plan_dir, token))
+    except Exception:  # noqa: BLE001 — a broken marker is not a verdict
+        _server.logger.warning(
+            "[verification_workflow_lease] could not read the zombie-round "
+            "marker for plan=%s round=%s; treating the round as live",
+            plan_dir.name, token, exc_info=True,
+        )
+        return False
+
+
+def _invalidated_round_mark(
+    plan_dir: Path, round_token: str,
+) -> Optional[Dict[str, Any]]:
+    """The dead round's own record -- why it died, and who said so.
+
+    ``None`` when the record cannot be read or does not belong to this
+    round.  It is a BONUS for the log, never a gate: the refusal
+    happens whether or not the mark can be read.
+    """
+    token = str(round_token or "").strip()
+    if not token:
+        return None
+    try:
+        mark = zombie_rounds.invalidated_round(plan_dir)
+    except Exception:  # noqa: BLE001 — a broken marker is not a verdict
+        return None
+    if not mark:
+        return None
+    if str(mark.get("round_token") or "") != token:
+        # The most recent mark belongs to another round; this round's
+        # own reason is not in the file (or the file no longer holds it).
+        return None
+    return mark
+
+
+def _record_verification_lease_acquire_refused(
+    plan_dir: Path,
+    conflict: Dict[str, Any],
+    mark: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Write the refused acquisition into the plan's own execution log.
+
+    "A round asked for the plan and did not get it" has to be
+    answerable afterwards: a round that was written off and comes back
+    looks exactly like a round that is still working, from the outside.
+
+    ``mark`` is the dead round's own record (why it was declared dead,
+    and by whom) when it can be read -- the answer to "and why was that
+    round dead in the first place?".  It is optional: the refusal is
+    worth recording even when the mark cannot be read.
+
+    A logger that fails must not break the round: the refusal itself
+    has already been decided, and losing the record is worse than
+    losing nothing.
+    """
+    data = dict(conflict)
+    if mark:
+        data.update({
+            "invalidated_reason": mark.get("reason"),
+            "invalidated_actor": mark.get("actor"),
+            "invalidated_at": mark.get("at"),
+        })
+    try:
+        plan_logger = _verification_event_logger(plan_dir)
+        if plan_logger is not None:
+            plan_logger.warning(
+                VERIFICATION_LEASE_ACQUIRE_REFUSED_EVENT,
+                f"{ROUND_INVALIDATED_ERROR_KIND} — this round was declared "
+                "dead and does not take the plan's lease",
+                data=data,
+            )
+    except Exception:  # noqa: BLE001 — logging must never break a round
+        pass
+
 
 def _acquire_verification_workflow_lease(
     plan_dir: Path,
@@ -5569,7 +6612,14 @@ def _acquire_verification_workflow_lease(
       round hits anyway.  The failure is logged at ERROR level;
     * ``(None, conflict)`` — another live round holds the plan.
       ``conflict["reason"]`` is ``"round_conflict"`` and the conflict
-      carries the holder's record.
+      carries the holder's record;
+    * ``(None, conflict)`` — THIS round was declared dead (2026-11-01).
+      ``conflict["reason"]`` is ``"round_invalidated"`` and the
+      conflict names the round's own token.  A round that was written
+      off does not come back and take the plan, and the refusal
+      happens BEFORE the lock file is created: the file is never
+      created and never touched.  The refusal is written to the plan's
+      own execution log as ``verification_lease_acquire_refused``.
 
     The wait is bounded: a run that cannot take the lease waits at
     most ``wait_seconds`` and then returns the conflict.  It never
@@ -5584,6 +6634,31 @@ def _acquire_verification_workflow_lease(
     run = str(run_id or plan_dir.name)
     deadline = time.monotonic() + max(0.0, float(wait_seconds))
     stale_breaks = 0
+
+    # 2026-11-01: a round that was declared dead does not get the plan.
+    # The check is BEFORE the O_CREAT | O_EXCL below, and it has to be:
+    # a refusal that created the lock file and then took it away again
+    # would leave a window in which another round sees a holder that is
+    # not there, and it would take a live holder's lease with it.  The
+    # refusal is about the round's own identity, so it never touches the
+    # file at all.
+    if _round_token_is_invalidated(plan_dir, token):
+        conflict = {
+            "reason": ROUND_INVALIDATED_ERROR_KIND,
+            "plan_id": plan_dir.name,
+            "path": str(path),
+            "round_token": token,
+            # The pid of the process that ASKED for the lease: the round
+            # asking is the round that was written off, so this is the
+            # pid an operator has to look at.
+            "holder_pid": owner_pid,
+            "holder_round_token": token,
+            "run_id": run,
+        }
+        _record_verification_lease_acquire_refused(
+            plan_dir, conflict, _invalidated_round_mark(plan_dir, token),
+        )
+        return None, conflict
 
     while True:
         started_at = datetime.now().isoformat()
@@ -6391,6 +7466,132 @@ def _record_dispatch_bindings(
         )
 
 
+# ---------------------------------------------------------------------------
+# The round scope — which processes belong to this round (2026-11-01)
+# ---------------------------------------------------------------------------
+#
+# A verification round has a name: the service-owner token the workflow
+# lease is taken with.  What it did not have was a *ledger* — a record of
+# the coding tools the round created, so that a round judged dead can
+# take down the processes those tools started.  Two of the three process
+# populations were already covered (the registered VP handles and the
+# ``/tmp`` orphans); the third — the orchestrator's own ``coding_query_*``
+# child — was not, because a tool is not a registry handle and nothing
+# outside the tool knew it existed.
+#
+# The helpers below are the whole of the wiring, and each of them is
+# deliberately unable to break a round: a missing plan directory, an
+# empty token or a ledger that raises must not stop a verification.
+
+
+def _round_token_of(round_token: Any) -> str:
+    """The token as a non-empty string, or ``""`` when there is none."""
+    try:
+        return str(round_token or "").strip()
+    except Exception:  # pragma: no cover - a token is a string in practice
+        return ""
+
+
+def _round_token_of_state(plan_id: str) -> str:
+    """The running round's token, as the in-memory verification state has it.
+
+    The watchdog keeps no ledger of its own: it reads
+    ``_verification_state[plan_id]`` to learn *which* round is running,
+    and that is where the token the round was opened with is visible.
+    A state that is missing, or that carries no token, names no round —
+    and a round that cannot be named is not one the cleanup may kill.
+    """
+    try:
+        state = _server._verification_state.get(plan_id)
+    except Exception:  # pragma: no cover - the state is a plain dict
+        return ""
+    if not isinstance(state, dict):
+        return ""
+    return _round_token_of(state.get("round_token"))
+
+
+def _open_round_in_ledger(
+    plan_dir: Optional[Path], round_token: str,
+) -> None:
+    """Open the round in the process ledger.
+
+    Nothing happens without a token or a plan directory: a round that
+    cannot be addressed cannot be cleaned up, so an unnameable round is
+    not opened at all.
+    """
+    token = _round_token_of(round_token)
+    if not token or plan_dir is None:
+        return
+    try:
+        if not Path(plan_dir).exists():
+            return
+        round_process_ledger.begin_round(plan_dir, token)
+    except Exception:  # noqa: BLE001 — the ledger must not break a round
+        _server.logger.warning(
+            "[verification_loop] could not open the round in the process "
+            "ledger plan=%s round=%s", plan_dir, token, exc_info=True,
+        )
+
+
+def _stamp_round_token(plan_id: str, round_token: str) -> None:
+    """Write the round's token onto the in-memory verification state.
+
+    The watchdog holds no ledger of its own: it reads
+    ``_verification_state[plan_id]`` to learn *which* round is running,
+    and that is where the token has to be visible for the cleanup to
+    know what to aim at.
+    """
+    token = _round_token_of(round_token)
+    if not token:
+        return
+    state = _server._verification_state.get(plan_id)
+    if isinstance(state, dict):
+        state["round_token"] = token
+
+
+def _register_round_tool(
+    plan_dir: Optional[Path], round_token: str, tool: Any,
+) -> None:
+    """Put a coding tool into the round that is running in ``plan_dir``.
+
+    A tool registered outside a round is dropped by the ledger: a
+    process that belongs to no round is a process nobody may kill.
+    """
+    token = _round_token_of(round_token)
+    if not token or tool is None or plan_dir is None:
+        return
+    try:
+        if not Path(plan_dir).exists():
+            return
+        round_process_ledger.register_tool(plan_dir, tool)
+    except Exception:  # noqa: BLE001 — the ledger must not break a round
+        _server.logger.warning(
+            "[verification_loop] could not register the coding tool in "
+            "the round plan=%s round=%s", plan_dir, token, exc_info=True,
+        )
+
+
+def _close_round_in_ledger(
+    plan_dir: Optional[Path], round_token: str,
+) -> None:
+    """Close the round: the ledger forgets the tools it owned.
+
+    The tools are dropped, not killed — a round that *finished* has
+    already finished with its processes.  A round that has to be cleaned
+    up is cleaned up by the kill, not by the close.
+    """
+    token = _round_token_of(round_token)
+    if not token or plan_dir is None:
+        return
+    try:
+        round_process_ledger.end_round(plan_dir, token)
+    except Exception:  # noqa: BLE001 — the ledger must not break a round
+        _server.logger.warning(
+            "[verification_loop] could not close the round in the process "
+            "ledger plan=%s round=%s", plan_dir, token, exc_info=True,
+        )
+
+
 def _run_auto_verification_loop(plan_id: str, plan_dir: Path, project_dir: Path, max_rounds: int = _server.DEFAULT_MAX_VERIFICATION_ROUNDS, tool: Optional[str] = None, start_round: int = 1) -> _VerificationLoopOutcome:
     """Thin lifecycle wrapper around :func:`_run_auto_verification_loop_inner`.
 
@@ -6434,11 +7635,17 @@ def _run_auto_verification_loop(plan_id: str, plan_dir: Path, project_dir: Path,
     """
     outcome = _VerificationLoopOutcome()
     owner_token = _server._new_service_owner_token("verification_loop")
+    # 2026-11-01: the round's name.  The lease, the process ledger and
+    # the in-memory state all have to name the SAME round — a kill aimed
+    # at "the plan" would take the next round's processes with it — so
+    # the token the lease is taken with is the token the ledger is
+    # opened with.
+    round_token = owner_token or (
+        f"verification_loop-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    )
     lease, conflict = _acquire_verification_workflow_lease(
         plan_dir,
-        round_token=owner_token or (
-            f"verification_loop-{os.getpid()}-{uuid.uuid4().hex[:12]}"
-        ),
+        round_token=round_token,
         run_id=plan_id,
     )
     if conflict is not None:
@@ -6449,13 +7656,22 @@ def _run_auto_verification_loop(plan_id: str, plan_dir: Path, project_dir: Path,
         outcome.refused = True
         return outcome
     _server._register_service_owner(plan_dir, owner_token, current=True)
+    # The round is open from here on: the coding tools the loop creates
+    # belong to it, and a round that has to be cleaned up can only be
+    # cleaned up if it was opened under a name.
+    _open_round_in_ledger(plan_dir, round_token)
     try:
         _server._run_auto_verification_loop_inner(
             plan_id, plan_dir, project_dir,
             max_rounds=max_rounds, tool=tool, start_round=start_round,
             outcome=outcome,
+            round_token=round_token,
         )
     finally:
+        # The loop closes the round itself; this is the backstop for the
+        # paths where it never got that far — a body that was replaced,
+        # or a loop that died before its own finally was reached.
+        _close_round_in_ledger(plan_dir, round_token)
         _server._release_service_owner(plan_dir, owner_token)
         if lease is not None:
             lease.release()
@@ -6593,6 +7809,7 @@ def _make_repair_on_complete(
     plan_id: str,
     project_dir: Path,
     tool: Optional[str] = None,
+    round_token: str = "",
 ) -> Callable[[int], None]:
     """Build the callback that re-enters verification after a repair.
 
@@ -6606,6 +7823,14 @@ def _make_repair_on_complete(
     The body below is the closure's body, unchanged: only the binding
     moved. ``_record_terminal`` is the same helper the loop had — it is
     ``_server._record_verification_terminal`` for this plan.
+
+    ``round_token`` names the verification round the re-entered round
+    belongs to.  The callback runs *after* the loop that scheduled it
+    returned, so that loop's round is closed by then: the round has to
+    be opened again here for the tool this callback creates to belong
+    to one — a tool that belongs to no round is a tool nobody may kill.
+    It is empty when the caller has no round to name (the ``/start``
+    resume path), and then nothing is opened and nothing is registered.
     """
 
     def _record_terminal(status: str, stop_reason: str):
@@ -6614,8 +7839,17 @@ def _make_repair_on_complete(
         The loop's own ``_record_terminal`` (a closure over the same
         two arguments) does exactly this; it is re-bound here because
         this factory must not reach into the loop's scope.
+
+        2026-11-01: the round's token travels with the write.  It is
+        CAPTURED here — when this callback is built — and not read out
+        of the in-memory state when the write happens: a newer round
+        overwrites that state, and a recorder that read it at write
+        time would name the wrong round (and a dead round's verdict
+        would land as if the live round had written it).
         """
-        _server._record_verification_terminal(plan_id, status, stop_reason)
+        _server._record_verification_terminal(
+            plan_id, status, stop_reason, round_token=round_token,
+        )
 
     def _on_repair_complete(returncode: int) -> None:
         """Re-enter verification after repair execution finishes.
@@ -6834,43 +8068,59 @@ def _make_repair_on_complete(
 
             # Invoke a fresh verification round.
             try:
-                _coding_tool = _server.create_coding_tool(
-                    tool, cwd=str(project_dir), scene="verification",
-                    logger=_verification_event_logger(plan_dir),
-                )
-                _verif_repo = None
+                # 2026-11-01: the re-entered round opens its own scope in
+                # the process ledger.  The loop that scheduled this repair
+                # closed its round when it handed the plan over, so the round
+                # has to be opened again for the tool this callback creates
+                # to belong to one — a tool that belongs to no round is a
+                # tool nobody may kill.
+                _open_round_in_ledger(plan_dir, round_token)
                 try:
-                    _vc, _vr2, _vv = _server._open_verification_state()
-                    _verif_repo = _vv
-                    # 2026-09-15 FIX — do NOT close ``_vc`` here.
-                    # The repository is BOUND to this connection;
-                    # closing it left the freshly-started round
-                    # writing through a dead handle (see
-                    # ``_bind_verification_state_conn``).
-                    _bind_verification_state_conn(plan_id, _vc)
-                except Exception:
+                    _coding_tool = _server.create_coding_tool(
+                        tool, cwd=str(project_dir), scene="verification",
+                        logger=_verification_event_logger(plan_dir),
+                    )
+                    # 2026-11-01 — the re-entered round's queries are
+                    # capped like every other verification query: a
+                    # dispatch that outstays the ceiling is killed and
+                    # fails with a HardTimeoutError.
+                    _apply_verification_query_cap(_coding_tool)
+                    _register_round_tool(plan_dir, round_token, _coding_tool)
                     _verif_repo = None
-                _new_orch = _server.VerificationOrchestrator(
-                    plan_dir, project_dir,
-                    coding_tool=_coding_tool,
-                    verif_repo=_verif_repo,
-                )
-                # 2026-09-15 FIX — flip the in-memory entry to
-                # ``running`` BEFORE the cycle starts. This
-                # callback only wrote the result AFTER the round
-                # finished, so for the entire duration of the
-                # re-entered round the map still held the
-                # PREVIOUS round's terminal status: /api/system/
-                # active reported ``total_active: 0`` and the card
-                # showed the old verdict while VPs were actively
-                # running (observed live through round 2).
-                _mark_verification_round_running(
-                    plan_id, _next_round,
-                )
-                _report, _round_conflict = _dispatch_verification_round(
-                    plan_id, plan_dir, _new_orch, _next_round,
-                    resume=True,
-                )
+                    try:
+                        _vc, _vr2, _vv = _server._open_verification_state()
+                        _verif_repo = _vv
+                        # 2026-09-15 FIX — do NOT close ``_vc`` here.
+                        # The repository is BOUND to this connection;
+                        # closing it left the freshly-started round
+                        # writing through a dead handle (see
+                        # ``_bind_verification_state_conn``).
+                        _bind_verification_state_conn(plan_id, _vc)
+                    except Exception:
+                        _verif_repo = None
+                    _new_orch = _server.VerificationOrchestrator(
+                        plan_dir, project_dir,
+                        coding_tool=_coding_tool,
+                        verif_repo=_verif_repo,
+                    )
+                    # 2026-09-15 FIX — flip the in-memory entry to
+                    # ``running`` BEFORE the cycle starts. This
+                    # callback only wrote the result AFTER the round
+                    # finished, so for the entire duration of the
+                    # re-entered round the map still held the
+                    # PREVIOUS round's terminal status: /api/system/
+                    # active reported ``total_active: 0`` and the card
+                    # showed the old verdict while VPs were actively
+                    # running (observed live through round 2).
+                    _mark_verification_round_running(
+                        plan_id, _next_round,
+                    )
+                    _report, _round_conflict = _dispatch_verification_round(
+                        plan_id, plan_dir, _new_orch, _next_round,
+                        resume=True,
+                    )
+                finally:
+                    _close_round_in_ledger(plan_dir, round_token)
                 if _round_conflict is not None:
                     # 2026-10-25: another live round owns this plan, so
                     # this re-entry dispatched no VP.  The repair chain
@@ -7136,6 +8386,7 @@ def _make_repair_on_complete(
                         or "no_repair_tasks",
                         chain_ending=False,
                         rollback_to_ready=False,
+                        round_token=round_token,
                     )
                     _server.logger.warning(
                         "[Auto-Verification] Post-repair round %d: no "
@@ -7195,7 +8446,7 @@ def _make_repair_on_complete(
     return _on_repair_complete
 
 
-def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir: Path, max_rounds: int = _server.DEFAULT_MAX_VERIFICATION_ROUNDS, tool: Optional[str] = None, start_round: int = 1, outcome: Optional[_VerificationLoopOutcome] = None):
+def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir: Path, max_rounds: int = _server.DEFAULT_MAX_VERIFICATION_ROUNDS, tool: Optional[str] = None, start_round: int = 1, outcome: Optional[_VerificationLoopOutcome] = None, round_token: str = ""):
     """Run verification loop automatically after execution completes.
 
     Handles the full verification-repair-retry cycle without user intervention:
@@ -7221,6 +8472,19 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
     exit leaves it alone, which is what makes "returned" and "finished"
     distinguishable. Direct calls may omit it — the loop then behaves
     exactly as before this parameter existed.
+
+    ``round_token`` names the round this run is (2026-11-01). It is the
+    same token the workflow lease was taken with, and it is what the
+    process ledger is opened under: the coding tools this loop creates
+    are registered into that round, so a round judged dead can take down
+    the processes it started — including the orchestrator's own
+    ``coding_query_*`` child, which no handle outside the tool could
+    reach. The token is also written onto ``_verification_state``, which
+    is where the watchdog reads it to learn which round to clean up.
+
+    It defaults to ``""``, and an empty token opens no round: a round
+    that cannot be addressed is a round nobody can clean up, so the
+    older callers that pass nothing keep their old behaviour.
     """
     from datetime import datetime
 
@@ -7237,6 +8501,15 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
             print(f"[Auto-Verification] Verification already running for {plan_id}, skipping duplicate auto-start")
             return
         _init_verification_state(plan_id, max_rounds)
+
+    # 2026-11-01: open the round and name it.  The ledger round is what
+    # the coding tools below are registered into, and the state's copy
+    # of the token is what the watchdog reads to learn WHICH round to
+    # clean up.  Both happen after ``_init_verification_state`` — the
+    # init replaces the state entry, so a token stamped before it would
+    # be stamped onto a dict that no longer exists.
+    _open_round_in_ledger(plan_dir, round_token)
+    _stamp_round_token(plan_id, round_token)
 
     # Materialise the plan state BEFORE the routing CAS below.
     #
@@ -7339,8 +8612,39 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
         2026-09-11 plan v14: thin wrapper around the module-level
         ``_record_verification_terminal`` so unit tests can patch
         / mock it without re-implementing closure logic.
+
+        2026-11-01: the round's token travels with the write.  It is
+        CAPTURED here — when this loop started — and not read out of
+        the in-memory state when the write happens: a newer round
+        overwrites that state, and a recorder that read it at write
+        time would name the wrong round (and a dead round's verdict
+        would land as if the live round had written it).
         """
-        _server._record_verification_terminal(plan_id, status, stop_reason)
+        _server._record_verification_terminal(
+            plan_id, status, stop_reason, round_token=round_token,
+        )
+
+    def _repair_generation_failed(plan_id: str, error: str) -> None:
+        """This round's failure recorder (2026-11-01).
+
+        The module-level recorder of the same name cannot know which
+        round is speaking: it is called by name, with the plan and the
+        error and nothing else.  This local one is bound to the round
+        the loop IS running, so a round that was declared dead records
+        nothing — the same refusal the terminal recorder above makes.
+
+        The name is deliberately the module-level one: the call site is
+        pinned by an existing regression test
+        (``test_repair_generation_failure_handling.py``), which reads
+        this source text.  The module-level implementation therefore
+        also lives under a second name
+        (``_record_repair_generation_failed``) — a local name shadows
+        the module-level one, so the loop needs a name for the
+        implementation that its own binding does not hide.
+        """
+        _record_repair_generation_failed(
+            plan_id, error, round_token=round_token,
+        )
 
     def _record_round_verdict(
         status: str, stop_reason: Optional[str], result: Optional[dict],
@@ -7370,12 +8674,28 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
         read-side reconciliation in ``routes.plans._build_plan_status``
         covers the case where this one does not land, and
         ``plan_status.find_divergences`` reports it when it happens.
+
+        2026-11-01: a round that was declared dead does not write its
+        verdict either.  ``plan_verification.verification_status`` is the
+        PLAN's column — a dead round's opinion about it is exactly the
+        split-brain this file exists to prevent, and the plan may already
+        have a live round writing to the same row.  The round's token is
+        the one captured by this loop (the enclosing ``round_token``),
+        not the one the in-memory state happens to carry.
         """
         if status not in {"passed", "failed", "loop_stopped"}:
             # A non-verdict ("running" during an in-place update, or an
             # unexpected spelling) is not something to persist as a round
             # outcome. Leave the row alone rather than writing a value
             # nothing else in the codebase knows how to read.
+            return
+        if _round_is_invalidated(plan_id, round_token):
+            _server.logger.warning(
+                "[verification_terminal] REFUSED plan=%s status=%s "
+                "stop_reason=%s round=%s — the round was declared dead; "
+                "its verdict is not the plan's to accept",
+                plan_id, status, stop_reason, round_token,
+            )
             return
         try:
             from state_machine.db.connection import open as _open_db
@@ -7425,717 +8745,781 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
     # 视图：判据层判掉的记录（没有定义的验证点、被取消的尝试）不该再
     # 进它的失败集合。
     _reconcile_failure_history(plan_id)
+    # 2026-11-01: the round scope.  The coding tools this loop creates
+    # belong to the round the ledger knows, and the round is closed
+    # when the loop is done with it — including when the loop raises,
+    # which is why the close is a ``finally`` and not a line at the end
+    # of the body.  The inner ``try`` is the loop's own orchestrator-init
+    # guard; the outer one is the round scope.
     try:
-        coding_tool = _server.create_coding_tool(
-            tool, cwd=str(project_dir), scene="verification",
-            logger=_verification_event_logger(plan_dir),
-        )
-        # Wire the SQLite VerificationRepository so the agent can
-        # persist Phase 1 execution envelopes to
-        # ``plan_verification.execution_results`` (task #3.5).
-        verif_repo = None
         try:
-            from state_machine.repositories.verification_repository import (
-                VerificationRepository,
+            coding_tool = _server.create_coding_tool(
+                tool, cwd=str(project_dir), scene="verification",
+                logger=_verification_event_logger(plan_dir),
             )
-            _, _, verif_repo = _server._open_verification_state()
-        except Exception:  # noqa: BLE001
+            # 2026-11-01 — the ceiling for one verification LLM query.
+            # The heartbeat says "still here"; this says "and not past
+            # this".  A dispatch that outstays it has its process group
+            # killed and fails with a HardTimeoutError.
+            _apply_verification_query_cap(coding_tool)
+            # 2026-11-01: the tool is the orchestrator's own, and its
+            # ``coding_query_*`` child is the one process the old cleanup
+            # could not reach — a tool is not a registry handle, so
+            # nothing outside the tool knew the process existed.  The
+            # round is what puts it within reach of the kill.
+            _register_round_tool(plan_dir, round_token, coding_tool)
+            # Wire the SQLite VerificationRepository so the agent can
+            # persist Phase 1 execution envelopes to
+            # ``plan_verification.execution_results`` (task #3.5).
             verif_repo = None
-        orch = _server.VerificationOrchestrator(
-            plan_dir, project_dir, coding_tool=coding_tool,
-            verif_repo=verif_repo,
-        )
-        v_state = _server._verification_state.get(plan_id)
-        if v_state:
-            v_state["orchestrator"] = orch
-    except Exception as e:
-        print(f"[Auto-Verification] Failed to create orchestrator: {e}")
-        _record_terminal("failed", f"orchestrator_init_failed: {e}")
-        return
-
-    for round_num in range(start_round, max_rounds + 1):
-        print(f"[Auto-Verification] Round {round_num}/{max_rounds}")
-        # 2026-09-15: never start another round once the
-        # operator has stopped the plan — the stop may land during a
-        # repair execution, between rounds.
-        try:
-            import verification_cancel as _vc_mod
-            if _vc_mod.is_cancelled(plan_id):
-                _server.logger.warning(
-                    "[Auto-Verification] stop requested before round %d "
-                    "plan=%s — exiting the auto-loop", round_num, plan_id,
-                )
-                return
-        except Exception:  # noqa: BLE001
-            pass
-        v_state = _server._verification_state.get(plan_id)
-        if v_state:
-            # 2026-09-15: re-assert ``running`` (and the round number /
-            # fresh timestamp) at round start — the previous round's
-            # terminal status otherwise lingered for the whole of round
-            # N ≥ 2, so /api/system/active reported zero verifications
-            # and the card showed the old verdict. See
-            # ``_mark_verification_round_running``.
-            _mark_verification_round_running(plan_id, round_num)
-            # 2026-09-14: the previous round's stop_reason / split
-            # records are RESIDUAL the moment a new round begins — a
-            # "verification_log_stale" left over from round N-1 made
-            # /status claim round N was failed while it was healthy
-            # (observed on a production plan: the status API surfaced the
-            # round-2 watchdog stamp all through round 3). Clear them
-            # at round start, like the recovered-state scrub does.
-            v_state.pop("vp_splits", None)
-        # 2026-08-19 audit: the auto-loop never called
-        # ``verification.init_round`` so the ``plan_verification.round``
-        # column stayed at the ``/start`` value forever. The status
-        # endpoint then reported ``round=1`` for round 2 regardless of
-        # how many rounds actually ran. Persist the round to the
-        # authoritative SQLite store before each cycle.
-        try:
-            from state_machine.repositories.verification_repository import (
-                VerificationRepository as _VR,
-            )
-            _, _routing_cl, _verif_cl = _server._open_verification_state()
             try:
-                _verif_cl.init_round(
-                    plan_id,
-                    round_n=round_num,
-                    max_rounds=max_rounds,
+                from state_machine.repositories.verification_repository import (
+                    VerificationRepository,
                 )
-            finally:
-                pass
-        except Exception:
-            pass
-        try:
-            # 2026-08-25: pass ``resume=True`` for round > 1 so the
-            # executor reuses the verdict cache (already-PASSED
-            # VPs are filtered out by ``BaseExecutor.run``'s
-            # ``completed_set`` check) instead of re-running every
-            # VP from scratch. Round 1 still starts with a clean
-            # slate (resume=False) so a freshly-edited
-            # ``verification_plan.json`` always gets re-evaluated
-            # from scratch.
-            #
-            # Pre-2026-08-25 behaviour: every round passed
-            # ``resume=False``, which triggered
-            # ``_clear_verification_state_files`` and re-ran all
-            # 28 VPs each round even though only 1 VP actually
-            # failed. Round 2 burned ~5 minutes and ~600k tokens
-            # re-running 20 already-passed VPs before the user
-            # noticed.
-            #
-            # 2026-10-25: the dispatch now goes through the plan's
-            # verification-round lease, so two rounds of the same plan
-            # cannot overlap (see the lease section above).  The lease
-            # is taken BEFORE the round's preflight — the preflight is
-            # what starts the services and seeds the fixture, and two
-            # rounds doing that at once is what produced the 2026-10-24
-            # incident.
-            report, _round_conflict = _dispatch_verification_round(
-                plan_id, plan_dir, orch, round_num,
-                resume=(round_num > 1),
-            )
-            if _round_conflict is not None:
-                # 2026-10-25: another live round owns this plan.  The
-                # lease refused us BEFORE the preflight, so no service
-                # was started, no fixture was rewritten and no VP was
-                # dispatched.  The run ends here, explicitly, and the
-                # refusal is recorded in the plan's execution log — the
-                # round that owns the plan keeps its verdict.
-                _record_round_lease_refusal(
-                    plan_id, plan_dir, _round_conflict,
-                )
-                return
-            # 2026-10-25 (repair-r1-33): the round's services were not
-            # usable, so the round dispatched nothing and measured
-            # nothing.  There is no verdict to repair against, and the
-            # judgment phase must not run: it would read the blocked
-            # round as a failure and send the repair chain after a
-            # product nobody ever looked at.  The refusal itself was
-            # written down by the dispatch.
-            _preflight_blocked = _service_preflight_blocked_report(report)
-            if _preflight_blocked is not None:
-                _record_terminal(
-                    "loop_stopped", SERVICE_PREFLIGHT_ERROR_KIND,
-                )
-                return
-            # 2026-10-29: the round was blocked by the base-drift check
-            # — the branch had drifted away from its base and merging
-            # the base back left conflicts.  The round dispatched
-            # nothing, so its report is empty: sending it to
-            # ``check_cycle_conditions`` would read the block as a
-            # failure and send the repair chain after a product nobody
-            # ever looked at.
-            _base_drift_blocked = _base_drift_blocked_report(report)
-            if _base_drift_blocked is not None:
-                if _base_drift_round_action(report) == "repair":
-                    # The conflict went through the repair channel that
-                    # already exists, so the round hands the plan to the
-                    # executor the way every other repair round does.
-                    # The callback is built HERE: the loop's own
-                    # ``_on_repair_complete`` is bound further down,
-                    # and this branch runs first.
-                    #
-                    # The work is a BASE MERGE, not a product-code fix,
-                    # so the executor runs under the merge's own
-                    # provider-routing scene.  The scene reaches the
-                    # child process through the environment.
-                    _base_drift_on_complete = _make_repair_on_complete(
-                        plan_id, project_dir, tool,
-                    )
-                    _server._run_repair_execution_async(
-                        plan_id, project_dir, tool=tool,
-                        on_complete=_base_drift_on_complete,
-                        outcome=outcome,
-                        scene=base_drift.BASE_DRIFT_MERGE_SCENE,
-                    )
-                    return
-                # No repair task behind the conflict: there is nothing
-                # to repair with, so the round ends here and says why.
-                _server.logger.warning(
-                    "[Auto-Verification] Round %d blocked by base drift "
-                    "— no repair task to run; stopping plan=%s",
-                    round_num, plan_id,
-                )
-                _record_terminal(
-                    "loop_stopped", BASE_DRIFT_CONFLICTS_STOP_REASON,
-                )
-                return
-            # The round has run against the addresses the ledger names —
-            # write them down (2026-10-25, repair-r1-25).
-            _record_dispatch_bindings(
-                plan_dir, plan_id,
-                reason=(
-                    f"round {round_num} dispatched to the addresses its "
-                    f"services were bound to"
-                ),
-            )
-
-            # 2026-09-15: the operator stopped this plan
-            # while the round was running. The stop handler already killed
-            # the in-flight sub-agents and parked the routing row; do NOT
-            # run the judgment / repair chain — that used to re-stamp the
-            # stage the operator had just parked and re-block ``/start``.
-            try:
-                import verification_cancel
-                _stopped = verification_cancel.is_cancelled(plan_id)
+                _, _, verif_repo = _server._open_verification_state()
             except Exception:  # noqa: BLE001
-                _stopped = False
-            if _stopped:
-                _server.logger.warning(
-                    "[Auto-Verification] Round %d aborted by operator "
-                    "stop plan=%s — skipping judgment and repair",
-                    round_num, plan_id,
-                )
-                return
-
-            # 2026-10-23: a question the round asked a human is a
-            # question the round WAITS for.  The judgment below must not
-            # run while a question is still open: the answer is what the
-            # judgment is waiting for.  The wait beats every 60 seconds
-            # so the watchdog can see that a round blocked on a human is
-            # waiting and not dead.
-            blocked = _wait_for_open_verification_decisions(
-                plan_id, round_num,
+                verif_repo = None
+            orch = _server.VerificationOrchestrator(
+                plan_dir, project_dir, coding_tool=coding_tool,
+                verif_repo=verif_repo,
             )
-            if blocked is not None:
-                # Nobody answered, and nobody may answer in a human's
-                # place: the round stops here and the plan waits for the
-                # answer.  The watchdog tick owns the pause checkpoint.
-                _pause_verification_for_human(plan_id, blocked, round_num)
-                return
-
-            # 2026-10-25 (VP-031): 生成修复任务**之前**对一次账。
-            #
-            # 这一步把上一轮落下的失败记录按判据层重新判一遍：判为
-            # criterion_defect / infra 的记录被标上 ``superseded_by``，
-            # 原记录留在文件里（审计不丢），但不再进入失败集合 —— 同一个
-            # id 的旧记录不得每轮重新出现。幂等，跑几遍结论一样。
-            _reconcile_failure_history(plan_id)
-
-            result = orch.check_cycle_conditions(report, round_number=round_num)
-
-            status = result.get("status", "failed")
-
-            # 2026-09-12: when the orchestrator
-            # rebuilds the report at end-of-round, ``snapshot_round_results``
-            # may have already moved the previous round's results into
-            # ``rounds[-1].results``. ``report.get("verification_results")``
-            # can therefore be empty even when ``result["repair_tasks"]``
-            # is non-empty (or vice versa). Count failed/passed across
-            # BOTH the top-level field AND the last round snapshot so
-            # the v_state summary text reflects what actually happened.
-            results_lists = []
-            top_level_results = report.get("verification_results", [])
-            if top_level_results:
-                results_lists.append(top_level_results)
-            rounds_field = report.get("rounds") or []
-            if (
-                not top_level_results
-                and isinstance(rounds_field, list)
-                and rounds_field
-            ):
-                last_round = rounds_field[-1] if isinstance(rounds_field[-1], dict) else {}
-                last_results = last_round.get("results") or []
-                if isinstance(last_results, list) and last_results:
-                    results_lists.append(last_results)
-            failed: List[Dict[str, Any]] = []
-            passed: List[Dict[str, Any]] = []
-            for results_list in results_lists:
-                for r in results_list:
-                    if not isinstance(r, dict):
-                        continue
-                    if r.get("status") == "FAILED":
-                        failed.append(r)
-                    elif r.get("status") == "PASSED":
-                        passed.append(r)
             v_state = _server._verification_state.get(plan_id)
             if v_state:
-                v_state["verification_status"] = status
-                v_state["verification_round"] = round_num
-                v_state["repair_tasks"] = result.get("repair_tasks", [])
-                v_state["stop_reason"] = result.get("stop_reason")
-                v_state["updated_at"] = datetime.now().isoformat()
-                v_state["results"] = {
-                    "pytest_summary": f"{len(passed)} passed, {len(failed)} failed",
-                    "llm_findings": report.get("summary", ""),
-                    "performance_metrics": {},
-                }
-                v_state["execution_profile"] = report.get("execution_profile", {})
-                # 2026-10-23: the intent gate's verdict belongs on the
-                # state as well — a conflict that only lives in the
-                # round's result is gone once the round ends.
-                _intent_fields = _repair_intent_round_fields(result)
-                v_state["intent_conflicts"] = (
-                    _intent_fields["intent_conflicts"]
-                )
-                v_state["needs_operator_decision"] = (
-                    _intent_fields["summary"]["needs_operator_decision"]
-                )
+                v_state["orchestrator"] = orch
+        except Exception as e:
+            print(f"[Auto-Verification] Failed to create orchestrator: {e}")
+            _record_terminal("failed", f"orchestrator_init_failed: {e}")
+            return
 
-            # 2026-09-11 plan v12 (cards.py repair_tasks 持久化):
-            # The orchestrator's ``result["repair_tasks"]`` only lives
-            # in ``_verification_state[plan_id]`` (in-memory). When the
-            # server restarts, the in-memory dict is lost and the Feishu
-            # card loses all repair-task visibility. Persist to
-            # ``plans/{id}/verification_repair_tasks.json`` immediately
-            # so the card builder can read it via the new
-            # ``_build_verification_progress`` repair_tasks field,
-            # regardless of server uptime.
-            #
-            # 2026-09-12 (RP-* persistence bug fix):
-            # ROUND-WISE ACCUMULATION (schema v2). Previously the file
-            # was overwritten each round — when round N had zero
-            # repair_tasks (e.g. all VPs passed), round N-1's RP-*
-            # rows vanished from disk and Feishu cards lost track of
-            # in-flight repair work. The new schema keeps a list of
-            # rounds and the readers aggregate across all rounds,
-            # deduping by task_id and preferring the latest copy.
-            # Legacy v1 single-round files (plan_id/round/tasks) are
-            # auto-migrated to v2 on first write so old plans pick
-            # up the new behaviour without an explicit migration.
+        for round_num in range(start_round, max_rounds + 1):
+            print(f"[Auto-Verification] Round {round_num}/{max_rounds}")
+            # 2026-09-15: never start another round once the
+            # operator has stopped the plan — the stop may land during a
+            # repair execution, between rounds.
             try:
-                _rt_payload = result.get("repair_tasks", [])
-                if not isinstance(_rt_payload, list):
-                    _rt_payload = []
-                _rt_path = _server._plan_dir(plan_id) / "verification_repair_tasks.json"
-                _rt_path.parent.mkdir(parents=True, exist_ok=True)
-                # Read existing file (legacy v1 or v2). Migrate v1 → v2
-                # by wrapping the previous ``tasks`` list as a single
-                # round entry.
-                _existing_rounds: List[Dict[str, Any]] = []
-                if _rt_path.exists():
-                    try:
-                        with _rt_path.open("r", encoding="utf-8") as _rtf_read:
-                            _rt_existing = json.load(_rtf_read)
-                        if isinstance(_rt_existing, dict):
-                            # v2 schema — keep all prior rounds, but
-                            # drop any round entry whose ``round`` is
-                            # == ``round_num`` (we are about to write a
-                            # fresh entry for the same round; previous
-                            # copy is stale).
-                            for entry in (_rt_existing.get("rounds") or []):
-                                if not isinstance(entry, dict):
-                                    continue
-                                if entry.get("round") == round_num:
-                                    continue
-                                _existing_rounds.append(entry)
-                            # v1 legacy: ``{round, tasks, generated_at}``
-                            # at top level. Wrap as a single round entry.
-                            if not _existing_rounds and (
-                                _rt_existing.get("round") is not None
-                                or _rt_existing.get("tasks") is not None
-                            ):
-                                _legacy_round = _rt_existing.get("round")
-                                _legacy_tasks = _rt_existing.get("tasks")
-                                if (
-                                    _legacy_round is not None
-                                    and isinstance(_legacy_tasks, list)
-                                    and _legacy_round != round_num
-                                ):
-                                    # 2026-10-23: the legacy file is
-                                    # itself a round snapshot — it may
-                                    # already carry the intent facts, so
-                                    # it is read through the same helper
-                                    # instead of being rebuilt by hand.
-                                    # Otherwise a conflict recorded by
-                                    # the repair-resume path would be
-                                    # dropped by the very migration that
-                                    # is supposed to preserve it.
-                                    _existing_rounds.append(
-                                        _build_repair_round_entry(
-                                            _legacy_round,
-                                            _legacy_tasks,
-                                            _rt_existing,
-                                            generated_at=_rt_existing.get(
-                                                "generated_at"
-                                            ),
-                                        )
-                                    )
-                    except Exception:
-                        # Corrupt or unreadable existing file — start
-                        # fresh rather than crashing the round write.
-                        _existing_rounds = []
-                _new_round_entry = _build_repair_round_entry(
-                    round_num, _rt_payload, result,
-                )
-                _existing_rounds.append(_new_round_entry)
-                with _rt_path.open("w", encoding="utf-8") as _rtf:
-                    json.dump(
-                        {
-                            "plan_id": plan_id,
-                            "schema_version": 2,
-                            "rounds": _existing_rounds,
-                        },
-                        _rtf,
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-            except Exception:
-                # Persistence is best-effort; in-memory state still
-                # carries the live copy. The card builder will fall
-                # back to in-memory if the file is missing.
-                _server.logger.exception(
-                    "[verification_repair_tasks_persist] failed plan=%s",
-                    plan_id,
-                )
-
-            if status == "passed":
-                # 2026-09-12: even when the round PASSED, there
-                # may be pending RP-* tasks from an earlier round that
-                # the orchestrator's ``same_failure_repeated`` branch
-                # (now bounded by ``_MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS``)
-                # orphaned. run pending RP-* tasks regardless of the
-                # current round's outcome — only treat as PASSED when
-                # both verification AND the executor queue are clear.
-                _pending = _get_pending_repair_tasks(
-                    plan_id, _round_failed_vp_ids(orch, report),
-                )
-                if _pending:
-                    _server.logger.info(
-                        "[Auto-Verification] Round %d PASSED but %d "
-                        "pending RP-* tasks remain — running executor first",
-                        round_num, len(_pending),
-                    )
-                    repair_tasks = _pending
-                    # 2026-09-12 plan v3 (closed-loop fix): the
-                    # orchestrator returned ``status="passed"`` because
-                    # the round's verdicts were all PASSED, but the
-                    # overall chain has not converged — pending RP-*
-                    # tasks are still in the executor queue. The state
-                    # machine vocabulary must reflect this: the plan
-                    # is in a non-terminal repair state, NOT in
-                    # ``verification_passed``. ``confirm_repair_and_rerun``
-                    # calls ``start_repair_execution`` which requires
-                    # ``current_phase == 'verification_repairing'``;
-                    # ``verification_passed`` is a terminal stage with
-                    # no forward edges.
-                    #
-                    # Override the status so the downstream
-                    # ``verification_failed`` → ``start_verification_repair``
-                    # path in :class:`VerificationOrchestrator` runs and
-                    # walks the plan into ``verification_repairing``
-                    # before :meth:`confirm_repair_and_rerun` is called.
-                    # The same override applies to the
-                    # ``same_failure_repeated`` branch below.
-                    result = dict(result)
-                    result["status"] = "failed"
-                    result["stop_reason"] = "pending_repair_tasks"
-                    status = "failed"
-                else:
-                    # No pending RP-* tasks — handle the PASSED case
-                    # via the helper (transition + record terminal).
-                    _handle_passed_round(plan_id, round_num, ps)
-                    return
-
-            # Failure path
-            stop_reason = result.get("stop_reason")
-            # 2026-09-20 (post-mortem): key this off the orchestrator's
-            # own ``status``, NOT off a spelling of ``stop_reason``.
-            #
-            # ``check_cycle_conditions`` returns ``status="loop_stopped"``
-            # from exactly one place — its same-failure convergence branch —
-            # and it writes that field and ``stop_reason`` in the same
-            # return literal, so the two cannot drift apart. The equality
-            # test this replaces compared against ``same_failure_repeated``,
-            # a spelling the orchestrator stopped emitting on 2026-09-12
-            # when the consecutive-rounds counter renamed it to
-            # ``same_failure_repeated_after_max_attempts``. The guard never
-            # matched, so the verdict was ignored: the round fell through
-            # to the empty-repair-queue exit, which routes to ``executing``
-            # (an edge that does not exist from ``verification_loop_stopped``)
-            # and blew up inside ``confirm_repair_and_rerun`` — the blanket
-            # ``except`` then started another full round. Observed live on
-            # that run: rounds 3 and 4 both logged the convergence verdict and
-            # the loop ran round 4 anyway, ending on ``max_rounds_reached``.
-            # See ``VERIFICATION_CONVERGENCE_STOP_REASONS``.
-            #
-            # This is also what the post-repair callback
-            # (``_on_repair_complete``) already does. The two exits must
-            # agree, or the same verdict terminates a plan on one path and
-            # starts another round on the other.
-            #
-            # Close the round in ``plan_verification`` before branching.
-            # Every TERMINAL exit below goes through
-            # ``_record_terminal`` → ``_persist_verification_terminal`` →
-            # ``VerificationRepository.complete_round``, which writes the
-            # verdict to ``plan_verification``. The REPAIR exits return
-            # straight to the executor without doing that, so the row
-            # keeps the ``running`` value written at round start while
-            # ``plan_routing`` has already recorded the terminal verdict.
-            # Since ``/api/plan/{id}/status`` takes its top-level
-            # ``verification_status`` from that row, the card header then
-            # reads "🔄 验证中" above a body naming the running repair
-            # task, for the whole round.
-            #
-            # Written here rather than at each exit so a future exit added
-            # below cannot repeat the omission.
-            _record_round_verdict(status, stop_reason, result)
-            if status == "loop_stopped":
-                # 2026-09-12: even when the loop has converged, there
-                # may be pending RP-* tasks from earlier rounds that should
-                # still be executed. pending RP-* tasks must run regardless
-                # of what ``check_cycle_conditions`` returns.
-                _pending = _get_pending_repair_tasks(
-                    plan_id, _round_failed_vp_ids(orch, report),
-                )
-                if _pending:
+                import verification_cancel as _vc_mod
+                if _vc_mod.is_cancelled(plan_id):
                     _server.logger.warning(
-                        "[Auto-Verification] Round %d: loop converged "
-                        "(%s) but %d pending RP-* tasks — running them "
-                        "before terminating",
-                        round_num, stop_reason, len(_pending),
+                        "[Auto-Verification] stop requested before round %d "
+                        "plan=%s — exiting the auto-loop", round_num, plan_id,
                     )
-                    repair_tasks = _pending
-                    # Skip the terminal branch — fall through to the
-                    # executor-spawn path.
-                    pass
-                else:
-                    print(
-                        f"[Auto-Verification] Round {round_num}: "
-                        f"converged ({stop_reason}) — stopping"
-                    )
-                    # 2026-09-07: removed ``ps.transition_to("failed")``
-                    # here — when the orchestrator has already advanced
-                    # the plan to ``verification_loop_stopped`` (see
-                    # orchestrator.check_cycle_conditions), this transition
-                    # raises ``Illegal transition`` and the blanket
-                    # ``except Exception`` swallowed it, leaving the plan
-                    # stranded. ``_record_terminal`` now delegates to
-                    # ``_persist_verification_terminal`` step 3 which
-                    # calls ``transition_to("failed")`` with a
-                    # ``force_set_phase`` fallback for the terminal-re-entry
-                    # case.
-                    #
-                    # ``loop_stopped`` (not ``failed``) is the honest status
-                    # for this exit and matches the post-repair path at
-                    # ``_on_repair_complete``; ``_persist_verification_terminal``
-                    # maps either spelling of a convergence reason to
-                    # ``loop_stopped`` anyway, so the two exits agree by
-                    # construction.
-                    _record_terminal("loop_stopped", stop_reason)
                     return
-            if stop_reason == "max_rounds_reached":
-                # 2026-08-25 audit: previous code logged "Per user
-                # max_rounds is no longer a stopping
-                # condition" and kept iterating. That decision was
-                # never recorded in the docs and contradicts the
-                # ``/start`` handler's ceiling check (server.py:5242)
-                # which refuses to start a round above ``max_rounds``.
-                # Honour the cap here: transition to failed with
-                # stop_reason="max_rounds_reached" and return. The
-                # card shows the user how many rounds ran; if they
-                # want to keep going they have to call
-                # ``/reset_rounds`` explicitly (which now refuses
-                # to set ``new_max_rounds`` above the original cap).
-                print(
-                    f"[Auto-Verification] Round {round_num}: max_rounds_reached — "
-                    f"stopping (cap {max_rounds} reached)"
+            except Exception:  # noqa: BLE001
+                pass
+            v_state = _server._verification_state.get(plan_id)
+            if v_state:
+                # 2026-09-15: re-assert ``running`` (and the round number /
+                # fresh timestamp) at round start — the previous round's
+                # terminal status otherwise lingered for the whole of round
+                # N ≥ 2, so /api/system/active reported zero verifications
+                # and the card showed the old verdict. See
+                # ``_mark_verification_round_running``.
+                _mark_verification_round_running(plan_id, round_num)
+                # 2026-09-14: the previous round's stop_reason / split
+                # records are RESIDUAL the moment a new round begins — a
+                # "verification_log_stale" left over from round N-1 made
+                # /status claim round N was failed while it was healthy
+                # (observed on a production plan: the status API surfaced the
+                # round-2 watchdog stamp all through round 3). Clear them
+                # at round start, like the recovered-state scrub does.
+                v_state.pop("vp_splits", None)
+            # 2026-08-19 audit: the auto-loop never called
+            # ``verification.init_round`` so the ``plan_verification.round``
+            # column stayed at the ``/start`` value forever. The status
+            # endpoint then reported ``round=1`` for round 2 regardless of
+            # how many rounds actually ran. Persist the round to the
+            # authoritative SQLite store before each cycle.
+            try:
+                from state_machine.repositories.verification_repository import (
+                    VerificationRepository as _VR,
                 )
-                # Same fix as same_failure_repeated above — the
-                # plan is likely already in ``verification_loop_stopped``
-                # at this point and the direct ``ps.transition_to("failed")``
-                # raised ``Illegal transition``. Delegate to
-                # ``_record_terminal``.
-                _record_terminal("loop_stopped", "max_rounds_reached")
-                return
-
-            # Generate repair tasks and auto-confirm for re-execution.
-            #
-            # 2026-09-12: prefer pending RP-* tasks from
-            # state.db over the orchestrator's
-            # ``result["repair_tasks"]`` payload. The user's
-            # if the executor queue has pending RP-*
-            # tasks (from any prior round), the executor MUST run
-            # them — the orchestrator's "empty repair_tasks" payload
-            # (which happens when same_failure_repeated fires) does
-            # NOT mean "no work to do"; it means "no new tasks to
-            # generate". The actual executor work is whatever's still
-            # pending in the DB.
-            _pending_db = _get_pending_repair_tasks(
-                plan_id, _round_failed_vp_ids(orch, report),
-            )
-            if _pending_db:
-                _server.logger.info(
-                    "[Auto-Verification] Round %d: %d pending RP-* "
-                    "tasks in state.db — using them instead of "
-                    "orchestrator's empty payload",
-                    round_num, len(_pending_db),
-                )
-                repair_tasks = _pending_db
-            else:
-                repair_tasks = result.get("repair_tasks") or []
-                if not isinstance(repair_tasks, list):
-                    repair_tasks = []
-            # 2026-09-14: a round whose only forward work
-            # is a VP split must NOT run the execution phase — the split
-            # children are *verified*, not implemented, so the executor
-            # queue is genuinely empty. Computed BEFORE the dead-end
-            # branch so an empty repair list caused by splitting is not
-            # mistaken for "the chain converged" (which would terminalise
-            # the plan with the children never verified).
-            _pure_split = _round_is_pure_split(result)
-            # 2026-09-11 plan v14 (repair→execution→verification
-            # auto-chain): define the callback that chains the next
-            # verification round after the executor subprocess exits.
-            # The previous behaviour was synchronous
-            # ``_run_repair_execution`` inside the auto-loop thread
-            # followed by ``for round_num`` iteration — that path
-            # silently dropped the post-repair re-verification on
-            # ``max_rounds`` exhaustion. The new flow schedules a
-            # fresh ``start_verification_cycle`` here, then chains
-            # another repair if the cycle still fails, or records
-            # terminal if it passes / loops out.
-            # 2026-10-22: the callback is a module-level factory now
-            # (``_make_repair_on_complete``) so the ``/start`` repair
-            # resume path and the auto-loop run the SAME
-            # implementation. The body is unchanged — only the binding
-            # moved.
-            _on_repair_complete = _make_repair_on_complete(
-                plan_id, project_dir, tool,
-            )
-
-            if not repair_tasks and not _pure_split:
-                # 2026-09-14 — check for a generation FAILURE before
-                # treating the empty list as convergence. Both cases
-                # arrive here with ``repair_tasks == []``; only one of
-                # them means "nothing to repair".
-                _gen_error = result.get("repair_generation_error")
-                if _gen_error:
-                    print(
-                        f"[Auto-Verification] Round {round_num}: repair-task "
-                        f"generation FAILED (not a convergence) — retrying in "
-                        f"the next round instead of parking"
+                _, _routing_cl, _verif_cl = _server._open_verification_state()
+                try:
+                    _verif_cl.init_round(
+                        plan_id,
+                        round_n=round_num,
+                        max_rounds=max_rounds,
                     )
-                    _gen_state = _server._verification_state.get(plan_id)
-                    if _gen_state:
-                        _gen_state["stop_reason"] = "repair_generation_failed"
-                        _gen_state["repair_generation_error"] = _gen_error
-                        _gen_state["updated_at"] = datetime.now().isoformat()
-                    _repair_generation_failed(plan_id, _gen_error)
-                    # 2026-09-17: "生成失败也是要重试的，
-                    # 给一个重试的机会，跟任何的任务一样". A generation
-                    # failure is a TRANSIENT fault (provider outage, hard
-                    # timeout, an empty reply), so the loop must retry it
-                    # like any other task rather than hand the plan back to
-                    # the operator. ``continue`` advances ``round_num`` and
-                    # re-runs the cycle, which re-attempts generation; the
-                    # ``max_rounds`` budget bounds the retries.
-                    #
-                    # ``_repair_generation_failed`` still runs first so the
-                    # failure is recorded on ``plan_verification``. It does
-                    # NOT move the routing row — the loop is still working
-                    # this plan, so the row stays inside the verification
-                    # family (see its docstring).
-                    continue
+                finally:
+                    pass
+            except Exception:
+                pass
+            try:
+                # 2026-08-25: pass ``resume=True`` for round > 1 so the
+                # executor reuses the verdict cache (already-PASSED
+                # VPs are filtered out by ``BaseExecutor.run``'s
+                # ``completed_set`` check) instead of re-running every
+                # VP from scratch. Round 1 still starts with a clean
+                # slate (resume=False) so a freshly-edited
+                # ``verification_plan.json`` always gets re-evaluated
+                # from scratch.
+                #
+                # Pre-2026-08-25 behaviour: every round passed
+                # ``resume=False``, which triggered
+                # ``_clear_verification_state_files`` and re-ran all
+                # 28 VPs each round even though only 1 VP actually
+                # failed. Round 2 burned ~5 minutes and ~600k tokens
+                # re-running 20 already-passed VPs before the user
+                # noticed.
+                #
+                # 2026-10-25: the dispatch now goes through the plan's
+                # verification-round lease, so two rounds of the same plan
+                # cannot overlap (see the lease section above).  The lease
+                # is taken BEFORE the round's preflight — the preflight is
+                # what starts the services and seeds the fixture, and two
+                # rounds doing that at once is what produced the 2026-10-24
+                # incident.
+                report, _round_conflict = _dispatch_verification_round(
+                    plan_id, plan_dir, orch, round_num,
+                    resume=(round_num > 1),
+                )
+                if _round_conflict is not None:
+                    # 2026-10-25: another live round owns this plan.  The
+                    # lease refused us BEFORE the preflight, so no service
+                    # was started, no fixture was rewritten and no VP was
+                    # dispatched.  The run ends here, explicitly, and the
+                    # refusal is recorded in the plan's execution log — the
+                    # round that owns the plan keeps its verdict.
+                    _record_round_lease_refusal(
+                        plan_id, plan_dir, _round_conflict,
+                    )
+                    return
+                # 2026-10-25 (repair-r1-33): the round's services were not
+                # usable, so the round dispatched nothing and measured
+                # nothing.  There is no verdict to repair against, and the
+                # judgment phase must not run: it would read the blocked
+                # round as a failure and send the repair chain after a
+                # product nobody ever looked at.  The refusal itself was
+                # written down by the dispatch.
+                _preflight_blocked = _service_preflight_blocked_report(report)
+                if _preflight_blocked is not None:
+                    _record_terminal(
+                        "loop_stopped", SERVICE_PREFLIGHT_ERROR_KIND,
+                    )
+                    return
+                # 2026-10-29: the round was blocked by the base-drift check
+                # — the branch had drifted away from its base and merging
+                # the base back left conflicts.  The round dispatched
+                # nothing, so its report is empty: sending it to
+                # ``check_cycle_conditions`` would read the block as a
+                # failure and send the repair chain after a product nobody
+                # ever looked at.
+                _base_drift_blocked = _base_drift_blocked_report(report)
+                if _base_drift_blocked is not None:
+                    if _base_drift_round_action(report) == "repair":
+                        # The conflict went through the repair channel that
+                        # already exists, so the round hands the plan to the
+                        # executor the way every other repair round does.
+                        # The callback is built HERE: the loop's own
+                        # ``_on_repair_complete`` is bound further down,
+                        # and this branch runs first.
+                        #
+                        # The work is a BASE MERGE, not a product-code fix,
+                        # so the executor runs under the merge's own
+                        # provider-routing scene.  The scene reaches the
+                        # child process through the environment.
+                        _base_drift_on_complete = _make_repair_on_complete(
+                            plan_id, project_dir, tool,
+                            round_token=round_token,
+                        )
+                        _server._run_repair_execution_async(
+                            plan_id, project_dir, tool=tool,
+                            on_complete=_base_drift_on_complete,
+                            outcome=outcome,
+                            scene=base_drift.BASE_DRIFT_MERGE_SCENE,
+                        )
+                        return
+                    # No repair task behind the conflict: there is nothing
+                    # to repair with, so the round ends here and says why.
+                    _server.logger.warning(
+                        "[Auto-Verification] Round %d blocked by base drift "
+                        "— no repair task to run; stopping plan=%s",
+                        round_num, plan_id,
+                    )
+                    _record_terminal(
+                        "loop_stopped", BASE_DRIFT_CONFLICTS_STOP_REASON,
+                    )
+                    return
+                # The round has run against the addresses the ledger names —
+                # write them down (2026-10-25, repair-r1-25).
+                _record_dispatch_bindings(
+                    plan_dir, plan_id,
+                    reason=(
+                        f"round {round_num} dispatched to the addresses its "
+                        f"services were bound to"
+                    ),
+                )
 
-                # 2026-09-12: even when both the orchestrator
-                # payload AND the DB queue are empty, we still need
-                # to surface a meaningful stop_reason. The chain is meant
-                # to keep running, but if there's nothing
-                # left to run, the chain has truly converged.
-                # Surface ``stop_reason`` from the orchestrator
-                # result (e.g. ``same_failure_repeated_after_max_attempts``
-                # after the 2026-09-12 fix) instead of the generic
-                # ``no_repair_tasks`` so operators see why.
-                _real_stop_reason = (
-                    result.get("stop_reason") or "no_repair_tasks"
+                # 2026-09-15: the operator stopped this plan
+                # while the round was running. The stop handler already killed
+                # the in-flight sub-agents and parked the routing row; do NOT
+                # run the judgment / repair chain — that used to re-stamp the
+                # stage the operator had just parked and re-block ``/start``.
+                try:
+                    import verification_cancel
+                    _stopped = verification_cancel.is_cancelled(plan_id)
+                except Exception:  # noqa: BLE001
+                    _stopped = False
+                if _stopped:
+                    _server.logger.warning(
+                        "[Auto-Verification] Round %d aborted by operator "
+                        "stop plan=%s — skipping judgment and repair",
+                        round_num, plan_id,
+                    )
+                    return
+
+                # 2026-10-23: a question the round asked a human is a
+                # question the round WAITS for.  The judgment below must not
+                # run while a question is still open: the answer is what the
+                # judgment is waiting for.  The wait beats every 60 seconds
+                # so the watchdog can see that a round blocked on a human is
+                # waiting and not dead.
+                blocked = _wait_for_open_verification_decisions(
+                    plan_id, round_num,
                 )
-                print(
-                    f"[Auto-Verification] Round {round_num}: No "
-                    f"repair tasks in orchestrator payload or DB "
-                    f"({_real_stop_reason}) — re-entering verification"
-                )
-                # 2026-09-14 at this final exit the
-                # dead end must disambiguate — roll back to ready
-                # when execution work remains, else close the chain.
-                # Previously `_record_terminal(..., "no_repair_tasks")`
-                # stayed non-chain-ending (the reason is deliberately
-                # absent from VERIFICATION_TERMINAL_STOP_REASONS because
-                # it also fires as an interim event mid-flight), so the
-                # routing stage was never advanced and the plan stranded
-                # on the user-gated verification_repairing stage with an
-                # empty repair list.
-                _dead_end_terminal(
-                    plan_id, _real_stop_reason,
-                    chain_ending=False,
-                    # Not parking, not chaining-off: the very next thing
-                    # this round does is route to ``executing`` (below), so
-                    # the row must stay inside the verification family —
-                    # ``tasks_ready`` is a stage ``/execution/start`` CASes
-                    # to ``executing`` with no verification-liveness guard.
-                    rollback_to_ready=False,
-                )
-                # 2026-09-17: "原本就已经跳到了 taskready，
-                # 你直接去跳到那个 executing 状态，它不就会去调度任务去
-                # 执行吗？如果发现没有任务，那不就跳转到 verification 吗？"
+                if blocked is not None:
+                    # Nobody answered, and nobody may answer in a human's
+                    # place: the round stops here and the plan waits for the
+                    # answer.  The watchdog tick owns the pause checkpoint.
+                    _pause_verification_for_human(plan_id, blocked, round_num)
+                    return
+
+                # 2026-10-25 (VP-031): 生成修复任务**之前**对一次账。
                 #
-                # So an empty repair queue is not a convergence verdict — it
-                # is the signal to go RUN whatever execution work remains.
-                # ``check_cycle_conditions`` has already put the plan in
-                # ``verification_repairing`` (``_safe_phase_call`` runs
-                # before any repair content is generated), and
-                # ``verification_repairing → executing`` is a declared edge,
-                # so this is a normal transition rather than a forced state
-                # write.
+                # 这一步把上一轮落下的失败记录按判据层重新判一遍：判为
+                # criterion_defect / infra 的记录被标上 ``superseded_by``，
+                # 原记录留在文件里（审计不丢），但不再进入失败集合 —— 同一个
+                # id 的旧记录不得每轮重新出现。幂等，跑几遍结论一样。
+                _reconcile_failure_history(plan_id)
+
+                result = orch.check_cycle_conditions(report, round_number=round_num)
+
+                status = result.get("status", "failed")
+
+                # 2026-09-12: when the orchestrator
+                # rebuilds the report at end-of-round, ``snapshot_round_results``
+                # may have already moved the previous round's results into
+                # ``rounds[-1].results``. ``report.get("verification_results")``
+                # can therefore be empty even when ``result["repair_tasks"]``
+                # is non-empty (or vice versa). Count failed/passed across
+                # BOTH the top-level field AND the last round snapshot so
+                # the v_state summary text reflects what actually happened.
+                results_lists = []
+                top_level_results = report.get("verification_results", [])
+                if top_level_results:
+                    results_lists.append(top_level_results)
+                rounds_field = report.get("rounds") or []
+                if (
+                    not top_level_results
+                    and isinstance(rounds_field, list)
+                    and rounds_field
+                ):
+                    last_round = rounds_field[-1] if isinstance(rounds_field[-1], dict) else {}
+                    last_results = last_round.get("results") or []
+                    if isinstance(last_results, list) and last_results:
+                        results_lists.append(last_results)
+                failed: List[Dict[str, Any]] = []
+                passed: List[Dict[str, Any]] = []
+                for results_list in results_lists:
+                    for r in results_list:
+                        if not isinstance(r, dict):
+                            continue
+                        if r.get("status") == "FAILED":
+                            failed.append(r)
+                        elif r.get("status") == "PASSED":
+                            passed.append(r)
+                v_state = _server._verification_state.get(plan_id)
+                if v_state:
+                    v_state["verification_status"] = status
+                    v_state["verification_round"] = round_num
+                    v_state["repair_tasks"] = result.get("repair_tasks", [])
+                    v_state["stop_reason"] = result.get("stop_reason")
+                    v_state["updated_at"] = datetime.now().isoformat()
+                    v_state["results"] = {
+                        "pytest_summary": f"{len(passed)} passed, {len(failed)} failed",
+                        "llm_findings": report.get("summary", ""),
+                        "performance_metrics": {},
+                    }
+                    v_state["execution_profile"] = report.get("execution_profile", {})
+                    # 2026-10-23: the intent gate's verdict belongs on the
+                    # state as well — a conflict that only lives in the
+                    # round's result is gone once the round ends.
+                    _intent_fields = _repair_intent_round_fields(result)
+                    v_state["intent_conflicts"] = (
+                        _intent_fields["intent_conflicts"]
+                    )
+                    v_state["needs_operator_decision"] = (
+                        _intent_fields["summary"]["needs_operator_decision"]
+                    )
+
+                # 2026-09-11 plan v12 (cards.py repair_tasks 持久化):
+                # The orchestrator's ``result["repair_tasks"]`` only lives
+                # in ``_verification_state[plan_id]`` (in-memory). When the
+                # server restarts, the in-memory dict is lost and the Feishu
+                # card loses all repair-task visibility. Persist to
+                # ``plans/{id}/verification_repair_tasks.json`` immediately
+                # so the card builder can read it via the new
+                # ``_build_verification_progress`` repair_tasks field,
+                # regardless of server uptime.
                 #
-                # Whether there is actually work is the EXECUTOR's question,
-                # not ours — if it finds nothing it exits immediately and
-                # ``_on_repair_complete`` hands the chain straight back to
-                # verification. Keeping that decision in one place is what
-                # makes the loop closed: executing always flows to
-                # verification, and only the round budget or a repeated
-                # failure set can end the chain.
-                print(
-                    f"[Auto-Verification] Round {round_num}: no repair tasks — "
-                    f"routing to executing so the executor can drain any "
-                    f"remaining work, then back to verification"
+                # 2026-09-12 (RP-* persistence bug fix):
+                # ROUND-WISE ACCUMULATION (schema v2). Previously the file
+                # was overwritten each round — when round N had zero
+                # repair_tasks (e.g. all VPs passed), round N-1's RP-*
+                # rows vanished from disk and Feishu cards lost track of
+                # in-flight repair work. The new schema keeps a list of
+                # rounds and the readers aggregate across all rounds,
+                # deduping by task_id and preferring the latest copy.
+                # Legacy v1 single-round files (plan_id/round/tasks) are
+                # auto-migrated to v2 on first write so old plans pick
+                # up the new behaviour without an explicit migration.
+                try:
+                    _rt_payload = result.get("repair_tasks", [])
+                    if not isinstance(_rt_payload, list):
+                        _rt_payload = []
+                    _rt_path = _server._plan_dir(plan_id) / "verification_repair_tasks.json"
+                    _rt_path.parent.mkdir(parents=True, exist_ok=True)
+                    # Read existing file (legacy v1 or v2). Migrate v1 → v2
+                    # by wrapping the previous ``tasks`` list as a single
+                    # round entry.
+                    _existing_rounds: List[Dict[str, Any]] = []
+                    if _rt_path.exists():
+                        try:
+                            with _rt_path.open("r", encoding="utf-8") as _rtf_read:
+                                _rt_existing = json.load(_rtf_read)
+                            if isinstance(_rt_existing, dict):
+                                # v2 schema — keep all prior rounds, but
+                                # drop any round entry whose ``round`` is
+                                # == ``round_num`` (we are about to write a
+                                # fresh entry for the same round; previous
+                                # copy is stale).
+                                for entry in (_rt_existing.get("rounds") or []):
+                                    if not isinstance(entry, dict):
+                                        continue
+                                    if entry.get("round") == round_num:
+                                        continue
+                                    _existing_rounds.append(entry)
+                                # v1 legacy: ``{round, tasks, generated_at}``
+                                # at top level. Wrap as a single round entry.
+                                if not _existing_rounds and (
+                                    _rt_existing.get("round") is not None
+                                    or _rt_existing.get("tasks") is not None
+                                ):
+                                    _legacy_round = _rt_existing.get("round")
+                                    _legacy_tasks = _rt_existing.get("tasks")
+                                    if (
+                                        _legacy_round is not None
+                                        and isinstance(_legacy_tasks, list)
+                                        and _legacy_round != round_num
+                                    ):
+                                        # 2026-10-23: the legacy file is
+                                        # itself a round snapshot — it may
+                                        # already carry the intent facts, so
+                                        # it is read through the same helper
+                                        # instead of being rebuilt by hand.
+                                        # Otherwise a conflict recorded by
+                                        # the repair-resume path would be
+                                        # dropped by the very migration that
+                                        # is supposed to preserve it.
+                                        _existing_rounds.append(
+                                            _build_repair_round_entry(
+                                                _legacy_round,
+                                                _legacy_tasks,
+                                                _rt_existing,
+                                                generated_at=_rt_existing.get(
+                                                    "generated_at"
+                                                ),
+                                            )
+                                        )
+                        except Exception:
+                            # Corrupt or unreadable existing file — start
+                            # fresh rather than crashing the round write.
+                            _existing_rounds = []
+                    _new_round_entry = _build_repair_round_entry(
+                        round_num, _rt_payload, result,
+                    )
+                    _existing_rounds.append(_new_round_entry)
+                    with _rt_path.open("w", encoding="utf-8") as _rtf:
+                        json.dump(
+                            {
+                                "plan_id": plan_id,
+                                "schema_version": 2,
+                                "rounds": _existing_rounds,
+                            },
+                            _rtf,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                except Exception:
+                    # Persistence is best-effort; in-memory state still
+                    # carries the live copy. The card builder will fall
+                    # back to in-memory if the file is missing.
+                    _server.logger.exception(
+                        "[verification_repair_tasks_persist] failed plan=%s",
+                        plan_id,
+                    )
+
+                if status == "passed":
+                    # 2026-09-12: even when the round PASSED, there
+                    # may be pending RP-* tasks from an earlier round that
+                    # the orchestrator's ``same_failure_repeated`` branch
+                    # (now bounded by ``_MAX_CONSECUTIVE_SAME_FAILURE_ROUNDS``)
+                    # orphaned. run pending RP-* tasks regardless of the
+                    # current round's outcome — only treat as PASSED when
+                    # both verification AND the executor queue are clear.
+                    _pending = _get_pending_repair_tasks(
+                        plan_id, _round_failed_vp_ids(orch, report),
+                    )
+                    if _pending:
+                        _server.logger.info(
+                            "[Auto-Verification] Round %d PASSED but %d "
+                            "pending RP-* tasks remain — running executor first",
+                            round_num, len(_pending),
+                        )
+                        repair_tasks = _pending
+                        # 2026-09-12 plan v3 (closed-loop fix): the
+                        # orchestrator returned ``status="passed"`` because
+                        # the round's verdicts were all PASSED, but the
+                        # overall chain has not converged — pending RP-*
+                        # tasks are still in the executor queue. The state
+                        # machine vocabulary must reflect this: the plan
+                        # is in a non-terminal repair state, NOT in
+                        # ``verification_passed``. ``confirm_repair_and_rerun``
+                        # calls ``start_repair_execution`` which requires
+                        # ``current_phase == 'verification_repairing'``;
+                        # ``verification_passed`` is a terminal stage with
+                        # no forward edges.
+                        #
+                        # Override the status so the downstream
+                        # ``verification_failed`` → ``start_verification_repair``
+                        # path in :class:`VerificationOrchestrator` runs and
+                        # walks the plan into ``verification_repairing``
+                        # before :meth:`confirm_repair_and_rerun` is called.
+                        # The same override applies to the
+                        # ``same_failure_repeated`` branch below.
+                        result = dict(result)
+                        result["status"] = "failed"
+                        result["stop_reason"] = "pending_repair_tasks"
+                        status = "failed"
+                    else:
+                        # No pending RP-* tasks — handle the PASSED case
+                        # via the helper (transition + record terminal).
+                        _handle_passed_round(
+                            plan_id, round_num, ps, round_token=round_token,
+                        )
+                        return
+
+                # Failure path
+                stop_reason = result.get("stop_reason")
+                # 2026-09-20 (post-mortem): key this off the orchestrator's
+                # own ``status``, NOT off a spelling of ``stop_reason``.
+                #
+                # ``check_cycle_conditions`` returns ``status="loop_stopped"``
+                # from exactly one place — its same-failure convergence branch —
+                # and it writes that field and ``stop_reason`` in the same
+                # return literal, so the two cannot drift apart. The equality
+                # test this replaces compared against ``same_failure_repeated``,
+                # a spelling the orchestrator stopped emitting on 2026-09-12
+                # when the consecutive-rounds counter renamed it to
+                # ``same_failure_repeated_after_max_attempts``. The guard never
+                # matched, so the verdict was ignored: the round fell through
+                # to the empty-repair-queue exit, which routes to ``executing``
+                # (an edge that does not exist from ``verification_loop_stopped``)
+                # and blew up inside ``confirm_repair_and_rerun`` — the blanket
+                # ``except`` then started another full round. Observed live on
+                # that run: rounds 3 and 4 both logged the convergence verdict and
+                # the loop ran round 4 anyway, ending on ``max_rounds_reached``.
+                # See ``VERIFICATION_CONVERGENCE_STOP_REASONS``.
+                #
+                # This is also what the post-repair callback
+                # (``_on_repair_complete``) already does. The two exits must
+                # agree, or the same verdict terminates a plan on one path and
+                # starts another round on the other.
+                #
+                # Close the round in ``plan_verification`` before branching.
+                # Every TERMINAL exit below goes through
+                # ``_record_terminal`` → ``_persist_verification_terminal`` →
+                # ``VerificationRepository.complete_round``, which writes the
+                # verdict to ``plan_verification``. The REPAIR exits return
+                # straight to the executor without doing that, so the row
+                # keeps the ``running`` value written at round start while
+                # ``plan_routing`` has already recorded the terminal verdict.
+                # Since ``/api/plan/{id}/status`` takes its top-level
+                # ``verification_status`` from that row, the card header then
+                # reads "🔄 验证中" above a body naming the running repair
+                # task, for the whole round.
+                #
+                # Written here rather than at each exit so a future exit added
+                # below cannot repeat the omission.
+                _record_round_verdict(status, stop_reason, result)
+                if status == "loop_stopped":
+                    # 2026-09-12: even when the loop has converged, there
+                    # may be pending RP-* tasks from earlier rounds that should
+                    # still be executed. pending RP-* tasks must run regardless
+                    # of what ``check_cycle_conditions`` returns.
+                    _pending = _get_pending_repair_tasks(
+                        plan_id, _round_failed_vp_ids(orch, report),
+                    )
+                    if _pending:
+                        _server.logger.warning(
+                            "[Auto-Verification] Round %d: loop converged "
+                            "(%s) but %d pending RP-* tasks — running them "
+                            "before terminating",
+                            round_num, stop_reason, len(_pending),
+                        )
+                        repair_tasks = _pending
+                        # Skip the terminal branch — fall through to the
+                        # executor-spawn path.
+                        pass
+                    else:
+                        print(
+                            f"[Auto-Verification] Round {round_num}: "
+                            f"converged ({stop_reason}) — stopping"
+                        )
+                        # 2026-09-07: removed ``ps.transition_to("failed")``
+                        # here — when the orchestrator has already advanced
+                        # the plan to ``verification_loop_stopped`` (see
+                        # orchestrator.check_cycle_conditions), this transition
+                        # raises ``Illegal transition`` and the blanket
+                        # ``except Exception`` swallowed it, leaving the plan
+                        # stranded. ``_record_terminal`` now delegates to
+                        # ``_persist_verification_terminal`` step 3 which
+                        # calls ``transition_to("failed")`` with a
+                        # ``force_set_phase`` fallback for the terminal-re-entry
+                        # case.
+                        #
+                        # ``loop_stopped`` (not ``failed``) is the honest status
+                        # for this exit and matches the post-repair path at
+                        # ``_on_repair_complete``; ``_persist_verification_terminal``
+                        # maps either spelling of a convergence reason to
+                        # ``loop_stopped`` anyway, so the two exits agree by
+                        # construction.
+                        _record_terminal("loop_stopped", stop_reason)
+                        return
+                if stop_reason == "max_rounds_reached":
+                    # 2026-08-25 audit: previous code logged "Per user
+                    # max_rounds is no longer a stopping
+                    # condition" and kept iterating. That decision was
+                    # never recorded in the docs and contradicts the
+                    # ``/start`` handler's ceiling check (server.py:5242)
+                    # which refuses to start a round above ``max_rounds``.
+                    # Honour the cap here: transition to failed with
+                    # stop_reason="max_rounds_reached" and return. The
+                    # card shows the user how many rounds ran; if they
+                    # want to keep going they have to call
+                    # ``/reset_rounds`` explicitly (which now refuses
+                    # to set ``new_max_rounds`` above the original cap).
+                    print(
+                        f"[Auto-Verification] Round {round_num}: max_rounds_reached — "
+                        f"stopping (cap {max_rounds} reached)"
+                    )
+                    # Same fix as same_failure_repeated above — the
+                    # plan is likely already in ``verification_loop_stopped``
+                    # at this point and the direct ``ps.transition_to("failed")``
+                    # raised ``Illegal transition``. Delegate to
+                    # ``_record_terminal``.
+                    _record_terminal("loop_stopped", "max_rounds_reached")
+                    return
+
+                # Generate repair tasks and auto-confirm for re-execution.
+                #
+                # 2026-09-12: prefer pending RP-* tasks from
+                # state.db over the orchestrator's
+                # ``result["repair_tasks"]`` payload. The user's
+                # if the executor queue has pending RP-*
+                # tasks (from any prior round), the executor MUST run
+                # them — the orchestrator's "empty repair_tasks" payload
+                # (which happens when same_failure_repeated fires) does
+                # NOT mean "no work to do"; it means "no new tasks to
+                # generate". The actual executor work is whatever's still
+                # pending in the DB.
+                _pending_db = _get_pending_repair_tasks(
+                    plan_id, _round_failed_vp_ids(orch, report),
                 )
-                # 2026-10-22: the operator stopped the plan — do not
-                # route it to ``executing`` and do not dispatch the
-                # executor. The check sits BEFORE the routing call so
-                # the plan is not moved into a phase that says "work is
-                # about to run".
+                if _pending_db:
+                    _server.logger.info(
+                        "[Auto-Verification] Round %d: %d pending RP-* "
+                        "tasks in state.db — using them instead of "
+                        "orchestrator's empty payload",
+                        round_num, len(_pending_db),
+                    )
+                    repair_tasks = _pending_db
+                else:
+                    repair_tasks = result.get("repair_tasks") or []
+                    if not isinstance(repair_tasks, list):
+                        repair_tasks = []
+                # 2026-09-14: a round whose only forward work
+                # is a VP split must NOT run the execution phase — the split
+                # children are *verified*, not implemented, so the executor
+                # queue is genuinely empty. Computed BEFORE the dead-end
+                # branch so an empty repair list caused by splitting is not
+                # mistaken for "the chain converged" (which would terminalise
+                # the plan with the children never verified).
+                _pure_split = _round_is_pure_split(result)
+                # 2026-09-11 plan v14 (repair→execution→verification
+                # auto-chain): define the callback that chains the next
+                # verification round after the executor subprocess exits.
+                # The previous behaviour was synchronous
+                # ``_run_repair_execution`` inside the auto-loop thread
+                # followed by ``for round_num`` iteration — that path
+                # silently dropped the post-repair re-verification on
+                # ``max_rounds`` exhaustion. The new flow schedules a
+                # fresh ``start_verification_cycle`` here, then chains
+                # another repair if the cycle still fails, or records
+                # terminal if it passes / loops out.
+                # 2026-10-22: the callback is a module-level factory now
+                # (``_make_repair_on_complete``) so the ``/start`` repair
+                # resume path and the auto-loop run the SAME
+                # implementation. The body is unchanged — only the binding
+                # moved.
+                _on_repair_complete = _make_repair_on_complete(
+                    plan_id, project_dir, tool,
+                    round_token=round_token,
+                )
+
+                if not repair_tasks and not _pure_split:
+                    # 2026-09-14 — check for a generation FAILURE before
+                    # treating the empty list as convergence. Both cases
+                    # arrive here with ``repair_tasks == []``; only one of
+                    # them means "nothing to repair".
+                    _gen_error = result.get("repair_generation_error")
+                    if _gen_error:
+                        print(
+                            f"[Auto-Verification] Round {round_num}: repair-task "
+                            f"generation FAILED (not a convergence) — retrying in "
+                            f"the next round instead of parking"
+                        )
+                        _gen_state = _server._verification_state.get(plan_id)
+                        if _gen_state:
+                            _gen_state["stop_reason"] = "repair_generation_failed"
+                            _gen_state["repair_generation_error"] = _gen_error
+                            _gen_state["updated_at"] = datetime.now().isoformat()
+                        _repair_generation_failed(plan_id, _gen_error)
+                        # 2026-09-17: "生成失败也是要重试的，
+                        # 给一个重试的机会，跟任何的任务一样". A generation
+                        # failure is a TRANSIENT fault (provider outage, hard
+                        # timeout, an empty reply), so the loop must retry it
+                        # like any other task rather than hand the plan back to
+                        # the operator. ``continue`` advances ``round_num`` and
+                        # re-runs the cycle, which re-attempts generation; the
+                        # ``max_rounds`` budget bounds the retries.
+                        #
+                        # ``_repair_generation_failed`` still runs first so the
+                        # failure is recorded on ``plan_verification``. It does
+                        # NOT move the routing row — the loop is still working
+                        # this plan, so the row stays inside the verification
+                        # family (see its docstring).
+                        continue
+
+                    # 2026-09-12: even when both the orchestrator
+                    # payload AND the DB queue are empty, we still need
+                    # to surface a meaningful stop_reason. The chain is meant
+                    # to keep running, but if there's nothing
+                    # left to run, the chain has truly converged.
+                    # Surface ``stop_reason`` from the orchestrator
+                    # result (e.g. ``same_failure_repeated_after_max_attempts``
+                    # after the 2026-09-12 fix) instead of the generic
+                    # ``no_repair_tasks`` so operators see why.
+                    _real_stop_reason = (
+                        result.get("stop_reason") or "no_repair_tasks"
+                    )
+                    print(
+                        f"[Auto-Verification] Round {round_num}: No "
+                        f"repair tasks in orchestrator payload or DB "
+                        f"({_real_stop_reason}) — re-entering verification"
+                    )
+                    # 2026-09-14 at this final exit the
+                    # dead end must disambiguate — roll back to ready
+                    # when execution work remains, else close the chain.
+                    # Previously `_record_terminal(..., "no_repair_tasks")`
+                    # stayed non-chain-ending (the reason is deliberately
+                    # absent from VERIFICATION_TERMINAL_STOP_REASONS because
+                    # it also fires as an interim event mid-flight), so the
+                    # routing stage was never advanced and the plan stranded
+                    # on the user-gated verification_repairing stage with an
+                    # empty repair list.
+                    _dead_end_terminal(
+                        plan_id, _real_stop_reason,
+                        chain_ending=False,
+                        # Not parking, not chaining-off: the very next thing
+                        # this round does is route to ``executing`` (below), so
+                        # the row must stay inside the verification family —
+                        # ``tasks_ready`` is a stage ``/execution/start`` CASes
+                        # to ``executing`` with no verification-liveness guard.
+                        rollback_to_ready=False,
+                        round_token=round_token,
+                    )
+                    # 2026-09-17: "原本就已经跳到了 taskready，
+                    # 你直接去跳到那个 executing 状态，它不就会去调度任务去
+                    # 执行吗？如果发现没有任务，那不就跳转到 verification 吗？"
+                    #
+                    # So an empty repair queue is not a convergence verdict — it
+                    # is the signal to go RUN whatever execution work remains.
+                    # ``check_cycle_conditions`` has already put the plan in
+                    # ``verification_repairing`` (``_safe_phase_call`` runs
+                    # before any repair content is generated), and
+                    # ``verification_repairing → executing`` is a declared edge,
+                    # so this is a normal transition rather than a forced state
+                    # write.
+                    #
+                    # Whether there is actually work is the EXECUTOR's question,
+                    # not ours — if it finds nothing it exits immediately and
+                    # ``_on_repair_complete`` hands the chain straight back to
+                    # verification. Keeping that decision in one place is what
+                    # makes the loop closed: executing always flows to
+                    # verification, and only the round budget or a repeated
+                    # failure set can end the chain.
+                    print(
+                        f"[Auto-Verification] Round {round_num}: no repair tasks — "
+                        f"routing to executing so the executor can drain any "
+                        f"remaining work, then back to verification"
+                    )
+                    # 2026-10-22: the operator stopped the plan — do not
+                    # route it to ``executing`` and do not dispatch the
+                    # executor. The check sits BEFORE the routing call so
+                    # the plan is not moved into a phase that says "work is
+                    # about to run".
+                    import verification_cancel as _vc_dispatch
+                    if _vc_dispatch.is_cancelled(plan_id):
+                        _server.logger.warning(
+                            "[Auto-Verification] stop requested — not "
+                            "dispatching repair plan=%s", plan_id,
+                        )
+                        return
+                    try:
+                        orch.confirm_repair_and_rerun()
+                    except Exception as _reroute_exc:  # noqa: BLE001
+                        # The transition needs the plan in ``verification_repairing``.
+                        # If a watchdog stamp or an operator stop moved it, do not
+                        # strand the round: fall back to another verification
+                        # round, which re-derives the state from scratch.
+                        _server.logger.exception(
+                            "[Auto-Verification] could not route the dead end to "
+                            "executing plan=%s — re-entering verification instead",
+                            plan_id,
+                        )
+                        continue
+                    _server._run_repair_execution_async(
+                        plan_id, project_dir, tool=tool,
+                        on_complete=_on_repair_complete,
+                        outcome=outcome,
+                    )
+                    return
+
+                if _pending_db:
+                    print(
+                        f"[Auto-Verification] Round {round_num}: Running "
+                        f"{len(repair_tasks)} pending RP-* tasks from DB"
+                    )
+                else:
+                    print(f"[Auto-Verification] Round {round_num}: Generated {len(repair_tasks)} repair tasks, re-executing...")
+
+                # Auto-confirm repair and run re-execution via CLI
+                #
+                # 2026-10-22: the operator stopped the plan — do not route
+                # it to ``executing`` and do not dispatch the executor. The
+                # check sits BEFORE the routing call so the plan is not
+                # moved into a phase that says "work is about to run".
                 import verification_cancel as _vc_dispatch
                 if _vc_dispatch.is_cancelled(plan_id):
                     _server.logger.warning(
@@ -8143,179 +9527,140 @@ def _run_auto_verification_loop_inner(plan_id: str, plan_dir: Path, project_dir:
                         "dispatching repair plan=%s", plan_id,
                     )
                     return
-                try:
-                    orch.confirm_repair_and_rerun()
-                except Exception as _reroute_exc:  # noqa: BLE001
-                    # The transition needs the plan in ``verification_repairing``.
-                    # If a watchdog stamp or an operator stop moved it, do not
-                    # strand the round: fall back to another verification
-                    # round, which re-derives the state from scratch.
-                    _server.logger.exception(
-                        "[Auto-Verification] could not route the dead end to "
-                        "executing plan=%s — re-entering verification instead",
-                        plan_id,
+                orch.confirm_repair_and_rerun()
+
+                # 2026-09-08: single-writer refactor. The previous
+                # code wrote ``verification_tasks_round_<N>.json`` and
+                # passed it to ``_run_repair_execution`` which merged it
+                # with ``tasks.json`` into ``tasks_with_repair_round_<N>.json``.
+                # That second writer violated the
+                # ``tasks.json`` read-only invariant post-plan-generation.
+                # The orchestrator's :meth:`check_cycle_conditions` now
+                # writes each repair task straight to ``state.db`` via
+                # :meth:`PlanTaskRepository.add_task`; the executor's
+                # ``_load_tasks`` Phase 2 reconciles them. No on-disk
+                # snapshot is needed — spawn the executor subprocess
+                # against canonical ``tasks.json`` only.
+                #
+                # 2026-09-11 plan v14: replace synchronous ``_run_repair_execution``
+                # (which ``process.wait()``ed inside the auto-loop thread for
+                # 5+ minutes, racing the verification watchdog) with
+                # ``_run_repair_execution_async`` — spawn + return
+                # immediately, chain the next verification round through the
+                # ``on_complete`` callback that fires when the subprocess
+                # exits. The closing ``return`` exits the auto-loop thread
+                # (the chain resumes from the callback, not from
+                # ``for round_num``).
+                #
+                # 2026-09-17 — ``_on_repair_complete`` used to be defined
+                # HERE, just above this dispatch, with a comment claiming the
+                # name "is only bound once execution reaches it". That was
+                # true of its position, not of its dependencies: its closure
+                # vars are ``plan_id`` / ``tool`` / ``project_dir`` /
+                # ``_record_terminal``, all bound before the ``for`` loop. It
+                # now lives above the dead-end branch so that branch can
+                # dispatch the executor too (see the comment there).
+                # 2026-09-14 — pure-split round: skip the
+                # execution phase entirely and re-enter verification, which
+                # now runs the split children. The callback is invoked with a
+                # synthetic rc=0 because no subprocess ran; its body only
+                # reloads state, bumps the round and launches the next
+                # verification cycle. ``_on_repair_complete`` must be the
+                # nested def above (the name is only bound once execution
+                # reaches it — hence this dispatch living here, after it).
+                if _pure_split:
+                    _split_ids = [
+                        s.get("vp_id") for s in (result.get("vp_splits") or [])
+                        if isinstance(s, dict)
+                    ]
+                    _server.logger.warning(
+                        "[Auto-Verification] Round %d: pure split (%s) — "
+                        "skipping the execution phase, re-entering verification",
+                        round_num, ", ".join(str(i) for i in _split_ids),
                     )
-                    continue
+                    _split_state = _server._verification_state.get(plan_id)
+                    if _split_state is not None:
+                        _split_state["vp_splits"] = result.get("vp_splits") or []
+                        _split_state["stop_reason"] = "vp_split_no_repair_tasks"
+                        _split_state["updated_at"] = datetime.now().isoformat()
+                    try:
+                        _on_repair_complete(0)
+                    except Exception:
+                        _server.logger.exception(
+                            "[Auto-Verification] pure-split chain crashed "
+                            "plan=%s", plan_id,
+                        )
+                        _record_terminal("failed", "vp_split_chain_crashed")
+                    # 2026-09-23: this exit has no subprocess of its own to
+                    # report from — ``_on_repair_complete(0)`` ran inline, so
+                    # by the time it returns the nested chain has either
+                    # settled (nothing in flight, reap as usual) or dispatched
+                    # a repair of its own (still in flight, defer).
+                    outcome.handed_off = _server._plan_execution_in_flight(plan_id)
+                    return
+
                 _server._run_repair_execution_async(
                     plan_id, project_dir, tool=tool,
                     on_complete=_on_repair_complete,
                     outcome=outcome,
                 )
                 return
-
-            if _pending_db:
+            except VerificationCancelled as cancelled:
+                # 2026-10-22 — the operator stopped this plan while the
+                # round was judging / generating repair tasks.
+                #
+                # This is NOT a failed round, so it must not be recorded as
+                # one. The arm below would call ``_record_terminal
+                # ("failed", …)``, which advances the plan to
+                # ``verification_failed`` — a terminal verdict on a round
+                # the operator paused on purpose, and the exact thing the
+                # 2026-09-15 rework was about ("the verification thread
+                # kept going … re-stamping the stage the operator had just
+                # parked").
+                #
+                # So: no terminal record, no failure record, no repair
+                # tasks, no retry. The phase is left exactly where the
+                # stop left it — the stop route parks a verification-half
+                # stop at ``verification`` ("the round is paused, not
+                # finished"), and a stop during the repair executor at
+                # ``verification_repairing``. Moving it from here would
+                # fight that CAS, which this module is not allowed to do
+                # (``routes/verification.py`` owns the stop's target
+                # phase).
+                #
+                # What the operator gets from ``/start`` is the ordinary
+                # path: the round is picked up again, and the repair
+                # generation re-opens the session the stopped round was
+                # using (see ``repair_generator.repair_content_session``),
+                # so the interrupted work is not paid for twice.
+                _server.logger.warning(
+                    "[Auto-Verification] Round %d cancelled by the operator "
+                    "stop plan=%s — no terminal record, no repair tasks",
+                    round_num, plan_id,
+                )
                 print(
-                    f"[Auto-Verification] Round {round_num}: Running "
-                    f"{len(repair_tasks)} pending RP-* tasks from DB"
-                )
-            else:
-                print(f"[Auto-Verification] Round {round_num}: Generated {len(repair_tasks)} repair tasks, re-executing...")
-
-            # Auto-confirm repair and run re-execution via CLI
-            #
-            # 2026-10-22: the operator stopped the plan — do not route
-            # it to ``executing`` and do not dispatch the executor. The
-            # check sits BEFORE the routing call so the plan is not
-            # moved into a phase that says "work is about to run".
-            import verification_cancel as _vc_dispatch
-            if _vc_dispatch.is_cancelled(plan_id):
-                _server.logger.warning(
-                    "[Auto-Verification] stop requested — not "
-                    "dispatching repair plan=%s", plan_id,
+                    f"[Auto-Verification] Round {round_num}: cancelled by the "
+                    f"operator stop — {cancelled}"
                 )
                 return
-            orch.confirm_repair_and_rerun()
-
-            # 2026-09-08: single-writer refactor. The previous
-            # code wrote ``verification_tasks_round_<N>.json`` and
-            # passed it to ``_run_repair_execution`` which merged it
-            # with ``tasks.json`` into ``tasks_with_repair_round_<N>.json``.
-            # That second writer violated the
-            # ``tasks.json`` read-only invariant post-plan-generation.
-            # The orchestrator's :meth:`check_cycle_conditions` now
-            # writes each repair task straight to ``state.db`` via
-            # :meth:`PlanTaskRepository.add_task`; the executor's
-            # ``_load_tasks`` Phase 2 reconciles them. No on-disk
-            # snapshot is needed — spawn the executor subprocess
-            # against canonical ``tasks.json`` only.
-            #
-            # 2026-09-11 plan v14: replace synchronous ``_run_repair_execution``
-            # (which ``process.wait()``ed inside the auto-loop thread for
-            # 5+ minutes, racing the verification watchdog) with
-            # ``_run_repair_execution_async`` — spawn + return
-            # immediately, chain the next verification round through the
-            # ``on_complete`` callback that fires when the subprocess
-            # exits. The closing ``return`` exits the auto-loop thread
-            # (the chain resumes from the callback, not from
-            # ``for round_num``).
-            #
-            # 2026-09-17 — ``_on_repair_complete`` used to be defined
-            # HERE, just above this dispatch, with a comment claiming the
-            # name "is only bound once execution reaches it". That was
-            # true of its position, not of its dependencies: its closure
-            # vars are ``plan_id`` / ``tool`` / ``project_dir`` /
-            # ``_record_terminal``, all bound before the ``for`` loop. It
-            # now lives above the dead-end branch so that branch can
-            # dispatch the executor too (see the comment there).
-            # 2026-09-14 — pure-split round: skip the
-            # execution phase entirely and re-enter verification, which
-            # now runs the split children. The callback is invoked with a
-            # synthetic rc=0 because no subprocess ran; its body only
-            # reloads state, bumps the round and launches the next
-            # verification cycle. ``_on_repair_complete`` must be the
-            # nested def above (the name is only bound once execution
-            # reaches it — hence this dispatch living here, after it).
-            if _pure_split:
-                _split_ids = [
-                    s.get("vp_id") for s in (result.get("vp_splits") or [])
-                    if isinstance(s, dict)
-                ]
-                _server.logger.warning(
-                    "[Auto-Verification] Round %d: pure split (%s) — "
-                    "skipping the execution phase, re-entering verification",
-                    round_num, ", ".join(str(i) for i in _split_ids),
-                )
-                _split_state = _server._verification_state.get(plan_id)
-                if _split_state is not None:
-                    _split_state["vp_splits"] = result.get("vp_splits") or []
-                    _split_state["stop_reason"] = "vp_split_no_repair_tasks"
-                    _split_state["updated_at"] = datetime.now().isoformat()
-                try:
-                    _on_repair_complete(0)
-                except Exception:
-                    _server.logger.exception(
-                        "[Auto-Verification] pure-split chain crashed "
-                        "plan=%s", plan_id,
-                    )
-                    _record_terminal("failed", "vp_split_chain_crashed")
-                # 2026-09-23: this exit has no subprocess of its own to
-                # report from — ``_on_repair_complete(0)`` ran inline, so
-                # by the time it returns the nested chain has either
-                # settled (nothing in flight, reap as usual) or dispatched
-                # a repair of its own (still in flight, defer).
-                outcome.handed_off = _server._plan_execution_in_flight(plan_id)
+            except Exception as e:
+                print(f"[Auto-Verification] Round {round_num}: Exception - {e}")
+                import traceback
+                traceback.print_exc()
+                # 2026-09-07: removed the inline ``ps.transition_to``
+                # calls — when the orchestrator already advanced the plan
+                # to ``verification_failed`` / ``verification_repairing``
+                # before the exception, ``transition_to("verification_failed")``
+                # raised ``Illegal transition`` and the
+                # ``except ValueError as ve`` swallowed it without any
+                # further state update. ``_record_terminal`` routes
+                # through ``_persist_verification_terminal`` which
+                # internally uses ``transition_to`` + ``force_set_phase``
+                # for terminal re-entry, so the plan always settles.
+                _record_terminal("failed", str(e))
                 return
-
-            _server._run_repair_execution_async(
-                plan_id, project_dir, tool=tool,
-                on_complete=_on_repair_complete,
-                outcome=outcome,
-            )
-            return
-        except VerificationCancelled as cancelled:
-            # 2026-10-22 — the operator stopped this plan while the
-            # round was judging / generating repair tasks.
-            #
-            # This is NOT a failed round, so it must not be recorded as
-            # one. The arm below would call ``_record_terminal
-            # ("failed", …)``, which advances the plan to
-            # ``verification_failed`` — a terminal verdict on a round
-            # the operator paused on purpose, and the exact thing the
-            # 2026-09-15 rework was about ("the verification thread
-            # kept going … re-stamping the stage the operator had just
-            # parked").
-            #
-            # So: no terminal record, no failure record, no repair
-            # tasks, no retry. The phase is left exactly where the
-            # stop left it — the stop route parks a verification-half
-            # stop at ``verification`` ("the round is paused, not
-            # finished"), and a stop during the repair executor at
-            # ``verification_repairing``. Moving it from here would
-            # fight that CAS, which this module is not allowed to do
-            # (``routes/verification.py`` owns the stop's target
-            # phase).
-            #
-            # What the operator gets from ``/start`` is the ordinary
-            # path: the round is picked up again, and the repair
-            # generation re-opens the session the stopped round was
-            # using (see ``repair_generator.repair_content_session``),
-            # so the interrupted work is not paid for twice.
-            _server.logger.warning(
-                "[Auto-Verification] Round %d cancelled by the operator "
-                "stop plan=%s — no terminal record, no repair tasks",
-                round_num, plan_id,
-            )
-            print(
-                f"[Auto-Verification] Round {round_num}: cancelled by the "
-                f"operator stop — {cancelled}"
-            )
-            return
-        except Exception as e:
-            print(f"[Auto-Verification] Round {round_num}: Exception - {e}")
-            import traceback
-            traceback.print_exc()
-            # 2026-09-07: removed the inline ``ps.transition_to``
-            # calls — when the orchestrator already advanced the plan
-            # to ``verification_failed`` / ``verification_repairing``
-            # before the exception, ``transition_to("verification_failed")``
-            # raised ``Illegal transition`` and the
-            # ``except ValueError as ve`` swallowed it without any
-            # further state update. ``_record_terminal`` routes
-            # through ``_persist_verification_terminal`` which
-            # internally uses ``transition_to`` + ``force_set_phase``
-            # for terminal re-entry, so the plan always settles.
-            _record_terminal("failed", str(e))
-            return
+    finally:
+        _close_round_in_ledger(plan_dir, round_token)
 
     # 2026-09-17 — REACHABLE, and no longer a "safety net".
     #

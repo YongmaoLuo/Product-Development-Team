@@ -40,6 +40,16 @@ from sub_agent_registry import SubAgentHandle, sub_agent_registry
 
 PLAN = "plan-triage"
 
+#: The stop_reason each trigger must be recorded with.  The assertions
+#: below read the expected value out of here and name the trigger they
+#: exercise, so an assertion always states the reason of the TRIGGER —
+#: never a literal that could belong to a different one.  (Before
+#: 2026-11-02 the watchdog recorded ``verification_thread_died_unexpectedly``
+#: for every trigger, so a round declared dead because its log went
+#: silent was written down as a thread death.)
+LOG_STALE_STOP_REASON = "verification_log_stale"
+THREAD_DEATH_STOP_REASON = "verification_thread_died_unexpectedly"
+
 
 # ---------------------------------------------------------------------------
 # fixtures
@@ -108,7 +118,7 @@ def plan_env(tmp_path, monkeypatch):
 def _run_lazy_check() -> Mock:
     """Invoke the lazy check with the terminal-persist call observable."""
     with patch.object(server_mod, "_persist_verification_terminal") as persist, \
-         patch.object(server_mod, "_mark_verification_failed_dead"), \
+         patch.object(server_mod, "_mark_verification_failed_dead") as mark, \
          patch.object(server_mod, "_update_plan_state_to_terminal"), \
          patch.object(server_mod, "_kill_orphaned_vp_processes",
                       return_value=[]) as orphan_kill, \
@@ -116,6 +126,10 @@ def _run_lazy_check() -> Mock:
         server_mod._lazy_check_verification(PLAN)
     persist._orphan_kill = orphan_kill  # type: ignore[attr-defined]
     persist._handle_kill = handle_kill  # type: ignore[attr-defined]
+    # The mark that writes the in-memory state + the side-channel
+    # snapshot.  It is called with the reason the ladder detected, so
+    # its call args are the second half of "the record says why".
+    persist._mark = mark  # type: ignore[attr-defined]
     return persist
 
 
@@ -182,9 +196,11 @@ def test_no_signal_past_hard_cap_flags_and_kills(plan_env):
     persist.assert_called_once()
     assert persist.call_args[0][0] == PLAN
     assert persist.call_args[0][1] == "failed"
-    assert persist.call_args[0][2] in (
-        "verification_log_stale", "verification_results_stale",
-    )
+    # The trigger is the silent round log — that is the reason the
+    # round is written off with.
+    assert persist.call_args[0][2] == LOG_STALE_STOP_REASON
+    # And the in-memory mark is told the same reason.
+    assert persist._mark.call_args[0][1] == LOG_STALE_STOP_REASON  # type: ignore[attr-defined]
     persist._orphan_kill.assert_called_once()  # type: ignore[attr-defined]
     assert "VP-023" in persist._orphan_kill.call_args[0][0]  # type: ignore[attr-defined]
 
@@ -230,9 +246,10 @@ def test_no_running_vp_with_live_thread_flags_past_hard_cap(plan_env):
     persist = _run_lazy_check()
 
     persist.assert_called_once()
-    assert persist.call_args[0][2] in (
-        "verification_log_stale", "verification_results_stale",
-    )
+    # The trigger is the silent round log — that is the reason the
+    # round is written off with.
+    assert persist.call_args[0][2] == LOG_STALE_STOP_REASON
+    assert persist._mark.call_args[0][1] == LOG_STALE_STOP_REASON  # type: ignore[attr-defined]
 
 
 def test_no_running_vp_with_dead_thread_flags_immediately(plan_env):
@@ -247,7 +264,10 @@ def test_no_running_vp_with_dead_thread_flags_immediately(plan_env):
     persist = _run_lazy_check()
 
     persist.assert_called_once()
-    assert persist.call_args[0][2] == "verification_thread_died_unexpectedly"
+    # The trigger is the dead thread — that is the reason the round is
+    # written off with.
+    assert persist.call_args[0][2] == THREAD_DEATH_STOP_REASON
+    assert persist._mark.call_args[0][1] == THREAD_DEATH_STOP_REASON  # type: ignore[attr-defined]
 
 
 def test_thread_death_cleans_up_processes(plan_env):
@@ -267,7 +287,10 @@ def test_thread_death_cleans_up_processes(plan_env):
     persist = _run_lazy_check()
 
     persist.assert_called_once()
-    assert persist.call_args[0][2] == "verification_thread_died_unexpectedly"
+    # The trigger is the dead thread — that is the reason the round is
+    # written off with.
+    assert persist.call_args[0][2] == THREAD_DEATH_STOP_REASON
+    assert persist._mark.call_args[0][1] == THREAD_DEATH_STOP_REASON  # type: ignore[attr-defined]
     persist._handle_kill.assert_called_once()  # type: ignore[attr-defined]
     # And the handle must have been unregistered by the cleanup.
     assert sub_agent_registry.all_handles(PLAN) == []
