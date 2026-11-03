@@ -3,7 +3,8 @@
 背景
 ----
 根因链（``_root_cause_chain_decision``）里有一条分支：根因报告回来了，但既
-没有 ``## 改动范围`` 段，也没有 JSON 正文 —— 范围是空的。猜范围就是让修复
+没有 ``json`` 声明块（整份报告不是 JSON，报告里也没有 ``json`` 围栏块）
+—— 范围是空的。猜范围就是让修复
 任务去动错的文件，所以这一步直接转人工（``BLOCKED_ON_USER`` /
 ``root_cause_report_without_scope``）。
 
@@ -16,7 +17,7 @@
 1. ``test_report_without_scope_blocks_and_warns`` —— 缺范围的报告让链判
    blocked（``root_cause_scope_missing == ["VP-3"]``、``blocked_on_user``、
    不派新任务），并且**留下一个可查的告警事件**：事件名稳定，四个字段齐全。
-2. ``test_scope_report_is_not_flagged`` —— 报告带了 ``## 改动范围`` 时，
+2. ``test_scope_report_is_not_flagged`` —— 报告用 ``json`` 块声明了范围时，
    **没有**这个告警事件，而且照常派实现任务（负控）。
 
 轮次序列
@@ -252,14 +253,14 @@ def _write_report(plan_dir, report):
 def _write_root_cause_report(plan_dir, scope=()):
     """The root cause report the diagnosis task delivers.
 
-    ``scope`` empty → the report names **no** file to change: neither a
-    ``改动范围`` section nor a JSON body. That is the diagnosis that came
-    back without saying what to change — nobody can act on it, so it goes
-    to a human.
+    ``scope`` empty → the report declares **no** file to change: no
+    ``json`` block. That is the diagnosis that came back without saying
+    what to change — nobody can act on it, so it goes to a human.
 
-    ``scope`` non-empty → the report names those paths under a
-    ``改动范围`` heading, and that section is the implementation task's
-    ``files_to_modify``.
+    ``scope`` non-empty → the report declares those paths in a ``json``
+    block, and that declaration is the implementation task's
+    ``files_to_modify``. The reader reads declarations, not prose: a
+    scope section written as bullets is not a declaration.
     """
     reports_dir = plan_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -271,9 +272,19 @@ def _write_root_cause_report(plan_dir, scope=()):
         "",
     ]
     if scope:
-        body.append("## 改动范围")
-        body.extend(f"- `{path}`" for path in scope)
-        body.append("")
+        body.extend([
+            "## 改动范围",
+            "",
+            "```json",
+            "{",
+            '  "files_to_modify": %s,' % json.dumps(
+                list(scope), ensure_ascii=False,
+            ),
+            '  "fix_plan": "在鉴权中间件里补一条身份检查"',
+            "}",
+            "```",
+            "",
+        ])
     body.extend([
         "## 验收方式",
         "pytest -q backend/tests/test_service.py",
@@ -346,7 +357,7 @@ def test_report_without_scope_blocks_and_warns(
 ):
     """根因报告没说要改哪里 → 链判 blocked，并且**留下告警**。
 
-    报告回来了，但既没有 ``## 改动范围`` 段，也没有 JSON 正文。范围是空
+    报告回来了，但里面没有 ``json`` 声明块。范围是空
     的 —— 没有范围就没有「改哪里」，猜出来的范围会让修复任务去动错的文
     件，所以这一步转人工。
 
@@ -417,7 +428,7 @@ def test_report_without_scope_blocks_and_warns(
 
 
 def test_scope_report_is_not_flagged(plan_dir, project_dir, repair_mocks):
-    """报告带了 ``## 改动范围`` → 没有告警，照常派实现任务。
+    """报告用 ``json`` 块声明了范围 → 没有告警，照常派实现任务。
 
     这是上面那条契约的**负控**：如果缺范围的报告和带范围的报告都告警，那
     告警就不再是「出了什么事」的信号，而是一段噪声 —— 它指向的问题也就

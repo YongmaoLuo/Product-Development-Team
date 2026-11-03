@@ -139,6 +139,12 @@ CHAIN_STAGE_BLOCKED_ON_USER = "BLOCKED_ON_USER"
 #: dictate — but the *scope* it delivers is not optional: the
 #: implementation task's ``files_to_modify`` is exactly these paths, and
 #: a task without a blast radius is a task that guesses.
+#:
+#: The reader does **not** scan these sections any more — it reads the
+#: author's declaration (see :func:`_root_cause_scope_from_text`). The
+#: headings stay because the author-side template offers one of them as
+#: the human-readable title of the scope section, and the two sides
+#: keep naming the same section.
 _ROOT_CAUSE_SCOPE_HEADINGS = (
     "改动范围",
     "修改范围",
@@ -213,73 +219,63 @@ def _parse_failure_fingerprints(raw: Any) -> Dict[str, List[Optional[str]]]:
     return out
 
 
-def _looks_like_path(token: str) -> bool:
-    """Whether a token is a relative path a report names.
+#: The fence that carries a **declaration** in a report.
+#:
+#: Only a block whose info string is exactly ``json`` is read. A
+#: ``python`` block, a ``bash`` block and a tilde fence are not
+#: declarations, and prose is not a declaration either — the reader
+#: reads what the author declared, and nothing else.
+_JSON_FENCE_RE = re.compile(
+    r"^[ \t]*```[ \t]*json(?![A-Za-z0-9_])[ \t]*\r?\n?(.*?)```",
+    re.DOTALL | re.MULTILINE,
+)
 
-    A path is a path because it says where it is: it carries a ``/`` and
-    nothing else that would make it prose. A URL is not a path in this
-    repository, and a bare word is a sentence, not a file.
+
+def _loads_json(text: str) -> Optional[Any]:
+    """Parse one JSON body, or ``None`` when it is not JSON.
+
+    A report that is not JSON is read as a report, not as broken JSON:
+    the caller moves on to the next candidate.
     """
-    if not token or " " in token or "\t" in token:
-        return False
-    if "/" not in token:
-        return False
-    if token.startswith(("#", ">", "|")):
-        return False
-    if "://" in token:
-        return False
-    return True
+    candidate = (text or "").strip()
+    if not candidate:
+        return None
+    try:
+        return json.loads(candidate)
+    except (ValueError, TypeError):
+        return None
 
 
-def _scope_tokens(line: str) -> List[str]:
-    """The paths one line of a report's scope section names.
+def _json_bodies(text: str) -> List[Any]:
+    """The JSON bodies a report carries, in the order they are tried.
 
-    A scope line is written by a person (or a model) writing prose: it
-    may be a bullet, a numbered item, a ``改动范围：a.py、b.py`` line, or
-    a sentence with the paths in backticks. Every shape is read the same
-    way — strip the marker, split on the separators, keep what looks like
-    a path.
-    """
-    text = line.strip()
-    # The bullet marker and the numbering.
-    text = re.sub(r"^(?:[-*+•]|\d+[.)])\s*", "", text)
-    # A "改动范围：a.py、b.py" line carries the paths after the colon.
-    text = re.split(r"[：:]", text, maxsplit=1)[-1]
-    out: List[str] = []
-    for raw in re.split(r"[\s,，、;；]+", text):
-        token = raw.strip().strip("`").strip()
-        token = token.rstrip("。．.，,、；;")
-        if _looks_like_path(token):
-            out.append(token)
-    return out
-
-
-def _json_body(text: str) -> Optional[Any]:
-    """The JSON a report carries, if it carries any.
-
-    Two shapes: the whole file is JSON, or a fenced ```json block inside
-    a markdown report. Anything else is not JSON — a report that is not
-    JSON is read as markdown, not as broken JSON.
+    Two shapes: the whole file is JSON, or a fenced ``json`` block
+    inside a markdown report. A block in another language is not JSON
+    and is not read.
     """
     stripped = (text or "").strip()
     if not stripped:
-        return None
-    candidates = [stripped]
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", stripped, re.DOTALL)
-    if fenced:
-        candidates.append(fenced.group(1).strip())
-    for candidate in candidates:
-        if not candidate.startswith(("{", "[")):
-            continue
-        try:
-            return json.loads(candidate)
-        except (ValueError, TypeError):
-            continue
-    return None
+        return []
+    bodies: List[Any] = []
+    if stripped.startswith(("{", "[")):
+        body = _loads_json(stripped)
+        if body is not None:
+            bodies.append(body)
+    for block in _JSON_FENCE_RE.findall(stripped):
+        body = _loads_json(block)
+        if body is not None:
+            bodies.append(body)
+    return bodies
 
 
 def _paths_from_report(body: Any) -> List[str]:
-    """The paths a JSON report body names."""
+    """The paths a JSON report body declares.
+
+    The declaration is one of three shapes: a top-level array of
+    paths, a ``paths`` / ``files_to_modify`` array, or the same key
+    nested under ``fix_plan``. A key that is present but empty does
+    not end the search — the next candidate is read.
+    """
     if isinstance(body, list):
         return [
             str(item).strip()
@@ -291,11 +287,13 @@ def _paths_from_report(body: Any) -> List[str]:
     for key in ("paths", "files_to_modify"):
         value = body.get(key)
         if isinstance(value, (list, tuple)):
-            return [
+            paths = [
                 str(item).strip()
                 for item in value
                 if isinstance(item, str) and item.strip()
             ]
+            if paths:
+                return paths
         if isinstance(value, str) and value.strip():
             return [value.strip()]
     fix_plan = body.get("fix_plan")
@@ -305,46 +303,32 @@ def _paths_from_report(body: Any) -> List[str]:
 
 
 def _root_cause_scope_from_text(text: str) -> List[str]:
-    """The relative paths a root-cause report names.
+    """The relative paths a root-cause report **declares**.
 
-    The report is the diagnosis's deliverable, and the scope it delivers
-    is what the implementation task is allowed to change. So the scope is
-    read out of the report — never guessed from the failure.
+    The report is the diagnosis's deliverable, and the scope it
+    delivers is what the implementation task is allowed to change. So
+    the scope is read out of the report — never guessed from the
+    failure, and never inferred from prose.
 
-    Two shapes are read: a JSON body (the whole file, or a fenced
-    ``json`` block) and a markdown section under a scope heading. A
-    report that names no path yields no scope, and the caller then
+    Prose is not a declaration. A scope section written as bullets, a
+    sentence or a table cannot be read, because nothing in the text
+    says whether a path it names is one this task will really create
+    or one it merely mentions as an example — and reading it wrong
+    locks the wrong files and unlocks the right ones. So the author
+    **declares** the scope in a typed container: the whole report is
+    JSON, or the report carries a ``json`` fenced block. The first
+    candidate that declares a non-empty scope wins.
+
+    A report that declares no scope yields none, and the caller then
     refuses to build an implementation task rather than invent one.
     """
     if not text:
         return []
-    body = _json_body(text)
-    if body is not None:
+    for body in _json_bodies(text):
         paths = _paths_from_report(body)
         if paths:
             return paths
-    paths: List[str] = []
-    in_scope = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            heading = stripped.lstrip("#").strip().lower()
-            in_scope = any(
-                heading.startswith(candidate.lower())
-                for candidate in _ROOT_CAUSE_SCOPE_HEADINGS
-            )
-            continue
-        if not in_scope:
-            continue
-        paths.extend(_scope_tokens(stripped))
-    seen: Set[str] = set()
-    unique: List[str] = []
-    for path in paths:
-        if path in seen:
-            continue
-        seen.add(path)
-        unique.append(path)
-    return unique
+    return []
 
 
 def _is_counted_failure(key: Tuple[str, str]) -> bool:
