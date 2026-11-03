@@ -49,6 +49,8 @@ from verification_split import SplitDecision
 from verification_subagent import (
     DEFAULT_FAILURE_CLASS,
     DEFAULT_FAILURE_CLASS_SOURCE,
+    DETERMINISTIC_FAILURE_CLASS_SOURCE,
+    INFRA_FAILURE_CLASS,
     VerificationSubAgent,
     Verdict,
 )
@@ -116,6 +118,15 @@ from verification_evidence import (  # noqa: E402
     tree_fingerprint,
     tree_mutated,
 )
+
+# 2026-11-02（轮次结束隔离越权改动）：验证子 agent 本该只读被验证仓库。护栏
+# 拦下的越界写会在 plan 目录里留下拒绝证据；轮次收尾据此把工作树里可能漏网
+# 的越权改动存成 patch，并把树还原到基线。
+#
+# 两条导入都是**模块级**的，跟上面的 `base_drift` 同一个理由：测试要能
+# monkeypatch 本模块上的名字（打在源模块上的桩打不中真正被调用的那一份）。
+from verification_quarantine import quarantine_and_restore  # noqa: E402
+from verification_write_guard import read_refusals  # noqa: E402
 
 # 2026-10-29（base drift 预检）：漂移检查走 ``base_drift`` **模块本身**
 # —— ``base_drift.check_and_merge_base(...)``，而不是 ``from base_drift
@@ -6236,6 +6247,129 @@ class Orchestrator:
             )
             return None
 
+    def _quarantine_round_tree_mutation(self, executor: Any) -> Optional[Path]:
+        """Undo a verifier's mutation of the tree it was supposed to read.
+
+        The write guard (``verification_write_guard``) refuses an
+        out-of-scope write and leaves the refusal on record under
+        ``<plan>/vp_write_scope/refusals/round-<n>/<vp>.jsonl``.  A
+        refusal is evidence, not a guarantee: the guard only knows the
+        write paths it can recognise, and a sub-agent that slips past it
+        leaves the tree it was supposed to only read changed.
+
+        So the round settles the question at its end.  If the round has
+        refusal evidence, whatever the tree is carrying is quarantined:
+        the mutation is saved as a patch under the plan directory and the
+        tree goes back to the commit it was on.  The patch is what makes
+        that safe — the mutation is not thrown away, it is filed, where
+        it can be looked at and replayed.
+
+        Three outcomes, and each of them is a fact worth recording:
+
+          * **no refusals** → nothing is touched.  The tree may be dirty
+            because somebody else is working in it, and this method does
+            not get to decide that somebody else's change is garbage.
+          * **refusals, clean tree** → the guard did its job; there is
+            nothing to save.  The event still goes out, because "the
+            verifier tried to write and was stopped" is exactly what the
+            operator has to know.
+          * **refusals, dirty tree** → the mutation is saved as a patch
+            and the tree is restored.
+
+        Never raises.  A quarantine that cannot be completed is recorded
+        with its reason in the event's ``error`` field and the round
+        carries on: the round's own verdict must not be replaced by a
+        failure of the clean-up.
+
+        Position matters: this must run **before** the deferred evidence
+        checks are flushed.  The flush re-runs those checks against the
+        tree, and it can only answer about a tree that is back where it
+        belongs.
+
+        Args:
+            executor: The executor that ran the round.  Consulted for the
+                round number when the orchestrator does not know it.
+
+        Returns:
+            The path of the patch the mutation was saved as, or ``None``
+            when there was nothing to save.
+        """
+        round_no = getattr(self, "_current_round", 0) or 0
+        if not round_no:
+            round_no = getattr(executor, "_round_no", 0) or 0
+
+        plan_dir = getattr(self, "plan_dir", None)
+        if not plan_dir:
+            return None
+
+        try:
+            refusals = read_refusals(plan_dir, round_no)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "[verification_quarantine] could not read the round's refusals",
+            )
+            return None
+
+        if not refusals:
+            # No refusal evidence → the tree is not this method's business.
+            return None
+
+        vps = sorted({
+            str(record.get("vp_id") or "").strip()
+            for record in refusals
+            if isinstance(record, dict) and str(record.get("vp_id") or "").strip()
+        })
+
+        patch_path: Optional[Path] = None
+        restored: List[str] = []
+        failed: List[str] = []
+        clean = False
+        error = ""
+        try:
+            result = quarantine_and_restore(
+                getattr(self, "project_dir", None),
+                plan_dir,
+                f"round-{round_no}",
+            )
+            patch_path = result.patch_path
+            restored = list(result.restored)
+            failed = list(result.failed)
+            clean = result.clean
+            error = result.error
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception(
+                "[verification_quarantine] the round-end quarantine failed",
+            )
+            error = f"the quarantine could not be completed: {exc}"
+
+        event: Dict[str, Any] = {
+            "plan_id": Path(plan_dir).name,
+            "round": round_no,
+            "patch": str(patch_path) if patch_path else None,
+            "restored": restored,
+            "vps": vps,
+            "clean": clean,
+        }
+        if failed:
+            event["failed"] = failed
+        if error:
+            event["error"] = error
+
+        try:
+            self._safe_log_freshness_event(
+                "__round__",
+                "verifier_mutated_tree_quarantined",
+                event,
+            )
+        except Exception:  # pragma: no cover - defensive
+            # The tree is already back where it belongs; losing the event
+            # is bad, but losing the round over it is worse.
+            logger.exception(
+                "[verification_quarantine] could not record the quarantine event",
+            )
+
+        return patch_path
+
     def _flush_deferred_evidence_checks(
         self, executor: Any,
     ) -> List[str]:
@@ -8619,13 +8753,26 @@ class Orchestrator:
             # propagate — this is best-effort.
             log_dir = None  # type: ignore[assignment]
 
+        # 2026-11-02（写入范围落地）：把 plan 目录与本轮轮次交给子 agent ——
+        # 它据此在 settings.json 里声明自己的可写范围（plan 目录 + 轮次）。
+        # ``getattr`` 而不是 ``self._current_round``：轮次是**本轮**的
+        # 状态，还没起轮次时它根本不存在（按 0 算，与 builder 的缺省一致）。
         verdict = await sub_agent.run(
             vp_node=vp,
             coding_tool=self.coding_tool,
             log_dir=log_dir,
             project_dir=self.project_dir,
             plan_id=self.plan_dir.name,
+            plan_dir=self.plan_dir,
+            round_no=getattr(self, "_current_round", 0),
         )
+
+        # 2026-11-02（写入范围落地）：写护栏把这个 VP 越权写被验证仓库的
+        # 尝试记在了案，而子 agent 自己不会读这份账本 —— 它照样交回一个
+        # PASSED。那条 PASSED 是在一个**它自己动过手脚**的树上给出的，
+        # 所以这里按拒绝证据把它改判掉（arch 决策点 3：VP 级失败原因
+        # verifier_mutated_tree）。
+        verdict = self._apply_refusal_evidence(verdict, vp_id)
 
         # Persist a sub-agent_completed event so the JSONL audit
         # log can correlate the sub-agent's verdict with the
@@ -8648,6 +8795,102 @@ class Orchestrator:
             pass
 
         return verdict
+
+    def _apply_refusal_evidence(self, verdict: Verdict, vp_id: str) -> Verdict:
+        """A VP that tried to write the tree it verified gets no PASSED.
+
+        2026-11-02（写入范围落地）：写护栏把越界的写机械拒绝，并把拒绝
+        记在 ``<plan>/vp_write_scope/refusals/round-<n>/<vp>.jsonl`` 里。
+        护栏读得见这份账本，子 agent 读不到 —— 它照样交回一个 PASSED。
+        而那个 PASSED 是在一个**它自己动过手脚**的树上给出的：结论的依据
+        已经不可信了。所以有拒绝记录的 VP 一律改判 FAILED，原因是
+        ``verifier_mutated_tree``（arch 决策点 3）。
+
+        改判后的失败分类是 ``infra``：这次出问题的不是交付物，是这次
+        尝试本身出了 malfunction（护栏拦下了它）。来源是
+        ``deterministic``：这个分类是**按规则推出来的**，不是模型说的。
+
+        只读**本 VP、本轮**的记录 —— 别的 VP 的越权写不该算在这个 VP
+        头上，别的轮次的记录也不该算进这一轮。provider / chosen_model /
+        model_complexity 沿用原 verdict：路由是这次尝试的事实，改判结论
+        不改变它。
+
+        读证据失败 → 原样返回 verdict。护栏的账本坏了，不等于这个 VP
+        越权了；拿一个读不出来的账本去否证一个 VP，比放过它更坏。
+
+        Args:
+            verdict: The verdict the sub-agent handed back.
+            vp_id: The VP the verdict belongs to.
+
+        Returns:
+            The rewritten verdict, or the original one when there is no
+            refusal evidence for this VP in this round.
+        """
+        plan_dir = getattr(self, "plan_dir", None)
+        if not plan_dir:
+            return verdict
+
+        round_no = getattr(self, "_current_round", 0) or 0
+
+        try:
+            refusals = read_refusals(plan_dir, round_no, vp_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "[verification_write_guard] could not read %s's refusals", vp_id,
+            )
+            return verdict
+
+        if not refusals:
+            # No refusal evidence → the sub-agent's verdict stands.
+            return verdict
+
+        records = [r for r in refusals if isinstance(r, dict)]
+        paths: List[str] = []
+        evidence: List[str] = []
+        for record in records:
+            path = str(record.get("path") or "").strip()
+            tool = str(record.get("tool") or "unknown")
+            reason = str(record.get("reason") or "")
+            if path and path not in paths:
+                paths.append(path)
+            evidence.append(f"{tool} → {path}（{reason}）")
+
+        reasons = [f"verifier_mutated_tree: 尝试写 {path}" for path in paths]
+        if not reasons:
+            reasons.append(
+                "verifier_mutated_tree: 有写被拒绝（路径未记录）",
+            )
+
+        event: Dict[str, Any] = {
+            "vp_id": vp_id,
+            "round": round_no,
+            "paths": paths,
+            # How many writes were refused — a path refused twice is one
+            # path but two attempts, and the operator wants both numbers.
+            "count": len(records),
+        }
+        try:
+            self._safe_log_freshness_event(vp_id, "verifier_mutated_tree", event)
+        except Exception:  # pragma: no cover - defensive
+            # The verdict is already rewritten; losing the event is bad,
+            # losing the round over it is worse.
+            logger.exception(
+                "[verification_write_guard] could not record the mutation event",
+            )
+
+        return Verdict(
+            verdict="FAILED",
+            reasons=reasons,
+            evidence=evidence,
+            provider=verdict.provider,
+            chosen_model=verdict.chosen_model,
+            model_complexity=verdict.model_complexity,
+            failure_class=INFRA_FAILURE_CLASS,
+            failure_class_source=DETERMINISTIC_FAILURE_CLASS_SOURCE,
+            # The quote has to appear verbatim in the reason text — it is
+            # the anchor a human reads before acting on the claim.
+            evidence_quote=reasons[0],
+        )
 
     @staticmethod
     def _verdict_to_result(vp_id: str, verdict: Verdict) -> dict:
@@ -9787,6 +10030,22 @@ class Orchestrator:
                     nest_asyncio.apply()
                     asyncio.run(executor.run(max_parallel=0))
             finally:
+                # 2026-11-02（轮次结束隔离越权改动）：护栏拦下的越界写在 plan
+                # 目录里留下了拒绝证据；轮次收尾据此把工作树里可能漏网的越权
+                # 改动存成 patch，并把树还原到基线。
+                #
+                # 位置承重：必须在 deferred 核对重跑**之前** —— 核对是对着
+                # **活的**树做的，树还原了它才能对一棵干净的树重跑。
+                #
+                # 这里再兜一层：finally 里的异常会**替换**正在飞的那一个，
+                # 所以隔离自己抛异常的话，轮次真正的失败原因就被它盖住了。
+                # 隔离内部已经吞掉异常并记进事件，这里防的是它自己崩掉。
+                try:
+                    self._quarantine_round_tree_mutation(executor)
+                except Exception:
+                    logger.exception(
+                        "[verification_quarantine] round-end quarantine failed",
+                    )
                 # 2026-10-23（轮次结束重跑挂起的核对）：挂起的核对是"这一轮
                 # 欠下的账"——轮次崩了也不能赖掉，所以这一步放在 finally 里。
                 #
