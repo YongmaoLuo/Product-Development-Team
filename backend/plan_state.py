@@ -1267,6 +1267,18 @@ class PlanState:
                 'same_failure_repeated_after_max_attempts' (2026-09-12: used when the consecutive-same-failure cap fires
                 after MAX attempts),
                 'repair_execution_failed', 'exception'.
+
+        The **first** reason wins (2026-11-03). A verification cycle that
+        is already terminated keeps the reason it was given first; a
+        later attempt only logs. Overwriting erased the real cause of
+        the termination — one plan ended its round with
+        ``base_drift_conflicts`` and a later stop rewrote the field to
+        ``user_stopped``, so the operator read the second reason as the
+        cause.
+
+        The vocabulary check runs **before** the keep-or-write
+        decision: an invalid reason is an error whether or not a reason
+        is already recorded.
         """
         valid_reasons = {
             "max_rounds_reached", "user_stopped",
@@ -1276,6 +1288,18 @@ class PlanState:
         }
         if reason not in valid_reasons:
             raise ValueError(f"Invalid stop reason: {reason}. Must be one of {valid_reasons}")
+
+        existing = (self._state.get("verification") or {}).get("stop_reason")
+        if existing:
+            # The reason is already there — keep it, change nothing else,
+            # and leave a trail for whoever tried to overwrite it.
+            logger.info(
+                "plan_stop_reason_kept plan=%s kept=%s attempted=%s",
+                self._state.get("plan_id") or self.plan_dir.name,
+                existing,
+                reason,
+            )
+            return
 
         self._state["verification"]["stop_reason"] = reason
         self.transition_to("verification_loop_stopped")
