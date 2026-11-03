@@ -18,6 +18,8 @@ description was replaced by a placeholder (see
 :data:`MERGE_REQUIRED_FIELDS`).
 """
 
+import json
+from collections.abc import Mapping
 from typing import Any, Iterable
 
 #: Fields an orphan row must carry for a loader to merge its REAL content
@@ -74,6 +76,113 @@ def missing_merge_fields(entry: Any) -> Iterable[str]:
         return list(MERGE_REQUIRED_FIELDS)
 
 
+#: The machine-readable marker that carries the report contract through
+#: the one free-form column ``plan_tasks`` still has: ``description``.
+#:
+#: Why a marker and not two columns: the verification-mode scope gate
+#: freezes the state schema (``backend/tests/static_gates/
+#: test_verification_mode_scope_gates.py`` pins the DDL hash), so
+#: ``deliverable`` / ``report_path`` cannot be added to ``plan_tasks``.
+#: The description, on the other hand, is stored verbatim and read back
+#: unchanged — it is the only place where a contract can ride along
+#: without touching the schema.
+#:
+#: The marker is one line, so a reader can find it without knowing
+#: anything about the rest of the description, and a description that
+#: does not carry it simply keeps ``SubTask``'s ``deliverable="code"``
+#: default.
+REPORT_DELIVERABLE_MARKER = "PDT_REPORT_DELIVERABLE:"
+
+
+def report_deliverable_marker(report_path: str) -> str:
+    """The marker line that carries a report task's contract.
+
+    Args:
+        report_path: where the report has to land.  Absolute when the
+            caller knows which directory the task runs in — the fence
+            that guards the write and the audit that reads the file
+            back must agree on the same path.
+
+    Returns:
+        One line: the marker, a space, and a JSON object carrying
+        ``deliverable`` and ``report_path``.
+    """
+    payload = {"deliverable": "report", "report_path": str(report_path)}
+    return (
+        f"{REPORT_DELIVERABLE_MARKER} "
+        f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
+    )
+
+
+def parse_report_deliverable(description: Any) -> dict:
+    """The report contract a description carries, as a matching PAIR.
+
+    ``SubTask`` refuses a ``report_path`` on a ``code`` task and a
+    ``report`` deliverable without a path, so the two fields can only
+    ever travel together.
+
+    A description without the marker — every task that hands back a
+    diff — contributes nothing, so the merged orphan keeps ``SubTask``'s
+    own ``deliverable="code"`` default.  A malformed marker is ignored
+    rather than raised: orphan reconciliation is best-effort and must
+    not be able to bring down ``_load_tasks``.
+    """
+    if not description:
+        return {}
+    try:
+        lines = str(description).splitlines()
+    except Exception:  # pragma: no cover - str() of anything works
+        return {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith(REPORT_DELIVERABLE_MARKER):
+            continue
+        raw = stripped[len(REPORT_DELIVERABLE_MARKER):].strip()
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        if payload.get("deliverable") != "report":
+            continue
+        report_path = str(payload.get("report_path") or "").strip()
+        if not report_path:
+            continue
+        return {"deliverable": "report", "report_path": report_path}
+    return {}
+
+
+def _deliverable_kwargs(entry: Any) -> dict:
+    """The deliverable fields of an orphan row, as a matching PAIR.
+
+    ``SubTask`` refuses a ``report_path`` on a ``code`` task and a
+    ``report`` deliverable without a path, so the two fields can only
+    ever travel together.  Carrying one without the other would make
+    the merged orphan un-constructable — the loader would raise instead
+    of recovering the row, which is the one thing orphan reconciliation
+    must not do.
+
+    The pair is read from the row's own columns when it has them, and
+    otherwise from the marker in the description — the schema is frozen,
+    so ``plan_tasks`` has no ``deliverable`` / ``report_path`` columns
+    and the description is where the contract travels.
+
+    A row that declares neither (the historical shape — every task was
+    a code task) contributes nothing, so the merged orphan keeps
+    ``SubTask``'s own ``deliverable="code"`` default.
+    """
+    try:
+        deliverable = entry.get("deliverable")
+        report_path = entry.get("report_path")
+        description = entry.get("description")
+    except AttributeError:
+        return {}
+    if deliverable == "report" and str(report_path or "").strip():
+        return {"deliverable": "report", "report_path": str(report_path)}
+    return parse_report_deliverable(description)
+
+
 def merged_subtask_kwargs(entry: Any) -> dict:
     """The ``SubTask`` keyword arguments to build a merged orphan.
 
@@ -95,4 +204,4 @@ def merged_subtask_kwargs(entry: Any) -> dict:
             "task_group", "verification_only",
         )
         if entry.get(k) is not None
-    }
+    } | _deliverable_kwargs(entry)

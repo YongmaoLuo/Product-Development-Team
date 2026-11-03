@@ -97,6 +97,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -812,6 +813,106 @@ def _stop_server(proc: subprocess.Popen, port: int, timeout: float = 10.0) -> No
             f"this fixture started would outlive the test that spawned it "
             f"and answer a later run's health probe."
         )
+
+
+@pytest.mark.unit
+def test_the_stop_path_never_names_the_test_sessions_own_group(
+    monkeypatch,
+):
+    """The group this module signals is never the test session's own.
+
+    ``_stop_server`` signals a *group* when the spawn created one, so
+    the group it picks has to be a group this module owns.  A group
+    that holds the test session would take the whole suite down with
+    it -- that is the shape the SIGTERM that ended a gate run had:
+    ``os.killpg`` aimed at the group the pytest process was in.
+
+    Four groups must never be named:
+
+    * the test session's own group (the spawn did not create one),
+    * a sentinel group (``<= 1`` -- ``killpg(1, sig)`` is
+      ``kill(-1, sig)``, a signal to *every* process the caller may
+      signal),
+    * the group of a process that is already gone (the pid was
+      recycled or the process died: the group it used to lead belongs
+      to somebody else now),
+    * and the group of a spawn that created one may be named -- that
+      is the only group the stop is allowed to signal, because the
+      server starts a reaper daemon that has to go with it.
+
+    The pin is on the *choice of group*, not on the signalling: a
+    server that shares the test session's group is stopped by its pid
+    alone, which is enough to stop the server and narrow enough not to
+    take the suite with it.
+    """
+    own_group = os.getpgrp()
+
+    # 1. A process in the test session's own group: the group must be
+    #    refused, so the stop degrades to a signal at the pid alone.
+    in_session = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+    # 2. A process that leads a session of its own: that group is the
+    #    one the stop is allowed to signal.
+    own_session = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        assert os.getpgid(in_session.pid) == own_group, (
+            "the control did not land in the test session's group, so "
+            "this test would not be testing anything"
+        )
+        assert _server_group(in_session) is None, (
+            f"the stop path would signal group {own_group} -- the group "
+            f"the test session itself is in. A signal to it takes the "
+            f"whole suite down."
+        )
+        assert _server_group(own_session) == own_session.pid, (
+            "the group the spawn created is not the one the stop path "
+            "signals, so stopping the server by group would miss the "
+            "daemon it started"
+        )
+
+        # 3. A sentinel group: refused, always.
+        real_getpgid = os.getpgid
+        monkeypatch.setattr(os, "getpgid", lambda pid: 1)
+        assert _server_group(own_session) is None, (
+            "the stop path would signal group 1, which is every process "
+            "the caller may signal"
+        )
+        monkeypatch.setattr(os, "getpgid", real_getpgid)
+
+        # 4. A process that is gone: the group it used to lead belongs
+        #    to somebody else now.
+        dead = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        dead.wait(timeout=30)
+        assert _server_group(dead) is None, (
+            "the stop path would signal the group of a process that is "
+            "already gone"
+        )
+    finally:
+        for proc in (in_session, own_session):
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:  # noqa: BLE001 - cleanup must not mask
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 @pytest.fixture

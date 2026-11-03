@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import tempfile
 from collections.abc import Mapping
 from typing import Any, List, Optional, Sequence
@@ -95,8 +96,11 @@ from failure_classification import (
 
 __all__ = [
     "FINGERPRINT_LENGTH",
+    "FINGERPRINT_RULE_IDENTITY",
+    "FINGERPRINT_RULE_LEGACY",
     "canonical_fingerprint_input",
     "failure_fingerprint",
+    "fingerprint_rule",
     "needs_root_cause_task",
 ]
 
@@ -126,6 +130,82 @@ _FIXED_TMP_ROOTS = ("/private/tmp", "/tmp")
 #: second round it failed again. That is the only round at which "it failed
 #: again" and "it failed for a different reason" can be told apart.
 _ROOT_CAUSE_ROUNDS = 2
+
+
+#: The rule a fingerprint was computed under.
+#:
+#: The value is 16 hex digits and that shape is a contract (the golden
+#: fixture pins it), so the rule cannot ride *inside* the value. It
+#: rides beside it instead: the loop's payload records the rule next to
+#: the fingerprint pair, and the decision reads both.
+#:
+#: Why the rule has to be recorded at all: two fingerprints may only be
+#: compared for equality when the same rule produced them. The legacy
+#: rule hashes the run's prose; the identity rule hashes the failing
+#: case set. The *same* failure therefore has two different values, and
+#: comparing them reads "the instrument changed" as "the root cause
+#: evolved" — which re-opens a root-cause task for a failure nobody
+#: touched, every round, forever. That is the loop the report calls
+#: structurally unable to converge.
+#:
+#: The id is versioned: change a rule and its id changes with it, so a
+#: fingerprint written under the old rule is recognisably incomparable
+#: with one written under the new.
+FINGERPRINT_RULE_IDENTITY = "identity-v1"
+FINGERPRINT_RULE_LEGACY = "legacy-v2"
+
+
+# ---------------------------------------------------------------------------
+# 运行噪声 —— 这几样描述的是「这一轮跑得怎么样」，不是「哪里坏了」
+# ---------------------------------------------------------------------------
+#
+# 旧路的输入是一段运行摘要（耗时、负载、脱选数、进程号、时间戳）。它们每轮
+# 都不同，于是同一批失败用例在两轮里得到两个指纹，「根因是否演进」这个问题
+# 就没有答案了。这里把它们逐个掩掉 —— **只**掩这些，不做全局的数字掩码：
+# 全局掩码会把 ``/tmp/a.py:12`` 里的 ``12`` 也掩掉，那会改掉旧路的字节。
+
+#: ``duration_seconds=1559.31`` / ``elapsed: 49.3s`` —— 这一轮花了多久。
+_NOISE_DURATION_RE = re.compile(
+    r"\b(duration_seconds|duration|elapsed|took)\s*([:=])\s*\d+(?:\.\d+)?s?\b"
+)
+
+#: ``loadavg=22.46`` —— 这台机器当时有多忙。
+_NOISE_LOAD_RE = re.compile(
+    r"\b(loadavg|load_avg)\s*([:=])\s*\d+(?:\.\d+)?\b"
+)
+
+#: ``11787 deselected`` / ``3 passed`` —— pytest 摘要里的计数。
+_NOISE_COUNT_RE = re.compile(
+    r"\b\d+\s+(deselected|passed|failed|errors?|skipped|xfailed|xpassed"
+    r"|warnings?|selected)\b"
+)
+
+#: ``pid=20464`` —— 这一次运行的进程号。
+_NOISE_PID_RE = re.compile(r"\b(pid|ppid|pgid)\s*([:=])\s*\d+\b")
+
+#: ``2026-11-02T01:46:45Z`` —— 这一次运行的时间戳。文本在掩码**之前**已经被
+#: 转成小写，所以 ``T`` / ``Z`` 两种写法都要认。
+_NOISE_TIMESTAMP_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?"
+    r"(?:Z|z|[+-]\d{2}:?\d{2})?"
+)
+
+#: 掩码的顺序。计数在前面（它会吃掉 ``3 passed`` 这种带数字的片段），
+#: 时间戳在后面（它要看到完整的形状）。
+_NOISE_MASKS = (
+    (_NOISE_DURATION_RE, r"\1\2<n>"),
+    (_NOISE_LOAD_RE, r"\1\2<n>"),
+    (_NOISE_COUNT_RE, r"<n> \1"),
+    (_NOISE_PID_RE, r"\1\2<n>"),
+    (_NOISE_TIMESTAMP_RE, "<ts>"),
+)
+
+
+def _mask_run_noise(text: str) -> str:
+    """Hide what the run looked like, keep what broke."""
+    for pattern, replacement in _NOISE_MASKS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def _tmp_roots() -> List[str]:
@@ -184,10 +264,48 @@ def _normalize_text(text: str) -> str:
         lambda match: _canonical_path_token(match.group(0)), text
     )
     lowered = with_paths.lower()
-    masked = _HEX_RUN_RE.sub(_mask_hex, lowered)
+    quiet = _mask_run_noise(lowered)
+    masked = _HEX_RUN_RE.sub(_mask_hex, quiet)
     # The unit separator is the field delimiter; a stray one inside a value
     # would let two different field sets hash to the same input.
     return " ".join(masked.replace(_TOKEN_SEP, " ").split())
+
+
+def _normalize_case_id(text: str) -> str:
+    """One failing case's id, spelled the same way every run.
+
+    A case id is an **identifier**, not prose: ``tests/x.py::TestY::test_z``.
+    So the case is kept, the digits are kept, the spelling is kept — a
+    pytest node id is case sensitive, and two node ids differing only in
+    case are two different tests. Only the temporary paths inside it are
+    normalized, for the same reason as everywhere else.
+    """
+    with_paths = _PATH_TOKEN_RE.sub(
+        lambda match: _canonical_path_token(match.group(0)), text
+    )
+    return " ".join(with_paths.replace(_TOKEN_SEP, " ").split())
+
+
+def _normalize_case_ids(value: Any) -> List[str]:
+    """The failing case ids, deduplicated and sorted.
+
+    Sorted and deduplicated, because the failing cases are a SET: the same
+    nine cases reported in a different order (or with one of them listed
+    twice) are the same failure.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items: Sequence[Any] = [value]
+    else:
+        items = list(value)
+    normalized = set()
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        normalized.add(_normalize_case_id(text))
+    return sorted(normalized)
 
 
 def _normalize_identifier(value: Any) -> str:
@@ -235,6 +353,7 @@ def canonical_fingerprint_input(
     failed_assertions: Any = None,
     command: Any = None,
     first_error_line: Any = None,
+    failed_cases: Any = None,
 ) -> str:
     """The exact string the fingerprint is computed from.
 
@@ -242,7 +361,28 @@ def canonical_fingerprint_input(
     field sentinel must be visible in it, and the ``None`` literal must
     not). It is the same string the fingerprint hashes — not a
     reconstruction of it.
+
+    Two shapes exist:
+
+    * **身份态** (``failed_cases`` given) — the input is only
+      ``vp_id`` / ``failure_class`` / the failing case set. The prose
+      (``command`` / ``first_error_line``) describes the RUN, not the
+      defect, so it does not belong in the identity: the same nine cases
+      failing for the same reason must fingerprint the same however long
+      the run took and however busy the machine was.
+    * **旧路** (``failed_cases`` absent or empty) — the five-part input
+      that has always been used, byte for byte. The golden fingerprints
+      pinned against it must keep holding.
     """
+    cases = _normalize_case_ids(failed_cases)
+    if cases:
+        parts = (
+            "vp_id=" + _normalize_identifier(vp_id),
+            "failure_class=" + _normalize_identifier(failure_class),
+            "failed_cases=" + _TOKEN_SEP.join(cases),
+        )
+        return _TOKEN_SEP.join(parts)
+
     parts = (
         "vp_id=" + _normalize_identifier(vp_id),
         "failure_class=" + _normalize_identifier(failure_class),
@@ -261,6 +401,7 @@ def failure_fingerprint(
     failed_assertions: Any = None,
     command: Any = None,
     first_error_line: Any = None,
+    failed_cases: Any = None,
 ) -> str:
     """The deterministic identity of one failed attempt.
 
@@ -272,6 +413,11 @@ def failure_fingerprint(
             sequence: the order does not change the fingerprint.
         command: The command that was run.
         first_error_line: The first line of the error output.
+        failed_cases: The **machine-written** ids of the failing cases
+            (pytest node ids). Given them, the fingerprint is the
+            identity of the failing set — the prose above is deliberately
+            left out, because it measures the run and not the defect.
+            Left out, the legacy five-part input is used unchanged.
 
     Every argument is optional: an argument that is omitted and an
     argument that is ``None`` are the same thing — a field the caller does
@@ -288,8 +434,87 @@ def failure_fingerprint(
         failed_assertions=failed_assertions,
         command=command,
         first_error_line=first_error_line,
+        failed_cases=failed_cases,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:FINGERPRINT_LENGTH]
+
+
+def fingerprint_rule(*, failed_cases: Any = None) -> str:
+    """Which rule produced — or would produce — this fingerprint.
+
+    The rule is the *basis* of the value, and the basis decides whether
+    two fingerprints may be compared at all:
+
+    * :data:`FINGERPRINT_RULE_IDENTITY` — the fingerprint is the identity
+      of the failing case set (``vp_id`` / ``failure_class`` / the set).
+      The run's prose does not enter the hash.
+    * :data:`FINGERPRINT_RULE_LEGACY` — the fingerprint is the identity of
+      the five-part text input. Used when no failing set is known.
+
+    The two rules give the same failure two different values. That is
+    fine on its own — a fingerprint is a key — and it is fatal when the
+    two are compared: the difference then says "the instrument changed",
+    not "the defect changed". So the rule has to be recorded next to the
+    value, and the decision has to read it.
+
+    Args:
+        failed_cases: The machine-written ids of the failing cases — the
+            same argument :func:`failure_fingerprint` takes. Whether they
+            are given decides which rule hashes the value.
+
+    Returns:
+        The rule's id. Never empty: a caller that cannot tell which rule
+        applied is told so by the *absence* of a recorded rule, not by a
+        special value.
+    """
+    if _normalize_case_ids(failed_cases):
+        return FINGERPRINT_RULE_IDENTITY
+    return FINGERPRINT_RULE_LEGACY
+
+
+def _known_rule(value: Any) -> Optional[str]:
+    """The rule id a record carries, or ``None`` when it carries none.
+
+    A rule that is not a non-empty string is a rule we cannot read — the
+    same "we do not know" the missing-field sentinel stands for. It must
+    never raise: one unreadable record must not be able to abort a round.
+    """
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _rules_are_comparable(rule_prev: Any, rule_curr: Any) -> bool:
+    """Whether two fingerprints may be compared for equality at all.
+
+    Two fingerprints are comparable when the same rule produced them.
+    Comparing across rules reads the change of the measuring instrument
+    as a change of the defect, which is how the loop ends up opening a
+    root-cause task for a failure nobody touched.
+
+    The three cases:
+
+    * **both rules known and equal** — comparable; the fingerprints may
+      be compared, and a difference means the defect changed.
+    * **both rules known and different** — not comparable. We cannot say
+      anything about the defect, so we say nothing about the root cause.
+    * **one or both rules unknown** — the records pre-date the rule ids
+      (or are unreadable). When *neither* side names a rule, the
+      comparison is the one the loop has always made and it stays. When
+      only one side names a rule, the other side's rule is unknown, so
+      the two may have been made by different rules: not comparable.
+
+    The "not comparable" answer is a *false*, not an error: the round
+    then hands the failure to a repair task instead of re-opening a
+    diagnosis, which is the direction that lets the chain close.
+    """
+    known_prev = _known_rule(rule_prev)
+    known_curr = _known_rule(rule_curr)
+    if known_prev is None and known_curr is None:
+        return True
+    if known_prev is None or known_curr is None:
+        return False
+    return known_prev == known_curr
 
 
 def needs_root_cause_task(history: Mapping[str, Any]) -> bool:
@@ -305,7 +530,8 @@ def needs_root_cause_task(history: Mapping[str, Any]) -> bool:
     that answer into a decision.
 
     Args:
-        history: The failure's history. Read four keys:
+        history: The failure's history. Read four keys, plus two
+            optional ones:
 
             * ``vp_id`` — the verification point (carried along, not used
               to branch);
@@ -313,7 +539,11 @@ def needs_root_cause_task(history: Mapping[str, Any]) -> bool:
               failure has repeated (one on the round it first failed);
             * ``fp_prev`` — the previous round's fingerprint of this
               point's failure;
-            * ``fp_curr`` — this round's fingerprint of it.
+            * ``fp_curr`` — this round's fingerprint of it;
+            * ``rule_prev`` / ``rule_curr`` — **optional** — the rule
+              each of the two fingerprints was computed under (see
+              :func:`fingerprint_rule`). Records written before the
+              rules existed simply do not carry them.
 
     Returns:
         ``True`` only on the round where a failure repeats for the second
@@ -327,7 +557,14 @@ def needs_root_cause_task(history: Mapping[str, Any]) -> bool:
           the path that owns that verdict decides;
         * a missing key → we do not know, so we fail open to the old
           path. A record we cannot read must never raise: one
-          unreadable payload must not be able to abort a round.
+          unreadable payload must not be able to abort a round;
+        * **the two fingerprints were computed under different rules** →
+          not comparable, so no verdict: the difference between them
+          says the instrument changed, not the defect, and reading it
+          as "the root cause evolved" would re-open a diagnosis for a
+          failure nobody touched. The round hands the failure to a
+          repair task instead, which is the direction that lets the
+          chain close.
 
     The function is pure — same record in, same answer out, in this
     process and in any other.
@@ -346,6 +583,11 @@ def needs_root_cause_task(history: Mapping[str, Any]) -> bool:
     if not isinstance(fp_prev, str) or not isinstance(fp_curr, str):
         return False
     if not fp_prev or not fp_curr:
+        return False
+
+    if not _rules_are_comparable(
+        history.get("rule_prev"), history.get("rule_curr"),
+    ):
         return False
 
     return fp_prev != fp_curr

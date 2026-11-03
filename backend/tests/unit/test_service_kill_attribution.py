@@ -96,6 +96,26 @@ INTERRUPTED_TASK_ID = "VP-001"
 #: How many routing rows the round's fixture holds.
 _FIXTURE_ROWS = 4
 
+#: The readiness budget for the tests that really start a service.
+#:
+#: The budget is a **wall-clock** deadline (see
+#: ``service_manager._wait_ready_with_evidence``), and the gate runs the
+#: suite with ``-n auto`` -- 18 workers on the 2026-11-01 run -- on a
+#: host whose load average was 22.46.  On that host a
+#: ``time.sleep(0.05)`` measured **0.129s**: the clock was running
+#: **2.6x** slow, and every deadline in the suite was 2.6x shorter in
+#: real work.  A 30-second readiness budget is therefore 30 seconds of
+#: a machine that is too busy to start a process in a second, and the
+#: service's own start (the interpreter's boot, the wrapper's
+#: ``setsid``, the spawn marker's ``ps`` probe) eats a good part of it.
+#:
+#: 120 seconds is the explicit budget: it is what a machine under that
+#: load is given to bring a service up.  It does **not** change what is
+#: asserted -- ``assert runtime.ready is True`` still has to hold, and a
+#: service that never comes up still fails the test (it just fails it
+#: later, and with the whole budget rather than a fraction of it).
+READY_TIMEOUT_SECONDS = 120
+
 
 # ---------------------------------------------------------------------------
 # The service under test
@@ -292,7 +312,7 @@ def _declaration(port: int, script: Path) -> ServiceDeclaration:
         ),
         cwd=".",
         health_url=f"http://127.0.0.1:{port}/health",
-        ready_timeout_seconds=30,
+        ready_timeout_seconds=READY_TIMEOUT_SECONDS,
         log_path="tmp/api.log",
     )
 
@@ -388,7 +408,7 @@ def _bring_up(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(600)
 def test_a_parked_execution_is_still_answerable_after_the_owning_process_exits(
     round_dirs,
     declaration,
@@ -602,7 +622,7 @@ def test_the_kill_request_is_written_before_the_signal_is_sent(
             child.wait(timeout=5)
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(600)
 def test_the_round_s_own_reap_names_itself_as_the_caller(
     round_dirs, declaration, started,
 ) -> None:

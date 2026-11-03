@@ -28,16 +28,19 @@ from unittest import mock
 # raising on a 4xx / 5xx response.
 import urllib.error
 
-# The SUT module lives in the same package as this test module, so we
-# add its parent directory (``backend/tests/integration``) to sys.path
-# and import ``resume_test.api_client`` directly. This is robust to
-# the rootdir / pythonpath quirks that arise when both project-root
-# and backend-level pytest.ini files coexist.
-_INTEGRATION_DIR = Path(__file__).resolve().parent.parent
-if str(_INTEGRATION_DIR) not in sys.path:
-    sys.path.insert(0, str(_INTEGRATION_DIR))
+# Anchor the path at ``backend``, NOT at ``backend/tests/integration``.
+# That directory holds the scheduler tests in a package of their own named
+# ``plan_scheduler``; putting it first on ``sys.path`` made
+# ``import plan_scheduler`` resolve to the *tests* package and broke every
+# later ``from plan_scheduler.engine import ...`` in the same process when
+# a shuffled collection order put this module first.  ``backend`` keeps
+# ``tests.integration.resume_test`` importable under either pytest rootdir
+# and shadows no top-level package.
+_BACKEND_DIR = Path(__file__).resolve().parents[3]
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
 
-from resume_test.api_client import (
+from tests.integration.resume_test.api_client import (
     ApiClient,
     ConnectionError,
     HTTPError,

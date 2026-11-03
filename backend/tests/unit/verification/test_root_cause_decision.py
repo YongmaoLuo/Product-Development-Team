@@ -185,3 +185,97 @@ def test_pure_function_same_input_same_answer():
     first = needs_root_cause_task(history)
     history["extra"] = "ignored"
     assert needs_root_cause_task(history) is first
+
+
+# ---------------------------------------------------------------------------
+# 4. 两条规则算出来的指纹不能拿来比
+# ---------------------------------------------------------------------------
+#
+# 「根因演进」这个结论,是拿上一轮和本轮的两个指纹**比**出来的。指纹是 16 位
+# hex,值里装不下「这是哪条规则算的」(形状是契约),所以规则得跟着指纹一起
+# 被记下来,并且在决定之前被读出来。
+#
+# 两条不同的规则给出两个不同的值,哪怕底下是**同一个**失败。旧五段式量的是
+# 「这一轮跑成什么样」,身份态量的是「哪个缺陷」。把这两个值放在一起比,读到
+# 的「根因演进」是**量具换了**,不是缺陷变了 —— 循环于是每轮重开一个根因任
+# 务,每轮重新描述同一批失败,这条链结构上不可能收敛。
+#
+# 所以:规则不一样的两个指纹**不可比**。不可比就不下结论(返回假),把这一轮
+# 交给修复任务,而不是再开一个根因任务。
+
+#: 旧五段式规则(带运行噪声屏蔽)与身份态规则的 id。
+_LEGACY_RULE = "legacy-v2"
+_IDENTITY_RULE = "identity-v1"
+
+
+def _history_with_rules(rounds, fp_prev, fp_curr, rule_prev=None, rule_curr=None):
+    """The decision record, with the rules the two fingerprints were made under."""
+    history = _history(rounds, fp_prev, fp_curr)
+    if rule_prev is not None:
+        history["rule_prev"] = rule_prev
+    if rule_curr is not None:
+        history["rule_curr"] = rule_curr
+    return history
+
+
+def test_fingerprints_from_different_rules_are_not_compared():
+    """规则不一样 -> 不可比 -> 不下「根因演进」的结论。"""
+    history = _history_with_rules(
+        2, "0ceab0d5d41cc058", "1251be5eba9e3a92",
+        rule_prev=_LEGACY_RULE, rule_curr=_IDENTITY_RULE,
+    )
+    assert needs_root_cause_task(history) is False, (
+        "two fingerprints computed under different rules are not evidence "
+        "that the root cause evolved — the instrument changed, not the "
+        "defect"
+    )
+
+
+def test_the_same_rule_still_reports_evolution():
+    """同一条规则下,指纹不同仍然是演进 —— 旧判据不许被削弱。"""
+    assert needs_root_cause_task(
+        _history_with_rules(
+            2, "1251be5eba9e3a92", "d2416ecf3d6a4c93",
+            rule_prev=_IDENTITY_RULE, rule_curr=_IDENTITY_RULE,
+        )
+    ) is True
+    assert needs_root_cause_task(
+        _history_with_rules(
+            2, "aaa", "aaa", rule_prev=_LEGACY_RULE, rule_curr=_LEGACY_RULE,
+        )
+    ) is False
+
+
+def test_one_unknown_rule_is_not_comparable():
+    """只有一边知道规则 -> 不可比(我们不知道另一边是怎么算的)。"""
+    assert needs_root_cause_task(
+        _history_with_rules(
+            2, "0ceab0d5d41cc058", "1251be5eba9e3a92", rule_curr=_IDENTITY_RULE,
+        )
+    ) is False
+    assert needs_root_cause_task(
+        _history_with_rules(
+            2, "0ceab0d5d41cc058", "1251be5eba9e3a92", rule_prev=_LEGACY_RULE,
+        )
+    ) is False
+
+
+def test_two_unknown_rules_keep_the_old_comparison():
+    """两边都不知道规则 -> 回到旧比较(历史记录一条也不能作废)。"""
+    assert needs_root_cause_task(_history(2, "aaa", "bbb")) is True
+    assert needs_root_cause_task(_history(2, "aaa", "aaa")) is False
+
+
+def test_a_malformed_rule_is_unknown():
+    """读不懂的规则 = 不知道规则,不是崩掉。"""
+    for bad in ("", 3, [], {}):
+        assert needs_root_cause_task(
+            _history_with_rules(
+                2, "aaa", "bbb", rule_prev=bad, rule_curr=_IDENTITY_RULE,
+            )
+        ) is False
+        assert needs_root_cause_task(
+            _history_with_rules(
+                2, "aaa", "bbb", rule_prev=_IDENTITY_RULE, rule_curr=bad,
+            )
+        ) is False

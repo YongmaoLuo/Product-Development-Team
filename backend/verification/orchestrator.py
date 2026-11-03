@@ -64,6 +64,7 @@ from verification.failure_triage import (
 # bookkeeping must be reproducible from the record alone.
 from verification.failure_fingerprint import (
     failure_fingerprint,
+    fingerprint_rule,
     needs_root_cause_task,
 )
 # 2026-10-27: the two task shapes the root-cause chain dispatches — the
@@ -217,6 +218,45 @@ def _parse_failure_fingerprints(raw: Any) -> Dict[str, List[Optional[str]]]:
             continue
         out[vp_id] = [fp_prev, fp_curr]
     return out
+
+
+def _parse_failure_fingerprint_rules(raw: Any) -> Dict[str, List[Optional[str]]]:
+    """The rules the fingerprint pairs carry, as ``{vp_id: [prev, curr]}``.
+
+    The payload's ``failure_fingerprint_rules`` key is **optional** — a
+    payload written before the rules existed does not have it, and that
+    is not an error: the reader returns an empty map and the loop keeps
+    its old behaviour.
+
+    A pair is ``[rule_prev, rule_curr]``: the rule the previous round's
+    fingerprint was computed under, and the rule this round's was. A
+    slot may be ``None`` — "we do not know which rule produced that
+    side" — and that is not the same as "it was the same rule" (nor a
+    ``KeyError`` further down).
+
+    A malformed pair is dropped rather than repaired: half a rule is
+    not evidence about anything. A rule that is not a non-empty string
+    reads as unknown, so an unreadable rule degrades to "we do not
+    know" instead of poisoning the comparison.
+    """
+    out: Dict[str, List[Optional[str]]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for vp_id, pair in raw.items():
+        if not isinstance(vp_id, str) or not vp_id:
+            continue
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        rule_prev, rule_curr = pair
+        out[vp_id] = [_known_rule_id(rule_prev), _known_rule_id(rule_curr)]
+    return out
+
+
+def _known_rule_id(value: Any) -> Optional[str]:
+    """A rule id a record carries, or ``None`` when it carries none."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 #: The fence that carries a **declaration** in a report.
@@ -1173,6 +1213,17 @@ class VerificationOrchestrator:
                 tracking_payload.get("failure_fingerprints")
             )
         )
+        # ``{vp_id: [rule_prev, rule_curr]}`` — the rule each
+        # fingerprint was computed under. Two fingerprints may only be
+        # compared when the same rule produced them; without the rule,
+        # a change of the measuring instrument reads as a change of the
+        # defect, and the loop re-opens a root-cause task for a failure
+        # nobody touched.
+        self._failure_fingerprint_rules: Dict[str, List[Optional[str]]] = (
+            _parse_failure_fingerprint_rules(
+                tracking_payload.get("failure_fingerprint_rules")
+            )
+        )
         self._current_repair_tasks: List[Dict] = []
         self._waiting_for_user = False
         # 2026-10-22 (triage): the semantic judge that names the nature of
@@ -1282,6 +1333,31 @@ class VerificationOrchestrator:
     @_failure_fingerprints.setter
     def _failure_fingerprints(self, value: Any) -> None:
         self.__dict__["_failure_fingerprints"] = dict(value or {})
+
+    @property
+    def _failure_fingerprint_rules(self) -> Dict[str, List[Optional[str]]]:
+        """The rules the fingerprint pairs were computed under, per point.
+
+        Stored in the instance dictionary and read through this
+        property, for the same reason as :attr:`_failure_fingerprints`:
+        an orchestrator built **without** ``__init__`` reads an empty
+        map instead of raising ``AttributeError``. A round must not die
+        on a missing bookkeeping attribute — missing rules mean "we do
+        not know which rule produced that fingerprint", which is
+        exactly what a legacy payload says too.
+
+        The map is **replaced**, never mutated in place: the round
+        writes a fresh pair map every time it records a round.
+        """
+        rules = self.__dict__.get("_failure_fingerprint_rules")
+        if rules is None:
+            rules = {}
+            self.__dict__["_failure_fingerprint_rules"] = rules
+        return rules
+
+    @_failure_fingerprint_rules.setter
+    def _failure_fingerprint_rules(self, value: Any) -> None:
+        self.__dict__["_failure_fingerprint_rules"] = dict(value or {})
 
     def _read_loop_tracking_payload(self) -> Dict[str, Any]:
         """The tracking file's raw payload — ``{}`` when it is not there.
@@ -1423,6 +1499,18 @@ class VerificationOrchestrator:
                 vp_id: list(pair)
                 for vp_id, pair in sorted(self._failure_fingerprints.items())
             }
+        # 2026-11-03: the rule that hashed each fingerprint rides along
+        # with it. Two hashes computed under different rules are not two
+        # different failures — they are two values that cannot be
+        # compared at all, so the reader needs to know which rule
+        # produced each side of the pair. The key is written only when
+        # there is a rule to record, for the same reason the fingerprint
+        # key is: an empty map carries no information.
+        if self._failure_fingerprint_rules:
+            payload["failure_fingerprint_rules"] = {
+                vp_id: list(pair)
+                for vp_id, pair in sorted(self._failure_fingerprint_rules.items())
+            }
         path = self._loop_tracking_path()
         tmp = path.with_name(path.name + ".tmp")
         try:
@@ -1473,19 +1561,111 @@ class VerificationOrchestrator:
         _, _, failure_class = key.partition(_DECISION_KEY_SEPARATOR)
         return failure_class
 
+    def _failed_case_ids(
+        self, vp_id: str, entry: Dict[str, Any],
+    ) -> List[str]:
+        """The ids of the cases that failed for this point.
+
+        Where the set comes from, in order:
+
+        1. **the report entry's own ``failed_assertions``** — the executor
+           lifts the gate's node ids into it, so the report entry, the
+           event log and the artifact all say the same thing;
+        2. **this round's CI artifact** —
+           ``vp_artifacts/<vp>/ci_output.json``'s ``junit_failures``,
+           which the gate itself wrote.
+
+        The prose in the report (``evidence`` / ``actual_result``) is NOT
+        a source: that is the run's summary, and the fingerprint has to
+        be the identity of the defect, not of the run. Reading it is
+        exactly what made every round look like a new root cause.
+        """
+        carried = entry.get("failed_assertions")
+        if isinstance(carried, str):
+            carried = [carried]
+        if carried:
+            ids = [str(item).strip() for item in carried if str(item).strip()]
+            if ids:
+                return sorted(set(ids))
+
+        return self._artifact_failed_case_ids(vp_id)
+    def _artifact_failed_case_ids(self, vp_id: str) -> List[str]:
+        """The failing node ids the gate recorded in this round's artifact.
+
+        The artifact is the machine-written record of the run. A missing
+        or unreadable artifact yields no ids — the caller then falls back
+        to the legacy fingerprint, which is worse but never wrong.
+        """
+        if not vp_id:
+            return []
+        path = (
+            Path(self.plan_dir) / "vp_artifacts" / str(vp_id) / "ci_output.json"
+        )
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(payload, dict):
+            return []
+        failures = payload.get("junit_failures")
+        if not isinstance(failures, list):
+            return []
+        ids = []
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+            node_id = str(failure.get("node_id") or "").strip()
+            if node_id:
+                ids.append(node_id)
+        return sorted(set(ids))
+
+    def _artifact_first_error_line(self, vp_id: str) -> Optional[str]:
+        """The first error line the gate recorded in this round's artifact.
+
+        The gate's own first line says what broke; the report entry's
+        ``evidence`` says how the run looked. The fingerprint's text
+        field wants the former.
+        """
+        if not vp_id:
+            return None
+        path = (
+            Path(self.plan_dir) / "vp_artifacts" / str(vp_id) / "ci_output.json"
+        )
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        failures = payload.get("junit_failures")
+        if not isinstance(failures, list):
+            return None
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+            first_line = str(failure.get("first_line") or "").strip()
+            if first_line:
+                return first_line.splitlines()[0].strip()
+        return None
+
     def _first_error_line(self, entry: Dict[str, Any]) -> Optional[str]:
         """The failure's first line of output — the fingerprint's text field.
 
         The report does not always name it, so it is derived: an explicit
-        ``first_error_line`` wins; otherwise the first line of the
-        evidence (the recorded output); otherwise the LAST line of
-        ``actual_result`` — the reasons are ordered "satisfied criteria
-        first, the failing one last", so the last line is the one that
-        says what went wrong.
+        ``first_error_line`` wins; otherwise the **gate's** first error
+        line from this round's artifact (the machine-written one); then
+        the first line of the evidence (the recorded output); otherwise
+        the LAST line of ``actual_result`` — the reasons are ordered
+        "satisfied criteria first, the failing one last", so the last
+        line is the one that says what went wrong.
         """
         explicit = entry.get("first_error_line")
         if isinstance(explicit, str) and explicit.strip():
             return explicit
+        vp_id = str(entry.get("id") or "").strip()
+        from_artifact = self._artifact_first_error_line(vp_id)
+        if from_artifact:
+            return from_artifact
         for line in str(entry.get("evidence") or "").splitlines():
             if line.strip():
                 return line
@@ -1497,15 +1677,29 @@ class VerificationOrchestrator:
             return reasons[-1]
         return None
 
-    def _round_fingerprints(self, report: Dict[str, Any]) -> Dict[str, str]:
-        """The fingerprint of every point that failed in this round.
+    def _round_fingerprint_records(
+        self, report: Dict[str, Any],
+    ) -> Dict[str, Dict[str, str]]:
+        """The fingerprint **and the rule** of every point that failed.
 
-        One fingerprint per point — the point is the unit the payload
+        One record per point — the point is the unit the payload
         stores, and the fingerprint itself carries the failure class, so
         two failures of one point under different classes do not share
         a fingerprint.
+
+        When the failing set is known, the fingerprint is the **identity
+        of the defect**: the same nine cases failing for the same reason
+        fingerprint the same however long the run took and however busy
+        the machine was. Only when no set is available does the legacy
+        text-based fingerprint apply.
+
+        The rule rides with the fingerprint because the two are only
+        comparable when the rule is the same: the identity rule and the
+        legacy rule give the same failure two different values, and
+        comparing those reads a change of instrument as a change of
+        defect.
         """
-        out: Dict[str, str] = {}
+        out: Dict[str, Dict[str, str]] = {}
         for entry in self._report_failure_entries(report):
             if not isinstance(entry, dict):
                 continue
@@ -1518,14 +1712,31 @@ class VerificationOrchestrator:
                 # The first occurrence wins — the top-level list is the
                 # freshest, exactly as in ``_extract_failed_keys``.
                 continue
-            out[vp_id] = failure_fingerprint(
-                vp_id=vp_id,
-                failure_class=self._failure_class_of_entry(vp_id, entry),
-                failed_assertions=entry.get("failed_assertions"),
-                command=entry.get("test_command") or entry.get("command"),
-                first_error_line=self._first_error_line(entry),
-            )
+            case_ids = self._failed_case_ids(vp_id, entry)
+            out[vp_id] = {
+                "fingerprint": failure_fingerprint(
+                    vp_id=vp_id,
+                    failure_class=self._failure_class_of_entry(vp_id, entry),
+                    failed_assertions=entry.get("failed_assertions"),
+                    command=entry.get("test_command") or entry.get("command"),
+                    first_error_line=self._first_error_line(entry),
+                    failed_cases=case_ids,
+                ),
+                "rule": fingerprint_rule(failed_cases=case_ids),
+            }
         return out
+
+    def _round_fingerprints(self, report: Dict[str, Any]) -> Dict[str, str]:
+        """The fingerprint of every point that failed in this round.
+
+        The fingerprint view of :meth:`_round_fingerprint_records` —
+        the same values, without the rule that says how they were
+        computed.
+        """
+        return {
+            vp_id: record["fingerprint"]
+            for vp_id, record in self._round_fingerprint_records(report).items()
+        }
 
     def _record_round_fingerprints(
         self, report: Dict[str, Any], void_vp_ids: Set[str],
@@ -1538,15 +1749,23 @@ class VerificationOrchestrator:
         fingerprint — ``None`` says "we do not know", which is not the
         same as "it was the same".
 
+        The rule pair rides along: ``[rule_prev, rule_curr]`` says which
+        rule produced each of the two fingerprints. It is carried the
+        same way the fingerprint is — the previous round's *current*
+        rule is this round's *previous* rule — so a point's history
+        stays comparable across the whole chain.
+
         The map is replaced, not merged: a point that is not failing any
         more has no fingerprint to carry, and a stale one would make the
         next round compare against a failure that has already been
         fixed.
         """
         previous = self._failure_fingerprints
-        current = self._round_fingerprints(report)
+        previous_rules = self._failure_fingerprint_rules
+        current = self._round_fingerprint_records(report)
         pairs: Dict[str, List[Optional[str]]] = {}
-        for vp_id, fp_curr in current.items():
+        rule_pairs: Dict[str, List[Optional[str]]] = {}
+        for vp_id, record in current.items():
             if vp_id in void_vp_ids:
                 # A voided point is not a failure of the deliverable —
                 # its criterion is gone, so it has no root cause to
@@ -1554,8 +1773,12 @@ class VerificationOrchestrator:
                 continue
             prior = previous.get(vp_id) or []
             fp_prev = prior[1] if len(prior) == 2 else None
-            pairs[vp_id] = [fp_prev, fp_curr]
+            pairs[vp_id] = [fp_prev, record["fingerprint"]]
+            prior_rules = previous_rules.get(vp_id) or []
+            rule_prev = prior_rules[1] if len(prior_rules) == 2 else None
+            rule_pairs[vp_id] = [rule_prev, record["rule"]]
         self._failure_fingerprints = pairs
+        self._failure_fingerprint_rules = rule_pairs
         return pairs
 
     def _root_cause_vp_ids(
@@ -1580,6 +1803,7 @@ class VerificationOrchestrator:
             pair = self._failure_fingerprints.get(vp_id)
             if not pair:
                 continue
+            rules = self._failure_fingerprint_rules.get(vp_id) or [None, None]
             history = {
                 "vp_id": vp_id,
                 "consecutive_failures": self._same_failure_counts.get(
@@ -1587,6 +1811,8 @@ class VerificationOrchestrator:
                 ),
                 "fp_prev": pair[0],
                 "fp_curr": pair[1],
+                "rule_prev": rules[0] if len(rules) == 2 else None,
+                "rule_curr": rules[1] if len(rules) == 2 else None,
             }
             if needs_root_cause_task(history):
                 out.append(vp_id)
@@ -1936,6 +2162,17 @@ class VerificationOrchestrator:
             vp_id = str(action["vp_id"])
             task_id = format_repair_task_id(seq_base + index)
             evidence = dict(evidence_by_vp.get(vp_id) or {})
+            # 2026-11-02: the report path handed to the task is the file
+            # the CHAIN reads (:meth:`_root_cause_report_file`), as an
+            # **absolute** path.  Two readers have to name the same file:
+            # the fence, which lets a report task write exactly the path
+            # the task declares (``PDT_REPORT_PATH``), and the chain,
+            # which reads the report back to get the scope.  A repo-
+            # relative path is resolved against the *executor's* working
+            # directory (``backend/``), so the two could name different
+            # files — and a report nobody can read is a report nobody
+            # gets.
+            report_path = str(self._root_cause_report_file(vp_id))
             if action["action"] == _CHAIN_STAGE_IMPLEMENTATION:
                 report = {
                     "plan_id": self.plan_dir.name,
@@ -1951,11 +2188,13 @@ class VerificationOrchestrator:
                     round_no=round_number,
                     evidence=evidence,
                     task_id=task_id,
+                    report_path=report_path,
                 )
             else:
                 task = build_root_cause_task(
                     self.plan_dir.name, vp_id, round_number, evidence,
                     task_id=task_id,
+                    report_path=report_path,
                 )
             tasks.append(self._mark_root_cause_task(task, vp_id))
         return tasks
@@ -3412,6 +3651,7 @@ class VerificationOrchestrator:
             # A stale one would make the next round compare against a
             # failure that has already been fixed.
             self._failure_fingerprints = {}
+            self._failure_fingerprint_rules = {}
             self._save_loop_tracking()
             # 2026-10-27: the point passed, so the escalation it was on
             # is over. A chain left on disk would keep owning the point
@@ -4394,15 +4634,31 @@ class VerificationOrchestrator:
                         #
                         # 2026-10-27 (root-cause chain): the chain's
                         # tasks carry fields the repair rows never had
-                        # (``kind`` / ``read_only`` / ``report_path`` /
-                        # ``deliverable`` / ``evidence``). They are taken
-                        # out by the same narrowing — a task that cannot
-                        # be written is a task the executor never runs,
-                        # and one of them aborting the write would take
-                        # the round's plain repair rows down with it.
-                        # What the table cannot hold stays in the fields
-                        # it can: the path a diagnosis must write is in
-                        # the task's description.
+                        # (``kind`` / ``read_only`` / ``evidence``).
+                        # They are taken out by the same narrowing — a
+                        # task that cannot be written is a task the
+                        # executor never runs, and one of them aborting
+                        # the write would take the round's plain repair
+                        # rows down with it.
+                        # 2026-11-02: the report contract does NOT ride
+                        # the allow-list — ``deliverable`` /
+                        # ``report_path`` are not columns of
+                        # ``plan_tasks``, and the verification-mode scope
+                        # gate freezes the schema's bytes, so a column
+                        # cannot be added for them.  The contract rides
+                        # the **description** instead: the root-cause
+                        # task's description carries a machine-readable
+                        # marker line (see ``orphan_rules.
+                        # report_deliverable_marker``), the description
+                        # is stored verbatim, and the executor's orphan
+                        # reconcile reads the pair back out of it.  So
+                        # the task still reaches the executor as a
+                        # report task — ``is_report_task()`` is true,
+                        # ``PDT_REPORT_PATH`` gets stamped, and the fence
+                        # lets the diagnosis write exactly that one
+                        # file.  What the table cannot hold at all
+                        # (``kind`` / ``read_only`` / ``evidence``)
+                        # stays where it was: dropped.
                         static_payload = {
                             k: v
                             for k, v in rt.items()

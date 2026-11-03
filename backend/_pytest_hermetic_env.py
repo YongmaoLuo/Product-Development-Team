@@ -312,6 +312,29 @@ def install_hermetic_env() -> HermeticEnv:
     # that exercise provider-specific routing.
     os.environ.pop("ANTHROPIC_BASE_URL", None)
 
+    # The git LAYOUT is not part of the environment a test may inherit.
+    #
+    # ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_INDEX_FILE`` decide **which
+    # repository** a git command runs against and **which index** it
+    # writes to.  A suite that inherits them does not run the same test
+    # twice: with a ``GIT_DIR`` pointing at a bare repository,
+    # ``git -C <checkout> status`` answers ``fatal: this operation must
+    # be run in a work tree`` and exits 128 — the case goes red for a
+    # reason that has nothing to do with the code under test, and the
+    # same commit is green on the machine that happens not to export
+    # those names.
+    #
+    # A case that genuinely wants a git layout (a bare-repo fixture, an
+    # index in a scratch file) sets it for the command it runs and puts
+    # it back afterwards — the same rule the task-scope variables below
+    # follow.
+    for _git_layout_var in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+    ):
+        os.environ.pop(_git_layout_var, None)
+
     # Provider mode is a property of the *deployment*, not of one test
     # process.
     #

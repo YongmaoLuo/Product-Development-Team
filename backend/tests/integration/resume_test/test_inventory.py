@@ -19,15 +19,19 @@ import sys
 from pathlib import Path
 from unittest import mock
 
-# ``resume_test`` is a package under ``backend/tests/integration``. To keep
-# imports robust across project-root and backend-level pytest invocations,
-# add ``backend/tests/integration`` to sys.path just like the api_client
-# tests do.
-_INTEGRATION_DIR = Path(__file__).resolve().parent.parent
-if str(_INTEGRATION_DIR) not in sys.path:
-    sys.path.insert(0, str(_INTEGRATION_DIR))
+# Anchor the path at ``backend``, NOT at ``backend/tests/integration``.
+# That directory holds the scheduler tests in a package of their own named
+# ``plan_scheduler``; putting it first on ``sys.path`` made
+# ``import plan_scheduler`` resolve to the *tests* package and broke every
+# later ``from plan_scheduler.engine import ...`` in the same process when
+# a shuffled collection order put this module first.  ``backend`` keeps
+# ``tests.integration.resume_test`` importable under either pytest rootdir
+# and shadows no top-level package.
+_BACKEND_DIR = Path(__file__).resolve().parents[3]
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
 
-from resume_test.inventory import (
+from tests.integration.resume_test.inventory import (
     ACTIVE_PHASES,
     is_active,
     inventory_safe_to_restart,

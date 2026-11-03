@@ -175,6 +175,7 @@ import argparse
 import contextlib
 import datetime
 import errno
+import importlib
 import inspect
 import json
 import logging
@@ -1238,6 +1239,76 @@ def _probe_registry_alive(pid: int) -> Optional[bool]:
     return _pid_alive(pid)
 
 
+def _process_is_zombie(pid: int) -> Optional[bool]:
+    """Whether *pid* is a zombie -- a process that exited and was not waited for.
+
+    ``True`` -- it is a zombie.  ``False`` -- it is not one (it is
+    running, or it is not there at all).  ``None`` -- the platform
+    cannot say.
+    """
+    result = _run_tool(
+        [_ps_binary(), "-o", "stat=", "-p", str(pid)], timeout=5.0,
+    )
+    if result is None:
+        return None
+    returncode, stdout, _stderr = result
+    if returncode == 1:
+        # ``ps`` reports 1 for a pid it does not know.  There is no
+        # zombie there either.
+        return False
+    if returncode != 0:
+        return None
+    state = stdout.strip()
+    if not state:
+        return False
+    return state.startswith("Z")
+
+
+def _owner_alive(pid: int) -> Optional[bool]:
+    """Whether the owner of a registry entry is still there to want it.
+
+    ``True`` -- the owner is running.  ``False`` -- the owner is gone:
+    there is nothing left of it that could want the process it started.
+    ``None`` -- the platform cannot say.
+
+    A **zombie** owner counts as gone.  It has already exited; all that
+    is left of it is a table entry, and a table entry cannot ask for its
+    children to be given back.  ``kill(pid, 0)`` cannot tell the two
+    apart -- it succeeds for a zombie -- so the state is read from the
+    operating system.
+    """
+    alive = _pid_alive(pid)
+    if alive is not True:
+        # ``False``: the owner is gone.  ``None``: the platform cannot
+        # say -- and "cannot say" is never "gone", it is "do not touch".
+        return alive
+    zombie = _process_is_zombie(pid)
+    if zombie is True:
+        return False
+    if zombie is None:
+        return None
+    return True
+
+
+def _memoised_owner_alive() -> Callable[[int], Optional[bool]]:
+    """An owner liveness probe that asks the platform once per owner.
+
+    A registry holds many entries and few owners, and the platform is
+    asked through ``ps`` -- one spawn per question.  One owner must
+    not get two answers in one pass either: the second answer would be
+    the one that decides, and the first one would have been a different
+    question.
+    """
+    answers: Dict[int, Optional[bool]] = {}
+
+    def owner_alive(pid: int) -> Optional[bool]:
+        if pid not in answers:
+            answers[pid] = _owner_alive(pid)
+        return answers[pid]
+
+    return owner_alive
+
+
 def _registry_group_of(pid: int) -> Optional[int]:
     """The process group *pid* leads, if it leads one.
 
@@ -1262,14 +1333,16 @@ def _reap_registry_entry(
     reason: str,
     probe: Optional[Callable[[int], str]] = None,
     alive: Optional[Callable[[int], Optional[bool]]] = None,
+    owner_alive: Optional[Callable[[int], Optional[bool]]] = None,
 ) -> str:
     """Give one registered process back.
 
     Returns ``"reaped"`` when the process was signalled, ``"gone"``
     when there was nothing left to signal, ``"foreign"`` when the pid
-    has been recycled and the process is not ours any more, and
-    ``"unknown"`` when the process' start time could not be
-    established on either side.
+    has been recycled and the process is not ours any more, ``"unknown"``
+    when the process' start time could not be established on either
+    side, and ``"owned"`` when the process belongs to an owner that is
+    still there.
 
     ``foreign`` and ``unknown`` both mean *not ours to kill*; they
     differ in what the run is entitled to say.  A pid whose start time
@@ -1279,9 +1352,21 @@ def _reap_registry_entry(
     start time is the only thing that makes a pid an identity, and an
     identity that cannot be established is not an identity.
 
+    ``owned`` says the same thing about a different question.  The
+    process *is* the one this run started -- its start time says so --
+    but the process that started it is still there, and it is not this
+    one.  That process may still want the service it started, and it
+    is the run that has to give it back.  A pass that signsalled it
+    anyway would take a live service away from a run that is still
+    going, which is how a cleanup path becomes a second bug.
+
     *probe* and *alive* are the injection points: *probe* reads a
     pid's start time (an empty string means *unknown*), *alive* says
     whether a pid is still there.  Both default to the real thing.
+    *owner_alive* answers the same question for the entry's owner; when
+    it is not given, the pass's own liveness probe answers for the
+    owner as well, and the real liveness check answers when there is
+    no probe at all.
     """
     try:
         pid = int(entry.get("pid") or 0)
@@ -1325,6 +1410,22 @@ def _reap_registry_entry(
         )
         return "foreign"
 
+    owner_pid = _entry_owner_pid(entry)
+    if owner_pid > 0 and owner_pid != os.getpid():
+        owner_fn = owner_alive
+        if owner_fn is None:
+            owner_fn = alive if alive is not None else _owner_alive
+        if owner_fn(owner_pid) is not False:
+            # The owner is still there -- or the platform cannot say --
+            # and it is not us.  "Cannot say" is not "gone": it means
+            # the entry is not this pass's to give back.
+            logger.info(
+                "orphan reaper: pid %s belongs to owner %s, which is "
+                "still there; leaving it alone",
+                pid, owner_pid,
+            )
+            return "owned"
+
     group = _registry_group_of(pid)
     try:
         if group is not None:
@@ -1362,6 +1463,20 @@ def _reap_registry_entry(
     return "reaped"
 
 
+def _entry_owner_pid(entry: Dict[str, Any]) -> int:
+    """The pid of the process that wrote an entry down.
+
+    ``0`` when the entry names no owner -- or names one that is not a
+    pid at all.  An entry without an owner cannot be judged against a
+    live owner, so the sweep treats it the way it treated it before:
+    the entry is the run's to give back.
+    """
+    try:
+        return int(entry.get("owner_pid") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _entry_identity(entry: Dict[str, Any]) -> Tuple[str, str, str]:
     """What makes one registry entry the *same* entry as another.
 
@@ -1374,10 +1489,7 @@ def _entry_identity(entry: Dict[str, Any]) -> Tuple[str, str, str]:
         pid = int(entry.get("pid") or 0)
     except (TypeError, ValueError):
         pid = 0
-    try:
-        owner = int(entry.get("owner_pid") or 0)
-    except (TypeError, ValueError):
-        owner = 0
+    owner = _entry_owner_pid(entry)
     return (str(pid), str(entry.get("start_epoch") or ""), str(owner))
 
 
@@ -1389,6 +1501,7 @@ def reap_spawned_processes(
     owner_pid: Optional[int] = None,
     probe: Optional[Callable[[int], str]] = None,
     alive: Optional[Callable[[int], Optional[bool]]] = None,
+    owner_alive: Optional[Callable[[int], Optional[bool]]] = None,
 ) -> List[Dict[str, Any]]:
     """Give back every process the registry names, and forget it.
 
@@ -1406,9 +1519,19 @@ def reap_spawned_processes(
 
     An entry whose process was **not** given back stays in the
     registry -- whether the pid turned out to be somebody else's
-    ("foreign") or could not be identified at all ("unknown").  The
-    run has not established that the process is gone, so the record of
-    it has to survive the cleanup.
+    ("foreign"), could not be identified at all ("unknown"), or
+    belongs to an owner that is still there ("owned").  The run has
+    not established that the process is gone, so the record of it has
+    to survive the cleanup.
+
+    An entry whose **owner is still there** is not this pass's to give
+    back, whoever started it.  The registry is shared by everything a
+    run starts, and one run's cleanup path sweeps all of it -- so a
+    gate that ends while another run is still going would otherwise
+    signal the services of the run that is still going.  The owner is
+    the run that started the process, and it is the run that has to
+    give it back.  An owner that cannot be found is treated the same
+    way: "cannot say" is never "gone".
 
     The registry is *merged*, not replaced: what is written back is
     what the registry holds now, minus the entries this pass acted on.
@@ -1428,9 +1551,14 @@ def reap_spawned_processes(
     ``owner_pid`` narrows the sweep to the processes one process
     started -- the harness that spawned a server wants the daemon
     *that server* started, and not the services of the whole run.
+    It narrows what the sweep *looks at*; it does not hand the sweep
+    the right to signal a process whose owner is still there.
 
     *probe* and *alive* are the injection points the reaping itself
-    uses; both default to the real thing.
+    uses; both default to the real thing.  *owner_alive* answers
+    whether an entry's owner is still there; when it is not given, the
+    pass's own liveness probe answers for the owner as well, and the
+    real liveness check answers when there is no probe at all.
     """
     target = Path(path) if path is not None else spawn_registry_path()
     if target is None:
@@ -1441,27 +1569,29 @@ def reap_spawned_processes(
 
     reaped: List[Dict[str, Any]] = []
     acted_on: set = set()
+    owner_alive_fn = owner_alive
+    if owner_alive_fn is None and alive is None:
+        # The platform is asked through ``ps``, and a registry holds
+        # many entries and few owners: one answer per owner per pass.
+        owner_alive_fn = _memoised_owner_alive()
     for entry in entries:
         if owner_pid is not None:
-            try:
-                entry_owner = int(entry.get("owner_pid") or 0)
-            except (TypeError, ValueError):
-                entry_owner = 0
+            entry_owner = _entry_owner_pid(entry)
             if entry_owner != int(owner_pid):
                 # Not this owner's process: it is not this pass's to
                 # give back, and it stays in the registry.
                 continue
         status = _reap_registry_entry(
             entry, grace_seconds=grace_seconds, reason=reason,
-            probe=probe, alive=alive,
+            probe=probe, alive=alive, owner_alive=owner_alive_fn,
         )
         if status == "reaped":
             reaped.append(entry)
         if status in ("reaped", "gone"):
             # Given back, or already gone: either way the registry must
-            # not keep pointing at it.  "foreign" and "unknown" are not
-            # in here -- the run has not established that those
-            # processes are gone.
+            # not keep pointing at it.  "foreign", "unknown" and
+            # "owned" are not in here -- the run has not established
+            # that those processes are gone.
             acted_on.add(_entry_identity(entry))
 
     with _registry_lock(target):
@@ -3471,6 +3601,88 @@ def _wait_for_exit(
         elapsed += POLL_STEP
 
 
+#: The outcome of one attempt to signal a target.
+_SENT = "sent"
+_GONE = "gone"
+_REFUSED = "refused"
+
+
+def _kill_audit_module():
+    """The kill audit module, imported on first use.
+
+    Imported lazily on purpose: importing it installs the audit hook,
+    and a process that never signals anything has no business writing
+    audit records.  ``None`` when the module cannot be imported — the
+    audit is evidence, never a precondition.
+
+    Loaded through :func:`importlib.import_module` rather than a plain
+    ``import kill_audit`` **inside** the function, because this module
+    is required to import nothing but the standard library (it runs
+    standalone as ``python -m backend.orphan_reaper``), and a module-
+    level import of a sibling backend module — even a lazy one — is
+    exactly what that rule forbids.  The audit module is itself
+    standard-library-only, so loading it at signal time costs nothing
+    and drags in no server.
+    """
+    try:
+        return importlib.import_module("kill_audit")
+    except Exception:  # noqa: BLE001 - the audit is best-effort
+        return None
+
+
+def _write_outcome(audit, kind, target, sig, outcome, errno=None) -> None:
+    """Write one signal's outcome into the kill audit.  Never raises."""
+    if audit is None:
+        return
+    try:
+        audit.write_kill_outcome(kind, target, sig, outcome, errno=errno)
+    except Exception:  # noqa: BLE001 - the audit never blocks a signal
+        pass
+
+
+def _signal_once(
+    sender: Callable[[int, str, Optional[int]], None],
+    pid: int,
+    sig_name: str,
+    pgid: Optional[int],
+) -> str:
+    """Send one signal and say what happened.
+
+    ``_SENT``
+        the signal went out.
+    ``_GONE``
+        the kernel says there is no such process — the target is
+        already gone, which is a success for the reaper, not an error.
+    ``_REFUSED``
+        the signal was refused or failed.  The reason is written to
+        the kill audit, so a refusal is evidence and not just a
+        traceback.
+    """
+    audit = _kill_audit_module()
+    sig = getattr(signal, "SIG" + sig_name, None)
+    kind = "killpg" if pgid is not None else "kill"
+    try:
+        sender(pid, sig_name, pgid)
+    except ProcessLookupError:
+        _write_outcome(audit, kind, pid, sig, "gone")
+        return _GONE
+    except PermissionError as exc:
+        _write_outcome(audit, kind, pid, sig, "refused", errno=exc.errno)
+        logger.warning(
+            "orphan reaper: the signal to pid %s was refused (errno %s)",
+            pid, exc.errno,
+        )
+        return _REFUSED
+    except OSError as exc:
+        _write_outcome(audit, kind, pid, sig, "failed", errno=exc.errno)
+        logger.warning(
+            "orphan reaper: could not signal pid %s", pid, exc_info=True
+        )
+        return _REFUSED
+    _write_outcome(audit, kind, pid, sig, "sent")
+    return _SENT
+
+
 def _reap_one(
     verdict: Verdict,
     config: ReaperConfig,
@@ -3530,32 +3742,60 @@ def _reap_one(
         pgid = None
 
     # -- SIGTERM, then the grace period, then SIGKILL.
-    try:
-        sender(pid, SIGNAL_TERM, pgid)
-    except ProcessLookupError:
+    #
+    # The refusals are three different things, and the difference is
+    # the whole point of this stage:
+    #
+    # ESRCH
+    #     the target is already gone — a success, not an error.
+    # EPERM
+    #     the signal was refused.  On macOS a process group whose
+    #     leader is a zombie answers this way for the WHOLE group,
+    #     while the process itself usually still answers — so the
+    #     group refusal degrades to a single-pid signal instead of
+    #     giving up.  This is the case that used to leave a verdict
+    #     saying ``decision='kill'`` with an empty signal: the reaper
+    #     had decided to kill the orphan and had not killed it.
+    # anything else
+    #     unknown — recorded, and the escalation continues against the
+    #     process itself.
+    #
+    # Whatever happens, a verdict that says ``decision='kill'`` never
+    # carries an empty signal.  The empty string meant "we decided to
+    # kill it and then did not", and that is exactly the shape a run
+    # leaves behind when a group refuses.
+    target_pgid = pgid
+    sent = _signal_once(sender, pid, SIGNAL_TERM, target_pgid)
+    if sent == _REFUSED and target_pgid is not None:
+        # The group refused; the process itself may still answer.
+        target_pgid = None
+        sent = _signal_once(sender, pid, SIGNAL_TERM, target_pgid)
+    if sent == _GONE:
         # Already gone: there is nothing left to escalate to.
         verdict.signal = SIGNAL_TERM
         return verdict
-    except OSError:
-        logger.warning(
-            "orphan reaper: could not signal pid %s", pid, exc_info=True
-        )
-        verdict.signal = ""
+    if sent == _REFUSED:
+        # Neither the group nor the process took the signal.  The
+        # verdict says exactly that — it does not say "killed nothing"
+        # by carrying an empty signal.
+        verdict.signal = SIGNAL_NONE
         return verdict
     verdict.signal = SIGNAL_TERM
 
     if _wait_for_exit(pid, probe, config.grace, napper):
         return verdict
 
-    try:
-        sender(pid, SIGNAL_KILL, pgid)
-    except ProcessLookupError:
+    sent = _signal_once(sender, pid, SIGNAL_KILL, target_pgid)
+    if sent == _REFUSED and target_pgid is not None:
+        target_pgid = None
+        sent = _signal_once(sender, pid, SIGNAL_KILL, target_pgid)
+    if sent == _SENT:
+        verdict.signal = SIGNAL_KILL
+    elif sent == _GONE:
         # Gone between the check and the kill.
         return verdict
-    except OSError:
-        logger.warning("orphan reaper: could not kill pid %s", pid, exc_info=True)
-        return verdict
-    verdict.signal = SIGNAL_KILL
+    else:
+        verdict.signal = SIGNAL_NONE
     return verdict
 
 

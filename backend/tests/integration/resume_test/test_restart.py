@@ -24,13 +24,20 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-# Mirror the same sys.path bootstrap the other resume_test tests use so
-# the import works regardless of which pytest rootdir is active.
-_INTEGRATION_DIR = Path(__file__).resolve().parent.parent
-if str(_INTEGRATION_DIR) not in sys.path:
-    sys.path.insert(0, str(_INTEGRATION_DIR))
+# Anchor the path at ``backend``, NOT at ``backend/tests/integration``.
+# That directory holds the scheduler tests in a package of their own named
+# ``plan_scheduler``; putting it first on ``sys.path`` made
+# ``import plan_scheduler`` resolve to the *tests* package, so every later
+# ``from plan_scheduler.engine import ...`` in the same pytest process
+# failed with ``ModuleNotFoundError`` as soon as a shuffled collection
+# order put this module before anything that imports the server.
+# ``backend`` keeps ``tests.integration.resume_test`` importable under
+# either pytest rootdir and shadows no top-level package.
+_BACKEND_DIR = Path(__file__).resolve().parents[3]
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
 
-from resume_test import restart  # noqa: E402
+from tests.integration.resume_test import restart  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

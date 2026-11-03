@@ -676,7 +676,16 @@ class TestFullCiVerdictClassification:
     def test_a_green_gate_carries_no_failure_class(self, tmp_path):
         verdict = _full_ci_agent(tmp_path)._run_full_ci_vp(_full_ci_vp())
         assert verdict["status"] == "PASSED"
-        assert set(verdict) == {"status", "reasons", "evidence"}
+        # The shape the executor reads: the status, the reasons, the
+        # evidence -- and the gate's own list of the cases that failed,
+        # which the report entry and the failure fingerprint read.
+        # A green gate has no failure class and no failing case.
+        assert set(verdict) == {
+            "status", "reasons", "evidence", "failed_assertions",
+        }
+        assert verdict["failed_assertions"] == [], verdict
+        assert "failure_class" not in verdict, verdict
+        assert "failure_class_source" not in verdict, verdict
 # ---------------------------------------------------------------------------
 # The per-phase junit evidence
 # ---------------------------------------------------------------------------
